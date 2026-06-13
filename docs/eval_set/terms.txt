@@ -1,0 +1,31 @@
+# ASR評価セット 固有名詞・技術用語リスト
+# score_asr.py --terms で読み込む形式（1行1語、#コメント・空行は無視）
+# このリストの全用語はreferences.jsonのいずれかの正解文に出現する
+
+# プロダクト名・ツール名
+VibeVoice
+Tauri
+faster-whisper
+kotoba-whisper
+ReazonSpeech
+
+# 技術用語・API名
+WebSocket
+NFKC
+CTranslate2
+CUDA
+nvidia-smi
+
+# ファイルパス・設定キー関連の読み上げ表記
+asr_worker
+bench_audio
+pyproject
+
+# 架空の人名・組織名（台本中の文脈用）
+田中エンジニア
+鈴木プロダクトマネージャー
+アカリテック株式会社
+
+# 数字・単位含む固有表現（読み上げ想定表記）
+十二ギガバイト
+ゼロポイントファイブ秒

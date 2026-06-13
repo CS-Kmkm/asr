@@ -1,0 +1,76 @@
+export type AppPhase =
+  | "idle"
+  | "recording"
+  | "processing"
+  | "injecting"
+  | "completed"
+  | "error";
+
+export interface AppState {
+  phase: AppPhase;
+  message: string | null;
+  lastResult: string | null;
+  updatedAt: string;
+}
+
+export interface AudioDevice {
+  id: string;
+  name: string;
+  isDefault: boolean;
+}
+
+export interface AudioLevel {
+  rms: number;
+  peak: number;
+}
+
+export interface RecordingResult {
+  text: string;
+  insertion: string;
+  durationMs: number;
+  latencyMs: number;
+}
+
+export interface Settings {
+  setupComplete: boolean;
+  hotkey: string;
+  microphoneId: string | null;
+  historyEnabled: boolean;
+  historyRetentionDays: number;
+  deleteAudioAfterProcessing: boolean;
+  cloudEnabled: boolean;
+  autoStart: boolean;
+  clipboardRestore: boolean;
+  modelId: string | null;
+  asrBackend: AsrBackend;
+}
+
+export type AsrBackend = "vibevoice" | "faster-whisper" | "mock";
+
+export interface HistoryItem {
+  id: number;
+  transcriptText: string;
+  processedText: string | null;
+  mode: string;
+  asrProvider: string;
+  llmProvider: string | null;
+  appCategory: string | null;
+  durationMs: number | null;
+  latencyMs: number | null;
+  createdAt: string;
+}
+
+export interface ModelStatus {
+  modelId: string | null;
+  installed: boolean;
+  state: "not_configured" | "not_installed" | "not_loaded" | "ready";
+  detail: string;
+}
+
+export interface GpuDiagnostics {
+  status: "available" | "unavailable" | "unsupported";
+  adapterName: string | null;
+  driverVersion: string | null;
+  memoryTotalMb: number | null;
+  recommendation: string;
+}

@@ -1,10 +1,21 @@
 # Python-generated files
 __pycache__/
 *.py[oc]
-build/
-dist/
+/build/
+/dist/
 wheels/
 *.egg-info
 
 # Virtual environments
 .venv
+/node_modules/
+src-tauri/target/
+src-tauri/gen/
+.codex
+.codex/
+.claude/
+.agents/
+*.sqlite3
+*.wav
+.mypy_cache/
+.pytest_cache/
