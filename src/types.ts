@@ -38,7 +38,6 @@ export interface Settings {
   historyEnabled: boolean;
   historyRetentionDays: number;
   deleteAudioAfterProcessing: boolean;
-  cloudEnabled: boolean;
   autoStart: boolean;
   clipboardRestore: boolean;
   modelId: string | null;
@@ -73,4 +72,24 @@ export interface GpuDiagnostics {
   driverVersion: string | null;
   memoryTotalMb: number | null;
   recommendation: string;
+}
+
+export interface DictionaryEntry {
+  id: number;
+  reading: string;
+  surface: string;
+  category: string | null;
+  aliases: string[];
+  priority: number;
+  appScope: string | null;
+  createdAt: string;
+}
+
+export interface DictionaryEntryInput {
+  reading: string;
+  surface: string;
+  category?: string | null;
+  aliases?: string[];
+  priority?: number;
+  appScope?: string | null;
 }

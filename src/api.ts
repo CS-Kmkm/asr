@@ -7,6 +7,8 @@ import type {
   ModelStatus,
   Settings,
   RecordingResult,
+  DictionaryEntry,
+  DictionaryEntryInput,
 } from "./types";
 
 const inTauri = "__TAURI_INTERNALS__" in window;
@@ -18,7 +20,6 @@ export const defaultSettings: Settings = {
   historyEnabled: true,
   historyRetentionDays: 30,
   deleteAudioAfterProcessing: true,
-  cloudEnabled: false,
   autoStart: false,
   clipboardRestore: true,
   modelId: null,
@@ -102,4 +103,30 @@ export async function runGpuDiagnostics(): Promise<GpuDiagnostics> {
     };
   }
   return invoke("run_gpu_diagnostics");
+}
+
+export async function listDictionary(): Promise<DictionaryEntry[]> {
+  if (!inTauri) return [];
+  return invoke("list_dictionary");
+}
+
+export async function addDictionaryEntry(entry: DictionaryEntryInput): Promise<DictionaryEntry> {
+  if (!inTauri) {
+    return {
+      id: Date.now(),
+      reading: entry.reading,
+      surface: entry.surface,
+      category: entry.category ?? null,
+      aliases: entry.aliases ?? [],
+      priority: entry.priority ?? 0,
+      appScope: entry.appScope ?? null,
+      createdAt: new Date().toISOString(),
+    };
+  }
+  return invoke("add_dictionary_entry", { entry });
+}
+
+export async function deleteDictionaryEntry(id: number): Promise<void> {
+  if (!inTauri) return;
+  await invoke("delete_dictionary_entry", { id });
 }
