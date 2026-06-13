@@ -40,9 +40,9 @@ import { PrivacyPage } from "./pages/PrivacyPage";
 import { DiagnosticsPage } from "./pages/DiagnosticsPage";
 
 const asrBackendOptions: Array<{ value: AsrBackend; label: string }> = [
-  { value: "vibevoice", label: "VibeVoice (GPU)" },
-  { value: "faster-whisper", label: "faster-whisper (CPU対応)" },
-  { value: "mock", label: "mock (開発用)" },
+  { value: "faster-whisper", label: "faster-whisper(推奨・低遅延/CPU可)" },
+  { value: "vibevoice", label: "VibeVoice(GPU・長文向け)" },
+  { value: "mock", label: "mock(開発用)" },
 ];
 
 type Page =

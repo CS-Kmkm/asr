@@ -57,10 +57,10 @@ export function SetupPage({
         />
         <SettingRow
           title="Local ASR model"
-          detail="VibeVoice downloads from Hugging Face on first load."
+          detail="The default faster-whisper model downloads on first load and runs on CPU or GPU. For long-form transcription, VibeVoice (optional GPU backend) can be selected in Settings."
           control={
             <button className="secondary" onClick={onPrepareModel}>
-              Load VibeVoice
+              Load ASR model
             </button>
           }
         />

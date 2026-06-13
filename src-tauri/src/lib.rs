@@ -32,7 +32,23 @@ use types::{
     LoadModelRequest, ModelStatus, NewDictionaryEntry, NewHistoryItem, RecordingResult, Settings,
 };
 
-pub(crate) const DEFAULT_MODEL_ID: &str = "microsoft/VibeVoice-ASR-HF";
+pub(crate) fn model_identity(asr_backend: &str) -> (Option<String>, String) {
+    match asr_backend {
+        "faster-whisper" => (
+            Some("faster-whisper:large-v3-turbo".into()),
+            "faster-whisper runs locally on CPU or GPU; the model downloads on first load.".into(),
+        ),
+        "vibevoice" => (
+            Some("microsoft/VibeVoice-ASR-HF".into()),
+            "VibeVoice requires a CUDA GPU; downloads from Hugging Face on first load.".into(),
+        ),
+        "mock" => (
+            Some("mock".into()),
+            "Mock backend for development; no model is downloaded.".into(),
+        ),
+        _ => (None, format!("Unknown ASR backend: {asr_backend}.")),
+    }
+}
 
 pub(crate) struct Services {
     audio: Mutex<Option<Box<dyn AudioCapture>>>,
@@ -44,6 +60,7 @@ pub(crate) struct Services {
 
 impl Services {
     fn new(asr_backend: &str) -> Self {
+        let (model_id, detail) = model_identity(asr_backend);
         Self {
             audio: Mutex::new(Some(Box::new(CpalAudioCapture::new()))),
             target: Mutex::new(None),
@@ -52,10 +69,10 @@ impl Services {
                 Duration::from_secs(300),
             )),
             model: Mutex::new(ModelStatus {
-                model_id: Some(DEFAULT_MODEL_ID.into()),
+                model_id,
                 installed: false,
                 state: "not_loaded".into(),
-                detail: "The model downloads from Hugging Face when Load model is selected.".into(),
+                detail,
             }),
             lifecycle: PipelineLifecycle::default(),
         }

@@ -39,7 +39,7 @@ pub struct Settings {
 pub const ASR_BACKENDS: [&str; 3] = ["vibevoice", "faster-whisper", "mock"];
 
 fn default_asr_backend() -> String {
-    "vibevoice".into()
+    "faster-whisper".into()
 }
 
 impl Default for Settings {
@@ -162,8 +162,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_settings_use_vibevoice_backend() {
-        assert_eq!(Settings::default().asr_backend, "vibevoice");
+    fn default_settings_use_faster_whisper_backend() {
+        assert_eq!(Settings::default().asr_backend, "faster-whisper");
     }
 
     #[test]
@@ -180,6 +180,6 @@ mod tests {
             "modelId": null
         }"#;
         let settings: Settings = serde_json::from_str(stored).unwrap();
-        assert_eq!(settings.asr_backend, "vibevoice");
+        assert_eq!(settings.asr_backend, "faster-whisper");
     }
 }

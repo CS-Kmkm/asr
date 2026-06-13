@@ -5,6 +5,11 @@ description = "Persistent local ASR worker (VibeVoice / faster-whisper / mock ba
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 dependencies = [
+    "faster-whisper>=1.0",
+]
+
+[project.optional-dependencies]
+vibevoice = [
     "accelerate>=1.13.0",
     "bitsandbytes>=0.46.0",
     "librosa>=0.11.0",
@@ -12,6 +17,3 @@ dependencies = [
     "torchvision>=0.26.0",
     "transformers>=5.6.2",
 ]
-
-[project.optional-dependencies]
-faster-whisper = ["faster-whisper>=1.0"]

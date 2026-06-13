@@ -54,6 +54,11 @@ name = "asr"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "faster-whisper" },
+]
+
+[package.optional-dependencies]
+vibevoice = [
     { name = "accelerate" },
     { name = "bitsandbytes" },
     { name = "librosa" },
@@ -62,22 +67,17 @@ dependencies = [
     { name = "transformers" },
 ]
 
-[package.optional-dependencies]
-faster-whisper = [
-    { name = "faster-whisper" },
-]
-
 [package.metadata]
 requires-dist = [
-    { name = "accelerate", specifier = ">=1.13.0" },
-    { name = "bitsandbytes", specifier = ">=0.46.0" },
-    { name = "faster-whisper", marker = "extra == 'faster-whisper'", specifier = ">=1.0" },
-    { name = "librosa", specifier = ">=0.11.0" },
-    { name = "torch" },
-    { name = "torchvision", specifier = ">=0.26.0" },
-    { name = "transformers", specifier = ">=5.6.2" },
+    { name = "accelerate", marker = "extra == 'vibevoice'", specifier = ">=1.13.0" },
+    { name = "bitsandbytes", marker = "extra == 'vibevoice'", specifier = ">=0.46.0" },
+    { name = "faster-whisper", specifier = ">=1.0" },
+    { name = "librosa", marker = "extra == 'vibevoice'", specifier = ">=0.11.0" },
+    { name = "torch", marker = "extra == 'vibevoice'" },
+    { name = "torchvision", marker = "extra == 'vibevoice'", specifier = ">=0.26.0" },
+    { name = "transformers", marker = "extra == 'vibevoice'", specifier = ">=5.6.2" },
 ]
-provides-extras = ["faster-whisper"]
+provides-extras = ["vibevoice"]
 
 [[package]]
 name = "audioop-lts"

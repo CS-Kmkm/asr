@@ -23,7 +23,7 @@ export const defaultSettings: Settings = {
   autoStart: false,
   clipboardRestore: true,
   modelId: null,
-  asrBackend: "vibevoice",
+  asrBackend: "faster-whisper",
 };
 
 export async function getAppState(): Promise<AppState> {
@@ -88,7 +88,7 @@ export async function getModelStatus(): Promise<ModelStatus> {
 export async function loadModel(quantization = "4bit"): Promise<ModelStatus> {
   if (!inTauri) return getModelStatus();
   return invoke("load_model", {
-    request: { modelId: "microsoft/VibeVoice-ASR-HF", quantization },
+    request: { quantization },
   });
 }
 

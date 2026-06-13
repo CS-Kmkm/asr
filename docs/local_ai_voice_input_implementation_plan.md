@@ -31,7 +31,8 @@ Windows 11上で、グローバルホットキーを押して話し、ローカ�
 
 - NVIDIA GPU搭載PC
 - VRAM 12GBから16GBを主要検証対象とする。
-- CPUのみの実行は、初期版では必須保証対象にしない。
+- **デフォルトのfaster-whisperバックエンドはCPU動作のためGPU不要**。
+  GPU(NVIDIA CUDA対応)が必要なのは、オプションのVibeVoice/長文バックエンドを使用する場合のみ。
 - ASRとローカルLLMを同時利用する場合、VRAM競合が発生するため、モデル常駐・アンロード・キュー制御を設計に含める。
 
 ### 2.4 対応言語
@@ -571,8 +572,9 @@ Hotkey
 | エラー定義 | thiserror 2 |
 | パス解決 | directories 6 |
 | ASRワーカー言語 | Python 3.10〜3.13 |
-| ASRモデル | VibeVoice-ASR-HF (transformers + CUDA) |
-| 量子化 | 4bit(標準)、8bit、BF16(選択可能) |
+| ASRモデル(デフォルト) | faster-whisper large-v3-turbo (CPU/GPU、`pip install -e .` に含む) |
+| ASRモデル(長文オプション) | VibeVoice-ASR-HF (transformers + CUDA、`pip install -e ".[vibevoice]"` で追加) |
+| 量子化 | faster-whisper: int8(CPU)/fp16(GPU)。VibeVoice: 4bit(標準)、8bit、BF16(選択可能) |
 | 認証情報 | Windows Credential Manager |
 | ログ | ローテーション付きローカルログ |
 | 配布 | **未決定(3案検討中、ADR-0003参照)** |
@@ -1039,6 +1041,10 @@ AI整形と個人辞書により、実用的な文章入力を実現する。
 8. Phase 1では毎日使える短文入力を優先し、高度編集はPhase 3へ送る。
 9. アプリフレームワークはTauri 2 + Rust + React(WebView2)を採用した(ADR-0001参照)。
 10. Pythonサイドカーの配布方式は2026-06-13時点で未決定である(ADR-0003参照)。
+11. デフォルトASRバックエンドをfaster-whisper (large-v3-turbo、CPU/GPU対応) とし、
+    VibeVoiceはオプションGPUバックエンド(長文・高精度用)に位置づける。
+    依存関係も再編し、コアインストール(`pip install -e .`)はfaster-whisper軽量スタックのみを含む
+    (ADR-0004参照)。
 
 ## 20. 参考資料
 
@@ -1051,6 +1057,7 @@ AI整形と個人辞書により、実用的な文章入力を実現する。
 - ADR-0001: docs/adr/0001-tech-stack.md
 - ADR-0002: docs/adr/0002-batch-asr-v1.md
 - ADR-0003: docs/adr/0003-python-sidecar-distribution.md
+- ADR-0004: docs/adr/0004-default-asr-backend.md
 
 ---
 

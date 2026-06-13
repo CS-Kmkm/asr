@@ -349,9 +349,12 @@ mod tests {
     }
 
     #[test]
-    fn defaults_select_vibevoice_backend() {
+    fn defaults_select_faster_whisper_backend() {
         let storage = Storage::in_memory().unwrap();
-        assert_eq!(storage.get_settings().unwrap().asr_backend, "vibevoice");
+        assert_eq!(
+            storage.get_settings().unwrap().asr_backend,
+            "faster-whisper"
+        );
     }
 
     #[test]

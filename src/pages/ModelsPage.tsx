@@ -20,7 +20,7 @@ export function ModelsPage({
         <span className="tag">{model?.state.replace("_", " ")}</span>
         <br />
         <button className="secondary" onClick={onPrepareModel}>
-          Load 4-bit model
+          Load model
         </button>
       </article>
       <article className="panel span-2">

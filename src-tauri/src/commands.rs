@@ -148,7 +148,7 @@ pub(crate) async fn stop_recording(
         Err(error) => {
             let _ = storage.add_metric(
                 "asr",
-                Some(DEFAULT_MODEL_ID),
+                Some(settings.asr_backend.as_str()),
                 None,
                 false,
                 Some("asr_failed"),
@@ -425,29 +425,25 @@ pub(crate) fn get_model_status(services: State<'_, Services>) -> Result<ModelSta
 pub(crate) async fn load_model(
     request: Option<LoadModelRequest>,
     services: State<'_, Services>,
+    storage: State<'_, Storage>,
 ) -> Result<ModelStatus, String> {
     let request = request.unwrap_or(LoadModelRequest {
         model_id: None,
         quantization: None,
     });
-    if request
-        .model_id
-        .as_deref()
-        .is_some_and(|id| id != DEFAULT_MODEL_ID)
-    {
-        return Err("only microsoft/VibeVoice-ASR-HF is currently supported".into());
-    }
     let quantization = request.quantization.as_deref().unwrap_or("4bit");
+    let settings = storage.get_settings().map_err(command_error)?;
     services
         .transcriber
         .load(quantization)
         .await
         .map_err(command_error)?;
+    let (model_id, detail) = model_identity(&settings.asr_backend);
     let status = ModelStatus {
-        model_id: Some(DEFAULT_MODEL_ID.into()),
+        model_id,
         installed: true,
         state: "ready".into(),
-        detail: format!("Model loaded with {quantization} quantization."),
+        detail: format!("{detail} Loaded with {quantization} quantization."),
     };
     *services
         .model
@@ -482,9 +478,9 @@ pub(crate) fn run_gpu_diagnostics() -> GpuDiagnostics {
                     driver_version: Some(values[1].into()),
                     memory_total_mb: memory,
                     recommendation: if memory.unwrap_or_default() >= 12_000 {
-                        "Suitable for the default quantized local configuration."
+                        "A CUDA GPU with 12 GB or more is suitable for VibeVoice; faster-whisper also runs without a GPU."
                     } else {
-                        "VibeVoice may exceed available VRAM; 12 GB or more is recommended."
+                        "VibeVoice may exceed available VRAM; a CUDA GPU with 12 GB or more is recommended only for VibeVoice. faster-whisper runs without a GPU."
                     }
                     .into(),
                 };
@@ -496,8 +492,6 @@ pub(crate) fn run_gpu_diagnostics() -> GpuDiagnostics {
         adapter_name: None,
         driver_version: None,
         memory_total_mb: None,
-        recommendation:
-            "NVIDIA diagnostics unavailable. Install a CUDA-capable driver and verify nvidia-smi."
-                .into(),
+        recommendation: "NVIDIA diagnostics unavailable. A CUDA GPU with 12 GB or more is recommended only for VibeVoice; faster-whisper runs without a GPU.".into(),
     }
 }

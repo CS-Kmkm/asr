@@ -105,7 +105,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--backend",
         choices=("vibevoice", "faster-whisper", "mock"),
-        default=os.environ.get("ASR_WORKER_BACKEND", "vibevoice"),
+        default=os.environ.get("ASR_WORKER_BACKEND", "faster-whisper"),
     )
     args = parser.parse_args(argv)
     try:
