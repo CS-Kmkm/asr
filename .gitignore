@@ -9,6 +9,7 @@ wheels/
 # Virtual environments
 .venv
 /node_modules/
+/.pnpm-store/
 src-tauri/target/
 src-tauri/gen/
 .codex

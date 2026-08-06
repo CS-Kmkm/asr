@@ -41,7 +41,7 @@
 
 ```powershell
 # 依存インストール
-npm install
+pnpm install
 py -3.10 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e .                          # デフォルト (faster-whisper、CPU対応・軽量)
@@ -49,12 +49,12 @@ pip install -e .                          # デフォルト (faster-whisper、CP
 $env:ASR_PYTHON = "$PWD\.venv\Scripts\python.exe"
 
 # 起動
-npm run tauri dev
+pnpm run tauri dev
 
 # mock バックエンドでプロトコル確認のみ (モデル不要)
 $env:ASR_WORKER_BACKEND = "mock"
 $env:ASR_WORKER_MOCK_TEXT = "テスト認識テキスト"
-npm run tauri dev
+pnpm run tauri dev
 ```
 
 ---
@@ -65,7 +65,7 @@ npm run tauri dev
 
 | # | 操作 | 期待結果 |
 |---|---|---|
-| 1 | リポジトリを Windows 実機へ clone し、上記ビルドコマンドを実行する（`pip install -e .` でデフォルトの faster-whisper スタックがインストールされる） | `npm run tauri dev` でアプリウィンドウが開く |
+| 1 | リポジトリを Windows 実機へ clone し、上記ビルドコマンドを実行する（`pip install -e .` でデフォルトの faster-whisper スタックがインストールされる） | `pnpm run tauri dev` でアプリウィンドウが開く |
 | 2 | バックエンドを確認・選択する。デフォルトは **faster-whisper (CPU対応)**。GPU ありで長文/高精度用途なら Settings → ASR backend で **VibeVoice (GPU)** を選ぶ（事前に `pip install -e ".[vibevoice]"` が必要）。GPU なしで検証のみなら **mock (開発用)** を選ぶ | Settings 画面に選択が反映される |
 | 3 | ASR モデルを読み込む。faster-whisper の場合: **Load ASR model** ボタンを押す（または初回 transcribe 時に自動ダウンロード）。VibeVoice の場合: Model & GPU ページ → **Load 4-bit model** ボタン | Model ステータスが `ready` になる |
 | 4 | Setup ページ → マイクをプルダウンで選択（「System default」でも可） | マイクが設定される |

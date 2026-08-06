@@ -33,12 +33,12 @@ intentionally disabled for VibeVoice. A current NVIDIA driver with
 ## Setup
 
 ```powershell
-npm install
+pnpm install
 py -3.10 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e .
 $env:ASR_PYTHON = "$PWD\.venv\Scripts\python.exe"
-npm run tauri dev
+pnpm run tauri dev
 ```
 
 `pip install -e .` installs the default faster-whisper stack (CPU-capable, no
@@ -59,7 +59,7 @@ For protocol-only development without a GPU:
 ```powershell
 $env:ASR_WORKER_BACKEND = "mock"
 $env:ASR_WORKER_MOCK_TEXT = "test transcript"
-npm run tauri dev
+pnpm run tauri dev
 ```
 
 See [docs/adr/0004-default-asr-backend.md](docs/adr/0004-default-asr-backend.md)
@@ -90,7 +90,7 @@ The generation token limit for VibeVoice can be overridden via
 ## Checks
 
 ```bash
-npm run build
+pnpm run build
 python3 -m unittest discover -s asr_worker/tests -v
 cd src-tauri && cargo test
 ```

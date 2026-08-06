@@ -6,7 +6,7 @@
 
 メインのClaudeが**指揮役**(`/orchestrate` スキル)として、実装をサブエージェント(Codex / Opus 4.8 / Sonnet 4.6)へ委譲し、各成果を `git diff` 確認とテスト再実行で検収する運用。
 
-検証環境はWSL2のため **Windows固有機能・CUDA・`cargo check` は実行不可**。Rustコンパイル検証はWindows実機でユーザーが行う前提。`cargo fmt --check` と `npm run build`(tsc)とPython `pytest` はこの環境で実行可能。
+検証環境はWSL2のため **Windows固有機能・CUDA・`cargo check` は実行不可**。Rustコンパイル検証はWindows実機でユーザーが行う前提。`cargo fmt --check` と `pnpm run build`(tsc)とPython `pytest` はこの環境で実行可能。
 
 ## 完了・検収合格済み(Wave 1 + 2)
 
@@ -25,7 +25,7 @@
 
 ## Wave 3.1(完了・検収合格)
 
-- **3.1-A ASRバックエンド選択(Rust+UI設定永続化)**: Opus。`Settings.asr_backend` 追加(デフォルトvibevoice、camelCase `asrBackend`)、UIセレクト、ワーカー起動引数 `--backend`、変更時に `reconfigure` でワーカーリセット+quantizationクリア。検収: `cargo fmt --check` 差分なし / `npm run build` 成功 / pytest 27件 / serde命名・レガシーフォールバック確認。
+- **3.1-A ASRバックエンド選択(Rust+UI設定永続化)**: Opus。`Settings.asr_backend` 追加(デフォルトvibevoice、camelCase `asrBackend`)、UIセレクト、ワーカー起動引数 `--backend`、変更時に `reconfigure` でワーカーリセット+quantizationクリア。検収: `cargo fmt --check` 差分なし / `pnpm run build` 成功 / pytest 27件 / serde命名・レガシーフォールバック確認。
 - **3.1-B クリップボード履歴除外+IMEガード**: Opus。一時クリップボード経路に `ExcludeClipboardContentFromMonitorProcessing` / `CanIncludeInClipboardHistory`=0 / `CanUploadToCloudClipboard`=0 をベストエフォートで付与(終端のclipboard-only保持は履歴許可)。IMEガードは `ImmGetCompositionStringW(GCS_COMPSTR)` 長>0で挿入中止→クリップボード保持。孤立していた `ImeCompositionActive` バリアントを解消。検収: `cargo fmt --check` 差分なし、孤立解消確認。
 
 ### Windows実機で要確認(3.1)
@@ -54,7 +54,7 @@ WSL2でTauri crateの `cargo check` を通すため、root権限なしで以下�
   - `Cargo.toml`: tokio features に `macros` が不足し `tokio::select!`(asr.rs:251、キャンセル処理)がコンパイル不能 → `macros` 追加。
   - `asr.rs`: `AsyncReadExt` のimport漏れで `(&mut stdout).take(...)`(asr.rs:165)が `Iterator::take` 扱いになりエラー → import追加。
   - いずれもプラットフォーム非依存の必須修正(Windowsビルドでも同じく失敗していたはずの既存バグ)。指揮役のglueとして直接修正。
-- 環境要因(恒久対応済み): Linuxの `generate_context!` が `icons/icon.png` を要求していた(従来 tauri.conf.json は `icon.ico` 1枚=16×16のみ参照で、Windows製品としても不十分)。ユーザー提供のロゴ `src-tauri/icons/logo.png`(1254×1254)から `npx tauri icon` で全プラットフォームのアイコン一式(icon.png / 32x32 / 128x128 / 128x128@2x / icon.icns / 複数サイズ icon.ico / Square*Logo 等)を生成し、`bundle.icon` を標準構成へ更新。これで**一時pngなしで Windows実ビルドも Linux の `cargo check` も両方通る**。
+- 環境要因(恒久対応済み): Linuxの `generate_context!` が `icons/icon.png` を要求していた(従来 tauri.conf.json は `icon.ico` 1枚=16×16のみ参照で、Windows製品としても不十分)。ユーザー提供のロゴ `src-tauri/icons/logo.png`(1254×1254)から `pnpm exec tauri icon` で全プラットフォームのアイコン一式(icon.png / 32x32 / 128x128 / 128x128@2x / icon.icns / 複数サイズ icon.ico / Square*Logo 等)を生成し、`bundle.icon` を標準構成へ更新。これで**一時pngなしで Windows実ビルドも Linux の `cargo check` も両方通る**。
 - **結果: `cargo check` がエラー0で通過**(警告11件はすべて `#[cfg(windows)]` 側でのみ使われるコードがLinuxチェックで未使用になる想定内のもの)。`cargo fmt --check` 差分なし、pytest 27件パスも維持。
 
 ### この cargo check の検証範囲と限界
@@ -63,7 +63,7 @@ WSL2でTauri crateの `cargo check` を通すため、root権限なしで以下�
 
 ## 環境整備済み
 
-- バックグラウンドエージェントのEdit/Write許可: `~/.claude/settings.json` に `Edit/Write(//home/koshi/asr/**)`、`worktree.bgIsolation: "none"`、`npm`/`cargo fmt`/`node` のBash許可を追加済み。
+- バックグラウンドエージェントのEdit/Write許可: `~/.claude/settings.json` に `Edit/Write(//home/koshi/asr/**)`、`worktree.bgIsolation: "none"`、`pnpm`/`cargo fmt`/`node` のBash許可を追加済み。
 - プロジェクト側 `.claude/settings.json` にも同等のallowを設定済み(次回セッションから有効)。
 - Rust検証の限界: crate全体はtauri経由のwebkit2gtk/libsoup依存でLinuxビルド不可。プラットフォーム非依存ロジックは `rustc --test` での抽出検証で代替。フル `cargo check`/`cargo test` はWindows実機、または `sudo apt-get install -y libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential pkg-config` 導入後にWSLで可能。
 

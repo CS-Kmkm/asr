@@ -10,7 +10,11 @@ use std::future::Future;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+#[cfg(target_os = "windows")]
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "windows")]
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const TARGET_SAMPLE_RATE: u32 = 24_000;
@@ -390,7 +394,35 @@ struct ActiveCapture {
     input_sample_rate: u32,
     shared: Arc<Mutex<SharedCapture>>,
     #[cfg(target_os = "windows")]
-    stream: cpal::Stream,
+    stream_worker: StreamWorker,
+}
+
+/// Owns the CPAL stream thread without moving `cpal::Stream` between threads.
+///
+/// CPAL's platform-erased stream is deliberately `!Send`, so the stream must
+/// remain on the thread where it was created. This handle itself is `Send` and
+/// can safely live in Tauri's managed audio service.
+#[cfg(target_os = "windows")]
+struct StreamWorker {
+    shutdown: mpsc::Sender<()>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "windows")]
+impl StreamWorker {
+    fn shutdown(&mut self) {
+        let _ = self.shutdown.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for StreamWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 /// CPAL microphone implementation on Windows and an API-compatible stub elsewhere.
@@ -415,9 +447,9 @@ impl CpalAudioCapture {
         if !self.is_recording() {
             return Err(AudioError::NotCapturing);
         }
-        let active = self.active.take().ok_or(AudioError::NotCapturing)?;
+        let mut active = self.active.take().ok_or(AudioError::NotCapturing)?;
         self.recording = false;
-        drop_active_stream(&active);
+        drop_active_stream(&mut active);
 
         if cancelled {
             return Err(AudioError::Cancelled);
@@ -462,8 +494,8 @@ impl AudioCapture for CpalAudioCapture {
             if self.is_recording() {
                 return Ok(());
             }
-            if let Some(active) = self.active.take() {
-                drop_active_stream(&active);
+            if let Some(mut active) = self.active.take() {
+                drop_active_stream(&mut active);
             }
             Ok(())
         })
@@ -738,6 +770,58 @@ fn list_cpal_devices() -> Result<Vec<AudioDevice>, AudioError> {
 
 #[cfg(target_os = "windows")]
 fn start_cpal_capture(config: CaptureConfig) -> Result<ActiveCapture, AudioError> {
+    let (startup_tx, startup_rx) = mpsc::sync_channel(1);
+    let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    let active_config = config.clone();
+    let thread = thread::Builder::new()
+        .name("cpal-input-stream".into())
+        .spawn(move || {
+            let startup = start_cpal_stream(config);
+            match startup {
+                Ok((input_sample_rate, shared, stream)) => {
+                    if startup_tx.send(Ok((input_sample_rate, shared))).is_err() {
+                        return;
+                    }
+                    let _ = shutdown_rx.recv();
+                    use cpal::traits::StreamTrait;
+                    let _ = stream.pause();
+                }
+                Err(error) => {
+                    let _ = startup_tx.send(Err(error));
+                }
+            }
+        })
+        .map_err(|error| AudioError::StreamBuild(error.to_string()))?;
+
+    let (input_sample_rate, shared) = match startup_rx.recv() {
+        Ok(Ok(startup)) => startup,
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            return Err(error);
+        }
+        Err(error) => {
+            let _ = thread.join();
+            return Err(AudioError::StreamBuild(format!(
+                "audio stream thread exited during startup: {error}"
+            )));
+        }
+    };
+
+    Ok(ActiveCapture {
+        config: active_config,
+        input_sample_rate,
+        shared,
+        stream_worker: StreamWorker {
+            shutdown: shutdown_tx,
+            thread: Some(thread),
+        },
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn start_cpal_stream(
+    config: CaptureConfig,
+) -> Result<(u32, Arc<Mutex<SharedCapture>>, cpal::Stream), AudioError> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     let host = cpal::default_host();
@@ -801,12 +885,7 @@ fn start_cpal_capture(config: CaptureConfig) -> Result<ActiveCapture, AudioError
         .play()
         .map_err(|error| AudioError::StreamPlay(error.to_string()))?;
 
-    Ok(ActiveCapture {
-        config,
-        input_sample_rate,
-        shared,
-        stream,
-    })
+    Ok((input_sample_rate, shared, stream))
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -854,11 +933,10 @@ where
         .map_err(|error| AudioError::StreamBuild(error.to_string()))
 }
 
-fn drop_active_stream(active: &ActiveCapture) {
+fn drop_active_stream(active: &mut ActiveCapture) {
     #[cfg(target_os = "windows")]
     {
-        use cpal::traits::StreamTrait;
-        let _ = active.stream.pause();
+        active.stream_worker.shutdown();
     }
     #[cfg(not(target_os = "windows"))]
     {
