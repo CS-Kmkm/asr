@@ -10,6 +10,68 @@ body { margin: 0; min-width: 960px; min-height: 100vh; background: radial-gradie
 button, input, select { font: inherit; }
 button { color: inherit; }
 
+.recording-overlay-body {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: transparent;
+}
+.recording-overlay {
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  justify-content: center;
+  padding: 0 15px;
+  border: 1px solid rgba(255, 255, 255, .13);
+  border-radius: 18px;
+  background: linear-gradient(135deg, rgba(20, 24, 24, .95), rgba(8, 12, 11, .93));
+  box-shadow: 0 10px 34px rgba(0, 0, 0, .38), inset 0 1px rgba(255, 255, 255, .05);
+  color: #f5f8f7;
+  user-select: none;
+}
+.recording-live-dot {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #ff5c64;
+  box-shadow: 0 0 0 5px rgba(255, 92, 100, .11), 0 0 14px rgba(255, 92, 100, .65);
+  animation: recording-pulse 1.8s ease-in-out infinite;
+}
+.recording-overlay-label {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .01em;
+}
+.recording-wave {
+  height: 17px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 1px;
+}
+.recording-wave i {
+  width: 2px;
+  height: 6px;
+  border-radius: 2px;
+  background: #66e0ae;
+  animation: recording-wave 1s ease-in-out infinite alternate;
+}
+.recording-wave i:nth-child(2) { animation-delay: -.7s; }
+.recording-wave i:nth-child(3) { animation-delay: -.35s; }
+.recording-wave i:nth-child(4) { animation-delay: -.8s; }
+.recording-wave i:nth-child(5) { animation-delay: -.2s; }
+@keyframes recording-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .72; transform: scale(.86); }
+}
+@keyframes recording-wave {
+  from { height: 4px; opacity: .55; }
+  to { height: 16px; opacity: 1; }
+}
+
 .app-shell { display: grid; grid-template-columns: 230px 1fr; min-height: 100vh; }
 aside { padding: 28px 18px; border-right: 1px solid #1b302a; background: rgba(5, 14, 12, .9); display: flex; flex-direction: column; }
 .brand { display: flex; align-items: center; gap: 12px; padding: 0 10px 28px; }

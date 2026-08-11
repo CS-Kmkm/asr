@@ -2,6 +2,7 @@ mod asr;
 mod audio;
 mod commands;
 mod injection;
+mod recording_overlay;
 mod state;
 mod storage;
 mod types;
@@ -130,6 +131,7 @@ pub(crate) fn worker_command_for_backend(asr_backend: &str) -> WorkerCommand {
 }
 
 pub(crate) fn emit_state(app: &AppHandle, state: &AppState, phase: AppPhase, message: &str) {
+    recording_overlay::set_recording(app, phase == AppPhase::Recording);
     let snapshot = state.transition(phase, Some(message.into()));
     let _ = app.emit("app-state", snapshot);
 }
@@ -250,6 +252,7 @@ pub fn run() {
             app.manage(storage);
             app.manage(AppState::default());
             app.manage(Services::new(&settings.asr_backend));
+            recording_overlay::create(app.handle())?;
             app.global_shortcut().register(shortcut)?;
             if cleanup_stale_artifacts(&std::env::temp_dir()).is_err() {
                 emit_status(

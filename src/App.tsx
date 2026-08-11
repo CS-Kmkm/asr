@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
   addDictionaryEntry,
   cancelRecording,
@@ -66,7 +67,33 @@ const pages: Array<{ id: Page; label: string }> = [
   { id: "diagnostics", label: "Diagnostics" },
 ];
 
+const isRecordingOverlay = getCurrentWebviewWindow().label === "recording-overlay";
+
+if (isRecordingOverlay) {
+  document.body.classList.add("recording-overlay-body");
+}
+
+function RecordingOverlay() {
+  return (
+    <div className="recording-overlay" role="status" aria-label="Recording in progress">
+      <span className="recording-live-dot" aria-hidden="true" />
+      <span className="recording-overlay-label">Listening</span>
+      <span className="recording-wave" aria-hidden="true">
+        <i />
+        <i />
+        <i />
+        <i />
+        <i />
+      </span>
+    </div>
+  );
+}
+
 export default function App() {
+  return isRecordingOverlay ? <RecordingOverlay /> : <MainApp />;
+}
+
+function MainApp() {
   const [page, setPage] = useState<Page>("dashboard");
   const [state, setState] = useState<AppState>({
     phase: "idle",
