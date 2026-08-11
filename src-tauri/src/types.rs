@@ -32,14 +32,41 @@ pub struct Settings {
     pub auto_start: bool,
     pub clipboard_restore: bool,
     pub model_id: Option<String>,
+    #[serde(default = "default_model_quantization")]
+    pub model_quantization: String,
     #[serde(default = "default_asr_backend")]
     pub asr_backend: String,
+    #[serde(default = "default_api_base_url")]
+    pub api_base_url: String,
+    #[serde(default = "default_api_key_env_var")]
+    pub api_key_env_var: String,
+    #[serde(default)]
+    pub custom_models: Vec<CustomModel>,
 }
 
-pub const ASR_BACKENDS: [&str; 3] = ["vibevoice", "faster-whisper", "mock"];
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomModel {
+    pub asr_backend: String,
+    pub model_id: String,
+}
+
+pub const ASR_BACKENDS: [&str; 4] = ["vibevoice", "faster-whisper", "openai-compatible", "mock"];
 
 fn default_asr_backend() -> String {
     "faster-whisper".into()
+}
+
+fn default_model_quantization() -> String {
+    "4bit".into()
+}
+
+fn default_api_base_url() -> String {
+    "https://api.openai.com/v1".into()
+}
+
+fn default_api_key_env_var() -> String {
+    "OPENAI_API_KEY".into()
 }
 
 impl Default for Settings {
@@ -54,7 +81,11 @@ impl Default for Settings {
             auto_start: false,
             clipboard_restore: true,
             model_id: None,
+            model_quantization: default_model_quantization(),
             asr_backend: default_asr_backend(),
+            api_base_url: default_api_base_url(),
+            api_key_env_var: default_api_key_env_var(),
+            custom_models: Vec::new(),
         }
     }
 }
@@ -164,6 +195,7 @@ mod tests {
     #[test]
     fn default_settings_use_faster_whisper_backend() {
         assert_eq!(Settings::default().asr_backend, "faster-whisper");
+        assert_eq!(Settings::default().model_quantization, "4bit");
     }
 
     #[test]
@@ -181,5 +213,9 @@ mod tests {
         }"#;
         let settings: Settings = serde_json::from_str(stored).unwrap();
         assert_eq!(settings.asr_backend, "faster-whisper");
+        assert_eq!(settings.model_quantization, "4bit");
+        assert_eq!(settings.api_base_url, "https://api.openai.com/v1");
+        assert_eq!(settings.api_key_env_var, "OPENAI_API_KEY");
+        assert!(settings.custom_models.is_empty());
     }
 }

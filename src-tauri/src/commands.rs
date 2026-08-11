@@ -28,6 +28,7 @@ pub(crate) async fn start_recording(
         id: operation_id,
     };
     let settings = storage.get_settings().map_err(command_error)?;
+    ensure_model_loaded(&app, &services, &settings).await?;
     let target = SystemTextInjector::default()
         .capture_target()
         .map_err(command_error)?;
@@ -96,14 +97,53 @@ pub(crate) async fn stop_recording(
     state: State<'_, AppState>,
     storage: State<'_, Storage>,
 ) -> Result<RecordingResult, String> {
-    let (operation_id, cancel) = services.lifecycle.begin_processing()?;
+    let (operation_id, cancel) = match services.lifecycle.begin_processing() {
+        Ok(operation) => operation,
+        Err(error) => {
+            if error == "no recording is active" {
+                emit_state(
+                    &app,
+                    &state,
+                    AppPhase::Idle,
+                    "No recording is active. Start a new recording.",
+                );
+            }
+            return Err(error.into());
+        }
+    };
     let _guard = PipelineGuard {
         lifecycle: &services.lifecycle,
         id: operation_id,
     };
+    // Publish the lifecycle transition immediately. Previously the UI stayed
+    // in Recording until audio finalization completed; if finalization failed
+    // (for example for a short or silent take), the lifecycle returned to Idle
+    // while the UI incorrectly continued to offer "Stop and transcribe".
+    emit_state(
+        &app,
+        &state,
+        AppPhase::Processing,
+        "Stopping recording and preparing audio.",
+    );
     let started = Instant::now();
-    let settings = storage.get_settings().map_err(command_error)?;
-    let mut audio = take_audio(&services)?;
+    let settings = storage.get_settings().map_err(|error| {
+        emit_state(
+            &app,
+            &state,
+            AppPhase::Error,
+            "Recording could not be completed. Start a new recording and try again.",
+        );
+        command_error(error)
+    })?;
+    let mut audio = take_audio(&services).map_err(|error| {
+        emit_state(
+            &app,
+            &state,
+            AppPhase::Error,
+            "Recording could not be completed. Start a new recording and try again.",
+        );
+        error
+    })?;
     let artifact_result = audio.stop().await;
     // Re-arm immediately so the next hotkey press records with zero warm-up
     // latency. A best-effort arm; failure simply falls back to cold start.
@@ -114,7 +154,15 @@ pub(crate) async fn stop_recording(
         })
         .await;
     return_audio(&services, audio);
-    let artifact = artifact_result.map_err(command_error)?;
+    let artifact = artifact_result.map_err(|error| {
+        emit_state(
+            &app,
+            &state,
+            AppPhase::Error,
+            "No usable speech was captured. Start a new recording and try again.",
+        );
+        command_error(error)
+    })?;
     let duration_ms = artifact.duration.as_millis() as u64;
     let mut artifact_cleanup = TempArtifact::new(
         artifact.path.clone(),
@@ -296,7 +344,58 @@ pub(crate) async fn update_settings(
         return Err("history retention must be between 1 and 3650 days".into());
     }
     if !types::ASR_BACKENDS.contains(&settings.asr_backend.as_str()) {
-        return Err("asr backend must be vibevoice, faster-whisper, or mock".into());
+        return Err(
+            "asr backend must be vibevoice, faster-whisper, openai-compatible, or mock".into(),
+        );
+    }
+    if !["4bit", "8bit", "bf16"].contains(&settings.model_quantization.as_str()) {
+        return Err("model quantization must be 4bit, 8bit, or bf16".into());
+    }
+    if settings.model_id.as_deref().is_some_and(|value| {
+        value.trim().is_empty() || value.len() > 512 || value.chars().any(char::is_control)
+    }) {
+        return Err(
+            "model ID must be non-empty, at most 512 characters, and contain no control characters"
+                .into(),
+        );
+    }
+    if settings.custom_models.len() > 100 {
+        return Err("at most 100 custom models can be saved".into());
+    }
+    let api_url = settings.api_base_url.trim();
+    if api_url.len() > 2048
+        || !(api_url.starts_with("http://") || api_url.starts_with("https://"))
+        || api_url.chars().any(char::is_control)
+    {
+        return Err(
+            "API base URL must be an absolute HTTP(S) URL of at most 2048 characters".into(),
+        );
+    }
+    let api_key_env = settings.api_key_env_var.trim();
+    if api_key_env.is_empty()
+        || api_key_env.len() > 128
+        || !api_key_env
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric())
+    {
+        return Err(
+            "API key environment variable must contain only ASCII letters, digits, or underscores"
+                .into(),
+        );
+    }
+    for model in &settings.custom_models {
+        if !types::ASR_BACKENDS.contains(&model.asr_backend.as_str()) {
+            return Err("custom model backend is not supported".into());
+        }
+        if model.model_id.trim().is_empty()
+            || model.model_id.len() > 512
+            || model.model_id.chars().any(char::is_control)
+        {
+            return Err(
+                "custom model ID must be non-empty, at most 512 characters, and contain no control characters"
+                    .into(),
+            );
+        }
     }
     let new_shortcut = parse_shortcut(&settings.hotkey)?;
     let previous = storage.get_settings().map_err(command_error)?;
@@ -338,11 +437,29 @@ pub(crate) async fn update_settings(
             );
         }
     }
-    if settings.asr_backend != previous.asr_backend {
+    let model_configuration_changed = settings.asr_backend != previous.asr_backend
+        || settings.model_id != previous.model_id
+        || settings.api_base_url != previous.api_base_url
+        || settings.api_key_env_var != previous.api_key_env_var;
+    if model_configuration_changed {
         services
             .transcriber
-            .reconfigure(worker_command_for_backend(&settings.asr_backend))
+            .reconfigure(worker_command_for_settings(&settings))
             .await;
+    }
+    if model_configuration_changed || settings.model_quantization != previous.model_quantization {
+        let (model_id, detail) = model_identity(&settings);
+        let status = ModelStatus {
+            model_id,
+            installed: false,
+            state: "not_loaded".into(),
+            detail,
+        };
+        *services
+            .model
+            .lock()
+            .map_err(|_| "model service is unavailable".to_string())? = status.clone();
+        let _ = app.emit("model-status", status);
     }
     Ok(settings)
 }
@@ -423,32 +540,70 @@ pub(crate) fn get_model_status(services: State<'_, Services>) -> Result<ModelSta
 
 #[tauri::command]
 pub(crate) async fn load_model(
+    app: AppHandle,
     request: Option<LoadModelRequest>,
     services: State<'_, Services>,
     storage: State<'_, Storage>,
 ) -> Result<ModelStatus, String> {
-    let request = request.unwrap_or(LoadModelRequest {
-        model_id: None,
-        quantization: None,
-    });
-    let quantization = request.quantization.as_deref().unwrap_or("4bit");
     let settings = storage.get_settings().map_err(command_error)?;
+    if let Some(request) = request {
+        let requested_model = request
+            .model_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        let configured_model = settings
+            .model_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        if requested_model != configured_model
+            || request
+                .quantization
+                .as_deref()
+                .is_some_and(|value| value != settings.model_quantization)
+        {
+            return Err("model settings changed; save them before loading".into());
+        }
+    }
+    ensure_model_loaded(&app, &services, &settings).await
+}
+
+async fn ensure_model_loaded(
+    app: &AppHandle,
+    services: &Services,
+    settings: &Settings,
+) -> Result<ModelStatus, String> {
+    let (model_id, detail) = model_identity(settings);
+    if let Ok(status) = services.model.lock() {
+        if status.state == "ready" && status.model_id == model_id {
+            return Ok(status.clone());
+        }
+    }
+    emit_status(
+        app,
+        "model_loading",
+        "Preparing the speech model. The first use may download model files.",
+    );
     services
         .transcriber
-        .load(quantization)
+        .load(&settings.model_quantization)
         .await
         .map_err(command_error)?;
-    let (model_id, detail) = model_identity(&settings.asr_backend);
     let status = ModelStatus {
         model_id,
         installed: true,
         state: "ready".into(),
-        detail: format!("{detail} Loaded with {quantization} quantization."),
+        detail: format!(
+            "{detail} Loaded with {} quantization.",
+            settings.model_quantization
+        ),
     };
     *services
         .model
         .lock()
         .map_err(|_| "model service is unavailable".to_string())? = status.clone();
+    let _ = app.emit("model-status", status.clone());
     Ok(status)
 }
 

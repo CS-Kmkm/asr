@@ -5,14 +5,14 @@ export function SetupPage({
   settings,
   devices,
   onSettingsChange,
-  onPrepareModel,
+  onConfigureModel,
   onDiagnoseGpu,
   onFinish,
 }: {
   settings: Settings;
   devices: AudioDevice[];
   onSettingsChange: (settings: Settings) => void;
-  onPrepareModel: () => void;
+  onConfigureModel: () => void;
   onDiagnoseGpu: () => void;
   onFinish: () => void;
 }) {
@@ -56,11 +56,11 @@ export function SetupPage({
           }
         />
         <SettingRow
-          title="Local ASR model"
-          detail="The default faster-whisper model downloads on first load and runs on CPU or GPU. For long-form transcription, VibeVoice (optional GPU backend) can be selected in Settings."
+          title="ASR model"
+          detail="Choose a local backend or an OpenAI-compatible API on the Models page. The selected model is prepared automatically before first use."
           control={
-            <button className="secondary" onClick={onPrepareModel}>
-              Load ASR model
+            <button className="secondary" onClick={onConfigureModel}>
+              Configure model
             </button>
           }
         />

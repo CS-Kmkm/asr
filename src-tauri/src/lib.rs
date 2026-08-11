@@ -8,6 +8,7 @@ mod storage;
 mod types;
 
 use std::{
+    ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
     process::Command,
@@ -33,21 +34,39 @@ use types::{
     LoadModelRequest, ModelStatus, NewDictionaryEntry, NewHistoryItem, RecordingResult, Settings,
 };
 
-pub(crate) fn model_identity(asr_backend: &str) -> (Option<String>, String) {
-    match asr_backend {
+pub(crate) fn model_identity(settings: &Settings) -> (Option<String>, String) {
+    let custom_model = settings
+        .model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match settings.asr_backend.as_str() {
         "faster-whisper" => (
-            Some("faster-whisper:large-v3-turbo".into()),
-            "faster-whisper runs locally on CPU or GPU; the model downloads on first load.".into(),
+            Some(format!(
+                "faster-whisper:{}",
+                custom_model.unwrap_or("large-v3-turbo")
+            )),
+            "faster-whisper runs locally on CPU or GPU. Model names and compatible Hugging Face CTranslate2 repositories download on first load.".into(),
         ),
         "vibevoice" => (
-            Some("microsoft/VibeVoice-ASR-HF".into()),
+            Some(custom_model.unwrap_or("microsoft/VibeVoice-ASR-HF").into()),
             "VibeVoice requires a CUDA GPU; downloads from Hugging Face on first load.".into(),
+        ),
+        "openai-compatible" => (
+            Some(format!(
+                "openai-compatible:{}",
+                custom_model.unwrap_or("gpt-4o-mini-transcribe")
+            )),
+            format!(
+                "Uses an OpenAI-compatible Audio Transcriptions API at {}. The API key is read from the {} environment variable.",
+                settings.api_base_url, settings.api_key_env_var
+            ),
         ),
         "mock" => (
             Some("mock".into()),
             "Mock backend for development; no model is downloaded.".into(),
         ),
-        _ => (None, format!("Unknown ASR backend: {asr_backend}.")),
+        _ => (None, format!("Unknown ASR backend: {}.", settings.asr_backend)),
     }
 }
 
@@ -60,13 +79,13 @@ pub(crate) struct Services {
 }
 
 impl Services {
-    fn new(asr_backend: &str) -> Self {
-        let (model_id, detail) = model_identity(asr_backend);
+    fn new(settings: &Settings) -> Self {
+        let (model_id, detail) = model_identity(settings);
         Self {
             audio: Mutex::new(Some(Box::new(CpalAudioCapture::new()))),
             target: Mutex::new(None),
             transcriber: Arc::new(JsonlTranscriber::new(
-                worker_command_for_backend(asr_backend),
+                worker_command_for_settings(settings),
                 Duration::from_secs(300),
             )),
             model: Mutex::new(ModelStatus {
@@ -125,9 +144,77 @@ pub(crate) fn command_error(error: impl std::fmt::Display) -> String {
     format!("local operation failed: {error}")
 }
 
-pub(crate) fn worker_command_for_backend(asr_backend: &str) -> WorkerCommand {
-    let python = std::env::var_os("ASR_PYTHON").unwrap_or_else(|| "python".into());
-    WorkerCommand::python(python).with_backend(asr_backend)
+pub(crate) fn worker_command_for_settings(settings: &Settings) -> WorkerCommand {
+    let (python, project_root) = worker_runtime();
+    let mut command = WorkerCommand::python(python).with_backend(&settings.asr_backend);
+    if let Some(model_id) = settings
+        .model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        command.env.push(("ASR_MODEL_ID".into(), model_id.into()));
+    }
+    if settings.asr_backend == "openai-compatible" {
+        command.env.push((
+            "ASR_API_BASE_URL".into(),
+            settings.api_base_url.trim().into(),
+        ));
+        if let Ok(api_key) = std::env::var(settings.api_key_env_var.trim()) {
+            command.env.push(("ASR_API_KEY".into(), api_key));
+        }
+    }
+
+    // The desktop app is often launched from a shortcut, so Python does not
+    // necessarily inherit the repository directory as its working directory.
+    // Keep the source worker importable in development and in local builds.
+    if let Some(root) = project_root {
+        let root = root.to_string_lossy().into_owned();
+        let python_path = std::env::var_os("PYTHONPATH")
+            .map(|value| {
+                let separator = if cfg!(windows) { ";" } else { ":" };
+                format!("{root}{separator}{}", value.to_string_lossy())
+            })
+            .unwrap_or(root);
+        command.env.push(("PYTHONPATH".into(), python_path));
+    }
+    command
+}
+
+fn worker_runtime() -> (OsString, Option<PathBuf>) {
+    let roots = [
+        std::env::current_dir().ok(),
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf)),
+    ];
+    let mut project_root = None;
+    for root in roots.into_iter().flatten() {
+        for candidate in root.ancestors() {
+            if candidate.join("asr_worker").join("__main__.py").is_file() {
+                project_root = Some(candidate.to_path_buf());
+                break;
+            }
+        }
+        if project_root.is_some() {
+            break;
+        }
+    }
+
+    if let Some(python) = std::env::var_os("ASR_PYTHON") {
+        return (python, project_root);
+    }
+    if let Some(root) = project_root.as_ref() {
+        let venv_python = if cfg!(windows) {
+            root.join(".venv").join("Scripts").join("python.exe")
+        } else {
+            root.join(".venv").join("bin").join("python")
+        };
+        if venv_python.is_file() {
+            return (venv_python.into_os_string(), project_root);
+        }
+    }
+    ("python".into(), project_root)
 }
 
 pub(crate) fn emit_state(app: &AppHandle, state: &AppState, phase: AppPhase, message: &str) {
@@ -168,6 +255,50 @@ fn parse_shortcut(value: &str) -> Result<Shortcut, String> {
     Shortcut::from_str(value.trim()).map_err(|_| "hotkey is invalid".to_string())
 }
 
+#[cfg(test)]
+mod model_configuration_tests {
+    use super::*;
+
+    #[test]
+    fn custom_model_is_reflected_in_identity_and_worker_environment() {
+        let settings = Settings {
+            model_id: Some("openai/whisper-custom".into()),
+            ..Settings::default()
+        };
+
+        let (identity, _) = model_identity(&settings);
+        assert_eq!(
+            identity.as_deref(),
+            Some("faster-whisper:openai/whisper-custom")
+        );
+
+        let command = worker_command_for_settings(&settings);
+        assert!(command
+            .env
+            .iter()
+            .any(|(key, value)| key == "ASR_MODEL_ID" && value == "openai/whisper-custom"));
+    }
+
+    #[test]
+    fn default_model_does_not_override_worker_environment() {
+        let command = worker_command_for_settings(&Settings::default());
+        assert!(!command.env.iter().any(|(key, _)| key == "ASR_MODEL_ID"));
+    }
+
+    #[test]
+    fn api_backend_passes_endpoint_without_persisting_a_secret() {
+        let settings = Settings {
+            asr_backend: "openai-compatible".into(),
+            api_base_url: "http://127.0.0.1:8000/v1".into(),
+            ..Settings::default()
+        };
+        let command = worker_command_for_settings(&settings);
+        assert!(command.env.iter().any(|(key, value)| {
+            key == "ASR_API_BASE_URL" && value == "http://127.0.0.1:8000/v1"
+        }));
+    }
+}
+
 fn cleanup_stale_artifacts(directory: &Path) -> io::Result<usize> {
     let mut removed = 0;
     for entry in fs::read_dir(directory)? {
@@ -190,24 +321,26 @@ fn cleanup_stale_artifacts(directory: &Path) -> io::Result<usize> {
 }
 
 async fn toggle_recording(app: AppHandle) {
-    let phase = app.state::<AppState>().snapshot().phase;
-    let result = if phase == AppPhase::Recording {
-        commands::stop_recording(
+    let phase = app.state::<Services>().lifecycle.phase();
+    let result = match phase {
+        PipelinePhase::Recording => commands::stop_recording(
             app.clone(),
             app.state::<Services>(),
             app.state::<AppState>(),
             app.state::<Storage>(),
         )
         .await
-        .map(|_| ())
-    } else {
-        commands::start_recording(
-            app.clone(),
-            app.state::<Services>(),
-            app.state::<AppState>(),
-            app.state::<Storage>(),
-        )
-        .await
+        .map(|_| ()),
+        PipelinePhase::Idle => {
+            commands::start_recording(
+                app.clone(),
+                app.state::<Services>(),
+                app.state::<AppState>(),
+                app.state::<Storage>(),
+            )
+            .await
+        }
+        PipelinePhase::Starting | PipelinePhase::Processing => Ok(()),
     };
     if let Err(error) = result {
         emit_status(&app, "error", &error);
@@ -251,7 +384,7 @@ pub fn run() {
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
             app.manage(storage);
             app.manage(AppState::default());
-            app.manage(Services::new(&settings.asr_backend));
+            app.manage(Services::new(&settings));
             recording_overlay::create(app.handle())?;
             app.global_shortcut().register(shortcut)?;
             if cleanup_stale_artifacts(&std::env::temp_dir()).is_err() {

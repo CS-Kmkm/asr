@@ -1,28 +1,268 @@
-import type { GpuDiagnostics, ModelStatus } from "../types";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { SettingRow } from "../components/ui";
+import type {
+  AsrBackend,
+  CustomModel,
+  GpuDiagnostics,
+  ModelQuantization,
+  Settings,
+} from "../types";
+
+type ModelConfiguration = Pick<
+  Settings,
+  | "asrBackend"
+  | "modelId"
+  | "modelQuantization"
+  | "apiBaseUrl"
+  | "apiKeyEnvVar"
+>;
+const ADDITIONAL_MODEL_VALUE = "__additional_model__";
+
+function builtinValue(backend: AsrBackend) {
+  return `builtin:${backend}`;
+}
+
+function customModelValue(model: CustomModel) {
+  return `custom:${encodeURIComponent(model.asrBackend)}:${encodeURIComponent(model.modelId)}`;
+}
+
+const backendDetails: Record<AsrBackend, { description: string }> = {
+  "faster-whisper": {
+    description: "Fast local transcription on CPU or CUDA.",
+  },
+  vibevoice: {
+    description: "Long-form transcription on a CUDA GPU.",
+  },
+  "openai-compatible": {
+    description: "OpenAI Audio Transcriptions API or a compatible local server.",
+  },
+};
+
+const modelTypeOptions: Array<{ value: AsrBackend; label: string }> = [
+  { value: "faster-whisper", label: "Whisper model" },
+  { value: "vibevoice", label: "VibeVoice model" },
+  { value: "openai-compatible", label: "OpenAI-compatible API model" },
+];
+
+function modelTypeLabel(backend: AsrBackend) {
+  return modelTypeOptions.find((option) => option.value === backend)?.label ?? backend;
+}
 
 export function ModelsPage({
-  model,
   gpu,
-  onPrepareModel,
+  settings,
+  asrBackendOptions,
+  modelLoading,
+  onConfigureModel,
+  onSaveCustomModel,
   onDiagnoseGpu,
 }: {
-  model: ModelStatus | null;
   gpu: GpuDiagnostics | null;
-  onPrepareModel: () => void;
+  settings: Settings;
+  asrBackendOptions: Array<{ value: AsrBackend; label: string }>;
+  modelLoading: boolean;
+  onConfigureModel: (configuration: ModelConfiguration) => void;
+  onSaveCustomModel: (model: CustomModel) => Promise<boolean>;
   onDiagnoseGpu: () => void;
 }) {
+  const [backend, setBackend] = useState(settings.asrBackend);
+  const [additionalModelId, setAdditionalModelId] = useState(settings.modelId ?? "");
+  const [quantization, setQuantization] = useState<ModelQuantization>(
+    settings.modelQuantization,
+  );
+  const [apiBaseUrl, setApiBaseUrl] = useState(settings.apiBaseUrl);
+  const [apiKeyEnvVar, setApiKeyEnvVar] = useState(settings.apiKeyEnvVar);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [draftBackend, setDraftBackend] = useState<AsrBackend>(settings.asrBackend);
+  const [draftModelId, setDraftModelId] = useState("");
+  const [savingCustomModel, setSavingCustomModel] = useState(false);
+
+  useEffect(() => {
+    setBackend(settings.asrBackend);
+    setAdditionalModelId(settings.modelId ?? "");
+    setQuantization(settings.modelQuantization);
+    setApiBaseUrl(settings.apiBaseUrl);
+    setApiKeyEnvVar(settings.apiKeyEnvVar);
+  }, [
+    settings.apiBaseUrl,
+    settings.apiKeyEnvVar,
+    settings.asrBackend,
+    settings.modelId,
+    settings.modelQuantization,
+  ]);
+
+  useEffect(() => {
+    if (!modalOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !savingCustomModel) setModalOpen(false);
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [modalOpen, savingCustomModel]);
+
+  const customModels = useMemo(() => {
+    const saved = [...settings.customModels];
+    if (
+      settings.modelId &&
+      !saved.some(
+        (model) =>
+          model.asrBackend === settings.asrBackend && model.modelId === settings.modelId,
+      )
+    ) {
+      saved.push({ asrBackend: settings.asrBackend, modelId: settings.modelId });
+    }
+    return saved;
+  }, [settings.asrBackend, settings.customModels, settings.modelId]);
+
+  const selectedBackend = backendDetails[backend];
+  const selectedValue = additionalModelId
+    ? customModelValue({ asrBackend: backend, modelId: additionalModelId })
+    : builtinValue(backend);
+
+  function openAdditionalModelModal() {
+    setDraftBackend(backend);
+    setDraftModelId("");
+    setModalOpen(true);
+  }
+
+  async function saveAdditionalModel(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const modelId = draftModelId.trim();
+    if (!modelId || savingCustomModel) return;
+    setSavingCustomModel(true);
+    const saved = await onSaveCustomModel({ asrBackend: draftBackend, modelId });
+    setSavingCustomModel(false);
+    if (!saved) return;
+    setBackend(draftBackend);
+    setAdditionalModelId(modelId);
+    setModalOpen(false);
+  }
+
   return (
     <section className="grid">
       <article className="panel span-2">
-        <p className="eyebrow">ASR MODEL</p>
-        <h2>{model?.modelId ?? "No model selected"}</h2>
-        <p>{model?.detail}</p>
-        <span className="tag">{model?.state.replace("_", " ")}</span>
-        <br />
-        <button className="secondary" onClick={onPrepareModel}>
-          Load model
+        <p className="eyebrow">ASR BACKEND</p>
+        <h2>Select a backend and load it</h2>
+        <p className="lead">
+          Choose a local model or an OpenAI-compatible transcription endpoint. Local model files
+          are downloaded on first use and cached.
+        </p>
+        <div className="steps model-settings">
+          <SettingRow
+            title="ASR backend"
+            detail={selectedBackend.description}
+            control={
+              <select
+                value={selectedValue}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  if (value === ADDITIONAL_MODEL_VALUE) {
+                    openAdditionalModelModal();
+                    return;
+                  }
+                  const builtin = asrBackendOptions.find(
+                    (option) => builtinValue(option.value) === value,
+                  );
+                  if (builtin) {
+                    setBackend(builtin.value);
+                    setAdditionalModelId("");
+                    return;
+                  }
+                  const customModel = customModels.find(
+                    (model) => customModelValue(model) === value,
+                  );
+                  if (customModel) {
+                    setBackend(customModel.asrBackend);
+                    setAdditionalModelId(customModel.modelId);
+                  }
+                }}
+              >
+                <optgroup label="Built-in backends">
+                  {asrBackendOptions.map((option) => (
+                    <option key={option.value} value={builtinValue(option.value)}>
+                      {option.label}
+                    </option>
+                  ))}
+                </optgroup>
+                {customModels.length > 0 && (
+                  <optgroup label="Additional Models">
+                    {customModels.map((model) => (
+                      <option key={customModelValue(model)} value={customModelValue(model)}>
+                        {model.modelId} ({modelTypeLabel(model.asrBackend)})
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                <option value={ADDITIONAL_MODEL_VALUE}>+ Additional Model...</option>
+              </select>
+            }
+          />
+          {backend === "openai-compatible" ? (
+            <>
+              <SettingRow
+                title="API base URL"
+                detail="Use https://api.openai.com/v1 for OpenAI, or a local server such as http://127.0.0.1:8000/v1."
+                control={
+                  <input
+                    value={apiBaseUrl}
+                    onChange={(event) => setApiBaseUrl(event.target.value)}
+                    placeholder="https://api.openai.com/v1"
+                    maxLength={2048}
+                  />
+                }
+              />
+              <SettingRow
+                title="API key environment variable"
+                detail="The secret itself is not saved. OpenAI uses OPENAI_API_KEY; an unauthenticated local server needs no value set."
+                control={
+                  <input
+                    value={apiKeyEnvVar}
+                    onChange={(event) => setApiKeyEnvVar(event.target.value)}
+                    placeholder="OPENAI_API_KEY"
+                    maxLength={128}
+                  />
+                }
+              />
+            </>
+          ) : (
+            <SettingRow
+              title="Load format"
+              detail="The recommended setting minimizes memory usage. Use bf16 only with sufficient GPU memory."
+              control={
+                <select
+                  value={quantization}
+                  onChange={(event) =>
+                    setQuantization(event.target.value as ModelQuantization)
+                  }
+                >
+                  <option value="4bit">Memory saving (recommended)</option>
+                  <option value="8bit">8-bit</option>
+                  <option value="bf16">bf16 / float16</option>
+                </select>
+              }
+            />
+          )}
+        </div>
+        <button
+          className="primary"
+          onClick={() =>
+            onConfigureModel({
+              asrBackend: backend,
+              modelId: additionalModelId || null,
+              modelQuantization: quantization,
+              apiBaseUrl: apiBaseUrl.trim(),
+              apiKeyEnvVar: apiKeyEnvVar.trim(),
+            })
+          }
+          disabled={modelLoading}
+        >
+          {modelLoading ? "Loading..." : "Load Model"}
         </button>
+        <p className="model-note">
+          If recording starts before loading, Local Voice automatically prepares the selected backend.
+        </p>
       </article>
+
       <article className="panel span-2">
         <p className="eyebrow">GPU</p>
         <h2>{gpu?.adapterName ?? "Not checked"}</h2>
@@ -33,6 +273,68 @@ export function ModelsPage({
           Run diagnostics
         </button>
       </article>
+
+      {modalOpen && (
+        <div className="modal-backdrop" onMouseDown={() => !savingCustomModel && setModalOpen(false)}>
+          <div
+            className="modal-card"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="additional-model-title"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <form onSubmit={(event) => void saveAdditionalModel(event)}>
+              <p className="eyebrow">ADDITIONAL MODEL</p>
+              <h2 id="additional-model-title">Add an ASR model</h2>
+              <p>The model will be saved and available from the ASR backend list.</p>
+              <label className="modal-field">
+                <strong>Model type</strong>
+                <select
+                  value={draftBackend}
+                  onChange={(event) => setDraftBackend(event.target.value as AsrBackend)}
+                >
+                  {modelTypeOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="modal-field">
+                <strong>Model ID</strong>
+                <input
+                  value={draftModelId}
+                  placeholder={
+                    draftBackend === "openai-compatible"
+                      ? "API model ID (for example gpt-4o-mini-transcribe)"
+                      : "Model name or Hugging Face repository ID"
+                  }
+                  onChange={(event) => setDraftModelId(event.target.value)}
+                  maxLength={512}
+                  autoFocus
+                />
+              </label>
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => setModalOpen(false)}
+                  disabled={savingCustomModel}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="primary"
+                  disabled={savingCustomModel || !draftModelId.trim()}
+                >
+                  {savingCustomModel ? "Saving..." : "Add Model"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

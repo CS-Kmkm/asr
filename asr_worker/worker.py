@@ -65,8 +65,15 @@ class Worker:
                         "invalid_request",
                         "prompt must be a string, list of dictionary terms, or null",
                     ), False
+                language = request.get("language")
+                if language is not None and (not isinstance(language, str) or len(language) > 32):
+                    return error_response(
+                        request_id,
+                        "invalid_request",
+                        "language must be a short string or null",
+                    ), False
                 started = time.monotonic()
-                text, segments = self.backend.transcribe(audio_path, prompt)
+                text, segments = self.backend.transcribe(audio_path, prompt, language)
                 return {
                     "id": request_id,
                     "ok": True,
@@ -104,16 +111,37 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="VibeVoice JSON Lines worker")
     parser.add_argument(
         "--backend",
-        choices=("vibevoice", "faster-whisper", "mock"),
+        choices=("vibevoice", "faster-whisper", "openai-compatible", "mock"),
         default=os.environ.get("ASR_WORKER_BACKEND", "faster-whisper"),
     )
+    parser.add_argument("--serve", action="store_true", help="Serve an OpenAI-compatible HTTP API")
+    parser.add_argument("--host", default=os.environ.get("ASR_SERVE_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("ASR_SERVE_PORT", "8000")))
+    parser.add_argument("--quantization", default=os.environ.get("ASR_QUANTIZATION", "4bit"))
+    parser.add_argument("--served-model", default=os.environ.get("ASR_SERVED_MODEL_NAME"))
     args = parser.parse_args(argv)
     try:
         backend = create_backend(args.backend)
     except BackendError as exc:
         print(f"worker startup failed: {exc.code}", file=sys.stderr)
         return 2
-    serve(Worker(backend))
+    if args.serve:
+        try:
+            from .api import run_api_server
+
+            run_api_server(
+                backend,
+                host=args.host,
+                port=args.port,
+                quantization=args.quantization,
+                api_key=os.environ.get("ASR_SERVE_API_KEY"),
+                served_model=args.served_model,
+            )
+        except BackendError as exc:
+            print(f"API server startup failed: {exc.code}: {exc.message}", file=sys.stderr)
+            return 2
+    else:
+        serve(Worker(backend))
     return 0
 
 

@@ -1,7 +1,7 @@
 # Local Voice Input
 
 Privacy-first Windows voice input built with Tauri, Rust, React, and a persistent
-Python ASR worker (VibeVoice or faster-whisper).
+Python ASR worker (VibeVoice, faster-whisper, or an OpenAI-compatible API).
 
 ## Current workflow
 
@@ -67,7 +67,7 @@ for the rationale behind the default backend choice.
 
 ## Backends
 
-Two ASR backends are supported. The backend is selected via the `--backend`
+Three ASR backends are supported. The backend is selected via the `--backend`
 argument to the worker or the `ASR_WORKER_BACKEND` environment variable.
 
 ### faster-whisper (default, CPU-capable)
@@ -86,6 +86,59 @@ select in Settings (`ASR_WORKER_BACKEND=vibevoice`).
 
 The generation token limit for VibeVoice can be overridden via
 `ASR_MAX_NEW_TOKENS` (integer; overrides the length-based estimate when set).
+
+### OpenAI-compatible API
+
+This backend calls `POST /v1/audio/transcriptions`, so the same desktop workflow
+can use OpenAI or a compatible local server. In **Models**, select
+**OpenAI-compatible API**, then configure the base URL and model ID. API secrets
+are not stored in application settings: the worker reads the environment
+variable named in the UI (by default `OPENAI_API_KEY`). Restart the desktop app
+after setting the variable so it inherits the value.
+
+```powershell
+$env:OPENAI_API_KEY = "..."
+# Base URL: https://api.openai.com/v1
+# Model ID: gpt-4o-mini-transcribe (or another available transcription model)
+pnpm run tauri dev
+```
+
+For another compatible endpoint, set its `/v1` base URL. An unauthenticated
+local endpoint does not require the configured key environment variable to
+exist.
+
+## Serve a local model through the OpenAI API shape
+
+Install the serving extra and expose either local backend over HTTP:
+
+```powershell
+uv sync --extra serve
+$env:ASR_MODEL_ID = "large-v3-turbo"
+uv run --extra serve python -m asr_worker --backend faster-whisper --serve `
+  --host 127.0.0.1 --port 8000 --served-model local-asr
+```
+
+To serve VibeVoice instead, sync both extras with
+`uv sync --extra serve --extra vibevoice` and select `--backend vibevoice`.
+
+The server exposes `POST /v1/audio/transcriptions`, `GET /v1/models`, and
+`GET /health`. Supported response formats are `json`, `text`, `verbose_json`,
+`srt`, and `vtt`. Optional bearer authentication can be enabled with the
+`ASR_SERVE_API_KEY` environment variable.
+
+It can be called with the OpenAI Python client by changing only `base_url`:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="local")
+with open("sample.wav", "rb") as audio:
+    result = client.audio.transcriptions.create(model="local-asr", file=audio)
+print(result.text)
+```
+
+The local server currently provides non-streaming transcription and does not
+provide diarization or token log probabilities.
 
 ## Checks
 
@@ -119,7 +172,8 @@ Full usage and Phase 0 gate criteria are documented in
 
 ## Privacy and limitations
 
-- Cloud processing is off and no cloud provider is implemented.
+- Local processing remains the default. Cloud/API processing is used only when
+  the OpenAI-compatible backend is explicitly selected.
 - History can be disabled; when disabled, transcript rows are not written.
 - Temporary WAV deletion defaults to enabled.
 - The captured target must still be foreground and non-secure at insertion time.

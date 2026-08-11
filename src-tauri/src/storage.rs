@@ -344,6 +344,10 @@ mod tests {
         let mut settings = Settings::default();
         settings.hotkey = "Ctrl+Alt+V".into();
         settings.history_retention_days = 7;
+        settings.custom_models.push(crate::types::CustomModel {
+            asr_backend: "faster-whisper".into(),
+            model_id: "community/whisper-custom".into(),
+        });
         storage.update_settings(&settings).unwrap();
         assert_eq!(storage.get_settings().unwrap(), settings);
     }

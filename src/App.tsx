@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
@@ -24,6 +24,7 @@ import type {
   AsrBackend,
   AudioDevice,
   AudioLevel,
+  CustomModel,
   DictionaryEntry,
   DictionaryEntryInput,
   GpuDiagnostics,
@@ -41,9 +42,9 @@ import { PrivacyPage } from "./pages/PrivacyPage";
 import { DiagnosticsPage } from "./pages/DiagnosticsPage";
 
 const asrBackendOptions: Array<{ value: AsrBackend; label: string }> = [
-  { value: "faster-whisper", label: "faster-whisper(推奨・低遅延/CPU可)" },
-  { value: "vibevoice", label: "VibeVoice(GPU・長文向け)" },
-  { value: "mock", label: "mock(開発用)" },
+  { value: "faster-whisper", label: "faster-whisper (recommended / CPU supported)" },
+  { value: "vibevoice", label: "VibeVoice (CUDA GPU required)" },
+  { value: "openai-compatible", label: "OpenAI-compatible API" },
 ];
 
 type Page =
@@ -59,8 +60,8 @@ type Page =
 const pages: Array<{ id: Page; label: string }> = [
   { id: "dashboard", label: "Status" },
   { id: "setup", label: "Setup" },
+  { id: "models", label: "Models" },
   { id: "settings", label: "Settings" },
-  { id: "models", label: "Model & GPU" },
   { id: "history", label: "History" },
   { id: "dictionary", label: "Dictionary" },
   { id: "privacy", label: "Privacy" },
@@ -104,6 +105,9 @@ function MainApp() {
   const [settings, setSettings] = useState<Settings>(defaultSettings);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [model, setModel] = useState<ModelStatus | null>(null);
+  const [modelLoading, setModelLoading] = useState(false);
+  const [recordingAction, setRecordingAction] = useState(false);
+  const recordingActionRef = useRef(false);
   const [gpu, setGpu] = useState<GpuDiagnostics | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [devices, setDevices] = useState<AudioDevice[]>([]);
@@ -132,6 +136,7 @@ function MainApp() {
     const listeners = Promise.all([
       listen<AppState>("app-state", (event) => setState(event.payload)),
       listen<AudioLevel>("audio-level", (event) => setLevel(event.payload)),
+      listen<ModelStatus>("model-status", (event) => setModel(event.payload)),
       listen<{ message: string }>("status", (event) => setNotice(event.payload.message)),
     ]);
     return () => {
@@ -166,6 +171,9 @@ function MainApp() {
   }
 
   async function toggleRecording() {
+    if (recordingActionRef.current) return;
+    recordingActionRef.current = true;
+    setRecordingAction(true);
     try {
       if (state.phase === "recording") {
         await stopRecording();
@@ -175,16 +183,66 @@ function MainApp() {
       }
     } catch (error) {
       setNotice(String(error));
+      try {
+        setState(await getAppState());
+      } catch {
+        // The status event normally keeps this synchronized. If refreshing
+        // fails, preserve the latest event-driven state.
+      }
+    } finally {
+      recordingActionRef.current = false;
+      setRecordingAction(false);
     }
   }
 
-  async function prepareModel() {
-    setNotice("Loading model. The first run may download several files.");
+  async function prepareModel(
+    configuration?: Pick<
+      Settings,
+      | "asrBackend"
+      | "modelId"
+      | "modelQuantization"
+      | "apiBaseUrl"
+      | "apiKeyEnvVar"
+    >,
+  ) {
+    if (modelLoading) return;
+    setModelLoading(true);
+    setNotice("Saving ASR settings and preparing the selected model...");
     try {
-      setModel(await loadModel());
+      const next = configuration ? { ...settings, ...configuration } : settings;
+      const saved = configuration ? await updateSettings(next) : next;
+      setSettings(saved);
+      setModel(await loadModel(saved.modelId, saved.modelQuantization));
       setNotice("Model loaded and ready.");
     } catch (error) {
       setNotice(String(error));
+    } finally {
+      setModelLoading(false);
+    }
+  }
+
+  async function saveCustomModel(customModel: CustomModel): Promise<boolean> {
+    const customModels = [
+      ...settings.customModels.filter(
+        (saved) =>
+          saved.asrBackend !== customModel.asrBackend || saved.modelId !== customModel.modelId,
+      ),
+      customModel,
+    ];
+    const next = {
+      ...settings,
+      asrBackend: customModel.asrBackend,
+      modelId: customModel.modelId,
+      customModels,
+    };
+    try {
+      const saved = await updateSettings(next);
+      setSettings(saved);
+      setNotice("Custom model saved locally.");
+      return true;
+    } catch (error) {
+      setNotice(String(error));
+      return false;
     }
   }
 
@@ -248,12 +306,6 @@ function MainApp() {
           </div>
         </header>
 
-        {notice && (
-          <button className="notice" onClick={() => setNotice(null)}>
-            {notice}
-          </button>
-        )}
-
         {page === "dashboard" && (
           <DashboardPage
             state={state}
@@ -262,6 +314,7 @@ function MainApp() {
             model={model}
             level={level}
             statusLabel={statusLabel}
+            recordingAction={recordingAction}
             onToggleRecording={() => void toggleRecording()}
             onCancelRecording={() => void cancelRecording()}
           />
@@ -272,7 +325,7 @@ function MainApp() {
             settings={settings}
             devices={devices}
             onSettingsChange={setSettings}
-            onPrepareModel={() => void prepareModel()}
+            onConfigureModel={() => setPage("models")}
             onDiagnoseGpu={() => void diagnoseGpu()}
             onFinish={() => {
               void saveSettings({ setupComplete: true });
@@ -284,16 +337,18 @@ function MainApp() {
         {page === "settings" && (
           <SettingsPage
             settings={settings}
-            asrBackendOptions={asrBackendOptions}
             onSave={(patch) => void saveSettings(patch)}
           />
         )}
 
         {page === "models" && (
           <ModelsPage
-            model={model}
             gpu={gpu}
-            onPrepareModel={() => void prepareModel()}
+            settings={settings}
+            asrBackendOptions={asrBackendOptions}
+            modelLoading={modelLoading}
+            onConfigureModel={(configuration) => void prepareModel(configuration)}
+            onSaveCustomModel={saveCustomModel}
             onDiagnoseGpu={() => void diagnoseGpu()}
           />
         )}
@@ -328,6 +383,18 @@ function MainApp() {
           />
         )}
       </main>
+
+      {notice && (
+        <button
+          className={`notice${modelLoading ? " loading" : ""}`}
+          onClick={() => setNotice(null)}
+          aria-live="polite"
+          aria-label="Dismiss notification"
+        >
+          {modelLoading && <span className="progress-ring" aria-hidden="true" />}
+          {notice}
+        </button>
+      )}
     </div>
   );
 }

@@ -1,13 +1,11 @@
 import { SettingRow, Toggle } from "../components/ui";
-import type { AsrBackend, Settings } from "../types";
+import type { Settings } from "../types";
 
 export function SettingsPage({
   settings,
-  asrBackendOptions,
   onSave,
 }: {
   settings: Settings;
-  asrBackendOptions: Array<{ value: AsrBackend; label: string }>;
   onSave: (patch: Partial<Settings>) => void;
 }) {
   return (
@@ -21,22 +19,6 @@ export function SettingsPage({
             value={settings.hotkey}
             onChange={(e) => onSave({ hotkey: e.target.value })}
           />
-        }
-      />
-      <SettingRow
-        title="ASR backend"
-        detail="Changing this restarts the local ASR worker; reload the model afterward."
-        control={
-          <select
-            value={settings.asrBackend}
-            onChange={(e) => onSave({ asrBackend: e.target.value as AsrBackend })}
-          >
-            {asrBackendOptions.map((option) => (
-              <option key={option.value} value={option.value}>
-                {option.label}
-              </option>
-            ))}
-          </select>
         }
       />
       <SettingRow

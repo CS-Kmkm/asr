@@ -41,10 +41,20 @@ export interface Settings {
   autoStart: boolean;
   clipboardRestore: boolean;
   modelId: string | null;
+  modelQuantization: ModelQuantization;
   asrBackend: AsrBackend;
+  apiBaseUrl: string;
+  apiKeyEnvVar: string;
+  customModels: CustomModel[];
 }
 
-export type AsrBackend = "vibevoice" | "faster-whisper" | "mock";
+export type AsrBackend = "vibevoice" | "faster-whisper" | "openai-compatible";
+export type ModelQuantization = "4bit" | "8bit" | "bf16";
+
+export interface CustomModel {
+  asrBackend: AsrBackend;
+  modelId: string;
+}
 
 export interface HistoryItem {
   id: number;

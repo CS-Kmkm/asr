@@ -10,6 +10,7 @@ export function DashboardPage({
   model,
   level,
   statusLabel,
+  recordingAction,
   onToggleRecording,
   onCancelRecording,
 }: {
@@ -19,6 +20,7 @@ export function DashboardPage({
   model: ModelStatus | null;
   level: AudioLevel;
   statusLabel: string;
+  recordingAction: boolean;
   onToggleRecording: () => void;
   onCancelRecording: () => void;
 }) {
@@ -29,8 +31,20 @@ export function DashboardPage({
           <p className="eyebrow">RECORDING STATUS</p>
           <h2>{state.phase === "idle" ? "Ready when you are" : statusLabel}</h2>
           <p>{state.message ?? `Use ${settings.hotkey} to start or stop dictation.`}</p>
-          <button className="primary" onClick={onToggleRecording}>
-            {state.phase === "recording" ? "Stop and transcribe" : "Start recording"}
+          <button
+            className="primary"
+            onClick={onToggleRecording}
+            disabled={
+              recordingAction || state.phase === "processing" || state.phase === "injecting"
+            }
+          >
+            {state.phase === "recording"
+              ? "Stop and transcribe"
+              : state.phase === "processing"
+                ? "Transcribing..."
+                : state.phase === "injecting"
+                  ? "Inserting..."
+                  : "Start recording"}
           </button>
           {state.phase === "recording" && (
             <button className="secondary" onClick={onCancelRecording}>

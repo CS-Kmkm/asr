@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -58,6 +59,12 @@ pub struct WorkerError {
     pub message: String,
 }
 
+impl fmt::Display for WorkerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AsrError {
     #[error("worker I/O failed: {0}")]
@@ -70,7 +77,7 @@ pub enum AsrError {
     Crashed,
     #[error("worker request cancelled")]
     Cancelled,
-    #[error("worker error {0:?}")]
+    #[error("worker error: {0}")]
     Worker(WorkerError),
 }
 

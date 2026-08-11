@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from asr_worker.backends import MockBackend, map_backend_exception
+from asr_worker.backends import MockBackend, map_backend_exception, vibevoice_dependency_error
 from asr_worker.worker import Worker, serve
 
 
@@ -40,6 +40,14 @@ class WorkerTests(unittest.TestCase):
     def test_oom_mapping(self) -> None:
         error = map_backend_exception(RuntimeError("CUDA out of memory"), "load")
         self.assertEqual(error.code, "gpu_oom")
+
+    def test_missing_vibevoice_dependency_has_install_instructions(self) -> None:
+        error = vibevoice_dependency_error(
+            ModuleNotFoundError("No module named 'transformers'", name="transformers")
+        )
+        self.assertEqual(error.code, "backend_unavailable")
+        self.assertIn("transformers", error.message)
+        self.assertIn("uv sync --extra vibevoice", error.message)
 
     def test_mock_transcription(self) -> None:
         worker = Worker(MockBackend())
@@ -78,6 +86,20 @@ class WorkerTests(unittest.TestCase):
                     "command": "transcribe",
                     "audio_path": audio.name,
                     "prompt": ["valid", 3],
+                }
+            )
+        self.assertEqual(response["error"]["code"], "invalid_request")
+
+    def test_language_validation(self) -> None:
+        worker = Worker(MockBackend())
+        worker.handle({"id": 1, "command": "load"})
+        with tempfile.NamedTemporaryFile(suffix=".wav") as audio:
+            response, _ = worker.handle(
+                {
+                    "id": 2,
+                    "command": "transcribe",
+                    "audio_path": audio.name,
+                    "language": ["en"],
                 }
             )
         self.assertEqual(response["error"]["code"], "invalid_request")

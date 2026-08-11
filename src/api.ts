@@ -23,7 +23,11 @@ export const defaultSettings: Settings = {
   autoStart: false,
   clipboardRestore: true,
   modelId: null,
+  modelQuantization: "4bit",
   asrBackend: "faster-whisper",
+  apiBaseUrl: "https://api.openai.com/v1",
+  apiKeyEnvVar: "OPENAI_API_KEY",
+  customModels: [],
 };
 
 export async function getAppState(): Promise<AppState> {
@@ -85,10 +89,13 @@ export async function getModelStatus(): Promise<ModelStatus> {
   return invoke("get_model_status");
 }
 
-export async function loadModel(quantization = "4bit"): Promise<ModelStatus> {
+export async function loadModel(
+  modelId: string | null,
+  quantization: Settings["modelQuantization"],
+): Promise<ModelStatus> {
   if (!inTauri) return getModelStatus();
   return invoke("load_model", {
-    request: { quantization },
+    request: { modelId, quantization },
   });
 }
 

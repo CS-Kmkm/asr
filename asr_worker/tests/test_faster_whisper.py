@@ -35,6 +35,14 @@ class CreateBackendTests(unittest.TestCase):
             backend = FasterWhisperBackend()
         self.assertEqual(backend.model_name, "faster-whisper:tiny")
 
+    def test_generic_model_id_env_takes_precedence(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"ASR_MODEL_ID": "custom/whisper", "ASR_FASTER_WHISPER_MODEL": "tiny"},
+        ):
+            backend = FasterWhisperBackend()
+        self.assertEqual(backend.model_name, "faster-whisper:custom/whisper")
+
 
 class LoadUnavailableTests(unittest.TestCase):
     def test_load_without_faster_whisper_reports_backend_unavailable(self) -> None:
