@@ -62,6 +62,18 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(response["segments"][0]["text"], "hello test")
         self.assertIsInstance(response["duration_ms"], int)
 
+    def test_shutdown_unloads_backend_and_stops_worker(self) -> None:
+        backend = MockBackend()
+        worker = Worker(backend)
+        worker.handle({"id": 1, "command": "load"})
+
+        response, stop = worker.handle({"id": 2, "command": "shutdown"})
+
+        self.assertTrue(response["ok"])
+        self.assertTrue(stop)
+        self.assertFalse(worker.loaded)
+        self.assertFalse(backend.loaded)
+
     def test_prompt_accepts_dictionary_term_list(self) -> None:
         worker = Worker(MockBackend())
         worker.handle({"id": 1, "command": "load"})

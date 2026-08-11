@@ -13,6 +13,7 @@ use tokio::sync::{watch, Mutex};
 use tokio::time::timeout;
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerCommand {
@@ -319,13 +320,16 @@ impl Transcriber for JsonlTranscriber {
             "id": self.next_id.fetch_add(1, Ordering::Relaxed),
             "command": "shutdown",
         });
-        let exchange = self.exchange(&mut worker, &request).await;
-        let wait = timeout(self.request_timeout, worker.child.wait()).await;
-        if wait.is_err() {
+        let exchange = timeout(SHUTDOWN_TIMEOUT, self.exchange(&mut worker, &request)).await;
+        let wait = timeout(SHUTDOWN_TIMEOUT, worker.child.wait()).await;
+        if exchange.is_err() || wait.is_err() {
             let _ = worker.child.kill().await;
             let _ = worker.child.wait().await;
         }
-        exchange.map(|_| ())
+        match exchange {
+            Ok(result) => result.map(|_| ()),
+            Err(_) => Err(AsrError::Timeout),
+        }
     }
 
     async fn reconfigure(&self, command: WorkerCommand) {

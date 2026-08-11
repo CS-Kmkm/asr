@@ -32,6 +32,9 @@ class Worker:
                 quantization = request.get("quantization", "4bit")
                 if not isinstance(quantization, str):
                     return error_response(request_id, "invalid_request", "quantization must be a string"), False
+                if self.loaded:
+                    self.backend.unload()
+                    self.loaded = False
                 self.backend.load(quantization)
                 self.loaded = True
                 return {
@@ -84,13 +87,15 @@ class Worker:
                 }, False
 
             if operation == "shutdown":
+                self.backend.unload()
+                self.loaded = False
                 return {"id": request_id, "ok": True}, True
             return error_response(request_id, "unsupported_operation", "Supported operations: load, transcribe, shutdown"), False
         except BackendError as exc:
-            return error_response(request_id, exc.code, exc.message), False
+            return error_response(request_id, exc.code, exc.message), operation == "shutdown"
         except BaseException as exc:
             print(f"worker operation failed: {type(exc).__name__}", file=sys.stderr, flush=True)
-            return error_response(request_id, "internal_error", "Unexpected worker error"), False
+            return error_response(request_id, "internal_error", "Unexpected worker error"), operation == "shutdown"
 
 
 def serve(worker: Worker, input_stream: TextIO = sys.stdin, output_stream: TextIO = sys.stdout) -> None:

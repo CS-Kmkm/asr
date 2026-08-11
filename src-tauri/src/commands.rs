@@ -569,7 +569,7 @@ pub(crate) async fn load_model(
     ensure_model_loaded(&app, &services, &settings).await
 }
 
-async fn ensure_model_loaded(
+pub(crate) async fn ensure_model_loaded(
     app: &AppHandle,
     services: &Services,
     settings: &Settings,
@@ -585,11 +585,36 @@ async fn ensure_model_loaded(
         "model_loading",
         "Preparing the speech model. The first use may download model files.",
     );
-    services
+    let loading = ModelStatus {
+        model_id: model_id.clone(),
+        installed: false,
+        state: "loading".into(),
+        detail: detail.clone(),
+    };
+    *services
+        .model
+        .lock()
+        .map_err(|_| "model service is unavailable".to_string())? = loading.clone();
+    let _ = app.emit("model-status", loading);
+
+    if let Err(error) = services
         .transcriber
         .load(&settings.model_quantization)
         .await
-        .map_err(command_error)?;
+    {
+        let message = command_error(&error);
+        let failed = ModelStatus {
+            model_id,
+            installed: false,
+            state: "error".into(),
+            detail: format!("{detail} {message}"),
+        };
+        if let Ok(mut status) = services.model.lock() {
+            *status = failed.clone();
+        }
+        let _ = app.emit("model-status", failed);
+        return Err(message);
+    }
     let status = ModelStatus {
         model_id,
         installed: true,

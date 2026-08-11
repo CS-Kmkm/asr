@@ -13,7 +13,10 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -25,7 +28,7 @@ use storage::Storage;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Emitter, Manager, State,
+    AppHandle, Emitter, Manager, RunEvent, State,
 };
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
@@ -76,6 +79,8 @@ pub(crate) struct Services {
     transcriber: Arc<dyn Transcriber>,
     model: Mutex<ModelStatus>,
     lifecycle: PipelineLifecycle,
+    initialization: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+    shutdown_started: AtomicBool,
 }
 
 impl Services {
@@ -95,7 +100,31 @@ impl Services {
                 detail,
             }),
             lifecycle: PipelineLifecycle::default(),
+            initialization: Mutex::new(None),
+            shutdown_started: AtomicBool::new(false),
         }
+    }
+
+    fn begin_shutdown(&self) -> bool {
+        self.shutdown_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    async fn shutdown(&self) {
+        let _ = self.lifecycle.cancel();
+        if let Ok(mut initialization) = self.initialization.lock() {
+            if let Some(task) = initialization.take() {
+                task.abort();
+            }
+        }
+        if let Ok(mut audio) = self.audio.lock() {
+            audio.take();
+        }
+        if let Ok(mut target) = self.target.lock() {
+            target.take();
+        }
+        let _ = self.transcriber.shutdown().await;
     }
 }
 
@@ -347,6 +376,30 @@ async fn toggle_recording(app: AppHandle) {
     }
 }
 
+async fn initialize_model_runtime(app: AppHandle, settings: Settings) {
+    let diagnostics = tauri::async_runtime::spawn_blocking(commands::run_gpu_diagnostics)
+        .await
+        .unwrap_or_else(|_| GpuDiagnostics {
+            status: "unavailable".into(),
+            adapter_name: None,
+            driver_version: None,
+            memory_total_mb: None,
+            recommendation: "GPU diagnostics could not be completed.".into(),
+        });
+    let diagnostic_kind = if diagnostics.status == "available" {
+        "gpu_available"
+    } else {
+        "gpu_unavailable"
+    };
+    emit_status(&app, diagnostic_kind, &diagnostics.recommendation);
+    let _ = app.emit("gpu-diagnostics", diagnostics);
+
+    let services = app.state::<Services>();
+    if let Err(error) = commands::ensure_model_loaded(&app, &services, &settings).await {
+        emit_status(&app, "model_load_failed", &error);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -413,6 +466,12 @@ pub fn run() {
                     _ => {}
                 })
                 .build(app)?;
+            let app_handle = app.handle().clone();
+            let initialization =
+                tauri::async_runtime::spawn(initialize_model_runtime(app_handle, settings));
+            if let Ok(mut task) = app.state::<Services>().initialization.lock() {
+                *task = Some(initialization);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -432,6 +491,19 @@ pub fn run() {
             commands::copy_history_item,
             commands::update_settings
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Local Voice Input");
+        .build(tauri::generate_context!())
+        .expect("error while building Local Voice Input")
+        .run(|app, event| {
+            if let RunEvent::ExitRequested { api, code, .. } = event {
+                let services = app.state::<Services>();
+                if services.begin_shutdown() {
+                    api.prevent_exit();
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        app.state::<Services>().shutdown().await;
+                        app.exit(code.unwrap_or(0));
+                    });
+                }
+            }
+        });
 }

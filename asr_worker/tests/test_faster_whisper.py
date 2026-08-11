@@ -187,6 +187,16 @@ class TranscribeWithFakeModuleTests(unittest.TestCase):
             backend.transcribe(Path("audio.wav"), None)
         self.assertIsNone(_FakeWhisperModel.last_transcribe_kwargs["hotwords"])
 
+    def test_unload_releases_model_reference(self) -> None:
+        backend = FasterWhisperBackend()
+        with patch.dict(sys.modules, _install_fake_faster_whisper()):
+            backend.load("4bit")
+        self.assertIsNotNone(backend.model)
+
+        backend.unload()
+
+        self.assertIsNone(backend.model)
+
 
 if __name__ == "__main__":
     unittest.main()

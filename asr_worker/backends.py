@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import mimetypes
 import os
 import wave
@@ -24,6 +25,8 @@ class Backend(Protocol):
     model_name: str
 
     def load(self, quantization: str) -> None: ...
+
+    def unload(self) -> None: ...
 
     def transcribe(
         self,
@@ -112,6 +115,9 @@ class MockBackend:
         text = os.environ.get("ASR_WORKER_MOCK_TEXT", "mock transcription")
         return text, [{"start": 0.0, "end": 0.0, "speaker": 0, "text": text}]
 
+    def unload(self) -> None:
+        self.loaded = False
+
 
 class VibeVoiceBackend:
     def __init__(self) -> None:
@@ -160,6 +166,22 @@ class VibeVoiceBackend:
             raise
         except BaseException as exc:
             raise map_backend_exception(exc, "load") from exc
+
+    def unload(self) -> None:
+        self.model = None
+        self.processor = None
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                # Releases CUDA inter-process cache allocations when supported.
+                if hasattr(torch.cuda, "ipc_collect"):
+                    torch.cuda.ipc_collect()
+        except (ImportError, RuntimeError):
+            # Cleanup is best-effort and must not prevent worker shutdown.
+            pass
 
     def transcribe(
         self,
@@ -224,6 +246,10 @@ class FasterWhisperBackend:
             raise
         except BaseException as exc:
             raise map_backend_exception(exc, "load", "faster-whisper") from exc
+
+    def unload(self) -> None:
+        self.model = None
+        gc.collect()
 
     def transcribe(
         self,
@@ -372,6 +398,12 @@ class OpenAICompatibleBackend:
                 "api_request_failed",
                 f"Transcription API request failed: {type(exc).__name__}",
             ) from exc
+
+    def unload(self) -> None:
+        if self.client is not None:
+            self.client.close()
+            self.client = None
+        gc.collect()
 
 
 def create_backend(name: str) -> Backend:
