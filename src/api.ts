@@ -27,6 +27,18 @@ export const defaultSettings: Settings = {
   asrBackend: "faster-whisper",
   apiBaseUrl: "https://api.openai.com/v1",
   apiKeyEnvVar: "OPENAI_API_KEY",
+  textCorrectionEnabled: false,
+  correctionProvider: "openai",
+  openaiCorrectionModel: "gpt-5.6-luna",
+  openaiApiKeyEnvVar: "OPENAI_API_KEY",
+  geminiCorrectionModel: "gemini-flash-lite-latest",
+  geminiApiKeyEnvVar: "GEMINI_API_KEY",
+  correctionInstruction: "",
+  correctionRemoveFillers: true,
+  correctionRemoveRepetitions: true,
+  correctionResolveSelfCorrections: true,
+  correctionAutoFormat: true,
+  correctionImproveClarity: true,
   customModels: [],
 };
 

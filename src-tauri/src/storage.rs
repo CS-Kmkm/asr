@@ -276,6 +276,36 @@ impl Storage {
         Ok(terms)
     }
 
+    pub fn dictionary_correction_hints(
+        &self,
+        transcript: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        let transcript = transcript.to_lowercase();
+        Ok(self
+            .list_dictionary()?
+            .into_iter()
+            .filter_map(|entry| {
+                let surface = entry.surface.trim();
+                let surface_folded = surface.to_lowercase();
+                let mut matched = Vec::new();
+                for variant in std::iter::once(entry.reading.as_str())
+                    .chain(entry.aliases.iter().map(String::as_str))
+                {
+                    let variant = variant.trim();
+                    if variant.is_empty() || variant.to_lowercase() == surface_folded {
+                        continue;
+                    }
+                    if transcript.contains(&variant.to_lowercase())
+                        && !matched.iter().any(|current| current == variant)
+                    {
+                        matched.push(variant.to_owned());
+                    }
+                }
+                (!matched.is_empty()).then(|| format!("{surface}<={}", matched.join("|")))
+            })
+            .collect())
+    }
+
     pub fn add_metric(
         &self,
         event_type: &str,
@@ -350,6 +380,27 @@ mod tests {
         });
         storage.update_settings(&settings).unwrap();
         assert_eq!(storage.get_settings().unwrap(), settings);
+    }
+
+    #[test]
+    fn legacy_settings_receive_automatic_editing_defaults() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for field in [
+            "correctionRemoveFillers",
+            "correctionRemoveRepetitions",
+            "correctionResolveSelfCorrections",
+            "correctionAutoFormat",
+            "correctionImproveClarity",
+        ] {
+            object.remove(field);
+        }
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert!(settings.correction_remove_fillers);
+        assert!(settings.correction_remove_repetitions);
+        assert!(settings.correction_resolve_self_corrections);
+        assert!(settings.correction_auto_format);
+        assert!(settings.correction_improve_clarity);
     }
 
     #[test]
@@ -458,6 +509,25 @@ mod tests {
         let terms = storage.dictionary_prompt_terms().unwrap();
         assert!(terms.contains(&"OpenAI".to_string()));
         assert!(terms.contains(&"ChatGPT".to_string()));
+    }
+
+    #[test]
+    fn dictionary_correction_hints_map_aliases_to_preferred_surface() {
+        let storage = Storage::in_memory().unwrap();
+        let aliases = vec!["Chat GPT".into()];
+        storage
+            .add_dictionary_entry(&dictionary_entry(&aliases))
+            .unwrap();
+        assert_eq!(
+            storage
+                .dictionary_correction_hints("Chat GPTを使います")
+                .unwrap(),
+            vec!["OpenAI<=Chat GPT"]
+        );
+        assert!(storage
+            .dictionary_correction_hints("関係のない文章")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -1,6 +1,18 @@
 import { Empty, Toggle } from "../components/ui";
 import type { HistoryItem, Settings } from "../types";
 
+function historyDetail(item: HistoryItem) {
+  const timestamp = new Date(item.createdAt).toLocaleString();
+  if (item.processedText) {
+    const provider = item.llmProvider === "gemini" ? "Gemini" : "OpenAI";
+    return `${timestamp} · AI edited with ${provider} · Copy`;
+  }
+  if (item.mode === "faithful_fallback") {
+    return `${timestamp} · Original used after AI fallback · Copy`;
+  }
+  return `${timestamp} · Original transcript · Copy`;
+}
+
 export function HistoryPage({
   settings,
   history,
@@ -39,9 +51,7 @@ export function HistoryPage({
           {history.map((item) => (
             <button key={item.id} onClick={() => onCopyItem(item.id)}>
               <span>{item.processedText ?? item.transcriptText}</span>
-              <small>
-                {new Date(item.createdAt).toLocaleString()} · Copy
-              </small>
+              <small>{historyDetail(item)}</small>
             </button>
           ))}
         </div>

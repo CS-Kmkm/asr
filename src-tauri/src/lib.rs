@@ -1,6 +1,8 @@
 mod asr;
 mod audio;
 mod commands;
+mod correction;
+mod correction_prompt;
 mod injection;
 mod recording_overlay;
 mod state;

@@ -45,11 +45,24 @@ export interface Settings {
   asrBackend: AsrBackend;
   apiBaseUrl: string;
   apiKeyEnvVar: string;
+  textCorrectionEnabled: boolean;
+  correctionProvider: CorrectionProvider;
+  openaiCorrectionModel: string;
+  openaiApiKeyEnvVar: string;
+  geminiCorrectionModel: string;
+  geminiApiKeyEnvVar: string;
+  correctionInstruction: string;
+  correctionRemoveFillers: boolean;
+  correctionRemoveRepetitions: boolean;
+  correctionResolveSelfCorrections: boolean;
+  correctionAutoFormat: boolean;
+  correctionImproveClarity: boolean;
   customModels: CustomModel[];
 }
 
 export type AsrBackend = "vibevoice" | "faster-whisper" | "openai-compatible";
 export type ModelQuantization = "4bit" | "8bit" | "bf16";
+export type CorrectionProvider = "openai" | "gemini";
 
 export interface CustomModel {
   asrBackend: AsrBackend;

@@ -7,7 +7,7 @@
 
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 960px; min-height: 100vh; background: radial-gradient(circle at 75% 10%, #12352c 0, transparent 30%), #07110f; }
-button, input, select { font: inherit; }
+button, input, select, textarea { font: inherit; }
 button { color: inherit; }
 
 .recording-overlay-body {
@@ -116,7 +116,8 @@ button:disabled { cursor: wait; opacity: .7; }
 .setting-row { display: flex; justify-content: space-between; align-items: center; gap: 30px; padding: 19px 0; border-bottom: 1px solid #1a342c; }
 .setting-row strong { font-size: 15px; }
 .setting-row p { margin: 5px 0 0; font-size: 13px; max-width: 580px; }
-input, select { color: #eaf3ef; border: 1px solid #315348; background: #091713; border-radius: 8px; padding: 9px 11px; min-width: 210px; }
+input, select, textarea { color: #eaf3ef; border: 1px solid #315348; background: #091713; border-radius: 8px; padding: 9px 11px; min-width: 210px; }
+textarea { width: min(420px, 42vw); resize: vertical; line-height: 1.45; }
 .primary, .secondary { border-radius: 9px; padding: 10px 15px; cursor: pointer; }
 .primary { border: 0; color: #07110f; background: #69e0af; font-weight: 800; }
 .secondary { border: 1px solid #315b4c; background: #112c23; color: #cceade; margin-top: 12px; }
@@ -135,6 +136,10 @@ input, select { color: #eaf3ef; border: 1px solid #315348; background: #091713; 
 .diagnostic-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 24px 0; }
 .diagnostic-grid .info-card { padding: 17px; }
 .model-settings { margin-bottom: 20px; }
+.settings-stack { display: grid; gap: 16px; }
+.correction-options-heading { margin-top: 18px; padding: 14px 0 3px; }
+.correction-options-heading strong { color: #bdebd8; font-size: 14px; text-transform: uppercase; letter-spacing: .08em; }
+.correction-options-heading p { margin: 5px 0 0; font-size: 13px; }
 .model-note { margin: 13px 0 0; font-size: 13px; }
 .modal-backdrop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 24px; background: rgba(2, 8, 6, .76); backdrop-filter: blur(4px); }
 .modal-card { width: min(560px, 100%); border: 1px solid #2c594a; border-radius: 16px; padding: 26px; background: #0d1d19; box-shadow: 0 24px 80px rgba(0, 0, 0, .55); }

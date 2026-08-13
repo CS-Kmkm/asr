@@ -107,6 +107,51 @@ For another compatible endpoint, set its `/v1` base URL. An unauthenticated
 local endpoint does not require the configured key environment variable to
 exist.
 
+### AI transcript correction (OpenAI or Gemini)
+
+The optional correction stage runs after transcription and before text
+insertion. Enable it in **Settings > AI text correction**, select OpenAI or
+Google Gemini, and configure the model ID. The transcript text and preferred
+dictionary spellings are sent to the selected provider; recorded audio is not.
+If correction fails, the original transcript is inserted instead.
+
+The automatic editor has independent switches for:
+
+- filler removal, while retaining hesitation or discourse markers that carry meaning;
+- accidental repetition and false-start removal, while retaining intentional emphasis;
+- resolving explicit spoken self-corrections to the speaker's final revision;
+- formatting spoken lists, steps, action items, and key points;
+- light clarity and grammar repair without changing meaning, tone, or formality.
+
+The provider prompt treats the transcript as untrusted data. Questions and
+commands spoken into the transcript are edited as text rather than answered or
+executed. Additional style and tone guidance can be configured separately from
+the safety and fidelity rules.
+
+To keep API cost and latency low, the editor uses a compact instruction, sends
+only dictionary aliases actually found in the transcript, caps optional style
+guidance at 500 characters, requests minimal/no reasoning on supported models,
+and sets an output-token limit based on the transcript length.
+
+All fixed prompt text and prompt-size limits are centralized in
+`src-tauri/src/correction_prompt.rs` under the `Prompt tuning` block. Edit that
+block to tune correction behavior without changing provider/API request code.
+
+API secrets are never stored in application settings. Set the environment
+variable shown in Settings, then restart the desktop app so it inherits the
+value:
+
+```powershell
+# OpenAI Responses API
+$env:OPENAI_API_KEY = "..."
+
+# Google Gemini Interactions API
+$env:GEMINI_API_KEY = "..."
+```
+
+Correction is disabled by default. The default model IDs can be changed in the
+UI without rebuilding the application.
+
 ## Serve a local model through the OpenAI API shape
 
 Install the serving extra and expose either local backend over HTTP:

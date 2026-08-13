@@ -175,6 +175,7 @@ pub(crate) async fn stop_recording(
         .ok()
         .filter(|terms| !terms.is_empty())
         .map(|terms| terms.join("\n"));
+    let correction_cancel = cancel.clone();
     let transcript_result = services
         .transcriber
         .transcribe(&artifact.path, prompt.as_deref(), cancel)
@@ -229,6 +230,67 @@ pub(crate) async fn stop_recording(
         return Err("dictation was cancelled".into());
     }
 
+    let mut final_text = transcript.text.clone();
+    let mut processed_text = None;
+    let mut llm_provider = None;
+    let mut correction_failed = false;
+    if settings.text_correction_enabled {
+        let correction_hints = storage
+            .dictionary_correction_hints(&transcript.text)
+            .unwrap_or_default();
+        emit_state(
+            &app,
+            &state,
+            AppPhase::Processing,
+            "Correcting the transcript with the configured AI provider.",
+        );
+        let correction_started = Instant::now();
+        match correction::correct_transcript(
+            &settings,
+            &transcript.text,
+            &correction_hints,
+            correction_cancel,
+        )
+        .await
+        {
+            Ok(corrected) => {
+                final_text = corrected;
+                processed_text = Some(final_text.clone());
+                llm_provider = Some(settings.correction_provider.clone());
+                let _ = storage.add_metric(
+                    "text_correction",
+                    Some(settings.correction_provider.as_str()),
+                    Some(correction_started.elapsed().as_millis() as i64),
+                    true,
+                    None,
+                );
+            }
+            Err(correction::CorrectionError::Cancelled) => {
+                emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
+                return Err("dictation was cancelled".into());
+            }
+            Err(error) => {
+                correction_failed = true;
+                let _ = storage.add_metric(
+                    "text_correction",
+                    Some(settings.correction_provider.as_str()),
+                    Some(correction_started.elapsed().as_millis() as i64),
+                    false,
+                    Some("correction_failed"),
+                );
+                emit_status(
+                    &app,
+                    "text_correction_failed",
+                    &format!("AI correction failed; using the original transcript. {error}"),
+                );
+            }
+        }
+    }
+    if services.lifecycle.is_cancelled(operation_id) {
+        emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
+        return Err("dictation was cancelled".into());
+    }
+
     emit_state(
         &app,
         &state,
@@ -244,17 +306,15 @@ pub(crate) async fn stop_recording(
     let injector = SystemTextInjector::new(InjectionOptions {
         restore_clipboard: settings.clipboard_restore,
     });
-    let insertion = injector
-        .insert(&transcript.text, &target)
-        .map_err(|error| {
-            emit_state(
-                &app,
-                &state,
-                AppPhase::Error,
-                "Insertion was blocked for safety.",
-            );
-            command_error(error)
-        })?;
+    let insertion = injector.insert(&final_text, &target).map_err(|error| {
+        emit_state(
+            &app,
+            &state,
+            AppPhase::Error,
+            "Insertion was blocked for safety.",
+        );
+        command_error(error)
+    })?;
     let latency_ms = started.elapsed().as_millis() as u64;
     let insertion_label = match insertion {
         InsertResult::UiAutomation => "ui_automation",
@@ -265,10 +325,16 @@ pub(crate) async fn stop_recording(
     storage
         .add_history(&NewHistoryItem {
             transcript_text: &transcript.text,
-            processed_text: None,
-            mode: "faithful",
+            processed_text: processed_text.as_deref(),
+            mode: if processed_text.is_some() {
+                "ai_corrected"
+            } else if correction_failed {
+                "faithful_fallback"
+            } else {
+                "faithful"
+            },
             asr_provider: &transcript.model,
-            llm_provider: None,
+            llm_provider: llm_provider.as_deref(),
             app_category: None,
             duration_ms: Some(duration_ms as i64),
             latency_ms: Some(latency_ms as i64),
@@ -285,14 +351,16 @@ pub(crate) async fn stop_recording(
         .map_err(command_error)?;
     let completion = if insertion == InsertResult::ClipboardOnly {
         "Automatic insertion failed; the result remains on the clipboard."
+    } else if correction_failed {
+        "AI correction failed; the original transcript was inserted."
     } else {
         "Dictation inserted successfully."
     };
-    let snapshot = state.complete(transcript.text.clone(), completion.into());
+    let snapshot = state.complete(final_text.clone(), completion.into());
     let _ = app.emit("app-state", snapshot);
     emit_status(&app, insertion_label, completion);
     Ok(RecordingResult {
-        text: transcript.text,
+        text: final_text,
         insertion: insertion_label.into(),
         duration_ms,
         latency_ms,
@@ -348,6 +416,9 @@ pub(crate) async fn update_settings(
             "asr backend must be vibevoice, faster-whisper, openai-compatible, or mock".into(),
         );
     }
+    if !types::CORRECTION_PROVIDERS.contains(&settings.correction_provider.as_str()) {
+        return Err("text correction provider must be openai or gemini".into());
+    }
     if !["4bit", "8bit", "bf16"].contains(&settings.model_quantization.as_str()) {
         return Err("model quantization must be 4bit, 8bit, or bf16".into());
     }
@@ -380,6 +451,54 @@ pub(crate) async fn update_settings(
     {
         return Err(
             "API key environment variable must contain only ASCII letters, digits, or underscores"
+                .into(),
+        );
+    }
+    for (label, model) in [
+        (
+            "OpenAI correction model",
+            settings.openai_correction_model.as_str(),
+        ),
+        (
+            "Gemini correction model",
+            settings.gemini_correction_model.as_str(),
+        ),
+    ] {
+        if model.trim().is_empty() || model.len() > 512 || model.chars().any(char::is_control) {
+            return Err(format!(
+                "{label} must be non-empty, at most 512 characters, and contain no control characters"
+            ));
+        }
+    }
+    for (label, environment_variable) in [
+        (
+            "OpenAI API key environment variable",
+            settings.openai_api_key_env_var.as_str(),
+        ),
+        (
+            "Gemini API key environment variable",
+            settings.gemini_api_key_env_var.as_str(),
+        ),
+    ] {
+        let environment_variable = environment_variable.trim();
+        if environment_variable.is_empty()
+            || environment_variable.len() > 128
+            || !environment_variable
+                .chars()
+                .all(|character| character == '_' || character.is_ascii_alphanumeric())
+        {
+            return Err(format!(
+                "{label} must contain only ASCII letters, digits, or underscores"
+            ));
+        }
+    }
+    if settings.correction_instruction.chars().count() > 500
+        || settings.correction_instruction.chars().any(|character| {
+            character.is_control() && character != '\n' && character != '\r' && character != '\t'
+        })
+    {
+        return Err(
+            "correction instruction must be at most 500 characters and contain no unsupported control characters"
                 .into(),
         );
     }

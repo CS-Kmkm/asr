@@ -41,6 +41,30 @@ pub struct Settings {
     #[serde(default = "default_api_key_env_var")]
     pub api_key_env_var: String,
     #[serde(default)]
+    pub text_correction_enabled: bool,
+    #[serde(default = "default_correction_provider")]
+    pub correction_provider: String,
+    #[serde(default = "default_openai_correction_model")]
+    pub openai_correction_model: String,
+    #[serde(default = "default_openai_api_key_env_var")]
+    pub openai_api_key_env_var: String,
+    #[serde(default = "default_gemini_correction_model")]
+    pub gemini_correction_model: String,
+    #[serde(default = "default_gemini_api_key_env_var")]
+    pub gemini_api_key_env_var: String,
+    #[serde(default = "default_correction_instruction")]
+    pub correction_instruction: String,
+    #[serde(default = "default_enabled_correction_feature")]
+    pub correction_remove_fillers: bool,
+    #[serde(default = "default_enabled_correction_feature")]
+    pub correction_remove_repetitions: bool,
+    #[serde(default = "default_enabled_correction_feature")]
+    pub correction_resolve_self_corrections: bool,
+    #[serde(default = "default_enabled_correction_feature")]
+    pub correction_auto_format: bool,
+    #[serde(default = "default_enabled_correction_feature")]
+    pub correction_improve_clarity: bool,
+    #[serde(default)]
     pub custom_models: Vec<CustomModel>,
 }
 
@@ -52,6 +76,7 @@ pub struct CustomModel {
 }
 
 pub const ASR_BACKENDS: [&str; 4] = ["vibevoice", "faster-whisper", "openai-compatible", "mock"];
+pub const CORRECTION_PROVIDERS: [&str; 2] = ["openai", "gemini"];
 
 fn default_asr_backend() -> String {
     "faster-whisper".into()
@@ -67,6 +92,34 @@ fn default_api_base_url() -> String {
 
 fn default_api_key_env_var() -> String {
     "OPENAI_API_KEY".into()
+}
+
+fn default_correction_provider() -> String {
+    "openai".into()
+}
+
+fn default_openai_correction_model() -> String {
+    "gpt-5.6-luna".into()
+}
+
+fn default_openai_api_key_env_var() -> String {
+    "OPENAI_API_KEY".into()
+}
+
+fn default_gemini_correction_model() -> String {
+    "gemini-flash-lite-latest".into()
+}
+
+fn default_gemini_api_key_env_var() -> String {
+    "GEMINI_API_KEY".into()
+}
+
+fn default_correction_instruction() -> String {
+    String::new()
+}
+
+fn default_enabled_correction_feature() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -85,6 +138,18 @@ impl Default for Settings {
             asr_backend: default_asr_backend(),
             api_base_url: default_api_base_url(),
             api_key_env_var: default_api_key_env_var(),
+            text_correction_enabled: false,
+            correction_provider: default_correction_provider(),
+            openai_correction_model: default_openai_correction_model(),
+            openai_api_key_env_var: default_openai_api_key_env_var(),
+            gemini_correction_model: default_gemini_correction_model(),
+            gemini_api_key_env_var: default_gemini_api_key_env_var(),
+            correction_instruction: default_correction_instruction(),
+            correction_remove_fillers: true,
+            correction_remove_repetitions: true,
+            correction_resolve_self_corrections: true,
+            correction_auto_format: true,
+            correction_improve_clarity: true,
             custom_models: Vec::new(),
         }
     }
@@ -216,6 +281,18 @@ mod tests {
         assert_eq!(settings.model_quantization, "4bit");
         assert_eq!(settings.api_base_url, "https://api.openai.com/v1");
         assert_eq!(settings.api_key_env_var, "OPENAI_API_KEY");
+        assert!(!settings.text_correction_enabled);
+        assert_eq!(settings.correction_provider, "openai");
+        assert_eq!(settings.openai_correction_model, "gpt-5.6-luna");
+        assert_eq!(settings.openai_api_key_env_var, "OPENAI_API_KEY");
+        assert_eq!(settings.gemini_correction_model, "gemini-flash-lite-latest");
+        assert_eq!(settings.gemini_api_key_env_var, "GEMINI_API_KEY");
+        assert!(settings.correction_instruction.is_empty());
+        assert!(settings.correction_remove_fillers);
+        assert!(settings.correction_remove_repetitions);
+        assert!(settings.correction_resolve_self_corrections);
+        assert!(settings.correction_auto_format);
+        assert!(settings.correction_improve_clarity);
         assert!(settings.custom_models.is_empty());
     }
 }
