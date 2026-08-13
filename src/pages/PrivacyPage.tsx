@@ -10,7 +10,6 @@ export function PrivacyPage({
 }) {
   return (
     <section className="panel">
-      <h2>Privacy controls</h2>
       <SettingRow
         title="Save text history"
         detail="When disabled, transcript and processed text are never inserted into dictation_history."

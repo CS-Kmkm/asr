@@ -40,18 +40,8 @@ export function DictionaryPage({
   }
 
   return (
-    <section className="panel">
-      <div className="section-heading">
-        <div>
-          <h2>Personal dictionary</h2>
-          <p>
-            Surfaces and aliases are sent to the ASR engine as a prompt, improving
-            recognition of proper nouns and domain terms.
-          </p>
-        </div>
-      </div>
-
-      <form className="steps" onSubmit={(e) => void handleSubmit(e)}>
+    <section className="panel compact-page-panel">
+      <form className="steps dictionary-form" onSubmit={(e) => void handleSubmit(e)}>
         <div className="setting-row">
           <div>
             <strong>Reading</strong>

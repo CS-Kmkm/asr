@@ -392,6 +392,33 @@ mod tests {
     }
 
     #[test]
+    fn disabled_correction_preserves_configuration() {
+        let storage = Storage::in_memory().unwrap();
+        let settings = Settings {
+            text_correction_enabled: false,
+            correction_provider: "gemini".into(),
+            gemini_correction_model: "gemini-custom".into(),
+            correction_remove_fillers: false,
+            correction_auto_format: false,
+            correction_instruction: "Keep technical terms unchanged.".into(),
+            ..Settings::default()
+        };
+
+        storage.update_settings(&settings).unwrap();
+
+        let restored = storage.get_settings().unwrap();
+        assert!(!restored.text_correction_enabled);
+        assert_eq!(restored.correction_provider, "gemini");
+        assert_eq!(restored.gemini_correction_model, "gemini-custom");
+        assert!(!restored.correction_remove_fillers);
+        assert!(!restored.correction_auto_format);
+        assert_eq!(
+            restored.correction_instruction,
+            "Keep technical terms unchanged."
+        );
+    }
+
+    #[test]
     fn legacy_settings_receive_audio_enhancement_defaults() {
         let mut value = serde_json::to_value(Settings::default()).unwrap();
         let object = value.as_object_mut().unwrap();

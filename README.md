@@ -110,10 +110,13 @@ exist.
 ### AI transcript correction (OpenAI or Gemini)
 
 The optional correction stage runs after transcription and before text
-insertion. Enable it in **Settings > AI text correction**, select OpenAI or
-Google Gemini, and configure the model ID. The transcript text and preferred
-dictionary spellings are sent to the selected provider; recorded audio is not.
-If correction fails, the original transcript is inserted instead.
+insertion. Its dedicated **AI text correction** card in **Settings** has a
+master switch that enables or disables all correction processing and external
+API requests at once. Provider, model, and editing options remain editable
+while the master switch is off, so correction can be configured before it is
+enabled. The transcript text and preferred dictionary spellings are sent to
+the selected provider; recorded audio is not. If correction fails, the
+original transcript is inserted instead.
 
 The automatic editor has independent switches for:
 

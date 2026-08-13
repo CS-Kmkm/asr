@@ -41,17 +41,21 @@ export function SettingRow({
 export function Toggle({
   checked,
   onChange,
+  label,
 }: {
   checked: boolean;
   onChange: (value: boolean) => void;
+  label?: string;
 }) {
   return (
     <button
+      type="button"
       className={`toggle ${checked ? "on" : ""}`}
       onClick={() => onChange(!checked)}
       aria-pressed={checked}
+      aria-label={label}
     >
-      <span />
+      <span aria-hidden="true" />
     </button>
   );
 }

@@ -4,7 +4,6 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
   addDictionaryEntry,
   cancelRecording,
-  copyHistoryItem,
   copyToClipboard,
   defaultSettings,
   deleteDictionaryEntry,
@@ -262,6 +261,14 @@ function MainApp() {
     }
   }
 
+  async function copyHistoryText(text: string) {
+    try {
+      await copyToClipboard(text);
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }
+
   async function saveSettings(patch: Partial<Settings>) {
     const next = { ...settings, ...patch };
     setSettings(next);
@@ -477,7 +484,7 @@ function MainApp() {
             settings={settings}
             history={history}
             onSave={(patch) => void saveSettings(patch)}
-            onCopyItem={(id) => void copyHistoryItem(id)}
+            onCopyItem={(text) => void copyHistoryText(text)}
           />
         )}
 

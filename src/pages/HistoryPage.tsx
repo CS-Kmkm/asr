@@ -1,18 +1,6 @@
 import { Empty, Toggle } from "../components/ui";
 import type { HistoryItem, Settings } from "../types";
 
-function historyDetail(item: HistoryItem) {
-  const timestamp = new Date(item.createdAt).toLocaleString();
-  if (item.processedText) {
-    const provider = item.llmProvider === "gemini" ? "Gemini" : "OpenAI";
-    return `${timestamp} · AI edited with ${provider} · Copy`;
-  }
-  if (item.mode === "faithful_fallback") {
-    return `${timestamp} · Original used after AI fallback · Copy`;
-  }
-  return `${timestamp} · Original transcript · Copy`;
-}
-
 export function HistoryPage({
   settings,
   history,
@@ -22,18 +10,16 @@ export function HistoryPage({
   settings: Settings;
   history: HistoryItem[];
   onSave: (patch: Partial<Settings>) => void;
-  onCopyItem: (id: number) => void;
+  onCopyItem: (text: string) => void;
 }) {
   return (
-    <section className="panel">
-      <div className="section-heading">
-        <div>
-          <h2>Dictation history</h2>
-          <p>Stored only when history is enabled.</p>
-        </div>
+    <section className="panel compact-page-panel">
+      <div className="history-controls">
+        <span>Save history</span>
         <Toggle
           checked={settings.historyEnabled}
           onChange={(value) => onSave({ historyEnabled: value })}
+          label="Save history"
         />
       </div>
       {!settings.historyEnabled ? (
@@ -49,13 +35,47 @@ export function HistoryPage({
       ) : (
         <div className="history-list">
           {history.map((item) => (
-            <button key={item.id} onClick={() => onCopyItem(item.id)}>
-              <span>{item.processedText ?? item.transcriptText}</span>
-              <small>{historyDetail(item)}</small>
-            </button>
+            <article className="history-item" key={item.id}>
+              <time dateTime={item.createdAt}>
+                {new Date(item.createdAt).toLocaleString()}
+              </time>
+              <HistoryText text={item.transcriptText} onCopy={onCopyItem} />
+              {item.processedText && (
+                <HistoryText
+                  text={item.processedText}
+                  onCopy={onCopyItem}
+                  corrected
+                />
+              )}
+            </article>
           ))}
         </div>
       )}
     </section>
+  );
+}
+
+function HistoryText({
+  text,
+  corrected = false,
+  onCopy,
+}: {
+  text: string;
+  corrected?: boolean;
+  onCopy: (text: string) => void;
+}) {
+  return (
+    <div
+      className={`history-text${corrected ? " api-corrected" : ""}`}
+      role="button"
+      tabIndex={0}
+      title="Double-click to copy"
+      onDoubleClick={() => onCopy(text)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") onCopy(text);
+      }}
+    >
+      {text}
+    </div>
   );
 }

@@ -14,7 +14,6 @@ export function DiagnosticsPage({
 }) {
   return (
     <section className="panel">
-      <h2>Local diagnostics</h2>
       <p className="lead">
         Diagnostics report status codes and hardware metadata only. Audio, transcripts,
         clipboard contents, window titles, and API keys are excluded.
