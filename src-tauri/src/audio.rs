@@ -19,6 +19,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const TARGET_SAMPLE_RATE: u32 = 24_000;
 
+/// Prefix used for persisted device selections. CPAL does not expose the
+/// underlying WASAPI endpoint ID, so the friendly name is the most stable
+/// identifier available through its public API. In particular, unlike the old
+/// `<enumeration index>:<name>` format, this survives device reordering after a
+/// reboot or Bluetooth reconnect.
+const DEVICE_NAME_ID_PREFIX: &str = "name:";
+
 /// Default amount of audio retained ahead of a hotkey press so the leading edge
 /// of speech is never clipped by stream warm-up latency.
 pub const DEFAULT_PREROLL: Duration = Duration::from_millis(300);
@@ -48,7 +55,7 @@ pub trait VoiceActivityDetector: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioDevice {
-    /// Stable only for the lifetime of the current device enumeration.
+    /// Stable across re-enumeration while the device's friendly name is unchanged.
     pub id: String,
     pub name: String,
     pub is_default: bool,
@@ -950,6 +957,24 @@ fn samples_to_duration(sample_count: usize, sample_rate: u32) -> Duration {
     }
 }
 
+fn device_id_from_name(name: &str) -> String {
+    format!("{DEVICE_NAME_ID_PREFIX}{name}")
+}
+
+/// Resolves both current name-based IDs and the index-based IDs written by
+/// versions before the name-based format was introduced. The numeric portion
+/// of a legacy ID is deliberately ignored: CPAL's enumeration order is not
+/// stable across device reconnects.
+fn device_name_from_id(id: &str) -> Option<&str> {
+    if let Some(name) = id.strip_prefix(DEVICE_NAME_ID_PREFIX) {
+        return (!name.is_empty()).then_some(name);
+    }
+
+    let (index, name) = id.split_once(':')?;
+    (!index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()) && !name.is_empty())
+        .then_some(name)
+}
+
 #[cfg(target_os = "windows")]
 fn list_cpal_devices() -> Result<Vec<AudioDevice>, AudioError> {
     use cpal::traits::{DeviceTrait, HostTrait};
@@ -963,13 +988,12 @@ fn list_cpal_devices() -> Result<Vec<AudioDevice>, AudioError> {
         .map_err(|error| AudioError::DeviceEnumeration(error.to_string()))?;
 
     devices
-        .enumerate()
-        .map(|(index, device)| {
+        .map(|device| {
             let name = device
                 .name()
                 .map_err(|error| AudioError::DeviceEnumeration(error.to_string()))?;
             Ok(AudioDevice {
-                id: format!("{index}:{name}"),
+                id: device_id_from_name(&name),
                 is_default: default_name.as_deref() == Some(name.as_str()),
                 name,
             })
@@ -1040,12 +1064,13 @@ fn start_cpal_stream(
 
     let host = cpal::default_host();
     let device = if let Some(requested_id) = config.device_id.as_deref() {
+        let requested_name = device_name_from_id(requested_id)
+            .ok_or_else(|| AudioError::DeviceNotFound(requested_id.to_owned()))?;
         host.input_devices()
             .map_err(|error| AudioError::DeviceEnumeration(error.to_string()))?
-            .enumerate()
-            .find_map(|(index, device)| {
+            .find_map(|device| {
                 let name = device.name().ok()?;
-                (format!("{index}:{name}") == requested_id).then_some(device)
+                (name == requested_name).then_some(device)
             })
             .ok_or_else(|| AudioError::DeviceNotFound(requested_id.to_owned()))?
     } else {
@@ -1176,6 +1201,27 @@ fn drop_active_stream(active: &mut ActiveCapture) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_ids_do_not_depend_on_enumeration_order() {
+        assert_eq!(
+            device_id_from_name("ヘッドセット (SOUNDPEATS Air5 Pro)"),
+            "name:ヘッドセット (SOUNDPEATS Air5 Pro)"
+        );
+    }
+
+    #[test]
+    fn legacy_device_ids_resolve_by_name_after_reordering() {
+        assert_eq!(
+            device_name_from_id("2:ヘッドセット (SOUNDPEATS Air5 Pro)"),
+            Some("ヘッドセット (SOUNDPEATS Air5 Pro)")
+        );
+        assert_eq!(
+            device_name_from_id("name:Microphone: USB"),
+            Some("Microphone: USB")
+        );
+        assert_eq!(device_name_from_id("not-an-id"), None);
+    }
 
     #[test]
     fn converts_interleaved_stereo_to_mono() {
