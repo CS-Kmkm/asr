@@ -52,9 +52,9 @@ pub(crate) async fn start_recording(
         .map_err(command_error)?;
     let capture_config = capture_config(&settings);
     let mut audio = take_audio(&services)?;
-    // Ensure the stream is warm (idempotent if a prior stop left it armed) so
-    // its preroll ring already holds the audio captured during warm-up, then
-    // promote it to recording without losing the leading edge of speech.
+    // Open the stream only when dictation starts. Keeping a Bluetooth headset
+    // microphone armed while idle forces Windows to retain the low-fidelity
+    // hands-free profile for playback.
     let result = async {
         audio.arm(capture_config.clone()).await?;
         audio.start(capture_config).await
@@ -160,9 +160,9 @@ pub(crate) async fn stop_recording(
         error
     })?;
     let artifact_result = audio.stop().await;
-    // Re-arm immediately so the next hotkey press records with zero warm-up
-    // latency. A best-effort arm; failure simply falls back to cold start.
-    let _ = audio.arm(capture_config(&settings)).await;
+    // `stop` closes the input stream. Do not re-arm it while transcription is
+    // running: on Bluetooth headsets an open microphone selects the low-quality
+    // HFP playback profile until the stream is released.
     return_audio(&services, audio);
     let artifact = artifact_result.map_err(|error| {
         emit_state(
