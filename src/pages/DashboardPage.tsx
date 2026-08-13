@@ -52,14 +52,16 @@ export function DashboardPage({
             </button>
           )}
         </div>
-        <div
-          className="wave"
-          aria-label={`Input level ${Math.round(level.peak * 100)} percent`}
-        >
-          {WAVE_SCALES.map((scale, i) => (
-            <i key={i} style={{ height: Math.max(8, level.peak * 100 * scale) }} />
-          ))}
-        </div>
+        {state.phase === "recording" && (
+          <div
+            className="wave"
+            aria-label={`Input level ${Math.round(level.peak * 100)} percent`}
+          >
+            {WAVE_SCALES.map((scale, i) => (
+              <i key={i} style={{ height: Math.max(8, level.peak * 100 * scale) }} />
+            ))}
+          </div>
+        )}
       </article>
 
       <InfoCard label="HOTKEY" value={settings.hotkey} detail="Global toggle shortcut" />

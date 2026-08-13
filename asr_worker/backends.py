@@ -76,10 +76,78 @@ def wav_duration_seconds(audio_path: Path) -> float | None:
 
 
 def map_backend_exception(exc: BaseException, operation: str, backend_label: str = "VibeVoice") -> BackendError:
-    message = str(exc).lower()
-    if "out of memory" in message or "cuda oom" in message:
+    details: list[str] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        details.extend((type(current).__name__.lower(), str(current).lower()))
+        current = current.__cause__ or current.__context__
+    diagnostic = "\n".join(details)
+
+    if "out of memory" in diagnostic or "cuda oom" in diagnostic:
         return BackendError("gpu_oom", "GPU out of memory while operating the ASR model")
     if operation == "load":
+        if any(marker in diagnostic for marker in ("rate limit", "ratelimit", "too many requests", "status code: 429")):
+            return BackendError(
+                "hf_rate_limited",
+                f"Hugging Face download rate limit reached for the {backend_label} model. "
+                "Set HF_TOKEN for higher limits, wait, then try again.",
+            )
+        if "gatedrepoerror" in diagnostic or any(
+            marker in diagnostic
+            for marker in (
+                "gated repo",
+                "gated model",
+                "access to this model is restricted",
+                "access to model is restricted",
+            )
+        ):
+            return BackendError(
+                "hf_auth_required",
+                f"Hugging Face authorization is required to download the {backend_label} model. "
+                "Set HF_TOKEN to a read token, accept any gated-model access terms, and restart Local Voice.",
+            )
+        if "repositorynotfounderror" in diagnostic:
+            return BackendError(
+                "hf_repository_unavailable",
+                f"The Hugging Face repository for the {backend_label} model was not found or is private. "
+                "Check the model ID; for a private model, set HF_TOKEN with read access and restart Local Voice.",
+            )
+        if any(
+            marker in diagnostic
+            for marker in (
+                "401 client error",
+                "403 client error",
+                "status code: 401",
+                "status code: 403",
+                "unauthorized",
+                "forbidden",
+                "invalid token",
+                "authentication required",
+            )
+        ):
+            return BackendError(
+                "hf_auth_required",
+                f"Hugging Face authentication failed while downloading the {backend_label} model. "
+                "Set a valid read token in HF_TOKEN and restart Local Voice.",
+            )
+        if any(
+            marker in diagnostic
+            for marker in (
+                "connectionerror",
+                "connecttimeout",
+                "readtimeout",
+                "name resolution",
+                "network is unreachable",
+                "offlinemodeisenabled",
+            )
+        ):
+            return BackendError(
+                "hf_download_failed",
+                f"Could not reach Hugging Face while downloading the {backend_label} model. "
+                "Check the network connection and try again.",
+            )
         return BackendError("model_load_failed", f"Unable to load {backend_label} model: {type(exc).__name__}")
     return BackendError("transcription_failed", f"{backend_label} transcription failed: {type(exc).__name__}")
 
@@ -190,17 +258,26 @@ class VibeVoiceBackend:
         language: str | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         try:
-            inputs = self.processor.apply_transcription_request(
-                audio=str(audio_path),
-                prompt=prompt,
-            ).to(self.model.device, self.model.dtype)
-            max_new_tokens = compute_max_new_tokens(
-                wav_duration_seconds(audio_path),
-                os.environ.get("ASR_MAX_NEW_TOKENS"),
-            )
-            output_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
-            generated_ids = output_ids[:, inputs["input_ids"].shape[1] :]
-            parsed = self.processor.decode(generated_ids, return_format="parsed")[0]
+            import torch
+
+            # Inference mode removes autograd bookkeeping and view tracking for
+            # the entire preprocessing/generation path. Releasing the (often
+            # large) audio inputs before decoding also lowers peak live VRAM.
+            with torch.inference_mode():
+                inputs = self.processor.apply_transcription_request(
+                    audio=str(audio_path),
+                    prompt=prompt,
+                ).to(self.model.device, self.model.dtype)
+                input_length = inputs["input_ids"].shape[1]
+                max_new_tokens = compute_max_new_tokens(
+                    wav_duration_seconds(audio_path),
+                    os.environ.get("ASR_MAX_NEW_TOKENS"),
+                )
+                output_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
+                generated_ids = output_ids[:, input_length:]
+                del inputs
+                parsed = self.processor.decode(generated_ids, return_format="parsed")[0]
+                del generated_ids, output_ids
             segments = [
                 {
                     "start": float(item.get("Start", 0.0)),

@@ -133,6 +133,19 @@ only dictionary aliases actually found in the transcript, caps optional style
 guidance at 500 characters, requests minimal/no reasoning on supported models,
 and sets an output-token limit based on the transcript length.
 
+Correction responses are consumed as server-sent events from both the OpenAI
+Responses API and Gemini Interactions API. As soon as ASR finishes, the
+raw transcript is inserted into the captured target as provisional text. The
+first correction delta replaces that draft and later deltas are appended while
+the API is still generating; the always-on-top status overlay mirrors the same
+progress. A short-lived helper process observes keyboard and pointer activity
+during this replacement session. It reports only activity counters (never key
+values or typed text), ignores this application's tagged input, and never
+suppresses an event. If the user types, clicks, changes focus, starts IME
+composition, or the monitor becomes unavailable, live replacement stops and
+the completed result is left on the clipboard instead of modifying the target
+again.
+
 All fixed prompt text and prompt-size limits are centralized in
 `src-tauri/src/correction_prompt.rs` under the `Prompt tuning` block. Edit that
 block to tune correction behavior without changing provider/API request code.

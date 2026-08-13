@@ -1,9 +1,25 @@
 import { SettingRow } from "../components/ui";
-import type { AudioDevice, Settings } from "../types";
+import type { AudioDevice, GpuDiagnostics, Settings } from "../types";
+
+function gpuSummary(gpu: GpuDiagnostics | null) {
+  if (!gpu) return "Checking GPU automatically...";
+  if (gpu.status !== "available") return `Checked automatically. ${gpu.recommendation}`;
+
+  const hardware = [
+    gpu.adapterName,
+    gpu.memoryTotalMb ? `${gpu.memoryTotalMb} MB VRAM` : null,
+    gpu.driverVersion ? `driver ${gpu.driverVersion}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return `Detected automatically: ${hardware}. ${gpu.recommendation}`;
+}
 
 export function SetupPage({
   settings,
   devices,
+  gpu,
+  gpuChecking,
   onSettingsChange,
   onConfigureModel,
   onDiagnoseGpu,
@@ -11,6 +27,8 @@ export function SetupPage({
 }: {
   settings: Settings;
   devices: AudioDevice[];
+  gpu: GpuDiagnostics | null;
+  gpuChecking: boolean;
   onSettingsChange: (settings: Settings) => void;
   onConfigureModel: () => void;
   onDiagnoseGpu: () => void;
@@ -65,11 +83,11 @@ export function SetupPage({
           }
         />
         <SettingRow
-          title="GPU check"
-          detail="Reads hardware metadata only; no transcript or audio is involved."
+          title="GPU"
+          detail={gpuSummary(gpu)}
           control={
-            <button className="secondary" onClick={onDiagnoseGpu}>
-              Run check
+            <button className="secondary" onClick={onDiagnoseGpu} disabled={gpuChecking}>
+              {gpuChecking ? "Checking..." : "Recheck GPU"}
             </button>
           }
         />

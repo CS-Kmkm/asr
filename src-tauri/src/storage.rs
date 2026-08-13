@@ -269,9 +269,18 @@ impl Storage {
 
     pub fn dictionary_prompt_terms(&self) -> Result<Vec<String>, StorageError> {
         let mut terms = Vec::new();
-        for entry in self.list_dictionary()? {
-            terms.push(entry.surface);
-            terms.extend(entry.aliases);
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT surface, aliases
+             FROM dictionary_entries ORDER BY priority DESC, surface ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (surface, aliases) = row?;
+            terms.push(surface);
+            terms.extend(serde_json::from_str::<Vec<String>>(&aliases)?);
         }
         Ok(terms)
     }
@@ -380,6 +389,19 @@ mod tests {
         });
         storage.update_settings(&settings).unwrap();
         assert_eq!(storage.get_settings().unwrap(), settings);
+    }
+
+    #[test]
+    fn legacy_settings_receive_audio_enhancement_defaults() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("noiseSuppression");
+        object.remove("inputGainPercent");
+        object.remove("automaticGain");
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.noise_suppression, "medium");
+        assert_eq!(settings.input_gain_percent, 100);
+        assert!(settings.automatic_gain);
     }
 
     #[test]

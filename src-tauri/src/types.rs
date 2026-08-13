@@ -31,6 +31,12 @@ pub struct Settings {
     pub delete_audio_after_processing: bool,
     pub auto_start: bool,
     pub clipboard_restore: bool,
+    #[serde(default = "default_noise_suppression")]
+    pub noise_suppression: String,
+    #[serde(default = "default_input_gain_percent")]
+    pub input_gain_percent: u16,
+    #[serde(default = "default_automatic_gain")]
+    pub automatic_gain: bool,
     pub model_id: Option<String>,
     #[serde(default = "default_model_quantization")]
     pub model_quantization: String,
@@ -94,6 +100,10 @@ fn default_api_key_env_var() -> String {
     "OPENAI_API_KEY".into()
 }
 
+fn default_noise_suppression() -> String {
+    "medium".into()
+}
+
 fn default_correction_provider() -> String {
     "openai".into()
 }
@@ -122,6 +132,14 @@ fn default_enabled_correction_feature() -> bool {
     true
 }
 
+fn default_input_gain_percent() -> u16 {
+    100
+}
+
+fn default_automatic_gain() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -133,6 +151,9 @@ impl Default for Settings {
             delete_audio_after_processing: true,
             auto_start: false,
             clipboard_restore: true,
+            noise_suppression: default_noise_suppression(),
+            input_gain_percent: default_input_gain_percent(),
+            automatic_gain: default_automatic_gain(),
             model_id: None,
             model_quantization: default_model_quantization(),
             asr_backend: default_asr_backend(),

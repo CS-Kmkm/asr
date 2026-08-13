@@ -11,6 +11,58 @@ from typing import Any, TextIO
 from .backends import Backend, BackendError, create_backend
 
 
+def _configure_protocol_stdio() -> None:
+    """Force the JSONL protocol streams to UTF-8 on every platform.
+
+    Redirected Python stdio inherits the Windows ANSI code page unless UTF-8
+    mode is enabled by the parent process. Keep this safeguard for direct
+    worker launches as well as launches from the desktop app.
+    """
+    for stream in (sys.stdin, sys.stdout):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="strict")
+
+
+def _sanitize_unicode(value: Any) -> Any:
+    """Replace lone UTF-16 surrogates before serializing a protocol response.
+
+    Model output can occasionally contain a lone surrogate. Python strings can
+    represent those code points, but Unicode and JSON cannot; serde_json rejects
+    an escaped lone surrogate as an invalid Unicode code point.
+    """
+    if isinstance(value, str):
+        sanitized: list[str] = []
+        index = 0
+        while index < len(value):
+            code_point = ord(value[index])
+            if 0xD800 <= code_point <= 0xDBFF and index + 1 < len(value):
+                low_surrogate = ord(value[index + 1])
+                if 0xDC00 <= low_surrogate <= 0xDFFF:
+                    sanitized.append(
+                        chr(
+                            0x10000
+                            + ((code_point - 0xD800) << 10)
+                            + (low_surrogate - 0xDC00)
+                        )
+                    )
+                    index += 2
+                    continue
+            sanitized.append("\ufffd" if 0xD800 <= code_point <= 0xDFFF else value[index])
+            index += 1
+        return "".join(sanitized)
+    if isinstance(value, dict):
+        return {
+            _sanitize_unicode(key): _sanitize_unicode(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_unicode(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_unicode(item) for item in value)
+    return value
+
+
 def error_response(request_id: Any, code: str, message: str) -> dict[str, Any]:
     return {"id": request_id, "ok": False, "error": {"code": code, "message": message}}
 
@@ -75,7 +127,7 @@ class Worker:
                         "invalid_request",
                         "language must be a short string or null",
                     ), False
-                started = time.monotonic()
+                started = time.perf_counter()
                 text, segments = self.backend.transcribe(audio_path, prompt, language)
                 return {
                     "id": request_id,
@@ -83,7 +135,7 @@ class Worker:
                     "text": text,
                     "segments": segments,
                     "model": self.backend.model_name,
-                    "duration_ms": round((time.monotonic() - started) * 1000),
+                    "duration_ms": round((time.perf_counter() - started) * 1000),
                 }, False
 
             if operation == "shutdown":
@@ -106,13 +158,15 @@ def serve(worker: Worker, input_stream: TextIO = sys.stdin, output_stream: TextI
             response, should_stop = error_response(None, "invalid_json", "Request is not valid JSON"), False
         else:
             response, should_stop = worker.handle(request)
-        output_stream.write(json.dumps(response, ensure_ascii=False, separators=(",", ":")) + "\n")
+        safe_response = _sanitize_unicode(response)
+        output_stream.write(json.dumps(safe_response, ensure_ascii=False, separators=(",", ":")) + "\n")
         output_stream.flush()
         if should_stop:
             return
 
 
 def main(argv: list[str] | None = None) -> int:
+    _configure_protocol_stdio()
     parser = argparse.ArgumentParser(description="VibeVoice JSON Lines worker")
     parser.add_argument(
         "--backend",

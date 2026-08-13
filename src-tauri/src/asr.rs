@@ -27,7 +27,13 @@ impl WorkerCommand {
         Self {
             program: program.into(),
             args: vec!["-m".into(), "asr_worker".into()],
-            env: Vec::new(),
+            // Windows otherwise uses the active ANSI code page for redirected
+            // Python stdio (CP932 on Japanese systems).  The worker protocol is
+            // UTF-8, so make that contract explicit for both directions.
+            env: vec![
+                ("PYTHONUTF8".into(), "1".into()),
+                ("PYTHONIOENCODING".into(), "utf-8".into()),
+            ],
         }
     }
 
@@ -112,14 +118,16 @@ struct State {
 
 pub struct JsonlTranscriber {
     request_timeout: Duration,
+    load_timeout: Duration,
     next_id: AtomicU64,
     state: Arc<Mutex<State>>,
 }
 
 impl JsonlTranscriber {
-    pub fn new(command: WorkerCommand, request_timeout: Duration) -> Self {
+    pub fn new(command: WorkerCommand, request_timeout: Duration, load_timeout: Duration) -> Self {
         Self {
             request_timeout,
+            load_timeout,
             next_id: AtomicU64::new(1),
             state: Arc::new(Mutex::new(State {
                 command,
@@ -158,6 +166,7 @@ impl JsonlTranscriber {
         &self,
         worker: &mut RunningWorker,
         request: &Value,
+        response_timeout: Duration,
     ) -> Result<Value, AsrError> {
         let expected_id = request.get("id").cloned().unwrap_or(Value::Null);
         let mut encoded =
@@ -168,7 +177,7 @@ impl JsonlTranscriber {
 
         let mut line = Vec::new();
         let read = timeout(
-            self.request_timeout,
+            response_timeout,
             (&mut worker.stdout)
                 .take((MAX_RESPONSE_BYTES + 1) as u64)
                 .read_until(b'\n', &mut line),
@@ -188,8 +197,11 @@ impl JsonlTranscriber {
     }
 
     fn validate_response(line: &[u8], expected_id: &Value) -> Result<Value, AsrError> {
-        let response: Value =
-            serde_json::from_slice(line).map_err(|error| AsrError::Protocol(error.to_string()))?;
+        std::str::from_utf8(line)
+            .map_err(|_| AsrError::Protocol("worker response was not valid UTF-8".into()))?;
+        let sanitized = Self::sanitize_response_unicode(line);
+        let response: Value = serde_json::from_slice(&sanitized)
+            .map_err(|error| AsrError::Protocol(error.to_string()))?;
         if response.get("id") != Some(expected_id) {
             return Err(AsrError::Protocol(
                 "response id did not match request id".into(),
@@ -202,6 +214,80 @@ impl JsonlTranscriber {
             return Err(AsrError::Worker(error));
         }
         Ok(response)
+    }
+
+    /// Make a worker response valid Unicode without changing JSON structure.
+    ///
+    /// Python and some model tokenizers can represent lone UTF-16 surrogate
+    /// code points. They are not Unicode scalar values, so serde_json correctly
+    /// rejects `\uD800` through `\uDFFF` unless they form a valid pair. Keep
+    /// valid pairs and escaped backslashes intact, replacing only lone escapes.
+    fn sanitize_response_unicode(line: &[u8]) -> Vec<u8> {
+        let decoded = String::from_utf8_lossy(line);
+        let bytes = decoded.as_bytes();
+        let mut sanitized = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        let mut in_string = false;
+
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if !in_string {
+                sanitized.push(byte);
+                if byte == b'"' {
+                    in_string = true;
+                }
+                index += 1;
+                continue;
+            }
+            if byte == b'"' {
+                sanitized.push(byte);
+                in_string = false;
+                index += 1;
+                continue;
+            }
+            if byte != b'\\' || index + 1 >= bytes.len() {
+                sanitized.push(byte);
+                index += 1;
+                continue;
+            }
+            if bytes[index + 1] != b'u' {
+                sanitized.extend_from_slice(&bytes[index..index + 2]);
+                index += 2;
+                continue;
+            }
+
+            let Some(code_point) = Self::parse_unicode_escape(bytes, index) else {
+                sanitized.push(byte);
+                index += 1;
+                continue;
+            };
+            if (0xD800..=0xDBFF).contains(&code_point) {
+                let paired = Self::parse_unicode_escape(bytes, index + 6)
+                    .is_some_and(|low| (0xDC00..=0xDFFF).contains(&low));
+                if paired {
+                    sanitized.extend_from_slice(&bytes[index..index + 12]);
+                    index += 12;
+                    continue;
+                }
+            }
+            if (0xD800..=0xDFFF).contains(&code_point) {
+                sanitized.extend_from_slice("\u{FFFD}".as_bytes());
+                index += 6;
+                continue;
+            }
+            sanitized.extend_from_slice(&bytes[index..index + 6]);
+            index += 6;
+        }
+        sanitized
+    }
+
+    fn parse_unicode_escape(bytes: &[u8], index: usize) -> Option<u16> {
+        let digits = bytes.get(index..index + 6)?;
+        if digits[0] != b'\\' || digits[1] != b'u' {
+            return None;
+        }
+        let text = std::str::from_utf8(&digits[2..]).ok()?;
+        u16::from_str_radix(text, 16).ok()
     }
 
     fn requires_reset(error: &AsrError) -> bool {
@@ -226,7 +312,8 @@ impl JsonlTranscriber {
                 "command": "load",
                 "quantization": quantization,
             });
-            self.exchange(&mut worker, &request).await?;
+            self.exchange(&mut worker, &request, self.load_timeout)
+                .await?;
         }
         state.running = Some(worker);
         Ok(())
@@ -248,6 +335,7 @@ impl JsonlTranscriber {
         &self,
         request: Value,
         mut cancel: Option<watch::Receiver<bool>>,
+        response_timeout: Duration,
     ) -> Result<Value, AsrError> {
         let mut state = self.state.lock().await;
         self.ensure_running(&mut state).await?;
@@ -257,17 +345,17 @@ impl JsonlTranscriber {
                 Err(AsrError::Cancelled)
             } else {
                 tokio::select! {
-                    result = self.exchange(worker, &request) => result,
+                    result = self.exchange(worker, &request, response_timeout) => result,
                     changed = receiver.changed() => {
                         match changed {
                             Ok(()) if *receiver.borrow() => Err(AsrError::Cancelled),
-                            _ => self.exchange(worker, &request).await,
+                            _ => self.exchange(worker, &request, response_timeout).await,
                         }
                     }
                 }
             }
         } else {
-            self.exchange(worker, &request).await
+            self.exchange(worker, &request, response_timeout).await
         };
         if result.as_ref().is_err_and(Self::requires_reset) {
             Self::reset_locked(&mut state).await;
@@ -284,7 +372,7 @@ impl Transcriber for JsonlTranscriber {
             "command": "load",
             "quantization": quantization,
         });
-        self.request(request, None).await?;
+        self.request(request, None, self.load_timeout).await?;
         self.state.lock().await.loaded_quantization = Some(quantization.to_owned());
         Ok(())
     }
@@ -301,7 +389,9 @@ impl Transcriber for JsonlTranscriber {
             "audio_path": audio_path,
             "prompt": prompt,
         });
-        let response = self.request(request, Some(cancel)).await?;
+        let response = self
+            .request(request, Some(cancel), self.request_timeout)
+            .await?;
         match serde_json::from_value(response) {
             Ok(transcript) => Ok(transcript),
             Err(error) => {
@@ -320,7 +410,11 @@ impl Transcriber for JsonlTranscriber {
             "id": self.next_id.fetch_add(1, Ordering::Relaxed),
             "command": "shutdown",
         });
-        let exchange = timeout(SHUTDOWN_TIMEOUT, self.exchange(&mut worker, &request)).await;
+        let exchange = timeout(
+            SHUTDOWN_TIMEOUT,
+            self.exchange(&mut worker, &request, SHUTDOWN_TIMEOUT),
+        )
+        .await;
         let wait = timeout(SHUTDOWN_TIMEOUT, worker.child.wait()).await;
         if exchange.is_err() || wait.is_err() {
             let _ = worker.child.kill().await;
@@ -369,10 +463,16 @@ mod tests {
             args: vec!["--mock".into()],
             env: vec![("TEST".into(), "1".into())],
         };
-        let client = JsonlTranscriber::new(command.clone(), Duration::from_secs(1));
+        let client = JsonlTranscriber::new(
+            command.clone(),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        );
         let state = client.state.try_lock().unwrap();
         assert_eq!(state.command, command);
         assert_eq!(state.command.program, PathBuf::from("custom-worker"));
+        assert_eq!(client.request_timeout, Duration::from_secs(1));
+        assert_eq!(client.load_timeout, Duration::from_secs(2));
     }
 
     #[test]
@@ -386,6 +486,27 @@ mod tests {
                 "--backend".to_string(),
                 "faster-whisper".to_string(),
             ]
+        );
+        assert_eq!(
+            command.env,
+            vec![
+                ("PYTHONUTF8".to_string(), "1".to_string()),
+                ("PYTHONIOENCODING".to_string(), "utf-8".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_non_utf8_worker_response_instead_of_corrupting_text() {
+        // "マ" encoded as CP932. This is the byte pattern that previously
+        // became a replacement character followed by an ASCII byte.
+        let response = b"{\"id\":1,\"ok\":true,\"text\":\"\x83\x7d\"}\n";
+        let error = JsonlTranscriber::validate_response(response, &json!(1)).unwrap_err();
+
+        assert!(matches!(error, AsrError::Protocol(_)));
+        assert_eq!(
+            error.to_string(),
+            "worker protocol failed: worker response was not valid UTF-8"
         );
     }
 
@@ -420,5 +541,18 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, AsrError::Worker(_)));
         assert!(!JsonlTranscriber::requires_reset(&error));
+    }
+
+    #[test]
+    fn sanitizes_lone_surrogates_in_worker_response() {
+        let response = JsonlTranscriber::validate_response(
+            br#"{"id":1,"ok":true,"text":"bad:\ud800","paired":"\ud83d\ude00","literal":"\\udfff"}"#,
+            &json!(1),
+        )
+        .unwrap();
+
+        assert_eq!(response["text"], "bad:\u{FFFD}");
+        assert_eq!(response["paired"], "\u{1F600}");
+        assert_eq!(response["literal"], r"\udfff");
     }
 }

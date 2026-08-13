@@ -22,6 +22,8 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
   末尾に改行 (`\n`) を付与して送出する。
 - 文字エンコーディングは **UTF-8** である。ワーカーは `ensure_ascii=False` で応答を直列化するため、
   非ASCII文字はエスケープせずそのまま出力される。
+- Windows の ANSI コードページに依存しないよう、デスクトップ側は Python 起動時に
+  `PYTHONUTF8=1` と `PYTHONIOENCODING=utf-8` を設定し、ワーカー側も標準入出力を UTF-8 に再設定する。
 - ワーカーの応答はコンパクト形式(区切りに余分な空白を含まない)で出力される。
 - 1リクエストにつき必ず1レスポンスが返る、同期的な request/response 往復モデルである
   (ADR-0002 のbatch方式に対応)。
@@ -240,6 +242,10 @@ faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレ�
 | `backend_unavailable` | backends.py (`FasterWhisperBackend.load`) | `faster_whisper` パッケージが未インストール(ImportError)。 |
 | `gpu_oom` | backends.py(例外マッピング / mock) | 例外メッセージに "out of memory" または "cuda oom" を含む(load/transcribe両方で発生しうる)。 |
 | `gpu_unsupported` | backends.py (`VibeVoiceBackend.load`) | CUDA GPUが利用不可、またはモデルがCUDAに配置されなかった(CPUフォールバック無効)。 |
+| `hf_auth_required` | backends.py(例外マッピング) | Hugging Faceのgatedモデル、無効なトークン、または401/403応答によりモデルを取得できない。 |
+| `hf_repository_unavailable` | backends.py(例外マッピング) | Hugging FaceのモデルIDが存在しない、またはprivateモデルへの読取権限がない。 |
+| `hf_rate_limited` | backends.py(例外マッピング) | Hugging Faceから429またはレート制限エラーが返された。 |
+| `hf_download_failed` | backends.py(例外マッピング) | Hugging Faceへの接続、名前解決、またはダウンロードが失敗した。 |
 | `model_load_failed` | backends.py(例外マッピング) | `load` 中の予期しない例外(OOM以外)。 |
 | `transcription_failed` | backends.py(例外マッピング) | `transcribe` 中の予期しない例外(OOM以外)。 |
 | `internal_error` | worker.py | 上記のいずれにも該当しない予期しない例外を `handle` が捕捉した場合の包括フォールバック。 |
@@ -249,7 +255,8 @@ faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレ�
 - `unsupported_backend` は起動時のバックエンド生成失敗としてのみ発生し、ワーカーは
   終了コード2で即時終了する。これはプロトコル上のレスポンスではなく、起動時の失敗である。
 - `BackendError` として送出されたコード(`unsupported_quantization`, `backend_unavailable`,
-  `gpu_oom`, `gpu_unsupported`, `model_load_failed`, `transcription_failed`)は
+  `gpu_oom`, `gpu_unsupported`, `hf_auth_required`, `hf_repository_unavailable`,
+  `hf_rate_limited`, `hf_download_failed`, `model_load_failed`, `transcription_failed`)は
   `handle` 内で捕捉され、そのコードのままレスポンスに反映される。
 - それ以外の想定外例外はすべて `internal_error` に丸められ、詳細はstderrにのみ出力される
   (`message` には例外の内部詳細を含めない)。
@@ -263,8 +270,10 @@ faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレ�
 
 ### 4.1 タイムアウト
 
-- 各リクエスト・レスポンス往復には設定可能なタイムアウトが適用される
+- 通常のリクエスト・レスポンス往復には設定可能なタイムアウトが適用される
   (`request_timeout`、`src-tauri/src/lib.rs` での現行設定値は **300秒**)。
+- モデルの初回ダウンロードと読込には独立したタイムアウトを適用する
+  (`load_timeout`、現行設定値は **6時間**)。ワーカー再起動後の自動再読込も同じ値を使う。
 - レスポンスが時間内に得られない場合 `AsrError::Timeout` となる。
 - `shutdown` ではレスポンス交換とは別に、プロセス終了の待機にも同じタイムアウトを適用する。
   時間内に終了しない場合はプロセスをkillする。

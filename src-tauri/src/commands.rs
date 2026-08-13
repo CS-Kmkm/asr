@@ -1,5 +1,23 @@
 use super::*;
 
+fn capture_config(settings: &Settings) -> CaptureConfig {
+    let noise_suppression = match settings.noise_suppression.as_str() {
+        "off" => NoiseSuppressionLevel::Off,
+        "low" => NoiseSuppressionLevel::Low,
+        "high" => NoiseSuppressionLevel::High,
+        _ => NoiseSuppressionLevel::Medium,
+    };
+    CaptureConfig {
+        device_id: settings.microphone_id.clone(),
+        enhancement: AudioEnhancementConfig {
+            noise_suppression,
+            gain: f32::from(settings.input_gain_percent) / 100.0,
+            automatic_gain: settings.automatic_gain,
+        },
+        ..CaptureConfig::default()
+    }
+}
+
 #[tauri::command]
 pub(crate) fn get_app_state(state: State<'_, AppState>) -> AppStateSnapshot {
     state.snapshot()
@@ -32,10 +50,7 @@ pub(crate) async fn start_recording(
     let target = SystemTextInjector::default()
         .capture_target()
         .map_err(command_error)?;
-    let capture_config = CaptureConfig {
-        device_id: settings.microphone_id,
-        ..CaptureConfig::default()
-    };
+    let capture_config = capture_config(&settings);
     let mut audio = take_audio(&services)?;
     // Ensure the stream is warm (idempotent if a prior stop left it armed) so
     // its preroll ring already holds the audio captured during warm-up, then
@@ -147,12 +162,7 @@ pub(crate) async fn stop_recording(
     let artifact_result = audio.stop().await;
     // Re-arm immediately so the next hotkey press records with zero warm-up
     // latency. A best-effort arm; failure simply falls back to cold start.
-    let _ = audio
-        .arm(CaptureConfig {
-            device_id: settings.microphone_id.clone(),
-            ..CaptureConfig::default()
-        })
-        .await;
+    let _ = audio.arm(capture_config(&settings)).await;
     return_audio(&services, audio);
     let artifact = artifact_result.map_err(|error| {
         emit_state(
@@ -170,11 +180,8 @@ pub(crate) async fn stop_recording(
     );
     emit_state(&app, &state, AppPhase::Processing, "Transcribing locally.");
 
-    let prompt = storage
-        .dictionary_prompt_terms()
-        .ok()
-        .filter(|terms| !terms.is_empty())
-        .map(|terms| terms.join("\n"));
+    let dictionary_terms = storage.dictionary_prompt_terms().unwrap_or_default();
+    let prompt = (!dictionary_terms.is_empty()).then(|| dictionary_terms.join("\n"));
     let correction_cancel = cancel.clone();
     let transcript_result = services
         .transcriber
@@ -230,14 +237,38 @@ pub(crate) async fn stop_recording(
         return Err("dictation was cancelled".into());
     }
 
+    let target = services
+        .target
+        .lock()
+        .map_err(|_| "target service is unavailable".to_string())?
+        .take()
+        .ok_or_else(|| "recording target is unavailable".to_string())?;
+    let injector = SystemTextInjector::new(InjectionOptions {
+        restore_clipboard: settings.clipboard_restore,
+    });
+    let input_monitor = Arc::clone(&services.input_monitor);
     let mut final_text = transcript.text.clone();
     let mut processed_text = None;
     let mut llm_provider = None;
     let mut correction_failed = false;
+    let mut streamed_into_target = false;
+    let mut streaming_session = None;
     if settings.text_correction_enabled {
         let correction_hints = storage
             .dictionary_correction_hints(&transcript.text)
             .unwrap_or_default();
+        match injector.begin_streaming(&transcript.text, &target, &input_monitor) {
+            Ok(session) => {
+                streamed_into_target = session.is_some();
+                streaming_session = session;
+            }
+            Err(error) => emit_status(
+                &app,
+                "streaming_insertion_unavailable",
+                &format!("Live replacement is unavailable; waiting for final text. {error}"),
+            ),
+        }
+        emit_correction_preview(&app, &transcript.text, "draft");
         emit_state(
             &app,
             &state,
@@ -250,11 +281,18 @@ pub(crate) async fn stop_recording(
             &transcript.text,
             &correction_hints,
             correction_cancel,
+            |delta| {
+                emit_correction_preview(&app, delta, "streaming");
+                if let Some(session) = streaming_session.as_mut() {
+                    let _ = injector.push_stream_delta(session, delta, &input_monitor);
+                }
+            },
         )
         .await
         {
             Ok(corrected) => {
                 final_text = corrected;
+                emit_correction_preview(&app, &final_text, "final");
                 processed_text = Some(final_text.clone());
                 llm_provider = Some(settings.correction_provider.clone());
                 let _ = storage.add_metric(
@@ -266,11 +304,16 @@ pub(crate) async fn stop_recording(
                 );
             }
             Err(correction::CorrectionError::Cancelled) => {
+                if let Some(session) = streaming_session.as_mut() {
+                    injector.cancel_streaming(session, &input_monitor);
+                }
+                input_monitor.shutdown();
                 emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
                 return Err("dictation was cancelled".into());
             }
             Err(error) => {
                 correction_failed = true;
+                emit_correction_preview(&app, &transcript.text, "fallback");
                 let _ = storage.add_metric(
                     "text_correction",
                     Some(settings.correction_provider.as_str()),
@@ -285,8 +328,14 @@ pub(crate) async fn stop_recording(
                 );
             }
         }
+    } else {
+        emit_correction_preview(&app, &transcript.text, "final");
     }
     if services.lifecycle.is_cancelled(operation_id) {
+        if let Some(session) = streaming_session.as_mut() {
+            injector.cancel_streaming(session, &input_monitor);
+        }
+        input_monitor.shutdown();
         emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
         return Err("dictation was cancelled".into());
     }
@@ -295,18 +344,21 @@ pub(crate) async fn stop_recording(
         &app,
         &state,
         AppPhase::Injecting,
-        "Inserting into the captured target.",
+        if streamed_into_target {
+            "Finalizing the provisional text in the captured target."
+        } else {
+            "Inserting into the captured target."
+        },
     );
-    let target = services
-        .target
-        .lock()
-        .map_err(|_| "target service is unavailable".to_string())?
-        .take()
-        .ok_or_else(|| "recording target is unavailable".to_string())?;
-    let injector = SystemTextInjector::new(InjectionOptions {
-        restore_clipboard: settings.clipboard_restore,
-    });
-    let insertion = injector.insert(&final_text, &target).map_err(|error| {
+    let insertion_result = if let Some(session) = streaming_session.as_mut() {
+        injector.finish_streaming(session, &final_text, &input_monitor)
+    } else {
+        injector.insert(&final_text, &target)
+    };
+    // The helper observes input only while a provisional replacement session
+    // can still mutate the target. Stop it before persisting the result.
+    input_monitor.shutdown();
+    let insertion = insertion_result.map_err(|error| {
         emit_state(
             &app,
             &state,
@@ -316,11 +368,15 @@ pub(crate) async fn stop_recording(
         command_error(error)
     })?;
     let latency_ms = started.elapsed().as_millis() as u64;
-    let insertion_label = match insertion {
-        InsertResult::UiAutomation => "ui_automation",
-        InsertResult::ClipboardPaste => "clipboard_paste",
-        InsertResult::UnicodeInput => "unicode_input",
-        InsertResult::ClipboardOnly => "clipboard_only",
+    let insertion_label = if streamed_into_target && insertion != InsertResult::ClipboardOnly {
+        "streaming_replace"
+    } else {
+        match insertion {
+            InsertResult::UiAutomation => "ui_automation",
+            InsertResult::ClipboardPaste => "clipboard_paste",
+            InsertResult::UnicodeInput => "unicode_input",
+            InsertResult::ClipboardOnly => "clipboard_only",
+        }
     };
     storage
         .add_history(&NewHistoryItem {
@@ -349,13 +405,16 @@ pub(crate) async fn stop_recording(
             None,
         )
         .map_err(command_error)?;
-    let completion = if insertion == InsertResult::ClipboardOnly {
+    let completion = if insertion == InsertResult::ClipboardOnly && streamed_into_target {
+        "User activity or a target change stopped live replacement; the final result remains on the clipboard."
+    } else if insertion == InsertResult::ClipboardOnly {
         "Automatic insertion failed; the result remains on the clipboard."
     } else if correction_failed {
         "AI correction failed; the original transcript was inserted."
     } else {
         "Dictation inserted successfully."
     };
+    recording_overlay::set_phase(&app, &AppPhase::Completed);
     let snapshot = state.complete(final_text.clone(), completion.into());
     let _ = app.emit("app-state", snapshot);
     emit_status(&app, insertion_label, completion);
@@ -365,6 +424,13 @@ pub(crate) async fn stop_recording(
         duration_ms,
         latency_ms,
     })
+}
+
+fn emit_correction_preview(app: &AppHandle, text: &str, stage: &str) {
+    let _ = app.emit(
+        "correction-preview",
+        serde_json::json!({ "text": text, "stage": stage }),
+    );
 }
 
 #[tauri::command]
@@ -410,6 +476,12 @@ pub(crate) async fn update_settings(
     }
     if !(1..=3650).contains(&settings.history_retention_days) {
         return Err("history retention must be between 1 and 3650 days".into());
+    }
+    if !["off", "low", "medium", "high"].contains(&settings.noise_suppression.as_str()) {
+        return Err("noise suppression must be off, low, medium, or high".into());
+    }
+    if !(25..=400).contains(&settings.input_gain_percent) {
+        return Err("input gain must be between 25 and 400 percent".into());
     }
     if !types::ASR_BACKENDS.contains(&settings.asr_backend.as_str()) {
         return Err(
@@ -649,6 +721,20 @@ pub(crate) fn copy_history_item(id: i64, storage: State<'_, Storage>) -> Result<
 }
 
 #[tauri::command]
+pub(crate) fn copy_to_clipboard(text: String) -> Result<(), String> {
+    #[cfg(windows)]
+    clipboard_win::set_clipboard_string(&text)
+        .map_err(|_| "clipboard operation failed".to_string())?;
+    #[cfg(not(windows))]
+    {
+        let _ = text;
+        return Err("clipboard copy is available in the Windows build".into());
+    }
+    #[allow(unreachable_code)]
+    Ok(())
+}
+
+#[tauri::command]
 pub(crate) fn get_model_status(services: State<'_, Services>) -> Result<ModelStatus, String> {
     services
         .model
@@ -751,8 +837,7 @@ pub(crate) async fn ensure_model_loaded(
     Ok(status)
 }
 
-#[tauri::command]
-pub(crate) fn run_gpu_diagnostics() -> GpuDiagnostics {
+pub(crate) fn probe_gpu_diagnostics() -> GpuDiagnostics {
     let output = Command::new("nvidia-smi")
         .args([
             "--query-gpu=name,driver_version,memory.total",
@@ -793,4 +878,43 @@ pub(crate) fn run_gpu_diagnostics() -> GpuDiagnostics {
         memory_total_mb: None,
         recommendation: "NVIDIA diagnostics unavailable. A CUDA GPU with 12 GB or more is recommended only for VibeVoice; faster-whisper runs without a GPU.".into(),
     }
+}
+
+#[tauri::command]
+pub(crate) async fn get_gpu_diagnostics(
+    services: State<'_, Services>,
+) -> Result<GpuDiagnostics, String> {
+    if let Some(diagnostics) = services
+        .gpu_diagnostics
+        .lock()
+        .map_err(|_| "GPU diagnostics are unavailable".to_string())?
+        .clone()
+    {
+        return Ok(diagnostics);
+    }
+
+    let diagnostics = tauri::async_runtime::spawn_blocking(probe_gpu_diagnostics)
+        .await
+        .map_err(|_| "GPU diagnostics could not be completed".to_string())?;
+    *services
+        .gpu_diagnostics
+        .lock()
+        .map_err(|_| "GPU diagnostics are unavailable".to_string())? = Some(diagnostics.clone());
+    Ok(diagnostics)
+}
+
+#[tauri::command]
+pub(crate) async fn run_gpu_diagnostics(
+    app: AppHandle,
+    services: State<'_, Services>,
+) -> Result<GpuDiagnostics, String> {
+    let diagnostics = tauri::async_runtime::spawn_blocking(probe_gpu_diagnostics)
+        .await
+        .map_err(|_| "GPU diagnostics could not be completed".to_string())?;
+    *services
+        .gpu_diagnostics
+        .lock()
+        .map_err(|_| "GPU diagnostics are unavailable".to_string())? = Some(diagnostics.clone());
+    let _ = app.emit("gpu-diagnostics", diagnostics.clone());
+    Ok(diagnostics)
 }

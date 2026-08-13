@@ -5,9 +5,11 @@ import {
   addDictionaryEntry,
   cancelRecording,
   copyHistoryItem,
+  copyToClipboard,
   defaultSettings,
   deleteDictionaryEntry,
   getAppState,
+  getGpuDiagnostics,
   getModelStatus,
   getSettings,
   listAudioDevices,
@@ -69,23 +71,112 @@ const pages: Array<{ id: Page; label: string }> = [
 ];
 
 const isRecordingOverlay = getCurrentWebviewWindow().label === "recording-overlay";
+const OVERLAY_WAVE_BAR_COUNT = 9;
+const OVERLAY_PREVIEW_CHARS = 140;
+
+interface CorrectionPreview {
+  text: string;
+  stage: "draft" | "streaming" | "final" | "fallback";
+}
+
+function compactOverlayPreview(text: string): string {
+  const characters = Array.from(text.trim());
+  return characters.length > OVERLAY_PREVIEW_CHARS
+    ? `…${characters.slice(-OVERLAY_PREVIEW_CHARS).join("")}`
+    : characters.join("");
+}
 
 if (isRecordingOverlay) {
   document.body.classList.add("recording-overlay-body");
 }
 
 function RecordingOverlay() {
+  const [waveform, setWaveform] = useState<number[]>(
+    () => Array(OVERLAY_WAVE_BAR_COUNT).fill(0),
+  );
+  const [phase, setPhase] = useState<AppState["phase"]>("idle");
+  const [message, setMessage] = useState<string | null>(null);
+  const [preview, setPreview] = useState<CorrectionPreview | null>(null);
+
+  useEffect(() => {
+    const listeners = Promise.all([
+      listen<AudioLevel>("audio-level", ({ payload }) => {
+        const rms = Number.isFinite(payload.rms) ? payload.rms : 0;
+        const peak = Number.isFinite(payload.peak) ? payload.peak : 0;
+        const inputLevel = Math.max(rms * 3.5, peak);
+        const normalizedLevel = inputLevel < 0.015 ? 0 : Math.min(1, inputLevel);
+        setWaveform((current) => [...current.slice(1), normalizedLevel]);
+      }),
+      listen<AppState>("app-state", ({ payload }) => {
+        setPhase(payload.phase);
+        setMessage(payload.message);
+        if (payload.phase === "recording") {
+          setWaveform(Array(OVERLAY_WAVE_BAR_COUNT).fill(0));
+          setPreview(null);
+        } else if (
+          payload.phase === "processing" &&
+          (payload.message?.startsWith("Stopping") || payload.message?.startsWith("Transcribing"))
+        ) {
+          setPreview(null);
+        }
+      }),
+      listen<CorrectionPreview>("correction-preview", ({ payload }) => {
+        setPreview((current) => {
+          if (payload.stage !== "streaming") return payload;
+          return {
+            ...payload,
+            text: current?.stage === "streaming" ? current.text + payload.text : payload.text,
+          };
+        });
+      }),
+    ]);
+
+    return () => {
+      void listeners.then((unlisten) => unlisten.forEach((fn) => fn()));
+    };
+  }, []);
+
+  if (phase === "recording") {
+    return (
+      <div className="recording-overlay recording" role="status" aria-label="Recording in progress">
+        <span className="recording-live-dot" aria-hidden="true" />
+        <span className="recording-overlay-label">Listening</span>
+        <span className="recording-wave" aria-hidden="true">
+          {waveform.map((amplitude, index) => (
+            <i
+              key={index}
+              style={{
+                height: `${3 + amplitude * 14}px`,
+                opacity: 0.45 + amplitude * 0.55,
+              }}
+            />
+          ))}
+        </span>
+      </div>
+    );
+  }
+
+  const compactPreview = compactOverlayPreview(preview?.text ?? "");
+  const label =
+    phase === "injecting"
+      ? "Inserting"
+      : preview?.stage === "draft"
+        ? "Transcript ready"
+        : preview?.stage === "streaming"
+          ? "AI correcting"
+          : preview?.stage === "fallback"
+            ? "Using transcript"
+            : "Processing";
+
   return (
-    <div className="recording-overlay" role="status" aria-label="Recording in progress">
-      <span className="recording-live-dot" aria-hidden="true" />
-      <span className="recording-overlay-label">Listening</span>
-      <span className="recording-wave" aria-hidden="true">
-        <i />
-        <i />
-        <i />
-        <i />
-        <i />
-      </span>
+    <div className="recording-overlay processing" role="status" aria-live="polite">
+      <span className="processing-spinner" aria-hidden="true" />
+      <div className="processing-copy">
+        <span className="recording-overlay-label">{label}</span>
+        <span className={`correction-preview${compactPreview ? "" : " pending"}`}>
+          {compactPreview || message || "Preparing text…"}
+        </span>
+      </div>
     </div>
   );
 }
@@ -109,7 +200,9 @@ function MainApp() {
   const [recordingAction, setRecordingAction] = useState(false);
   const recordingActionRef = useRef(false);
   const [gpu, setGpu] = useState<GpuDiagnostics | null>(null);
+  const [gpuChecking, setGpuChecking] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [noticeCopied, setNoticeCopied] = useState(false);
   const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [level, setLevel] = useState<AudioLevel>({ rms: 0, peak: 0 });
   const [dictionary, setDictionary] = useState<DictionaryEntry[]>([]);
@@ -120,23 +213,28 @@ function MainApp() {
       getSettings(),
       listHistory(),
       getModelStatus(),
+      getGpuDiagnostics(),
       listAudioDevices(),
       listDictionary(),
     ])
-      .then(([nextState, nextSettings, nextHistory, nextModel, nextDevices, nextDictionary]) => {
-        setState(nextState);
-        setSettings(nextSettings);
-        setHistory(nextHistory);
-        setModel(nextModel);
-        setDevices(nextDevices);
-        setDictionary(nextDictionary);
-        if (!nextSettings.setupComplete) setPage("setup");
-      })
+      .then(
+        ([nextState, nextSettings, nextHistory, nextModel, nextGpu, nextDevices, nextDictionary]) => {
+          setState(nextState);
+          setSettings(nextSettings);
+          setHistory(nextHistory);
+          setModel(nextModel);
+          setGpu(nextGpu);
+          setDevices(nextDevices);
+          setDictionary(nextDictionary);
+          if (!nextSettings.setupComplete) setPage("setup");
+        },
+      )
       .catch((error: unknown) => setNotice(String(error)));
     const listeners = Promise.all([
       listen<AppState>("app-state", (event) => setState(event.payload)),
       listen<AudioLevel>("audio-level", (event) => setLevel(event.payload)),
       listen<ModelStatus>("model-status", (event) => setModel(event.payload)),
+      listen<GpuDiagnostics>("gpu-diagnostics", (event) => setGpu(event.payload)),
       listen<{ message: string }>("status", (event) => setNotice(event.payload.message)),
     ]);
     return () => {
@@ -144,10 +242,25 @@ function MainApp() {
     };
   }, []);
 
+  useEffect(() => {
+    setNoticeCopied(false);
+  }, [notice]);
+
   const statusLabel = useMemo(
     () => state.phase.charAt(0).toUpperCase() + state.phase.slice(1),
     [state.phase],
   );
+
+  async function copyNotice() {
+    if (!notice) return;
+    try {
+      await copyToClipboard(notice);
+      setNoticeCopied(true);
+    } catch (error) {
+      setNotice(String(error));
+      setNoticeCopied(false);
+    }
+  }
 
   async function saveSettings(patch: Partial<Settings>) {
     const next = { ...settings, ...patch };
@@ -161,12 +274,16 @@ function MainApp() {
   }
 
   async function diagnoseGpu() {
+    if (gpuChecking) return;
+    setGpuChecking(true);
     setNotice("Running local GPU diagnostics...");
     try {
       setGpu(await runGpuDiagnostics());
       setNotice("Diagnostics complete.");
     } catch (error) {
       setNotice(String(error));
+    } finally {
+      setGpuChecking(false);
     }
   }
 
@@ -324,6 +441,8 @@ function MainApp() {
           <SetupPage
             settings={settings}
             devices={devices}
+            gpu={gpu}
+            gpuChecking={gpuChecking}
             onSettingsChange={setSettings}
             onConfigureModel={() => setPage("models")}
             onDiagnoseGpu={() => void diagnoseGpu()}
@@ -385,15 +504,27 @@ function MainApp() {
       </main>
 
       {notice && (
-        <button
+        <div
           className={`notice${modelLoading ? " loading" : ""}`}
-          onClick={() => setNotice(null)}
           aria-live="polite"
-          aria-label="Dismiss notification"
         >
           {modelLoading && <span className="progress-ring" aria-hidden="true" />}
-          {notice}
-        </button>
+          <button
+            className="notice-message"
+            onDoubleClick={() => void copyNotice()}
+            title="Double-click to copy"
+          >
+            {notice}
+          </button>
+          {noticeCopied && <span className="notice-copied">Copied</span>}
+          <button
+            className="notice-dismiss"
+            onClick={() => setNotice(null)}
+            aria-label="Dismiss notification"
+          >
+            ×
+          </button>
+        </div>
       )}
     </div>
   );

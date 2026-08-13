@@ -40,6 +40,9 @@ export interface Settings {
   deleteAudioAfterProcessing: boolean;
   autoStart: boolean;
   clipboardRestore: boolean;
+  noiseSuppression: NoiseSuppression;
+  inputGainPercent: number;
+  automaticGain: boolean;
   modelId: string | null;
   modelQuantization: ModelQuantization;
   asrBackend: AsrBackend;
@@ -62,6 +65,7 @@ export interface Settings {
 
 export type AsrBackend = "vibevoice" | "faster-whisper" | "openai-compatible";
 export type ModelQuantization = "4bit" | "8bit" | "bf16";
+export type NoiseSuppression = "off" | "low" | "medium" | "high";
 export type CorrectionProvider = "openai" | "gemini";
 
 export interface CustomModel {

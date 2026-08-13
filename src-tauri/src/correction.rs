@@ -1,5 +1,6 @@
 use std::{env, time::Duration};
 
+use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 use tokio::sync::watch;
@@ -32,6 +33,7 @@ pub async fn correct_transcript(
     transcript: &str,
     dictionary_hints: &[String],
     mut cancel: watch::Receiver<bool>,
+    mut on_update: impl FnMut(&str),
 ) -> Result<String, CorrectionError> {
     if *cancel.borrow() {
         return Err(CorrectionError::Cancelled);
@@ -67,20 +69,20 @@ pub async fn correct_transcript(
         }
     };
     let status = response.status();
-    let body = response.text().await?;
     if !status.is_success() {
+        let body = response.text().await?;
         return Err(CorrectionError::Api {
             status,
             message: compact_error_body(&body),
         });
     }
-    let value: Value = serde_json::from_str(&body)
-        .map_err(|error| CorrectionError::InvalidResponse(error.to_string()))?;
-    let corrected = match settings.correction_provider.as_str() {
-        "openai" => parse_openai_response(&value),
-        "gemini" => parse_gemini_response(&value),
-        provider => return Err(CorrectionError::UnsupportedProvider(provider.into())),
-    }?;
+    let corrected = collect_response(
+        response,
+        settings.correction_provider.as_str(),
+        &mut cancel,
+        &mut on_update,
+    )
+    .await?;
     let corrected = corrected.trim();
     if corrected.is_empty() {
         return Err(CorrectionError::InvalidResponse(
@@ -103,7 +105,8 @@ fn openai_request(settings: &Settings, transcript: &str, instruction: &str) -> V
         "instructions": instruction,
         "input": transcript,
         "max_output_tokens": max_output_tokens(transcript),
-        "store": false
+        "store": false,
+        "stream": true
     });
     if supports_openai_none_reasoning(settings.openai_correction_model.trim()) {
         request["reasoning"] = json!({"effort": "none"});
@@ -120,12 +123,190 @@ fn gemini_request(settings: &Settings, transcript: &str, instruction: &str) -> V
         "generation_config": {
             "max_output_tokens": max_output_tokens(transcript)
         },
-        "store": false
+        "store": false,
+        "stream": true
     });
     if supports_gemini_minimal_thinking(settings.gemini_correction_model.trim()) {
         request["generation_config"]["thinking_level"] = json!("minimal");
     }
     request
+}
+
+async fn collect_response(
+    response: reqwest::Response,
+    provider: &str,
+    cancel: &mut watch::Receiver<bool>,
+    on_update: &mut impl FnMut(&str),
+) -> Result<String, CorrectionError> {
+    let is_event_stream = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    if !is_event_stream {
+        let body = response.text().await?;
+        let value: Value = serde_json::from_str(&body)
+            .map_err(|error| CorrectionError::InvalidResponse(error.to_string()))?;
+        let text = parse_provider_response(provider, &value)?;
+        on_update(&text);
+        return Ok(text);
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut decoder = SseDecoder::default();
+    let mut text = String::new();
+    let mut completed = false;
+    loop {
+        let next = tokio::select! {
+            next = stream.next() => next,
+            changed = cancel.changed() => {
+                if changed.is_ok() && *cancel.borrow() {
+                    return Err(CorrectionError::Cancelled);
+                }
+                return Err(CorrectionError::Cancelled);
+            }
+        };
+        let Some(chunk) = next else { break };
+        for data in decoder.push(&chunk?)? {
+            if apply_stream_event(provider, &data, &mut text, on_update)? {
+                completed = true;
+            }
+        }
+    }
+    for data in decoder.finish()? {
+        if apply_stream_event(provider, &data, &mut text, on_update)? {
+            completed = true;
+        }
+    }
+    if !completed {
+        return Err(CorrectionError::InvalidResponse(
+            "the streaming response ended before completion".into(),
+        ));
+    }
+    if text.is_empty() {
+        return Err(CorrectionError::InvalidResponse(
+            "missing output text".into(),
+        ));
+    }
+    Ok(text)
+}
+
+fn parse_provider_response(provider: &str, value: &Value) -> Result<String, CorrectionError> {
+    match provider {
+        "openai" => parse_openai_response(value),
+        "gemini" => parse_gemini_response(value),
+        provider => Err(CorrectionError::UnsupportedProvider(provider.into())),
+    }
+}
+
+fn apply_stream_event(
+    provider: &str,
+    data: &str,
+    text: &mut String,
+    on_update: &mut impl FnMut(&str),
+) -> Result<bool, CorrectionError> {
+    if data == "[DONE]" {
+        return Ok(true);
+    }
+    let value: Value = serde_json::from_str(data)
+        .map_err(|error| CorrectionError::InvalidResponse(error.to_string()))?;
+    let event_type = match provider {
+        "openai" => value.get("type").and_then(Value::as_str),
+        "gemini" => value.get("event_type").and_then(Value::as_str),
+        provider => return Err(CorrectionError::UnsupportedProvider(provider.into())),
+    };
+    let delta = match (provider, event_type) {
+        ("openai", Some("response.output_text.delta")) => {
+            value.get("delta").and_then(Value::as_str)
+        }
+        ("gemini", Some("step.delta"))
+            if value.pointer("/delta/type").and_then(Value::as_str) == Some("text") =>
+        {
+            value.pointer("/delta/text").and_then(Value::as_str)
+        }
+        _ => None,
+    };
+    if let Some(delta) = delta {
+        text.push_str(delta);
+        on_update(delta);
+    }
+    match (provider, event_type) {
+        ("openai", Some("response.completed")) | ("gemini", Some("interaction.completed")) => {
+            Ok(true)
+        }
+        ("openai", Some("error" | "response.failed"))
+        | ("gemini", Some("error" | "interaction.failed")) => Err(
+            CorrectionError::InvalidResponse(stream_error_message(&value)),
+        ),
+        _ => Ok(false),
+    }
+}
+
+fn stream_error_message(value: &Value) -> String {
+    value
+        .pointer("/error/message")
+        .or_else(|| value.pointer("/response/error/message"))
+        .and_then(Value::as_str)
+        .unwrap_or("the streaming API reported an error")
+        .to_owned()
+}
+
+#[derive(Default)]
+struct SseDecoder {
+    pending: Vec<u8>,
+    data_lines: Vec<String>,
+}
+
+impl SseDecoder {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>, CorrectionError> {
+        self.pending.extend_from_slice(bytes);
+        let mut events = Vec::new();
+        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let mut line = self.pending.drain(..=newline).collect::<Vec<_>>();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            self.consume_line(&line, &mut events)?;
+        }
+        Ok(events)
+    }
+
+    fn finish(mut self) -> Result<Vec<String>, CorrectionError> {
+        let mut events = Vec::new();
+        if !self.pending.is_empty() {
+            let line = std::mem::take(&mut self.pending);
+            self.consume_line(&line, &mut events)?;
+        }
+        self.dispatch(&mut events);
+        Ok(events)
+    }
+
+    fn consume_line(
+        &mut self,
+        line: &[u8],
+        events: &mut Vec<String>,
+    ) -> Result<(), CorrectionError> {
+        if line.is_empty() {
+            self.dispatch(events);
+            return Ok(());
+        }
+        let Some(data) = line.strip_prefix(b"data:") else {
+            return Ok(());
+        };
+        let data = data.strip_prefix(b" ").unwrap_or(data);
+        let data = std::str::from_utf8(data)
+            .map_err(|error| CorrectionError::InvalidResponse(error.to_string()))?;
+        self.data_lines.push(data.to_owned());
+        Ok(())
+    }
+
+    fn dispatch(&mut self, events: &mut Vec<String>) {
+        if !self.data_lines.is_empty() {
+            events.push(self.data_lines.join("\n"));
+            self.data_lines.clear();
+        }
+    }
 }
 
 fn max_output_tokens(transcript: &str) -> usize {
@@ -226,6 +407,7 @@ mod tests {
         assert_eq!(openai["reasoning"]["effort"], "none");
         assert_eq!(openai["text"]["verbosity"], "low");
         assert_eq!(openai["store"], false);
+        assert_eq!(openai["stream"], true);
 
         let gemini = gemini_request(&settings, "raw text", "correct it");
         assert_eq!(gemini["model"], "gemini-flash-lite-latest");
@@ -233,6 +415,7 @@ mod tests {
         assert_eq!(gemini["generation_config"]["max_output_tokens"], 128);
         assert_eq!(gemini["generation_config"]["thinking_level"], "minimal");
         assert_eq!(gemini["store"], false);
+        assert_eq!(gemini["stream"], true);
     }
 
     #[test]
@@ -255,6 +438,81 @@ mod tests {
             }]
         });
         assert_eq!(parse_gemini_response(&value).unwrap(), "corrected");
+    }
+
+    #[test]
+    fn sse_decoder_handles_fragmented_crlf_events() {
+        let mut decoder = SseDecoder::default();
+        assert!(decoder
+            .push(b"event: response.output_text.delta\r\ndata: {\"type\":\"response.output_")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            decoder
+                .push(b"text.delta\",\"delta\":\"hello\"}\r\n\r\n")
+                .unwrap(),
+            vec![r#"{"type":"response.output_text.delta","delta":"hello"}"#]
+        );
+    }
+
+    #[test]
+    fn accumulates_openai_streaming_text() {
+        let mut text = String::new();
+        let mut previews = Vec::new();
+        let mut preview = |value: &str| previews.push(value.to_owned());
+        assert!(!apply_stream_event(
+            "openai",
+            r#"{"type":"response.output_text.delta","delta":"hello "}"#,
+            &mut text,
+            &mut preview,
+        )
+        .unwrap());
+        assert!(!apply_stream_event(
+            "openai",
+            r#"{"type":"response.output_text.delta","delta":"world"}"#,
+            &mut text,
+            &mut preview,
+        )
+        .unwrap());
+        assert!(apply_stream_event(
+            "openai",
+            r#"{"type":"response.completed"}"#,
+            &mut text,
+            &mut preview,
+        )
+        .unwrap());
+        assert_eq!(text, "hello world");
+        assert_eq!(previews, ["hello ", "world"]);
+    }
+
+    #[test]
+    fn accumulates_only_gemini_text_deltas() {
+        let mut text = String::new();
+        let mut previews = Vec::new();
+        let mut preview = |value: &str| previews.push(value.to_owned());
+        assert!(!apply_stream_event(
+            "gemini",
+            r#"{"event_type":"step.delta","delta":{"type":"thought_signature","signature":"hidden"}}"#,
+            &mut text,
+            &mut preview,
+        )
+        .unwrap());
+        assert!(!apply_stream_event(
+            "gemini",
+            r#"{"event_type":"step.delta","delta":{"type":"text","text":"corrected"}}"#,
+            &mut text,
+            &mut preview,
+        )
+        .unwrap());
+        assert!(apply_stream_event(
+            "gemini",
+            r#"{"event_type":"interaction.completed"}"#,
+            &mut text,
+            &mut preview,
+        )
+        .unwrap());
+        assert_eq!(text, "corrected");
+        assert_eq!(previews, ["corrected"]);
     }
 
     #[test]

@@ -54,22 +54,51 @@ button { color: inherit; }
 }
 .recording-wave i {
   width: 2px;
-  height: 6px;
+  height: 3px;
   border-radius: 2px;
   background: #66e0ae;
-  animation: recording-wave 1s ease-in-out infinite alternate;
+  transition: height 80ms linear, opacity 80ms linear;
 }
-.recording-wave i:nth-child(2) { animation-delay: -.7s; }
-.recording-wave i:nth-child(3) { animation-delay: -.35s; }
-.recording-wave i:nth-child(4) { animation-delay: -.8s; }
-.recording-wave i:nth-child(5) { animation-delay: -.2s; }
+.recording-overlay.processing {
+  justify-content: flex-start;
+  gap: 13px;
+  padding: 0 18px;
+  border-radius: 16px;
+}
+.processing-spinner {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  border: 2px solid rgba(102, 224, 174, .2);
+  border-top-color: #66e0ae;
+  border-radius: 50%;
+  animation: processing-spin .75s linear infinite;
+}
+.processing-copy {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+.processing .recording-overlay-label {
+  color: #82e8bd;
+  font-size: 11px;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+}
+.correction-preview {
+  display: block;
+  overflow: hidden;
+  color: #f5f8f7;
+  font-size: 14px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.correction-preview.pending { color: #a5b8b1; }
+@keyframes processing-spin { to { transform: rotate(360deg); } }
 @keyframes recording-pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: .72; transform: scale(.86); }
-}
-@keyframes recording-wave {
-  from { height: 4px; opacity: .55; }
-  to { height: 16px; opacity: 1; }
 }
 
 .app-shell { display: grid; grid-template-columns: 230px 1fr; min-height: 100vh; }
@@ -97,8 +126,13 @@ p { color: #8da69e; line-height: 1.55; }
 .status-pill { background: #10251f; border: 1px solid #245141; color: #bdebd8; padding: 9px 14px; border-radius: 999px; font-size: 13px; }
 .status-pill.error span { background: #f16f6f; box-shadow: 0 0 10px #f16f6f; }
 .status-pill.recording span { background: #ffbc66; box-shadow: 0 0 10px #ffbc66; }
-.notice { position: fixed; top: 22px; right: 24px; z-index: 10; width: min(420px, calc(100vw - 48px)); display: flex; align-items: center; gap: 11px; text-align: left; border: 1px solid #39745d; background: rgba(16, 42, 34, .96); color: #d8f4e7; padding: 14px 17px; border-radius: 10px; cursor: pointer; box-shadow: 0 12px 32px rgba(0, 0, 0, .3); animation: notice-in .18s ease-out; }
+.notice { position: fixed; top: 22px; right: 24px; z-index: 10; width: min(500px, calc(100vw - 48px)); display: flex; align-items: center; gap: 11px; text-align: left; border: 1px solid #39745d; background: rgba(16, 42, 34, .96); color: #d8f4e7; padding: 11px 12px 11px 17px; border-radius: 10px; box-shadow: 0 12px 32px rgba(0, 0, 0, .3); animation: notice-in .18s ease-out; }
 .notice:hover { border-color: #66e0ae; }
+.notice-message { min-width: 0; flex: 1; padding: 0; overflow-wrap: anywhere; border: 0; background: transparent; color: inherit; text-align: inherit; cursor: copy; }
+.notice-copied { flex: 0 0 auto; color: #82e8bd; font-size: 12px; font-weight: 700; }
+.notice-dismiss { cursor: pointer; }
+.notice-dismiss { flex: 0 0 auto; width: 26px; height: 26px; padding: 0; border-color: transparent; background: transparent; border-radius: 6px; font-size: 20px; line-height: 1; }
+.notice-dismiss:hover { background: rgba(255, 255, 255, .1); }
 .progress-ring { flex: 0 0 auto; width: 18px; height: 18px; border: 2px solid #39745d; border-top-color: #69e0af; border-radius: 50%; animation: progress-spin .8s linear infinite; }
 button:disabled { cursor: wait; opacity: .7; }
 @keyframes notice-in { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
@@ -118,6 +152,9 @@ button:disabled { cursor: wait; opacity: .7; }
 .setting-row p { margin: 5px 0 0; font-size: 13px; max-width: 580px; }
 input, select, textarea { color: #eaf3ef; border: 1px solid #315348; background: #091713; border-radius: 8px; padding: 9px 11px; min-width: 210px; }
 textarea { width: min(420px, 42vw); resize: vertical; line-height: 1.45; }
+.range-control { display: flex; align-items: center; gap: 12px; }
+.range-control input { min-width: 180px; padding: 0; accent-color: #69e0af; }
+.range-control output { width: 48px; color: #bdebd8; text-align: right; font-variant-numeric: tabular-nums; }
 .primary, .secondary { border-radius: 9px; padding: 10px 15px; cursor: pointer; }
 .primary { border: 0; color: #07110f; background: #69e0af; font-weight: 800; }
 .secondary { border: 1px solid #315b4c; background: #112c23; color: #cceade; margin-top: 12px; }

@@ -4,6 +4,7 @@ mod commands;
 mod correction;
 mod correction_prompt;
 mod injection;
+mod input_monitor;
 mod recording_overlay;
 mod state;
 mod storage;
@@ -23,14 +24,18 @@ use std::{
 };
 
 use asr::{JsonlTranscriber, Transcriber, WorkerCommand};
-use audio::{AudioCapture, AudioDevice, CaptureConfig, CpalAudioCapture};
+use audio::{
+    AudioCapture, AudioDevice, AudioEnhancementConfig, CaptureConfig, CpalAudioCapture,
+    NoiseSuppressionLevel,
+};
 use injection::{InjectionOptions, InsertResult, SystemTextInjector, TargetWindow, TextInjector};
+use input_monitor::InputMonitor;
 use state::{AppState, PipelineLifecycle, PipelinePhase};
 use storage::Storage;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Emitter, Manager, RunEvent, State,
+    AppHandle, Emitter, Manager, RunEvent, State, WindowEvent,
 };
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
@@ -38,6 +43,9 @@ use types::{
     AppPhase, AppStateSnapshot, DictionaryEntry, DictionaryEntryInput, GpuDiagnostics, HistoryItem,
     LoadModelRequest, ModelStatus, NewDictionaryEntry, NewHistoryItem, RecordingResult, Settings,
 };
+
+const ASR_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const ASR_MODEL_LOAD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 
 pub(crate) fn model_identity(settings: &Settings) -> (Option<String>, String) {
     let custom_model = settings
@@ -79,7 +87,9 @@ pub(crate) struct Services {
     audio: Mutex<Option<Box<dyn AudioCapture>>>,
     target: Mutex<Option<TargetWindow>>,
     transcriber: Arc<dyn Transcriber>,
+    input_monitor: Arc<InputMonitor>,
     model: Mutex<ModelStatus>,
+    gpu_diagnostics: Mutex<Option<GpuDiagnostics>>,
     lifecycle: PipelineLifecycle,
     initialization: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     shutdown_started: AtomicBool,
@@ -93,14 +103,17 @@ impl Services {
             target: Mutex::new(None),
             transcriber: Arc::new(JsonlTranscriber::new(
                 worker_command_for_settings(settings),
-                Duration::from_secs(300),
+                ASR_REQUEST_TIMEOUT,
+                ASR_MODEL_LOAD_TIMEOUT,
             )),
+            input_monitor: Arc::new(InputMonitor::default()),
             model: Mutex::new(ModelStatus {
                 model_id,
                 installed: false,
                 state: "not_loaded".into(),
                 detail,
             }),
+            gpu_diagnostics: Mutex::new(None),
             lifecycle: PipelineLifecycle::default(),
             initialization: Mutex::new(None),
             shutdown_started: AtomicBool::new(false),
@@ -126,8 +139,13 @@ impl Services {
         if let Ok(mut target) = self.target.lock() {
             target.take();
         }
+        self.input_monitor.shutdown();
         let _ = self.transcriber.shutdown().await;
     }
+}
+
+pub fn run_input_monitor_worker() {
+    input_monitor::run_worker();
 }
 
 pub(crate) struct PipelineGuard<'a> {
@@ -249,7 +267,7 @@ fn worker_runtime() -> (OsString, Option<PathBuf>) {
 }
 
 pub(crate) fn emit_state(app: &AppHandle, state: &AppState, phase: AppPhase, message: &str) {
-    recording_overlay::set_recording(app, phase == AppPhase::Recording);
+    recording_overlay::set_phase(app, &phase);
     let snapshot = state.transition(phase, Some(message.into()));
     let _ = app.emit("app-state", snapshot);
 }
@@ -379,7 +397,7 @@ async fn toggle_recording(app: AppHandle) {
 }
 
 async fn initialize_model_runtime(app: AppHandle, settings: Settings) {
-    let diagnostics = tauri::async_runtime::spawn_blocking(commands::run_gpu_diagnostics)
+    let diagnostics = tauri::async_runtime::spawn_blocking(commands::probe_gpu_diagnostics)
         .await
         .unwrap_or_else(|_| GpuDiagnostics {
             status: "unavailable".into(),
@@ -388,6 +406,9 @@ async fn initialize_model_runtime(app: AppHandle, settings: Settings) {
             memory_total_mb: None,
             recommendation: "GPU diagnostics could not be completed.".into(),
         });
+    if let Ok(mut current) = app.state::<Services>().gpu_diagnostics.lock() {
+        *current = Some(diagnostics.clone());
+    }
     let diagnostic_kind = if diagnostics.status == "available" {
         "gpu_available"
     } else {
@@ -485,14 +506,28 @@ pub fn run() {
             commands::get_settings,
             commands::get_model_status,
             commands::load_model,
+            commands::get_gpu_diagnostics,
             commands::run_gpu_diagnostics,
             commands::list_history,
             commands::list_dictionary,
             commands::add_dictionary_entry,
             commands::delete_dictionary_entry,
             commands::copy_history_item,
+            commands::copy_to_clipboard,
             commands::update_settings
         ])
+        .on_window_event(|window, event| {
+            if window.label() == "main" && matches!(event, WindowEvent::CloseRequested { .. }) {
+                // A tray icon keeps a Tauri process alive after its last window
+                // is closed. Treat the main window's close button as an actual
+                // application exit, but keep the window alive until RunEvent's
+                // asynchronous shutdown has stopped capture and the ASR worker.
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                }
+                window.app_handle().exit(0);
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building Local Voice Input")
         .run(|app, event| {

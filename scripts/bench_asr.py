@@ -170,7 +170,9 @@ class WorkerSession:
         payload = {"id": self._alloc_id(), **payload}
         line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
-        started = time.monotonic()
+        # perf_counter uses QueryPerformanceCounter on Windows. monotonic uses
+        # GetTickCount64 there and would quantize fast requests to 0/16 ms.
+        started = time.perf_counter()
         try:
             self.proc.stdin.write(line)
             self.proc.stdin.flush()
@@ -180,7 +182,7 @@ class WorkerSession:
             ) from exc
 
         response_line = self._read_line_with_timeout()
-        wall_ms = (time.monotonic() - started) * 1000.0
+        wall_ms = (time.perf_counter() - started) * 1000.0
 
         if response_line is None:
             self._kill()

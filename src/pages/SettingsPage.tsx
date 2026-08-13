@@ -42,6 +42,52 @@ export function SettingsPage({
           />
         }
       />
+      <SettingRow
+        title="Noise suppression"
+        detail="Reduces steady fan and room noise after recording, without adding work to the live microphone callback."
+        control={
+          <select
+            value={settings.noiseSuppression}
+            onChange={(event) =>
+              onSave({
+                noiseSuppression: event.target.value as Settings["noiseSuppression"],
+              })
+            }
+          >
+            <option value="off">Off</option>
+            <option value="low">Low</option>
+            <option value="medium">Medium</option>
+            <option value="high">High</option>
+          </select>
+        }
+      />
+      <SettingRow
+        title="Automatic gain"
+        detail="Targets a clear speech level after recording. Manual gain below is applied in addition."
+        control={
+          <Toggle
+            checked={settings.automaticGain}
+            onChange={(value) => onSave({ automaticGain: value })}
+          />
+        }
+      />
+      <SettingRow
+        title="Input gain"
+        detail="Adjusts the processed microphone level from 25% to 400%."
+        control={
+          <label className="range-control">
+            <input
+              type="range"
+              min="25"
+              max="400"
+              step="5"
+              value={settings.inputGainPercent}
+              onChange={(event) => onSave({ inputGainPercent: Number(event.target.value) })}
+            />
+            <output>{settings.inputGainPercent}%</output>
+          </label>
+        }
+      />
     </section>
     <section className="panel">
       <h2>AI text correction</h2>

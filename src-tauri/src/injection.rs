@@ -5,6 +5,15 @@
 
 use std::fmt;
 
+use unicode_segmentation::UnicodeSegmentation;
+
+use crate::input_monitor::InputMonitor;
+
+/// Marks every SendInput event created by this application. The monitor helper
+/// ignores only this marker; injected input from other software is treated as
+/// external activity and stops provisional replacement.
+pub(crate) const INJECTION_MARKER: usize = 0x4C56_494A;
+
 /// Identity of the foreground window and focused control captured before ASR.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetWindow {
@@ -24,6 +33,17 @@ pub enum InsertResult {
     /// Automatic insertion failed or was unsafe; the text remains available
     /// for an explicit user paste.
     ClipboardOnly,
+}
+
+/// State for a transcript already inserted into the captured target while the
+/// correction API is still generating its replacement.
+pub(crate) struct StreamingInsertion {
+    target: TargetWindow,
+    displayed: String,
+    checkpoint: u64,
+    active: bool,
+    started: bool,
+    initial_result: InsertResult,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +109,62 @@ impl SystemTextInjector {
             options,
         }
     }
+
+    /// Inserts the ASR draft only after the out-of-process input monitor is
+    /// ready. Returning `None` means the caller must keep using the ordinary
+    /// final-only insertion path.
+    pub(crate) fn begin_streaming(
+        &self,
+        draft: &str,
+        target: &TargetWindow,
+        monitor: &InputMonitor,
+    ) -> Result<Option<StreamingInsertion>, InjectionError> {
+        begin_streaming_with(&self.backend, self.options, draft, target, monitor)
+    }
+
+    /// Replaces the draft on the first delta and appends subsequent deltas.
+    /// Any external activity permanently abandons in-place mutation.
+    pub(crate) fn push_stream_delta(
+        &self,
+        session: &mut StreamingInsertion,
+        delta: &str,
+        monitor: &InputMonitor,
+    ) -> bool {
+        push_stream_delta_with(&self.backend, session, delta, monitor)
+    }
+
+    /// Makes the target exactly match the provider's completed text when it is
+    /// still safe. Otherwise, leaves all target text untouched and copies the
+    /// completed result for an explicit user paste.
+    pub(crate) fn finish_streaming(
+        &self,
+        session: &mut StreamingInsertion,
+        final_text: &str,
+        monitor: &InputMonitor,
+    ) -> Result<InsertResult, InjectionError> {
+        finish_streaming_with(&self.backend, session, final_text, monitor)
+    }
+
+    /// Removes the provisional text only when the target and activity
+    /// checkpoint still prove that doing so cannot consume user input.
+    pub(crate) fn cancel_streaming(
+        &self,
+        session: &mut StreamingInsertion,
+        monitor: &InputMonitor,
+    ) {
+        if streaming_target_is_safe(&self.backend, session, monitor) {
+            let _ = self.backend.replace_recent(
+                grapheme_count(&session.displayed),
+                "",
+                &session.target,
+            );
+        }
+        session.active = false;
+    }
+}
+
+fn grapheme_count(text: &str) -> usize {
+    UnicodeSegmentation::graphemes(text, true).count()
 }
 
 impl Default for SystemTextInjector {
@@ -133,6 +209,12 @@ trait Backend {
     ) -> Result<bool, InjectionError>;
     fn paste(&self, target: &TargetWindow) -> Result<bool, InjectionError>;
     fn unicode_input(&self, text: &str, target: &TargetWindow) -> Result<bool, InjectionError>;
+    fn replace_recent(
+        &self,
+        graphemes: usize,
+        text: &str,
+        target: &TargetWindow,
+    ) -> Result<bool, InjectionError>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,6 +312,120 @@ fn orchestrate_insert<B: Backend>(
     clipboard_only_fallback(backend, text, InjectionError::ClipboardUnavailable)
 }
 
+fn begin_streaming_with<B: Backend>(
+    backend: &B,
+    options: InjectionOptions,
+    draft: &str,
+    target: &TargetWindow,
+    monitor: &InputMonitor,
+) -> Result<Option<StreamingInsertion>, InjectionError> {
+    if !monitor.start() {
+        return Ok(None);
+    }
+    let Some(checkpoint) = monitor.checkpoint() else {
+        return Ok(None);
+    };
+    let result = orchestrate_insert(backend, options, draft, target)?;
+    if result == InsertResult::ClipboardOnly {
+        return Ok(None);
+    }
+    if !monitor.unchanged_since(checkpoint) {
+        return Ok(Some(StreamingInsertion {
+            target: target.clone(),
+            displayed: draft.to_owned(),
+            checkpoint,
+            active: false,
+            started: false,
+            initial_result: result,
+        }));
+    }
+    Ok(Some(StreamingInsertion {
+        target: target.clone(),
+        displayed: draft.to_owned(),
+        checkpoint,
+        active: true,
+        started: false,
+        initial_result: result,
+    }))
+}
+
+fn streaming_target_is_safe<B: Backend>(
+    backend: &B,
+    session: &StreamingInsertion,
+    monitor: &InputMonitor,
+) -> bool {
+    session.active
+        && monitor.unchanged_since(session.checkpoint)
+        && backend.validate_target(&session.target).is_ok()
+        && !backend
+            .ime_composition_active(&session.target)
+            .unwrap_or(true)
+}
+
+fn push_stream_delta_with<B: Backend>(
+    backend: &B,
+    session: &mut StreamingInsertion,
+    delta: &str,
+    monitor: &InputMonitor,
+) -> bool {
+    if delta.is_empty() {
+        return session.active;
+    }
+    if !streaming_target_is_safe(backend, session, monitor) {
+        session.active = false;
+        return false;
+    }
+    let result = if !session.started {
+        backend.replace_recent(grapheme_count(&session.displayed), delta, &session.target)
+    } else {
+        backend.unicode_input(delta, &session.target)
+    };
+    match result {
+        Ok(true) => {
+            if !session.started {
+                session.displayed.clear();
+            }
+            session.displayed.push_str(delta);
+            session.started = true;
+            true
+        }
+        _ => {
+            session.active = false;
+            false
+        }
+    }
+}
+
+fn finish_streaming_with<B: Backend>(
+    backend: &B,
+    session: &mut StreamingInsertion,
+    final_text: &str,
+    monitor: &InputMonitor,
+) -> Result<InsertResult, InjectionError> {
+    if session.active
+        && session.displayed == final_text
+        && streaming_target_is_safe(backend, session, monitor)
+    {
+        return Ok(session.initial_result);
+    }
+    if session.active && streaming_target_is_safe(backend, session, monitor) {
+        if backend
+            .replace_recent(
+                grapheme_count(&session.displayed),
+                final_text,
+                &session.target,
+            )
+            .unwrap_or(false)
+        {
+            session.displayed = final_text.to_owned();
+            return Ok(session.initial_result);
+        }
+    }
+    session.active = false;
+    backend.clipboard_write(final_text, ClipboardExclusion::AllowHistory)?;
+    Ok(InsertResult::ClipboardOnly)
+}
+
 #[cfg(not(target_os = "windows"))]
 struct PlatformBackend;
 
@@ -291,11 +487,23 @@ impl Backend for PlatformBackend {
     fn unicode_input(&self, _text: &str, _target: &TargetWindow) -> Result<bool, InjectionError> {
         Err(InjectionError::UnsupportedPlatform)
     }
+
+    fn replace_recent(
+        &self,
+        _graphemes: usize,
+        _text: &str,
+        _target: &TargetWindow,
+    ) -> Result<bool, InjectionError> {
+        Err(InjectionError::UnsupportedPlatform)
+    }
 }
 
 #[cfg(target_os = "windows")]
 mod windows_backend {
-    use super::{Backend, ClipboardExclusion, ClipboardSnapshot, InjectionError, TargetWindow};
+    use super::{
+        Backend, ClipboardExclusion, ClipboardSnapshot, InjectionError, TargetWindow,
+        INJECTION_MARKER,
+    };
     use std::mem::{size_of, zeroed};
     use std::ptr;
     use std::sync::OnceLock;
@@ -325,8 +533,8 @@ mod windows_backend {
         ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, GCS_COMPSTR,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-        VIRTUAL_KEY, VK_CONTROL, VK_V,
+        GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+        KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_LEFT, VK_MENU, VK_SHIFT, VK_V,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongPtrW,
@@ -601,7 +809,7 @@ mod windows_backend {
                     wScan: 0,
                     dwFlags: windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(flags),
                     time: 0,
-                    dwExtraInfo: 0,
+                    dwExtraInfo: INJECTION_MARKER,
                 },
             },
         }
@@ -609,6 +817,41 @@ mod windows_backend {
 
     fn send(inputs: &[INPUT]) -> bool {
         (unsafe { SendInput(inputs, size_of::<INPUT>() as i32) }) == inputs.len() as u32
+    }
+
+    fn append_unicode_inputs(inputs: &mut Vec<INPUT>, text: &str) {
+        for unit in text.encode_utf16() {
+            inputs.push(INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(0),
+                        wScan: unit,
+                        dwFlags: KEYEVENTF_UNICODE,
+                        time: 0,
+                        dwExtraInfo: INJECTION_MARKER,
+                    },
+                },
+            });
+            inputs.push(INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: VIRTUAL_KEY(0),
+                        wScan: unit,
+                        dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                        time: 0,
+                        dwExtraInfo: INJECTION_MARKER,
+                    },
+                },
+            });
+        }
+    }
+
+    fn modifiers_released() -> bool {
+        [VK_SHIFT, VK_CONTROL, VK_MENU]
+            .into_iter()
+            .all(|key| unsafe { GetAsyncKeyState(key.0 as i32) } & i16::MIN == 0)
     }
 
     impl Backend for PlatformBackend {
@@ -808,32 +1051,31 @@ mod windows_backend {
 
         fn unicode_input(&self, text: &str, target: &TargetWindow) -> Result<bool, InjectionError> {
             let mut inputs = Vec::with_capacity(text.encode_utf16().count() * 2);
-            for unit in text.encode_utf16() {
-                inputs.push(INPUT {
-                    r#type: INPUT_KEYBOARD,
-                    Anonymous: INPUT_0 {
-                        ki: KEYBDINPUT {
-                            wVk: VIRTUAL_KEY(0),
-                            wScan: unit,
-                            dwFlags: KEYEVENTF_UNICODE,
-                            time: 0,
-                            dwExtraInfo: 0,
-                        },
-                    },
-                });
-                inputs.push(INPUT {
-                    r#type: INPUT_KEYBOARD,
-                    Anonymous: INPUT_0 {
-                        ki: KEYBDINPUT {
-                            wVk: VIRTUAL_KEY(0),
-                            wScan: unit,
-                            dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-                            time: 0,
-                            dwExtraInfo: 0,
-                        },
-                    },
-                });
+            append_unicode_inputs(&mut inputs, text);
+            self.validate_target(target)?;
+            Ok(send(&inputs))
+        }
+
+        fn replace_recent(
+            &self,
+            graphemes: usize,
+            text: &str,
+            target: &TargetWindow,
+        ) -> Result<bool, InjectionError> {
+            self.validate_target(target)?;
+            if self.ime_composition_active(target)? || !modifiers_released() {
+                return Ok(false);
             }
+            let mut inputs = Vec::with_capacity(graphemes.saturating_mul(2) + 2 + text.len() * 2);
+            if graphemes > 0 {
+                inputs.push(keyboard_input(VK_SHIFT, 0));
+                for _ in 0..graphemes {
+                    inputs.push(keyboard_input(VK_LEFT, 0));
+                    inputs.push(keyboard_input(VK_LEFT, KEYEVENTF_KEYUP.0));
+                }
+                inputs.push(keyboard_input(VK_SHIFT, KEYEVENTF_KEYUP.0));
+            }
+            append_unicode_inputs(&mut inputs, text);
             self.validate_target(target)?;
             Ok(send(&inputs))
         }
@@ -863,6 +1105,7 @@ mod tests {
         uia: bool,
         paste: bool,
         unicode: bool,
+        replace: bool,
     }
 
     impl MockBackend {
@@ -882,6 +1125,7 @@ mod tests {
                 uia: false,
                 paste: false,
                 unicode: false,
+                replace: false,
             }
         }
     }
@@ -976,6 +1220,17 @@ mod tests {
             self.validate_target(_target)?;
             self.calls.borrow_mut().push("unicode");
             Ok(self.unicode)
+        }
+
+        fn replace_recent(
+            &self,
+            _graphemes: usize,
+            _text: &str,
+            target: &TargetWindow,
+        ) -> Result<bool, InjectionError> {
+            self.validate_target(target)?;
+            self.calls.borrow_mut().push("replace");
+            Ok(self.replace)
         }
     }
 
@@ -1199,6 +1454,89 @@ mod tests {
         // The IME check runs but does not block the paste path.
         assert!(backend.calls.borrow().contains(&"ime_check"));
         assert!(backend.calls.borrow().contains(&"paste"));
+    }
+
+    #[test]
+    fn streaming_replaces_draft_once_then_appends_deltas() {
+        let mut backend = MockBackend::new();
+        backend.paste = true;
+        backend.replace = true;
+        backend.unicode = true;
+        let monitor = InputMonitor::default();
+        monitor.test_set_available(true);
+        let mut session = begin_streaming_with(
+            &backend,
+            InjectionOptions::default(),
+            "raw transcript",
+            &target(1, false),
+            &monitor,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(push_stream_delta_with(
+            &backend,
+            &mut session,
+            "corrected ",
+            &monitor
+        ));
+        assert!(push_stream_delta_with(
+            &backend,
+            &mut session,
+            "text",
+            &monitor
+        ));
+        assert_eq!(session.displayed, "corrected text");
+        assert_eq!(
+            finish_streaming_with(&backend, &mut session, "corrected text", &monitor).unwrap(),
+            InsertResult::ClipboardPaste
+        );
+        let calls = backend.calls.borrow();
+        assert_eq!(calls.iter().filter(|call| **call == "replace").count(), 1);
+        assert_eq!(calls.iter().filter(|call| **call == "unicode").count(), 1);
+    }
+
+    #[test]
+    fn external_input_abandons_replacement_and_copies_final_text() {
+        let mut backend = MockBackend::new();
+        backend.paste = true;
+        backend.replace = true;
+        backend.unicode = true;
+        let monitor = InputMonitor::default();
+        monitor.test_set_available(true);
+        let mut session = begin_streaming_with(
+            &backend,
+            InjectionOptions::default(),
+            "draft",
+            &target(1, false),
+            &monitor,
+        )
+        .unwrap()
+        .unwrap();
+        monitor.test_record_input();
+
+        assert!(!push_stream_delta_with(
+            &backend,
+            &mut session,
+            "generated",
+            &monitor
+        ));
+        assert_eq!(
+            finish_streaming_with(&backend, &mut session, "generated final", &monitor).unwrap(),
+            InsertResult::ClipboardOnly
+        );
+        assert_eq!(
+            backend.clipboard.borrow().as_deref(),
+            Some("generated final")
+        );
+        assert!(!backend.calls.borrow().contains(&"replace"));
+    }
+
+    #[test]
+    fn grapheme_count_treats_combining_text_and_emoji_as_caret_units() {
+        assert_eq!(grapheme_count("e\u{301}"), 1);
+        assert_eq!(grapheme_count("👨‍👩‍👧‍👦"), 1);
+        assert_eq!(grapheme_count("ab"), 2);
     }
 
     #[cfg(not(target_os = "windows"))]

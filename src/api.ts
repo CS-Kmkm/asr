@@ -22,6 +22,9 @@ export const defaultSettings: Settings = {
   deleteAudioAfterProcessing: true,
   autoStart: false,
   clipboardRestore: true,
+  noiseSuppression: "medium",
+  inputGainPercent: 100,
+  automaticGain: true,
   modelId: null,
   modelQuantization: "4bit",
   asrBackend: "faster-whisper",
@@ -89,6 +92,14 @@ export async function copyHistoryItem(id: number): Promise<void> {
   await invoke("copy_history_item", { id });
 }
 
+export async function copyToClipboard(text: string): Promise<void> {
+  if (inTauri) {
+    await invoke("copy_to_clipboard", { text });
+    return;
+  }
+  await navigator.clipboard.writeText(text);
+}
+
 export async function getModelStatus(): Promise<ModelStatus> {
   if (!inTauri) {
     return {
@@ -122,6 +133,11 @@ export async function runGpuDiagnostics(): Promise<GpuDiagnostics> {
     };
   }
   return invoke("run_gpu_diagnostics");
+}
+
+export async function getGpuDiagnostics(): Promise<GpuDiagnostics> {
+  if (!inTauri) return runGpuDiagnostics();
+  return invoke("get_gpu_diagnostics");
 }
 
 export async function listDictionary(): Promise<DictionaryEntry[]> {

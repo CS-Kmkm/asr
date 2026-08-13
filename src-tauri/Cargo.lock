@@ -2118,6 +2118,7 @@ dependencies = [
  "clipboard-win",
  "cpal",
  "directories",
+ "futures-util",
  "reqwest",
  "rusqlite",
  "serde",
@@ -2129,6 +2130,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "unicode-segmentation",
  "windows 0.58.0",
 ]
 

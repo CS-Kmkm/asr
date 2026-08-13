@@ -63,6 +63,7 @@ pub struct CaptureConfig {
     /// disables prerolling and matches the legacy "open on press" behaviour.
     pub preroll: Duration,
     pub vad: EnergyVadConfig,
+    pub enhancement: AudioEnhancementConfig,
     pub artifact_directory: Option<PathBuf>,
 }
 
@@ -74,7 +75,34 @@ impl Default for CaptureConfig {
             minimum_duration: Duration::from_millis(250),
             preroll: DEFAULT_PREROLL,
             vad: EnergyVadConfig::default(),
+            enhancement: AudioEnhancementConfig::default(),
             artifact_directory: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoiseSuppressionLevel {
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AudioEnhancementConfig {
+    pub noise_suppression: NoiseSuppressionLevel,
+    /// User-selected linear gain. 1.0 means no manual gain change.
+    pub gain: f32,
+    pub automatic_gain: bool,
+}
+
+impl Default for AudioEnhancementConfig {
+    fn default() -> Self {
+        Self {
+            noise_suppression: NoiseSuppressionLevel::Medium,
+            gain: 1.0,
+            automatic_gain: true,
         }
     }
 }
@@ -153,17 +181,39 @@ impl EnergyVad {
 
 impl VoiceActivityDetector for EnergyVad {
     fn analyze(&self, samples: &[f32], sample_rate: u32) -> VadAnalysis {
+        self.analyze_with_meter(samples, sample_rate).0
+    }
+}
+
+impl EnergyVad {
+    /// Computes VAD and the whole-recording meter in one pass over the audio.
+    fn analyze_with_meter(&self, samples: &[f32], sample_rate: u32) -> (VadAnalysis, LevelMeter) {
         if samples.is_empty() || sample_rate == 0 {
-            return VadAnalysis::default();
+            return (VadAnalysis::default(), LevelMeter::default());
         }
 
         let frame_len = duration_to_samples(self.config.frame_duration, sample_rate).max(1);
         let mut voiced_samples = 0usize;
         let mut trailing_silent_samples = 0usize;
         let mut seen_voice = false;
+        let mut peak = 0.0f32;
+        let mut total_sum_squares = 0.0f64;
 
         for frame in samples.chunks(frame_len) {
-            if meter(frame).rms >= self.config.rms_threshold {
+            let mut frame_sum_squares = 0.0f64;
+            for &sample in frame {
+                let value = if sample.is_finite() {
+                    sample.clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                };
+                peak = peak.max(value.abs());
+                let square = f64::from(value) * f64::from(value);
+                frame_sum_squares += square;
+                total_sum_squares += square;
+            }
+            let frame_rms = (frame_sum_squares / frame.len() as f64).sqrt() as f32;
+            if frame_rms >= self.config.rms_threshold {
                 voiced_samples += frame.len();
                 trailing_silent_samples = 0;
                 seen_voice = true;
@@ -173,11 +223,17 @@ impl VoiceActivityDetector for EnergyVad {
         }
 
         let voiced_duration = samples_to_duration(voiced_samples, sample_rate);
-        VadAnalysis {
-            contains_voice: voiced_duration >= self.config.minimum_voice_duration,
-            voiced_duration,
-            trailing_silence: samples_to_duration(trailing_silent_samples, sample_rate),
-        }
+        (
+            VadAnalysis {
+                contains_voice: voiced_duration >= self.config.minimum_voice_duration,
+                voiced_duration,
+                trailing_silence: samples_to_duration(trailing_silent_samples, sample_rate),
+            },
+            LevelMeter {
+                rms: (total_sum_squares / samples.len() as f64).sqrt() as f32,
+                peak,
+            },
+        )
     }
 }
 
@@ -235,27 +291,42 @@ impl PrerollBuffer {
 
     /// Appends `samples`, evicting the oldest entries once capacity is reached.
     pub fn extend(&mut self, samples: &[f32]) {
-        if self.capacity == 0 {
+        if self.capacity == 0 || samples.is_empty() {
             return;
         }
-        for &sample in samples {
-            self.push(sample);
-        }
-    }
 
-    fn push(&mut self, sample: f32) {
-        if self.capacity == 0 {
+        // A callback can occasionally deliver more than the entire window.
+        // Keep its tail directly instead of rotating through the ring sample by sample.
+        if samples.len() >= self.capacity {
+            self.buffer.clear();
+            self.buffer
+                .extend_from_slice(&samples[samples.len() - self.capacity..]);
+            self.head = 0;
+            self.full = true;
             return;
         }
-        if self.full {
-            self.buffer[self.head] = sample;
-            self.head = (self.head + 1) % self.capacity;
-        } else {
-            self.buffer.push(sample);
+
+        let mut remaining = samples;
+        if !self.full {
+            let append = remaining.len().min(self.capacity - self.buffer.len());
+            self.buffer.extend_from_slice(&remaining[..append]);
+            remaining = &remaining[append..];
             if self.buffer.len() == self.capacity {
                 self.full = true;
                 self.head = 0;
             }
+            if remaining.is_empty() {
+                return;
+            }
+        }
+
+        let first = remaining.len().min(self.capacity - self.head);
+        self.buffer[self.head..self.head + first].copy_from_slice(&remaining[..first]);
+        self.head = (self.head + first) % self.capacity;
+        remaining = &remaining[first..];
+        if !remaining.is_empty() {
+            self.buffer[self.head..self.head + remaining.len()].copy_from_slice(remaining);
+            self.head += remaining.len();
         }
     }
 
@@ -272,8 +343,12 @@ impl PrerollBuffer {
 
     /// Returns the retained samples (oldest first) and resets the ring.
     pub fn drain(&mut self) -> Vec<f32> {
-        let out = self.snapshot();
-        self.clear();
+        if self.full && self.head != 0 {
+            self.buffer.rotate_left(self.head);
+        }
+        let out = std::mem::take(&mut self.buffer);
+        self.head = 0;
+        self.full = false;
         out
     }
 
@@ -510,7 +585,12 @@ impl AudioCapture for CpalAudioCapture {
             // Reuse the armed stream (preserving its preroll) when present, so the
             // leading edge of speech captured during warm-up is not lost.
             let active = match self.active.take() {
-                Some(active) => active,
+                Some(mut active) => {
+                    // Processing-only settings can change while the stream is
+                    // armed. Use the latest values without reopening the device.
+                    active.config.enhancement = config.enhancement;
+                    active
+                }
                 None => start_cpal_capture(config)?,
             };
             {
@@ -569,6 +649,11 @@ fn validate_config(config: &CaptureConfig) -> Result<(), AudioError> {
             "VAD RMS threshold must be finite and non-negative",
         ));
     }
+    if !config.enhancement.gain.is_finite() || !(0.25..=4.0).contains(&config.enhancement.gain) {
+        return Err(AudioError::InvalidConfiguration(
+            "input gain must be finite and between 0.25 and 4.0",
+        ));
+    }
     Ok(())
 }
 
@@ -577,7 +662,8 @@ fn finalize_samples(
     input_sample_rate: u32,
     config: &CaptureConfig,
 ) -> Result<AudioArtifact, AudioError> {
-    let samples = resample_linear(&mono_samples, input_sample_rate, config.target_sample_rate);
+    let mut samples =
+        resample_linear_owned(mono_samples, input_sample_rate, config.target_sample_rate);
     let duration = samples_to_duration(samples.len(), config.target_sample_rate);
     if duration < config.minimum_duration {
         return Err(AudioError::TooShort {
@@ -586,12 +672,14 @@ fn finalize_samples(
         });
     }
 
-    let vad = EnergyVad::new(config.vad).analyze(&samples, config.target_sample_rate);
+    enhance_audio(&mut samples, config.target_sample_rate, config.enhancement);
+
+    let (vad, levels) =
+        EnergyVad::new(config.vad).analyze_with_meter(&samples, config.target_sample_rate);
     if !vad.contains_voice {
         return Err(AudioError::NoVoiceDetected);
     }
 
-    let levels = meter(&samples);
     let path = temporary_wav_path(config.artifact_directory.as_deref());
     if let Err(error) = write_pcm16_wav(&path, &samples, config.target_sample_rate) {
         let _ = fs::remove_file(&path);
@@ -607,6 +695,101 @@ fn finalize_samples(
         rms_level: levels.rms,
         vad,
     })
+}
+
+/// Applies inexpensive, deterministic post-capture processing. Keeping this out
+/// of the CPAL callback prevents audio cleanup from competing with foreground
+/// typing while the microphone is active.
+pub fn enhance_audio(samples: &mut [f32], sample_rate: u32, config: AudioEnhancementConfig) {
+    if samples.is_empty() || sample_rate == 0 {
+        return;
+    }
+
+    sanitize_and_high_pass(samples, sample_rate);
+    suppress_stationary_noise(samples, sample_rate, config.noise_suppression);
+
+    let measured_rms = meter(samples).rms;
+    let automatic_gain = if config.automatic_gain && measured_rms > 0.000_1 {
+        // -20 dBFS is a conservative speech target. The cap prevents quiet
+        // recordings from turning residual background noise into loud audio.
+        (0.1 / measured_rms).clamp(0.5, 4.0)
+    } else {
+        1.0
+    };
+    let gain = config.gain * automatic_gain;
+    for sample in samples {
+        // A smooth limiter avoids hard clipping while preserving small signals.
+        *sample = soft_limit(*sample * gain);
+    }
+}
+
+fn sanitize_and_high_pass(samples: &mut [f32], sample_rate: u32) {
+    let cutoff_hz = 70.0f32;
+    let dt = 1.0 / sample_rate as f32;
+    let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff_hz);
+    let alpha = rc / (rc + dt);
+    let mut previous_input = 0.0f32;
+    let mut previous_output = 0.0f32;
+    for sample in samples {
+        let input = if sample.is_finite() { *sample } else { 0.0 };
+        let output = alpha * (previous_output + input - previous_input);
+        previous_input = input;
+        previous_output = output;
+        *sample = output;
+    }
+}
+
+fn suppress_stationary_noise(samples: &mut [f32], sample_rate: u32, level: NoiseSuppressionLevel) {
+    let strength = match level {
+        NoiseSuppressionLevel::Off => return,
+        NoiseSuppressionLevel::Low => 1.5,
+        NoiseSuppressionLevel::Medium => 2.0,
+        NoiseSuppressionLevel::High => 2.8,
+    };
+    let frame_len = (sample_rate as usize / 100).max(1); // 10 ms
+    let mut frame_levels: Vec<f32> = samples
+        .chunks(frame_len)
+        .map(|frame| meter(frame).rms)
+        .collect();
+    if frame_levels.is_empty() {
+        return;
+    }
+    frame_levels.sort_by(f32::total_cmp);
+    let noise_floor = frame_levels[frame_levels.len() / 4].max(0.000_5);
+    let threshold = noise_floor * strength;
+    let minimum_gain = match level {
+        NoiseSuppressionLevel::Low => 0.45,
+        NoiseSuppressionLevel::Medium => 0.2,
+        NoiseSuppressionLevel::High => 0.08,
+        NoiseSuppressionLevel::Off => 1.0,
+    };
+    let mut smoothed_gain = 1.0f32;
+    for frame in samples.chunks_mut(frame_len) {
+        let rms = meter(frame).rms;
+        let target_gain = if rms >= threshold {
+            1.0
+        } else {
+            (rms / threshold).clamp(minimum_gain, 1.0)
+        };
+        // Open quickly for speech, close gradually to avoid audible pumping.
+        let smoothing = if target_gain > smoothed_gain {
+            0.65
+        } else {
+            0.18
+        };
+        smoothed_gain += (target_gain - smoothed_gain) * smoothing;
+        for sample in frame {
+            *sample *= smoothed_gain;
+        }
+    }
+}
+
+fn soft_limit(value: f32) -> f32 {
+    if value.abs() <= 0.95 {
+        value
+    } else {
+        value.signum() * (0.95 + 0.05 * ((value.abs() - 0.95) / 0.05).tanh())
+    }
 }
 
 /// Averages complete interleaved frames into normalized mono samples.
@@ -645,6 +828,33 @@ pub fn resample_linear(samples: &[f32], source_rate: u32, target_rate: u32) -> V
             samples[left] + (samples[right] - samples[left]) * fraction
         })
         .collect()
+}
+
+/// Owned variant used by the recording pipeline. Downsampling is performed in
+/// place, which avoids holding both the full input and output recordings at once.
+fn resample_linear_owned(mut samples: Vec<f32>, source_rate: u32, target_rate: u32) -> Vec<f32> {
+    if samples.is_empty() || source_rate == 0 || target_rate == 0 {
+        samples.clear();
+        return samples;
+    }
+    if source_rate == target_rate {
+        return samples;
+    }
+    if target_rate > source_rate {
+        return resample_linear(&samples, source_rate, target_rate);
+    }
+
+    let output_len = ((samples.len() as u64 * target_rate as u64) / source_rate as u64) as usize;
+    let scale = source_rate as f64 / target_rate as f64;
+    for index in 0..output_len {
+        let position = index as f64 * scale;
+        let left = position.floor() as usize;
+        let right = (left + 1).min(samples.len() - 1);
+        let fraction = (position - left as f64) as f32;
+        samples[index] = samples[left] + (samples[right] - samples[left]) * fraction;
+    }
+    samples.truncate(output_len);
+    samples
 }
 
 pub fn meter(samples: &[f32]) -> LevelMeter {
@@ -695,14 +905,18 @@ fn write_pcm16_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<(),
     writer.write_all(&16u16.to_le_bytes())?;
     writer.write_all(b"data")?;
     writer.write_all(&data_size.to_le_bytes())?;
-    for sample in samples {
-        let normalized = if sample.is_finite() {
-            sample.clamp(-1.0, 1.0)
-        } else {
-            0.0
-        };
-        let value = (normalized * i16::MAX as f32).round() as i16;
-        writer.write_all(&value.to_le_bytes())?;
+    const SAMPLES_PER_CHUNK: usize = 4096;
+    let mut encoded = [0u8; SAMPLES_PER_CHUNK * 2];
+    for chunk in samples.chunks(SAMPLES_PER_CHUNK) {
+        for (sample, bytes) in chunk.iter().zip(encoded.chunks_exact_mut(2)) {
+            let normalized = if sample.is_finite() {
+                sample.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            bytes.copy_from_slice(&((normalized * i16::MAX as f32).round() as i16).to_le_bytes());
+        }
+        writer.write_all(&encoded[..chunk.len() * 2])?;
     }
     writer.flush()?;
     Ok(())
@@ -911,9 +1125,24 @@ where
         .build_input_stream(
             config,
             move |data: &[T], _| {
-                let interleaved: Vec<f32> =
-                    data.iter().copied().map(cpal::Sample::to_sample).collect();
-                let mono = interleaved_to_mono(&interleaved, channels);
+                // Convert and downmix directly into the mono buffer. The old
+                // path first allocated a full interleaved f32 copy on every
+                // callback, briefly doubling callback memory and copy work.
+                let channel_count = channels as usize;
+                let mono: Vec<f32> = if channel_count == 0 {
+                    Vec::new()
+                } else {
+                    data.chunks_exact(channel_count)
+                        .map(|frame| {
+                            frame
+                                .iter()
+                                .copied()
+                                .map(|sample| cpal::Sample::to_sample::<f32>(sample))
+                                .sum::<f32>()
+                                / channel_count as f32
+                        })
+                        .collect()
+                };
                 let current_level = meter(&mono);
                 if let Ok(mut state) = shared.lock() {
                     state.level = current_level;
@@ -961,6 +1190,89 @@ mod tests {
         assert_eq!(upsampled.len(), 8);
         assert!((upsampled[1] - 0.5).abs() < 1e-6);
         assert_eq!(resample_linear(&source, 4, 2).len(), 2);
+    }
+
+    #[test]
+    fn owned_resampling_matches_borrowed_resampling() {
+        let source: Vec<f32> = (0..997).map(|index| (index as f32 * 0.17).sin()).collect();
+        for target_rate in [16_000, 24_000, 48_000] {
+            let expected = resample_linear(&source, 48_000, target_rate);
+            let actual = resample_linear_owned(source.clone(), 48_000, target_rate);
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn combined_vad_meter_matches_standalone_meter() {
+        let samples = [0.0, 0.25, -0.5, f32::NAN, 2.0, 0.0];
+        let (_, combined) = EnergyVad::new(EnergyVadConfig::default())
+            .analyze_with_meter(&samples, TARGET_SAMPLE_RATE);
+        assert_eq!(combined, meter(&samples));
+    }
+
+    #[test]
+    fn manual_gain_increases_quiet_audio_without_clipping() {
+        let mut samples: Vec<f32> = (0..2_400)
+            .map(|index| (index as f32 * 0.07).sin() * 0.05)
+            .collect();
+        let before = meter(&samples).rms;
+        enhance_audio(
+            &mut samples,
+            TARGET_SAMPLE_RATE,
+            AudioEnhancementConfig {
+                noise_suppression: NoiseSuppressionLevel::Off,
+                gain: 2.0,
+                automatic_gain: false,
+            },
+        );
+        let after = meter(&samples);
+        assert!(after.rms > before * 1.7);
+        assert!(after.peak <= 1.0);
+        assert!(samples.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn high_noise_suppression_attenuates_quiet_frames() {
+        let noise: Vec<f32> = (0..2_400)
+            .map(|index| if index % 2 == 0 { 0.006 } else { -0.006 })
+            .collect();
+        let speech: Vec<f32> = (0..2_400)
+            .map(|index| (index as f32 * 0.11).sin() * 0.12)
+            .collect();
+        let mut off = [noise.clone(), speech.clone()].concat();
+        let mut high = off.clone();
+        enhance_audio(
+            &mut off,
+            TARGET_SAMPLE_RATE,
+            AudioEnhancementConfig {
+                noise_suppression: NoiseSuppressionLevel::Off,
+                gain: 1.0,
+                automatic_gain: false,
+            },
+        );
+        enhance_audio(
+            &mut high,
+            TARGET_SAMPLE_RATE,
+            AudioEnhancementConfig {
+                noise_suppression: NoiseSuppressionLevel::High,
+                gain: 1.0,
+                automatic_gain: false,
+            },
+        );
+        let quiet_tail = 1_200..2_400;
+        assert!(meter(&high[quiet_tail.clone()]).rms < meter(&off[quiet_tail]).rms * 0.5);
+        assert!(meter(&high[2_640..]).rms > meter(&off[2_640..]).rms * 0.8);
+    }
+
+    #[test]
+    fn enhancement_sanitizes_non_finite_samples() {
+        let mut samples = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.25];
+        enhance_audio(
+            &mut samples,
+            TARGET_SAMPLE_RATE,
+            AudioEnhancementConfig::default(),
+        );
+        assert!(samples.iter().all(|sample| sample.is_finite()));
     }
 
     #[test]
