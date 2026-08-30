@@ -92,11 +92,17 @@ The generation token limit for VibeVoice can be overridden via
 This backend calls `POST /v1/audio/transcriptions`, so the same desktop workflow
 can use OpenAI or a compatible local server. In **Models**, select
 **OpenAI-compatible API**, then configure the base URL and model ID. API secrets
-are not stored in application settings: the worker reads the environment
-variable named in the UI (by default `OPENAI_API_KEY`). Restart the desktop app
-after setting the variable so it inherits the value.
+are not stored in application settings. The desktop app loads a local `.env`
+file at startup and reads the environment variable named in the UI (by default
+`OPENAI_API_KEY`). The `.env` file may be placed in the project directory during
+development or next to the desktop executable. Existing process/system
+environment variables take precedence over values from `.env`.
 
 ```powershell
+# Put this in .env instead:
+OPENAI_API_KEY=...
+
+# Or set it in PowerShell for the current process:
 $env:OPENAI_API_KEY = "..."
 # Base URL: https://api.openai.com/v1
 # Model ID: gpt-4o-mini-transcribe (or another available transcription model)
@@ -126,6 +132,11 @@ The automatic editor has independent switches for:
 - formatting spoken lists, steps, action items, and key points;
 - light clarity and grammar repair without changing meaning, tone, or formality.
 
+For OpenAI correction, reasoning effort can be set to `none`, `low`, `medium`,
+`high`, `xhigh`, or `max`. Higher values can improve difficult corrections at
+the cost of additional latency and token usage; support depends on the selected
+model.
+
 The provider prompt treats the transcript as untrusted data. Questions and
 commands spoken into the transcript are edited as text rather than answered or
 executed. Additional style and tone guidance can be configured separately from
@@ -153,16 +164,15 @@ All fixed prompt text and prompt-size limits are centralized in
 `src-tauri/src/correction_prompt.rs` under the `Prompt tuning` block. Edit that
 block to tune correction behavior without changing provider/API request code.
 
-API secrets are never stored in application settings. Set the environment
-variable shown in Settings, then restart the desktop app so it inherits the
-value:
+API secrets are never stored in application settings. Put the environment
+variables shown in Settings in `.env`, then restart the desktop app:
 
 ```powershell
 # OpenAI Responses API
-$env:OPENAI_API_KEY = "..."
+OPENAI_API_KEY=...
 
 # Google Gemini Interactions API
-$env:GEMINI_API_KEY = "..."
+GEMINI_API_KEY=...
 ```
 
 Correction is disabled by default. The default model IDs can be changed in the
