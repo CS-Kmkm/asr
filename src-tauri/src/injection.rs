@@ -534,7 +534,7 @@ mod windows_backend {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-        KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_CONTROL, VK_LEFT, VK_MENU, VK_SHIFT, VK_V,
+        KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_LEFT, VK_MENU, VK_SHIFT, VK_V,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongPtrW,
@@ -848,6 +848,25 @@ mod windows_backend {
         }
     }
 
+    fn replacement_inputs(graphemes: usize, text: &str) -> Vec<INPUT> {
+        let mut inputs = Vec::with_capacity(graphemes.saturating_mul(2) + 4 + text.len() * 2);
+        if graphemes > 0 {
+            inputs.push(keyboard_input(VK_SHIFT, 0));
+            for _ in 0..graphemes {
+                inputs.push(keyboard_input(VK_LEFT, 0));
+                inputs.push(keyboard_input(VK_LEFT, KEYEVENTF_KEYUP.0));
+            }
+            inputs.push(keyboard_input(VK_SHIFT, KEYEVENTF_KEYUP.0));
+            // Some target controls append Unicode input instead of replacing
+            // the active selection. Delete the draft explicitly so the
+            // corrected text cannot be inserted alongside it.
+            inputs.push(keyboard_input(VK_BACK, 0));
+            inputs.push(keyboard_input(VK_BACK, KEYEVENTF_KEYUP.0));
+        }
+        append_unicode_inputs(&mut inputs, text);
+        inputs
+    }
+
     fn modifiers_released() -> bool {
         [VK_SHIFT, VK_CONTROL, VK_MENU]
             .into_iter()
@@ -1066,18 +1085,40 @@ mod windows_backend {
             if self.ime_composition_active(target)? || !modifiers_released() {
                 return Ok(false);
             }
-            let mut inputs = Vec::with_capacity(graphemes.saturating_mul(2) + 2 + text.len() * 2);
-            if graphemes > 0 {
-                inputs.push(keyboard_input(VK_SHIFT, 0));
-                for _ in 0..graphemes {
-                    inputs.push(keyboard_input(VK_LEFT, 0));
-                    inputs.push(keyboard_input(VK_LEFT, KEYEVENTF_KEYUP.0));
-                }
-                inputs.push(keyboard_input(VK_SHIFT, KEYEVENTF_KEYUP.0));
-            }
-            append_unicode_inputs(&mut inputs, text);
+            let inputs = replacement_inputs(graphemes, text);
             self.validate_target(target)?;
             Ok(send(&inputs))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn replacement_deletes_selected_draft_before_typing_corrected_text() {
+            let inputs = replacement_inputs(1, "x");
+            let events = inputs
+                .iter()
+                .map(|input| unsafe {
+                    let keyboard = input.Anonymous.ki;
+                    (keyboard.wVk, keyboard.dwFlags)
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                events,
+                [
+                    (VK_SHIFT, Default::default()),
+                    (VK_LEFT, Default::default()),
+                    (VK_LEFT, KEYEVENTF_KEYUP),
+                    (VK_SHIFT, KEYEVENTF_KEYUP),
+                    (VK_BACK, Default::default()),
+                    (VK_BACK, KEYEVENTF_KEYUP),
+                    (VIRTUAL_KEY(0), KEYEVENTF_UNICODE),
+                    (VIRTUAL_KEY(0), KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+                ]
+            );
         }
     }
 }
