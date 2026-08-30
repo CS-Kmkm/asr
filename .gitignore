@@ -16,6 +16,9 @@ src-tauri/gen/
 .codex/
 .claude/
 .agents/
+.env
+.env.*
+!.env.example
 *.sqlite3
 *.wav
 .mypy_cache/

@@ -304,9 +304,60 @@ fn parse_shortcut(value: &str) -> Result<Shortcut, String> {
     Shortcut::from_str(value.trim()).map_err(|_| "hotkey is invalid".to_string())
 }
 
+fn load_environment_file() {
+    let current_dir = std::env::current_dir().ok();
+    let executable = std::env::current_exe().ok();
+    let candidates = environment_file_candidates(current_dir.as_deref(), executable.as_deref());
+
+    if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
+        if let Err(error) = dotenvy::from_path(&path) {
+            eprintln!(
+                "Failed to load environment file {}: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+fn environment_file_candidates(
+    current_dir: Option<&Path>,
+    executable: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(current_dir) = current_dir {
+        candidates.push(current_dir.join(".env"));
+        if current_dir
+            .file_name()
+            .is_some_and(|name| name == "src-tauri")
+        {
+            if let Some(workspace) = current_dir.parent() {
+                candidates.push(workspace.join(".env"));
+            }
+        }
+    }
+    if let Some(parent) = executable.and_then(Path::parent) {
+        let path = parent.join(".env");
+        if !candidates.contains(&path) {
+            candidates.push(path);
+        }
+    }
+    candidates
+}
+
 #[cfg(test)]
 mod model_configuration_tests {
     use super::*;
+
+    #[test]
+    fn development_launch_finds_workspace_environment_file() {
+        let workspace = Path::new("workspace");
+        let current_dir = workspace.join("src-tauri");
+        let executable = current_dir.join("target/debug/local-voice-input.exe");
+
+        let candidates = environment_file_candidates(Some(&current_dir), Some(&executable));
+
+        assert!(candidates.contains(&workspace.join(".env")));
+    }
 
     #[test]
     fn custom_model_is_reflected_in_identity_and_worker_environment() {
@@ -425,6 +476,7 @@ async fn initialize_model_runtime(app: AppHandle, settings: Settings) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    load_environment_file();
     tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
