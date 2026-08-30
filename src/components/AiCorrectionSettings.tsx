@@ -120,6 +120,28 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
             }
           />
           <SettingRow
+            title="Reasoning effort"
+            detail="Choose the quality, latency, and cost tradeoff. None is fastest; high and above spend more time reasoning. Availability depends on the selected model."
+            control={
+              <select
+                value={settings.openaiReasoningEffort}
+                onChange={(event) =>
+                  onSave({
+                    openaiReasoningEffort: event.target
+                      .value as Settings["openaiReasoningEffort"],
+                  })
+                }
+              >
+                <option value="none">None — fastest</option>
+                <option value="low">Low</option>
+                <option value="medium">Medium — balanced</option>
+                <option value="high">High</option>
+                <option value="xhigh">XHigh</option>
+                <option value="max">Max — quality first</option>
+              </select>
+            }
+          />
+          <SettingRow
             title="OpenAI API key environment variable"
             detail="The key itself is not saved. Restart the app after setting this variable."
             control={

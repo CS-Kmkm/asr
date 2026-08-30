@@ -491,6 +491,11 @@ pub(crate) async fn update_settings(
     if !types::CORRECTION_PROVIDERS.contains(&settings.correction_provider.as_str()) {
         return Err("text correction provider must be openai or gemini".into());
     }
+    if !types::OPENAI_REASONING_EFFORTS.contains(&settings.openai_reasoning_effort.as_str()) {
+        return Err(
+            "OpenAI reasoning effort must be none, low, medium, high, xhigh, or max".into(),
+        );
+    }
     if !["4bit", "8bit", "bf16"].contains(&settings.model_quantization.as_str()) {
         return Err("model quantization must be 4bit, 8bit, or bf16".into());
     }

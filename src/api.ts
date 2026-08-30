@@ -33,6 +33,7 @@ export const defaultSettings: Settings = {
   textCorrectionEnabled: false,
   correctionProvider: "openai",
   openaiCorrectionModel: "gpt-5.6-luna",
+  openaiReasoningEffort: "none",
   openaiApiKeyEnvVar: "OPENAI_API_KEY",
   geminiCorrectionModel: "gemini-flash-lite-latest",
   geminiApiKeyEnvVar: "GEMINI_API_KEY",

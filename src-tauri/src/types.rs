@@ -52,6 +52,8 @@ pub struct Settings {
     pub correction_provider: String,
     #[serde(default = "default_openai_correction_model")]
     pub openai_correction_model: String,
+    #[serde(default = "default_openai_reasoning_effort")]
+    pub openai_reasoning_effort: String,
     #[serde(default = "default_openai_api_key_env_var")]
     pub openai_api_key_env_var: String,
     #[serde(default = "default_gemini_correction_model")]
@@ -83,6 +85,7 @@ pub struct CustomModel {
 
 pub const ASR_BACKENDS: [&str; 4] = ["vibevoice", "faster-whisper", "openai-compatible", "mock"];
 pub const CORRECTION_PROVIDERS: [&str; 2] = ["openai", "gemini"];
+pub const OPENAI_REASONING_EFFORTS: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];
 
 fn default_asr_backend() -> String {
     "faster-whisper".into()
@@ -110,6 +113,10 @@ fn default_correction_provider() -> String {
 
 fn default_openai_correction_model() -> String {
     "gpt-5.6-luna".into()
+}
+
+fn default_openai_reasoning_effort() -> String {
+    "none".into()
 }
 
 fn default_openai_api_key_env_var() -> String {
@@ -162,6 +169,7 @@ impl Default for Settings {
             text_correction_enabled: false,
             correction_provider: default_correction_provider(),
             openai_correction_model: default_openai_correction_model(),
+            openai_reasoning_effort: default_openai_reasoning_effort(),
             openai_api_key_env_var: default_openai_api_key_env_var(),
             gemini_correction_model: default_gemini_correction_model(),
             gemini_api_key_env_var: default_gemini_api_key_env_var(),
@@ -305,6 +313,7 @@ mod tests {
         assert!(!settings.text_correction_enabled);
         assert_eq!(settings.correction_provider, "openai");
         assert_eq!(settings.openai_correction_model, "gpt-5.6-luna");
+        assert_eq!(settings.openai_reasoning_effort, "none");
         assert_eq!(settings.openai_api_key_env_var, "OPENAI_API_KEY");
         assert_eq!(settings.gemini_correction_model, "gemini-flash-lite-latest");
         assert_eq!(settings.gemini_api_key_env_var, "GEMINI_API_KEY");

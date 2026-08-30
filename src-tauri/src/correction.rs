@@ -14,7 +14,7 @@ const MAX_ERROR_BODY_CHARS: usize = 500;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CorrectionError {
-    #[error("the {0} environment variable is not set")]
+    #[error("the {0} environment variable or .env entry is not set")]
     MissingApiKey(String),
     #[error("text correction request failed: {0}")]
     Request(#[from] reqwest::Error),
@@ -100,16 +100,20 @@ fn api_key(environment_variable: &str) -> Result<String, CorrectionError> {
 }
 
 fn openai_request(settings: &Settings, transcript: &str, instruction: &str) -> Value {
+    let model = settings.openai_correction_model.trim();
+    let effort = settings.openai_reasoning_effort.as_str();
     let mut request = json!({
-        "model": settings.openai_correction_model.trim(),
+        "model": model,
         "instructions": instruction,
         "input": transcript,
         "max_output_tokens": max_output_tokens(transcript),
         "store": false,
         "stream": true
     });
-    if supports_openai_none_reasoning(settings.openai_correction_model.trim()) {
-        request["reasoning"] = json!({"effort": "none"});
+    if effort != "none" || supports_openai_none_reasoning(model) {
+        request["reasoning"] = json!({"effort": effort});
+    }
+    if supports_openai_none_reasoning(model) {
         request["text"] = json!({"verbosity": "low"});
     }
     request
@@ -206,7 +210,10 @@ fn apply_stream_event(
     on_update: &mut impl FnMut(&str),
 ) -> Result<bool, CorrectionError> {
     if data == "[DONE]" {
-        return Ok(true);
+        // `[DONE]` only terminates the SSE framing. Success requires the
+        // provider's semantic completion event so partial output is never
+        // mistaken for a completed correction.
+        return Ok(false);
     }
     let value: Value = serde_json::from_str(data)
         .map_err(|error| CorrectionError::InvalidResponse(error.to_string()))?;
@@ -231,14 +238,48 @@ fn apply_stream_event(
         on_update(delta);
     }
     match (provider, event_type) {
-        ("openai", Some("response.completed")) | ("gemini", Some("interaction.completed")) => {
-            Ok(true)
+        ("openai", Some("response.completed")) => Ok(true),
+        ("gemini", Some("interaction.completed"))
+            if value.pointer("/interaction/status").and_then(Value::as_str)
+                == Some("incomplete") =>
+        {
+            Err(CorrectionError::InvalidResponse(incomplete_stream_message(
+                provider, &value,
+            )))
+        }
+        ("gemini", Some("interaction.completed")) => Ok(true),
+        ("openai", Some("response.incomplete")) => Err(CorrectionError::InvalidResponse(
+            incomplete_stream_message(provider, &value),
+        )),
+        ("gemini", Some("interaction.status_update"))
+            if value.get("status").and_then(Value::as_str) == Some("incomplete") =>
+        {
+            Err(CorrectionError::InvalidResponse(incomplete_stream_message(
+                provider, &value,
+            )))
         }
         ("openai", Some("error" | "response.failed"))
         | ("gemini", Some("error" | "interaction.failed")) => Err(
             CorrectionError::InvalidResponse(stream_error_message(&value)),
         ),
         _ => Ok(false),
+    }
+}
+
+fn incomplete_stream_message(provider: &str, value: &Value) -> String {
+    let reason = match provider {
+        "openai" => value
+            .pointer("/response/incomplete_details/reason")
+            .and_then(Value::as_str),
+        "gemini" => value
+            .get("status")
+            .or_else(|| value.pointer("/interaction/status"))
+            .and_then(Value::as_str),
+        _ => None,
+    };
+    match reason {
+        Some(reason) => format!("the streaming response was incomplete: {reason}"),
+        None => "the streaming response was incomplete".into(),
     }
 }
 
@@ -419,6 +460,18 @@ mod tests {
     }
 
     #[test]
+    fn openai_request_uses_configured_reasoning_effort() {
+        let settings = Settings {
+            openai_reasoning_effort: "high".into(),
+            ..Settings::default()
+        };
+
+        let request = openai_request(&settings, "raw text", "correct it");
+
+        assert_eq!(request["reasoning"]["effort"], "high");
+    }
+
+    #[test]
     fn parses_openai_responses_output_text() {
         let value = json!({
             "output": [{
@@ -513,6 +566,30 @@ mod tests {
         .unwrap());
         assert_eq!(text, "corrected");
         assert_eq!(previews, ["corrected"]);
+    }
+
+    #[test]
+    fn incomplete_and_done_events_never_complete_the_stream() {
+        let mut text = String::from("partial output");
+        let mut preview = |_value: &str| {};
+
+        let openai = apply_stream_event(
+            "openai",
+            r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}"#,
+            &mut text,
+            &mut preview,
+        );
+        assert!(matches!(openai, Err(CorrectionError::InvalidResponse(_))));
+
+        let gemini = apply_stream_event(
+            "gemini",
+            r#"{"event_type":"interaction.status_update","status":"incomplete"}"#,
+            &mut text,
+            &mut preview,
+        );
+        assert!(matches!(gemini, Err(CorrectionError::InvalidResponse(_))));
+
+        assert!(!apply_stream_event("openai", "[DONE]", &mut text, &mut preview).unwrap());
     }
 
     #[test]

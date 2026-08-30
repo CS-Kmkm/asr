@@ -453,6 +453,19 @@ mod tests {
     }
 
     #[test]
+    fn legacy_settings_receive_openai_reasoning_effort_default() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("openaiReasoningEffort");
+
+        let settings: Settings = serde_json::from_value(value).unwrap();
+
+        assert_eq!(settings.openai_reasoning_effort, "none");
+    }
+
+    #[test]
     fn defaults_select_faster_whisper_backend() {
         let storage = Storage::in_memory().unwrap();
         assert_eq!(
