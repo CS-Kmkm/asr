@@ -411,15 +411,14 @@ fn parse_gemini_response(value: &Value) -> Result<String, CorrectionError> {
 }
 
 fn compact_error_body(body: &str) -> String {
-    let message = serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .pointer("/error/message")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| body.trim().to_owned());
+    let Some(message) = serde_json::from_str::<Value>(body).ok().and_then(|value| {
+        value
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }) else {
+        return "unrecognized error response".into();
+    };
     let mut chars = message.chars();
     let compact = chars
         .by_ref()
@@ -718,5 +717,15 @@ mod tests {
             compact_error_body(r#"{"error":{"message":"invalid key"}}"#),
             "invalid key"
         );
+    }
+
+    #[test]
+    fn unrecognized_api_error_does_not_return_response_body() {
+        let body = "private transcript echoed by provider";
+
+        let message = compact_error_body(body);
+
+        assert_eq!(message, "unrecognized error response");
+        assert!(!message.contains(body));
     }
 }

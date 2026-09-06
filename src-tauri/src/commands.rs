@@ -27,10 +27,8 @@ pub(crate) fn get_app_state(state: State<'_, AppState>) -> AppStateSnapshot {
 pub(crate) async fn list_audio_devices(
     services: State<'_, Services>,
 ) -> Result<Vec<AudioDevice>, String> {
-    let audio = take_audio(&services)?;
-    let result = audio.list_devices().await.map_err(command_error);
-    return_audio(&services, audio);
-    result
+    let audio = services.audio.lock().await;
+    audio.list_devices().await.map_err(command_error)
 }
 
 #[tauri::command]
@@ -51,25 +49,21 @@ pub(crate) async fn start_recording(
         .capture_target()
         .map_err(command_error)?;
     let capture_config = capture_config(&settings);
-    let mut audio = take_audio(&services)?;
+    let mut audio = services.audio.lock().await;
     // Open the stream only when dictation starts. Keeping a Bluetooth headset
     // microphone armed while idle forces Windows to retain the low-fidelity
     // hands-free profile for playback.
-    let result = async {
+    async {
         audio.arm(capture_config.clone()).await?;
         audio.start(capture_config).await
     }
     .await
-    .map_err(command_error);
-    return_audio(&services, audio);
-    result?;
+    .map_err(command_error)?;
     if let Err(error) = services.lifecycle.mark_recording(operation_id) {
-        let mut audio = take_audio(&services)?;
-        let cancel_result = audio.cancel().await.map_err(command_error);
-        return_audio(&services, audio);
-        cancel_result?;
+        audio.cancel().await.map_err(command_error)?;
         return Err(error.into());
     }
+    drop(audio);
     *services
         .target
         .lock()
@@ -93,12 +87,10 @@ pub(crate) async fn start_recording(
             if services.lifecycle.phase() != PipelinePhase::Recording {
                 break;
             }
-            let level = services
-                .audio
-                .lock()
-                .ok()
-                .and_then(|slot| slot.as_ref().map(|audio| audio.level()))
-                .unwrap_or_default();
+            let level = {
+                let audio = services.audio.lock().await;
+                audio.level()
+            };
             let _ = app_for_levels.emit("audio-level", level);
         }
     });
@@ -150,20 +142,12 @@ pub(crate) async fn stop_recording(
         );
         command_error(error)
     })?;
-    let mut audio = take_audio(&services).map_err(|error| {
-        emit_state(
-            &app,
-            &state,
-            AppPhase::Error,
-            "Recording could not be completed. Start a new recording and try again.",
-        );
-        error
-    })?;
+    let mut audio = services.audio.lock().await;
     let artifact_result = audio.stop().await;
     // `stop` closes the input stream. Do not re-arm it while transcription is
     // running: on Bluetooth headsets an open microphone selects the low-quality
     // HFP playback profile until the stream is released.
-    return_audio(&services, audio);
+    drop(audio);
     let artifact = artifact_result.map_err(|error| {
         emit_state(
             &app,
@@ -257,7 +241,7 @@ pub(crate) async fn stop_recording(
         let correction_hints = storage
             .dictionary_correction_hints(&transcript.text)
             .unwrap_or_default();
-        match injector.begin_streaming(&transcript.text, &target, &input_monitor) {
+        match injector.begin_provisional(&transcript.text, &target, &input_monitor) {
             Ok(session) => {
                 streamed_into_target = session.is_some();
                 streaming_session = session;
@@ -283,9 +267,6 @@ pub(crate) async fn stop_recording(
             correction_cancel,
             |delta| {
                 emit_correction_preview(&app, delta, "streaming");
-                if let Some(session) = streaming_session.as_mut() {
-                    let _ = injector.push_stream_delta(session, delta, &input_monitor);
-                }
             },
         )
         .await
@@ -305,7 +286,7 @@ pub(crate) async fn stop_recording(
             }
             Err(correction::CorrectionError::Cancelled) => {
                 if let Some(session) = streaming_session.as_mut() {
-                    injector.cancel_streaming(session, &input_monitor);
+                    injector.cancel_provisional(session, &input_monitor);
                 }
                 input_monitor.shutdown();
                 emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
@@ -324,7 +305,7 @@ pub(crate) async fn stop_recording(
                 emit_status(
                     &app,
                     "text_correction_failed",
-                    &format!("AI correction failed; using the original transcript. {error}"),
+                    &correction_failure_status(&error),
                 );
             }
         }
@@ -333,7 +314,7 @@ pub(crate) async fn stop_recording(
     }
     if services.lifecycle.is_cancelled(operation_id) {
         if let Some(session) = streaming_session.as_mut() {
-            injector.cancel_streaming(session, &input_monitor);
+            injector.cancel_provisional(session, &input_monitor);
         }
         input_monitor.shutdown();
         emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
@@ -351,7 +332,7 @@ pub(crate) async fn stop_recording(
         },
     );
     let insertion_result = if let Some(session) = streaming_session.as_mut() {
-        injector.finish_streaming(session, &final_text, &input_monitor)
+        injector.finish_provisional(session, &final_text, &input_monitor)
     } else {
         injector.insert(&final_text, &target)
     };
@@ -368,14 +349,13 @@ pub(crate) async fn stop_recording(
         command_error(error)
     })?;
     let latency_ms = started.elapsed().as_millis() as u64;
-    let insertion_label = if streamed_into_target && insertion != InsertResult::ClipboardOnly {
-        "streaming_replace"
+    let insertion_label = if streamed_into_target && insertion == InsertResult::ClipboardPaste {
+        "provisional_replace"
     } else {
         match insertion {
-            InsertResult::UiAutomation => "ui_automation",
             InsertResult::ClipboardPaste => "clipboard_paste",
-            InsertResult::UnicodeInput => "unicode_input",
             InsertResult::ClipboardOnly => "clipboard_only",
+            InsertResult::PasteUnverified => "paste_unverified",
         }
     };
     storage
@@ -405,8 +385,10 @@ pub(crate) async fn stop_recording(
             None,
         )
         .map_err(command_error)?;
-    let completion = if insertion == InsertResult::ClipboardOnly && streamed_into_target {
-        "User activity or a target change stopped live replacement; the final result remains on the clipboard."
+    let completion = if insertion == InsertResult::PasteUnverified {
+        "Paste completion could not be confirmed. Check the input target before pasting again; the completed result is available in this app."
+    } else if insertion == InsertResult::ClipboardOnly && streamed_into_target {
+        "The provisional text could not be safely replaced; the final result remains on the clipboard."
     } else if insertion == InsertResult::ClipboardOnly {
         "Automatic insertion failed; the result remains on the clipboard."
     } else if correction_failed {
@@ -439,24 +421,160 @@ pub(crate) async fn cancel_recording(
     services: State<'_, Services>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let Some((operation_id, phase)) = services.lifecycle.cancel()? else {
+    if !cancel_pipeline_operation(&services.lifecycle, &services.audio, &services.target).await? {
         return Ok(());
-    };
-    if let Ok(mut target) = services.target.lock() {
-        target.take();
-    }
-    if matches!(phase, PipelinePhase::Starting | PipelinePhase::Recording) {
-        if let Ok(mut audio) = take_audio(&services) {
-            let result = audio.cancel().await.map_err(command_error);
-            return_audio(&services, audio);
-            result?;
-            services.lifecycle.finish(operation_id);
-        } else if phase == PipelinePhase::Recording {
-            return Err("audio operation is already in progress".into());
-        }
     }
     emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
     Ok(())
+}
+
+async fn cancel_pipeline_operation(
+    lifecycle: &PipelineLifecycle,
+    audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
+    target: &Mutex<Option<TargetWindow>>,
+) -> Result<bool, String> {
+    let Some((operation_id, phase)) = lifecycle.cancel()? else {
+        return Ok(false);
+    };
+    let _guard = PipelineGuard {
+        lifecycle,
+        id: operation_id,
+    };
+    if let Ok(mut target) = target.lock() {
+        target.take();
+    }
+    if matches!(phase, PipelinePhase::Starting | PipelinePhase::Recording) {
+        let mut audio = audio.lock().await;
+        audio.cancel().await.map_err(command_error)?;
+    }
+    Ok(true)
+}
+
+fn correction_failure_status(error: &correction::CorrectionError) -> String {
+    let kind = match error {
+        correction::CorrectionError::MissingApiKey(_) => "missing_api_key",
+        correction::CorrectionError::Request(_) => "request_failed",
+        correction::CorrectionError::Api { status, .. } => {
+            return format!(
+                "AI correction failed; using the original transcript. HTTP status {}.",
+                status.as_u16()
+            );
+        }
+        correction::CorrectionError::InvalidResponse(_) => "invalid_response",
+        correction::CorrectionError::Cancelled => "cancelled",
+        correction::CorrectionError::UnsupportedProvider(_) => "unsupported_provider",
+    };
+    format!("AI correction failed; using the original transcript. Error kind: {kind}.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::{AudioArtifact, AudioError, AudioFuture, CaptureState, LevelMeter};
+
+    struct TestAudio {
+        cancel_error: bool,
+    }
+
+    impl AudioCapture for TestAudio {
+        fn list_devices(&self) -> AudioFuture<'_, Vec<AudioDevice>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn arm(&mut self, _config: CaptureConfig) -> AudioFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn disarm(&mut self) -> AudioFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn start(&mut self, _config: CaptureConfig) -> AudioFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn stop(&mut self) -> AudioFuture<'_, AudioArtifact> {
+            Box::pin(async { Err(AudioError::NotCapturing) })
+        }
+
+        fn cancel(&mut self) -> AudioFuture<'_, ()> {
+            let cancel_error = self.cancel_error;
+            Box::pin(async move {
+                if cancel_error {
+                    Err(AudioError::NotCapturing)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn state(&self) -> CaptureState {
+            CaptureState::Idle
+        }
+
+        fn level(&self) -> LevelMeter {
+            LevelMeter::default()
+        }
+    }
+
+    fn test_audio(cancel_error: bool) -> tokio::sync::Mutex<Box<dyn AudioCapture>> {
+        tokio::sync::Mutex::new(Box::new(TestAudio { cancel_error }))
+    }
+
+    #[tokio::test]
+    async fn cancel_waits_for_audio_operation_then_allows_new_start() {
+        let lifecycle = PipelineLifecycle::default();
+        let operation_id = lifecycle.begin_start().unwrap();
+        lifecycle.mark_recording(operation_id).unwrap();
+        let audio = test_audio(false);
+        let target = Mutex::new(None);
+        let audio_operation = audio.lock().await;
+        let cancellation = cancel_pipeline_operation(&lifecycle, &audio, &target);
+        tokio::pin!(cancellation);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), cancellation.as_mut())
+                .await
+                .is_err()
+        );
+        drop(audio_operation);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), cancellation)
+                .await
+                .unwrap(),
+            Ok(true)
+        );
+        assert!(lifecycle.begin_start().is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_audio_cancel_still_allows_new_start() {
+        let lifecycle = PipelineLifecycle::default();
+        let operation_id = lifecycle.begin_start().unwrap();
+        lifecycle.mark_recording(operation_id).unwrap();
+        let audio = test_audio(true);
+        let target = Mutex::new(None);
+
+        assert!(cancel_pipeline_operation(&lifecycle, &audio, &target)
+            .await
+            .is_err());
+        assert!(lifecycle.begin_start().is_ok());
+    }
+
+    #[test]
+    fn correction_failure_status_excludes_provider_response_body() {
+        let marker = "private transcript echoed by provider";
+        let message = correction_failure_status(&correction::CorrectionError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            message: marker.into(),
+        });
+
+        assert_eq!(
+            message,
+            "AI correction failed; using the original transcript. HTTP status 400."
+        );
+        assert!(!message.contains(marker));
+    }
 }
 
 #[tauri::command]
@@ -596,6 +714,12 @@ pub(crate) async fn update_settings(
     let new_shortcut = parse_shortcut(&settings.hotkey)?;
     let previous = storage.get_settings().map_err(command_error)?;
     let old_shortcut = parse_shortcut(&previous.hotkey)?;
+    if cfg!(debug_assertions) && settings.auto_start && !previous.auto_start {
+        return Err(
+            "autostart cannot be enabled from a development build; install and run a release build"
+                .into(),
+        );
+    }
     if new_shortcut != old_shortcut {
         app.global_shortcut()
             .register(new_shortcut)

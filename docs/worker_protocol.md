@@ -34,7 +34,7 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
 
 - Rust側がワーカーを **spawn** する。起動コマンドは既定で `python -m asr_worker` であり、
   `--backend` 引数または環境変数 `ASR_WORKER_BACKEND` でバックエンド
-  (`vibevoice` / `faster-whisper` / `mock`、既定 `vibevoice`)を選択する。
+  (`vibevoice` / `faster-whisper` / `openai-compatible` / `mock`、既定 `faster-whisper`)を選択する。
 - ワーカーはstdinがEOFに達するか `shutdown` を受信するまでメッセージを処理し続ける。
 - ワーカープロセスは **ステートフル**である。`load` 後に内部状態 `loaded = True` を保持し、
   `transcribe` はロード済みを前提とする。

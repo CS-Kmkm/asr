@@ -246,11 +246,13 @@ pub struct NewDictionaryEntry<'a> {
 pub struct DictionaryEntryInput {
     pub reading: String,
     pub surface: String,
+    #[serde(default)]
     pub category: Option<String>,
     #[serde(default)]
     pub aliases: Vec<String>,
     #[serde(default)]
     pub priority: i64,
+    #[serde(default)]
     pub app_scope: Option<String>,
 }
 
@@ -290,6 +292,25 @@ mod tests {
     fn default_settings_use_faster_whisper_backend() {
         assert_eq!(Settings::default().asr_backend, "faster-whisper");
         assert_eq!(Settings::default().model_quantization, "4bit");
+    }
+
+    #[test]
+    fn dictionary_entry_input_accepts_frontend_payload_without_optional_fields() {
+        let input: DictionaryEntryInput = serde_json::from_str(
+            r#"{
+                "reading": "open ai",
+                "surface": "OpenAI",
+                "category": null,
+                "aliases": ["ChatGPT"],
+                "priority": 0
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(input.category, None);
+        assert_eq!(input.app_scope, None);
+        assert_eq!(input.aliases, vec!["ChatGPT"]);
+        assert_eq!(input.priority, 0);
     }
 
     #[test]

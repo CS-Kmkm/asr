@@ -84,7 +84,7 @@ pub(crate) fn model_identity(settings: &Settings) -> (Option<String>, String) {
 }
 
 pub(crate) struct Services {
-    audio: Mutex<Option<Box<dyn AudioCapture>>>,
+    audio: tokio::sync::Mutex<Box<dyn AudioCapture>>,
     target: Mutex<Option<TargetWindow>>,
     transcriber: Arc<dyn Transcriber>,
     input_monitor: Arc<InputMonitor>,
@@ -99,7 +99,7 @@ impl Services {
     fn new(settings: &Settings) -> Self {
         let (model_id, detail) = model_identity(settings);
         Self {
-            audio: Mutex::new(Some(Box::new(CpalAudioCapture::new()))),
+            audio: tokio::sync::Mutex::new(Box::new(CpalAudioCapture::new())),
             target: Mutex::new(None),
             transcriber: Arc::new(JsonlTranscriber::new(
                 worker_command_for_settings(settings),
@@ -133,8 +133,9 @@ impl Services {
                 task.abort();
             }
         }
-        if let Ok(mut audio) = self.audio.lock() {
-            audio.take();
+        {
+            let mut audio = self.audio.lock().await;
+            let _ = audio.cancel().await;
         }
         if let Ok(mut target) = self.target.lock() {
             target.take();
@@ -279,21 +280,6 @@ pub(crate) fn emit_status(app: &AppHandle, kind: &str, message: &str) {
     );
 }
 
-pub(crate) fn take_audio(services: &Services) -> Result<Box<dyn AudioCapture>, String> {
-    services
-        .audio
-        .lock()
-        .map_err(|_| "audio service is unavailable".to_string())?
-        .take()
-        .ok_or_else(|| "audio operation is already in progress".to_string())
-}
-
-pub(crate) fn return_audio(services: &Services, audio: Box<dyn AudioCapture>) {
-    if let Ok(mut slot) = services.audio.lock() {
-        *slot = Some(audio);
-    }
-}
-
 fn database_path(app: &AppHandle) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let directory = app.path().app_data_dir()?;
     fs::create_dir_all(&directory)?;
@@ -397,18 +383,104 @@ mod model_configuration_tests {
             key == "ASR_API_BASE_URL" && value == "http://127.0.0.1:8000/v1"
         }));
     }
+
+    #[test]
+    fn stale_artifact_cleanup_preserves_live_and_unrecognized_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory
+            .path()
+            .join(format!("local-ai-voice-{}-1-0.wav", std::process::id()));
+        let dead = directory
+            .path()
+            .join(format!("local-ai-voice-{}-1-0.wav", u32::MAX));
+        let unrecognized = directory
+            .path()
+            .join(format!("local-ai-voice-{}-1.wav", u32::MAX));
+        fs::write(&live, b"live").unwrap();
+        fs::write(&dead, b"dead").unwrap();
+        fs::write(&unrecognized, b"unrecognized").unwrap();
+
+        assert_eq!(cleanup_stale_artifacts(directory.path(), true).unwrap(), 1);
+        assert!(live.exists());
+        assert!(!dead.exists());
+        assert!(unrecognized.exists());
+    }
+
+    #[test]
+    fn stale_artifact_cleanup_is_skipped_when_audio_is_retained() {
+        let directory = tempfile::tempdir().unwrap();
+        let retained = directory
+            .path()
+            .join(format!("local-ai-voice-{}-1-0.wav", u32::MAX));
+        fs::write(&retained, b"retained").unwrap();
+
+        assert_eq!(
+            cleanup_stale_artifacts(&directory.path().join("missing"), false).unwrap(),
+            0
+        );
+        assert_eq!(cleanup_stale_artifacts(directory.path(), false).unwrap(), 0);
+        assert!(retained.exists());
+    }
 }
 
-fn cleanup_stale_artifacts(directory: &Path) -> io::Result<usize> {
+fn artifact_process_id(name: &std::ffi::OsStr) -> Option<u32> {
+    let components = name
+        .to_str()?
+        .strip_prefix("local-ai-voice-")?
+        .strip_suffix(".wav")?
+        .split('-')
+        .collect::<Vec<_>>();
+    if components.len() != 3 {
+        return None;
+    }
+    let process_id = components[0].parse().ok()?;
+    components[1].parse::<u128>().ok()?;
+    components[2].parse::<u64>().ok()?;
+    Some(process_id)
+}
+
+#[cfg(target_os = "windows")]
+fn process_is_live(process_id: u32) -> bool {
+    use windows::Win32::{
+        Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, STILL_ACTIVE},
+        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+
+    let process = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
+    {
+        Ok(process) => process,
+        Err(error)
+            if error.code() == windows::core::HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) =>
+        {
+            return false;
+        }
+        // Access can be denied for protected processes. If liveness cannot be
+        // disproved, preserve the artifact rather than risking another process's file.
+        Err(_) => return true,
+    };
+    let mut exit_code = 0;
+    let result = unsafe { GetExitCodeProcess(process, &mut exit_code) };
+    let _ = unsafe { CloseHandle(process) };
+    result.is_err() || exit_code == STILL_ACTIVE.0 as u32
+}
+
+#[cfg(not(target_os = "windows"))]
+fn process_is_live(process_id: u32) -> bool {
+    process_id == std::process::id() || Path::new("/proc").join(process_id.to_string()).exists()
+}
+
+fn cleanup_stale_artifacts(
+    directory: &Path,
+    delete_audio_after_processing: bool,
+) -> io::Result<usize> {
+    if !delete_audio_after_processing {
+        return Ok(0);
+    }
     let mut removed = 0;
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        let name = entry.file_name();
-        if name.to_string_lossy().starts_with("local-ai-voice-")
-            && entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension == "wav")
+        if artifact_process_id(&entry.file_name())
+            .is_some_and(|process_id| !process_is_live(process_id))
         {
             match fs::remove_file(entry.path()) {
                 Ok(()) => removed += 1,
@@ -496,17 +568,24 @@ pub fn run() {
             let storage = Storage::open(&database_path(app.handle())?)?;
             storage.enforce_current_history_policy()?;
             let settings = storage.get_settings()?;
-            let autostart_result = if settings.auto_start {
-                app.autolaunch().enable()
-            } else {
-                app.autolaunch().disable()
-            };
-            if let Err(error) = autostart_result {
-                emit_status(
-                    app.handle(),
-                    "autostart_update_failed",
-                    &format!("Autostart update failed: {error}"),
-                );
+            // The autostart plugin registers the currently running executable.
+            // A development executable depends on Vite's dev server and cannot
+            // run on its own at Windows sign-in, so it must never replace the
+            // registration created by an installed/release build.
+            #[cfg(not(debug_assertions))]
+            {
+                let autostart_result = if settings.auto_start {
+                    app.autolaunch().enable()
+                } else {
+                    app.autolaunch().disable()
+                };
+                if let Err(error) = autostart_result {
+                    emit_status(
+                        app.handle(),
+                        "autostart_update_failed",
+                        &format!("Autostart update failed: {error}"),
+                    );
+                }
             }
             let shortcut = parse_shortcut(&settings.hotkey)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -515,7 +594,12 @@ pub fn run() {
             app.manage(Services::new(&settings));
             recording_overlay::create(app.handle())?;
             app.global_shortcut().register(shortcut)?;
-            if cleanup_stale_artifacts(&std::env::temp_dir()).is_err() {
+            if cleanup_stale_artifacts(
+                &std::env::temp_dir(),
+                settings.delete_audio_after_processing,
+            )
+            .is_err()
+            {
                 emit_status(
                     app.handle(),
                     "artifact_cleanup_failed",
