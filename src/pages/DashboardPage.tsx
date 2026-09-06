@@ -13,6 +13,7 @@ export function DashboardPage({
   recordingAction,
   onToggleRecording,
   onCancelRecording,
+  onCopyResult,
 }: {
   state: AppState;
   settings: Settings;
@@ -23,6 +24,7 @@ export function DashboardPage({
   recordingAction: boolean;
   onToggleRecording: () => void;
   onCancelRecording: () => void;
+  onCopyResult: (text: string) => void;
 }) {
   return (
     <section className="grid">
@@ -70,6 +72,27 @@ export function DashboardPage({
         value={model?.installed ? model.modelId ?? "Ready" : "Not installed"}
         detail={model?.detail ?? "Checking local cache"}
       />
+      {state.lastResult && (
+        <article className="info-card span-2">
+          <p className="eyebrow">LAST RESULT</p>
+          <div
+            className="history-text"
+            role="button"
+            tabIndex={0}
+            title="Double-click to copy"
+            onDoubleClick={() => onCopyResult(state.lastResult!)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                onCopyResult(state.lastResult!);
+              }
+            }}
+          >
+            {state.lastResult}
+          </div>
+          <p>Double-click to copy</p>
+        </article>
+      )}
       <InfoCard
         label="PRIVACY"
         value="Local only"

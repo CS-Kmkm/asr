@@ -118,7 +118,14 @@ export function DictionaryPage({
                   {` · priority ${entry.priority}`}
                 </p>
               </div>
-              <button className="secondary" onClick={() => onDelete(entry.id)}>
+              <button
+                className="secondary"
+                onClick={() => {
+                  if (window.confirm(`Delete “${entry.surface}” from the dictionary?`)) {
+                    onDelete(entry.id);
+                  }
+                }}
+              >
                 Delete
               </button>
             </div>

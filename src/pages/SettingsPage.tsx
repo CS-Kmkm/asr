@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { SettingRow, Toggle } from "../components/ui";
 import { AiCorrectionSettings } from "../components/AiCorrectionSettings";
 import type { Settings } from "../types";
@@ -9,6 +10,21 @@ export function SettingsPage({
   settings: Settings;
   onSave: (patch: Partial<Settings>) => void;
 }) {
+  const [hotkey, setHotkey] = useState(settings.hotkey);
+  const cancelHotkeyBlurRef = useRef(false);
+  const suppressHotkeyBlurRef = useRef(false);
+
+  useEffect(() => setHotkey(settings.hotkey), [settings.hotkey]);
+
+  function commitHotkey() {
+    if (cancelHotkeyBlurRef.current || suppressHotkeyBlurRef.current) {
+      cancelHotkeyBlurRef.current = false;
+      suppressHotkeyBlurRef.current = false;
+      return;
+    }
+    if (hotkey !== settings.hotkey) onSave({ hotkey });
+  }
+
   return (
     <div className="settings-stack">
       <section className="panel">
@@ -18,8 +34,21 @@ export function SettingsPage({
           detail="The default is Ctrl+Shift+Space."
           control={
             <input
-              value={settings.hotkey}
-              onChange={(e) => onSave({ hotkey: e.target.value })}
+              value={hotkey}
+              onChange={(e) => setHotkey(e.target.value)}
+              onBlur={commitHotkey}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  commitHotkey();
+                  suppressHotkeyBlurRef.current = true;
+                  e.currentTarget.blur();
+                } else if (e.key === "Escape") {
+                  setHotkey(settings.hotkey);
+                  cancelHotkeyBlurRef.current = true;
+                  e.currentTarget.blur();
+                }
+              }}
             />
           }
         />

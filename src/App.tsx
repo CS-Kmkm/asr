@@ -78,6 +78,11 @@ interface CorrectionPreview {
   stage: "draft" | "streaming" | "final" | "fallback";
 }
 
+interface Notice {
+  message: string;
+  severity: "info" | "error";
+}
+
 function compactOverlayPreview(text: string): string {
   const characters = Array.from(text.trim());
   return characters.length > OVERLAY_PREVIEW_CHARS
@@ -200,7 +205,9 @@ function MainApp() {
   const recordingActionRef = useRef(false);
   const [gpu, setGpu] = useState<GpuDiagnostics | null>(null);
   const [gpuChecking, setGpuChecking] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const showNotice = (message: string, severity: Notice["severity"] = "info") =>
+    setNotice({ message, severity });
   const [noticeCopied, setNoticeCopied] = useState(false);
   const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [level, setLevel] = useState<AudioLevel>({ rms: 0, peak: 0 });
@@ -228,13 +235,13 @@ function MainApp() {
           if (!nextSettings.setupComplete) setPage("setup");
         },
       )
-      .catch((error: unknown) => setNotice(String(error)));
+      .catch((error: unknown) => showNotice(String(error), "error"));
     const listeners = Promise.all([
       listen<AppState>("app-state", (event) => setState(event.payload)),
       listen<AudioLevel>("audio-level", (event) => setLevel(event.payload)),
       listen<ModelStatus>("model-status", (event) => setModel(event.payload)),
       listen<GpuDiagnostics>("gpu-diagnostics", (event) => setGpu(event.payload)),
-      listen<{ message: string }>("status", (event) => setNotice(event.payload.message)),
+      listen<{ message: string }>("status", (event) => showNotice(event.payload.message)),
     ]);
     return () => {
       void listeners.then((unlisten) => unlisten.forEach((fn) => fn()));
@@ -253,10 +260,10 @@ function MainApp() {
   async function copyNotice() {
     if (!notice) return;
     try {
-      await copyToClipboard(notice);
+      await copyToClipboard(notice.message);
       setNoticeCopied(true);
     } catch (error) {
-      setNotice(String(error));
+      showNotice(String(error), "error");
       setNoticeCopied(false);
     }
   }
@@ -265,30 +272,32 @@ function MainApp() {
     try {
       await copyToClipboard(text);
     } catch (error) {
-      setNotice(String(error));
+      showNotice(String(error), "error");
     }
   }
 
   async function saveSettings(patch: Partial<Settings>) {
+    const previous = settings;
     const next = { ...settings, ...patch };
     setSettings(next);
     try {
       setSettings(await updateSettings(next));
-      setNotice("Settings saved locally.");
+      showNotice("Settings saved locally.");
     } catch (error) {
-      setNotice(String(error));
+      setSettings(previous);
+      showNotice(String(error), "error");
     }
   }
 
   async function diagnoseGpu() {
     if (gpuChecking) return;
     setGpuChecking(true);
-    setNotice("Running local GPU diagnostics...");
+    showNotice("Running local GPU diagnostics...");
     try {
       setGpu(await runGpuDiagnostics());
-      setNotice("Diagnostics complete.");
+      showNotice("Diagnostics complete.");
     } catch (error) {
-      setNotice(String(error));
+      showNotice(String(error), "error");
     } finally {
       setGpuChecking(false);
     }
@@ -306,7 +315,7 @@ function MainApp() {
         await startRecording();
       }
     } catch (error) {
-      setNotice(String(error));
+      showNotice(String(error), "error");
       try {
         setState(await getAppState());
       } catch {
@@ -331,15 +340,15 @@ function MainApp() {
   ) {
     if (modelLoading) return;
     setModelLoading(true);
-    setNotice("Saving ASR settings and preparing the selected model...");
+    showNotice("Saving ASR settings and preparing the selected model...");
     try {
       const next = configuration ? { ...settings, ...configuration } : settings;
       const saved = configuration ? await updateSettings(next) : next;
       setSettings(saved);
       setModel(await loadModel(saved.modelId, saved.modelQuantization));
-      setNotice("Model loaded and ready.");
+      showNotice("Model loaded and ready.");
     } catch (error) {
-      setNotice(String(error));
+      showNotice(String(error), "error");
     } finally {
       setModelLoading(false);
     }
@@ -362,10 +371,10 @@ function MainApp() {
     try {
       const saved = await updateSettings(next);
       setSettings(saved);
-      setNotice("Custom model saved locally.");
+      showNotice("Custom model saved locally.");
       return true;
     } catch (error) {
-      setNotice(String(error));
+      showNotice(String(error), "error");
       return false;
     }
   }
@@ -374,10 +383,10 @@ function MainApp() {
     try {
       await addDictionaryEntry(entry);
       setDictionary(await listDictionary());
-      setNotice("Dictionary entry added.");
+      showNotice("Dictionary entry added.");
       return true;
     } catch (error) {
-      setNotice(String(error));
+      showNotice(String(error), "error");
       return false;
     }
   }
@@ -386,9 +395,9 @@ function MainApp() {
     try {
       await deleteDictionaryEntry(id);
       setDictionary(await listDictionary());
-      setNotice("Dictionary entry removed.");
+      showNotice("Dictionary entry removed.");
     } catch (error) {
-      setNotice(String(error));
+      showNotice(String(error), "error");
     }
   }
 
@@ -441,6 +450,7 @@ function MainApp() {
             recordingAction={recordingAction}
             onToggleRecording={() => void toggleRecording()}
             onCancelRecording={() => void cancelRecording()}
+            onCopyResult={(text) => void copyHistoryText(text)}
           />
         )}
 
@@ -512,7 +522,7 @@ function MainApp() {
 
       {notice && (
         <div
-          className={`notice${modelLoading ? " loading" : ""}`}
+          className={`notice ${notice.severity}${modelLoading ? " loading" : ""}`}
           aria-live="polite"
         >
           {modelLoading && <span className="progress-ring" aria-hidden="true" />}
@@ -521,7 +531,7 @@ function MainApp() {
             onDoubleClick={() => void copyNotice()}
             title="Double-click to copy"
           >
-            {notice}
+            {notice.message}
           </button>
           {noticeCopied && <span className="notice-copied">Copied</span>}
           <button

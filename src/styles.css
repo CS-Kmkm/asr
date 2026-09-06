@@ -127,6 +127,8 @@ p { color: #8da69e; line-height: 1.55; }
 .status-pill.error span { background: #f16f6f; box-shadow: 0 0 10px #f16f6f; }
 .status-pill.recording span { background: #ffbc66; box-shadow: 0 0 10px #ffbc66; }
 .notice { position: fixed; top: 22px; right: 24px; z-index: 10; width: min(500px, calc(100vw - 48px)); display: flex; align-items: center; gap: 11px; text-align: left; border: 0; background: rgba(20, 52, 42, .97); color: #d8f4e7; padding: 11px 12px 11px 17px; border-radius: 10px; box-shadow: 0 16px 46px rgba(0, 0, 0, .34); animation: notice-in .18s ease-out; }
+.notice.error { background: rgba(92, 30, 32, .97); color: #ffe1df; }
+.notice.error .notice-copied { color: #ffb6b1; }
 .notice-message { min-width: 0; flex: 1; padding: 0; overflow-wrap: anywhere; border: 0; background: transparent; color: inherit; text-align: inherit; cursor: copy; }
 .notice-copied { flex: 0 0 auto; color: #82e8bd; font-size: 12px; font-weight: 700; }
 .notice-dismiss { cursor: pointer; }
