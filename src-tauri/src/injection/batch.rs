@@ -37,13 +37,17 @@ fn paste<B: Backend>(
         None
     };
     if !safe(backend, target, activity, policy)
-        || backend.target_text(target).ok().as_ref() != Some(before)
+        || !backend
+            .target_text(target)
+            .is_ok_and(|actual| actual.same_content(before))
     {
         return copy_only(backend, text);
     }
     let sequence = backend.clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)?;
     if !safe(backend, target, activity, policy)
-        || backend.target_text(target).ok().as_ref() != Some(before)
+        || !backend
+            .target_text(target)
+            .is_ok_and(|actual| actual.same_content(before))
     {
         return copy_only(backend, text);
     }
@@ -55,7 +59,10 @@ fn paste<B: Backend>(
         if !safe(backend, target, activity, policy) {
             break;
         }
-        if backend.target_text(target).ok().as_ref() == Some(&expected) {
+        if backend
+            .target_text(target)
+            .is_ok_and(|actual| actual.same_content(&expected))
+        {
             if let Some(previous) = previous {
                 // Restoration failure cannot undo a confirmed edit and must
                 // never initiate a second insertion. New clipboard copies win.
@@ -198,7 +205,9 @@ pub(super) fn finish<B: Backend>(
         &session.target,
         activity,
         SafetyPolicy::Destructive,
-    ) || backend.target_text(&session.target).ok().as_ref() != Some(&session.after)
+    ) || !backend
+        .target_text(&session.target)
+        .is_ok_and(|actual| actual.same_content(&session.after))
         || !backend
             .select_recent(&session.target, &session.after, &session.displayed)
             .unwrap_or(false)
@@ -240,7 +249,9 @@ pub(super) fn cancel<B: Backend>(
         &session.target,
         activity,
         SafetyPolicy::Destructive,
-    ) && backend.target_text(&session.target).ok().as_ref() == Some(&session.after)
+    ) && backend
+        .target_text(&session.target)
+        .is_ok_and(|actual| actual.same_content(&session.after))
         && backend
             .select_recent(&session.target, &session.after, &session.displayed)
             .unwrap_or(false)
@@ -252,7 +263,10 @@ pub(super) fn cancel<B: Backend>(
         )
     {
         if let Some(selected) = session.after.select_recent(&session.displayed) {
-            if backend.target_text(&session.target).ok().as_ref() == Some(&selected) {
+            if backend
+                .target_text(&session.target)
+                .is_ok_and(|actual| actual.same_content(&selected))
+            {
                 let _ = backend.delete_selection(&session.target);
             }
         }
@@ -278,6 +292,7 @@ mod tests {
         settle_after: usize,
         waits: Cell<usize>,
         change_clipboard_on_paste: bool,
+        change_identity_on_paste: bool,
     }
 
     impl MockBackend {
@@ -301,12 +316,16 @@ mod tests {
                 settle_after: 0,
                 waits: Cell::new(0),
                 change_clipboard_on_paste: false,
+                change_identity_on_paste: false,
             }
         }
         fn apply_pending(&self) {
             if let Some(text) = self.pending.borrow_mut().take() {
                 let next = self.text.borrow().replaced_with(&text);
                 *self.text.borrow_mut() = next;
+                if self.change_identity_on_paste {
+                    self.text.borrow_mut().identity.push(2);
+                }
             }
         }
         fn content(&self) -> String {
@@ -524,6 +543,36 @@ mod tests {
             2
         );
         assert!(!backend.calls.borrow().contains(&"delete"));
+    }
+    #[test]
+    fn changed_element_identity_after_paste_still_confirms_and_replaces_draft() {
+        let mut backend = MockBackend::new();
+        backend.change_identity_on_paste = true;
+        let monitor = monitor();
+
+        let mut session = begin(
+            &backend,
+            InjectionOptions::default(),
+            "draft",
+            &target(),
+            &monitor,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(session.result, InsertResult::ClipboardPaste);
+
+        assert_eq!(
+            finish(
+                &backend,
+                InjectionOptions::default(),
+                &mut session,
+                "corrected",
+                &monitor,
+            )
+            .unwrap(),
+            InsertResult::ClipboardPaste
+        );
+        assert_eq!(backend.content(), "prefix corrected suffix");
     }
     #[test]
     fn unchanged_correction_or_api_failure_keeps_the_original_batch() {

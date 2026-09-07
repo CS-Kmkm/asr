@@ -194,6 +194,10 @@ fn normalize_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 impl TargetText {
+    fn same_content(&self, other: &Self) -> bool {
+        self.before == other.before && self.selected == other.selected && self.after == other.after
+    }
+
     fn replaced_with(&self, text: &str) -> Self {
         Self {
             identity: self.identity.clone(),

@@ -149,7 +149,7 @@ pub(super) fn select_recent(
     text: &str,
 ) -> Result<bool, InjectionError> {
     let control = TextControl::focused(target)?;
-    if control.state()? != *expected {
+    if !control.state()?.same_content(expected) {
         return Ok(false);
     }
     let Some(selected) = expected.select_recent(text) else {
@@ -162,11 +162,11 @@ pub(super) fn select_recent(
     for _ in 0..=text.encode_utf16().count() {
         let actual = read_range(&range)?;
         if actual == text {
-            if control.state()? != *expected {
+            if !control.state()?.same_content(expected) {
                 return Ok(false);
             }
             unsafe { range.Select() }.map_err(|_| unavailable())?;
-            return Ok(control.state()? == selected);
+            return Ok(control.state()?.same_content(&selected));
         }
         if !text.ends_with(&actual) {
             return Ok(false);
