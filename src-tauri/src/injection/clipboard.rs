@@ -400,32 +400,61 @@ pub(super) fn snapshot() -> Result<Snapshot, InjectionError> {
 }
 
 pub(super) fn write(text: &str, exclusion: ClipboardExclusion) -> Result<u32, InjectionError> {
-    let _guard = open_clipboard()?;
-    unsafe { EmptyClipboard() }.map_err(|_| InjectionError::ClipboardUnavailable)?;
-    if exclusion == ClipboardExclusion::ExcludeFromHistory && !apply_history_exclusion() {
-        return Err(InjectionError::ClipboardUnavailable);
-    }
-    let utf16: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
-    let allocation = unsafe { GlobalAlloc(GMEM_MOVEABLE, utf16.len() * size_of::<u16>()) }
-        .map_err(|_| InjectionError::ClipboardUnavailable)?;
-    let destination = unsafe { GlobalLock(allocation) } as *mut u16;
-    if destination.is_null() {
-        unsafe {
-            let _ = GlobalFree(allocation);
+    {
+        let _guard = open_clipboard()?;
+        unsafe { EmptyClipboard() }.map_err(|_| InjectionError::ClipboardUnavailable)?;
+        if exclusion == ClipboardExclusion::ExcludeFromHistory && !apply_history_exclusion() {
+            return Err(InjectionError::ClipboardUnavailable);
         }
-        return Err(InjectionError::ClipboardUnavailable);
-    }
-    unsafe {
-        ptr::copy_nonoverlapping(utf16.as_ptr(), destination, utf16.len());
-        let _ = GlobalUnlock(allocation);
-    }
-    unsafe { SetClipboardData(CF_UNICODETEXT, HANDLE(allocation.0)) }.map_err(|_| {
+        let utf16: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+        let allocation = unsafe { GlobalAlloc(GMEM_MOVEABLE, utf16.len() * size_of::<u16>()) }
+            .map_err(|_| InjectionError::ClipboardUnavailable)?;
+        let destination = unsafe { GlobalLock(allocation) } as *mut u16;
+        if destination.is_null() {
+            unsafe {
+                let _ = GlobalFree(allocation);
+            }
+            return Err(InjectionError::ClipboardUnavailable);
+        }
         unsafe {
-            let _ = GlobalFree(allocation);
-        };
-        InjectionError::ClipboardUnavailable
-    })?;
+            ptr::copy_nonoverlapping(utf16.as_ptr(), destination, utf16.len());
+            let _ = GlobalUnlock(allocation);
+        }
+        unsafe { SetClipboardData(CF_UNICODETEXT, HANDLE(allocation.0)) }.map_err(|_| {
+            unsafe {
+                let _ = GlobalFree(allocation);
+            };
+            InjectionError::ClipboardUnavailable
+        })?;
+    }
+    // Closing materializes synthesized formats and advances the sequence.
     Ok(unsafe { GetClipboardSequenceNumber() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "changes the real clipboard and requires an interactive Windows desktop"]
+    fn native_clipboard_write_and_restore_round_trip() {
+        let original = snapshot().expect("snapshot the current clipboard");
+        let cleanup = snapshot().expect("snapshot the current clipboard for failure cleanup");
+        let sequence = write(
+            "local voice input clipboard round-trip",
+            ClipboardExclusion::ExcludeFromHistory,
+        )
+        .expect("write the test clipboard payload");
+        let restored = restore(original, sequence).expect("restore the original clipboard");
+        if !restored {
+            let current_sequence = unsafe { GetClipboardSequenceNumber() };
+            assert!(
+                restore(cleanup, current_sequence).expect("clean up the test clipboard payload"),
+                "clipboard changed externally before failure cleanup"
+            );
+            panic!("clipboard sequence changed between write and restore");
+        }
+    }
 }
 
 pub(super) fn restore(
