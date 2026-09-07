@@ -30,9 +30,11 @@ import type {
   DictionaryEntryInput,
   GpuDiagnostics,
   HistoryItem,
+  ModelProgress,
   ModelStatus,
   Settings,
 } from "./types";
+import { ModelProgressBar } from "./components/ui";
 import { DashboardPage } from "./pages/DashboardPage";
 import { SetupPage } from "./pages/SetupPage";
 import { SettingsPage } from "./pages/SettingsPage";
@@ -81,7 +83,12 @@ interface CorrectionPreview {
 interface Notice {
   message: string;
   severity: "info" | "error";
+  // Kind of the backend status event, when the notice came from one.
+  kind?: string;
 }
+
+// Notices that only describe model preparation and are cleared once it ends.
+const MODEL_PREPARATION_KINDS = ["model_loading", "model_downloading"];
 
 function compactOverlayPreview(text: string): string {
   const characters = Array.from(text.trim());
@@ -201,6 +208,7 @@ function MainApp() {
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [model, setModel] = useState<ModelStatus | null>(null);
   const [modelLoading, setModelLoading] = useState(false);
+  const [modelProgress, setModelProgress] = useState<ModelProgress | null>(null);
   const [recordingAction, setRecordingAction] = useState(false);
   const recordingActionRef = useRef(false);
   const [gpu, setGpu] = useState<GpuDiagnostics | null>(null);
@@ -239,9 +247,22 @@ function MainApp() {
     const listeners = Promise.all([
       listen<AppState>("app-state", (event) => setState(event.payload)),
       listen<AudioLevel>("audio-level", (event) => setLevel(event.payload)),
-      listen<ModelStatus>("model-status", (event) => setModel(event.payload)),
+      listen<ModelStatus>("model-status", (event) => {
+        setModel(event.payload);
+        // Preparation is over once the worker reports an outcome, so its
+        // progress and its running commentary both stop here.
+        if (event.payload.state !== "loading") {
+          setModelProgress(null);
+          setNotice((current) =>
+            current?.kind && MODEL_PREPARATION_KINDS.includes(current.kind) ? null : current,
+          );
+        }
+      }),
+      listen<ModelProgress>("model-progress", (event) => setModelProgress(event.payload)),
       listen<GpuDiagnostics>("gpu-diagnostics", (event) => setGpu(event.payload)),
-      listen<{ message: string }>("status", (event) => showNotice(event.payload.message)),
+      listen<{ kind: string; message: string }>("status", (event) =>
+        setNotice({ message: event.payload.message, severity: "info", kind: event.payload.kind }),
+      ),
     ]);
     return () => {
       void listeners.then((unlisten) => unlisten.forEach((fn) => fn()));
@@ -256,6 +277,8 @@ function MainApp() {
     () => state.phase.charAt(0).toUpperCase() + state.phase.slice(1),
     [state.phase],
   );
+  // A load started from the Models page or automatically at startup.
+  const preparingModel = modelLoading || model?.state === "loading";
 
   async function copyNotice() {
     if (!notice) return;
@@ -520,23 +543,32 @@ function MainApp() {
         )}
       </main>
 
-      {notice && (
+      {(notice || modelProgress) && (
         <div
-          className={`notice ${notice.severity}${modelLoading ? " loading" : ""}`}
+          className={`notice ${notice?.severity ?? "info"}${preparingModel ? " loading" : ""}`}
           aria-live="polite"
         >
-          {modelLoading && <span className="progress-ring" aria-hidden="true" />}
-          <button
-            className="notice-message"
-            onDoubleClick={() => void copyNotice()}
-            title="Double-click to copy"
-          >
-            {notice.message}
-          </button>
+          {preparingModel && <span className="progress-ring" aria-hidden="true" />}
+          <div className="notice-body">
+            <button
+              className="notice-message"
+              onDoubleClick={() => void copyNotice()}
+              title="Double-click to copy"
+            >
+              {notice?.message ??
+                (modelProgress?.stage === "download"
+                  ? "Downloading the speech model files."
+                  : "Loading the speech model.")}
+            </button>
+            {modelProgress && <ModelProgressBar progress={modelProgress} />}
+          </div>
           {noticeCopied && <span className="notice-copied">Copied</span>}
           <button
             className="notice-dismiss"
-            onClick={() => setNotice(null)}
+            onClick={() => {
+              setNotice(null);
+              setModelProgress(null);
+            }}
             aria-label="Dismiss notification"
           >
             ×

@@ -1,4 +1,44 @@
 import React from "react";
+import type { ModelProgress } from "../types";
+
+function formatBytes(bytes: number) {
+  const mega = bytes / (1024 * 1024);
+  return mega >= 1024 ? `${(mega / 1024).toFixed(1)} GB` : `${Math.round(mega)} MB`;
+}
+
+export function ModelProgressBar({ progress }: { progress: ModelProgress }) {
+  const { completedBytes, totalBytes } = progress;
+  // The download size is unknown until Hugging Face reports file metadata, and
+  // the transferred amount can slightly exceed it, so keep the bar in range.
+  const ratio =
+    completedBytes !== null && totalBytes !== null && totalBytes > 0
+      ? Math.min(1, completedBytes / totalBytes)
+      : null;
+  const label =
+    progress.stage === "load"
+      ? "Loading into memory"
+      : ratio !== null && completedBytes !== null && totalBytes !== null
+        ? `${Math.round(ratio * 100)}% (${formatBytes(completedBytes)} / ${formatBytes(totalBytes)})`
+        : "Starting download";
+  return (
+    <div
+      className="model-progress"
+      role="progressbar"
+      aria-label="Speech model preparation"
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={ratio !== null ? Math.round(ratio * 100) : undefined}
+    >
+      <span className="model-progress-track">
+        <span
+          className={`model-progress-value${ratio === null ? " indeterminate" : ""}`}
+          style={ratio === null ? undefined : { width: `${ratio * 100}%` }}
+        />
+      </span>
+      <span className="model-progress-label">{label}</span>
+    </div>
+  );
+}
 
 export function InfoCard({
   label,

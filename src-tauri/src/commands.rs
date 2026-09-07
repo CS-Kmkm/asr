@@ -914,11 +914,7 @@ pub(crate) async fn ensure_model_loaded(
             return Ok(status.clone());
         }
     }
-    emit_status(
-        app,
-        "model_loading",
-        "Preparing the speech model. The first use may download model files.",
-    );
+    emit_status(app, "model_loading", "Loading the speech model.");
     let loading = ModelStatus {
         model_id: model_id.clone(),
         installed: false,
@@ -931,11 +927,18 @@ pub(crate) async fn ensure_model_loaded(
         .map_err(|_| "model service is unavailable".to_string())? = loading.clone();
     let _ = app.emit("model-status", loading);
 
-    if let Err(error) = services
+    // Only the worker knows whether the model files are already cached, so the
+    // download message and progress bar are driven by what it reports.
+    let progress_forwarder = spawn_load_progress_forwarder(app, services);
+    let load_result = services
         .transcriber
         .load(&settings.model_quantization)
-        .await
-    {
+        .await;
+    if let Some(forwarder) = progress_forwarder {
+        forwarder.abort();
+    }
+
+    if let Err(error) = load_result {
         let message = command_error(&error);
         let failed = ModelStatus {
             model_id,
@@ -964,6 +967,39 @@ pub(crate) async fn ensure_model_loaded(
         .map_err(|_| "model service is unavailable".to_string())? = status.clone();
     let _ = app.emit("model-status", status.clone());
     Ok(status)
+}
+
+/// Relay worker load progress to the window until the load finishes.
+///
+/// The first download report also replaces the loading message, so a model that
+/// is already cached never claims that files are being downloaded.
+fn spawn_load_progress_forwarder(
+    app: &AppHandle,
+    services: &Services,
+) -> Option<tauri::async_runtime::JoinHandle<()>> {
+    let mut receiver = services.transcriber.load_progress()?;
+    let app = app.clone();
+    Some(tauri::async_runtime::spawn(async move {
+        let mut download_announced = false;
+        loop {
+            match receiver.recv().await {
+                Ok(progress) => {
+                    if progress.stage == "download" && !download_announced {
+                        download_announced = true;
+                        emit_status(
+                            &app,
+                            "model_downloading",
+                            "Downloading the speech model files. This runs once; later starts use the local cache.",
+                        );
+                    }
+                    let _ = app.emit("model-progress", progress);
+                }
+                // Progress is advisory: a dropped batch must not end reporting.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }))
 }
 
 pub(crate) fn probe_gpu_diagnostics() -> GpuDiagnostics {

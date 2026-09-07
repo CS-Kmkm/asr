@@ -160,6 +160,59 @@ def _install_fake_faster_whisper() -> dict[str, types.ModuleType]:
     return {"faster_whisper": fake_fw, "ctranslate2": fake_ct2}
 
 
+class ResolveModelFilesTests(unittest.TestCase):
+    def test_cached_model_is_loaded_without_downloading(self) -> None:
+        backend = FasterWhisperBackend()
+        events: list[dict] = []
+        backend.progress = events.append
+        with patch("asr_worker.backends.faster_whisper_repo_id", return_value="org/repo"), patch(
+            "asr_worker.backends.cached_snapshot_path", return_value="/cache/repo"
+        ), patch("asr_worker.backends.download_snapshot") as download:
+            source = backend._resolve_model_files()
+
+        self.assertEqual(source, "/cache/repo")
+        download.assert_not_called()
+        self.assertEqual(events, [])
+
+    def test_missing_model_is_downloaded_with_progress(self) -> None:
+        backend = FasterWhisperBackend()
+        events: list[dict] = []
+        backend.progress = events.append
+
+        def fake_download(repo_id, allow_patterns, progress):  # noqa: ANN001
+            progress({"completed_bytes": 5, "total_bytes": 10})
+            return "/cache/repo"
+
+        with patch("asr_worker.backends.faster_whisper_repo_id", return_value="org/repo"), patch(
+            "asr_worker.backends.cached_snapshot_path", return_value=None
+        ), patch("asr_worker.backends.download_snapshot", fake_download):
+            source = backend._resolve_model_files()
+
+        self.assertEqual(source, "/cache/repo")
+        self.assertEqual(
+            events,
+            [
+                {"stage": "download", "model": "org/repo"},
+                {
+                    "stage": "download",
+                    "model": "org/repo",
+                    "completed_bytes": 5,
+                    "total_bytes": 10,
+                },
+            ],
+        )
+
+    def test_unresolvable_model_is_left_to_faster_whisper(self) -> None:
+        backend = FasterWhisperBackend()
+        events: list[dict] = []
+        backend.progress = events.append
+        with patch("asr_worker.backends.faster_whisper_repo_id", return_value=None):
+            source = backend._resolve_model_files()
+
+        self.assertEqual(source, backend.model_id)
+        self.assertEqual(events, [])
+
+
 class TranscribeWithFakeModuleTests(unittest.TestCase):
     def test_transcribe_formats_segments_and_passes_hotwords(self) -> None:
         backend = FasterWhisperBackend()

@@ -214,5 +214,56 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(response["error"]["code"], "invalid_request")
 
 
+class _ProgressBackend(MockBackend):
+    def load(self, quantization: str) -> None:
+        self.report_progress("download", model="org/repo", completed_bytes=4, total_bytes=8)
+        self.report_progress("load")
+        super().load(quantization)
+
+
+class LoadProgressTests(unittest.TestCase):
+    def test_load_reports_progress_before_its_response(self) -> None:
+        output = io.StringIO()
+        serve(
+            Worker(_ProgressBackend()),
+            io.StringIO('{"id": 3, "command": "load"}\n'),
+            output,
+        )
+        messages = [json.loads(line) for line in output.getvalue().splitlines()]
+
+        self.assertEqual(
+            [message.get("event") for message in messages],
+            ["progress", "progress", None],
+        )
+        self.assertEqual(messages[0]["id"], 3)
+        self.assertEqual(messages[0]["stage"], "download")
+        self.assertEqual(messages[0]["total_bytes"], 8)
+        self.assertEqual(messages[1]["stage"], "load")
+        self.assertTrue(messages[2]["ok"])
+
+    def test_progress_is_withheld_from_a_client_that_did_not_ask(self) -> None:
+        # The worker runs from this repository, so a desktop build that predates
+        # progress notifications must not receive them.
+        output = io.StringIO()
+        serve(
+            Worker(_ProgressBackend()),
+            io.StringIO('{"id": 3, "command": "load"}\n'),
+            output,
+            notify_progress=False,
+        )
+        messages = [json.loads(line) for line in output.getvalue().splitlines()]
+
+        self.assertEqual(len(messages), 1)
+        self.assertTrue(messages[0]["ok"])
+
+    def test_progress_sink_is_released_after_the_load(self) -> None:
+        backend = _ProgressBackend()
+        worker = Worker(backend, notify=lambda message: None)
+
+        worker.handle({"id": 1, "command": "load"})
+
+        self.assertIsNone(backend.progress)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Callable, TextIO
 
 from .backends import Backend, BackendError, create_backend
 
@@ -68,9 +68,20 @@ def error_response(request_id: Any, code: str, message: str) -> dict[str, Any]:
 
 
 class Worker:
-    def __init__(self, backend: Backend) -> None:
+    def __init__(
+        self,
+        backend: Backend,
+        notify: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         self.backend = backend
         self.loaded = False
+        # Assigned by serve() so a load can report progress before its response.
+        self.notify = notify
+
+    def _emit_progress(self, request_id: Any, update: dict[str, Any]) -> None:
+        if self.notify is None:
+            return
+        self.notify({"id": request_id, "event": "progress", **update})
 
     def handle(self, request: Any) -> tuple[dict[str, Any], bool]:
         if not isinstance(request, dict):
@@ -87,7 +98,11 @@ class Worker:
                 if self.loaded:
                     self.backend.unload()
                     self.loaded = False
-                self.backend.load(quantization)
+                self.backend.progress = lambda update: self._emit_progress(request_id, update)
+                try:
+                    self.backend.load(quantization)
+                finally:
+                    self.backend.progress = None
                 self.loaded = True
                 return {
                     "id": request_id,
@@ -150,7 +165,21 @@ class Worker:
             return error_response(request_id, "internal_error", "Unexpected worker error"), operation == "shutdown"
 
 
-def serve(worker: Worker, input_stream: TextIO = sys.stdin, output_stream: TextIO = sys.stdout) -> None:
+def _write_message(output_stream: TextIO, message: dict[str, Any]) -> None:
+    safe_message = _sanitize_unicode(message)
+    output_stream.write(json.dumps(safe_message, ensure_ascii=False, separators=(",", ":")) + "\n")
+    output_stream.flush()
+
+
+def serve(
+    worker: Worker,
+    input_stream: TextIO = sys.stdin,
+    output_stream: TextIO = sys.stdout,
+    *,
+    notify_progress: bool = True,
+) -> None:
+    if notify_progress:
+        worker.notify = lambda message: _write_message(output_stream, message)
     for line in input_stream:
         try:
             request = json.loads(line)
@@ -158,9 +187,7 @@ def serve(worker: Worker, input_stream: TextIO = sys.stdin, output_stream: TextI
             response, should_stop = error_response(None, "invalid_json", "Request is not valid JSON"), False
         else:
             response, should_stop = worker.handle(request)
-        safe_response = _sanitize_unicode(response)
-        output_stream.write(json.dumps(safe_response, ensure_ascii=False, separators=(",", ":")) + "\n")
-        output_stream.flush()
+        _write_message(output_stream, response)
         if should_stop:
             return
 
@@ -200,7 +227,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"API server startup failed: {exc.code}: {exc.message}", file=sys.stderr)
             return 2
     else:
-        serve(Worker(backend))
+        # Progress notifications break a client that predates them, and the
+        # worker runs from this repository while the desktop app is a
+        # separately built binary. Only a client that asks for them gets them.
+        serve(
+            Worker(backend),
+            notify_progress=os.environ.get("ASR_WORKER_PROGRESS") == "1",
+        )
     return 0
 
 

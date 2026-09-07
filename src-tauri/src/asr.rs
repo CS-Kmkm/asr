@@ -9,11 +9,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{broadcast, watch, Mutex};
 use tokio::time::timeout;
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Progress notifications are advisory, so a slow subscriber may drop them
+/// rather than delay the load it is reporting on.
+const PROGRESS_CHANNEL_CAPACITY: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerCommand {
@@ -33,6 +36,11 @@ impl WorkerCommand {
             env: vec![
                 ("PYTHONUTF8".into(), "1".into()),
                 ("PYTHONIOENCODING".into(), "utf-8".into()),
+                // The worker runs from the repository while the desktop binary
+                // is built separately, so an app built before progress
+                // notifications existed can spawn a worker that emits them.
+                // Notifications are sent only to a client that asks for them.
+                ("ASR_WORKER_PROGRESS".into(), "1".into()),
             ],
         }
     }
@@ -58,6 +66,23 @@ pub struct Transcript {
     pub segments: Vec<Segment>,
     pub model: String,
     pub duration_ms: u64,
+}
+
+/// Progress the worker reports while a `load` request is still running.
+///
+/// `stage` is `download` while model files are being fetched on first use and
+/// `load` once cached files are read into memory. Byte counts are absent until
+/// the download size is known, and for backends that cannot measure it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all(serialize = "camelCase"))]
+pub struct LoadProgress {
+    pub stage: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub completed_bytes: Option<u64>,
+    #[serde(default)]
+    pub total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -102,6 +127,10 @@ pub trait Transcriber: Send + Sync {
     /// setting changes) and tear down any running worker so the next request
     /// spawns with the new command.
     async fn reconfigure(&self, command: WorkerCommand);
+    /// Subscribe to the progress the worker reports during a model load.
+    fn load_progress(&self) -> Option<broadcast::Receiver<LoadProgress>> {
+        None
+    }
 }
 
 struct RunningWorker {
@@ -121,6 +150,7 @@ pub struct JsonlTranscriber {
     load_timeout: Duration,
     next_id: AtomicU64,
     state: Arc<Mutex<State>>,
+    progress: broadcast::Sender<LoadProgress>,
 }
 
 impl JsonlTranscriber {
@@ -134,6 +164,7 @@ impl JsonlTranscriber {
                 running: None,
                 loaded_quantization: None,
             })),
+            progress: broadcast::channel(PROGRESS_CHANNEL_CAPACITY).0,
         }
     }
 
@@ -175,25 +206,51 @@ impl JsonlTranscriber {
         worker.stdin.write_all(&encoded).await?;
         worker.stdin.flush().await?;
 
-        let mut line = Vec::new();
-        let read = timeout(
-            response_timeout,
-            (&mut worker.stdout)
-                .take((MAX_RESPONSE_BYTES + 1) as u64)
-                .read_until(b'\n', &mut line),
-        )
-        .await
-        .map_err(|_| AsrError::Timeout)??;
-        if read == 0 {
-            let _ = worker.child.wait().await;
-            return Err(AsrError::Crashed);
+        // A request may be preceded by progress notifications carrying the same
+        // id; the response is the first line that reports an outcome.
+        loop {
+            let mut line = Vec::new();
+            let read = timeout(
+                response_timeout,
+                (&mut worker.stdout)
+                    .take((MAX_RESPONSE_BYTES + 1) as u64)
+                    .read_until(b'\n', &mut line),
+            )
+            .await
+            .map_err(|_| AsrError::Timeout)??;
+            if read == 0 {
+                let _ = worker.child.wait().await;
+                return Err(AsrError::Crashed);
+            }
+            if line.len() > MAX_RESPONSE_BYTES || !line.ends_with(b"\n") {
+                return Err(AsrError::Protocol(
+                    "worker response exceeded size limit".into(),
+                ));
+            }
+            match Self::parse_progress(&line, &expected_id) {
+                Some(progress) => {
+                    let _ = self.progress.send(progress);
+                }
+                None => return Self::validate_response(&line, &expected_id),
+            }
         }
-        if line.len() > MAX_RESPONSE_BYTES || !line.ends_with(b"\n") {
-            return Err(AsrError::Protocol(
-                "worker response exceeded size limit".into(),
-            ));
+    }
+
+    /// Recognize a progress notification for the request being awaited.
+    ///
+    /// Notifications repeat the request id and carry `event` instead of `ok`,
+    /// so anything else — including a malformed notification — is handed to
+    /// response validation and reported as a protocol error.
+    fn parse_progress(line: &[u8], expected_id: &Value) -> Option<LoadProgress> {
+        let sanitized = Self::sanitize_response_unicode(line);
+        let message: Value = serde_json::from_slice(&sanitized).ok()?;
+        if message.get("ok").is_some()
+            || message.get("event") != Some(&json!("progress"))
+            || message.get("id") != Some(expected_id)
+        {
+            return None;
         }
-        Self::validate_response(&line, &expected_id)
+        serde_json::from_value(message).ok()
     }
 
     fn validate_response(line: &[u8], expected_id: &Value) -> Result<Value, AsrError> {
@@ -426,6 +483,10 @@ impl Transcriber for JsonlTranscriber {
         }
     }
 
+    fn load_progress(&self) -> Option<broadcast::Receiver<LoadProgress>> {
+        Some(self.progress.subscribe())
+    }
+
     async fn reconfigure(&self, command: WorkerCommand) {
         let mut state = self.state.lock().await;
         if state.command == command {
@@ -492,6 +553,7 @@ mod tests {
             vec![
                 ("PYTHONUTF8".to_string(), "1".to_string()),
                 ("PYTHONIOENCODING".to_string(), "utf-8".to_string()),
+                ("ASR_WORKER_PROGRESS".to_string(), "1".to_string()),
             ]
         );
     }
@@ -541,6 +603,56 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, AsrError::Worker(_)));
         assert!(!JsonlTranscriber::requires_reset(&error));
+    }
+
+    #[test]
+    fn progress_notification_is_read_without_ending_the_request() {
+        let progress = JsonlTranscriber::parse_progress(
+            br#"{"id":1,"event":"progress","stage":"download","model":"repo","completed_bytes":10,"total_bytes":40}"#,
+            &json!(1),
+        )
+        .unwrap();
+
+        assert_eq!(progress.stage, "download");
+        assert_eq!(progress.model.as_deref(), Some("repo"));
+        assert_eq!(progress.completed_bytes, Some(10));
+        assert_eq!(progress.total_bytes, Some(40));
+    }
+
+    #[test]
+    fn real_worker_download_notifications_are_consumed() {
+        // Lines captured from `python -m asr_worker` during a first-use download.
+        for line in [
+            br#"{"id":1,"event":"progress","stage":"download","model":"Systran/faster-whisper-tiny"}"#.as_slice(),
+            br#"{"id":1,"event":"progress","stage":"download","model":"Systran/faster-whisper-tiny","completed_bytes":2249,"total_bytes":null}"#.as_slice(),
+            br#"{"id":1,"event":"progress","stage":"download","model":"Systran/faster-whisper-tiny","completed_bytes":2665349,"total_bytes":75538270}"#.as_slice(),
+            br#"{"id":1,"event":"progress","stage":"load"}"#.as_slice(),
+        ] {
+            assert!(JsonlTranscriber::parse_progress(line, &json!(1)).is_some());
+        }
+    }
+
+    #[test]
+    fn progress_without_byte_counts_is_accepted() {
+        let progress = JsonlTranscriber::parse_progress(
+            br#"{"id":1,"event":"progress","stage":"load"}"#,
+            &json!(1),
+        )
+        .unwrap();
+
+        assert_eq!(progress.stage, "load");
+        assert_eq!(progress.completed_bytes, None);
+    }
+
+    #[test]
+    fn responses_and_foreign_notifications_are_not_progress() {
+        for line in [
+            br#"{"id":1,"ok":true,"model":"m","quantization":"4bit"}"#.as_slice(),
+            br#"{"id":2,"event":"progress","stage":"download"}"#.as_slice(),
+            br#"{"id":1,"event":"progress"}"#.as_slice(),
+        ] {
+            assert!(JsonlTranscriber::parse_progress(line, &json!(1)).is_none());
+        }
     }
 
     #[test]

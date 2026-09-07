@@ -91,8 +91,18 @@ export interface HistoryItem {
 export interface ModelStatus {
   modelId: string | null;
   installed: boolean;
-  state: "not_configured" | "not_installed" | "not_loaded" | "ready";
+  state: "not_configured" | "not_installed" | "not_loaded" | "loading" | "ready" | "error";
   detail: string;
+}
+
+// Progress reported while the ASR worker prepares the model. Byte counts are
+// absent until the download size is known, and for backends that cannot
+// measure it.
+export interface ModelProgress {
+  stage: "download" | "load";
+  model: string | null;
+  completedBytes: number | null;
+  totalBytes: number | null;
 }
 
 export interface GpuDiagnostics {

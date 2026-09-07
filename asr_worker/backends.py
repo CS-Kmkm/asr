@@ -9,6 +9,13 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
+from .download import (
+    FASTER_WHISPER_ALLOW_PATTERNS,
+    ProgressCallback,
+    cached_snapshot_path,
+    download_snapshot,
+)
+
 MODEL_ID = "microsoft/VibeVoice-ASR-HF"
 QUANTIZATIONS = {"4bit", "8bit", "bf16"}
 FASTER_WHISPER_DEFAULT_MODEL = "large-v3-turbo"
@@ -23,6 +30,7 @@ class BackendError(Exception):
 
 class Backend(Protocol):
     model_name: str
+    progress: ProgressCallback | None
 
     def load(self, quantization: str) -> None: ...
 
@@ -34,6 +42,37 @@ class Backend(Protocol):
         prompt: str | None,
         language: str | None = None,
     ) -> tuple[str, list[dict[str, Any]]]: ...
+
+
+class ProgressReporting:
+    """Load-progress sink that the worker assigns for the duration of a load.
+
+    Loading a cached model and downloading it on first use look identical from
+    the outside, so each backend reports which stage it has reached.
+    """
+
+    progress: ProgressCallback | None = None
+
+    def report_progress(self, stage: str, **fields: Any) -> None:
+        callback = self.progress
+        if callback is not None:
+            callback({"stage": stage, **fields})
+
+
+def faster_whisper_repo_id(model_id: str) -> str | None:
+    """Resolve a faster-whisper model name to its Hugging Face repository.
+
+    Returns None when the name is not one of the mappings faster-whisper ships;
+    the caller then leaves model resolution to faster-whisper itself and only
+    gives up download progress reporting.
+    """
+    if "/" in model_id:
+        return model_id
+    try:
+        from faster_whisper.utils import _MODELS
+    except ImportError:
+        return None
+    return _MODELS.get(model_id)
 
 
 def faster_whisper_compute_type(quantization: str, *, cuda: bool) -> str:
@@ -161,7 +200,7 @@ def vibevoice_dependency_error(exc: ModuleNotFoundError) -> BackendError:
     )
 
 
-class MockBackend:
+class MockBackend(ProgressReporting):
     model_name = f"{MODEL_ID}:mock"
 
     def __init__(self) -> None:
@@ -187,7 +226,7 @@ class MockBackend:
         self.loaded = False
 
 
-class VibeVoiceBackend:
+class VibeVoiceBackend(ProgressReporting):
     def __init__(self) -> None:
         self.model_id = os.environ.get("ASR_MODEL_ID", MODEL_ID)
         self.model_name = self.model_id
@@ -218,6 +257,7 @@ class VibeVoiceBackend:
             else:
                 kwargs["torch_dtype"] = torch.bfloat16
 
+            self._report_pending_download()
             self.processor = AutoProcessor.from_pretrained(self.model_id)
             self.model = VibeVoiceAsrForConditionalGeneration.from_pretrained(self.model_id, **kwargs)
             device = str(next(self.model.parameters()).device)
@@ -234,6 +274,17 @@ class VibeVoiceBackend:
             raise
         except BaseException as exc:
             raise map_backend_exception(exc, "load") from exc
+
+    def _report_pending_download(self) -> None:
+        """Report that model files are still missing before transformers loads.
+
+        transformers downloads inside ``from_pretrained`` without a progress
+        hook, so only the stage is reported for this backend.
+        """
+        if Path(self.model_id).is_dir():
+            return
+        if cached_snapshot_path(self.model_id) is None:
+            self.report_progress("download", model=self.model_id)
 
     def unload(self) -> None:
         self.model = None
@@ -293,7 +344,7 @@ class VibeVoiceBackend:
             raise map_backend_exception(exc, "transcribe") from exc
 
 
-class FasterWhisperBackend:
+class FasterWhisperBackend(ProgressReporting):
     def __init__(self) -> None:
         self.model_id = os.environ.get(
             "ASR_MODEL_ID",
@@ -318,11 +369,35 @@ class FasterWhisperBackend:
             cuda = ctranslate2.get_cuda_device_count() > 0
             device = "cuda" if cuda else "cpu"
             compute_type = faster_whisper_compute_type(quantization, cuda=cuda)
-            self.model = WhisperModel(self.model_id, device=device, compute_type=compute_type)
+            model_source = self._resolve_model_files()
+            self.report_progress("load")
+            self.model = WhisperModel(model_source, device=device, compute_type=compute_type)
         except BackendError:
             raise
         except BaseException as exc:
             raise map_backend_exception(exc, "load", "faster-whisper") from exc
+
+    def _resolve_model_files(self) -> str:
+        """Return a local model source, downloading it only when it is missing.
+
+        WhisperModel downloads silently, which makes a first-use download
+        indistinguishable from loading a cached model. Resolving the files here
+        keeps the two apart and lets the download report byte progress.
+        """
+        if Path(self.model_id).is_dir():
+            return self.model_id
+        repo_id = faster_whisper_repo_id(self.model_id)
+        if repo_id is None:
+            return self.model_id
+        cached = cached_snapshot_path(repo_id, FASTER_WHISPER_ALLOW_PATTERNS)
+        if cached is not None:
+            return cached
+        self.report_progress("download", model=repo_id)
+        return download_snapshot(
+            repo_id,
+            FASTER_WHISPER_ALLOW_PATTERNS,
+            lambda update: self.report_progress("download", model=repo_id, **update),
+        )
 
     def unload(self) -> None:
         self.model = None
@@ -356,7 +431,7 @@ class FasterWhisperBackend:
             raise map_backend_exception(exc, "transcribe", "faster-whisper") from exc
 
 
-class OpenAICompatibleBackend:
+class OpenAICompatibleBackend(ProgressReporting):
     """Client for OpenAI's ``POST /v1/audio/transcriptions`` contract.
 
     The endpoint can be OpenAI itself or a locally served compatible model. API
