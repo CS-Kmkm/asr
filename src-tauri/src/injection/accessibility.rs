@@ -132,11 +132,15 @@ fn runtime_id(element: &IUIAutomationElement) -> Result<Vec<i32>, InjectionError
 }
 
 fn read_range(range: &IUIAutomationTextRange) -> Result<String, InjectionError> {
+    Ok(normalize_text(&read_range_raw(range)?))
+}
+
+fn read_range_raw(range: &IUIAutomationTextRange) -> Result<String, InjectionError> {
     let text = unsafe { range.GetText(MAX_TEXT_UNITS + 1) }.map_err(|_| unavailable())?;
     if text.len() > MAX_TEXT_UNITS as usize {
         return Err(unavailable());
     }
-    Ok(normalize_text(&text.to_string()))
+    Ok(text.to_string())
 }
 
 pub(super) fn read(target: &TargetWindow) -> Result<TargetText, InjectionError> {
@@ -157,20 +161,13 @@ pub(super) fn select_recent(
     };
     let range = control.selection()?;
     let text = normalize_text(text);
-    // UIA providers disagree on grapheme/caret units. Walk a detached range,
-    // checking the actual text; never select by a guessed character count.
-    for _ in 0..=text.encode_utf16().count() {
-        let actual = read_range(&range)?;
-        if actual == text {
-            if !control.state()?.same_content(expected) {
-                return Ok(false);
-            }
-            unsafe { range.Select() }.map_err(|_| unavailable())?;
-            return Ok(control.state()?.same_content(&selected));
-        }
-        if !text.ends_with(&actual) {
-            return Ok(false);
-        }
+    // UIA providers disagree on grapheme/caret units, and some spend two units
+    // on CRLF even though read_range normalizes it to LF. Walk until the
+    // provider reaches the document boundary, accumulating only each newly
+    // added unit so cross-process text transfer remains linear.
+    let mut raw_actual = String::new();
+    loop {
+        let previous = unsafe { range.Clone() }.map_err(|_| unavailable())?;
         if unsafe {
             range.MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character, -1)
         }
@@ -179,6 +176,28 @@ pub(super) fn select_recent(
         {
             return Ok(false);
         }
+        let added = unsafe { range.Clone() }.map_err(|_| unavailable())?;
+        unsafe {
+            added
+                .MoveEndpointByRange(
+                    TextPatternRangeEndpoint_End,
+                    &previous,
+                    TextPatternRangeEndpoint_Start,
+                )
+                .map_err(|_| unavailable())?;
+        }
+        raw_actual.insert_str(0, &read_range_raw(&added)?);
+        let actual = normalize_text(&raw_actual);
+        if actual == text {
+            // Verify the complete candidate range immediately before Select().
+            if read_range(&range)? != text || !control.state()?.same_content(expected) {
+                return Ok(false);
+            }
+            unsafe { range.Select() }.map_err(|_| unavailable())?;
+            return Ok(control.state()?.same_content(&selected));
+        }
+        if !text.ends_with(&actual) {
+            return Ok(false);
+        }
     }
-    Ok(false)
 }
