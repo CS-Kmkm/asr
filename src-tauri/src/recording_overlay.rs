@@ -8,8 +8,6 @@ use crate::types::AppPhase;
 const WINDOW_LABEL: &str = "recording-overlay";
 const RECORDING_WIDTH: f64 = 172.0;
 const RECORDING_HEIGHT: f64 = 48.0;
-const PROCESSING_WIDTH: f64 = 560.0;
-const PROCESSING_HEIGHT: f64 = 76.0;
 const BOTTOM_MARGIN: f64 = 24.0;
 
 pub(crate) fn create(app: &AppHandle) -> tauri::Result<()> {
@@ -41,8 +39,9 @@ pub(crate) fn set_phase(app: &AppHandle, phase: &AppPhase) {
     };
 
     let size = match phase {
-        AppPhase::Recording => Some((RECORDING_WIDTH, RECORDING_HEIGHT)),
-        AppPhase::Processing | AppPhase::Injecting => Some((PROCESSING_WIDTH, PROCESSING_HEIGHT)),
+        AppPhase::Recording | AppPhase::Processing | AppPhase::Injecting => {
+            Some((RECORDING_WIDTH, RECORDING_HEIGHT))
+        }
         AppPhase::Idle | AppPhase::Completed | AppPhase::Error => None,
     };
     if let Some((width, height)) = size {

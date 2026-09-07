@@ -184,17 +184,25 @@ function RecordingOverlay() {
     );
   }
 
+  if (phase !== "processing" && phase !== "injecting") return null;
+
   const compactPreview = compactOverlayPreview(preview?.text ?? "");
   const label =
     phase === "injecting"
-      ? t("Inserting")
-      : preview?.stage === "draft"
-        ? t("Transcript ready")
-        : preview?.stage === "streaming"
-          ? t("AI correcting")
-          : preview?.stage === "fallback"
-            ? t("Using transcript")
-            : t("Processing");
+      ? message?.startsWith("Finalizing")
+        ? t("Updating text")
+        : t("Inserting")
+      : message?.startsWith("Stopping")
+        ? t("Finishing audio")
+        : message?.startsWith("Transcribing")
+          ? t("Transcribing")
+          : preview?.stage === "draft"
+            ? t("Transcript ready")
+            : preview?.stage === "streaming"
+              ? t("AI correcting")
+              : preview?.stage === "fallback"
+                ? t("Using transcript")
+                : t("Processing");
 
   return (
     <div className="recording-overlay processing" role="status" aria-live="polite">

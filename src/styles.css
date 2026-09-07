@@ -61,41 +61,46 @@ button { color: inherit; }
 }
 .recording-overlay.processing {
   justify-content: flex-start;
-  gap: 13px;
-  padding: 0 18px;
-  border-radius: 16px;
+  gap: 10px;
 }
 .processing-spinner {
-  width: 20px;
-  height: 20px;
+  width: 14px;
+  height: 14px;
   flex: 0 0 auto;
   border: 2px solid rgba(102, 224, 174, .2);
   border-top-color: #66e0ae;
   border-radius: 50%;
-  animation: processing-spin .75s linear infinite;
+  animation: processing-spin 1s linear infinite;
 }
 .processing-copy {
   min-width: 0;
+  flex: 1;
   display: grid;
-  gap: 4px;
+  gap: 2px;
 }
 .processing .recording-overlay-label {
-  color: #82e8bd;
+  color: #dcebe5;
   font-size: 11px;
-  letter-spacing: .07em;
-  text-transform: uppercase;
+  font-weight: 600;
+  line-height: 15px;
+  letter-spacing: .01em;
+  white-space: nowrap;
 }
 .correction-preview {
   display: block;
   overflow: hidden;
-  color: #f5f8f7;
-  font-size: 14px;
-  line-height: 1.35;
+  color: #a5b8b1;
+  font-size: 10px;
+  line-height: 13px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .correction-preview.pending { color: #a5b8b1; }
 @keyframes processing-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .processing-spinner, .recording-live-dot { animation: none; }
+  .recording-wave i { transition: none; }
+}
 @keyframes recording-pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50% { opacity: .72; transform: scale(.86); }

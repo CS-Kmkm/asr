@@ -241,6 +241,13 @@ pub(crate) async fn stop_recording(
         let correction_hints = storage
             .dictionary_correction_hints(&transcript.text)
             .unwrap_or_default();
+        emit_correction_preview(&app, &transcript.text, "draft");
+        emit_state(
+            &app,
+            &state,
+            AppPhase::Injecting,
+            "Inserting the provisional transcript into the captured target.",
+        );
         match injector.begin_provisional(&transcript.text, &target, &input_monitor) {
             Ok(session) => {
                 streamed_into_target = session.is_some();
@@ -252,7 +259,6 @@ pub(crate) async fn stop_recording(
                 &format!("Live replacement is unavailable; waiting for final text. {error}"),
             ),
         }
-        emit_correction_preview(&app, &transcript.text, "draft");
         emit_state(
             &app,
             &state,
@@ -336,6 +342,9 @@ pub(crate) async fn stop_recording(
     } else {
         injector.insert(&final_text, &target)
     };
+    // Insertion has returned; helper shutdown and persistence are not insertion.
+    // This only hides the overlay. The result below still determines success.
+    recording_overlay::set_phase(&app, &AppPhase::Completed);
     // The helper observes input only while a provisional replacement session
     // can still mutate the target. Stop it before persisting the result.
     input_monitor.shutdown();
@@ -396,7 +405,6 @@ pub(crate) async fn stop_recording(
     } else {
         "Dictation inserted successfully."
     };
-    recording_overlay::set_phase(&app, &AppPhase::Completed);
     let snapshot = state.complete(final_text.clone(), completion.into());
     let _ = app.emit("app-state", snapshot);
     emit_status(&app, insertion_label, completion);
