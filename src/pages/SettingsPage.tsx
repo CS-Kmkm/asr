@@ -11,10 +11,14 @@ export function SettingsPage({
   onSave: (patch: Partial<Settings>) => void;
 }) {
   const [hotkey, setHotkey] = useState(settings.hotkey);
+  const [translationHotkey, setTranslationHotkey] = useState(settings.translationHotkey);
   const cancelHotkeyBlurRef = useRef(false);
   const suppressHotkeyBlurRef = useRef(false);
+  const cancelTranslationBlurRef = useRef(false);
+  const suppressTranslationBlurRef = useRef(false);
 
   useEffect(() => setHotkey(settings.hotkey), [settings.hotkey]);
+  useEffect(() => setTranslationHotkey(settings.translationHotkey), [settings.translationHotkey]);
 
   function commitHotkey() {
     if (cancelHotkeyBlurRef.current || suppressHotkeyBlurRef.current) {
@@ -23,6 +27,15 @@ export function SettingsPage({
       return;
     }
     if (hotkey !== settings.hotkey) onSave({ hotkey });
+  }
+
+  function commitTranslationHotkey() {
+    if (cancelTranslationBlurRef.current || suppressTranslationBlurRef.current) {
+      cancelTranslationBlurRef.current = false;
+      suppressTranslationBlurRef.current = false;
+      return;
+    }
+    if (translationHotkey !== settings.translationHotkey) onSave({ translationHotkey });
   }
 
   return (
@@ -49,6 +62,32 @@ export function SettingsPage({
                   e.currentTarget.blur();
                 }
               }}
+            />
+          }
+        />
+        <SettingRow
+          title="Translation hotkey"
+          detail="Translates selected text; the default is Ctrl+Shift+T."
+          control={
+            <input
+              value={translationHotkey}
+              onChange={(event) => setTranslationHotkey(event.target.value)}
+              onBlur={commitTranslationHotkey}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") { event.preventDefault(); commitTranslationHotkey(); suppressTranslationBlurRef.current = true; event.currentTarget.blur(); }
+                if (event.key === "Escape") { setTranslationHotkey(settings.translationHotkey); cancelTranslationBlurRef.current = true; event.currentTarget.blur(); }
+              }}
+            />
+          }
+        />
+        <SettingRow
+          title="Translation instruction"
+          detail="Optional guidance appended to the fixed translation-only contract."
+          control={
+            <input
+              value={settings.translationInstruction}
+              maxLength={500}
+              onChange={(event) => onSave({ translationInstruction: event.target.value })}
             />
           }
         />

@@ -16,6 +16,8 @@ const inTauri = "__TAURI_INTERNALS__" in window;
 export const defaultSettings: Settings = {
   setupComplete: false,
   hotkey: "Ctrl+Shift+Space",
+  translationHotkey: "Ctrl+Shift+T",
+  translationInstruction: "",
   microphoneId: null,
   historyEnabled: true,
   historyRetentionDays: 30,

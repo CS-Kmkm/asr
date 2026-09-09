@@ -592,6 +592,9 @@ pub(crate) async fn update_settings(
     if settings.hotkey.trim().is_empty() {
         return Err("hotkey cannot be empty".into());
     }
+    if settings.translation_hotkey.trim().is_empty() {
+        return Err("translation hotkey cannot be empty".into());
+    }
     if !(1..=3650).contains(&settings.history_retention_days) {
         return Err("history retention must be between 1 and 3650 days".into());
     }
@@ -712,35 +715,63 @@ pub(crate) async fn update_settings(
         }
     }
     let new_shortcut = parse_shortcut(&settings.hotkey)?;
+    let new_translation_shortcut = parse_shortcut(&settings.translation_hotkey)?;
     let previous = storage.get_settings().map_err(command_error)?;
     let old_shortcut = parse_shortcut(&previous.hotkey)?;
+    let old_translation_shortcut = parse_shortcut(&previous.translation_hotkey)?;
+    if new_translation_shortcut == new_shortcut {
+        return Err("translation hotkey must differ from recording hotkey".into());
+    }
+    if settings.translation_instruction.chars().count() > 500
+        || settings.translation_instruction.chars().any(|character| {
+            character.is_control() && character != '\n' && character != '\r' && character != '\t'
+        })
+    {
+        return Err("translation instruction must be at most 500 characters and contain no unsupported control characters".into());
+    }
     if cfg!(debug_assertions) && settings.auto_start && !previous.auto_start {
         return Err(
             "autostart cannot be enabled from a development build; install and run a release build"
                 .into(),
         );
     }
-    if new_shortcut != old_shortcut {
+    let recording_changed = new_shortcut != old_shortcut;
+    let translation_changed = new_translation_shortcut != old_translation_shortcut;
+    let rollback_shortcuts = || {
+        if recording_changed {
+            let _ = app.global_shortcut().unregister(new_shortcut);
+            let _ = app.global_shortcut().register(old_shortcut);
+        }
+        if translation_changed {
+            let _ = app.global_shortcut().unregister(new_translation_shortcut);
+            let _ = app.global_shortcut().register(old_translation_shortcut);
+        }
+    };
+    if recording_changed {
         app.global_shortcut()
             .register(new_shortcut)
             .map_err(|error| format!("hotkey registration failed: {error}"))?;
         if let Err(error) = app.global_shortcut().unregister(old_shortcut) {
-            let _ = app.global_shortcut().unregister(new_shortcut);
+            rollback_shortcuts();
             return Err(format!("hotkey update failed: {error}"));
         }
     }
-    if let Err(error) = storage.apply_history_policy(&previous, &settings) {
-        if new_shortcut != old_shortcut {
-            let _ = app.global_shortcut().register(old_shortcut);
-            let _ = app.global_shortcut().unregister(new_shortcut);
+    if translation_changed {
+        if let Err(error) = app.global_shortcut().register(new_translation_shortcut) {
+            rollback_shortcuts();
+            return Err(format!("translation hotkey registration failed: {error}"));
         }
+        if let Err(error) = app.global_shortcut().unregister(old_translation_shortcut) {
+            rollback_shortcuts();
+            return Err(format!("translation hotkey update failed: {error}"));
+        }
+    }
+    if let Err(error) = storage.apply_history_policy(&previous, &settings) {
+        rollback_shortcuts();
         return Err(command_error(error));
     }
     if let Err(error) = storage.update_settings(&settings) {
-        if new_shortcut != old_shortcut {
-            let _ = app.global_shortcut().register(old_shortcut);
-            let _ = app.global_shortcut().unregister(new_shortcut);
-        }
+        rollback_shortcuts();
         return Err(command_error(error));
     }
     if settings.auto_start != previous.auto_start {

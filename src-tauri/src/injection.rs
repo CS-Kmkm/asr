@@ -88,6 +88,15 @@ pub struct SystemTextInjector {
     backend: PlatformBackend,
     options: InjectionOptions,
 }
+
+pub(crate) struct SelectedText {
+    target: TargetWindow,
+    text: String,
+    state: TargetText,
+}
+impl SelectedText {
+    pub(crate) fn text(&self) -> &str { &self.text }
+}
 impl SystemTextInjector {
     pub fn new(options: InjectionOptions) -> Self {
         Self {
@@ -119,6 +128,39 @@ impl SystemTextInjector {
         monitor: &InputMonitor,
     ) {
         batch::cancel(&self.backend, session, monitor)
+    }
+
+    pub(crate) fn capture_selection(&self) -> Result<SelectedText, InjectionError> {
+        let target = self.capture_target()?;
+        let state = self.backend.target_text(&target)?;
+        if state.selected.is_empty() {
+            return Err(InjectionError::BackendFailure("no text is selected"));
+        }
+        Ok(SelectedText { target, text: state.selected.clone(), state })
+    }
+
+    pub(crate) fn replace_selection(
+        &self,
+        selection: &SelectedText,
+        text: &str,
+        monitor: &InputMonitor,
+        checkpoint: u64,
+    ) -> Result<InsertResult, InjectionError> {
+        batch::replace_selection(
+            &self.backend,
+            self.options,
+            &selection.target,
+            &selection.state,
+            text,
+            monitor,
+            checkpoint,
+        )
+    }
+
+    pub(crate) fn copy_to_clipboard(&self, text: &str) -> Result<(), InjectionError> {
+        self.backend
+            .clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)
+            .map(|_| ())
     }
 }
 impl Default for SystemTextInjector {

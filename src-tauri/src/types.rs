@@ -25,6 +25,10 @@ pub struct AppStateSnapshot {
 pub struct Settings {
     pub setup_complete: bool,
     pub hotkey: String,
+    #[serde(default = "default_translation_hotkey")]
+    pub translation_hotkey: String,
+    #[serde(default)]
+    pub translation_instruction: String,
     pub microphone_id: Option<String>,
     pub history_enabled: bool,
     pub history_retention_days: u32,
@@ -135,6 +139,8 @@ fn default_correction_instruction() -> String {
     String::new()
 }
 
+fn default_translation_hotkey() -> String { "Ctrl+Shift+T".into() }
+
 fn default_enabled_correction_feature() -> bool {
     true
 }
@@ -152,6 +158,8 @@ impl Default for Settings {
         Self {
             setup_complete: false,
             hotkey: "Ctrl+Shift+Space".into(),
+            translation_hotkey: default_translation_hotkey(),
+            translation_instruction: String::new(),
             microphone_id: None,
             history_enabled: true,
             history_retention_days: 30,

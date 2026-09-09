@@ -34,6 +34,8 @@ export interface RecordingResult {
 export interface Settings {
   setupComplete: boolean;
   hotkey: string;
+  translationHotkey: string;
+  translationInstruction: string;
   microphoneId: string | null;
   historyEnabled: boolean;
   historyRetentionDays: number;
