@@ -589,6 +589,9 @@ pub(crate) async fn update_settings(
     services: State<'_, Services>,
     storage: State<'_, Storage>,
 ) -> Result<Settings, String> {
+    if !["en", "ja"].contains(&settings.ui_language.as_str()) {
+        return Err("ui language must be en or ja".into());
+    }
     if settings.hotkey.trim().is_empty() {
         return Err("hotkey cannot be empty".into());
     }

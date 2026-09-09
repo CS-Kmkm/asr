@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Empty } from "../components/ui";
 import type { DictionaryEntry, DictionaryEntryInput } from "../types";
+import { useI18n } from "../i18n";
 
 const EMPTY_FORM = {
   reading: "",
@@ -19,6 +20,7 @@ export function DictionaryPage({
   onAdd: (entry: DictionaryEntryInput) => Promise<boolean>;
   onDelete: (id: number) => void;
 }) {
+  const { t } = useI18n();
   const [form, setForm] = useState(EMPTY_FORM);
 
   async function handleSubmit(event: React.FormEvent) {
@@ -44,8 +46,8 @@ export function DictionaryPage({
       <form className="steps dictionary-form" onSubmit={(e) => void handleSubmit(e)}>
         <div className="setting-row">
           <div>
-            <strong>Reading</strong>
-            <p>How the term is spoken (e.g. かな or romaji).</p>
+          <strong>{t("Reading")}</strong>
+            <p>{t("How the term is spoken (e.g. かな or romaji).")}</p>
           </div>
           <input
             value={form.reading}
@@ -55,8 +57,8 @@ export function DictionaryPage({
         </div>
         <div className="setting-row">
           <div>
-            <strong>Surface</strong>
-            <p>The exact text to produce when recognized.</p>
+          <strong>{t("Surface")}</strong>
+            <p>{t("The exact text to produce when recognized.")}</p>
           </div>
           <input
             value={form.surface}
@@ -66,8 +68,8 @@ export function DictionaryPage({
         </div>
         <div className="setting-row">
           <div>
-            <strong>Category</strong>
-            <p>Optional grouping label.</p>
+          <strong>{t("Category")}</strong>
+            <p>{t("Optional grouping label.")}</p>
           </div>
           <input
             value={form.category}
@@ -76,8 +78,8 @@ export function DictionaryPage({
         </div>
         <div className="setting-row">
           <div>
-            <strong>Aliases</strong>
-            <p>Optional, comma-separated alternative surfaces.</p>
+          <strong>{t("Aliases")}</strong>
+            <p>{t("Optional, comma-separated alternative surfaces.")}</p>
           </div>
           <input
             value={form.aliases}
@@ -86,8 +88,8 @@ export function DictionaryPage({
         </div>
         <div className="setting-row">
           <div>
-            <strong>Priority</strong>
-            <p>Higher values win when readings collide.</p>
+          <strong>{t("Priority")}</strong>
+            <p>{t("Higher values win when readings collide.")}</p>
           </div>
           <input
             type="number"
@@ -96,14 +98,14 @@ export function DictionaryPage({
           />
         </div>
         <button className="primary" type="submit">
-          Add entry
+          {t("Add entry")}
         </button>
       </form>
 
       {entries.length === 0 ? (
         <Empty
-          title="No dictionary entries yet"
-          detail="Add proper nouns and terms to improve recognition accuracy."
+          title={t("No dictionary entries yet")}
+          detail={t("Add proper nouns and terms to improve recognition accuracy.")}
         />
       ) : (
         <div className="history-list">
@@ -126,7 +128,7 @@ export function DictionaryPage({
                   }
                 }}
               >
-                Delete
+                {t("Delete")}
               </button>
             </div>
           ))}

@@ -14,6 +14,7 @@ import type {
 const inTauri = "__TAURI_INTERNALS__" in window;
 
 export const defaultSettings: Settings = {
+  uiLanguage: "ja",
   setupComplete: false,
   hotkey: "Ctrl+Shift+Space",
   microphoneId: null,

@@ -1,5 +1,6 @@
 import { InfoCard } from "../components/ui";
 import type { AppState, AudioLevel, HistoryItem, ModelStatus, Settings } from "../types";
+import { useI18n } from "../i18n";
 
 const WAVE_SCALES = [0.4, 0.7, 1, 0.6, 0.9, 0.5, 0.8, 0.55, 0.35];
 
@@ -26,13 +27,16 @@ export function DashboardPage({
   onCancelRecording: () => void;
   onCopyResult: (text: string) => void;
 }) {
+  const { t } = useI18n();
   return (
     <section className="grid">
       <article className="hero-card span-2">
         <div>
-          <p className="eyebrow">RECORDING STATUS</p>
-          <h2>{state.phase === "idle" ? "Ready when you are" : statusLabel}</h2>
-          <p>{state.message ?? `Use ${settings.hotkey} to start or stop dictation.`}</p>
+          <p className="eyebrow">{t("RECORDING STATUS")}</p>
+          <h2>{state.phase === "idle" ? t("Ready when you are") : statusLabel}</h2>
+          <p>
+            {state.message ?? `${t("Use the recording hotkey to start or stop dictation:")} ${settings.hotkey}`}
+          </p>
           <button
             className="primary"
             onClick={onToggleRecording}
@@ -41,16 +45,16 @@ export function DashboardPage({
             }
           >
             {state.phase === "recording"
-              ? "Stop and transcribe"
+              ? t("Stop and transcribe")
               : state.phase === "processing"
-                ? "Transcribing..."
+                ? t("Transcribing...")
                 : state.phase === "injecting"
-                  ? "Inserting..."
-                  : "Start recording"}
+                ? t("Inserting...")
+                : t("Start recording")}
           </button>
           {state.phase === "recording" && (
             <button className="secondary" onClick={onCancelRecording}>
-              Cancel
+              {t("Cancel")}
             </button>
           )}
         </div>
@@ -66,20 +70,20 @@ export function DashboardPage({
         )}
       </article>
 
-      <InfoCard label="HOTKEY" value={settings.hotkey} detail="Global toggle shortcut" />
+      <InfoCard label={t("HOTKEY")} value={settings.hotkey} detail={t("Global toggle shortcut")} />
       <InfoCard
-        label="MODEL"
+        label={t("MODEL")}
         value={model?.installed ? model.modelId ?? "Ready" : "Not installed"}
         detail={model?.detail ?? "Checking local cache"}
       />
       {state.lastResult && (
         <article className="info-card span-2">
-          <p className="eyebrow">LAST RESULT</p>
+          <p className="eyebrow">{t("LAST RESULT")}</p>
           <div
             className="history-text"
             role="button"
             tabIndex={0}
-            title="Double-click to copy"
+            title={t("Double-click to copy")}
             onDoubleClick={() => onCopyResult(state.lastResult!)}
             onKeyDown={(event) => {
               if (event.key === "Enter" || event.key === " ") {
@@ -90,11 +94,11 @@ export function DashboardPage({
           >
             {state.lastResult}
           </div>
-          <p>Double-click to copy</p>
+          <p>{t("Double-click to copy")}</p>
         </article>
       )}
       <InfoCard
-        label="PRIVACY"
+        label={t("PRIVACY")}
         value="Local only"
         detail={
           settings.historyEnabled
@@ -103,9 +107,9 @@ export function DashboardPage({
         }
       />
       <InfoCard
-        label="RECENT ITEMS"
+        label={t("RECENT ITEMS")}
         value={String(history.length)}
-        detail="No transcript content is logged"
+        detail={t("No transcript content is logged")}
       />
     </section>
   );
