@@ -8,6 +8,7 @@ import type {
   Settings,
 } from "../types";
 import { useI18n } from "../i18n";
+import type { MessageKey } from "../i18n";
 
 type ModelConfiguration = Pick<
   Settings,
@@ -27,26 +28,14 @@ function customModelValue(model: CustomModel) {
   return `custom:${encodeURIComponent(model.asrBackend)}:${encodeURIComponent(model.modelId)}`;
 }
 
-const backendDetails: Record<AsrBackend, { description: string }> = {
-  "faster-whisper": {
-    description: "Fast local transcription on CPU or CUDA.",
-  },
-  vibevoice: {
-    description: "Long-form transcription on a CUDA GPU.",
-  },
-  "openai-compatible": {
-    description: "OpenAI Audio Transcriptions API or a compatible local server.",
-  },
-};
-
-const modelTypeOptions: Array<{ value: AsrBackend; label: string }> = [
+const modelTypeOptions: Array<{ value: AsrBackend; label: MessageKey }> = [
   { value: "faster-whisper", label: "Whisper model" },
   { value: "vibevoice", label: "VibeVoice model" },
   { value: "openai-compatible", label: "OpenAI-compatible API model" },
 ];
 
 function modelTypeLabel(backend: AsrBackend) {
-  return modelTypeOptions.find((option) => option.value === backend)?.label ?? backend;
+  return modelTypeOptions.find((option) => option.value === backend)?.label ?? "Model ID";
 }
 
 export function ModelsPage({
@@ -60,7 +49,7 @@ export function ModelsPage({
 }: {
   gpu: GpuDiagnostics | null;
   settings: Settings;
-  asrBackendOptions: Array<{ value: AsrBackend; label: string }>;
+  asrBackendOptions: Array<{ value: AsrBackend; label: MessageKey }>;
   modelLoading: boolean;
   onConfigureModel: (configuration: ModelConfiguration) => void;
   onSaveCustomModel: (model: CustomModel) => Promise<boolean>;
@@ -116,7 +105,11 @@ export function ModelsPage({
     return saved;
   }, [settings.asrBackend, settings.customModels, settings.modelId]);
 
-  const selectedBackend = backendDetails[backend];
+  const localizedBackendDetails: Record<AsrBackend, string> = {
+    "faster-whisper": t("Fast local transcription on CPU or CUDA."),
+    vibevoice: t("Long-form transcription on a CUDA GPU."),
+    "openai-compatible": t("OpenAI Audio Transcriptions API or a compatible local server."),
+  };
   const selectedValue = additionalModelId
     ? customModelValue({ asrBackend: backend, modelId: additionalModelId })
     : builtinValue(backend);
@@ -146,13 +139,12 @@ export function ModelsPage({
         <p className="eyebrow">{t("ASR BACKEND")}</p>
         <h2>{t("Select a backend and load it")}</h2>
         <p className="lead">
-          Choose a local model or an OpenAI-compatible transcription endpoint. Local model files
-          are downloaded on first use and cached.
+          {t("Choose a local model or an OpenAI-compatible transcription endpoint. Local model files are downloaded on first use and cached.")}
         </p>
         <div className="steps model-settings">
           <SettingRow
             title={t("ASR backend")}
-            detail={selectedBackend.description}
+            detail={localizedBackendDetails[backend]}
             control={
               <select
                 value={selectedValue}
@@ -182,7 +174,7 @@ export function ModelsPage({
                 <optgroup label={t("Built-in backends")}>
                   {asrBackendOptions.map((option) => (
                     <option key={option.value} value={builtinValue(option.value)}>
-                      {option.label}
+                      {t(option.label)}
                     </option>
                   ))}
                 </optgroup>
@@ -190,7 +182,7 @@ export function ModelsPage({
                   <optgroup label={t("Additional Models")}>
                     {customModels.map((model) => (
                     <option key={customModelValue(model)} value={customModelValue(model)}>
-                        {model.modelId} ({modelTypeLabel(model.asrBackend)})
+                        {model.modelId} ({t(modelTypeLabel(model.asrBackend))})
                       </option>
                     ))}
                   </optgroup>
@@ -308,8 +300,8 @@ export function ModelsPage({
                   value={draftModelId}
                   placeholder={
                     draftBackend === "openai-compatible"
-                      ? "API model ID (for example gpt-4o-mini-transcribe)"
-                      : "Model name or Hugging Face repository ID"
+                      ? t("API model ID (for example gpt-4o-mini-transcribe)")
+                      : t("Model name or Hugging Face repository ID")
                   }
                   onChange={(event) => setDraftModelId(event.target.value)}
                   maxLength={512}

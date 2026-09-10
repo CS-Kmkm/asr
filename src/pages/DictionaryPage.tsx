@@ -116,14 +116,14 @@ export function DictionaryPage({
                 <p>
                   {entry.reading}
                   {entry.category ? ` · ${entry.category}` : ""}
-                  {entry.aliases.length > 0 ? ` · aliases: ${entry.aliases.join(", ")}` : ""}
-                  {` · priority ${entry.priority}`}
+                  {entry.aliases.length > 0 ? ` · ${t("aliases:")} ${entry.aliases.join(", ")}` : ""}
+                  {` · ${t("priority")} ${entry.priority}`}
                 </p>
               </div>
               <button
                 className="secondary"
                 onClick={() => {
-                  if (window.confirm(`Delete “${entry.surface}” from the dictionary?`)) {
+                  if (window.confirm(`${t("Delete dictionary entry")}: “${entry.surface}”`)) {
                     onDelete(entry.id);
                   }
                 }}

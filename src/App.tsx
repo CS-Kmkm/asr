@@ -51,7 +51,7 @@ import {
   type MessageKey,
 } from "./i18n";
 
-const asrBackendOptions: Array<{ value: AsrBackend; label: string }> = [
+const asrBackendOptions: Array<{ value: AsrBackend; label: MessageKey }> = [
   { value: "faster-whisper", label: "faster-whisper (recommended / CPU supported)" },
   { value: "vibevoice", label: "VibeVoice (CUDA GPU required)" },
   { value: "openai-compatible", label: "OpenAI-compatible API" },

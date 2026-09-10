@@ -73,8 +73,8 @@ export function DashboardPage({
       <InfoCard label={t("HOTKEY")} value={settings.hotkey} detail={t("Global toggle shortcut")} />
       <InfoCard
         label={t("MODEL")}
-        value={model?.installed ? model.modelId ?? "Ready" : "Not installed"}
-        detail={model?.detail ?? "Checking local cache"}
+        value={model?.installed ? model.modelId ?? t("Ready") : t("Not installed")}
+        detail={model?.detail ?? t("Checking local cache")}
       />
       {state.lastResult && (
         <article className="info-card span-2">
@@ -99,11 +99,11 @@ export function DashboardPage({
       )}
       <InfoCard
         label={t("PRIVACY")}
-        value="Local only"
+        value={t("Local only")}
         detail={
           settings.historyEnabled
-            ? "History stored locally on this device"
-            : "History disabled; nothing is stored"
+            ? t("History stored locally on this device")
+            : t("History disabled; nothing is stored")
         }
       />
       <InfoCard

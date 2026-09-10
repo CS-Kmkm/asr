@@ -17,8 +17,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         <div>
       <h2>{t("AI text correction")}</h2>
           <p className="muted">
-            When enabled, the transcript is sent to the selected external provider after local
-            transcription. Audio is never sent by this feature.
+            {t("When enabled, the transcript is sent to the selected external provider after local transcription. Audio is never sent by this feature.")}
           </p>
         </div>
         <div className="ai-correction-master">
@@ -123,7 +122,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
           />
           <SettingRow
             title={t("Reasoning effort")}
-            detail="Choose the quality, latency, and cost tradeoff. None is fastest; high and above spend more time reasoning. Availability depends on the selected model."
+            detail={t("Choose the quality, latency, and cost tradeoff. None is fastest; high and above spend more time reasoning. Availability depends on the selected model.")}
             control={
               <select
                 value={settings.openaiReasoningEffort}
