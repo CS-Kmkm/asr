@@ -740,10 +740,14 @@ pub(crate) async fn update_settings(
     let rollback_shortcuts = || {
         if recording_changed {
             let _ = app.global_shortcut().unregister(new_shortcut);
-            let _ = app.global_shortcut().register(old_shortcut);
         }
         if translation_changed {
             let _ = app.global_shortcut().unregister(new_translation_shortcut);
+        }
+        if recording_changed {
+            let _ = app.global_shortcut().register(old_shortcut);
+        }
+        if translation_changed {
             let _ = app.global_shortcut().register(old_translation_shortcut);
         }
     };
