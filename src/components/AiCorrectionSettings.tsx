@@ -1,5 +1,6 @@
 import { SettingRow, Toggle } from "./ui";
 import type { Settings } from "../types";
+import { useI18n } from "../i18n";
 
 interface AiCorrectionSettingsProps {
   settings: Settings;
@@ -7,16 +8,16 @@ interface AiCorrectionSettingsProps {
 }
 
 export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsProps) {
-  const status = settings.textCorrectionEnabled ? "On" : "Off";
+  const { t } = useI18n();
+  const status = settings.textCorrectionEnabled ? t("On") : t("Off");
 
   return (
     <section className="panel ai-correction-panel">
       <div className="ai-correction-header">
         <div>
-          <h2>AI text correction</h2>
+      <h2>{t("AI text correction")}</h2>
           <p className="muted">
-            When enabled, the transcript is sent to the selected external provider after local
-            transcription. Audio is never sent by this feature.
+            {t("When enabled, the transcript is sent to the selected external provider after local transcription. Audio is never sent by this feature.")}
           </p>
         </div>
         <div className="ai-correction-master">
@@ -26,19 +27,19 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
           <Toggle
             checked={settings.textCorrectionEnabled}
             onChange={(value) => onSave({ textCorrectionEnabled: value })}
-            label={`${settings.textCorrectionEnabled ? "Disable" : "Enable"} AI text correction`}
+            label={`${settings.textCorrectionEnabled ? t("Disable") : t("Enable")} ${t("AI text correction")}`}
           />
         </div>
       </div>
       <p className="ai-correction-master-detail">
         {settings.textCorrectionEnabled
-          ? "AI correction is applied before text is inserted. If the API fails, the original transcript is used."
-          : "AI correction and external API requests are disabled. You can configure the options below before enabling it."}
+          ? t("AI correction is applied before text is inserted. If the API fails, the original transcript is used.")
+          : t("AI correction and external API requests are disabled. You can configure the options below before enabling it.")}
       </p>
 
       <SettingRow
-        title="Provider"
-        detail="Choose the API used for correction. This can be configured while correction is off."
+        title={t("Provider")}
+        detail={t("Choose the API used for correction. This can be configured while correction is off.")}
         control={
           <select
             value={settings.correctionProvider}
@@ -54,12 +55,12 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         }
       />
       <div className="correction-options-heading">
-        <strong>Automatic editing</strong>
-        <p>Each operation is independently applied when AI text correction is enabled.</p>
+        <strong>{t("Automatic editing")}</strong>
+        <p>{t("Each operation is independently applied when AI text correction is enabled.")}</p>
       </div>
       <SettingRow
-        title="Remove filler words"
-        detail="Remove empty hesitations such as ‘えーと’, ‘あのー’, ‘um’, and ‘uh’, while preserving meaningful hesitation or emphasis."
+        title={t("Remove filler words")}
+        detail={t("Remove empty hesitations such as ‘えーと’, ‘あのー’, ‘um’, and ‘uh’, while preserving meaningful hesitation or emphasis.")}
         control={
           <Toggle
             checked={settings.correctionRemoveFillers}
@@ -68,8 +69,8 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         }
       />
       <SettingRow
-        title="Remove accidental repetition"
-        detail="Collapse unintended repeated words and false starts, while retaining deliberate rhetorical repetition."
+        title={t("Remove accidental repetition")}
+        detail={t("Collapse unintended repeated words and false starts, while retaining deliberate rhetorical repetition.")}
         control={
           <Toggle
             checked={settings.correctionRemoveRepetitions}
@@ -78,8 +79,8 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         }
       />
       <SettingRow
-        title="Apply spoken self-corrections"
-        detail="For phrases such as ‘Tuesday—actually, Wednesday’, keep the speaker’s final intended revision."
+        title={t("Apply spoken self-corrections")}
+        detail={t("For phrases such as ‘Tuesday—actually, Wednesday’, keep the speaker’s final intended revision.")}
         control={
           <Toggle
             checked={settings.correctionResolveSelfCorrections}
@@ -88,8 +89,8 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         }
       />
       <SettingRow
-        title="Automatic formatting"
-        detail="Turn spoken lists, steps, action items, and key points into paragraphs, bullets, or numbered lists when appropriate."
+        title={t("Automatic formatting")}
+        detail={t("Turn spoken lists, steps, action items, and key points into paragraphs, bullets, or numbered lists when appropriate.")}
         control={
           <Toggle
             checked={settings.correctionAutoFormat}
@@ -98,8 +99,8 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         }
       />
       <SettingRow
-        title="Improve clarity"
-        detail="Lightly repair spontaneous-speech grammar and unclear phrasing without changing meaning, tone, or formality."
+        title={t("Improve clarity")}
+        detail={t("Lightly repair spontaneous-speech grammar and unclear phrasing without changing meaning, tone, or formality.")}
         control={
           <Toggle
             checked={settings.correctionImproveClarity}
@@ -110,8 +111,8 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
       {settings.correctionProvider === "openai" ? (
         <>
           <SettingRow
-            title="OpenAI model"
-            detail="Model ID used through the OpenAI Responses API."
+            title={t("OpenAI model")}
+            detail={t("Model ID used through the OpenAI Responses API.")}
             control={
               <input
                 value={settings.openaiCorrectionModel}
@@ -120,8 +121,8 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
             }
           />
           <SettingRow
-            title="Reasoning effort"
-            detail="Choose the quality, latency, and cost tradeoff. None is fastest; high and above spend more time reasoning. Availability depends on the selected model."
+            title={t("Reasoning effort")}
+            detail={t("Choose the quality, latency, and cost tradeoff. None is fastest; high and above spend more time reasoning. Availability depends on the selected model.")}
             control={
               <select
                 value={settings.openaiReasoningEffort}
@@ -132,18 +133,18 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
                   })
                 }
               >
-                <option value="none">None — fastest</option>
-                <option value="low">Low</option>
-                <option value="medium">Medium — balanced</option>
-                <option value="high">High</option>
-                <option value="xhigh">XHigh</option>
-                <option value="max">Max — quality first</option>
+                <option value="none">{t("None — fastest")}</option>
+                <option value="low">{t("Low")}</option>
+                <option value="medium">{t("Medium — balanced")}</option>
+                <option value="high">{t("High")}</option>
+                <option value="xhigh">{t("XHigh")}</option>
+                <option value="max">{t("Max — quality first")}</option>
               </select>
             }
           />
           <SettingRow
-            title="OpenAI API key environment variable"
-            detail="The key itself is not saved. Restart the app after setting this variable."
+            title={t("OpenAI API key environment variable")}
+            detail={t("The key itself is not saved. Restart the app after setting this variable.")}
             control={
               <input
                 value={settings.openaiApiKeyEnvVar}
@@ -155,8 +156,8 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
       ) : (
         <>
           <SettingRow
-            title="Gemini model"
-            detail="Model ID used through the Gemini Interactions API."
+            title={t("Gemini model")}
+            detail={t("Model ID used through the Gemini Interactions API.")}
             control={
               <input
                 value={settings.geminiCorrectionModel}
@@ -165,8 +166,8 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
             }
           />
           <SettingRow
-            title="Gemini API key environment variable"
-            detail="The key itself is not saved. Restart the app after setting this variable."
+            title={t("Gemini API key environment variable")}
+            detail={t("The key itself is not saved. Restart the app after setting this variable.")}
             control={
               <input
                 value={settings.geminiApiKeyEnvVar}
@@ -177,14 +178,14 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         </>
       )}
       <SettingRow
-        title="Additional style and tone guidance"
-        detail="Customize the editing style. Safety constraints, enabled operations, and dictionary spellings are applied automatically."
+        title={t("Additional style and tone guidance")}
+        detail={t("Customize the editing style. Safety constraints, enabled operations, and dictionary spellings are applied automatically.")}
         control={
           <textarea
             rows={7}
             maxLength={500}
             value={settings.correctionInstruction}
-            placeholder="For example: Keep my tone concise and friendly."
+            placeholder={t("For example: Keep my tone concise and friendly.")}
             onChange={(event) => onSave({ correctionInstruction: event.target.value })}
           />
         }

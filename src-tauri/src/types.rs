@@ -23,6 +23,8 @@ pub struct AppStateSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
+    #[serde(default = "default_ui_language")]
+    pub ui_language: String,
     pub setup_complete: bool,
     pub hotkey: String,
     pub microphone_id: Option<String>,
@@ -91,6 +93,10 @@ fn default_asr_backend() -> String {
     "faster-whisper".into()
 }
 
+fn default_ui_language() -> String {
+    "ja".into()
+}
+
 fn default_model_quantization() -> String {
     "4bit".into()
 }
@@ -150,6 +156,7 @@ fn default_automatic_gain() -> bool {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            ui_language: default_ui_language(),
             setup_complete: false,
             hotkey: "Ctrl+Shift+Space".into(),
             microphone_id: None,
@@ -292,6 +299,7 @@ mod tests {
     fn default_settings_use_faster_whisper_backend() {
         assert_eq!(Settings::default().asr_backend, "faster-whisper");
         assert_eq!(Settings::default().model_quantization, "4bit");
+        assert_eq!(Settings::default().ui_language, "ja");
     }
 
     #[test]
@@ -328,6 +336,7 @@ mod tests {
         }"#;
         let settings: Settings = serde_json::from_str(stored).unwrap();
         assert_eq!(settings.asr_backend, "faster-whisper");
+        assert_eq!(settings.ui_language, "ja");
         assert_eq!(settings.model_quantization, "4bit");
         assert_eq!(settings.api_base_url, "https://api.openai.com/v1");
         assert_eq!(settings.api_key_env_var, "OPENAI_API_KEY");

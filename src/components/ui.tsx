@@ -1,5 +1,6 @@
 import React from "react";
 import type { ModelProgress } from "../types";
+import { useI18n } from "../i18n";
 
 function formatBytes(bytes: number) {
   const mega = bytes / (1024 * 1024);
@@ -7,6 +8,7 @@ function formatBytes(bytes: number) {
 }
 
 export function ModelProgressBar({ progress }: { progress: ModelProgress }) {
+  const { t } = useI18n();
   const { completedBytes, totalBytes } = progress;
   // The download size is unknown until Hugging Face reports file metadata, and
   // the transferred amount can slightly exceed it, so keep the bar in range.
@@ -16,15 +18,15 @@ export function ModelProgressBar({ progress }: { progress: ModelProgress }) {
       : null;
   const label =
     progress.stage === "load"
-      ? "Loading into memory"
+      ? t("Loading into memory")
       : ratio !== null && completedBytes !== null && totalBytes !== null
         ? `${Math.round(ratio * 100)}% (${formatBytes(completedBytes)} / ${formatBytes(totalBytes)})`
-        : "Starting download";
+        : t("Starting download");
   return (
     <div
       className="model-progress"
       role="progressbar"
-      aria-label="Speech model preparation"
+      aria-label={t("Speech model preparation")}
       aria-valuemin={0}
       aria-valuemax={100}
       aria-valuenow={ratio !== null ? Math.round(ratio * 100) : undefined}

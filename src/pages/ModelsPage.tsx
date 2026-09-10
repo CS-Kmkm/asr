@@ -7,6 +7,8 @@ import type {
   ModelQuantization,
   Settings,
 } from "../types";
+import { useI18n } from "../i18n";
+import type { MessageKey } from "../i18n";
 
 type ModelConfiguration = Pick<
   Settings,
@@ -26,26 +28,14 @@ function customModelValue(model: CustomModel) {
   return `custom:${encodeURIComponent(model.asrBackend)}:${encodeURIComponent(model.modelId)}`;
 }
 
-const backendDetails: Record<AsrBackend, { description: string }> = {
-  "faster-whisper": {
-    description: "Fast local transcription on CPU or CUDA.",
-  },
-  vibevoice: {
-    description: "Long-form transcription on a CUDA GPU.",
-  },
-  "openai-compatible": {
-    description: "OpenAI Audio Transcriptions API or a compatible local server.",
-  },
-};
-
-const modelTypeOptions: Array<{ value: AsrBackend; label: string }> = [
+const modelTypeOptions: Array<{ value: AsrBackend; label: MessageKey }> = [
   { value: "faster-whisper", label: "Whisper model" },
   { value: "vibevoice", label: "VibeVoice model" },
   { value: "openai-compatible", label: "OpenAI-compatible API model" },
 ];
 
 function modelTypeLabel(backend: AsrBackend) {
-  return modelTypeOptions.find((option) => option.value === backend)?.label ?? backend;
+  return modelTypeOptions.find((option) => option.value === backend)?.label ?? "Model ID";
 }
 
 export function ModelsPage({
@@ -59,12 +49,13 @@ export function ModelsPage({
 }: {
   gpu: GpuDiagnostics | null;
   settings: Settings;
-  asrBackendOptions: Array<{ value: AsrBackend; label: string }>;
+  asrBackendOptions: Array<{ value: AsrBackend; label: MessageKey }>;
   modelLoading: boolean;
   onConfigureModel: (configuration: ModelConfiguration) => void;
   onSaveCustomModel: (model: CustomModel) => Promise<boolean>;
   onDiagnoseGpu: () => void;
 }) {
+  const { t } = useI18n();
   const [backend, setBackend] = useState(settings.asrBackend);
   const [additionalModelId, setAdditionalModelId] = useState(settings.modelId ?? "");
   const [quantization, setQuantization] = useState<ModelQuantization>(
@@ -114,7 +105,11 @@ export function ModelsPage({
     return saved;
   }, [settings.asrBackend, settings.customModels, settings.modelId]);
 
-  const selectedBackend = backendDetails[backend];
+  const localizedBackendDetails: Record<AsrBackend, string> = {
+    "faster-whisper": t("Fast local transcription on CPU or CUDA."),
+    vibevoice: t("Long-form transcription on a CUDA GPU."),
+    "openai-compatible": t("OpenAI Audio Transcriptions API or a compatible local server."),
+  };
   const selectedValue = additionalModelId
     ? customModelValue({ asrBackend: backend, modelId: additionalModelId })
     : builtinValue(backend);
@@ -141,16 +136,15 @@ export function ModelsPage({
   return (
     <section className="grid">
       <article className="panel span-2">
-        <p className="eyebrow">ASR BACKEND</p>
-        <h2>Select a backend and load it</h2>
+        <p className="eyebrow">{t("ASR BACKEND")}</p>
+        <h2>{t("Select a backend and load it")}</h2>
         <p className="lead">
-          Choose a local model or an OpenAI-compatible transcription endpoint. Local model files
-          are downloaded on first use and cached.
+          {t("Choose a local model or an OpenAI-compatible transcription endpoint. Local model files are downloaded on first use and cached.")}
         </p>
         <div className="steps model-settings">
           <SettingRow
-            title="ASR backend"
-            detail={selectedBackend.description}
+            title={t("ASR backend")}
+            detail={localizedBackendDetails[backend]}
             control={
               <select
                 value={selectedValue}
@@ -177,31 +171,31 @@ export function ModelsPage({
                   }
                 }}
               >
-                <optgroup label="Built-in backends">
+                <optgroup label={t("Built-in backends")}>
                   {asrBackendOptions.map((option) => (
                     <option key={option.value} value={builtinValue(option.value)}>
-                      {option.label}
+                      {t(option.label)}
                     </option>
                   ))}
                 </optgroup>
                 {customModels.length > 0 && (
-                  <optgroup label="Additional Models">
+                  <optgroup label={t("Additional Models")}>
                     {customModels.map((model) => (
-                      <option key={customModelValue(model)} value={customModelValue(model)}>
-                        {model.modelId} ({modelTypeLabel(model.asrBackend)})
+                    <option key={customModelValue(model)} value={customModelValue(model)}>
+                        {model.modelId} ({t(modelTypeLabel(model.asrBackend))})
                       </option>
                     ))}
                   </optgroup>
                 )}
-                <option value={ADDITIONAL_MODEL_VALUE}>+ Additional Model...</option>
+                <option value={ADDITIONAL_MODEL_VALUE}>{t("+ Additional Model...")}</option>
               </select>
             }
           />
           {backend === "openai-compatible" ? (
             <>
               <SettingRow
-                title="API base URL"
-                detail="Use https://api.openai.com/v1 for OpenAI, or a local server such as http://127.0.0.1:8000/v1."
+                title={t("API base URL")}
+                detail={t("Use https://api.openai.com/v1 for OpenAI, or a local server such as http://127.0.0.1:8000/v1.")}
                 control={
                   <input
                     value={apiBaseUrl}
@@ -212,8 +206,8 @@ export function ModelsPage({
                 }
               />
               <SettingRow
-                title="API key environment variable"
-                detail="The secret itself is not saved. OpenAI uses OPENAI_API_KEY; an unauthenticated local server needs no value set."
+                title={t("API key environment variable")}
+                detail={t("The secret itself is not saved. OpenAI uses OPENAI_API_KEY; an unauthenticated local server needs no value set.")}
                 control={
                   <input
                     value={apiKeyEnvVar}
@@ -226,8 +220,8 @@ export function ModelsPage({
             </>
           ) : (
             <SettingRow
-              title="Load format"
-              detail="The recommended setting minimizes memory usage. Use bf16 only with sufficient GPU memory."
+              title={t("Load format")}
+              detail={t("The recommended setting minimizes memory usage. Use bf16 only with sufficient GPU memory.")}
               control={
                 <select
                   value={quantization}
@@ -235,9 +229,9 @@ export function ModelsPage({
                     setQuantization(event.target.value as ModelQuantization)
                   }
                 >
-                  <option value="4bit">Memory saving (recommended)</option>
-                  <option value="8bit">8-bit</option>
-                  <option value="bf16">bf16 / float16</option>
+                  <option value="4bit">{t("Memory saving (recommended)")}</option>
+                  <option value="8bit">{t("8-bit")}</option>
+                  <option value="bf16">{t("bf16 / float16")}</option>
                 </select>
               }
             />
@@ -256,21 +250,21 @@ export function ModelsPage({
           }
           disabled={modelLoading}
         >
-          {modelLoading ? "Loading..." : "Load Model"}
+          {modelLoading ? t("Loading...") : t("Load Model")}
         </button>
         <p className="model-note">
-          If recording starts before loading, Local Voice automatically prepares the selected backend.
+          {t("If recording starts before loading, Local Voice automatically prepares the selected backend.")}
         </p>
       </article>
 
       <article className="panel span-2">
-        <p className="eyebrow">GPU</p>
-        <h2>{gpu?.adapterName ?? "Not checked"}</h2>
-        <p>{gpu?.recommendation ?? "Run diagnostics to check NVIDIA availability and VRAM."}</p>
+        <p className="eyebrow">{t("GPU")}</p>
+        <h2>{gpu?.adapterName ?? t("Not checked")}</h2>
+        <p>{gpu?.recommendation ?? t("Run diagnostics to check NVIDIA availability and VRAM.")}</p>
         {gpu?.memoryTotalMb && <strong>{gpu.memoryTotalMb} MB VRAM</strong>}
         <br />
         <button className="secondary" onClick={onDiagnoseGpu}>
-          Run diagnostics
+          {t("Run diagnostics")}
         </button>
       </article>
 
@@ -284,30 +278,30 @@ export function ModelsPage({
             onMouseDown={(event) => event.stopPropagation()}
           >
             <form onSubmit={(event) => void saveAdditionalModel(event)}>
-              <p className="eyebrow">ADDITIONAL MODEL</p>
-              <h2 id="additional-model-title">Add an ASR model</h2>
-              <p>The model will be saved and available from the ASR backend list.</p>
+              <p className="eyebrow">{t("ADDITIONAL MODEL")}</p>
+              <h2 id="additional-model-title">{t("Add an ASR model")}</h2>
+              <p>{t("The model will be saved and available from the ASR backend list.")}</p>
               <label className="modal-field">
-                <strong>Model type</strong>
+                  <strong>{t("Model type")}</strong>
                 <select
                   value={draftBackend}
                   onChange={(event) => setDraftBackend(event.target.value as AsrBackend)}
                 >
                   {modelTypeOptions.map((option) => (
                     <option key={option.value} value={option.value}>
-                      {option.label}
+                      {t(option.label)}
                     </option>
                   ))}
                 </select>
               </label>
               <label className="modal-field">
-                <strong>Model ID</strong>
+                  <strong>{t("Model ID")}</strong>
                 <input
                   value={draftModelId}
                   placeholder={
                     draftBackend === "openai-compatible"
-                      ? "API model ID (for example gpt-4o-mini-transcribe)"
-                      : "Model name or Hugging Face repository ID"
+                      ? t("API model ID (for example gpt-4o-mini-transcribe)")
+                      : t("Model name or Hugging Face repository ID")
                   }
                   onChange={(event) => setDraftModelId(event.target.value)}
                   maxLength={512}
@@ -321,14 +315,14 @@ export function ModelsPage({
                   onClick={() => setModalOpen(false)}
                   disabled={savingCustomModel}
                 >
-                  Cancel
+                  {t("Cancel")}
                 </button>
                 <button
                   type="submit"
                   className="primary"
                   disabled={savingCustomModel || !draftModelId.trim()}
                 >
-                  {savingCustomModel ? "Saving..." : "Add Model"}
+                  {savingCustomModel ? t("Saving...") : t("Add Model")}
                 </button>
               </div>
             </form>

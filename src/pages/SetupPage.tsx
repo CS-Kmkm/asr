@@ -1,18 +1,19 @@
 import { SettingRow } from "../components/ui";
 import type { AudioDevice, GpuDiagnostics, Settings } from "../types";
+import { useI18n, type MessageKey } from "../i18n";
 
-function gpuSummary(gpu: GpuDiagnostics | null) {
-  if (!gpu) return "Checking GPU automatically...";
-  if (gpu.status !== "available") return `Checked automatically. ${gpu.recommendation}`;
+function gpuSummary(gpu: GpuDiagnostics | null, t: (key: MessageKey) => string) {
+  if (!gpu) return t("Checking GPU automatically...");
+  if (gpu.status !== "available") return `${t("Checked automatically.")} ${gpu.recommendation}`;
 
   const hardware = [
     gpu.adapterName,
     gpu.memoryTotalMb ? `${gpu.memoryTotalMb} MB VRAM` : null,
-    gpu.driverVersion ? `driver ${gpu.driverVersion}` : null,
+    gpu.driverVersion ? `${t("driver")} ${gpu.driverVersion}` : null,
   ]
     .filter(Boolean)
     .join(" · ");
-  return `Detected automatically: ${hardware}. ${gpu.recommendation}`;
+  return `${t("Detected automatically:")} ${hardware}. ${gpu.recommendation}`;
 }
 
 export function SetupPage({
@@ -34,18 +35,16 @@ export function SetupPage({
   onDiagnoseGpu: () => void;
   onFinish: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <section className="panel">
-      <p className="eyebrow">FIRST RUN</p>
-      <h2>Configure local dictation</h2>
-      <p className="lead">
-        Voice data stays on this device. Model downloads and cloud services require an
-        explicit action.
-      </p>
+      <p className="eyebrow">{t("FIRST RUN")}</p>
+      <h2>{t("Configure local dictation")}</h2>
+      <p className="lead">{t("Voice data stays on this device. Model downloads and cloud services require an explicit action.")}</p>
       <div className="steps">
         <SettingRow
-          title="Microphone"
-          detail="Captured only while recording."
+          title={t("Microphone")}
+          detail={t("Captured only while recording.")}
           control={
             <select
               value={settings.microphoneId ?? ""}
@@ -53,19 +52,19 @@ export function SetupPage({
                 onSettingsChange({ ...settings, microphoneId: e.target.value || null })
               }
             >
-              <option value="">System default</option>
+              <option value="">{t("System default")}</option>
               {devices.map((device) => (
                 <option key={device.id} value={device.id}>
                   {device.name}
-                  {device.isDefault ? " (default)" : ""}
+                  {device.isDefault ? ` (${t("default")})` : ""}
                 </option>
               ))}
             </select>
           }
         />
         <SettingRow
-          title="Global hotkey"
-          detail="Default recording toggle."
+          title={t("Global hotkey")}
+          detail={t("Default recording toggle.")}
           control={
             <input
               value={settings.hotkey}
@@ -74,26 +73,26 @@ export function SetupPage({
           }
         />
         <SettingRow
-          title="ASR model"
-          detail="Choose a local backend or an OpenAI-compatible API on the Models page. The selected model is prepared automatically before first use."
+          title={t("ASR model")}
+          detail={t("Choose a local backend or an OpenAI-compatible API on the Models page. The selected model is prepared automatically before first use.")}
           control={
             <button className="secondary" onClick={onConfigureModel}>
-              Configure model
+              {t("Configure model")}
             </button>
           }
         />
         <SettingRow
-          title="GPU"
-          detail={gpuSummary(gpu)}
+          title={t("GPU")}
+          detail={gpuSummary(gpu, t)}
           control={
             <button className="secondary" onClick={onDiagnoseGpu} disabled={gpuChecking}>
-              {gpuChecking ? "Checking..." : "Recheck GPU"}
+              {gpuChecking ? t("Checking") : t("Recheck GPU")}
             </button>
           }
         />
       </div>
       <button className="primary" onClick={onFinish}>
-        Finish setup
+        {t("Finish setup")}
       </button>
     </section>
   );

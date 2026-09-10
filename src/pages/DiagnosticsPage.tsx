@@ -1,5 +1,6 @@
 import { InfoCard } from "../components/ui";
 import type { AppState, GpuDiagnostics } from "../types";
+import { useI18n } from "../i18n";
 
 export function DiagnosticsPage({
   state,
@@ -12,27 +13,25 @@ export function DiagnosticsPage({
   statusLabel: string;
   onDiagnoseGpu: () => void;
 }) {
+  const { t } = useI18n();
   return (
     <section className="panel">
-      <p className="lead">
-        Diagnostics report status codes and hardware metadata only. Audio, transcripts,
-        clipboard contents, window titles, and API keys are excluded.
-      </p>
+      <p className="lead">{t("Diagnostics report status codes and hardware metadata only. Audio, transcripts, clipboard contents, window titles, and API keys are excluded.")}</p>
       <div className="diagnostic-grid">
-        <InfoCard label="DATABASE" value="Connected" detail="SQLite migrations applied" />
+        <InfoCard label={t("DATABASE")} value={t("Connected")} detail={t("SQLite migrations applied")} />
         <InfoCard
-          label="APP STATE"
+          label={t("APP STATE")}
           value={statusLabel}
-          detail={`Updated ${new Date(state.updatedAt).toLocaleTimeString()}`}
+          detail={`${t("Updated")} ${new Date(state.updatedAt).toLocaleTimeString()}`}
         />
         <InfoCard
-          label="GPU"
-          value={gpu?.status ?? "Not checked"}
-          detail={gpu?.adapterName ?? "Run the hardware probe"}
+          label={t("GPU")}
+          value={gpu?.status ?? t("Not checked")}
+          detail={gpu?.adapterName ?? t("Run the hardware probe")}
         />
       </div>
       <button className="secondary" onClick={onDiagnoseGpu}>
-        Run GPU probe
+        {t("Run GPU probe")}
       </button>
     </section>
   );

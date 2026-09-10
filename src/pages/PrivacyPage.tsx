@@ -1,5 +1,6 @@
 import { SettingRow, Toggle } from "../components/ui";
 import type { Settings } from "../types";
+import { useI18n } from "../i18n";
 
 export function PrivacyPage({
   settings,
@@ -8,11 +9,12 @@ export function PrivacyPage({
   settings: Settings;
   onSave: (patch: Partial<Settings>) => void;
 }) {
+  const { t } = useI18n();
   return (
     <section className="panel">
       <SettingRow
-        title="Save text history"
-        detail="When disabled, transcript and processed text are never inserted into dictation_history."
+        title={t("Save text history")}
+        detail={t("When disabled, transcript and processed text are never inserted into dictation_history.")}
         control={
           <Toggle
             checked={settings.historyEnabled}
@@ -21,8 +23,8 @@ export function PrivacyPage({
         }
       />
       <SettingRow
-        title="Delete audio after processing"
-        detail="Audio cleanup is enabled by default."
+        title={t("Delete audio after processing")}
+        detail={t("Audio cleanup is enabled by default.")}
         control={
           <Toggle
             checked={settings.deleteAudioAfterProcessing}
@@ -31,16 +33,16 @@ export function PrivacyPage({
         }
       />
       <SettingRow
-        title="History retention"
-        detail="Text history cleanup window."
+        title={t("History retention")}
+        detail={t("Text history cleanup window.")}
         control={
           <select
             value={settings.historyRetentionDays}
             onChange={(e) => onSave({ historyRetentionDays: Number(e.target.value) })}
           >
-            <option value={7}>7 days</option>
-            <option value={30}>30 days</option>
-            <option value={90}>90 days</option>
+            <option value={7}>{t("7 days")}</option>
+            <option value={30}>{t("30 days")}</option>
+            <option value={90}>{t("90 days")}</option>
           </select>
         }
       />

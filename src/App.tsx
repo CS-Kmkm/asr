@@ -43,8 +43,15 @@ import { HistoryPage } from "./pages/HistoryPage";
 import { DictionaryPage } from "./pages/DictionaryPage";
 import { PrivacyPage } from "./pages/PrivacyPage";
 import { DiagnosticsPage } from "./pages/DiagnosticsPage";
+import {
+  I18nProvider,
+  translate,
+  translateAppMessage,
+  useI18n,
+  type MessageKey,
+} from "./i18n";
 
-const asrBackendOptions: Array<{ value: AsrBackend; label: string }> = [
+const asrBackendOptions: Array<{ value: AsrBackend; label: MessageKey }> = [
   { value: "faster-whisper", label: "faster-whisper (recommended / CPU supported)" },
   { value: "vibevoice", label: "VibeVoice (CUDA GPU required)" },
   { value: "openai-compatible", label: "OpenAI-compatible API" },
@@ -60,7 +67,7 @@ type Page =
   | "privacy"
   | "diagnostics";
 
-const pages: Array<{ id: Page; label: string }> = [
+const pages: Array<{ id: Page; label: MessageKey }> = [
   { id: "dashboard", label: "Status" },
   { id: "setup", label: "Setup" },
   { id: "models", label: "Models" },
@@ -70,6 +77,15 @@ const pages: Array<{ id: Page; label: string }> = [
   { id: "privacy", label: "Privacy" },
   { id: "diagnostics", label: "Diagnostics" },
 ];
+
+const phaseMessageKeys: Record<AppState["phase"], MessageKey> = {
+  idle: "Idle",
+  recording: "Recording",
+  processing: "Processing",
+  injecting: "Injecting",
+  completed: "Completed",
+  error: "Error",
+};
 
 const isRecordingOverlay = getCurrentWebviewWindow().label === "recording-overlay";
 const OVERLAY_WAVE_BAR_COUNT = 9;
@@ -102,6 +118,7 @@ if (isRecordingOverlay) {
 }
 
 function RecordingOverlay() {
+  const { language, t } = useI18n();
   const [waveform, setWaveform] = useState<number[]>(
     () => Array(OVERLAY_WAVE_BAR_COUNT).fill(0),
   );
@@ -149,9 +166,9 @@ function RecordingOverlay() {
 
   if (phase === "recording") {
     return (
-      <div className="recording-overlay recording" role="status" aria-label="Recording in progress">
+      <div className="recording-overlay recording" role="status" aria-label={t("Recording in progress")}>
         <span className="recording-live-dot" aria-hidden="true" />
-        <span className="recording-overlay-label">Listening</span>
+        <span className="recording-overlay-label">{t("Listening")}</span>
         <span className="recording-wave" aria-hidden="true">
           {waveform.map((amplitude, index) => (
             <i
@@ -170,14 +187,14 @@ function RecordingOverlay() {
   const compactPreview = compactOverlayPreview(preview?.text ?? "");
   const label =
     phase === "injecting"
-      ? "Inserting"
+      ? t("Inserting")
       : preview?.stage === "draft"
-        ? "Transcript ready"
+        ? t("Transcript ready")
         : preview?.stage === "streaming"
-          ? "AI correcting"
+          ? t("AI correcting")
           : preview?.stage === "fallback"
-            ? "Using transcript"
-            : "Processing";
+            ? t("Using transcript")
+            : t("Processing");
 
   return (
     <div className="recording-overlay processing" role="status" aria-live="polite">
@@ -185,7 +202,7 @@ function RecordingOverlay() {
       <div className="processing-copy">
         <span className="recording-overlay-label">{label}</span>
         <span className={`correction-preview${compactPreview ? "" : " pending"}`}>
-          {compactPreview || message || "Preparing text…"}
+          {compactPreview || translateAppMessage(language, message) || t("Preparing text…")}
         </span>
       </div>
     </div>
@@ -193,10 +210,28 @@ function RecordingOverlay() {
 }
 
 export default function App() {
-  return isRecordingOverlay ? <RecordingOverlay /> : <MainApp />;
+  const [language, setLanguage] = useState<Settings["uiLanguage"] | null>(null);
+
+  useEffect(() => {
+    getSettings()
+      .then((settings) => setLanguage(settings.uiLanguage))
+      .catch(() => setLanguage(defaultSettings.uiLanguage));
+  }, []);
+
+  if (language === null) return null;
+  return (
+    <I18nProvider language={language}>
+      {isRecordingOverlay ? (
+        <RecordingOverlay />
+      ) : (
+        <MainAppContent onLanguageChange={setLanguage} />
+      )}
+    </I18nProvider>
+  );
 }
 
-function MainApp() {
+function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Settings["uiLanguage"]) => void }) {
+  const { language, t } = useI18n();
   const [page, setPage] = useState<Page>("dashboard");
   const [state, setState] = useState<AppState>({
     phase: "idle",
@@ -235,6 +270,7 @@ function MainApp() {
         ([nextState, nextSettings, nextHistory, nextModel, nextGpu, nextDevices, nextDictionary]) => {
           setState(nextState);
           setSettings(nextSettings);
+          onLanguageChange(nextSettings.uiLanguage);
           setHistory(nextHistory);
           setModel(nextModel);
           setGpu(nextGpu);
@@ -267,15 +303,16 @@ function MainApp() {
     return () => {
       void listeners.then((unlisten) => unlisten.forEach((fn) => fn()));
     };
-  }, []);
+  }, [onLanguageChange]);
 
   useEffect(() => {
     setNoticeCopied(false);
   }, [notice]);
 
-  const statusLabel = useMemo(
-    () => state.phase.charAt(0).toUpperCase() + state.phase.slice(1),
-    [state.phase],
+  const statusLabel = t(phaseMessageKeys[state.phase]);
+  const localizedState = useMemo(
+    () => ({ ...state, message: translateAppMessage(language, state.message) }),
+    [language, state],
   );
   // A load started from the Models page or automatically at startup.
   const preparingModel = modelLoading || model?.state === "loading";
@@ -283,7 +320,7 @@ function MainApp() {
   async function copyNotice() {
     if (!notice) return;
     try {
-      await copyToClipboard(notice.message);
+      await copyToClipboard(translateAppMessage(language, notice.message) ?? notice.message);
       setNoticeCopied(true);
     } catch (error) {
       showNotice(String(error), "error");
@@ -304,8 +341,10 @@ function MainApp() {
     const next = { ...settings, ...patch };
     setSettings(next);
     try {
-      setSettings(await updateSettings(next));
-      showNotice("Settings saved locally.");
+      const saved = await updateSettings(next);
+      setSettings(saved);
+      onLanguageChange(saved.uiLanguage);
+      showNotice(translate(saved.uiLanguage, "Settings saved locally."));
     } catch (error) {
       setSettings(previous);
       showNotice(String(error), "error");
@@ -315,10 +354,10 @@ function MainApp() {
   async function diagnoseGpu() {
     if (gpuChecking) return;
     setGpuChecking(true);
-    showNotice("Running local GPU diagnostics...");
+    showNotice(t("Running local GPU diagnostics..."));
     try {
       setGpu(await runGpuDiagnostics());
-      showNotice("Diagnostics complete.");
+      showNotice(t("Diagnostics complete."));
     } catch (error) {
       showNotice(String(error), "error");
     } finally {
@@ -363,13 +402,13 @@ function MainApp() {
   ) {
     if (modelLoading) return;
     setModelLoading(true);
-    showNotice("Saving ASR settings and preparing the selected model...");
+    showNotice(t("Saving ASR settings and preparing the selected model..."));
     try {
       const next = configuration ? { ...settings, ...configuration } : settings;
       const saved = configuration ? await updateSettings(next) : next;
       setSettings(saved);
       setModel(await loadModel(saved.modelId, saved.modelQuantization));
-      showNotice("Model loaded and ready.");
+      showNotice(t("Model loaded and ready."));
     } catch (error) {
       showNotice(String(error), "error");
     } finally {
@@ -394,7 +433,7 @@ function MainApp() {
     try {
       const saved = await updateSettings(next);
       setSettings(saved);
-      showNotice("Custom model saved locally.");
+      showNotice(t("Custom model saved locally."));
       return true;
     } catch (error) {
       showNotice(String(error), "error");
@@ -406,7 +445,7 @@ function MainApp() {
     try {
       await addDictionaryEntry(entry);
       setDictionary(await listDictionary());
-      showNotice("Dictionary entry added.");
+      showNotice(t("Dictionary entry added."));
       return true;
     } catch (error) {
       showNotice(String(error), "error");
@@ -418,7 +457,7 @@ function MainApp() {
     try {
       await deleteDictionaryEntry(id);
       setDictionary(await listDictionary());
-      showNotice("Dictionary entry removed.");
+      showNotice(t("Dictionary entry removed."));
     } catch (error) {
       showNotice(String(error), "error");
     }
@@ -430,8 +469,8 @@ function MainApp() {
         <div className="brand">
           <span className="brand-mark">LV</span>
           <div>
-            <strong>Local Voice</strong>
-            <small>Windows input</small>
+            <strong>{t("Local Voice")}</strong>
+            <small>{t("Windows input")}</small>
           </div>
         </div>
         <nav>
@@ -441,20 +480,20 @@ function MainApp() {
               className={page === item.id ? "active" : ""}
               onClick={() => setPage(item.id)}
             >
-              {item.label}
+              {t(item.label)}
             </button>
           ))}
         </nav>
         <div className="local-badge">
-          <span /> Local processing default
+          <span /> {t("Local processing default")}
         </div>
       </aside>
 
       <main>
         <header>
           <div>
-            <p className="eyebrow">LOCAL AI VOICE INPUT</p>
-            <h1>{pages.find((item) => item.id === page)?.label}</h1>
+            <p className="eyebrow">{t("LOCAL AI VOICE INPUT")}</p>
+            <h1>{t(pages.find((item) => item.id === page)?.label ?? "Status")}</h1>
           </div>
           <div className={`status-pill ${state.phase}`}>
             <span />
@@ -464,7 +503,7 @@ function MainApp() {
 
         {page === "dashboard" && (
           <DashboardPage
-            state={state}
+            state={localizedState}
             settings={settings}
             history={history}
             model={model}
@@ -535,7 +574,7 @@ function MainApp() {
 
         {page === "diagnostics" && (
           <DiagnosticsPage
-            state={state}
+            state={localizedState}
             gpu={gpu}
             statusLabel={statusLabel}
             onDiagnoseGpu={() => void diagnoseGpu()}
@@ -553,23 +592,23 @@ function MainApp() {
             <button
               className="notice-message"
               onDoubleClick={() => void copyNotice()}
-              title="Double-click to copy"
+              title={t("Double-click to copy")}
             >
-              {notice?.message ??
+              {translateAppMessage(language, notice?.message ?? null) ??
                 (modelProgress?.stage === "download"
-                  ? "Downloading the speech model files."
-                  : "Loading the speech model.")}
+                  ? t("Downloading the speech model files.")
+                  : t("Loading the speech model."))}
             </button>
             {modelProgress && <ModelProgressBar progress={modelProgress} />}
           </div>
-          {noticeCopied && <span className="notice-copied">Copied</span>}
+          {noticeCopied && <span className="notice-copied">{t("Copied")}</span>}
           <button
             className="notice-dismiss"
             onClick={() => {
               setNotice(null);
               setModelProgress(null);
             }}
-            aria-label="Dismiss notification"
+            aria-label={t("Dismiss notification")}
           >
             ×
           </button>

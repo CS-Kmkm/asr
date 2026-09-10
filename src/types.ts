@@ -32,6 +32,7 @@ export interface RecordingResult {
 }
 
 export interface Settings {
+  uiLanguage: UiLanguage;
   setupComplete: boolean;
   hotkey: string;
   microphoneId: string | null;
@@ -63,6 +64,8 @@ export interface Settings {
   correctionImproveClarity: boolean;
   customModels: CustomModel[];
 }
+
+export type UiLanguage = "en" | "ja";
 
 export type AsrBackend = "vibevoice" | "faster-whisper" | "openai-compatible";
 export type ModelQuantization = "4bit" | "8bit" | "bf16";

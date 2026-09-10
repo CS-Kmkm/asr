@@ -1,5 +1,6 @@
 import { Empty, Toggle } from "../components/ui";
 import type { HistoryItem, Settings } from "../types";
+import { useI18n } from "../i18n";
 
 export function HistoryPage({
   settings,
@@ -12,25 +13,26 @@ export function HistoryPage({
   onSave: (patch: Partial<Settings>) => void;
   onCopyItem: (text: string) => void;
 }) {
+  const { t } = useI18n();
   return (
     <section className="panel compact-page-panel">
       <div className="history-controls">
-        <span>Save history</span>
+        <span>{t("Save history")}</span>
         <Toggle
           checked={settings.historyEnabled}
           onChange={(value) => onSave({ historyEnabled: value })}
-          label="Save history"
+          label={t("Save history")}
         />
       </div>
       {!settings.historyEnabled ? (
         <Empty
-          title="History is disabled"
-          detail="New transcripts will not be written to SQLite."
+          title={t("History is disabled")}
+          detail={t("New transcripts will not be written to SQLite.")}
         />
       ) : history.length === 0 ? (
         <Empty
-          title="No dictations yet"
-          detail="Completed local dictations will appear here."
+          title={t("No dictations yet")}
+          detail={t("Completed local dictations will appear here.")}
         />
       ) : (
         <div className="history-list">
@@ -64,12 +66,13 @@ function HistoryText({
   corrected?: boolean;
   onCopy: (text: string) => void;
 }) {
+  const { t } = useI18n();
   return (
     <div
       className={`history-text${corrected ? " api-corrected" : ""}`}
       role="button"
       tabIndex={0}
-      title="Double-click to copy"
+      title={t("Double-click to copy")}
       onDoubleClick={() => onCopy(text)}
       onKeyDown={(event) => {
         if (event.key === "Enter") onCopy(text);
