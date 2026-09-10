@@ -12,13 +12,17 @@ export function SettingsPage({
 }) {
   const [hotkey, setHotkey] = useState(settings.hotkey);
   const [translationHotkey, setTranslationHotkey] = useState(settings.translationHotkey);
+  const [translationInstruction, setTranslationInstruction] = useState(settings.translationInstruction);
   const cancelHotkeyBlurRef = useRef(false);
   const suppressHotkeyBlurRef = useRef(false);
   const cancelTranslationBlurRef = useRef(false);
   const suppressTranslationBlurRef = useRef(false);
+  const cancelTranslationInstructionBlurRef = useRef(false);
+  const suppressTranslationInstructionBlurRef = useRef(false);
 
   useEffect(() => setHotkey(settings.hotkey), [settings.hotkey]);
   useEffect(() => setTranslationHotkey(settings.translationHotkey), [settings.translationHotkey]);
+  useEffect(() => setTranslationInstruction(settings.translationInstruction), [settings.translationInstruction]);
 
   function commitHotkey() {
     if (cancelHotkeyBlurRef.current || suppressHotkeyBlurRef.current) {
@@ -36,6 +40,17 @@ export function SettingsPage({
       return;
     }
     if (translationHotkey !== settings.translationHotkey) onSave({ translationHotkey });
+  }
+
+  function commitTranslationInstruction() {
+    if (cancelTranslationInstructionBlurRef.current || suppressTranslationInstructionBlurRef.current) {
+      cancelTranslationInstructionBlurRef.current = false;
+      suppressTranslationInstructionBlurRef.current = false;
+      return;
+    }
+    if (translationInstruction !== settings.translationInstruction) {
+      onSave({ translationInstruction });
+    }
   }
 
   return (
@@ -85,9 +100,22 @@ export function SettingsPage({
           detail="Optional guidance appended to the fixed translation-only contract."
           control={
             <input
-              value={settings.translationInstruction}
+              value={translationInstruction}
               maxLength={500}
-              onChange={(event) => onSave({ translationInstruction: event.target.value })}
+              onChange={(event) => setTranslationInstruction(event.target.value)}
+              onBlur={commitTranslationInstruction}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  commitTranslationInstruction();
+                  suppressTranslationInstructionBlurRef.current = true;
+                  event.currentTarget.blur();
+                } else if (event.key === "Escape") {
+                  setTranslationInstruction(settings.translationInstruction);
+                  cancelTranslationInstructionBlurRef.current = true;
+                  event.currentTarget.blur();
+                }
+              }}
             />
           }
         />

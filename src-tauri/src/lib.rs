@@ -523,27 +523,53 @@ async fn toggle_recording(app: AppHandle) {
 
 async fn translate_selection(app: AppHandle) {
     let active = &app.state::<Services>().translation_active;
-    if active.swap(true, Ordering::AcqRel) { return; }
+    if active.swap(true, Ordering::AcqRel) {
+        return;
+    }
     struct TranslationGuard<'a>(&'a AtomicBool);
-    impl Drop for TranslationGuard<'_> { fn drop(&mut self) { self.0.store(false, Ordering::Release); } }
+    impl Drop for TranslationGuard<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
     let _guard = TranslationGuard(active);
     let settings = match app.state::<Storage>().get_settings() {
         Ok(settings) => settings,
-        Err(_) => { emit_status(&app, "error", "Translation settings are unavailable."); return; }
+        Err(_) => {
+            emit_status(&app, "error", "Translation settings are unavailable.");
+            return;
+        }
     };
-    let injector = SystemTextInjector::new(InjectionOptions { restore_clipboard: settings.clipboard_restore });
+    let injector = SystemTextInjector::new(InjectionOptions {
+        restore_clipboard: settings.clipboard_restore,
+    });
     let selection = match injector.capture_selection() {
         Ok(selection) => selection,
-        Err(_) => { emit_status(&app, "error", "Select text in a supported foreground edit control."); return; }
+        Err(_) => {
+            emit_status(
+                &app,
+                "error",
+                "Select text in a supported foreground edit control.",
+            );
+            return;
+        }
     };
     let source = selection.text().to_owned();
     let monitor = Arc::clone(&app.state::<Services>().input_monitor);
     if !monitor.start() {
-        emit_status(&app, "error", "Translation could not monitor the target safely.");
+        emit_status(
+            &app,
+            "error",
+            "Translation could not monitor the target safely.",
+        );
         return;
     }
     let Some(checkpoint) = monitor.checkpoint() else {
-        emit_status(&app, "error", "Translation could not monitor the target safely.");
+        emit_status(
+            &app,
+            "error",
+            "Translation could not monitor the target safely.",
+        );
         return;
     };
     let (_cancel_guard, cancel) = tokio::sync::watch::channel(false);
@@ -553,18 +579,30 @@ async fn translate_selection(app: AppHandle) {
         Ok(text) => text,
         Err(_) => {
             let copied = injector.copy_to_clipboard(&source).is_ok();
-            let message = if copied { "Translation failed; the selected text remains on the clipboard." } else { "Translation failed and the clipboard is unavailable." };
+            let message = if copied {
+                "Translation failed; the selected text remains on the clipboard."
+            } else {
+                "Translation failed and the clipboard is unavailable."
+            };
             emit_status(&app, "error", message);
             return;
         }
     };
     match injector.replace_selection(&selection, &translated, &monitor, checkpoint) {
         Ok(InsertResult::ClipboardOnly | InsertResult::PasteUnverified) => {
-            emit_status(&app, "error", "The target changed; the translation remains on the clipboard.");
+            emit_status(
+                &app,
+                "error",
+                "The target changed; the translation remains on the clipboard.",
+            );
         }
         Err(_) => {
             let copied = injector.copy_to_clipboard(&translated).is_ok();
-            let message = if copied { "The target changed; the translation remains on the clipboard." } else { "The target changed and the clipboard is unavailable." };
+            let message = if copied {
+                "The target changed; the translation remains on the clipboard."
+            } else {
+                "The target changed and the clipboard is unavailable."
+            };
             emit_status(&app, "error", message);
         }
         Ok(InsertResult::ClipboardPaste) => emit_status(&app, "success", "Translation inserted."),
@@ -572,9 +610,15 @@ async fn translate_selection(app: AppHandle) {
 }
 
 fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
-    let Ok(settings) = app.state::<Storage>().get_settings() else { return; };
-    let Ok(recording) = parse_shortcut(&settings.hotkey) else { return; };
-    let Ok(translation) = parse_shortcut(&settings.translation_hotkey) else { return; };
+    let Ok(settings) = app.state::<Storage>().get_settings() else {
+        return;
+    };
+    let Ok(recording) = parse_shortcut(&settings.hotkey) else {
+        return;
+    };
+    let Ok(translation) = parse_shortcut(&settings.translation_hotkey) else {
+        return;
+    };
     if shortcut == recording {
         tauri::async_runtime::spawn(toggle_recording(app));
     } else if shortcut == translation {

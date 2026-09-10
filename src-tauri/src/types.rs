@@ -139,7 +139,9 @@ fn default_correction_instruction() -> String {
     String::new()
 }
 
-fn default_translation_hotkey() -> String { "Ctrl+Shift+T".into() }
+fn default_translation_hotkey() -> String {
+    "Ctrl+Shift+T".into()
+}
 
 fn default_enabled_correction_feature() -> bool {
     true

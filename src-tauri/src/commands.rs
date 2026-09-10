@@ -747,23 +747,30 @@ pub(crate) async fn update_settings(
             let _ = app.global_shortcut().register(old_translation_shortcut);
         }
     };
+    // Remove every changed registration before adding any replacement. This
+    // makes swapping the two shortcuts an atomic-looking transaction.
     if recording_changed {
-        app.global_shortcut()
-            .register(new_shortcut)
-            .map_err(|error| format!("hotkey registration failed: {error}"))?;
         if let Err(error) = app.global_shortcut().unregister(old_shortcut) {
             rollback_shortcuts();
             return Err(format!("hotkey update failed: {error}"));
         }
     }
     if translation_changed {
-        if let Err(error) = app.global_shortcut().register(new_translation_shortcut) {
-            rollback_shortcuts();
-            return Err(format!("translation hotkey registration failed: {error}"));
-        }
         if let Err(error) = app.global_shortcut().unregister(old_translation_shortcut) {
             rollback_shortcuts();
             return Err(format!("translation hotkey update failed: {error}"));
+        }
+    }
+    if recording_changed {
+        if let Err(error) = app.global_shortcut().register(new_shortcut) {
+            rollback_shortcuts();
+            return Err(format!("hotkey registration failed: {error}"));
+        }
+    }
+    if translation_changed {
+        if let Err(error) = app.global_shortcut().register(new_translation_shortcut) {
+            rollback_shortcuts();
+            return Err(format!("translation hotkey registration failed: {error}"));
         }
     }
     if let Err(error) = storage.apply_history_policy(&previous, &settings) {

@@ -95,7 +95,9 @@ pub(crate) struct SelectedText {
     state: TargetText,
 }
 impl SelectedText {
-    pub(crate) fn text(&self) -> &str { &self.text }
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
 }
 impl SystemTextInjector {
     pub fn new(options: InjectionOptions) -> Self {
@@ -136,7 +138,11 @@ impl SystemTextInjector {
         if state.selected.is_empty() {
             return Err(InjectionError::BackendFailure("no text is selected"));
         }
-        Ok(SelectedText { target, text: state.selected.clone(), state })
+        Ok(SelectedText {
+            target,
+            text: state.selected.clone(),
+            state,
+        })
     }
 
     pub(crate) fn replace_selection(
