@@ -61,6 +61,14 @@ const en = {
   "Automatic insertion failed; the result remains on the clipboard.": "Automatic insertion failed; the result remains on the clipboard.",
   "AI correction failed; the original transcript was inserted.": "AI correction failed; the original transcript was inserted.",
   "Dictation inserted successfully.": "Dictation inserted successfully.",
+  "Translation settings are unavailable.": "Translation settings are unavailable.",
+  "Select text in a supported foreground edit control.": "Select text in a supported foreground edit control.",
+  "Translation could not monitor the target safely.": "Translation could not monitor the target safely.",
+  "Translation failed; the selected text remains on the clipboard.": "Translation failed; the selected text remains on the clipboard.",
+  "Translation failed and the clipboard is unavailable.": "Translation failed and the clipboard is unavailable.",
+  "The target changed; the translation remains on the clipboard.": "The target changed; the translation remains on the clipboard.",
+  "The target changed and the clipboard is unavailable.": "The target changed and the clipboard is unavailable.",
+  "Translation inserted.": "Translation inserted.",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
@@ -122,6 +130,14 @@ const ja: Record<MessageKey, string> = {
   "Automatic insertion failed; the result remains on the clipboard.": "自動挿入に失敗しました。結果はクリップボードに残っています。",
   "AI correction failed; the original transcript was inserted.": "AI修正に失敗したため、元の文字起こしを挿入しました。",
   "Dictation inserted successfully.": "音声入力を挿入しました。",
+  "Translation settings are unavailable.": "翻訳設定を読み込めませんでした。",
+  "Select text in a supported foreground edit control.": "対応する前面の編集欄でテキストを選択してください。",
+  "Translation could not monitor the target safely.": "対象を安全に監視できないため、翻訳を中止しました。",
+  "Translation failed; the selected text remains on the clipboard.": "翻訳に失敗しました。選択したテキストはクリップボードに残っています。",
+  "Translation failed and the clipboard is unavailable.": "翻訳に失敗し、クリップボードも利用できません。",
+  "The target changed; the translation remains on the clipboard.": "入力対象が変更されたため、翻訳結果はクリップボードに残っています。",
+  "The target changed and the clipboard is unavailable.": "入力対象が変更され、クリップボードも利用できません。",
+  "Translation inserted.": "翻訳結果を挿入しました。",
 } satisfies Record<MessageKey, string>;
 
 const appMessageKeys: ReadonlySet<MessageKey> = new Set(
@@ -144,6 +160,14 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "Automatic insertion failed; the result remains on the clipboard.",
       "AI correction failed; the original transcript was inserted.",
       "Dictation inserted successfully.",
+      "Translation settings are unavailable.",
+      "Select text in a supported foreground edit control.",
+      "Translation could not monitor the target safely.",
+      "Translation failed; the selected text remains on the clipboard.",
+      "Translation failed and the clipboard is unavailable.",
+      "The target changed; the translation remains on the clipboard.",
+      "The target changed and the clipboard is unavailable.",
+      "Translation inserted.",
   ] satisfies MessageKey[],
 );
 
