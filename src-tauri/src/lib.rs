@@ -573,8 +573,7 @@ async fn translate_selection(app: AppHandle) {
         return;
     };
     let (_cancel_guard, cancel) = tokio::sync::watch::channel(false);
-    let direction = correction::translation_direction(&source);
-    let translated = correction::translate_text(&settings, &source, direction, cancel).await;
+    let translated = correction::translate_text(&settings, &source, cancel).await;
     let translated = match translated {
         Ok(text) => text,
         Err(_) => {
