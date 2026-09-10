@@ -289,7 +289,7 @@ export function ModelsPage({
                 >
                   {modelTypeOptions.map((option) => (
                     <option key={option.value} value={option.value}>
-                      {option.label}
+                      {t(option.label)}
                     </option>
                   ))}
                 </select>

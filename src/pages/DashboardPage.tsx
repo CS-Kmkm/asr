@@ -61,7 +61,7 @@ export function DashboardPage({
         {state.phase === "recording" && (
           <div
             className="wave"
-            aria-label={`Input level ${Math.round(level.peak * 100)} percent`}
+            aria-label={`${t("Input level")} ${Math.round(level.peak * 100)} ${t("percent")}`}
           >
             {WAVE_SCALES.map((scale, i) => (
               <i key={i} style={{ height: Math.max(8, level.peak * 100 * scale) }} />
