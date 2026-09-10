@@ -93,6 +93,7 @@ pub(crate) struct Services {
     lifecycle: PipelineLifecycle,
     initialization: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     shutdown_started: AtomicBool,
+    translation_active: AtomicBool,
 }
 
 impl Services {
@@ -117,6 +118,7 @@ impl Services {
             lifecycle: PipelineLifecycle::default(),
             initialization: Mutex::new(None),
             shutdown_started: AtomicBool::new(false),
+            translation_active: AtomicBool::new(false),
         }
     }
 
@@ -519,6 +521,110 @@ async fn toggle_recording(app: AppHandle) {
     }
 }
 
+async fn translate_selection(app: AppHandle) {
+    let active = &app.state::<Services>().translation_active;
+    if active.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    struct TranslationGuard<'a>(&'a AtomicBool);
+    impl Drop for TranslationGuard<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let _guard = TranslationGuard(active);
+    let settings = match app.state::<Storage>().get_settings() {
+        Ok(settings) => settings,
+        Err(_) => {
+            emit_status(&app, "error", "Translation settings are unavailable.");
+            return;
+        }
+    };
+    let injector = SystemTextInjector::new(InjectionOptions {
+        restore_clipboard: settings.clipboard_restore,
+    });
+    let selection = match injector.capture_selection() {
+        Ok(selection) => selection,
+        Err(_) => {
+            emit_status(
+                &app,
+                "error",
+                "Select text in a supported foreground edit control.",
+            );
+            return;
+        }
+    };
+    let source = selection.text().to_owned();
+    let monitor = Arc::clone(&app.state::<Services>().input_monitor);
+    if !monitor.start() {
+        emit_status(
+            &app,
+            "error",
+            "Translation could not monitor the target safely.",
+        );
+        return;
+    }
+    let Some(checkpoint) = monitor.checkpoint() else {
+        emit_status(
+            &app,
+            "error",
+            "Translation could not monitor the target safely.",
+        );
+        return;
+    };
+    let (_cancel_guard, cancel) = tokio::sync::watch::channel(false);
+    let translated = correction::translate_text(&settings, &source, cancel).await;
+    let translated = match translated {
+        Ok(text) => text,
+        Err(_) => {
+            let copied = injector.copy_to_clipboard(&source).is_ok();
+            let message = if copied {
+                "Translation failed; the selected text remains on the clipboard."
+            } else {
+                "Translation failed and the clipboard is unavailable."
+            };
+            emit_status(&app, "error", message);
+            return;
+        }
+    };
+    match injector.replace_selection(&selection, &translated, &monitor, checkpoint) {
+        Ok(InsertResult::ClipboardOnly | InsertResult::PasteUnverified) => {
+            emit_status(
+                &app,
+                "error",
+                "The target changed; the translation remains on the clipboard.",
+            );
+        }
+        Err(_) => {
+            let copied = injector.copy_to_clipboard(&translated).is_ok();
+            let message = if copied {
+                "The target changed; the translation remains on the clipboard."
+            } else {
+                "The target changed and the clipboard is unavailable."
+            };
+            emit_status(&app, "error", message);
+        }
+        Ok(InsertResult::ClipboardPaste) => emit_status(&app, "success", "Translation inserted."),
+    }
+}
+
+fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
+    let Ok(settings) = app.state::<Storage>().get_settings() else {
+        return;
+    };
+    let Ok(recording) = parse_shortcut(&settings.hotkey) else {
+        return;
+    };
+    let Ok(translation) = parse_shortcut(&settings.translation_hotkey) else {
+        return;
+    };
+    if shortcut == recording {
+        tauri::async_runtime::spawn(toggle_recording(app));
+    } else if shortcut == translation {
+        tauri::async_runtime::spawn(translate_selection(app));
+    }
+}
+
 async fn initialize_model_runtime(app: AppHandle, settings: Settings) {
     let diagnostics = tauri::async_runtime::spawn_blocking(commands::probe_gpu_diagnostics)
         .await
@@ -556,10 +662,9 @@ pub fn run() {
         ))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(move |app, _pressed, event| {
+                .with_handler(move |app, pressed, event| {
                     if event.state() == ShortcutState::Pressed {
-                        let app = app.clone();
-                        tauri::async_runtime::spawn(toggle_recording(app));
+                        handle_shortcut(app.clone(), *pressed);
                     }
                 })
                 .build(),
@@ -589,11 +694,16 @@ pub fn run() {
             }
             let shortcut = parse_shortcut(&settings.hotkey)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            let translation_shortcut = parse_shortcut(&settings.translation_hotkey)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
             app.manage(storage);
             app.manage(AppState::default());
             app.manage(Services::new(&settings));
             recording_overlay::create(app.handle())?;
             app.global_shortcut().register(shortcut)?;
+            if translation_shortcut != shortcut {
+                app.global_shortcut().register(translation_shortcut)?;
+            }
             if cleanup_stale_artifacts(
                 &std::env::temp_dir(),
                 settings.delete_audio_after_processing,

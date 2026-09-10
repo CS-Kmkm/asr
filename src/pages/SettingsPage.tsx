@@ -13,10 +13,18 @@ export function SettingsPage({
 }) {
   const { t } = useI18n();
   const [hotkey, setHotkey] = useState(settings.hotkey);
+  const [translationHotkey, setTranslationHotkey] = useState(settings.translationHotkey);
+  const [translationInstruction, setTranslationInstruction] = useState(settings.translationInstruction);
   const cancelHotkeyBlurRef = useRef(false);
   const suppressHotkeyBlurRef = useRef(false);
+  const cancelTranslationBlurRef = useRef(false);
+  const suppressTranslationBlurRef = useRef(false);
+  const cancelTranslationInstructionBlurRef = useRef(false);
+  const suppressTranslationInstructionBlurRef = useRef(false);
 
   useEffect(() => setHotkey(settings.hotkey), [settings.hotkey]);
+  useEffect(() => setTranslationHotkey(settings.translationHotkey), [settings.translationHotkey]);
+  useEffect(() => setTranslationInstruction(settings.translationInstruction), [settings.translationInstruction]);
 
   function commitHotkey() {
     if (cancelHotkeyBlurRef.current || suppressHotkeyBlurRef.current) {
@@ -25,6 +33,26 @@ export function SettingsPage({
       return;
     }
     if (hotkey !== settings.hotkey) onSave({ hotkey });
+  }
+
+  function commitTranslationHotkey() {
+    if (cancelTranslationBlurRef.current || suppressTranslationBlurRef.current) {
+      cancelTranslationBlurRef.current = false;
+      suppressTranslationBlurRef.current = false;
+      return;
+    }
+    if (translationHotkey !== settings.translationHotkey) onSave({ translationHotkey });
+  }
+
+  function commitTranslationInstruction() {
+    if (cancelTranslationInstructionBlurRef.current || suppressTranslationInstructionBlurRef.current) {
+      cancelTranslationInstructionBlurRef.current = false;
+      suppressTranslationInstructionBlurRef.current = false;
+      return;
+    }
+    if (translationInstruction !== settings.translationInstruction) {
+      onSave({ translationInstruction });
+    }
   }
 
   return (
@@ -57,6 +85,53 @@ export function SettingsPage({
                   setHotkey(settings.hotkey);
                   cancelHotkeyBlurRef.current = true;
                   e.currentTarget.blur();
+                }
+              }}
+            />
+          }
+        />
+        <SettingRow
+          title={t("Translation hotkey")}
+          detail={t("Translates selected text; the default is Ctrl+Shift+T.")}
+          control={
+            <input
+              value={translationHotkey}
+              onChange={(event) => setTranslationHotkey(event.target.value)}
+              onBlur={commitTranslationHotkey}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  commitTranslationHotkey();
+                  suppressTranslationBlurRef.current = true;
+                  event.currentTarget.blur();
+                } else if (event.key === "Escape") {
+                  setTranslationHotkey(settings.translationHotkey);
+                  cancelTranslationBlurRef.current = true;
+                  event.currentTarget.blur();
+                }
+              }}
+            />
+          }
+        />
+        <SettingRow
+          title={t("Translation instruction")}
+          detail={t("Optional guidance appended to the fixed translation-only contract.")}
+          control={
+            <input
+              value={translationInstruction}
+              maxLength={500}
+              onChange={(event) => setTranslationInstruction(event.target.value)}
+              onBlur={commitTranslationInstruction}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  commitTranslationInstruction();
+                  suppressTranslationInstructionBlurRef.current = true;
+                  event.currentTarget.blur();
+                } else if (event.key === "Escape") {
+                  setTranslationInstruction(settings.translationInstruction);
+                  cancelTranslationInstructionBlurRef.current = true;
+                  event.currentTarget.blur();
                 }
               }}
             />

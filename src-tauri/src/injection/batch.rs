@@ -107,6 +107,26 @@ pub(super) fn insert<B: Backend>(
     )
 }
 
+pub(super) fn replace_selection<B: Backend>(
+    backend: &B,
+    options: InjectionOptions,
+    target: &TargetWindow,
+    before: &TargetText,
+    text: &str,
+    monitor: &InputMonitor,
+    checkpoint: u64,
+) -> Result<InsertResult, InjectionError> {
+    paste(
+        backend,
+        options,
+        text,
+        target,
+        before,
+        Some((monitor, checkpoint)),
+        SafetyPolicy::Destructive,
+    )
+}
+
 pub(super) fn begin<B: Backend>(
     backend: &B,
     options: InjectionOptions,
@@ -396,6 +416,17 @@ mod tests {
         let monitor = InputMonitor::default();
         monitor.test_set_available(true);
         monitor
+    }
+
+    #[test]
+    fn selection_verification_rejects_empty_source() {
+        let state = TargetText {
+            identity: vec![1],
+            before: "prefix ".into(),
+            selected: String::new(),
+            after: " suffix".into(),
+        };
+        assert!(state.select_recent("").is_none());
     }
 
     #[test]

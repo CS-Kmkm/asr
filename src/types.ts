@@ -35,6 +35,8 @@ export interface Settings {
   uiLanguage: UiLanguage;
   setupComplete: boolean;
   hotkey: string;
+  translationHotkey: string;
+  translationInstruction: string;
   microphoneId: string | null;
   historyEnabled: boolean;
   historyRetentionDays: number;
