@@ -270,13 +270,17 @@ p, .history-controls { color: var(--text-muted); }
 .status-pill.error span { background: var(--error); box-shadow: 0 0 8px rgba(161, 40, 40, .35); }
 .status-pill.recording { background: var(--warning-soft); color: var(--warning); }
 .status-pill.recording span { background: var(--warning); box-shadow: 0 0 8px rgba(138, 75, 8, .35); }
-.notice { border: 1px solid #b9ddca; background: var(--success-soft); color: #174c37; box-shadow: 0 16px 46px rgba(35, 50, 75, .16); }
+.notice { border: 1px solid #c5d3f2; background: var(--accent-soft); color: var(--accent-strong); box-shadow: 0 16px 46px rgba(35, 50, 75, .16); }
+.notice.success { border-color: #b9ddca; background: var(--success-soft); color: var(--success); }
+.notice.warning { border-color: #e8c78e; background: var(--warning-soft); color: var(--warning); }
 .notice.error { border-color: #efb9b7; background: var(--error-soft); color: #7d2020; }
+.notice.success .notice-copied { color: var(--success); }
+.notice.warning .notice-copied { color: var(--warning); }
 .notice.error .notice-copied { color: var(--error); }
 .notice-dismiss:hover { background: rgba(23, 32, 51, .08); }
 .model-progress-track { background: var(--surface-muted); }
 .model-progress-value { background: var(--accent); }
-.model-progress-label, .notice-copied { color: var(--success); }
+.model-progress-label, .notice-copied { color: var(--accent-strong); }
 .progress-ring { border-color: #cbd5e6; border-top-color: var(--accent); }
 .info-card { border: 1px solid var(--border); background: var(--surface-raised); }
 .hero-card { border: 1px solid #c5d3f2; background: linear-gradient(125deg, #e8efff, #f7f9ff); }

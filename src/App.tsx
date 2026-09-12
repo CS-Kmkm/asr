@@ -98,13 +98,37 @@ interface CorrectionPreview {
 
 interface Notice {
   message: string;
-  severity: "info" | "error";
+  severity: "info" | "success" | "warning" | "error";
   // Kind of the backend status event, when the notice came from one.
   kind?: string;
 }
 
 // Notices that only describe model preparation and are cleared once it ends.
 const MODEL_PREPARATION_KINDS = ["model_loading", "model_downloading"];
+
+const WARNING_STATUS_KINDS = new Set([
+  "artifact_cleanup_failed",
+  "autostart_update_failed",
+  "clipboard_only",
+  "gpu_unavailable",
+  "paste_unverified",
+  "streaming_insertion_unavailable",
+  "text_correction_failed",
+]);
+
+const SUCCESS_STATUS_KINDS = new Set([
+  "clipboard_paste",
+  "gpu_available",
+  "provisional_replace",
+  "success",
+]);
+
+function statusSeverity(kind: string): Notice["severity"] {
+  if (kind === "error" || kind === "model_load_failed") return "error";
+  if (WARNING_STATUS_KINDS.has(kind)) return "warning";
+  if (SUCCESS_STATUS_KINDS.has(kind)) return "success";
+  return "info";
+}
 
 function compactOverlayPreview(text: string): string {
   const characters = Array.from(text.trim());
@@ -305,7 +329,11 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       listen<ModelProgress>("model-progress", (event) => setModelProgress(event.payload)),
       listen<GpuDiagnostics>("gpu-diagnostics", (event) => setGpu(event.payload)),
       listen<{ kind: string; message: string }>("status", (event) =>
-        setNotice({ message: event.payload.message, severity: "info", kind: event.payload.kind }),
+        setNotice({
+          message: event.payload.message,
+          severity: statusSeverity(event.payload.kind),
+          kind: event.payload.kind,
+        }),
       ),
     ]);
     return () => {
@@ -352,7 +380,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       const saved = await updateSettings(next);
       setSettings(saved);
       onLanguageChange(saved.uiLanguage);
-      showNotice(translate(saved.uiLanguage, "Settings saved locally."));
+      showNotice(translate(saved.uiLanguage, "Settings saved locally."), "success");
     } catch (error) {
       setSettings(previous);
       showNotice(String(error), "error");
@@ -365,7 +393,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     showNotice(t("Running local GPU diagnostics..."));
     try {
       setGpu(await runGpuDiagnostics());
-      showNotice(t("Diagnostics complete."));
+      showNotice(t("Diagnostics complete."), "success");
     } catch (error) {
       showNotice(String(error), "error");
     } finally {
@@ -416,7 +444,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       const saved = configuration ? await updateSettings(next) : next;
       setSettings(saved);
       setModel(await loadModel(saved.modelId, saved.modelQuantization));
-      showNotice(t("Model loaded and ready."));
+      showNotice(t("Model loaded and ready."), "success");
     } catch (error) {
       showNotice(String(error), "error");
     } finally {
@@ -441,7 +469,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     try {
       const saved = await updateSettings(next);
       setSettings(saved);
-      showNotice(t("Custom model saved locally."));
+      showNotice(t("Custom model saved locally."), "success");
       return true;
     } catch (error) {
       showNotice(String(error), "error");
@@ -453,7 +481,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     try {
       await addDictionaryEntry(entry);
       setDictionary(await listDictionary());
-      showNotice(t("Dictionary entry added."));
+      showNotice(t("Dictionary entry added."), "success");
       return true;
     } catch (error) {
       showNotice(String(error), "error");
@@ -465,7 +493,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     try {
       await deleteDictionaryEntry(id);
       setDictionary(await listDictionary());
-      showNotice(t("Dictionary entry removed."));
+      showNotice(t("Dictionary entry removed."), "success");
     } catch (error) {
       showNotice(String(error), "error");
     }
