@@ -42,3 +42,12 @@ Decisions (2026-09-13):
 - Keep the late-confirmation and early-draft changes in one implementation commit. They share `injection/batch.rs` state semantics, and separating them would create an uncertain intermediate contract.
 - Transplant `0075078`, `a40b96b`, `a7e820f`, `891e1e0`, `4a2a009`, and `430d6ea`; exclude duplicate Issue commits/merges `286ed20`, `2f6c361`, `d6a37fb`, and `e3b064a`.
 - Recreate the updated Issue/task documentation as a final work-management commit rather than transplanting stale `c42370f` unchanged.
+
+Completion status (2026-09-13):
+- Created `integration/unified-history` from `origin/main` `cb2e974` and transplanted only the six unique pre-Issue commits, followed by the consolidated provisional-insertion fix, narrowed test cleanup, semantic notice fix, and consolidated task records.
+- Resolved the overlay conflict by preserving phase-specific feedback and routing the three restored labels through the typed English/Japanese dictionary. Resolved the settings-test conflict by retaining default UI-language coverage in the broader legacy-settings test.
+- Removed the legacy dark/green CSS layer instead of depending on later cascade overrides. The stylesheet now has one token source and explicit info/success/warning/error plus processing/injecting status mappings.
+- Verification passed on the consolidated tree: frontend type check and production build; `cargo fmt --check`; `cargo clippy`; Rust library tests (101 passed, 2 ignored); `cargo check --all-targets`; Python worker tests (54 passed, one dependency deprecation warning).
+- Semantic text/background contrast ratios are info 6.79:1, success 5.76:1, warning 6.09:1, and error 8.57:1. No legacy black/green token from the prior theme remains in `src/styles.css`.
+- The primary worktree source, tests, and task documents are committed; only intentionally untracked `.diagnostics/` runtime logs remain. Existing worktrees and artifacts were preserved.
+- Remaining: independent final review, then remote publication/default-branch integration if authorized.
