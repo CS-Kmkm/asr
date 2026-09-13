@@ -53,6 +53,8 @@ const en = {
   "Transcription failed. Check model and GPU diagnostics.": "Transcription failed. Check model and GPU diagnostics.",
   "Temporary audio cleanup failed.": "Temporary audio cleanup failed.",
   "Correcting the transcript with the configured AI provider.": "Correcting the transcript with the configured AI provider.",
+  "Inserting the provisional transcript into the captured target.": "Inserting the provisional transcript into the captured target.",
+  "Draft insertion failed; the transcript is available in this app.": "Draft insertion failed; the transcript is available in this app.",
   "Finalizing the provisional text in the captured target.": "Finalizing the provisional text in the captured target.",
   "Inserting into the captured target.": "Inserting into the captured target.",
   "Insertion was blocked for safety.": "Insertion was blocked for safety.",
@@ -122,6 +124,8 @@ const ja: Record<MessageKey, string> = {
   "Transcription failed. Check model and GPU diagnostics.": "文字起こしに失敗しました。モデルとGPU診断を確認してください。",
   "Temporary audio cleanup failed.": "一時音声の削除に失敗しました。",
   "Correcting the transcript with the configured AI provider.": "設定されたAIプロバイダーで文字起こしを修正しています。",
+  "Inserting the provisional transcript into the captured target.": "取得した入力先へ暫定の文字起こしを挿入しています。",
+  "Draft insertion failed; the transcript is available in this app.": "暫定テキストの挿入に失敗しました。文字起こしはこのアプリで確認できます。",
   "Finalizing the provisional text in the captured target.": "入力先の仮テキストを確定しています。",
   "Inserting into the captured target.": "取得した入力先へ挿入しています。",
   "Insertion was blocked for safety.": "安全のため挿入を中止しました。",
@@ -152,6 +156,7 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "Transcription failed. Check model and GPU diagnostics.",
       "Temporary audio cleanup failed.",
       "Correcting the transcript with the configured AI provider.",
+      "Inserting the provisional transcript into the captured target.",
       "Finalizing the provisional text in the captured target.",
       "Inserting into the captured target.",
       "Insertion was blocked for safety.",
@@ -178,7 +183,14 @@ export function translate(language: UiLanguage, key: MessageKey): string {
 export function translateAppMessage(language: UiLanguage, message: string | null): string | null {
   if (message === null) return null;
   const key = message as MessageKey;
-  return appMessageKeys.has(key) ? translate(language, key) : message;
+  if (appMessageKeys.has(key)) return translate(language, key);
+
+  const draftInsertionFailure = "Draft insertion failed; the transcript is available in this app.";
+  if (message.startsWith(`${draftInsertionFailure} `)) {
+    return `${translate(language, draftInsertionFailure)} ${message.slice(draftInsertionFailure.length + 1)}`;
+  }
+
+  return message;
 }
 const LanguageContext = createContext<UiLanguage>("ja");
 export function I18nProvider({ language, children }: { language: UiLanguage; children: ReactNode }) {
