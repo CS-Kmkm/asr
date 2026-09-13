@@ -6,6 +6,7 @@ Scope / non-scope:
 - Preserve intentional test-suite cleanup as a separate test-only intent after verifying it does not remove unique behavioral coverage.
 - Consolidate work into a new branch based on `origin/main`; do not rewrite published commits or mutate the dirty primary branch after its current work is safely committed.
 - Exclude `.diagnostics/` runtime logs and do not delete existing worktrees, branches, artifacts, or user data.
+- Follow-up scope (2026-09-13): validate the remaining fix branches against the consolidated tree, integrate the consolidated branch into `main`, delete branches whose changes are already represented, and close only GitHub Issues whose stated requirements are verified on the published `main` branch.
 
 Constraints:
 - The canonical baseline is `origin/main` at `cb2e974`, which already contains the reviewed Issue #1-#3 merges.
@@ -27,6 +28,9 @@ Acceptance criteria:
 - Notification text/background contrast remains at least 4.5:1 for all four severities; verify by deterministic color calculation.
 - `pnpm.cmd exec tsc --noEmit`, `pnpm.cmd run build`, `cargo fmt --check`, `cargo clippy`, `cargo test --lib`, `cargo check --all-targets`, and the full Python worker suite pass on the consolidated HEAD.
 - No `.diagnostics/` file is tracked and the primary worktree retains no unstaged source/test/document change after its changes are safely transferred; verify with `git status` in both worktrees.
+- The remaining fix branches contribute no required behavior absent from `integration/unified-history`; verify with `git cherry`, focused patch review, and prior integration decisions before deleting them.
+- Local and remote `main` contain the consolidated commits, obsolete local/worktree branches are removed, and the only retained branches have a stated reason; verify with branch/worktree listings and remote fetch.
+- Issues #1-#3 are mapped to concrete implementation and verification evidence, then closed only after the corresponding code is present on remote `main`; verify through the GitHub API.
 
 Open questions:
 - Remote publication and default-branch integration require explicit approval if the execution environment requests it; local consolidation may proceed.
