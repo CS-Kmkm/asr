@@ -33,10 +33,20 @@ pub enum InsertResult {
 pub(crate) struct ProvisionalInsertion {
     target: TargetWindow,
     displayed: String,
-    after: TargetText,
-    checkpoint: u64,
+    replacement: Option<ReplacementRange>,
     result: InsertResult,
     finished: bool,
+}
+
+struct ReplacementRange {
+    after: TargetText,
+    checkpoint: u64,
+}
+
+impl ProvisionalInsertion {
+    pub(crate) fn paste_was_queued(&self) -> bool {
+        self.result != InsertResult::ClipboardOnly
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,8 +116,9 @@ impl SystemTextInjector {
             options,
         }
     }
-    /// No session means nothing was queued into the target. A queued but
-    /// unconfirmed draft still owns a session so completion cannot paste again.
+    /// Only an empty draft has no session. Every insertion outcome is retained
+    /// so correction completion cannot retry an initial paste. Errors occur
+    /// before any target input is queued (the clipboard may have changed).
     pub(crate) fn begin_provisional(
         &self,
         draft: &str,

@@ -237,6 +237,7 @@ pub(crate) async fn stop_recording(
     let mut correction_failed = false;
     let mut streamed_into_target = false;
     let mut streaming_session = None;
+    let _ = app.emit("app-state", state.publish_result(transcript.text.clone()));
     if settings.text_correction_enabled {
         let correction_hints = storage
             .dictionary_correction_hints(&transcript.text)
@@ -250,13 +251,13 @@ pub(crate) async fn stop_recording(
         );
         match injector.begin_provisional(&transcript.text, &target, &input_monitor) {
             Ok(session) => {
-                streamed_into_target = session.is_some();
+                streamed_into_target = session.as_ref().is_some_and(|s| s.paste_was_queued());
                 streaming_session = session;
             }
             Err(error) => emit_status(
                 &app,
                 "streaming_insertion_unavailable",
-                &format!("Live replacement is unavailable; waiting for final text. {error}"),
+                &format!("Draft insertion failed; the transcript is available in this app. {error}"),
             ),
         }
         emit_state(
@@ -339,6 +340,11 @@ pub(crate) async fn stop_recording(
     );
     let insertion_result = if let Some(session) = streaming_session.as_mut() {
         injector.finish_provisional(session, &final_text, &input_monitor)
+    } else if settings.text_correction_enabled {
+        // A failed initial insertion must not trigger a delayed target paste.
+        injector
+            .copy_to_clipboard(&final_text)
+            .map(|()| InsertResult::ClipboardOnly)
     } else {
         injector.insert(&final_text, &target)
     };

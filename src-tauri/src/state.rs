@@ -166,6 +166,13 @@ impl AppState {
         state.clone()
     }
 
+    pub fn publish_result(&self, result: String) -> AppStateSnapshot {
+        let mut state = self.inner.write().expect("app state lock poisoned");
+        state.last_result = Some(result);
+        state.updated_at = Utc::now().to_rfc3339();
+        state.clone()
+    }
+
     pub fn complete(&self, result: String, message: String) -> AppStateSnapshot {
         let mut state = self.inner.write().expect("app state lock poisoned");
         state.phase = AppPhase::Completed;
@@ -201,6 +208,23 @@ mod tests {
         let next = state.transition(AppPhase::Processing, Some("ASR worker started".into()));
         assert_eq!(next.phase, AppPhase::Processing);
         assert_eq!(next.message.as_deref(), Some("ASR worker started"));
+    }
+
+    #[test]
+    fn draft_is_visible_during_processing_until_final_result_replaces_it() {
+        let state = AppState::default();
+        state.transition(AppPhase::Processing, Some("Transcribing locally.".into()));
+        let draft = state.publish_result("local draft".into());
+        assert_eq!(draft.phase, AppPhase::Processing);
+        assert_eq!(draft.last_result.as_deref(), Some("local draft"));
+        state.transition(
+            AppPhase::Processing,
+            Some("Correcting the transcript.".into()),
+        );
+        assert_eq!(state.snapshot().last_result.as_deref(), Some("local draft"));
+        let final_state = state.complete("corrected".into(), "Done.".into());
+        assert_eq!(final_state.last_result.as_deref(), Some("corrected"));
+        assert_eq!(final_state.phase, AppPhase::Completed);
     }
 
     #[test]
