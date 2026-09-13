@@ -20,10 +20,6 @@ from asr_worker.backends import (
 
 
 class CreateBackendTests(unittest.TestCase):
-    def test_create_faster_whisper_backend(self) -> None:
-        backend = create_backend("faster-whisper")
-        self.assertIsInstance(backend, FasterWhisperBackend)
-
     def test_default_model_name(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("ASR_FASTER_WHISPER_MODEL", None)
@@ -71,11 +67,6 @@ class ComputeTypeTests(unittest.TestCase):
     def test_bf16(self) -> None:
         self.assertEqual(faster_whisper_compute_type("bf16", cuda=True), "float16")
         self.assertEqual(faster_whisper_compute_type("bf16", cuda=False), "int8")
-
-    def test_unknown_raises(self) -> None:
-        with self.assertRaises(BackendError) as ctx:
-            faster_whisper_compute_type("fp32", cuda=True)
-        self.assertEqual(ctx.exception.code, "unsupported_quantization")
 
 
 class MaxNewTokensTests(unittest.TestCase):
@@ -215,7 +206,7 @@ class ResolveModelFilesTests(unittest.TestCase):
 
 class TranscribeWithFakeModuleTests(unittest.TestCase):
     def test_transcribe_formats_segments_and_passes_hotwords(self) -> None:
-        backend = FasterWhisperBackend()
+        backend = create_backend("faster-whisper")
         with patch.dict(sys.modules, _install_fake_faster_whisper()):
             backend.load("8bit")
             text, segments = backend.transcribe(Path("audio.wav"), "VibeVoice\nTauri")

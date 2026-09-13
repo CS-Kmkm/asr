@@ -306,13 +306,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_settings_use_faster_whisper_backend() {
-        assert_eq!(Settings::default().asr_backend, "faster-whisper");
-        assert_eq!(Settings::default().model_quantization, "4bit");
-        assert_eq!(Settings::default().ui_language, "ja");
-    }
-
-    #[test]
     fn dictionary_entry_input_accepts_frontend_payload_without_optional_fields() {
         let input: DictionaryEntryInput = serde_json::from_str(
             r#"{

@@ -24,14 +24,9 @@ class OpenAICompatibleBackendTests(unittest.TestCase):
             },
             clear=True,
         ):
-            backend = OpenAICompatibleBackend()
+            backend = create_backend("openai-compatible")
         backend.load("4bit")
         return backend
-
-    def test_factory_creates_api_backend(self) -> None:
-        with patch.dict(os.environ, {"ASR_API_BASE_URL": "http://localhost:8000/v1"}, clear=True):
-            backend = create_backend("openai-compatible")
-        self.assertIsInstance(backend, OpenAICompatibleBackend)
 
     def test_openai_endpoint_requires_key(self) -> None:
         with patch.dict(os.environ, {}, clear=True):

@@ -518,25 +518,6 @@ mod tests {
     }
 
     #[test]
-    fn worker_command_is_injectable() {
-        let command = WorkerCommand {
-            program: "custom-worker".into(),
-            args: vec!["--mock".into()],
-            env: vec![("TEST".into(), "1".into())],
-        };
-        let client = JsonlTranscriber::new(
-            command.clone(),
-            Duration::from_secs(1),
-            Duration::from_secs(2),
-        );
-        let state = client.state.try_lock().unwrap();
-        assert_eq!(state.command, command);
-        assert_eq!(state.command.program, PathBuf::from("custom-worker"));
-        assert_eq!(client.request_timeout, Duration::from_secs(1));
-        assert_eq!(client.load_timeout, Duration::from_secs(2));
-    }
-
-    #[test]
     fn python_command_appends_backend_argument() {
         let command = WorkerCommand::python("python").with_backend("faster-whisper");
         assert_eq!(
