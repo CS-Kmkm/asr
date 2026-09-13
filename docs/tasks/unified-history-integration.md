@@ -49,5 +49,6 @@ Completion status (2026-09-13):
 - Removed the legacy dark/green CSS layer instead of depending on later cascade overrides. The stylesheet now has one token source and explicit info/success/warning/error plus processing/injecting status mappings.
 - Verification passed on the consolidated tree: frontend type check and production build; `cargo fmt --check`; `cargo clippy`; Rust library tests (101 passed, 2 ignored); `cargo check --all-targets`; Python worker tests (54 passed, one dependency deprecation warning).
 - Semantic text/background contrast ratios are info 6.79:1, success 5.76:1, warning 6.09:1, and error 8.57:1. No legacy black/green token from the prior theme remains in `src/styles.css`.
+- Final independent review found two integration gaps and both were fixed: provisional-insertion notices now localize their static text while preserving dynamic error details, and disabled primary/secondary buttons no longer acquire hover styles. Frontend type checking and the production build passed again after these fixes; follow-up review reported no remaining blocker.
 - The primary worktree source, tests, and task documents are committed; only intentionally untracked `.diagnostics/` runtime logs remain. Existing worktrees and artifacts were preserved.
-- Remaining: independent final review, then remote publication/default-branch integration if authorized.
+- Remaining: remote publication/default-branch integration if authorized.
