@@ -206,10 +206,10 @@ textarea { width: min(420px, 42vw); resize: vertical; line-height: 1.45; }
 .range-control output { width: 48px; color: var(--accent-strong); text-align: right; font-variant-numeric: tabular-nums; }
 .primary, .secondary { border-radius: 8px; padding: 10px 15px; cursor: pointer; transition: transform .14s ease, background .14s ease; }
 .primary { border: 0; color: #fff; background: var(--accent); font-weight: 800; }
-.primary:hover { background: var(--accent-strong); }
-.primary:hover, .secondary:hover { transform: translateY(-1px); }
+.primary:not(:disabled):hover { background: var(--accent-strong); }
+.primary:not(:disabled):hover, .secondary:not(:disabled):hover { transform: translateY(-1px); }
 .secondary { border: 1px solid #b9c8e5; background: var(--accent-soft); color: var(--accent-strong); margin-top: 0; }
-.secondary:hover { background: #dce7ff; }
+.secondary:not(:disabled):hover { background: #dce7ff; }
 .hero-card .secondary { margin-left: 8px; }
 .panel > .secondary { margin-top: 12px; }
 .tag { display: inline-block; padding: 6px 9px; border-radius: 7px; background: var(--accent-soft); color: var(--accent-strong); font-size: 12px; }
