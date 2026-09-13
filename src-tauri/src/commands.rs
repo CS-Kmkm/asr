@@ -257,7 +257,9 @@ pub(crate) async fn stop_recording(
             Err(error) => emit_status(
                 &app,
                 "streaming_insertion_unavailable",
-                &format!("Draft insertion failed; the transcript is available in this app. {error}"),
+                &format!(
+                    "Draft insertion failed; the transcript is available in this app. {error}"
+                ),
             ),
         }
         emit_state(
