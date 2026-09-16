@@ -1,0 +1,18 @@
+
+  VITE v6.4.3  ready in 307 ms
+
+  ➜  Local:   http://127.0.0.1:1420/
+13:31:20 [vite] (client) page reload .worktrees/issue-2-followup/index.html
+13:31:20 [vite] changed tsconfig file detected: C:/Users/Koshi/asr/.worktrees/issue-2-followup/tsconfig.json - Clearing cache and forcing full-reload to ensure TypeScript is compiled with updated config values.
+13:32:33 [vite] (client) page reload .pnpm-store/v11/projects/3898a36bd0fd6943c7777ca520768f49/index.html
+13:32:33 [vite] changed tsconfig file detected: C:/Users/Koshi/asr/.pnpm-store/v11/projects/3898a36bd0fd6943c7777ca520768f49/tsconfig.json - Clearing cache and forcing full-reload to ensure TypeScript is compiled with updated config values.
+13:32:54 [vite] (client) page reload .worktrees/issue-2-followup/dist/index.html
+13:32:54 [vite] (client) page reload .pnpm-store/v11/projects/3898a36bd0fd6943c7777ca520768f49/dist/index.html
+13:34:54 [vite] (client) page reload .worktrees/issue-2-followup/.venv/Lib/site-packages/setuptools/tests/indexes/test_links_priority/external.html
+13:35:00 [vite] (client) page reload .worktrees/issue-2-followup/.venv/Lib/site-packages/setuptools/tests/indexes/test_links_priority/simple/foobar/index.html
+13:35:01 [vite] (client) page reload .pnpm-store/v11/projects/3898a36bd0fd6943c7777ca520768f49/.venv/Lib/site-packages/setuptools/tests/indexes/test_links_priority/external.html
+13:35:02 [vite] (client) page reload .pnpm-store/v11/projects/3898a36bd0fd6943c7777ca520768f49/.venv/Lib/site-packages/setuptools/tests/indexes/test_links_priority/simple/foobar/index.html
+13:36:21 [vite] (client) page reload .pnpm-store/v11/projects/3898a36bd0fd6943c7777ca520768f49/dist/index.html
+13:36:21 [vite] (client) page reload .worktrees/issue-2-followup/dist/index.html
+13:36:21 [vite] (client) page reload .worktrees/issue-2-followup/dist/index.html
+13:36:21 [vite] (client) page reload .pnpm-store/v11/projects/3898a36bd0fd6943c7777ca520768f49/dist/index.html

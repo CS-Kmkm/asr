@@ -5,6 +5,7 @@ mod correction;
 mod correction_prompt;
 mod injection;
 mod input_monitor;
+mod live_dictation;
 mod recording_overlay;
 mod state;
 mod storage;
@@ -85,6 +86,7 @@ pub(crate) fn model_identity(settings: &Settings) -> (Option<String>, String) {
 
 pub(crate) struct Services {
     audio: tokio::sync::Mutex<Box<dyn AudioCapture>>,
+    live: tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
     target: Mutex<Option<TargetWindow>>,
     transcriber: Arc<dyn Transcriber>,
     input_monitor: Arc<InputMonitor>,
@@ -101,6 +103,7 @@ impl Services {
         let (model_id, detail) = model_identity(settings);
         Self {
             audio: tokio::sync::Mutex::new(Box::new(CpalAudioCapture::new())),
+            live: tokio::sync::Mutex::new(None),
             target: Mutex::new(None),
             transcriber: Arc::new(JsonlTranscriber::new(
                 worker_command_for_settings(settings),
@@ -138,6 +141,9 @@ impl Services {
         {
             let mut audio = self.audio.lock().await;
             let _ = audio.cancel().await;
+        }
+        if let Some(task) = self.live.lock().await.take() {
+            let _ = task.finish().await;
         }
         if let Ok(mut target) = self.target.lock() {
             target.take();
@@ -506,11 +512,12 @@ async fn toggle_recording(app: AppHandle) {
         .await
         .map(|_| ()),
         PipelinePhase::Idle => {
-            commands::start_recording(
+            commands::start_recording_with_origin(
                 app.clone(),
                 app.state::<Services>(),
                 app.state::<AppState>(),
                 app.state::<Storage>(),
+                true,
             )
             .await
         }

@@ -147,6 +147,7 @@ function RecordingOverlay() {
     () => Array(OVERLAY_WAVE_BAR_COUNT).fill(0),
   );
   const [phase, setPhase] = useState<AppState["phase"]>("idle");
+  const previousPhase = useRef<AppState["phase"]>("idle");
   const [message, setMessage] = useState<string | null>(null);
   const [preview, setPreview] = useState<CorrectionPreview | null>(null);
 
@@ -160,9 +161,11 @@ function RecordingOverlay() {
         setWaveform((current) => [...current.slice(1), normalizedLevel]);
       }),
       listen<AppState>("app-state", ({ payload }) => {
+        const recordingStarted = payload.phase === "recording" && previousPhase.current !== "recording";
+        previousPhase.current = payload.phase;
         setPhase(payload.phase);
         setMessage(payload.message);
-        if (payload.phase === "recording") {
+        if (recordingStarted) {
           setWaveform(Array(OVERLAY_WAVE_BAR_COUNT).fill(0));
           setPreview(null);
         } else if (

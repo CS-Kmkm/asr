@@ -2,6 +2,8 @@ import { createContext, useContext, useMemo, type ReactNode } from "react";
 import type { UiLanguage } from "./types";
 
 const en = {
+  "Live transcription failed. The full recording will be transcribed after stopping.": "Live transcription failed. The full recording will be transcribed after stopping.",
+  "Live text insertion paused. The final result will remain available in this app.": "Live text insertion paused. The final result will remain available in this app.",
   "API model ID (for example gpt-4o-mini-transcribe)": "API model ID (for example gpt-4o-mini-transcribe)", "Model name or Hugging Face repository ID": "Model name or Hugging Face repository ID",
   "Fast local transcription on CPU or CUDA.": "Fast local transcription on CPU or CUDA.", "Long-form transcription on a CUDA GPU.": "Long-form transcription on a CUDA GPU.", "OpenAI Audio Transcriptions API or a compatible local server.": "OpenAI Audio Transcriptions API or a compatible local server.", "Whisper model": "Whisper model", "VibeVoice model": "VibeVoice model", "OpenAI-compatible API model": "OpenAI-compatible API model", "Choose a local model or an OpenAI-compatible transcription endpoint. Local model files are downloaded on first use and cached.": "Choose a local model or an OpenAI-compatible transcription endpoint. Local model files are downloaded on first use and cached.", "faster-whisper (recommended / CPU supported)": "faster-whisper (recommended / CPU supported)", "VibeVoice (CUDA GPU required)": "VibeVoice (CUDA GPU required)", "OpenAI-compatible API": "OpenAI-compatible API", "When enabled, the transcript is sent to the selected external provider after local transcription. Audio is never sent by this feature.": "When enabled, the transcript is sent to the selected external provider after local transcription. Audio is never sent by this feature.", "Choose the quality, latency, and cost tradeoff. None is fastest; high and above spend more time reasoning. Availability depends on the selected model.": "Choose the quality, latency, and cost tradeoff. None is fastest; high and above spend more time reasoning. Availability depends on the selected model.", Ready: "Ready", "Not installed": "Not installed", "Checking local cache": "Checking local cache", "Delete dictionary entry": "Delete dictionary entry", "aliases:": "aliases:", "priority": "priority", "Input level": "Input level", "percent": "percent",
   Status: "Status", Setup: "Setup", Settings: "Settings", History: "History", Dictionary: "Dictionary", Privacy: "Privacy", Diagnostics: "Diagnostics", Models: "Models",
@@ -115,6 +117,8 @@ const ja: Record<MessageKey, string> = {
   "30 days": "30日",
   "90 days": "90日",
   "Recording from the selected microphone.": "選択したマイクで録音しています。",
+  "Live transcription failed. The full recording will be transcribed after stopping.": "録音中の文字起こしに失敗しました。停止後に録音全体を文字起こしします。",
+  "Live text insertion paused. The final result will remain available in this app.": "入力先への逐次挿入を中断しました。最終結果はこのアプリで確認できます。",
   "No recording is active. Start a new recording.": "録音中ではありません。新しい録音を開始してください。",
   "Stopping recording and preparing audio.": "録音を停止し、音声を準備しています。",
   "Recording could not be completed. Start a new recording and try again.": "録音を完了できませんでした。新しい録音を開始して再試行してください。",
@@ -147,6 +151,8 @@ const ja: Record<MessageKey, string> = {
 const appMessageKeys: ReadonlySet<MessageKey> = new Set(
   [
       "Recording from the selected microphone.",
+      "Live transcription failed. The full recording will be transcribed after stopping.",
+      "Live text insertion paused. The final result will remain available in this app.",
       "No recording is active. Start a new recording.",
       "Stopping recording and preparing audio.",
       "Recording could not be completed. Start a new recording and try again.",

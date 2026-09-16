@@ -1,0 +1,30 @@
+[
+  {
+    "part": 0,
+    "start": 0.0,
+    "end": 3.3550833333333334,
+    "gain": 1.0,
+    "quiet_continuation": false
+  },
+  {
+    "part": 1,
+    "start": 4.105083333333333,
+    "end": 11.361458333333333,
+    "gain": 1.0,
+    "quiet_continuation": false
+  },
+  {
+    "part": 2,
+    "start": 12.111458333333333,
+    "end": 27.034291666666668,
+    "gain": 1.0,
+    "quiet_continuation": true
+  },
+  {
+    "part": 3,
+    "start": 27.784291666666668,
+    "end": 31.045833333333334,
+    "gain": 0.2,
+    "quiet_continuation": false
+  }
+]

@@ -1,0 +1,833 @@
+{
+  "audio_seconds": 35.92583333333334,
+  "backend": "faster-whisper:large-v3-turbo",
+  "policies": [
+    {
+      "calls": [
+        {
+          "endpoint": false,
+          "inference_seconds": 0.6995434,
+          "received_seconds": 2.21459,
+          "start_seconds": 0.0,
+          "window_seconds": 1.504666667
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.6968327,
+          "received_seconds": 4.4718142,
+          "start_seconds": 0.0,
+          "window_seconds": 3.724
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7499071,
+          "received_seconds": 6.7602539,
+          "start_seconds": 0.0,
+          "window_seconds": 5.986541667
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7984717,
+          "received_seconds": 9.1191646,
+          "start_seconds": 0.0,
+          "window_seconds": 8.271208333
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.842464,
+          "received_seconds": 11.5202965,
+          "start_seconds": 0.0,
+          "window_seconds": 10.620791667
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 1.0347896,
+          "received_seconds": 14.1325165,
+          "start_seconds": 0.0,
+          "window_seconds": 13.02225
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 1.2583636999999999,
+          "received_seconds": 17.027865,
+          "start_seconds": 0.0,
+          "window_seconds": 15.63625
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 1.0443334,
+          "received_seconds": 19.673338,
+          "start_seconds": 0.0,
+          "window_seconds": 18.529
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 1.1433738,
+          "received_seconds": 22.4110522,
+          "start_seconds": 0.0,
+          "window_seconds": 21.176083333
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 1.071131,
+          "received_seconds": 25.092629,
+          "start_seconds": 0.0,
+          "window_seconds": 23.918333333
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 1.1999691000000001,
+          "received_seconds": 27.9036746,
+          "start_seconds": 0.0,
+          "window_seconds": 26.594416667
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 1.3497205,
+          "received_seconds": 30.9519369,
+          "start_seconds": 0.0,
+          "window_seconds": 29.420125
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 1.7377053999999998,
+          "received_seconds": 34.3518227,
+          "start_seconds": 0.0,
+          "window_seconds": 32.453958333
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 1.7604457,
+          "received_seconds": 37.8333607,
+          "start_seconds": 0.0,
+          "window_seconds": 35.863166667
+        }
+      ],
+      "last_draft": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず、文章の最後まで正しく入力することが大切です。小さな声でも最後の言葉まで残してください。",
+      "policy": "cumulative_1500ms",
+      "updates": [
+        {
+          "audio_end_seconds": 1.504666667,
+          "received_seconds": 2.21459,
+          "text": "今日は音声入力のソフトをご覧ください。"
+        },
+        {
+          "audio_end_seconds": 3.724,
+          "received_seconds": 4.4718142,
+          "text": "今日は音声入力の速度と精度を確認します。"
+        },
+        {
+          "audio_end_seconds": 5.986541667,
+          "received_seconds": 6.7602539,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。"
+        },
+        {
+          "audio_end_seconds": 8.271208333,
+          "received_seconds": 9.1191646,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。"
+        },
+        {
+          "audio_end_seconds": 10.620791667,
+          "received_seconds": 11.5202965,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回。"
+        },
+        {
+          "audio_end_seconds": 13.02225,
+          "received_seconds": 14.1325165,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切り…"
+        },
+        {
+          "audio_end_seconds": 15.63625,
+          "received_seconds": 17.027865,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、"
+        },
+        {
+          "audio_end_seconds": 18.529,
+          "received_seconds": 19.673338,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、"
+        },
+        {
+          "audio_end_seconds": 21.176083333,
+          "received_seconds": 22.4110522,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。"
+        },
+        {
+          "audio_end_seconds": 23.918333333,
+          "received_seconds": 25.092629,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても、"
+        },
+        {
+          "audio_end_seconds": 26.594416667,
+          "received_seconds": 27.9036746,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず、文章の最後までただ、"
+        },
+        {
+          "audio_end_seconds": 29.420125,
+          "received_seconds": 30.9519369,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず、文章の最後まで正しく入力することが大切です。"
+        },
+        {
+          "audio_end_seconds": 32.453958333,
+          "received_seconds": 34.3518227,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず、文章の最後まで正しく入力することが大切です。小さな声でも最後の言葉まで残してください。"
+        }
+      ]
+    },
+    {
+      "calls": [
+        {
+          "endpoint": false,
+          "inference_seconds": 0.6676346,
+          "received_seconds": 1.9899374,
+          "start_seconds": 0.0,
+          "window_seconds": 1.296958333
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7299188,
+          "received_seconds": 3.399131,
+          "start_seconds": 0.0,
+          "window_seconds": 2.658
+        },
+        {
+          "endpoint": true,
+          "inference_seconds": 0.707165,
+          "received_seconds": 4.458353,
+          "start_seconds": 0.0,
+          "window_seconds": 3.22
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.6573507,
+          "received_seconds": 5.9309573,
+          "start_seconds": 4.04,
+          "window_seconds": 1.225833333
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 1.4888080000000001,
+          "received_seconds": 8.1369366,
+          "start_seconds": 4.04,
+          "window_seconds": 2.577166667
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7051001,
+          "received_seconds": 9.2233163,
+          "start_seconds": 4.04,
+          "window_seconds": 4.439166667
+        },
+        {
+          "endpoint": true,
+          "inference_seconds": 0.7232966,
+          "received_seconds": 10.1321128,
+          "start_seconds": 4.04,
+          "window_seconds": 4.2
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.6759925,
+          "received_seconds": 11.3252359,
+          "start_seconds": 9.06,
+          "window_seconds": 1.567875
+        },
+        {
+          "endpoint": true,
+          "inference_seconds": 0.6762093,
+          "received_seconds": 12.6932759,
+          "start_seconds": 9.06,
+          "window_seconds": 2.36
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.6685302,
+          "received_seconds": 14.0270207,
+          "start_seconds": 12.02,
+          "window_seconds": 1.328583333
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7280112,
+          "received_seconds": 15.4353989,
+          "start_seconds": 12.02,
+          "window_seconds": 2.670541667
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7239638,
+          "received_seconds": 16.6963007,
+          "start_seconds": 12.02,
+          "window_seconds": 3.933958333
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7629887,
+          "received_seconds": 17.999515,
+          "start_seconds": 12.02,
+          "window_seconds": 5.194666667
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.760303,
+          "received_seconds": 19.3362042,
+          "start_seconds": 12.02,
+          "window_seconds": 6.516875
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.8796986,
+          "received_seconds": 20.8053335,
+          "start_seconds": 12.02,
+          "window_seconds": 7.845875
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.9075829,
+          "received_seconds": 22.1204068,
+          "start_seconds": 12.02,
+          "window_seconds": 9.146916667
+        },
+        {
+          "endpoint": true,
+          "inference_seconds": 0.9039359,
+          "received_seconds": 23.252478,
+          "start_seconds": 12.02,
+          "window_seconds": 9.66
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.6709621,
+          "received_seconds": 24.4192112,
+          "start_seconds": 22.2,
+          "window_seconds": 1.5415
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7166264,
+          "received_seconds": 25.8218,
+          "start_seconds": 22.2,
+          "window_seconds": 2.880625
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7151627,
+          "received_seconds": 27.0506497,
+          "start_seconds": 22.2,
+          "window_seconds": 4.114833333
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7464761,
+          "received_seconds": 28.3637778,
+          "start_seconds": 22.2,
+          "window_seconds": 5.383416667
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7814813,
+          "received_seconds": 29.711201,
+          "start_seconds": 22.2,
+          "window_seconds": 6.692458333
+        },
+        {
+          "endpoint": true,
+          "inference_seconds": 0.7510851,
+          "received_seconds": 30.6646766,
+          "start_seconds": 22.2,
+          "window_seconds": 6.5600000000000005
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7007221,
+          "received_seconds": 31.5472637,
+          "start_seconds": 28.76,
+          "window_seconds": 2.069916667
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.6970749,
+          "received_seconds": 32.7656105,
+          "start_seconds": 28.76,
+          "window_seconds": 3.286583333
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7182287,
+          "received_seconds": 34.0327532,
+          "start_seconds": 28.76,
+          "window_seconds": 4.514416667
+        },
+        {
+          "endpoint": true,
+          "inference_seconds": 0.6832896,
+          "received_seconds": 34.9137203,
+          "start_seconds": 28.76,
+          "window_seconds": 4.22
+        }
+      ],
+      "last_draft": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず、文章の最後まで正しく入力することが大切です。小さな声でも最後の言葉まで残してください",
+      "policy": "utterance_650ms",
+      "updates": [
+        {
+          "audio_end_seconds": 1.296958333,
+          "received_seconds": 1.9899374,
+          "text": "今日は音声入力の"
+        },
+        {
+          "audio_end_seconds": 2.658,
+          "received_seconds": 3.399131,
+          "text": "今日は音声入力の速度と精度を確認。"
+        },
+        {
+          "audio_end_seconds": 3.22,
+          "received_seconds": 4.458353,
+          "text": "今日は音声入力の速度と精度を確認します。"
+        },
+        {
+          "audio_end_seconds": 5.265833333,
+          "received_seconds": 5.9309573,
+          "text": "今日は音声入力の速度と精度を確認します。番号は202"
+        },
+        {
+          "audio_end_seconds": 6.617166667,
+          "received_seconds": 8.1369366,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123"
+        },
+        {
+          "audio_end_seconds": 8.479166667,
+          "received_seconds": 9.2233163,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。"
+        },
+        {
+          "audio_end_seconds": 10.627875,
+          "received_seconds": 11.3252359,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回。"
+        },
+        {
+          "audio_end_seconds": 11.42,
+          "received_seconds": 12.6932759,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。"
+        },
+        {
+          "audio_end_seconds": 13.348583333,
+          "received_seconds": 14.0270207,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎる"
+        },
+        {
+          "audio_end_seconds": 14.690541667,
+          "received_seconds": 15.4353989,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失う。"
+        },
+        {
+          "audio_end_seconds": 15.953958333,
+          "received_seconds": 16.6963007,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、"
+        },
+        {
+          "audio_end_seconds": 17.214666667,
+          "received_seconds": 17.999515,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文明が失われる。"
+        },
+        {
+          "audio_end_seconds": 18.536875,
+          "received_seconds": 19.3362042,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、"
+        },
+        {
+          "audio_end_seconds": 19.865875,
+          "received_seconds": 20.8053335,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところ。"
+        },
+        {
+          "audio_end_seconds": 21.166916667,
+          "received_seconds": 22.1204068,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移り、"
+        },
+        {
+          "audio_end_seconds": 21.68,
+          "received_seconds": 23.252478,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。"
+        },
+        {
+          "audio_end_seconds": 23.7415,
+          "received_seconds": 24.4192112,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いています。"
+        },
+        {
+          "audio_end_seconds": 25.080625,
+          "received_seconds": 25.8218,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず。"
+        },
+        {
+          "audio_end_seconds": 26.314833333,
+          "received_seconds": 27.0506497,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず、文章の最後まで。"
+        },
+        {
+          "audio_end_seconds": 27.583416667,
+          "received_seconds": 28.3637778,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず、文章の最後まで正しく入力する。"
+        },
+        {
+          "audio_end_seconds": 28.892458333,
+          "received_seconds": 29.711201,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず、文章の最後まで正しく入力することが大切です。"
+        },
+        {
+          "audio_end_seconds": 30.829916667,
+          "received_seconds": 31.5472637,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず、文章の最後まで正しく入力することが大切です。小さな声でもさ"
+        },
+        {
+          "audio_end_seconds": 32.046583333,
+          "received_seconds": 32.7656105,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず、文章の最後まで正しく入力することが大切です。小さな声でも最後の言葉まで残す"
+        },
+        {
+          "audio_end_seconds": 33.274416667,
+          "received_seconds": 34.0327532,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず、文章の最後まで正しく入力することが大切です。小さな声でも最後の言葉まで残してください"
+        }
+      ]
+    },
+    {
+      "calls": [
+        {
+          "endpoint": false,
+          "inference_seconds": 0.8065268,
+          "received_seconds": 2.1200911,
+          "start_seconds": 0.0,
+          "window_seconds": 1.301708333
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7252167,
+          "received_seconds": 3.3376579,
+          "start_seconds": 0.0,
+          "window_seconds": 2.599666667
+        },
+        {
+          "endpoint": true,
+          "inference_seconds": 0.6861283,
+          "received_seconds": 4.2064385,
+          "start_seconds": 0.0,
+          "window_seconds": 3.22
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.66505,
+          "received_seconds": 6.0182925,
+          "start_seconds": 4.04,
+          "window_seconds": 1.300166667
+        },
+        {
+          "endpoint": true,
+          "inference_seconds": 0.6538154,
+          "received_seconds": 6.8495573,
+          "start_seconds": 4.04,
+          "window_seconds": 1.8199999999999998
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.6947577,
+          "received_seconds": 7.8800484,
+          "start_seconds": 5.9399999999999995,
+          "window_seconds": 1.22075
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.662067,
+          "received_seconds": 9.06612,
+          "start_seconds": 5.9399999999999995,
+          "window_seconds": 2.442958333
+        },
+        {
+          "endpoint": true,
+          "inference_seconds": 0.675578,
+          "received_seconds": 9.9124762,
+          "start_seconds": 5.9399999999999995,
+          "window_seconds": 2.38
+        },
+        {
+          "endpoint": true,
+          "inference_seconds": 0.6453355,
+          "received_seconds": 11.0549194,
+          "start_seconds": 9.06,
+          "window_seconds": 0.6
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.6914164,
+          "received_seconds": 12.0983953,
+          "start_seconds": 9.78,
+          "window_seconds": 1.6081666669999999
+        },
+        {
+          "endpoint": true,
+          "inference_seconds": 0.674741,
+          "received_seconds": 12.954219,
+          "start_seconds": 9.78,
+          "window_seconds": 1.6400000000000001
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.6946766,
+          "received_seconds": 13.9905011,
+          "start_seconds": 12.02,
+          "window_seconds": 1.267
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7348611,
+          "received_seconds": 15.2381922,
+          "start_seconds": 12.02,
+          "window_seconds": 2.470583333
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7541521,
+          "received_seconds": 16.5204029,
+          "start_seconds": 12.02,
+          "window_seconds": 3.722041667
+        },
+        {
+          "endpoint": true,
+          "inference_seconds": 0.7430353,
+          "received_seconds": 17.4514186,
+          "start_seconds": 12.02,
+          "window_seconds": 3.48
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7060057,
+          "received_seconds": 18.4975448,
+          "start_seconds": 15.64,
+          "window_seconds": 2.134375
+        },
+        {
+          "endpoint": true,
+          "inference_seconds": 0.7078828,
+          "received_seconds": 19.3886033,
+          "start_seconds": 15.64,
+          "window_seconds": 2.5
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.676899,
+          "received_seconds": 20.3979208,
+          "start_seconds": 18.22,
+          "window_seconds": 1.49325
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.733452,
+          "received_seconds": 21.6627724,
+          "start_seconds": 18.22,
+          "window_seconds": 2.696291667
+        },
+        {
+          "endpoint": true,
+          "inference_seconds": 0.7057453,
+          "received_seconds": 22.7430889,
+          "start_seconds": 18.22,
+          "window_seconds": 3.46
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.6901529,
+          "received_seconds": 24.2813377,
+          "start_seconds": 22.2,
+          "window_seconds": 1.3545
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.6827464,
+          "received_seconds": 25.4709261,
+          "start_seconds": 22.2,
+          "window_seconds": 2.571291667
+        },
+        {
+          "endpoint": true,
+          "inference_seconds": 0.7014826,
+          "received_seconds": 26.3506925,
+          "start_seconds": 22.2,
+          "window_seconds": 2.82
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.6735731,
+          "received_seconds": 27.3775503,
+          "start_seconds": 25.08,
+          "window_seconds": 1.605416667
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.7161448,
+          "received_seconds": 28.8002805,
+          "start_seconds": 25.08,
+          "window_seconds": 2.98075
+        },
+        {
+          "endpoint": true,
+          "inference_seconds": 0.7031471,
+          "received_seconds": 29.890967,
+          "start_seconds": 25.08,
+          "window_seconds": 3.68
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.69867,
+          "received_seconds": 30.7635285,
+          "start_seconds": 28.76,
+          "window_seconds": 1.288208333
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.6591823,
+          "received_seconds": 31.943991,
+          "start_seconds": 28.76,
+          "window_seconds": 2.506291667
+        },
+        {
+          "endpoint": false,
+          "inference_seconds": 0.6965343,
+          "received_seconds": 33.1812973,
+          "start_seconds": 28.76,
+          "window_seconds": 3.707
+        },
+        {
+          "endpoint": true,
+          "inference_seconds": 0.6797769,
+          "received_seconds": 34.0582817,
+          "start_seconds": 28.76,
+          "window_seconds": 4.22
+        }
+      ],
+      "last_draft": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。はい。はいと2回言いました。短く区切りすぎると前後の意味が失われるため話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず。文章の最後まで正しく入力することが大切です。小さな声でも最後の言葉まで残してください",
+      "policy": "utterance_450ms",
+      "updates": [
+        {
+          "audio_end_seconds": 1.301708333,
+          "received_seconds": 2.1200911,
+          "text": "今日は音声入力の"
+        },
+        {
+          "audio_end_seconds": 2.599666667,
+          "received_seconds": 3.3376579,
+          "text": "今日は音声入力の速度と精度を確認。"
+        },
+        {
+          "audio_end_seconds": 3.22,
+          "received_seconds": 4.2064385,
+          "text": "今日は音声入力の速度と精度を確認します。"
+        },
+        {
+          "audio_end_seconds": 5.340166667,
+          "received_seconds": 6.0182925,
+          "text": "今日は音声入力の速度と精度を確認します。番号は202"
+        },
+        {
+          "audio_end_seconds": 5.86,
+          "received_seconds": 6.8495573,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。"
+        },
+        {
+          "audio_end_seconds": 7.16075,
+          "received_seconds": 7.8800484,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。1,2,3"
+        },
+        {
+          "audio_end_seconds": 8.382958333,
+          "received_seconds": 9.06612,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。"
+        },
+        {
+          "audio_end_seconds": 9.66,
+          "received_seconds": 11.0549194,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。はい。"
+        },
+        {
+          "audio_end_seconds": 11.388166667,
+          "received_seconds": 12.0983953,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。はい。はいと2回言いました。"
+        },
+        {
+          "audio_end_seconds": 13.287,
+          "received_seconds": 13.9905011,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。はい。はいと2回言いました。短く区切りすぎる。"
+        },
+        {
+          "audio_end_seconds": 14.490583333,
+          "received_seconds": 15.2381922,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。はい。はいと2回言いました。短く区切りすぎると前後の意味がうし"
+        },
+        {
+          "audio_end_seconds": 15.742041667,
+          "received_seconds": 16.5204029,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。はい。はいと2回言いました。短く区切りすぎると前後の意味が失われるため"
+        },
+        {
+          "audio_end_seconds": 17.774375,
+          "received_seconds": 18.4975448,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。はい。はいと2回言いました。短く区切りすぎると前後の意味が失われるため話している途中は文脈を残し、"
+        },
+        {
+          "audio_end_seconds": 19.71325,
+          "received_seconds": 20.3979208,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。はい。はいと2回言いました。短く区切りすぎると前後の意味が失われるため話している途中は文脈を残し、自然に息をついたとき、"
+        },
+        {
+          "audio_end_seconds": 20.916291667,
+          "received_seconds": 21.6627724,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。はい。はいと2回言いました。短く区切りすぎると前後の意味が失われるため話している途中は文脈を残し、自然に息をついたところで次の処理に移動します。"
+        },
+        {
+          "audio_end_seconds": 21.68,
+          "received_seconds": 22.7430889,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。はい。はいと2回言いました。短く区切りすぎると前後の意味が失われるため話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。"
+        },
+        {
+          "audio_end_seconds": 23.5545,
+          "received_seconds": 24.2813377,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。はい。はいと2回言いました。短く区切りすぎると前後の意味が失われるため話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いて、"
+        },
+        {
+          "audio_end_seconds": 24.771291667,
+          "received_seconds": 25.4709261,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。はい。はいと2回言いました。短く区切りすぎると前後の意味が失われるため話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず。"
+        },
+        {
+          "audio_end_seconds": 26.685416667,
+          "received_seconds": 27.3775503,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。はい。はいと2回言いました。短く区切りすぎると前後の意味が失われるため話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず。文章の最後まで正しい"
+        },
+        {
+          "audio_end_seconds": 28.06075,
+          "received_seconds": 28.8002805,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。はい。はいと2回言いました。短く区切りすぎると前後の意味が失われるため話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず。文章の最後まで正しく入力することが大切です。"
+        },
+        {
+          "audio_end_seconds": 30.048208333,
+          "received_seconds": 30.7635285,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。はい。はいと2回言いました。短く区切りすぎると前後の意味が失われるため話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず。文章の最後まで正しく入力することが大切です。小さな"
+        },
+        {
+          "audio_end_seconds": 31.266291667,
+          "received_seconds": 31.943991,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。はい。はいと2回言いました。短く区切りすぎると前後の意味が失われるため話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず。文章の最後まで正しく入力することが大切です。小さな声でも最後の声"
+        },
+        {
+          "audio_end_seconds": 32.467,
+          "received_seconds": 33.1812973,
+          "text": "今日は音声入力の速度と精度を確認します。番号は2026。123、123です。はい。はいと2回言いました。短く区切りすぎると前後の意味が失われるため話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず。文章の最後まで正しく入力することが大切です。小さな声でも最後の言葉まで残してください"
+        }
+      ]
+    }
+  ],
+  "quantization": "bf16",
+  "sample_rate": 24000,
+  "whole_recording": {
+    "inference_seconds": 1.6170974999999999,
+    "text": "今日は音声入力の速度と精度を確認します。番号は2026-123-123です。はい、はいと2回言いました。短く区切りすぎると前後の意味が失われるため、話している途中は文脈を残し、自然に息をついたところで次の処理に移ります。同じ言葉が続いても勝手に消さず、文章の最後まで正しく入力することが大切です。小さな声でも最後の言葉まで残してください。"
+  }
+}

@@ -41,6 +41,8 @@ pub trait AudioCapture: Send {
     /// Release a previously armed stream. Idempotent and a no-op while capturing.
     fn disarm(&mut self) -> AudioFuture<'_, ()>;
     fn start(&mut self, config: CaptureConfig) -> AudioFuture<'_, ()>;
+    /// Copy current audio without stopping or consuming the recording buffer.
+    fn snapshot(&self, since: Duration) -> Result<AudioSnapshot, AudioError>;
     fn stop(&mut self) -> AudioFuture<'_, AudioArtifact>;
     fn cancel(&mut self) -> AudioFuture<'_, ()>;
     fn state(&self) -> CaptureState;
@@ -124,6 +126,49 @@ pub struct AudioArtifact {
     pub peak_level: f32,
     pub rms_level: f32,
     pub vad: VadAnalysis,
+}
+
+pub struct AudioSnapshot {
+    samples: Vec<f32>,
+    input_sample_rate: u32,
+    config: CaptureConfig,
+}
+
+impl AudioSnapshot {
+    /// Processing and disk I/O run outside the capture lock and callback.
+    pub fn into_artifact(self) -> Result<AudioArtifact, AudioError> {
+        self.prepare()?.into_artifact()
+    }
+
+    pub(crate) fn prepare(self) -> Result<PreparedAudio, AudioError> {
+        prepare_samples(self.samples, self.input_sample_rate, self.config)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(samples: Vec<f32>, config: CaptureConfig) -> Self {
+        Self {
+            samples,
+            input_sample_rate: TARGET_SAMPLE_RATE,
+            config,
+        }
+    }
+}
+
+/// Enhanced audio shared by endpoint analysis and recognition. Applying gain
+/// once keeps quiet-speech endpoint decisions consistent with ASR input.
+pub(crate) struct PreparedAudio {
+    pub(crate) samples: Vec<f32>,
+    pub(crate) config: CaptureConfig,
+}
+
+impl PreparedAudio {
+    pub(crate) fn duration(&self) -> Duration {
+        samples_to_duration(self.samples.len(), self.config.target_sample_rate)
+    }
+
+    pub(crate) fn into_artifact(self) -> Result<AudioArtifact, AudioError> {
+        write_prepared_audio(self.samples, &self.config)
+    }
 }
 
 impl AudioArtifact {
@@ -553,6 +598,28 @@ impl CpalAudioCapture {
 }
 
 impl AudioCapture for CpalAudioCapture {
+    fn snapshot(&self, since: Duration) -> Result<AudioSnapshot, AudioError> {
+        if !self.is_recording() {
+            return Err(AudioError::NotCapturing);
+        }
+        let active = self.active.as_ref().ok_or(AudioError::NotCapturing)?;
+        let shared = active
+            .shared
+            .lock()
+            .map_err(|_| AudioError::StreamFailure("capture buffer lock poisoned".into()))?;
+        if let Some(message) = &shared.stream_error {
+            return Err(AudioError::StreamFailure(message.clone()));
+        }
+        Ok(AudioSnapshot {
+            samples: shared.samples[((since.as_secs_f64() * f64::from(active.input_sample_rate))
+                .round() as usize)
+                .min(shared.samples.len())..]
+                .to_vec(),
+            input_sample_rate: active.input_sample_rate,
+            config: active.config.clone(),
+        })
+    }
+
     fn list_devices(&self) -> AudioFuture<'_, Vec<AudioDevice>> {
         Box::pin(async move { list_cpal_devices() })
     }
@@ -669,6 +736,14 @@ fn finalize_samples(
     input_sample_rate: u32,
     config: &CaptureConfig,
 ) -> Result<AudioArtifact, AudioError> {
+    prepare_samples(mono_samples, input_sample_rate, config.clone())?.into_artifact()
+}
+
+fn prepare_samples(
+    mono_samples: Vec<f32>,
+    input_sample_rate: u32,
+    config: CaptureConfig,
+) -> Result<PreparedAudio, AudioError> {
     let mut samples =
         resample_linear_owned(mono_samples, input_sample_rate, config.target_sample_rate);
     let duration = samples_to_duration(samples.len(), config.target_sample_rate);
@@ -680,6 +755,20 @@ fn finalize_samples(
     }
 
     enhance_audio(&mut samples, config.target_sample_rate, config.enhancement);
+    Ok(PreparedAudio { samples, config })
+}
+
+fn write_prepared_audio(
+    samples: Vec<f32>,
+    config: &CaptureConfig,
+) -> Result<AudioArtifact, AudioError> {
+    let duration = samples_to_duration(samples.len(), config.target_sample_rate);
+    if duration < config.minimum_duration {
+        return Err(AudioError::TooShort {
+            actual: duration,
+            minimum: config.minimum_duration,
+        });
+    }
 
     let (vad, levels) =
         EnergyVad::new(config.vad).analyze_with_meter(&samples, config.target_sample_rate);
@@ -1201,6 +1290,54 @@ fn drop_active_stream(active: &mut ActiveCapture) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn snapshot_keeps_capture_active_and_final_audio_complete() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = CaptureConfig {
+            artifact_directory: Some(directory.path().to_owned()),
+            ..CaptureConfig::default()
+        };
+        let samples: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.1).sin() * 0.2).collect();
+        let shared = Arc::new(Mutex::new(SharedCapture {
+            samples: samples.clone(),
+            recording: true,
+            ..SharedCapture::default()
+        }));
+        let mut capture = CpalAudioCapture {
+            recording: true,
+            active: Some(ActiveCapture {
+                config,
+                input_sample_rate: TARGET_SAMPLE_RATE,
+                shared: Arc::clone(&shared),
+                #[cfg(target_os = "windows")]
+                stream_worker: StreamWorker {
+                    shutdown: mpsc::channel().0,
+                    thread: None,
+                },
+            }),
+        };
+        let snapshot = capture.snapshot(Duration::ZERO).unwrap();
+        shared.lock().unwrap().samples.extend_from_slice(&samples);
+        assert_eq!(
+            capture
+                .snapshot(Duration::from_secs(1))
+                .unwrap()
+                .samples
+                .len(),
+            24_000
+        );
+        let partial = snapshot.into_artifact().unwrap();
+        assert_eq!(partial.sample_count, 24_000);
+        assert_eq!(capture.state(), CaptureState::Capturing);
+        assert!(shared.lock().unwrap().recording);
+        let complete = capture.stop().await.unwrap();
+        assert_eq!(complete.sample_count, 48_000);
+        assert_eq!(capture.state(), CaptureState::Idle);
+        assert_ne!(partial.path, complete.path);
+        partial.remove().unwrap();
+        complete.remove().unwrap();
+    }
 
     #[test]
     fn device_ids_do_not_depend_on_enumeration_order() {

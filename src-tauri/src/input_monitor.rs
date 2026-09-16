@@ -6,6 +6,8 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+mod shortcut;
+
 #[cfg(all(target_os = "windows", not(test)))]
 use std::{
     io::{BufRead, BufReader, Write},
@@ -21,6 +23,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub(crate) struct InputMonitor {
     sequence: std::sync::Arc<AtomicU64>,
     available: std::sync::Arc<AtomicBool>,
+    shortcut_pending: std::sync::Arc<AtomicBool>,
+    recording_shortcut: std::sync::Mutex<Option<String>>,
+    started_by_shortcut: AtomicBool,
+    cancellation: std::sync::Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
     #[cfg(all(target_os = "windows", not(test)))]
     ready: Arc<(Mutex<bool>, Condvar)>,
     #[cfg(all(target_os = "windows", not(test)))]
@@ -40,6 +46,10 @@ impl Default for InputMonitor {
         Self {
             sequence: std::sync::Arc::new(AtomicU64::new(0)),
             available: std::sync::Arc::new(AtomicBool::new(false)),
+            shortcut_pending: std::sync::Arc::new(AtomicBool::new(false)),
+            recording_shortcut: std::sync::Mutex::new(None),
+            started_by_shortcut: AtomicBool::new(false),
+            cancellation: std::sync::Mutex::new(None),
             #[cfg(all(target_os = "windows", not(test)))]
             ready: Arc::new((Mutex::new(false), Condvar::new())),
             #[cfg(all(target_os = "windows", not(test)))]
@@ -51,6 +61,55 @@ impl Default for InputMonitor {
 }
 
 impl InputMonitor {
+    pub(crate) fn observe_cancellation(&self, cancel: Option<tokio::sync::watch::Receiver<bool>>) {
+        if let Ok(mut slot) = self.cancellation.lock() {
+            *slot = cancel;
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancellation
+            .lock()
+            .map(|slot| slot.as_ref().is_some_and(|cancel| *cancel.borrow()))
+            .unwrap_or(true)
+    }
+    pub(crate) fn start_for_recording(&self, shortcut: &str, from_shortcut: bool) -> bool {
+        if shortcut::ShortcutFilter::parse(shortcut).is_none() {
+            return false;
+        }
+        let Ok(mut configured) = self.recording_shortcut.lock() else {
+            return false;
+        };
+        *configured = Some(shortcut.to_owned());
+        self.started_by_shortcut
+            .store(from_shortcut, Ordering::Release);
+        drop(configured);
+        self.start()
+    }
+
+    pub(crate) fn shortcut_pending(&self) -> bool {
+        #[cfg(all(target_os = "windows", not(test)))]
+        {
+            use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+            if [0x10, 0x11, 0x12, 0x5B, 0x5C]
+                .iter()
+                .any(|key| unsafe { GetAsyncKeyState(*key) } & i16::MIN != 0)
+            {
+                return true;
+            }
+        }
+        self.shortcut_pending.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_for_shortcut_release(&self) {
+        for _ in 0..100 {
+            if !self.shortcut_pending() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
     /// Starts the monitor lazily. Tests and non-Windows builds deliberately
     /// return false so they never recursively spawn the test/app executable.
     pub(crate) fn start(&self) -> bool {
@@ -79,6 +138,14 @@ impl InputMonitor {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .creation_flags(CREATE_NO_WINDOW);
+            if let Ok(shortcut) = self.recording_shortcut.lock() {
+                if let Some(shortcut) = shortcut.as_ref() {
+                    command.arg("--recording-shortcut").arg(shortcut);
+                    if self.started_by_shortcut.load(Ordering::Acquire) {
+                        command.arg("--start-shortcut");
+                    }
+                }
+            }
             let Ok(mut child) = command.spawn() else {
                 return false;
             };
@@ -101,6 +168,7 @@ impl InputMonitor {
             }
             let sequence = Arc::clone(&self.sequence);
             let available = Arc::clone(&self.available);
+            let shortcut_pending = Arc::clone(&self.shortcut_pending);
             let ready = Arc::clone(&self.ready);
             let generation = Arc::clone(&self.generation);
             std::thread::spawn(move || {
@@ -111,6 +179,10 @@ impl InputMonitor {
                     let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
                         continue;
                     };
+                    if let Some(pending) = event.get("pending").and_then(serde_json::Value::as_bool)
+                    {
+                        shortcut_pending.store(pending, Ordering::Release);
+                    }
                     match event.get("kind").and_then(serde_json::Value::as_str) {
                         Some("ready") => {
                             available.store(true, Ordering::Release);
@@ -163,7 +235,8 @@ impl InputMonitor {
     }
 
     pub(crate) fn unchanged_since(&self, checkpoint: u64) -> bool {
-        self.available.load(Ordering::Acquire)
+        !self.cancelled()
+            && self.available.load(Ordering::Acquire)
             && self.sequence.load(Ordering::Acquire) == checkpoint
     }
 
@@ -230,23 +303,41 @@ mod windows_worker {
         UI::WindowsAndMessaging::{
             CallNextHookEx, GetMessageW, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
             UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-            PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MBUTTONDOWN,
-            WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_XBUTTONDOWN,
+            PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+            WM_MBUTTONDOWN, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_SYSKEYDOWN,
+            WM_SYSKEYUP, WM_XBUTTONDOWN,
         },
     };
 
     use crate::injection::INJECTION_MARKER;
 
-    static EVENTS: OnceLock<Sender<(&'static str, u64)>> = OnceLock::new();
+    use super::shortcut::ShortcutFilter;
+    static FILTER: OnceLock<std::sync::Mutex<ShortcutFilter>> = OnceLock::new();
+    static EVENTS: OnceLock<Sender<(&'static str, u64, bool)>> = OnceLock::new();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-        if code == HC_ACTION as i32 && matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN) {
+        if code == HC_ACTION as i32
+            && matches!(
+                wparam.0 as u32,
+                WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP
+            )
+        {
             let event = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
             if event.dwExtraInfo != INJECTION_MARKER {
                 if let Some(sender) = EVENTS.get() {
-                    let sequence = SEQUENCE.fetch_add(1, Ordering::AcqRel) + 1;
-                    let _ = sender.send(("keyboard", sequence));
+                    let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+                    let (activity, pending) = FILTER
+                        .get()
+                        .and_then(|filter| filter.lock().ok())
+                        .map(|mut filter| (filter.event(event.vkCode, down), filter.pending()))
+                        .unwrap_or((down, false));
+                    let sequence = if activity {
+                        SEQUENCE.fetch_add(1, Ordering::AcqRel) + 1
+                    } else {
+                        SEQUENCE.load(Ordering::Acquire)
+                    };
+                    let _ = sender.send(("keyboard", sequence, pending));
                 }
             }
         }
@@ -269,7 +360,11 @@ mod windows_worker {
             if event.dwExtraInfo != INJECTION_MARKER {
                 if let Some(sender) = EVENTS.get() {
                     let sequence = SEQUENCE.fetch_add(1, Ordering::AcqRel) + 1;
-                    let _ = sender.send(("pointer", sequence));
+                    let pending = FILTER
+                        .get()
+                        .and_then(|filter| filter.lock().ok())
+                        .is_some_and(|filter| filter.pending());
+                    let _ = sender.send(("pointer", sequence, pending));
                 }
             }
         }
@@ -277,10 +372,21 @@ mod windows_worker {
     }
 
     pub(super) fn run() {
+        let mut arguments = std::env::args();
+        if arguments.any(|arg| arg == "--recording-shortcut") {
+            let Some(mut filter) = arguments.next().as_deref().and_then(ShortcutFilter::parse)
+            else {
+                return;
+            };
+            filter.initialize(std::env::args().any(|arg| arg == "--start-shortcut"), |vk| unsafe {
+                windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(vk as i32)
+            } & i16::MIN != 0);
+            let _ = FILTER.set(std::sync::Mutex::new(filter));
+        }
         let (sender, receiver) = channel();
         let _ = EVENTS.set(sender);
         std::thread::spawn(move || {
-            while let Ok((device, sequence)) = receiver.recv() {
+            while let Ok((device, sequence, pending)) = receiver.recv() {
                 // Do not hold stdout's process-wide lock while waiting for an
                 // event; the hook thread must leave the ready handshake free
                 // to use the same pipe.
@@ -292,7 +398,8 @@ mod windows_worker {
                     serde_json::json!({
                         "kind": "input",
                         "device": device,
-                        "sequence": sequence
+                        "sequence": sequence,
+                        "pending": pending
                     })
                 );
                 let _ = output.flush();
@@ -319,7 +426,14 @@ mod windows_worker {
             let _ = std::io::stdin().lock().read_line(&mut command);
             let _ = unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
         });
-        println!("{}", serde_json::json!({ "kind": "ready" }));
+        let pending = FILTER
+            .get()
+            .and_then(|filter| filter.lock().ok())
+            .is_some_and(|filter| filter.pending());
+        println!(
+            "{}",
+            serde_json::json!({ "kind": "ready", "pending": pending })
+        );
         let _ = std::io::stdout().flush();
 
         while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {}

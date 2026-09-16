@@ -20,6 +20,40 @@ fn copy_only<B: Backend>(backend: &B, text: &str) -> Result<InsertResult, Inject
     Ok(InsertResult::ClipboardOnly)
 }
 
+fn select_verified<B: Backend>(
+    backend: &B,
+    target: &TargetWindow,
+    before: &TargetText,
+    text: &str,
+    activity: Option<(&InputMonitor, u64)>,
+) -> Option<TargetText> {
+    let selected = before.select_recent(text)?;
+    if !safe(backend, target, activity, SafetyPolicy::Destructive)
+        || !backend.target_text(target).ok()?.same_content(before)
+        || !backend.select_recent(target, before, text).ok()?
+    {
+        return None;
+    }
+    for attempt in 0..=VERIFY_ATTEMPTS {
+        if attempt > 0 {
+            backend.wait_for_target();
+        }
+        if !safe(backend, target, activity, SafetyPolicy::Destructive) {
+            return None;
+        }
+        let actual = backend.target_text(target).ok()?;
+        if actual.same_content(&selected) {
+            return Some(selected);
+        }
+        // Only the unchanged caret state may precede the requested selection.
+        // An unrelated edit or selection must never authorize replacement.
+        if !actual.same_content(before) {
+            return None;
+        }
+    }
+    None
+}
+
 /// Once any paste input is queued, its clipboard payload must remain intact
 /// until the target confirms the edit. Never substitute a retry or fallback.
 fn paste<B: Backend>(
@@ -143,13 +177,42 @@ pub(super) fn begin<B: Backend>(
     target: &TargetWindow,
     monitor: &InputMonitor,
 ) -> Result<Option<ProvisionalInsertion>, InjectionError> {
+    let checkpoint = monitor.start().then(|| monitor.checkpoint()).flatten();
+    begin_with_checkpoint(backend, options, draft, target, monitor, checkpoint, true)
+}
+
+pub(super) fn begin_live<B: Backend>(
+    backend: &B,
+    options: InjectionOptions,
+    draft: &str,
+    target: &TargetWindow,
+    monitor: &InputMonitor,
+    checkpoint: u64,
+) -> Result<Option<ProvisionalInsertion>, InjectionError> {
+    begin_with_checkpoint(
+        backend,
+        options,
+        draft,
+        target,
+        monitor,
+        Some(checkpoint),
+        false,
+    )
+}
+
+fn begin_with_checkpoint<B: Backend>(
+    backend: &B,
+    options: InjectionOptions,
+    draft: &str,
+    target: &TargetWindow,
+    monitor: &InputMonitor,
+    checkpoint: Option<u64>,
+    allow_untracked: bool,
+) -> Result<Option<ProvisionalInsertion>, InjectionError> {
     if draft.is_empty() {
         return Ok(None);
     }
-    let replacement = monitor
-        .start()
-        .then(|| monitor.checkpoint())
-        .flatten()
+    let replacement = checkpoint
         .filter(|checkpoint| {
             safe(
                 backend,
@@ -179,10 +242,14 @@ pub(super) fn begin<B: Backend>(
             checkpoint,
         });
         (result, range)
-    } else {
+    } else if allow_untracked {
         // Inserting the local result does not require permission to replace it
         // later. Reuse ordinary insertion guards, and never retry on completion.
         (insert(backend, options, draft, target)?, None)
+    } else {
+        // A live hypothesis must remain replaceable. Do not paste a fragment
+        // into an unreadable target or bypass cancellation via additive input.
+        (InsertResult::ClipboardOnly, None)
     };
     Ok(Some(ProvisionalInsertion {
         target: target.clone(),
@@ -200,13 +267,27 @@ pub(super) fn finish<B: Backend>(
     final_text: &str,
     monitor: &InputMonitor,
 ) -> Result<InsertResult, InjectionError> {
+    let result = update(backend, options, session, final_text, monitor, true);
+    session.finished = true;
+    result
+}
+
+pub(super) fn update<B: Backend>(
+    backend: &B,
+    options: InjectionOptions,
+    session: &mut ProvisionalInsertion,
+    final_text: &str,
+    monitor: &InputMonitor,
+    finalizing: bool,
+) -> Result<InsertResult, InjectionError> {
     if session.finished {
         return Ok(session.result);
     }
-    session.finished = true;
     let Some(range) = session.replacement.as_ref() else {
-        if session.result != InsertResult::PasteUnverified
-            && normalize_text(&session.displayed) != normalize_text(final_text)
+        if finalizing
+            && session.result != InsertResult::PasteUnverified
+            && (session.result == InsertResult::ClipboardOnly
+                || normalize_text(&session.displayed) != normalize_text(final_text))
         {
             session.result = copy_only(backend, final_text)?;
         }
@@ -232,28 +313,24 @@ pub(super) fn finish<B: Backend>(
         return Ok(session.result);
     }
     let activity = Some((monitor, range.checkpoint));
-    if !safe(
+    let Some(selected) = select_verified(
         backend,
         &session.target,
+        &range.after,
+        &session.displayed,
         activity,
-        SafetyPolicy::Destructive,
-    ) || !backend
-        .target_text(&session.target)
-        .is_ok_and(|actual| actual.same_content(&range.after))
-        || !backend
-            .select_recent(&session.target, &range.after, &session.displayed)
-            .unwrap_or(false)
-    {
-        session.result = copy_only(backend, final_text)?;
+    ) else {
+        session.replacement = None;
+        session.result = if finalizing {
+            copy_only(backend, final_text)?
+        } else {
+            InsertResult::ClipboardOnly
+        };
         return Ok(session.result);
-    }
-    let selected =
-        range
-            .after
-            .select_recent(&session.displayed)
-            .ok_or(InjectionError::BackendFailure(
-                "the provisional range is no longer available",
-            ))?;
+    };
+    let checkpoint = range.checkpoint;
+    // A failure after selecting must not authorize another target edit.
+    session.replacement = None;
     session.result = paste(
         backend,
         options,
@@ -263,6 +340,13 @@ pub(super) fn finish<B: Backend>(
         activity,
         SafetyPolicy::Destructive,
     )?;
+    if session.result != InsertResult::ClipboardOnly {
+        session.displayed = final_text.to_owned();
+        session.replacement = Some(ReplacementRange {
+            after: selected.replaced_with(final_text),
+            checkpoint,
+        });
+    }
     Ok(session.result)
 }
 
@@ -279,6 +363,15 @@ pub(super) fn cancel<B: Backend>(
         return;
     };
     let activity = Some((monitor, range.checkpoint));
+    let Some(selected) = select_verified(
+        backend,
+        &session.target,
+        &range.after,
+        &session.displayed,
+        activity,
+    ) else {
+        return;
+    };
     if safe(
         backend,
         &session.target,
@@ -286,25 +379,9 @@ pub(super) fn cancel<B: Backend>(
         SafetyPolicy::Destructive,
     ) && backend
         .target_text(&session.target)
-        .is_ok_and(|actual| actual.same_content(&range.after))
-        && backend
-            .select_recent(&session.target, &range.after, &session.displayed)
-            .unwrap_or(false)
-        && safe(
-            backend,
-            &session.target,
-            activity,
-            SafetyPolicy::Destructive,
-        )
+        .is_ok_and(|actual| actual.same_content(&selected))
     {
-        if let Some(selected) = range.after.select_recent(&session.displayed) {
-            if backend
-                .target_text(&session.target)
-                .is_ok_and(|actual| actual.same_content(&selected))
-            {
-                let _ = backend.delete_selection(&session.target);
-            }
-        }
+        let _ = backend.delete_selection(&session.target);
     }
 }
 
@@ -312,6 +389,210 @@ pub(super) fn cancel<B: Backend>(
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn live_updates_replace_the_latest_range_and_finalization_is_idempotent() {
+        let backend = MockBackend::new();
+        let monitor = monitor();
+        let mut session = begin(
+            &backend,
+            InjectionOptions::default(),
+            "今日",
+            &target(),
+            &monitor,
+        )
+        .unwrap()
+        .unwrap();
+        for text in ["今日は雨", "今日は晴れです。", "今日は晴れです。"] {
+            assert_eq!(
+                update(
+                    &backend,
+                    InjectionOptions::default(),
+                    &mut session,
+                    text,
+                    &monitor,
+                    false
+                )
+                .unwrap(),
+                InsertResult::ClipboardPaste
+            );
+            assert_eq!(backend.content(), format!("prefix {text} suffix"));
+        }
+        finish(
+            &backend,
+            InjectionOptions::default(),
+            &mut session,
+            "今日は晴れです！",
+            &monitor,
+        )
+        .unwrap();
+        finish(
+            &backend,
+            InjectionOptions::default(),
+            &mut session,
+            "duplicate",
+            &monitor,
+        )
+        .unwrap();
+        assert_eq!(backend.content(), "prefix 今日は晴れです！ suffix");
+        assert_eq!(
+            backend
+                .calls
+                .borrow()
+                .iter()
+                .filter(|c| **c == "paste")
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn cancel_after_live_revision_removes_only_the_latest_draft() {
+        let backend = MockBackend::new();
+        let monitor = monitor();
+        let mut session = begin(
+            &backend,
+            InjectionOptions::default(),
+            "draft",
+            &target(),
+            &monitor,
+        )
+        .unwrap()
+        .unwrap();
+        update(
+            &backend,
+            InjectionOptions::default(),
+            &mut session,
+            "revised draft",
+            &monitor,
+            false,
+        )
+        .unwrap();
+        cancel(&backend, &mut session, &monitor);
+        assert_eq!(backend.content(), "prefix  suffix");
+    }
+
+    #[test]
+    fn cancellation_during_live_selection_wait_prevents_replacement_paste() {
+        let mut backend = MockBackend::new();
+        let monitor = monitor();
+        let (cancel, cancelled) = tokio::sync::watch::channel(false);
+        monitor.observe_cancellation(Some(cancelled));
+        let mut session = begin_live(
+            &backend,
+            InjectionOptions::default(),
+            "draft",
+            &target(),
+            &monitor,
+            monitor.checkpoint().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        backend.selection_settle_after = 2;
+        backend.on_selection_wait = Some(Box::new(move |_| {
+            cancel.send_replace(true);
+        }));
+        update(
+            &backend,
+            InjectionOptions::default(),
+            &mut session,
+            "late replacement",
+            &monitor,
+            false,
+        )
+        .unwrap();
+        assert_eq!(backend.content(), "prefix draft suffix");
+        assert_eq!(
+            backend
+                .calls
+                .borrow()
+                .iter()
+                .filter(|c| **c == "paste")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn live_begin_never_uses_untracked_input_or_refreshes_an_interrupted_checkpoint() {
+        for reason in ["cancel", "input", "unreadable"] {
+            let backend = MockBackend::new();
+            let monitor = monitor();
+            let checkpoint = monitor.checkpoint().unwrap();
+            let (cancel, cancelled) = tokio::sync::watch::channel(false);
+            monitor.observe_cancellation(Some(cancelled));
+            match reason {
+                "cancel" => {
+                    cancel.send_replace(true);
+                }
+                "input" => monitor.test_record_input(),
+                "unreadable" => backend.text_readable.set(false),
+                _ => unreachable!(),
+            }
+            let mut session = begin_live(
+                &backend,
+                InjectionOptions::default(),
+                "fragment",
+                &target(),
+                &monitor,
+                checkpoint,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(backend.calls.borrow().is_empty());
+            finish(
+                &backend,
+                InjectionOptions::default(),
+                &mut session,
+                "complete",
+                &monitor,
+            )
+            .unwrap();
+            assert_eq!(backend.content(), "prefix  suffix");
+            assert_eq!(&*backend.clipboard.borrow(), "complete");
+        }
+    }
+
+    #[test]
+    fn live_edit_interruption_freezes_target_and_only_final_text_is_copied() {
+        let backend = MockBackend::new();
+        let monitor = monitor();
+        let mut session = begin(
+            &backend,
+            InjectionOptions::default(),
+            "draft",
+            &target(),
+            &monitor,
+        )
+        .unwrap()
+        .unwrap();
+        monitor.test_record_input();
+        for text in ["partial one", "partial two"] {
+            assert_eq!(
+                update(
+                    &backend,
+                    InjectionOptions::default(),
+                    &mut session,
+                    text,
+                    &monitor,
+                    false
+                )
+                .unwrap(),
+                InsertResult::ClipboardOnly
+            );
+            assert_eq!(backend.content(), "prefix draft suffix");
+            assert_eq!(&*backend.clipboard.borrow(), "original rich clipboard");
+        }
+        finish(
+            &backend,
+            InjectionOptions::default(),
+            &mut session,
+            "draft",
+            &monitor,
+        )
+        .unwrap();
+        assert_eq!(&*backend.clipboard.borrow(), "draft");
+    }
 
     struct MockBackend {
         text: RefCell<TargetText>,
@@ -323,6 +604,10 @@ mod tests {
         text_readable: Cell<bool>,
         paste_accepted: Cell<bool>,
         pending: RefCell<Option<String>>,
+        pending_selection: RefCell<Option<TargetText>>,
+        selection_settle_after: usize,
+        selection_waits: Cell<usize>,
+        on_selection_wait: Option<Box<dyn Fn(&MockBackend)>>,
         exclusions: RefCell<Vec<ClipboardExclusion>>,
         settle_after: usize,
         waits: Cell<usize>,
@@ -347,6 +632,10 @@ mod tests {
                 text_readable: Cell::new(true),
                 paste_accepted: Cell::new(true),
                 pending: RefCell::new(None),
+                pending_selection: RefCell::new(None),
+                selection_settle_after: 0,
+                selection_waits: Cell::new(0),
+                on_selection_wait: None,
                 exclusions: RefCell::new(Vec::new()),
                 settle_after: 0,
                 waits: Cell::new(0),
@@ -401,7 +690,11 @@ mod tests {
             let Some(selected) = state.select_recent(text) else {
                 return Ok(false);
             };
-            *self.text.borrow_mut() = selected;
+            if self.selection_settle_after == 0 {
+                *self.text.borrow_mut() = selected;
+            } else {
+                *self.pending_selection.borrow_mut() = Some(selected);
+            }
             Ok(true)
         }
         fn clipboard_snapshot(&self) -> Result<Self::Clipboard, InjectionError> {
@@ -451,6 +744,17 @@ mod tests {
             Ok(true)
         }
         fn wait_for_target(&self) {
+            if self.pending_selection.borrow().is_some() {
+                self.selection_waits.set(self.selection_waits.get() + 1);
+                if self.selection_waits.get() == 1 {
+                    if let Some(on_wait) = &self.on_selection_wait {
+                        on_wait(self);
+                    }
+                }
+                if self.selection_waits.get() == self.selection_settle_after {
+                    *self.text.borrow_mut() = self.pending_selection.borrow_mut().take().unwrap();
+                }
+            }
             self.waits.set(self.waits.get() + 1);
             if self.waits.get() == self.settle_after {
                 self.apply_pending();
@@ -656,6 +960,157 @@ mod tests {
                 if corrected != "draft" {
                     assert_eq!(&*backend.clipboard.borrow(), corrected);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn delayed_selection_is_confirmed_before_corrected_paste() {
+        for delay in [1, VERIFY_ATTEMPTS] {
+            let mut backend = MockBackend::new();
+            backend.selection_settle_after = delay;
+            backend.on_selection_wait = Some(Box::new(|backend| {
+                assert_eq!(&*backend.clipboard.borrow(), "original rich clipboard");
+                assert_eq!(
+                    backend
+                        .calls
+                        .borrow()
+                        .iter()
+                        .filter(|call| **call == "paste")
+                        .count(),
+                    1
+                );
+            }));
+            let monitor = monitor();
+            let mut session = begin(
+                &backend,
+                InjectionOptions::default(),
+                "draft",
+                &target(),
+                &monitor,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(backend.content(), "prefix draft suffix");
+            finish(
+                &backend,
+                InjectionOptions::default(),
+                &mut session,
+                "corrected",
+                &monitor,
+            )
+            .unwrap();
+            assert_eq!(backend.content(), "prefix corrected suffix");
+            assert_eq!(
+                backend
+                    .calls
+                    .borrow()
+                    .iter()
+                    .filter(|call| **call == "select")
+                    .count(),
+                1
+            );
+            let calls = backend.calls.borrow().clone();
+            finish(
+                &backend,
+                InjectionOptions::default(),
+                &mut session,
+                "corrected",
+                &monitor,
+            )
+            .unwrap();
+            assert_eq!(*backend.calls.borrow(), calls);
+        }
+    }
+
+    #[test]
+    fn unconfirmed_or_interrupted_selection_never_replaces_or_deletes_text() {
+        for interruption in [
+            "timeout",
+            "input",
+            "monitor",
+            "focus",
+            "text",
+            "selection",
+            "active_ime",
+            "unknown_ime",
+            "unreadable",
+        ] {
+            for cancelling in [false, true] {
+                let monitor = std::sync::Arc::new(monitor());
+                let observed_monitor = monitor.clone();
+                let mut backend = MockBackend::new();
+                backend.selection_settle_after = VERIFY_ATTEMPTS + 1;
+                backend.on_selection_wait = Some(Box::new(move |backend| match interruption {
+                    "input" => observed_monitor.test_record_input(),
+                    "monitor" => observed_monitor.test_set_available(false),
+                    "focus" => backend.target_valid.set(false),
+                    "text" => backend.text.borrow_mut().after.push('!'),
+                    "selection" => {
+                        backend.text.borrow_mut().before.pop();
+                    }
+                    "active_ime" => backend.ime.set(Some(true)),
+                    "unknown_ime" => backend.ime.set(None),
+                    "unreadable" => backend.text_readable.set(false),
+                    _ => {}
+                }));
+                let mut session = begin(
+                    &backend,
+                    InjectionOptions::default(),
+                    "draft",
+                    &target(),
+                    &monitor,
+                )
+                .unwrap()
+                .unwrap();
+                if cancelling {
+                    cancel(&backend, &mut session, &monitor);
+                } else {
+                    assert_eq!(
+                        finish(
+                            &backend,
+                            InjectionOptions::default(),
+                            &mut session,
+                            "corrected",
+                            &monitor
+                        )
+                        .unwrap(),
+                        InsertResult::ClipboardOnly
+                    );
+                    assert_eq!(&*backend.clipboard.borrow(), "corrected");
+                }
+                assert_eq!(
+                    backend
+                        .calls
+                        .borrow()
+                        .iter()
+                        .filter(|call| **call == "select")
+                        .count(),
+                    1,
+                    "{interruption}"
+                );
+                assert_eq!(
+                    backend
+                        .calls
+                        .borrow()
+                        .iter()
+                        .filter(|call| **call == "paste")
+                        .count(),
+                    1,
+                    "{interruption}"
+                );
+                assert!(
+                    !backend.calls.borrow().contains(&"delete"),
+                    "{interruption}"
+                );
+                assert_eq!(
+                    backend.selection_waits.get(),
+                    if interruption == "timeout" {
+                        VERIFY_ATTEMPTS
+                    } else {
+                        1
+                    }
+                );
             }
         }
     }
@@ -918,6 +1373,20 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        for text in ["partial one", "partial two"] {
+            assert_eq!(
+                update(
+                    &backend,
+                    InjectionOptions::default(),
+                    &mut session,
+                    text,
+                    &monitor,
+                    false
+                )
+                .unwrap(),
+                InsertResult::PasteUnverified
+            );
+        }
         assert_eq!(
             finish(
                 &backend,

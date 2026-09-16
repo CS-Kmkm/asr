@@ -4,6 +4,9 @@
 use crate::input_monitor::InputMonitor;
 use std::fmt;
 
+#[cfg(all(test, target_os = "windows"))]
+mod native_tests;
+
 #[cfg(target_os = "windows")]
 mod accessibility;
 mod batch;
@@ -127,6 +130,22 @@ impl SystemTextInjector {
     ) -> Result<Option<ProvisionalInsertion>, InjectionError> {
         batch::begin(&self.backend, self.options, draft, target, monitor)
     }
+    pub(crate) fn begin_live_provisional(
+        &self,
+        draft: &str,
+        target: &TargetWindow,
+        monitor: &InputMonitor,
+        checkpoint: u64,
+    ) -> Result<Option<ProvisionalInsertion>, InjectionError> {
+        batch::begin_live(
+            &self.backend,
+            self.options,
+            draft,
+            target,
+            monitor,
+            checkpoint,
+        )
+    }
     pub(crate) fn finish_provisional(
         &self,
         session: &mut ProvisionalInsertion,
@@ -134,6 +153,14 @@ impl SystemTextInjector {
         monitor: &InputMonitor,
     ) -> Result<InsertResult, InjectionError> {
         batch::finish(&self.backend, self.options, session, final_text, monitor)
+    }
+    pub(crate) fn update_provisional(
+        &self,
+        session: &mut ProvisionalInsertion,
+        text: &str,
+        monitor: &InputMonitor,
+    ) -> Result<InsertResult, InjectionError> {
+        batch::update(&self.backend, self.options, session, text, monitor, false)
     }
     pub(crate) fn cancel_provisional(
         &self,
@@ -257,6 +284,8 @@ trait Backend {
     fn ime_composition_active(&self, target: &TargetWindow)
         -> Result<Option<bool>, InjectionError>;
     fn target_text(&self, target: &TargetWindow) -> Result<TargetText, InjectionError>;
+    /// Returns true when selection was requested. The target may apply it later;
+    /// callers must confirm the selected text before replacing or deleting it.
     fn select_recent(
         &self,
         target: &TargetWindow,

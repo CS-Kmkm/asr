@@ -1,0 +1,107 @@
+$ tauri "dev"
+     Running BeforeDevCommand (`pnpm run dev`)
+$ vite
+     Running DevCommand (`cargo  run --no-default-features --color always --`)
+        Info Watching C:\Users\Koshi\asr\src-tauri for changes...
+[1m[92m   Compiling[0m local-voice-input v0.1.0 (C:\Users\Koshi\asr\src-tauri)
+[1m[96m    Building[0m [=======================> ] 461/463: local-v…                                                            [1m[93mwarning[0m[1m[97m: methods `disarm` and `state` are never used[0m
+  [1m[96m--> [0msrc\audio.rs:42:8
+   [1m[96m|[0m
+[1m[96m36[0m [1m[96m|[0m pub trait AudioCapture: Send {
+   [1m[96m|[0m           [1m[96m------------[0m [1m[96mmethods in this trait[0m
+[1m[96m...[0m
+[1m[96m42[0m [1m[96m|[0m     fn disarm(&mut self) -> AudioFuture<'_, ()>;
+   [1m[96m|[0m        [1m[93m^^^^^^[0m
+[1m[96m...[0m
+[1m[96m46[0m [1m[96m|[0m     fn state(&self) -> CaptureState;
+   [1m[96m|[0m        [1m[93m^^^^^[0m
+   [1m[96m|[0m
+   [1m[96m= [0m[1m[97mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+[1m[96m    Building[0m [=======================> ] 461/463: local-v…                                                            [1m[93mwarning[0m[1m[97m: trait `VoiceActivityDetector` is never used[0m
+  [1m[96m--> [0msrc\audio.rs:51:11
+   [1m[96m|[0m
+[1m[96m51[0m [1m[96m|[0m pub trait VoiceActivityDetector: Send + Sync {
+   [1m[96m|[0m           [1m[93m^^^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: method `remove` is never used[0m
+   [1m[96m--> [0msrc\audio.rs:131:12
+    [1m[96m|[0m
+[1m[96m129[0m [1m[96m|[0m impl AudioArtifact {
+    [1m[96m|[0m [1m[96m------------------[0m [1m[96mmethod in this implementation[0m
+[1m[96m130[0m [1m[96m|[0m     /// Explicit cleanup helper; artifacts are not deleted automatically on drop.
+[1m[96m131[0m [1m[96m|[0m     pub fn remove(self) -> Result<(), AudioError> {
+    [1m[96m|[0m            [1m[93m^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: enum `CaptureState` is never used[0m
+   [1m[96m--> [0msrc\audio.rs:149:10
+    [1m[96m|[0m
+[1m[96m149[0m [1m[96m|[0m pub enum CaptureState {
+    [1m[96m|[0m          [1m[93m^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: methods `capacity`, `len`, `is_empty`, `snapshot`, and `clear` are never used[0m
+   [1m[96m--> [0msrc\audio.rs:282:12
+    [1m[96m|[0m
+[1m[96m266[0m [1m[96m|[0m impl PrerollBuffer {
+    [1m[96m|[0m [1m[96m------------------[0m [1m[96mmethods in this implementation[0m
+[1m[96m...[0m
+[1m[96m282[0m [1m[96m|[0m     pub fn capacity(&self) -> usize {
+    [1m[96m|[0m            [1m[93m^^^^^^^^[0m
+[1m[96m...[0m
+[1m[96m287[0m [1m[96m|[0m     pub fn len(&self) -> usize {
+    [1m[96m|[0m            [1m[93m^^^[0m
+[1m[96m...[0m
+[1m[96m295[0m [1m[96m|[0m     pub fn is_empty(&self) -> bool {
+    [1m[96m|[0m            [1m[93m^^^^^^^^[0m
+[1m[96m...[0m
+[1m[96m341[0m [1m[96m|[0m     pub fn snapshot(&self) -> Vec<f32> {
+    [1m[96m|[0m            [1m[93m^^^^^^^^[0m
+[1m[96m...[0m
+[1m[96m362[0m [1m[96m|[0m     pub fn clear(&mut self) {
+    [1m[96m|[0m            [1m[93m^^^^^[0m
+
+[1m[96m    Building[0m [=======================> ] 461/463: local-v…                                                            [1m[93mwarning[0m[1m[97m: variant `UnsupportedPlatform` is never constructed[0m
+   [1m[96m--> [0msrc\audio.rs:374:5
+    [1m[96m|[0m
+[1m[96m370[0m [1m[96m|[0m pub enum AudioError {
+    [1m[96m|[0m          [1m[96m----------[0m [1m[96mvariant in this enum[0m
+[1m[96m...[0m
+[1m[96m374[0m [1m[96m|[0m     UnsupportedPlatform,
+    [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^^^^^[0m
+    [1m[96m|[0m
+    [1m[96m= [0m[1m[97mnote[0m: `AudioError` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+[1m[93mwarning[0m[1m[97m: function `interleaved_to_mono` is never used[0m
+   [1m[96m--> [0msrc\audio.rs:803:8
+    [1m[96m|[0m
+[1m[96m803[0m [1m[96m|[0m pub fn interleaved_to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
+    [1m[96m|[0m        [1m[93m^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[96m    Building[0m [=======================> ] 461/463: local-v…                                                            [1m[93mwarning[0m[1m[97m: variants `UnsupportedPlatform` and `ImeCompositionActive` are never constructed[0m
+  [1m[96m--> [0msrc\injection.rs:44:5
+   [1m[96m|[0m
+[1m[96m43[0m [1m[96m|[0m pub enum InjectionError {
+   [1m[96m|[0m          [1m[96m--------------[0m [1m[96mvariants in this enum[0m
+[1m[96m44[0m [1m[96m|[0m     UnsupportedPlatform,
+   [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^^^^^[0m
+[1m[96m...[0m
+[1m[96m49[0m [1m[96m|[0m     ImeCompositionActive,
+   [1m[96m|[0m     [1m[93m^^^^^^^^^^^^^^^^^^^^[0m
+   [1m[96m|[0m
+   [1m[96m= [0m[1m[97mnote[0m: `InjectionError` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[96m    Building[0m [=======================> ] 461/463: local-v…                                                            [1m[93mwarning[0m[1m[97m: variant `AllowHistory` is never constructed[0m
+   [1m[96m--> [0msrc\injection.rs:221:5
+    [1m[96m|[0m
+[1m[96m219[0m [1m[96m|[0m enum ClipboardExclusion {
+    [1m[96m|[0m      [1m[96m------------------[0m [1m[96mvariant in this enum[0m
+[1m[96m220[0m [1m[96m|[0m     ExcludeFromHistory,
+[1m[96m221[0m [1m[96m|[0m     AllowHistory,
+    [1m[96m|[0m     [1m[93m^^^^^^^^^^^^[0m
+    [1m[96m|[0m
+    [1m[96m= [0m[1m[97mnote[0m: `ClipboardExclusion` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+[1m[96m    Building[0m [=======================> ] 461/463: local-v…                                                            [1m[93mwarning[0m: `local-voice-input` (lib) generated 9 warnings
+[1m[96m    Building[0m [=======================> ] 462/463: local-v…                                                            [1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 37.95s
+[1m[92m     Running[0m `target\debug\local-voice-input.exe`
+[0912/142835.134:ERROR:ui\gfx\win\window_impl.cc:172] Failed to unregister class Chrome_WidgetWin_0. Error = 1412

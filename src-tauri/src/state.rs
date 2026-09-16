@@ -58,6 +58,18 @@ impl PipelineLifecycle {
         self.transition(id, PipelinePhase::Starting, PipelinePhase::Recording)
     }
 
+    pub fn cancellation(&self, id: u64) -> Result<watch::Receiver<bool>, &'static str> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| "pipeline lifecycle is unavailable")?;
+        inner
+            .as_ref()
+            .filter(|op| op.id == id)
+            .map(|op| op.cancel.subscribe())
+            .ok_or("pipeline operation is no longer active")
+    }
+
     pub fn begin_processing(&self) -> Result<(u64, watch::Receiver<bool>), &'static str> {
         let mut inner = self
             .inner
@@ -82,6 +94,9 @@ impl PipelineLifecycle {
         let Some(operation) = inner.as_ref() else {
             return Ok(None);
         };
+        if *operation.cancel.borrow() {
+            return Ok(None);
+        }
         operation.cancel.send_replace(true);
         Ok(Some((operation.id, operation.phase)))
     }

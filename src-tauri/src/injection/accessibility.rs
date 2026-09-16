@@ -156,7 +156,7 @@ pub(super) fn select_recent(
     if !control.state()?.same_content(expected) {
         return Ok(false);
     }
-    let Some(selected) = expected.select_recent(text) else {
+    let Some(_) = expected.select_recent(text) else {
         return Ok(false);
     };
     let range = control.selection()?;
@@ -194,7 +194,9 @@ pub(super) fn select_recent(
                 return Ok(false);
             }
             unsafe { range.Select() }.map_err(|_| unavailable())?;
-            return Ok(control.state()?.same_content(&selected));
+            // Providers such as Chromium apply Select asynchronously. The batch
+            // layer confirms the selection while checking focus, input and IME.
+            return Ok(true);
         }
         if !text.ends_with(&actual) {
             return Ok(false);

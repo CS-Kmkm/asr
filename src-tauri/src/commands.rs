@@ -38,6 +38,16 @@ pub(crate) async fn start_recording(
     state: State<'_, AppState>,
     storage: State<'_, Storage>,
 ) -> Result<(), String> {
+    start_recording_with_origin(app, services, state, storage, false).await
+}
+
+pub(crate) async fn start_recording_with_origin(
+    app: AppHandle,
+    services: State<'_, Services>,
+    state: State<'_, AppState>,
+    storage: State<'_, Storage>,
+    from_shortcut: bool,
+) -> Result<(), String> {
     let operation_id = services.lifecycle.begin_start()?;
     let guard = PipelineGuard {
         lifecycle: &services.lifecycle,
@@ -45,9 +55,18 @@ pub(crate) async fn start_recording(
     };
     let settings = storage.get_settings().map_err(command_error)?;
     ensure_model_loaded(&app, &services, &settings).await?;
+    if services.lifecycle.is_cancelled(operation_id) {
+        emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
+        return Err("dictation was cancelled".into());
+    }
     let target = SystemTextInjector::default()
         .capture_target()
         .map_err(command_error)?;
+    let mut live_slot = services.live.lock().await;
+    let draft = live_dictation::LiveDraft::new(target.clone(), &settings, from_shortcut);
+    let cancel = services.lifecycle.cancellation(operation_id)?;
+    let dictionary_terms = storage.dictionary_prompt_terms().unwrap_or_default();
+    let prompt = (!dictionary_terms.is_empty()).then(|| dictionary_terms.join("\n"));
     let capture_config = capture_config(&settings);
     let mut audio = services.audio.lock().await;
     // Open the stream only when dictation starts. Keeping a Bluetooth headset
@@ -75,6 +94,14 @@ pub(crate) async fn start_recording(
         AppPhase::Recording,
         "Recording from the selected microphone.",
     );
+    *live_slot = Some(live_dictation::start(
+        app.clone(),
+        operation_id,
+        draft,
+        prompt,
+        cancel,
+    ));
+    drop(live_slot);
     std::mem::forget(guard);
 
     let app_for_levels = app.clone();
@@ -84,7 +111,9 @@ pub(crate) async fn start_recording(
             let Some(services) = app_for_levels.try_state::<Services>() else {
                 break;
             };
-            if services.lifecycle.phase() != PipelinePhase::Recording {
+            if services.lifecycle.phase() != PipelinePhase::Recording
+                || services.lifecycle.is_cancelled(operation_id)
+            {
                 break;
             }
             let level = {
@@ -133,21 +162,23 @@ pub(crate) async fn stop_recording(
         "Stopping recording and preparing audio.",
     );
     let started = Instant::now();
-    let settings = storage.get_settings().map_err(|error| {
-        emit_state(
-            &app,
-            &state,
-            AppPhase::Error,
-            "Recording could not be completed. Start a new recording and try again.",
-        );
-        command_error(error)
-    })?;
+    let live_task = services.live.lock().await.take();
     let mut audio = services.audio.lock().await;
     let artifact_result = audio.stop().await;
     // `stop` closes the input stream. Do not re-arm it while transcription is
     // running: on Bluetooth headsets an open microphone selects the low-quality
     // HFP playback profile until the stream is released.
     drop(audio);
+    // Keep the full artifact owned even if joining live work or loading settings fails.
+    let mut artifact_cleanup = artifact_result
+        .as_ref()
+        .ok()
+        .map(|artifact| TempArtifact::new(artifact.path.clone(), false));
+    let mut draft = live_task
+        .ok_or("live dictation session is unavailable")?
+        .finish()
+        .await?;
+    let settings = storage.get_settings().map_err(command_error)?;
     let artifact = artifact_result.map_err(|error| {
         emit_state(
             &app,
@@ -158,10 +189,14 @@ pub(crate) async fn stop_recording(
         command_error(error)
     })?;
     let duration_ms = artifact.duration.as_millis() as u64;
-    let mut artifact_cleanup = TempArtifact::new(
-        artifact.path.clone(),
-        !settings.delete_audio_after_processing,
-    );
+    let mut artifact_cleanup = artifact_cleanup
+        .take()
+        .expect("successful audio has cleanup ownership");
+    artifact_cleanup.retain = !settings.delete_audio_after_processing;
+    if services.lifecycle.is_cancelled(operation_id) {
+        emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
+        return Err("dictation was cancelled".into());
+    }
     emit_state(&app, &state, AppPhase::Processing, "Transcribing locally.");
 
     let dictionary_terms = storage.dictionary_prompt_terms().unwrap_or_default();
@@ -221,23 +256,30 @@ pub(crate) async fn stop_recording(
         return Err("dictation was cancelled".into());
     }
 
-    let target = services
+    services
         .target
         .lock()
         .map_err(|_| "target service is unavailable".to_string())?
-        .take()
-        .ok_or_else(|| "recording target is unavailable".to_string())?;
-    let injector = SystemTextInjector::new(InjectionOptions {
-        restore_clipboard: settings.clipboard_restore,
-    });
-    let input_monitor = Arc::clone(&services.input_monitor);
+        .take();
     let mut final_text = transcript.text.clone();
     let mut processed_text = None;
     let mut llm_provider = None;
     let mut correction_failed = false;
-    let mut streamed_into_target = false;
-    let mut streaming_session = None;
     let _ = app.emit("app-state", state.publish_result(transcript.text.clone()));
+    // Full-recording recognition reconciles the last live hypothesis before AI correction.
+    draft.monitor.wait_for_shortcut_release().await;
+    if services.lifecycle.is_cancelled(operation_id) {
+        emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
+        return Err("dictation was cancelled".into());
+    }
+    if let Err(error) = draft.update(&transcript.text) {
+        emit_status(
+            &app,
+            "streaming_insertion_unavailable",
+            &format!("Draft insertion failed; the transcript is available in this app. {error}"),
+        );
+    }
+    let streamed_into_target = draft.pasted;
     if settings.text_correction_enabled {
         let correction_hints = storage
             .dictionary_correction_hints(&transcript.text)
@@ -249,19 +291,6 @@ pub(crate) async fn stop_recording(
             AppPhase::Injecting,
             "Inserting the provisional transcript into the captured target.",
         );
-        match injector.begin_provisional(&transcript.text, &target, &input_monitor) {
-            Ok(session) => {
-                streamed_into_target = session.as_ref().is_some_and(|s| s.paste_was_queued());
-                streaming_session = session;
-            }
-            Err(error) => emit_status(
-                &app,
-                "streaming_insertion_unavailable",
-                &format!(
-                    "Draft insertion failed; the transcript is available in this app. {error}"
-                ),
-            ),
-        }
         emit_state(
             &app,
             &state,
@@ -294,10 +323,6 @@ pub(crate) async fn stop_recording(
                 );
             }
             Err(correction::CorrectionError::Cancelled) => {
-                if let Some(session) = streaming_session.as_mut() {
-                    injector.cancel_provisional(session, &input_monitor);
-                }
-                input_monitor.shutdown();
                 emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
                 return Err("dictation was cancelled".into());
             }
@@ -322,10 +347,6 @@ pub(crate) async fn stop_recording(
         emit_correction_preview(&app, &transcript.text, "final");
     }
     if services.lifecycle.is_cancelled(operation_id) {
-        if let Some(session) = streaming_session.as_mut() {
-            injector.cancel_provisional(session, &input_monitor);
-        }
-        input_monitor.shutdown();
         emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
         return Err("dictation was cancelled".into());
     }
@@ -340,22 +361,13 @@ pub(crate) async fn stop_recording(
             "Inserting into the captured target."
         },
     );
-    let insertion_result = if let Some(session) = streaming_session.as_mut() {
-        injector.finish_provisional(session, &final_text, &input_monitor)
-    } else if settings.text_correction_enabled {
-        // A failed initial insertion must not trigger a delayed target paste.
-        injector
-            .copy_to_clipboard(&final_text)
-            .map(|()| InsertResult::ClipboardOnly)
-    } else {
-        injector.insert(&final_text, &target)
-    };
+    let insertion_result = draft.finish(&final_text);
     // Insertion has returned; helper shutdown and persistence are not insertion.
     // This only hides the overlay. The result below still determines success.
     recording_overlay::set_phase(&app, &AppPhase::Completed);
     // The helper observes input only while a provisional replacement session
     // can still mutate the target. Stop it before persisting the result.
-    input_monitor.shutdown();
+    drop(draft);
     let insertion = insertion_result.map_err(|error| {
         emit_state(
             &app,
@@ -437,10 +449,19 @@ pub(crate) async fn cancel_recording(
     services: State<'_, Services>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    if !cancel_pipeline_operation(&services.lifecycle, &services.audio, &services.target).await? {
+    if !cancel_pipeline_operation(
+        &services.lifecycle,
+        &services.audio,
+        &services.target,
+        &services.live,
+    )
+    .await?
+    {
         return Ok(());
     }
-    emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
+    if services.lifecycle.phase() == PipelinePhase::Idle {
+        emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
+    }
     Ok(())
 }
 
@@ -448,10 +469,16 @@ async fn cancel_pipeline_operation(
     lifecycle: &PipelineLifecycle,
     audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
     target: &Mutex<Option<TargetWindow>>,
+    live: &tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
 ) -> Result<bool, String> {
     let Some((operation_id, phase)) = lifecycle.cancel()? else {
         return Ok(false);
     };
+    // Starting and Processing already have an owner. Releasing their lifecycle
+    // here would allow a new recording to race their remaining writes/cleanup.
+    if phase != PipelinePhase::Recording {
+        return Ok(true);
+    }
     let _guard = PipelineGuard {
         lifecycle,
         id: operation_id,
@@ -459,10 +486,15 @@ async fn cancel_pipeline_operation(
     if let Ok(mut target) = target.lock() {
         target.take();
     }
-    if matches!(phase, PipelinePhase::Starting | PipelinePhase::Recording) {
+    let live_task = live.lock().await.take();
+    let audio_result = {
         let mut audio = audio.lock().await;
-        audio.cancel().await.map_err(command_error)?;
+        audio.cancel().await
+    };
+    if let Some(task) = live_task {
+        drop(task.finish().await?);
     }
+    audio_result.map_err(command_error)?;
     Ok(true)
 }
 
@@ -493,6 +525,10 @@ mod tests {
     }
 
     impl AudioCapture for TestAudio {
+        fn snapshot(&self, _: Duration) -> Result<crate::audio::AudioSnapshot, AudioError> {
+            Err(AudioError::NotCapturing)
+        }
+
         fn list_devices(&self) -> AudioFuture<'_, Vec<AudioDevice>> {
             Box::pin(async { Ok(Vec::new()) })
         }
@@ -545,7 +581,8 @@ mod tests {
         let audio = test_audio(false);
         let target = Mutex::new(None);
         let audio_operation = audio.lock().await;
-        let cancellation = cancel_pipeline_operation(&lifecycle, &audio, &target);
+        let live = tokio::sync::Mutex::new(None);
+        let cancellation = cancel_pipeline_operation(&lifecycle, &audio, &target, &live);
         tokio::pin!(cancellation);
 
         assert!(
@@ -553,6 +590,12 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            !cancel_pipeline_operation(&lifecycle, &audio, &target, &live)
+                .await
+                .unwrap()
+        );
+        assert!(lifecycle.begin_start().is_err());
         drop(audio_operation);
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), cancellation)
@@ -571,9 +614,34 @@ mod tests {
         let audio = test_audio(true);
         let target = Mutex::new(None);
 
-        assert!(cancel_pipeline_operation(&lifecycle, &audio, &target)
-            .await
-            .is_err());
+        assert!(cancel_pipeline_operation(
+            &lifecycle,
+            &audio,
+            &target,
+            &tokio::sync::Mutex::new(None)
+        )
+        .await
+        .is_err());
+        assert!(lifecycle.begin_start().is_ok());
+    }
+
+    #[tokio::test]
+    async fn processing_cancel_retains_ownership_until_processing_exits() {
+        let lifecycle = PipelineLifecycle::default();
+        let id = lifecycle.begin_start().unwrap();
+        lifecycle.mark_recording(id).unwrap();
+        let (_, cancel) = lifecycle.begin_processing().unwrap();
+        cancel_pipeline_operation(
+            &lifecycle,
+            &test_audio(false),
+            &Mutex::new(None),
+            &tokio::sync::Mutex::new(None),
+        )
+        .await
+        .unwrap();
+        assert!(*cancel.borrow());
+        assert!(lifecycle.begin_start().is_err());
+        lifecycle.finish(id);
         assert!(lifecycle.begin_start().is_ok());
     }
 
