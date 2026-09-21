@@ -510,6 +510,7 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
         }
         correction::CorrectionError::InvalidResponse(_) => "invalid_response",
         correction::CorrectionError::Cancelled => "cancelled",
+        correction::CorrectionError::InvalidEndpoint(_) => "invalid_endpoint",
         correction::CorrectionError::UnsupportedProvider(_) => "unsupported_provider",
     };
     format!("AI correction failed; using the original transcript. Error kind: {kind}.")
@@ -697,7 +698,7 @@ pub(crate) async fn update_settings(
         );
     }
     if !types::CORRECTION_PROVIDERS.contains(&settings.correction_provider.as_str()) {
-        return Err("text correction provider must be openai or gemini".into());
+        return Err("text correction provider must be openai, gemini, or local".into());
     }
     if !types::OPENAI_REASONING_EFFORTS.contains(&settings.openai_reasoning_effort.as_str()) {
         return Err(
@@ -748,6 +749,10 @@ pub(crate) async fn update_settings(
             "Gemini correction model",
             settings.gemini_correction_model.as_str(),
         ),
+        (
+            "Local correction model",
+            settings.local_correction_model.as_str(),
+        ),
     ] {
         if model.trim().is_empty() || model.len() > 512 || model.chars().any(char::is_control) {
             return Err(format!(
@@ -755,6 +760,8 @@ pub(crate) async fn update_settings(
             ));
         }
     }
+    correction::local_chat_completions_url(&settings.local_correction_base_url)
+        .map_err(|error| error.to_string())?;
     for (label, environment_variable) in [
         (
             "OpenAI API key environment variable",

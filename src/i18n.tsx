@@ -73,6 +73,13 @@ const en = {
   "The target changed; the translation remains on the clipboard.": "The target changed; the translation remains on the clipboard.",
   "The target changed and the clipboard is unavailable.": "The target changed and the clipboard is unavailable.",
   "Translation inserted.": "Translation inserted.",
+  "When enabled, the transcript is sent to the selected correction provider after local transcription. Audio is never sent by this feature.": "When enabled, the transcript is sent to the selected correction provider after local transcription. Audio is never sent by this feature.",
+  "AI correction requests are disabled. You can configure the options below before enabling it.": "AI correction requests are disabled. You can configure the options below before enabling it.",
+  "Local (OpenAI-compatible)": "Local (OpenAI-compatible)",
+  "Local endpoint base URL": "Local endpoint base URL",
+  "Use a numeric loopback URL ending in /v1. Requests bypass proxies and redirects are rejected.": "Use a numeric loopback URL ending in /v1. Requests bypass proxies and redirects are rejected.",
+  "Local correction model": "Local correction model",
+  "Model ID exposed by the local OpenAI-compatible Chat Completions server. No API key is sent.": "Model ID exposed by the local OpenAI-compatible Chat Completions server. No API key is sent.",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
@@ -146,6 +153,13 @@ const ja: Record<MessageKey, string> = {
   "The target changed; the translation remains on the clipboard.": "入力対象が変更されたため、翻訳結果はクリップボードに残っています。",
   "The target changed and the clipboard is unavailable.": "入力対象が変更され、クリップボードも利用できません。",
   "Translation inserted.": "翻訳結果を挿入しました。",
+  "When enabled, the transcript is sent to the selected correction provider after local transcription. Audio is never sent by this feature.": "有効にすると、ローカル文字起こし後に選択した修正プロバイダーへテキストを送信します。この機能で音声を送信することはありません。",
+  "AI correction requests are disabled. You can configure the options below before enabling it.": "AI修正リクエストは無効です。有効化する前に以下の設定を変更できます。",
+  "Local (OpenAI-compatible)": "ローカル（OpenAI互換）",
+  "Local endpoint base URL": "ローカルエンドポイントのベースURL",
+  "Use a numeric loopback URL ending in /v1. Requests bypass proxies and redirects are rejected.": "末尾が /v1 の数値ループバックURLを使用します。プロキシは迂回し、リダイレクトは拒否します。",
+  "Local correction model": "ローカル修正モデル",
+  "Model ID exposed by the local OpenAI-compatible Chat Completions server. No API key is sent.": "ローカルのOpenAI互換Chat Completionsサーバーが公開するモデルID。APIキーは送信しません。",
 } satisfies Record<MessageKey, string>;
 
 const appMessageKeys: ReadonlySet<MessageKey> = new Set(

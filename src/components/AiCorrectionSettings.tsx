@@ -17,7 +17,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         <div>
       <h2>{t("AI text correction")}</h2>
           <p className="muted">
-            {t("When enabled, the transcript is sent to the selected external provider after local transcription. Audio is never sent by this feature.")}
+            {t("When enabled, the transcript is sent to the selected correction provider after local transcription. Audio is never sent by this feature.")}
           </p>
         </div>
         <div className="ai-correction-master">
@@ -34,7 +34,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
       <p className="ai-correction-master-detail">
         {settings.textCorrectionEnabled
           ? t("AI correction is applied before text is inserted. If the API fails, the original transcript is used.")
-          : t("AI correction and external API requests are disabled. You can configure the options below before enabling it.")}
+          : t("AI correction requests are disabled. You can configure the options below before enabling it.")}
       </p>
 
       <SettingRow
@@ -51,6 +51,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
           >
             <option value="openai">OpenAI</option>
             <option value="gemini">Google Gemini</option>
+            <option value="local">{t("Local (OpenAI-compatible)")}</option>
           </select>
         }
       />
@@ -108,7 +109,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
           />
         }
       />
-      {settings.correctionProvider === "openai" ? (
+      {settings.correctionProvider === "openai" && (
         <>
           <SettingRow
             title={t("OpenAI model")}
@@ -153,7 +154,8 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
             }
           />
         </>
-      ) : (
+      )}
+      {settings.correctionProvider === "gemini" && (
         <>
           <SettingRow
             title={t("Gemini model")}
@@ -172,6 +174,32 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
               <input
                 value={settings.geminiApiKeyEnvVar}
                 onChange={(event) => onSave({ geminiApiKeyEnvVar: event.target.value })}
+              />
+            }
+          />
+        </>
+      )}
+      {settings.correctionProvider === "local" && (
+        <>
+          <SettingRow
+            title={t("Local endpoint base URL")}
+            detail={t("Use a numeric loopback URL ending in /v1. Requests bypass proxies and redirects are rejected.")}
+            control={
+              <input
+                value={settings.localCorrectionBaseUrl}
+                placeholder="http://127.0.0.1:11434/v1"
+                onChange={(event) => onSave({ localCorrectionBaseUrl: event.target.value })}
+              />
+            }
+          />
+          <SettingRow
+            title={t("Local correction model")}
+            detail={t("Model ID exposed by the local OpenAI-compatible Chat Completions server. No API key is sent.")}
+            control={
+              <input
+                value={settings.localCorrectionModel}
+                placeholder="qwen3:8b"
+                onChange={(event) => onSave({ localCorrectionModel: event.target.value })}
               />
             }
           />

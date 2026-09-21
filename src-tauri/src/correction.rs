@@ -1,7 +1,7 @@
-use std::{env, time::Duration};
+use std::{env, future::Future, net::IpAddr, time::Duration};
 
 use futures_util::StreamExt;
-use reqwest::{Client, StatusCode};
+use reqwest::{redirect::Policy, Client, StatusCode, Url};
 use serde_json::{json, Value};
 use tokio::sync::watch;
 
@@ -24,6 +24,8 @@ pub enum CorrectionError {
     InvalidResponse(String),
     #[error("text correction was cancelled")]
     Cancelled,
+    #[error("invalid local correction endpoint: {0}")]
+    InvalidEndpoint(String),
     #[error("unsupported text correction provider: {0}")]
     UnsupportedProvider(String),
 }
@@ -71,7 +73,13 @@ async fn request_text(
         return Err(CorrectionError::Cancelled);
     }
 
-    let client = Client::builder().timeout(REQUEST_TIMEOUT).build()?;
+    let provider = settings.correction_provider.as_str();
+    let client_builder = Client::builder().timeout(REQUEST_TIMEOUT);
+    let client = if provider == "local" {
+        client_builder.redirect(Policy::none()).no_proxy().build()?
+    } else {
+        client_builder.build()?
+    };
     let request = match settings.correction_provider.as_str() {
         "openai" => {
             let key = api_key(&settings.openai_api_key_env_var)?;
@@ -87,21 +95,18 @@ async fn request_text(
                 .header("x-goog-api-key", key)
                 .json(&gemini_request(settings, transcript, &instruction))
         }
+        "local" => client
+            .post(local_chat_completions_url(
+                &settings.local_correction_base_url,
+            )?)
+            .json(&local_request(settings, transcript, instruction)),
         provider => return Err(CorrectionError::UnsupportedProvider(provider.into())),
     };
 
-    let response = tokio::select! {
-        result = request.send() => result?,
-        changed = cancel.changed() => {
-            if changed.is_ok() && *cancel.borrow() {
-                return Err(CorrectionError::Cancelled);
-            }
-            return Err(CorrectionError::Cancelled);
-        }
-    };
+    let response = await_reqwest_or_cancel(request.send(), &mut cancel).await?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await?;
+        let body = await_reqwest_or_cancel(response.text(), &mut cancel).await?;
         return Err(CorrectionError::Api {
             status,
             message: compact_error_body(&body),
@@ -128,6 +133,60 @@ fn api_key(environment_variable: &str) -> Result<String, CorrectionError> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| CorrectionError::MissingApiKey(environment_variable.into()))
+}
+
+async fn await_reqwest_or_cancel<T>(
+    future: impl Future<Output = Result<T, reqwest::Error>>,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<T, CorrectionError> {
+    if *cancel.borrow() {
+        return Err(CorrectionError::Cancelled);
+    }
+    tokio::select! {
+        result = future => Ok(result?),
+        _ = cancel.changed() => Err(CorrectionError::Cancelled),
+    }
+}
+
+pub(crate) fn local_chat_completions_url(base_url: &str) -> Result<Url, CorrectionError> {
+    let mut url = Url::parse(base_url.trim()).map_err(|_| {
+        CorrectionError::InvalidEndpoint("the base URL is not a valid absolute URL".into())
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(CorrectionError::InvalidEndpoint(
+            "the scheme must be http or https".into(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(CorrectionError::InvalidEndpoint(
+            "userinfo is not allowed".into(),
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(CorrectionError::InvalidEndpoint(
+            "query strings and fragments are not allowed".into(),
+        ));
+    }
+    let host = url.host_str().ok_or_else(|| {
+        CorrectionError::InvalidEndpoint("the base URL must include a host".into())
+    })?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let ip = host.parse::<IpAddr>().map_err(|_| {
+        CorrectionError::InvalidEndpoint(
+            "the host must be a numeric IPv4 or IPv6 loopback address".into(),
+        )
+    })?;
+    if !ip.is_loopback() {
+        return Err(CorrectionError::InvalidEndpoint(
+            "the host must be a loopback address".into(),
+        ));
+    }
+    let base_path = url.path().trim_end_matches('/');
+    url.set_path(&format!("{base_path}/chat/completions"));
+    Ok(url)
 }
 
 fn openai_request(settings: &Settings, transcript: &str, instruction: &str) -> Value {
@@ -167,6 +226,18 @@ fn gemini_request(settings: &Settings, transcript: &str, instruction: &str) -> V
     request
 }
 
+fn local_request(settings: &Settings, transcript: &str, instruction: &str) -> Value {
+    json!({
+        "model": settings.local_correction_model.trim(),
+        "messages": [
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": transcript}
+        ],
+        "max_tokens": max_output_tokens(transcript),
+        "stream": true
+    })
+}
+
 async fn collect_response(
     response: reqwest::Response,
     provider: &str,
@@ -179,7 +250,7 @@ async fn collect_response(
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("text/event-stream"));
     if !is_event_stream {
-        let body = response.text().await?;
+        let body = await_reqwest_or_cancel(response.text(), cancel).await?;
         let value: Value = serde_json::from_str(&body)
             .map_err(|error| CorrectionError::InvalidResponse(error.to_string()))?;
         let text = parse_provider_response(provider, &value)?;
@@ -191,7 +262,7 @@ async fn collect_response(
     let mut decoder = SseDecoder::default();
     let mut text = String::new();
     let mut completed = false;
-    loop {
+    'stream: loop {
         let next = tokio::select! {
             next = stream.next() => next,
             changed = cancel.changed() => {
@@ -205,12 +276,16 @@ async fn collect_response(
         for data in decoder.push(&chunk?)? {
             if apply_stream_event(provider, &data, &mut text, on_update)? {
                 completed = true;
+                break 'stream;
             }
         }
     }
-    for data in decoder.finish()? {
-        if apply_stream_event(provider, &data, &mut text, on_update)? {
-            completed = true;
+    if !completed {
+        for data in decoder.finish()? {
+            if apply_stream_event(provider, &data, &mut text, on_update)? {
+                completed = true;
+                break;
+            }
         }
     }
     if !completed {
@@ -230,6 +305,7 @@ fn parse_provider_response(provider: &str, value: &Value) -> Result<String, Corr
     match provider {
         "openai" => parse_openai_response(value),
         "gemini" => parse_gemini_response(value),
+        "local" => parse_local_response(value),
         provider => Err(CorrectionError::UnsupportedProvider(provider.into())),
     }
 }
@@ -242,12 +318,36 @@ fn apply_stream_event(
 ) -> Result<bool, CorrectionError> {
     if data == "[DONE]" {
         // `[DONE]` only terminates the SSE framing. Success requires the
-        // provider's semantic completion event so partial output is never
-        // mistaken for a completed correction.
-        return Ok(false);
+        // provider's semantic completion event for Responses/Interactions.
+        // Chat Completions defines `[DONE]` as its terminal event.
+        return Ok(provider == "local");
     }
     let value: Value = serde_json::from_str(data)
         .map_err(|error| CorrectionError::InvalidResponse(error.to_string()))?;
+    if provider == "local" {
+        if value.get("error").is_some() {
+            return Err(CorrectionError::InvalidResponse(stream_error_message(
+                &value,
+            )));
+        }
+        if let Some(delta) = value
+            .pointer("/choices/0/delta/content")
+            .and_then(Value::as_str)
+        {
+            text.push_str(delta);
+            on_update(delta);
+        }
+        return match value.pointer("/choices/0/finish_reason") {
+            None | Some(Value::Null) => Ok(false),
+            Some(Value::String(reason)) if reason == "stop" => Ok(true),
+            Some(Value::String(reason)) => Err(CorrectionError::InvalidResponse(format!(
+                "local completion stopped with finish reason {reason}"
+            ))),
+            Some(_) => Err(CorrectionError::InvalidResponse(
+                "local completion returned an invalid finish reason".into(),
+            )),
+        };
+    }
     let event_type = match provider {
         "openai" => value.get("type").and_then(Value::as_str),
         "gemini" => value.get("event_type").and_then(Value::as_str),
@@ -441,6 +541,28 @@ fn parse_gemini_response(value: &Value) -> Result<String, CorrectionError> {
         .ok_or_else(|| CorrectionError::InvalidResponse("missing output text".into()))
 }
 
+fn parse_local_response(value: &Value) -> Result<String, CorrectionError> {
+    match value.pointer("/choices/0/finish_reason") {
+        Some(Value::String(reason)) if reason == "stop" => {}
+        Some(Value::String(reason)) => {
+            return Err(CorrectionError::InvalidResponse(format!(
+                "local completion stopped with finish reason {reason}"
+            )))
+        }
+        _ => {
+            return Err(CorrectionError::InvalidResponse(
+                "local completion is missing a valid finish reason".into(),
+            ))
+        }
+    }
+    value
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| CorrectionError::InvalidResponse("missing output text".into()))
+}
+
 fn compact_error_body(body: &str) -> String {
     let Some(message) = serde_json::from_str::<Value>(body).ok().and_then(|value| {
         value
@@ -576,6 +698,50 @@ mod tests {
         assert_eq!(gemini["generation_config"]["thinking_level"], "minimal");
         assert_eq!(gemini["store"], false);
         assert_eq!(gemini["stream"], true);
+
+        let local = local_request(&settings, "raw text", "correct it");
+        assert_eq!(local["model"], "qwen3:8b");
+        assert_eq!(local["messages"][0]["role"], "system");
+        assert_eq!(local["messages"][0]["content"], "correct it");
+        assert_eq!(local["messages"][1]["role"], "user");
+        assert_eq!(local["messages"][1]["content"], "raw text");
+        assert_eq!(local["max_tokens"], 128);
+        assert_eq!(local["stream"], true);
+        assert!(local.get("authorization").is_none());
+    }
+
+    #[test]
+    fn local_endpoint_accepts_only_numeric_loopback_base_urls() {
+        assert_eq!(
+            local_chat_completions_url("http://127.0.0.1:11434/v1/")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:11434/v1/chat/completions"
+        );
+        assert_eq!(
+            local_chat_completions_url("https://[::1]:1234/v1")
+                .unwrap()
+                .as_str(),
+            "https://[::1]:1234/v1/chat/completions"
+        );
+
+        for invalid in [
+            "http://localhost:11434/v1",
+            "http://192.168.1.20:11434/v1",
+            "https://example.com/v1",
+            "ftp://127.0.0.1/v1",
+            "http://user@127.0.0.1:11434/v1",
+            "http://127.0.0.1:11434/v1?target=remote",
+            "http://127.0.0.1:11434/v1#fragment",
+        ] {
+            assert!(
+                matches!(
+                    local_chat_completions_url(invalid),
+                    Err(CorrectionError::InvalidEndpoint(_))
+                ),
+                "accepted {invalid}"
+            );
+        }
     }
 
     #[test]
@@ -610,6 +776,56 @@ mod tests {
             }]
         });
         assert_eq!(parse_gemini_response(&value).unwrap(), "corrected");
+    }
+
+    #[test]
+    fn parses_local_chat_completion_output_text() {
+        let value = json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "corrected"},
+                "finish_reason": "stop"
+            }]
+        });
+        assert_eq!(parse_local_response(&value).unwrap(), "corrected");
+    }
+
+    #[test]
+    fn rejects_incomplete_or_non_text_local_completions() {
+        fn ignore_preview(_: &str) {}
+
+        for reason in ["length", "content_filter", "tool_calls"] {
+            let value = json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "partial"},
+                    "finish_reason": reason
+                }]
+            });
+            assert!(matches!(
+                parse_local_response(&value),
+                Err(CorrectionError::InvalidResponse(_))
+            ));
+
+            let mut text = String::new();
+            let mut preview = ignore_preview;
+            let event = json!({
+                "choices": [{"delta": {"content": "partial"}, "finish_reason": reason}]
+            });
+            assert!(matches!(
+                apply_stream_event("local", &event.to_string(), &mut text, &mut preview),
+                Err(CorrectionError::InvalidResponse(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_response_body_observes_cancellation() {
+        let (cancel_tx, mut cancel_rx) = watch::channel(false);
+        cancel_tx.send(true).unwrap();
+        let pending = std::future::pending::<Result<String, reqwest::Error>>();
+        assert!(matches!(
+            await_reqwest_or_cancel(pending, &mut cancel_rx).await,
+            Err(CorrectionError::Cancelled)
+        ));
     }
 
     #[test]
@@ -685,6 +901,36 @@ mod tests {
         .unwrap());
         assert_eq!(text, "corrected");
         assert_eq!(previews, ["corrected"]);
+    }
+
+    #[test]
+    fn accumulates_local_chat_streaming_text_until_done() {
+        let mut text = String::new();
+        let mut previews = Vec::new();
+        let mut preview = |value: &str| previews.push(value.to_owned());
+        assert!(!apply_stream_event(
+            "local",
+            r#"{"choices":[{"delta":{"content":"hello "},"finish_reason":null}]}"#,
+            &mut text,
+            &mut preview,
+        )
+        .unwrap());
+        assert!(!apply_stream_event(
+            "local",
+            r#"{"choices":[{"delta":{"content":"world"},"finish_reason":null}]}"#,
+            &mut text,
+            &mut preview,
+        )
+        .unwrap());
+        assert!(apply_stream_event(
+            "local",
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            &mut text,
+            &mut preview,
+        )
+        .unwrap());
+        assert_eq!(text, "hello world");
+        assert_eq!(previews, ["hello ", "world"]);
     }
 
     #[test]
@@ -829,6 +1075,10 @@ mod tests {
         let gemini = gemini_request(&settings, transcript, &instruction);
         assert_eq!(gemini["input"], transcript);
         assert_ne!(gemini["system_instruction"], transcript);
+
+        let local = local_request(&settings, transcript, &instruction);
+        assert_eq!(local["messages"][1]["content"], transcript);
+        assert_eq!(local["messages"][0]["content"], instruction);
     }
 
     #[test]
