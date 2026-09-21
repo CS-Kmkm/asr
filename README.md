@@ -113,7 +113,7 @@ For another compatible endpoint, set its `/v1` base URL. An unauthenticated
 local endpoint does not require the configured key environment variable to
 exist.
 
-### AI transcript correction (OpenAI or Gemini)
+### AI transcript correction (OpenAI, Gemini, or local)
 
 The optional correction stage runs after transcription and before text
 insertion. Its dedicated **AI text correction** card in **Settings** has a
@@ -123,6 +123,14 @@ while the master switch is off, so correction can be configured before it is
 enabled. The transcript text and preferred dictionary spellings are sent to
 the selected provider; recorded audio is not. If correction fails, the
 original transcript is inserted instead.
+
+For fully local correction, select **Local (OpenAI-compatible)** and configure
+the model ID and a numeric loopback base URL such as
+`http://127.0.0.1:11434/v1`. The app calls the Chat Completions endpoint,
+requires no API key, bypasses system proxies, rejects redirects, and refuses
+non-loopback hosts so transcript text cannot be sent to an obvious remote
+endpoint through this provider. The local model server itself is not bundled
+or started by the app.
 
 The automatic editor has independent switches for:
 
@@ -147,9 +155,10 @@ only dictionary aliases actually found in the transcript, caps optional style
 guidance at 500 characters, requests minimal/no reasoning on supported models,
 and sets an output-token limit based on the transcript length.
 
-Correction responses are consumed as server-sent events from both the OpenAI
-Responses API and Gemini Interactions API. As soon as ASR finishes, the
-raw transcript is inserted into the captured target as provisional text. The
+Correction responses are consumed as server-sent events from the OpenAI
+Responses API, Gemini Interactions API, and compatible local Chat Completions
+servers; non-streaming local responses are also accepted. As soon as ASR
+finishes, the raw transcript is inserted into the captured target as provisional text. The
 first correction delta replaces that draft and later deltas are appended while
 the API is still generating; the always-on-top status overlay mirrors the same
 progress. A short-lived helper process observes keyboard and pointer activity
