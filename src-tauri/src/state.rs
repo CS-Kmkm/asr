@@ -13,8 +13,15 @@ pub enum PipelinePhase {
     Processing,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipelineMode {
+    Dictate,
+    Translate,
+}
+
 struct PipelineOperation {
     id: u64,
+    mode: PipelineMode,
     phase: PipelinePhase,
     cancel: watch::Sender<bool>,
 }
@@ -34,7 +41,7 @@ impl Default for PipelineLifecycle {
 }
 
 impl PipelineLifecycle {
-    pub fn begin_start(&self) -> Result<u64, &'static str> {
+    pub fn begin_start(&self, mode: PipelineMode) -> Result<u64, &'static str> {
         let mut inner = self
             .inner
             .lock()
@@ -48,6 +55,7 @@ impl PipelineLifecycle {
         let (cancel, _) = watch::channel(false);
         *inner = Some(PipelineOperation {
             id,
+            mode,
             phase: PipelinePhase::Starting,
             cancel,
         });
@@ -70,7 +78,9 @@ impl PipelineLifecycle {
             .ok_or("pipeline operation is no longer active")
     }
 
-    pub fn begin_processing(&self) -> Result<(u64, watch::Receiver<bool>), &'static str> {
+    pub fn begin_processing(
+        &self,
+    ) -> Result<(u64, PipelineMode, watch::Receiver<bool>), &'static str> {
         let mut inner = self
             .inner
             .lock()
@@ -83,7 +93,7 @@ impl PipelineLifecycle {
             return Err("pipeline operation was cancelled");
         }
         operation.phase = PipelinePhase::Processing;
-        Ok((operation.id, operation.cancel.subscribe()))
+        Ok((operation.id, operation.mode, operation.cancel.subscribe()))
     }
 
     pub fn cancel(&self) -> Result<Option<(u64, PipelinePhase)>, &'static str> {
@@ -115,6 +125,13 @@ impl PipelineLifecycle {
             .ok()
             .and_then(|inner| inner.as_ref().map(|operation| operation.phase))
             .unwrap_or(PipelinePhase::Idle)
+    }
+
+    pub fn mode(&self) -> Option<PipelineMode> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.as_ref().map(|operation| operation.mode))
     }
 
     pub fn is_cancelled(&self, id: u64) -> bool {
@@ -245,9 +262,10 @@ mod tests {
     #[test]
     fn exactly_one_stop_claims_recording() {
         let lifecycle = PipelineLifecycle::default();
-        let id = lifecycle.begin_start().unwrap();
+        let id = lifecycle.begin_start(PipelineMode::Translate).unwrap();
         lifecycle.mark_recording(id).unwrap();
-        assert!(lifecycle.begin_processing().is_ok());
+        let (_, mode, _) = lifecycle.begin_processing().unwrap();
+        assert_eq!(mode, PipelineMode::Translate);
         assert_eq!(
             lifecycle.begin_processing().unwrap_err(),
             "recording stop is already in progress"
@@ -257,9 +275,9 @@ mod tests {
     #[test]
     fn old_operation_cannot_clear_new_operation() {
         let lifecycle = PipelineLifecycle::default();
-        let first = lifecycle.begin_start().unwrap();
+        let first = lifecycle.begin_start(PipelineMode::Dictate).unwrap();
         lifecycle.finish(first);
-        let second = lifecycle.begin_start().unwrap();
+        let second = lifecycle.begin_start(PipelineMode::Translate).unwrap();
         lifecycle.finish(first);
         assert_eq!(lifecycle.phase(), PipelinePhase::Starting);
         lifecycle.finish(second);
@@ -269,7 +287,7 @@ mod tests {
     #[test]
     fn cancelled_start_cannot_publish_recording() {
         let lifecycle = PipelineLifecycle::default();
-        let id = lifecycle.begin_start().unwrap();
+        let id = lifecycle.begin_start(PipelineMode::Dictate).unwrap();
         lifecycle.cancel().unwrap();
         assert!(lifecycle.mark_recording(id).is_err());
         lifecycle.finish(id);

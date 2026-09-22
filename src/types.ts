@@ -37,6 +37,9 @@ export interface Settings {
   hotkey: string;
   translationHotkey: string;
   translationInstruction: string;
+  voiceTranslateHotkey: string;
+  translationTargetLanguages: string[];
+  translationTargetLanguage: string;
   microphoneId: string | null;
   historyEnabled: boolean;
   historyRetentionDays: number;
@@ -89,6 +92,7 @@ export interface HistoryItem {
   mode: string;
   asrProvider: string;
   llmProvider: string | null;
+  targetLanguage: string | null;
   appCategory: string | null;
   durationMs: number | null;
   latencyMs: number | null;

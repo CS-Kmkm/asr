@@ -47,7 +47,8 @@ impl Storage {
     }
 
     fn migrate(&self) -> Result<(), StorageError> {
-        self.connection()?.execute_batch(
+        let connection = self.connection()?;
+        connection.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS settings (
@@ -73,6 +74,7 @@ impl Storage {
                mode TEXT NOT NULL,
                asr_provider TEXT NOT NULL,
                llm_provider TEXT,
+               target_language TEXT,
                app_category TEXT,
                duration_ms INTEGER,
                latency_ms INTEGER,
@@ -89,6 +91,20 @@ impl Storage {
                created_at TEXT NOT NULL
              );",
         )?;
+        let has_target_language: bool = connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM pragma_table_info('dictation_history')
+               WHERE name = 'target_language'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_target_language {
+            connection.execute(
+                "ALTER TABLE dictation_history ADD COLUMN target_language TEXT",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -150,14 +166,15 @@ impl Storage {
         self.connection()?.execute(
             "INSERT INTO dictation_history(
                transcript_text, processed_text, mode, asr_provider, llm_provider,
-               app_category, duration_ms, latency_ms, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+               target_language, app_category, duration_ms, latency_ms, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 item.transcript_text,
                 item.processed_text,
                 item.mode,
                 item.asr_provider,
                 item.llm_provider,
+                item.target_language,
                 item.app_category,
                 item.duration_ms,
                 item.latency_ms,
@@ -174,7 +191,7 @@ impl Storage {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, transcript_text, processed_text, mode, asr_provider, llm_provider,
-                    app_category, duration_ms, latency_ms, created_at
+                    target_language, app_category, duration_ms, latency_ms, created_at
              FROM dictation_history ORDER BY created_at DESC LIMIT ?1",
         )?;
         let rows = statement.query_map([limit.min(500)], |row| {
@@ -185,10 +202,11 @@ impl Storage {
                 mode: row.get(3)?,
                 asr_provider: row.get(4)?,
                 llm_provider: row.get(5)?,
-                app_category: row.get(6)?,
-                duration_ms: row.get(7)?,
-                latency_ms: row.get(8)?,
-                created_at: row.get(9)?,
+                target_language: row.get(6)?,
+                app_category: row.get(7)?,
+                duration_ms: row.get(8)?,
+                latency_ms: row.get(9)?,
+                created_at: row.get(10)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -350,6 +368,7 @@ mod tests {
             mode: "faithful",
             asr_provider: "test",
             llm_provider: None,
+            target_language: None,
             app_category: None,
             duration_ms: Some(1000),
             latency_ms: Some(200),
@@ -375,6 +394,60 @@ mod tests {
                 .unwrap();
             assert!(exists, "missing table {table}");
         }
+    }
+
+    #[test]
+    fn migrates_target_language_column_idempotently() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE dictation_history (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   transcript_text TEXT NOT NULL,
+                   processed_text TEXT,
+                   mode TEXT NOT NULL,
+                   asr_provider TEXT NOT NULL,
+                   llm_provider TEXT,
+                   app_category TEXT,
+                   duration_ms INTEGER,
+                   latency_ms INTEGER,
+                   created_at TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        let storage = Storage {
+            connection: Mutex::new(connection),
+        };
+
+        storage.migrate().unwrap();
+        storage.migrate().unwrap();
+
+        let exists: bool = storage
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM pragma_table_info('dictation_history')
+                   WHERE name = 'target_language'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists);
+    }
+
+    #[test]
+    fn translation_history_round_trips_target_language() {
+        let storage = Storage::in_memory().unwrap();
+        let mut translation = item();
+        translation.mode = "translate";
+        translation.target_language = Some("ja");
+        storage.add_history(&translation).unwrap();
+
+        let stored = storage.list_history(1).unwrap().remove(0);
+        assert_eq!(stored.mode, "translate");
+        assert_eq!(stored.target_language.as_deref(), Some("ja"));
     }
 
     #[test]

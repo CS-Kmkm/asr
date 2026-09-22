@@ -4,6 +4,17 @@ import { AiCorrectionSettings } from "../components/AiCorrectionSettings";
 import type { Settings } from "../types";
 import { useI18n } from "../i18n";
 
+const translationLanguages = [
+  ["en", "English"],
+  ["ja", "Japanese"],
+  ["zh", "Chinese"],
+  ["es", "Spanish"],
+  ["fr", "French"],
+  ["pt", "Portuguese"],
+  ["de", "German"],
+  ["ko", "Korean"],
+] as const;
+
 export function SettingsPage({
   settings,
   onSave,
@@ -14,17 +25,29 @@ export function SettingsPage({
   const { t } = useI18n();
   const [hotkey, setHotkey] = useState(settings.hotkey);
   const [translationHotkey, setTranslationHotkey] = useState(settings.translationHotkey);
+  const [voiceTranslateHotkey, setVoiceTranslateHotkey] = useState(settings.voiceTranslateHotkey);
   const [translationInstruction, setTranslationInstruction] = useState(settings.translationInstruction);
+  const [languageToAdd, setLanguageToAdd] = useState("zh");
   const cancelHotkeyBlurRef = useRef(false);
   const suppressHotkeyBlurRef = useRef(false);
   const cancelTranslationBlurRef = useRef(false);
   const suppressTranslationBlurRef = useRef(false);
+  const cancelVoiceTranslateBlurRef = useRef(false);
+  const suppressVoiceTranslateBlurRef = useRef(false);
   const cancelTranslationInstructionBlurRef = useRef(false);
   const suppressTranslationInstructionBlurRef = useRef(false);
 
   useEffect(() => setHotkey(settings.hotkey), [settings.hotkey]);
   useEffect(() => setTranslationHotkey(settings.translationHotkey), [settings.translationHotkey]);
+  useEffect(() => setVoiceTranslateHotkey(settings.voiceTranslateHotkey), [settings.voiceTranslateHotkey]);
   useEffect(() => setTranslationInstruction(settings.translationInstruction), [settings.translationInstruction]);
+  useEffect(() => {
+    if (!settings.translationTargetLanguages.includes(languageToAdd)) return;
+    const available = translationLanguages.find(
+      ([code]) => !settings.translationTargetLanguages.includes(code),
+    );
+    if (available) setLanguageToAdd(available[0]);
+  }, [languageToAdd, settings.translationTargetLanguages]);
 
   function commitHotkey() {
     if (cancelHotkeyBlurRef.current || suppressHotkeyBlurRef.current) {
@@ -53,6 +76,44 @@ export function SettingsPage({
     if (translationInstruction !== settings.translationInstruction) {
       onSave({ translationInstruction });
     }
+  }
+
+  function commitVoiceTranslateHotkey() {
+    if (cancelVoiceTranslateBlurRef.current || suppressVoiceTranslateBlurRef.current) {
+      cancelVoiceTranslateBlurRef.current = false;
+      suppressVoiceTranslateBlurRef.current = false;
+      return;
+    }
+    if (voiceTranslateHotkey !== settings.voiceTranslateHotkey) {
+      onSave({ voiceTranslateHotkey });
+    }
+  }
+
+  function moveTargetLanguage(index: number, direction: -1 | 1) {
+    const destination = index + direction;
+    if (destination < 0 || destination >= settings.translationTargetLanguages.length) return;
+    const languages = [...settings.translationTargetLanguages];
+    [languages[index], languages[destination]] = [languages[destination], languages[index]];
+    onSave({ translationTargetLanguages: languages });
+  }
+
+  function removeTargetLanguage(language: string) {
+    const languages = settings.translationTargetLanguages.filter((item) => item !== language);
+    if (languages.length === 0) return;
+    onSave({
+      translationTargetLanguages: languages,
+      translationTargetLanguage:
+        settings.translationTargetLanguage === language
+          ? languages[0]
+          : settings.translationTargetLanguage,
+    });
+  }
+
+  function addTargetLanguage() {
+    if (settings.translationTargetLanguages.includes(languageToAdd)) return;
+    onSave({
+      translationTargetLanguages: [...settings.translationTargetLanguages, languageToAdd],
+    });
   }
 
   return (
@@ -91,7 +152,7 @@ export function SettingsPage({
           }
         />
         <SettingRow
-          title={t("Translation hotkey")}
+          title={t("Selected-text translation hotkey")}
           detail={t("Translates selected text; the default is Ctrl+Shift+T.")}
           control={
             <input
@@ -112,8 +173,75 @@ export function SettingsPage({
               }}
             />
           }
+      />
+        <SettingRow
+          title={t("Voice Translate hotkey")}
+          detail={t("Starts or stops speech translation; the default is Ctrl+Shift+Y.")}
+          control={
+            <input
+              value={voiceTranslateHotkey}
+              onChange={(event) => setVoiceTranslateHotkey(event.target.value)}
+              onBlur={commitVoiceTranslateHotkey}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  commitVoiceTranslateHotkey();
+                  suppressVoiceTranslateBlurRef.current = true;
+                  event.currentTarget.blur();
+                } else if (event.key === "Escape") {
+                  setVoiceTranslateHotkey(settings.voiceTranslateHotkey);
+                  cancelVoiceTranslateBlurRef.current = true;
+                  event.currentTarget.blur();
+                }
+              }}
+            />
+          }
         />
         <SettingRow
+          title={t("Voice Translate target")}
+          detail={t("The first language is the default. Reorder the list or choose the active target.")}
+          control={
+            <div className="translation-target-settings">
+              <select
+                value={settings.translationTargetLanguage}
+                onChange={(event) => onSave({ translationTargetLanguage: event.target.value })}
+              >
+                {settings.translationTargetLanguages.map((language) => {
+                  const option = translationLanguages.find(([code]) => code === language);
+                  return <option key={language} value={language}>{option ? t(option[1]) : language}</option>;
+                })}
+              </select>
+              <ol className="translation-target-list">
+                {settings.translationTargetLanguages.map((language, index) => {
+                  const option = translationLanguages.find(([code]) => code === language);
+                  return (
+                    <li key={language}>
+                      <span>{option ? t(option[1]) : language}</span>
+                      <button type="button" onClick={() => moveTargetLanguage(index, -1)} disabled={index === 0} aria-label={t("Move language up")}>↑</button>
+                      <button type="button" onClick={() => moveTargetLanguage(index, 1)} disabled={index === settings.translationTargetLanguages.length - 1} aria-label={t("Move language down")}>↓</button>
+                      <button type="button" onClick={() => removeTargetLanguage(language)} disabled={settings.translationTargetLanguages.length === 1}>{t("Remove")}</button>
+                    </li>
+                  );
+                })}
+              </ol>
+              <div className="translation-target-add">
+                <select value={languageToAdd} onChange={(event) => setLanguageToAdd(event.target.value)}>
+                  {translationLanguages
+                    .filter(([code]) => !settings.translationTargetLanguages.includes(code))
+                    .map(([code, label]) => <option key={code} value={code}>{t(label)}</option>)}
+                </select>
+                <button
+                  type="button"
+                  onClick={addTargetLanguage}
+                  disabled={settings.translationTargetLanguages.length === translationLanguages.length || settings.translationTargetLanguages.includes(languageToAdd)}
+                >
+                  {t("Add language")}
+                </button>
+              </div>
+            </div>
+          }
+        />
+      <SettingRow
           title={t("Translation instruction")}
           detail={t("Optional guidance appended to the fixed translation-only contract.")}
           control={

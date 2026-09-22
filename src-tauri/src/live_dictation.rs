@@ -32,14 +32,21 @@ pub(crate) struct LiveDraft {
     session: Option<ProvisionalInsertion>,
     checkpoint: Option<u64>,
     attempted: bool,
+    defer_insertion: bool,
     pub(crate) pasted: bool,
 }
 
 impl LiveDraft {
-    pub(crate) fn new(target: TargetWindow, settings: &Settings, from_shortcut: bool) -> Self {
+    pub(crate) fn new(
+        target: TargetWindow,
+        settings: &Settings,
+        active_hotkey: &str,
+        from_shortcut: bool,
+        defer_insertion: bool,
+    ) -> Self {
         let monitor = Arc::new(InputMonitor::default());
         let checkpoint = monitor
-            .start_for_recording(&settings.hotkey, from_shortcut)
+            .start_for_recording(active_hotkey, from_shortcut)
             .then(|| monitor.checkpoint())
             .flatten();
         Self {
@@ -51,12 +58,13 @@ impl LiveDraft {
             session: None,
             checkpoint,
             attempted: false,
+            defer_insertion,
             pasted: false,
         }
     }
 
     pub(crate) fn update(&mut self, text: &str) -> Result<(), injection::InjectionError> {
-        if text.is_empty() || self.monitor.shortcut_pending() {
+        if text.is_empty() || self.monitor.shortcut_pending() || self.defer_insertion {
             return Ok(());
         }
         if let Some(session) = self.session.as_mut() {
@@ -94,6 +102,25 @@ impl LiveDraft {
     }
 
     pub(crate) fn finish(&mut self, text: &str) -> Result<InsertResult, injection::InjectionError> {
+        if self.defer_insertion && self.session.is_none() && !self.attempted {
+            self.attempted = true;
+            if !text.is_empty()
+                && self
+                    .checkpoint
+                    .is_some_and(|checkpoint| self.monitor.unchanged_since(checkpoint))
+            {
+                self.session = self.injector.begin_live_provisional(
+                    text,
+                    &self.target,
+                    &self.monitor,
+                    self.checkpoint.expect("checkpoint was verified"),
+                )?;
+                self.pasted |= self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.paste_was_queued());
+            }
+        }
         if let Some(session) = self.session.as_mut() {
             self.injector
                 .finish_provisional(session, text, &self.monitor)

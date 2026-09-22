@@ -31,7 +31,7 @@ use audio::{
 };
 use injection::{InjectionOptions, InsertResult, SystemTextInjector, TargetWindow, TextInjector};
 use input_monitor::InputMonitor;
-use state::{AppState, PipelineLifecycle, PipelinePhase};
+use state::{AppState, PipelineLifecycle, PipelineMode, PipelinePhase};
 use storage::Storage;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -96,6 +96,7 @@ pub(crate) struct Services {
     initialization: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     shutdown_started: AtomicBool,
     translation_active: AtomicBool,
+    voice_translation_target: Mutex<Option<String>>,
 }
 
 impl Services {
@@ -122,6 +123,7 @@ impl Services {
             initialization: Mutex::new(None),
             shutdown_started: AtomicBool::new(false),
             translation_active: AtomicBool::new(false),
+            voice_translation_target: Mutex::new(None),
         }
     }
 
@@ -147,6 +149,9 @@ impl Services {
         }
         if let Ok(mut target) = self.target.lock() {
             target.take();
+        }
+        if let Ok(mut language) = self.voice_translation_target.lock() {
+            language.take();
         }
         self.input_monitor.shutdown();
         let _ = self.transcriber.shutdown().await;
@@ -500,27 +505,44 @@ fn cleanup_stale_artifacts(
     Ok(removed)
 }
 
-async fn toggle_recording(app: AppHandle) {
+async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode) {
     let phase = app.state::<Services>().lifecycle.phase();
     let result = match phase {
-        PipelinePhase::Recording => commands::stop_recording(
-            app.clone(),
-            app.state::<Services>(),
-            app.state::<AppState>(),
-            app.state::<Storage>(),
-        )
-        .await
-        .map(|_| ()),
-        PipelinePhase::Idle => {
-            commands::start_recording_with_origin(
+        PipelinePhase::Recording
+            if app.state::<Services>().lifecycle.mode() == Some(requested_mode) =>
+        {
+            commands::stop_recording(
                 app.clone(),
                 app.state::<Services>(),
                 app.state::<AppState>(),
                 app.state::<Storage>(),
-                true,
             )
             .await
+            .map(|_| ())
         }
+        PipelinePhase::Recording => Err("another voice mode is already recording".into()),
+        PipelinePhase::Idle => match requested_mode {
+            PipelineMode::Dictate => {
+                commands::start_recording_with_origin(
+                    app.clone(),
+                    app.state::<Services>(),
+                    app.state::<AppState>(),
+                    app.state::<Storage>(),
+                    true,
+                )
+                .await
+            }
+            PipelineMode::Translate => {
+                commands::start_voice_translation_with_origin(
+                    app.clone(),
+                    app.state::<Services>(),
+                    app.state::<AppState>(),
+                    app.state::<Storage>(),
+                    true,
+                )
+                .await
+            }
+        },
         PipelinePhase::Starting | PipelinePhase::Processing => Ok(()),
     };
     if let Err(error) = result {
@@ -529,7 +551,11 @@ async fn toggle_recording(app: AppHandle) {
 }
 
 async fn translate_selection(app: AppHandle) {
-    let active = &app.state::<Services>().translation_active;
+    let services = app.state::<Services>();
+    if services.lifecycle.phase() != PipelinePhase::Idle {
+        return;
+    }
+    let active = &services.translation_active;
     if active.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -540,6 +566,9 @@ async fn translate_selection(app: AppHandle) {
         }
     }
     let _guard = TranslationGuard(active);
+    if services.lifecycle.phase() != PipelinePhase::Idle {
+        return;
+    }
     let settings = match app.state::<Storage>().get_settings() {
         Ok(settings) => settings,
         Err(_) => {
@@ -625,8 +654,13 @@ fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
     let Ok(translation) = parse_shortcut(&settings.translation_hotkey) else {
         return;
     };
+    let Ok(voice_translate) = parse_shortcut(&settings.voice_translate_hotkey) else {
+        return;
+    };
     if shortcut == recording {
-        tauri::async_runtime::spawn(toggle_recording(app));
+        tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Dictate));
+    } else if shortcut == voice_translate {
+        tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Translate));
     } else if shortcut == translation {
         tauri::async_runtime::spawn(translate_selection(app));
     }
@@ -703,14 +737,25 @@ pub fn run() {
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
             let translation_shortcut = parse_shortcut(&settings.translation_hotkey)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            let voice_translate_shortcut = parse_shortcut(&settings.voice_translate_hotkey)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            if shortcut == translation_shortcut
+                || shortcut == voice_translate_shortcut
+                || translation_shortcut == voice_translate_shortcut
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "recording, selected-text translation, and voice Translate hotkeys must differ",
+                )
+                .into());
+            }
             app.manage(storage);
             app.manage(AppState::default());
             app.manage(Services::new(&settings));
             recording_overlay::create(app.handle())?;
             app.global_shortcut().register(shortcut)?;
-            if translation_shortcut != shortcut {
-                app.global_shortcut().register(translation_shortcut)?;
-            }
+            app.global_shortcut().register(translation_shortcut)?;
+            app.global_shortcut().register(voice_translate_shortcut)?;
             if cleanup_stale_artifacts(
                 &std::env::temp_dir(),
                 settings.delete_audio_after_processing,
@@ -753,8 +798,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::list_audio_devices,
             commands::start_recording,
+            commands::start_voice_translation,
             commands::stop_recording,
             commands::cancel_recording,
+            commands::cycle_voice_translation_target,
             commands::get_app_state,
             commands::get_settings,
             commands::get_model_status,

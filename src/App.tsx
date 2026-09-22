@@ -5,6 +5,7 @@ import {
   addDictionaryEntry,
   cancelRecording,
   copyToClipboard,
+  cycleVoiceTranslationTarget,
   defaultSettings,
   deleteDictionaryEntry,
   getAppState,
@@ -96,6 +97,22 @@ interface CorrectionPreview {
   stage: "draft" | "streaming" | "final" | "fallback";
 }
 
+interface VoiceModeEvent {
+  mode: "dictate" | "translate";
+  targetLanguage: string | null;
+}
+
+const translationLanguageKeys: Record<string, MessageKey> = {
+  en: "English",
+  ja: "Japanese",
+  zh: "Chinese",
+  es: "Spanish",
+  fr: "French",
+  pt: "Portuguese",
+  de: "German",
+  ko: "Korean",
+};
+
 interface Notice {
   message: string;
   severity: "info" | "success" | "warning" | "error";
@@ -114,6 +131,7 @@ const WARNING_STATUS_KINDS = new Set([
   "paste_unverified",
   "streaming_insertion_unavailable",
   "text_correction_failed",
+  "voice_translation_failed",
 ]);
 
 const SUCCESS_STATUS_KINDS = new Set([
@@ -150,6 +168,10 @@ function RecordingOverlay() {
   const previousPhase = useRef<AppState["phase"]>("idle");
   const [message, setMessage] = useState<string | null>(null);
   const [preview, setPreview] = useState<CorrectionPreview | null>(null);
+  const [voiceMode, setVoiceMode] = useState<VoiceModeEvent>({
+    mode: "dictate",
+    targetLanguage: null,
+  });
 
   useEffect(() => {
     const listeners = Promise.all([
@@ -184,6 +206,7 @@ function RecordingOverlay() {
           };
         });
       }),
+      listen<VoiceModeEvent>("voice-mode", ({ payload }) => setVoiceMode(payload)),
     ]);
 
     return () => {
@@ -195,7 +218,9 @@ function RecordingOverlay() {
     return (
       <div className="recording-overlay recording" role="status" aria-label={t("Recording in progress")}>
         <span className="recording-live-dot" aria-hidden="true" />
-        <span className="recording-overlay-label">{t("Listening")}</span>
+        <span className="recording-overlay-label">
+          {voiceMode.mode === "translate" ? t("Translating") : t("Listening")}
+        </span>
         <span className="recording-wave" aria-hidden="true">
           {waveform.map((amplitude, index) => (
             <i
@@ -207,6 +232,16 @@ function RecordingOverlay() {
             />
           ))}
         </span>
+        {voiceMode.mode === "translate" && voiceMode.targetLanguage && (
+          <button
+            className="translation-target-button"
+            type="button"
+            title={t("Cycle target language; this recording will use clipboard fallback.")}
+            onClick={() => void cycleVoiceTranslationTarget().catch(() => undefined)}
+          >
+            {t(translationLanguageKeys[voiceMode.targetLanguage] ?? "Language")} ↻
+          </button>
+        )}
       </div>
     );
   }
@@ -331,6 +366,10 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       }),
       listen<ModelProgress>("model-progress", (event) => setModelProgress(event.payload)),
       listen<GpuDiagnostics>("gpu-diagnostics", (event) => setGpu(event.payload)),
+      listen<Settings>("settings-changed", (event) => {
+        setSettings(event.payload);
+        onLanguageChange(event.payload.uiLanguage);
+      }),
       listen<{ kind: string; message: string }>("status", (event) =>
         setNotice({
           message: event.payload.message,

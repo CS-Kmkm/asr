@@ -38,9 +38,14 @@ export function HistoryPage({
         <div className="history-list">
           {history.map((item) => (
             <article className="history-item" key={item.id}>
-              <time dateTime={item.createdAt}>
-                {new Date(item.createdAt).toLocaleString()}
-              </time>
+              <div className="history-meta">
+                <time dateTime={item.createdAt}>
+                  {new Date(item.createdAt).toLocaleString()}
+                </time>
+                <span className="history-mode">
+                  {item.mode}{item.targetLanguage ? ` · ${item.targetLanguage}` : ""}
+                </span>
+              </div>
               <HistoryText text={item.transcriptText} onCopy={onCopyItem} />
               {item.processedText && (
                 <HistoryText

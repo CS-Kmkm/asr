@@ -19,6 +19,9 @@ export const defaultSettings: Settings = {
   hotkey: "Ctrl+Shift+Space",
   translationHotkey: "Ctrl+Shift+T",
   translationInstruction: "",
+  voiceTranslateHotkey: "Ctrl+Shift+Y",
+  translationTargetLanguages: ["en", "ja"],
+  translationTargetLanguage: "en",
   microphoneId: null,
   historyEnabled: true,
   historyRetentionDays: 30,
@@ -66,6 +69,16 @@ export async function listAudioDevices(): Promise<AudioDevice[]> {
 export async function startRecording(): Promise<void> {
   if (!inTauri) return;
   return invoke("start_recording");
+}
+
+export async function startVoiceTranslation(): Promise<void> {
+  if (!inTauri) return;
+  return invoke("start_voice_translation");
+}
+
+export async function cycleVoiceTranslationTarget(): Promise<string> {
+  if (!inTauri) return defaultSettings.translationTargetLanguage;
+  return invoke("cycle_voice_translation_target");
 }
 
 export async function stopRecording(): Promise<RecordingResult | null> {
