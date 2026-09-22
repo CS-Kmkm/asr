@@ -12,6 +12,14 @@ using clipboard paste, Unicode input, or the available UI Automation path. If
 automatic insertion fails after the clipboard is populated, the transcript
 remains on the clipboard.
 
+`Ctrl+Shift+Y` starts the independent voice **Translate** mode. Press it again
+to stop, transcribe, translate into the configured target language, and insert
+only the translated result. Settings stores an ordered target-language list
+and the current target. The recording overlay shows that target and can cycle
+the list; clicking the overlay counts as user activity, so that recording uses
+the clipboard fallback instead of modifying a target after interaction.
+`Ctrl+Shift+T` remains the separate selected-text translation action.
+
 Audio is deleted after processing by default. Transcript history is optional and
 stored in the application SQLite database. Logs and status events must never
 contain transcript, audio, window-title, or clipboard content.
@@ -157,9 +165,9 @@ and sets an output-token limit based on the transcript length.
 
 Correction responses are consumed as server-sent events from the OpenAI
 Responses API, Gemini Interactions API, and compatible local Chat Completions
-servers; non-streaming local responses are also accepted. As soon as ASR
-finishes, the raw transcript is inserted into the captured target as provisional text. The
-first correction delta replaces that draft and later deltas are appended while
+servers; non-streaming local responses are also accepted. In Dictate mode, as
+soon as ASR finishes, the raw transcript is inserted into the captured target
+as provisional text. The first correction delta replaces that draft and later deltas are appended while
 the API is still generating; the always-on-top status overlay mirrors the same
 progress. A short-lived helper process observes keyboard and pointer activity
 during this replacement session. It reports only activity counters (never key
