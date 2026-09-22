@@ -1,3 +1,4 @@
+mod app_context;
 mod asr;
 mod audio;
 mod commands;
@@ -6,6 +7,7 @@ mod correction_prompt;
 mod injection;
 mod input_monitor;
 mod live_dictation;
+mod personalization;
 mod recording_overlay;
 mod state;
 mod storage;
@@ -88,6 +90,7 @@ pub(crate) struct Services {
     audio: tokio::sync::Mutex<Box<dyn AudioCapture>>,
     live: tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
     target: Mutex<Option<TargetWindow>>,
+    app_context: Mutex<Option<types::AppContext>>,
     transcriber: Arc<dyn Transcriber>,
     input_monitor: Arc<InputMonitor>,
     model: Mutex<ModelStatus>,
@@ -105,6 +108,7 @@ impl Services {
             audio: tokio::sync::Mutex::new(Box::new(CpalAudioCapture::new())),
             live: tokio::sync::Mutex::new(None),
             target: Mutex::new(None),
+            app_context: Mutex::new(None),
             transcriber: Arc::new(JsonlTranscriber::new(
                 worker_command_for_settings(settings),
                 ASR_REQUEST_TIMEOUT,

@@ -47,6 +47,9 @@ export const defaultSettings: Settings = {
   correctionAutoFormat: true,
   correctionImproveClarity: true,
   customModels: [],
+  personalizationEnabled: false,
+  globalStyleProfile: null,
+  scopedStyleProfiles: [],
 };
 
 export async function getAppState(): Promise<AppState> {

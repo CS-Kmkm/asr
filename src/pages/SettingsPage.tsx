@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { SettingRow, Toggle } from "../components/ui";
 import { AiCorrectionSettings } from "../components/AiCorrectionSettings";
-import type { Settings } from "../types";
+import type { ScopedStyleProfile, Settings, StyleProfile } from "../types";
 import { useI18n } from "../i18n";
 
 export function SettingsPage({
@@ -15,6 +15,7 @@ export function SettingsPage({
   const [hotkey, setHotkey] = useState(settings.hotkey);
   const [translationHotkey, setTranslationHotkey] = useState(settings.translationHotkey);
   const [translationInstruction, setTranslationInstruction] = useState(settings.translationInstruction);
+  const [profiles, setProfiles] = useState(settings.scopedStyleProfiles);
   const cancelHotkeyBlurRef = useRef(false);
   const suppressHotkeyBlurRef = useRef(false);
   const cancelTranslationBlurRef = useRef(false);
@@ -25,6 +26,19 @@ export function SettingsPage({
   useEffect(() => setHotkey(settings.hotkey), [settings.hotkey]);
   useEffect(() => setTranslationHotkey(settings.translationHotkey), [settings.translationHotkey]);
   useEffect(() => setTranslationInstruction(settings.translationInstruction), [settings.translationInstruction]);
+  useEffect(() => setProfiles(settings.scopedStyleProfiles), [settings.scopedStyleProfiles]);
+
+  function saveProfiles(next: ScopedStyleProfile[]) {
+    setProfiles(next);
+    if (next.every((item) => /^(app|category):[^:\s]+$/.test(item.scope)) &&
+        new Set(next.map((item) => item.scope)).size === next.length) {
+      onSave({ scopedStyleProfiles: next });
+    }
+  }
+
+  function saveGlobalProfile(profile: StyleProfile | null) {
+    onSave({ globalStyleProfile: profile });
+  }
 
   function commitHotkey() {
     if (cancelHotkeyBlurRef.current || suppressHotkeyBlurRef.current) {
@@ -138,6 +152,11 @@ export function SettingsPage({
           }
         />
         <SettingRow
+          title={t("Personalization")}
+          detail={t("Use manually configured abstract style profiles for the captured app category.")}
+          control={<Toggle checked={settings.personalizationEnabled} onChange={(value) => onSave({ personalizationEnabled: value })} />}
+        />
+        <SettingRow
           title={t("Start with Windows")}
           detail={t("Launches Local Voice Input automatically when you sign in to Windows.")}
           control={
@@ -204,7 +223,53 @@ export function SettingsPage({
           }
         />
       </section>
+      <PersonalizationProfiles settings={settings} profiles={profiles} onSaveGlobal={saveGlobalProfile} onSaveProfiles={saveProfiles} />
       <AiCorrectionSettings settings={settings} onSave={onSave} />
     </div>
+  );
+}
+
+function PersonalizationProfiles({
+  settings,
+  profiles,
+  onSaveGlobal,
+  onSaveProfiles,
+}: {
+  settings: Settings;
+  profiles: ScopedStyleProfile[];
+  onSaveGlobal: (profile: StyleProfile | null) => void;
+  onSaveProfiles: (profiles: ScopedStyleProfile[]) => void;
+}) {
+  const { t } = useI18n();
+  const global = settings.globalStyleProfile ?? { formality: "formal", detail: "concise", guidance: "" };
+  const updateGlobal = (patch: Partial<StyleProfile>) => onSaveGlobal({ ...global, ...patch });
+  return (
+    <section className="panel">
+      <h2>{t("Personalization profiles")}</h2>
+      <p>{t("Structured style settings are retained locally; no transcript examples are stored.")}</p>
+      <SettingRow title={t("Global profile")} detail={t("Fallback style used when no app or category profile matches.")} control={
+        <div className="profile-controls">
+          <select value={global.formality} onChange={(e) => updateGlobal({ formality: e.target.value as StyleProfile["formality"] })}><option value="formal">{t("Formal")}</option><option value="casual">{t("Casual")}</option></select>
+          <select value={global.detail} onChange={(e) => updateGlobal({ detail: e.target.value as StyleProfile["detail"] })}><option value="concise">{t("Concise")}</option><option value="detailed">{t("Detailed")}</option></select>
+          <input maxLength={300} placeholder={t("Optional guidance")} value={global.guidance ?? ""} onChange={(e) => updateGlobal({ guidance: e.target.value })} />
+          <button className="secondary" onClick={() => onSaveGlobal(null)}>{t("Clear")}</button>
+        </div>
+      } />
+      <div className="profile-list">
+        <strong>{t("Scoped profiles")}</strong>
+        {profiles.map((item, index) => (
+          <div className="setting-row" key={index}>
+            <input value={item.scope} maxLength={80} placeholder={t("app:code or category:development")} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, scope: e.target.value }; onSaveProfiles(next); }} />
+            <select value={item.profile.formality} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, formality: e.target.value as StyleProfile["formality"] } }; onSaveProfiles(next); }}><option value="formal">{t("Formal")}</option><option value="casual">{t("Casual")}</option></select>
+            <select value={item.profile.detail} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, detail: e.target.value as StyleProfile["detail"] } }; onSaveProfiles(next); }}><option value="concise">{t("Concise")}</option><option value="detailed">{t("Detailed")}</option></select>
+            <input maxLength={300} placeholder={t("Optional guidance")} value={item.profile.guidance ?? ""} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, guidance: e.target.value } }; onSaveProfiles(next); }} />
+            <button className="secondary" onClick={() => onSaveProfiles(profiles.filter((_, i) => i !== index))}>{t("Remove")}</button>
+            <button className="secondary" disabled={index === 0} onClick={() => { const next = [...profiles]; [next[index - 1], next[index]] = [next[index], next[index - 1]]; onSaveProfiles(next); }}>↑</button>
+            <button className="secondary" disabled={index === profiles.length - 1} onClick={() => { const next = [...profiles]; [next[index], next[index + 1]] = [next[index + 1], next[index]]; onSaveProfiles(next); }}>↓</button>
+          </div>
+        ))}
+        <button className="primary" onClick={() => onSaveProfiles([...profiles, { scope: "category:other", profile: { formality: "formal", detail: "concise", guidance: "" } }])}>{t("Add scoped profile")}</button>
+      </div>
+    </section>
   );
 }

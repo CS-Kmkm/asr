@@ -80,6 +80,35 @@ pub struct Settings {
     pub correction_improve_clarity: bool,
     #[serde(default)]
     pub custom_models: Vec<CustomModel>,
+    #[serde(default)]
+    pub personalization_enabled: bool,
+    #[serde(default)]
+    pub global_style_profile: Option<StyleProfile>,
+    #[serde(default)]
+    pub scoped_style_profiles: Vec<ScopedStyleProfile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AppContext {
+    pub app_key: Option<String>,
+    pub category: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleProfile {
+    pub formality: String,
+    pub detail: String,
+    #[serde(default)]
+    pub guidance: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopedStyleProfile {
+    pub scope: String,
+    pub profile: StyleProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -197,6 +226,9 @@ impl Default for Settings {
             correction_auto_format: true,
             correction_improve_clarity: true,
             custom_models: Vec::new(),
+            personalization_enabled: false,
+            global_style_profile: None,
+            scoped_style_profiles: Vec::new(),
         }
     }
 }

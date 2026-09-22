@@ -62,10 +62,13 @@ pub(crate) async fn start_recording_with_origin(
     let target = SystemTextInjector::default()
         .capture_target()
         .map_err(command_error)?;
+    let app_context = app_context::from_target(&target);
     let mut live_slot = services.live.lock().await;
     let draft = live_dictation::LiveDraft::new(target.clone(), &settings, from_shortcut);
     let cancel = services.lifecycle.cancellation(operation_id)?;
-    let dictionary_terms = storage.dictionary_prompt_terms().unwrap_or_default();
+    let dictionary_terms = storage
+        .dictionary_prompt_terms_for(Some(&app_context))
+        .unwrap_or_default();
     let prompt = (!dictionary_terms.is_empty()).then(|| dictionary_terms.join("\n"));
     let capture_config = capture_config(&settings);
     let mut audio = services.audio.lock().await;
@@ -87,6 +90,10 @@ pub(crate) async fn start_recording_with_origin(
         .target
         .lock()
         .map_err(|_| "target service is unavailable".to_string())? = Some(target);
+    *services
+        .app_context
+        .lock()
+        .map_err(|_| "target service is unavailable".to_string())? = Some(app_context);
     state.clear_result();
     emit_state(
         &app,
@@ -199,7 +206,14 @@ pub(crate) async fn stop_recording(
     }
     emit_state(&app, &state, AppPhase::Processing, "Transcribing locally.");
 
-    let dictionary_terms = storage.dictionary_prompt_terms().unwrap_or_default();
+    let app_context = services
+        .app_context
+        .lock()
+        .map_err(|_| "target service is unavailable".to_string())?
+        .clone();
+    let dictionary_terms = storage
+        .dictionary_prompt_terms_for(app_context.as_ref())
+        .unwrap_or_default();
     let prompt = (!dictionary_terms.is_empty()).then(|| dictionary_terms.join("\n"));
     let correction_cancel = cancel.clone();
     let transcript_result = services
@@ -282,7 +296,7 @@ pub(crate) async fn stop_recording(
     let streamed_into_target = draft.pasted;
     if settings.text_correction_enabled {
         let correction_hints = storage
-            .dictionary_correction_hints(&transcript.text)
+            .dictionary_correction_hints(&transcript.text, app_context.as_ref())
             .unwrap_or_default();
         emit_correction_preview(&app, &transcript.text, "draft");
         emit_state(
@@ -302,6 +316,15 @@ pub(crate) async fn stop_recording(
             &settings,
             &transcript.text,
             &correction_hints,
+            personalization::resolve_profile(
+                &settings,
+                app_context.as_ref().unwrap_or(&crate::types::AppContext {
+                    app_key: None,
+                    category: "other".into(),
+                }),
+            )
+            .map(|profile| personalization::guidance(&profile))
+            .as_deref(),
             correction_cancel,
             |delta| {
                 emit_correction_preview(&app, delta, "streaming");
@@ -400,7 +423,9 @@ pub(crate) async fn stop_recording(
             },
             asr_provider: &transcript.model,
             llm_provider: llm_provider.as_deref(),
-            app_category: None,
+            app_category: app_context
+                .as_ref()
+                .map(|context| context.category.as_str()),
             duration_ms: Some(duration_ms as i64),
             latency_ms: Some(latency_ms as i64),
         })
@@ -673,6 +698,7 @@ pub(crate) async fn update_settings(
     services: State<'_, Services>,
     storage: State<'_, Storage>,
 ) -> Result<Settings, String> {
+    personalization::validate_settings_profiles(&settings).map_err(str::to_owned)?;
     if !["en", "ja"].contains(&settings.ui_language.as_str()) {
         return Err("ui language must be en or ja".into());
     }
@@ -933,6 +959,8 @@ pub(crate) fn add_dictionary_entry(
     entry: DictionaryEntryInput,
     storage: State<'_, Storage>,
 ) -> Result<DictionaryEntry, String> {
+    personalization::validate_dictionary_scope(entry.app_scope.as_deref())
+        .map_err(str::to_owned)?;
     let id = storage
         .add_dictionary_entry(&NewDictionaryEntry {
             reading: &entry.reading,

@@ -41,6 +41,7 @@ export function HistoryPage({
               <time dateTime={item.createdAt}>
                 {new Date(item.createdAt).toLocaleString()}
               </time>
+              {item.appCategory && <small>{t("App category")}: {item.appCategory}</small>}
               <HistoryText text={item.transcriptText} onCopy={onCopyItem} />
               {item.processedText && (
                 <HistoryText

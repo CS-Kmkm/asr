@@ -65,7 +65,12 @@ export interface Settings {
   correctionAutoFormat: boolean;
   correctionImproveClarity: boolean;
   customModels: CustomModel[];
+  personalizationEnabled: boolean;
+  globalStyleProfile: StyleProfile | null;
+  scopedStyleProfiles: ScopedStyleProfile[];
 }
+export interface StyleProfile { formality: "formal" | "casual"; detail: "concise" | "detailed"; guidance?: string | null; }
+export interface ScopedStyleProfile { scope: string; profile: StyleProfile; }
 
 export type UiLanguage = "en" | "ja";
 
