@@ -2138,6 +2138,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "unicode-segmentation",
+ "url",
  "windows 0.58.0",
 ]
 
