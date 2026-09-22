@@ -20,6 +20,14 @@ the list; clicking the overlay counts as user activity, so that recording uses
 the clipboard fallback instead of modifying a target after interaction.
 `Ctrl+Shift+T` remains the separate selected-text translation action.
 
+`Ctrl+Shift+E` starts **Speak to edit** for the text selected at that moment.
+Speak an instruction such as “make this concise” or “translate this to
+Japanese,” then press the shortcut again. The provider receives the immutable
+selected text and spoken instruction as separate untrusted fields and may only
+return replacement text. If focus, selection, user input, shortcut release, or
+IME safety checks fail, the original text is left alone and the generated edit
+remains on the clipboard.
+
 Audio is deleted after processing by default. Transcript history is optional and
 stored in the application SQLite database. Logs and status events must never
 contain transcript, audio, window-title, or clipboard content.
