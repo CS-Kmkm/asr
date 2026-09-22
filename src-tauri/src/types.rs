@@ -277,6 +277,7 @@ pub struct DictionaryEntry {
     pub aliases: Vec<String>,
     pub priority: i64,
     pub app_scope: Option<String>,
+    pub source: String,
     pub created_at: String,
 }
 
@@ -303,6 +304,23 @@ pub struct DictionaryEntryInput {
     pub priority: i64,
     #[serde(default)]
     pub app_scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DictionaryCandidate {
+    pub id: i64,
+    pub original_span: String,
+    pub preferred_span: String,
+    pub confidence: f64,
+    pub history_id: Option<i64>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DictionaryImportInput {
+    pub csv: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

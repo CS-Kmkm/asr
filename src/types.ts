@@ -131,6 +131,7 @@ export interface DictionaryEntry {
   aliases: string[];
   priority: number;
   appScope: string | null;
+  source: "manual" | "auto";
   createdAt: string;
 }
 
@@ -141,4 +142,13 @@ export interface DictionaryEntryInput {
   aliases?: string[];
   priority?: number;
   appScope?: string | null;
+}
+
+export interface DictionaryCandidate {
+  id: number;
+  originalSpan: string;
+  preferredSpan: string;
+  confidence: number;
+  historyId: number | null;
+  createdAt: string;
 }

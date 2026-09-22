@@ -7,7 +7,14 @@ use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 
-use crate::types::{DictionaryEntry, HistoryItem, NewDictionaryEntry, NewHistoryItem, Settings};
+use crate::types::{
+    DictionaryCandidate, DictionaryEntry, HistoryItem, NewDictionaryEntry, NewHistoryItem, Settings,
+};
+
+const MAX_DICTIONARY_TEXT_CHARS: usize = 200;
+const MAX_CANDIDATE_CHARS: usize = 80;
+const MAX_CSV_BYTES: usize = 1024 * 1024;
+const MAX_CSV_ROWS: usize = 1000;
 
 fn scope_matches(scope: Option<&str>, context: Option<&crate::types::AppContext>) -> bool {
     let Some(scope) = scope.filter(|value| !value.is_empty() && *value != "global") else {
@@ -28,6 +35,10 @@ pub enum StorageError {
     InvalidSettings(#[from] serde_json::Error),
     #[error("storage lock is unavailable")]
     Lock,
+    #[error("dictionary validation failed: {0}")]
+    Validation(String),
+    #[error("CSV parsing failed")]
+    Csv(#[from] csv::Error),
 }
 
 pub struct Storage {
@@ -74,9 +85,21 @@ impl Storage {
                aliases TEXT NOT NULL DEFAULT '[]',
                priority INTEGER NOT NULL DEFAULT 0,
                app_scope TEXT,
+               source TEXT NOT NULL DEFAULT 'manual',
                created_at TEXT NOT NULL,
                updated_at TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS dictionary_candidates (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               original_span TEXT NOT NULL,
+               preferred_span TEXT NOT NULL,
+               confidence REAL NOT NULL,
+               history_id INTEGER,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL,
+               FOREIGN KEY(history_id) REFERENCES dictation_history(id) ON DELETE SET NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_dictionary_candidates_created_at ON dictionary_candidates(created_at DESC);
              CREATE TABLE IF NOT EXISTS dictation_history (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                transcript_text TEXT NOT NULL,
@@ -100,6 +123,20 @@ impl Storage {
                created_at TEXT NOT NULL
              );",
         )?;
+        let connection = self.connection()?;
+        let columns = {
+            let mut statement = connection.prepare("PRAGMA table_info(dictionary_entries)")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let has_source = columns.iter().any(|column| column == "source");
+        if !has_source {
+            connection.execute(
+                "ALTER TABLE dictionary_entries ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
+                [],
+            )?;
+        }
+        connection.execute("UPDATE dictionary_entries SET source = 'manual' WHERE source IS NULL OR source NOT IN ('manual', 'auto')", [])?;
         Ok(())
     }
 
@@ -137,6 +174,7 @@ impl Storage {
         let connection = self.connection()?;
         if previous.history_enabled && !settings.history_enabled {
             connection.execute("DELETE FROM dictation_history", [])?;
+            connection.execute("DELETE FROM dictionary_candidates", [])?;
             return Ok(());
         }
         if settings.history_enabled {
@@ -214,67 +252,270 @@ impl Storage {
     }
 
     pub fn list_dictionary(&self) -> Result<Vec<DictionaryEntry>, StorageError> {
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT id, reading, surface, category, aliases, priority, app_scope, created_at
-             FROM dictionary_entries ORDER BY priority DESC, surface ASC",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, String>(7)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (id, reading, surface, category, aliases, priority, app_scope, created_at) = row?;
-            Ok(DictionaryEntry {
-                id,
-                reading,
-                surface,
-                category,
-                aliases: serde_json::from_str(&aliases)?,
-                priority,
-                app_scope,
-                created_at,
+        read_dictionary_entries(&self.connection()?)
+    }
+
+    pub fn search_dictionary(
+        &self,
+        query: Option<&str>,
+        source: Option<&str>,
+    ) -> Result<Vec<DictionaryEntry>, StorageError> {
+        let source = source.filter(|value| !value.is_empty() && *value != "all");
+        if !matches!(source, None | Some("manual") | Some("auto")) {
+            return Err(StorageError::Validation(
+                "source must be manual or auto".into(),
+            ));
+        }
+        let query = query.unwrap_or("").trim().to_lowercase();
+        Ok(self
+            .list_dictionary()?
+            .into_iter()
+            .filter(|entry| source.is_none_or(|value| entry.source == value))
+            .filter(|entry| {
+                query.is_empty()
+                    || [
+                        entry.reading.as_str(),
+                        entry.surface.as_str(),
+                        entry.category.as_deref().unwrap_or(""),
+                        &entry.aliases.join(" "),
+                        entry.app_scope.as_deref().unwrap_or(""),
+                    ]
+                    .iter()
+                    .any(|value| value.to_lowercase().contains(&query))
             })
-        })
-        .collect()
+            .collect())
     }
 
     pub fn add_dictionary_entry(
         &self,
         entry: &NewDictionaryEntry<'_>,
     ) -> Result<i64, StorageError> {
-        let aliases = serde_json::to_string(entry.aliases)?;
-        let now = Utc::now().to_rfc3339();
         let connection = self.connection()?;
-        connection.execute(
-            "INSERT INTO dictionary_entries(
-               reading, surface, category, aliases, priority, app_scope, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+        insert_dictionary_entry(&connection, entry, "manual", None)
+    }
+
+    pub fn update_dictionary_entry(
+        &self,
+        id: i64,
+        entry: &NewDictionaryEntry<'_>,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection()?;
+        let existing = read_dictionary_entries(&connection)?;
+        if !existing.iter().any(|current| current.id == id) {
+            return Ok(false);
+        }
+        validate_dictionary_entry(entry)?;
+        validate_dictionary_collisions(&existing, entry, Some(id))?;
+        let scope = normalized_scope(entry.app_scope);
+        Ok(connection.execute(
+            "UPDATE dictionary_entries SET reading = ?1, surface = ?2, category = ?3, aliases = ?4,
+             priority = ?5, app_scope = ?6, updated_at = ?7 WHERE id = ?8",
             params![
-                entry.reading,
-                entry.surface,
-                entry.category,
-                aliases,
+                entry.reading.trim(),
+                entry.surface.trim(),
+                entry
+                    .category
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty()),
+                serde_json::to_string(entry.aliases)?,
                 entry.priority,
-                entry.app_scope,
-                now
+                scope,
+                Utc::now().to_rfc3339(),
+                id
             ],
-        )?;
-        Ok(connection.last_insert_rowid())
+        )? > 0)
+    }
+
+    pub fn import_dictionary_csv(&self, csv_text: &str) -> Result<usize, StorageError> {
+        if csv_text.len() > MAX_CSV_BYTES {
+            return Err(StorageError::Validation("CSV input exceeds 1 MiB".into()));
+        }
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(csv_text.as_bytes());
+        let headers = reader.headers()?;
+        let expected = [
+            "reading",
+            "surface",
+            "category",
+            "aliases",
+            "priority",
+            "app_scope",
+        ];
+        if headers.iter().collect::<Vec<_>>() != expected {
+            return Err(StorageError::Validation(
+                "CSV header must be reading,surface,category,aliases,priority,app_scope".into(),
+            ));
+        }
+        let mut values = Vec::new();
+        for (index, row) in reader.records().enumerate() {
+            if index >= MAX_CSV_ROWS {
+                return Err(StorageError::Validation(
+                    "CSV has more than 1000 rows".into(),
+                ));
+            }
+            let row = row?;
+            if row.len() != expected.len() {
+                return Err(StorageError::Validation(format!(
+                    "CSV row {} has an invalid field count",
+                    index + 2
+                )));
+            }
+            let priority = row[4].trim().parse::<i64>().map_err(|_| {
+                StorageError::Validation(format!("CSV row {} has an invalid priority", index + 2))
+            })?;
+            values.push(OwnedDictionaryEntry {
+                reading: row[0].to_owned(),
+                surface: row[1].to_owned(),
+                category: (!row[2].trim().is_empty()).then(|| row[2].to_owned()),
+                aliases: if row[3].trim().is_empty() {
+                    Vec::new()
+                } else {
+                    row[3]
+                        .split('|')
+                        .map(str::trim)
+                        .map(ToOwned::to_owned)
+                        .collect()
+                },
+                priority,
+                app_scope: (!row[5].trim().is_empty()).then(|| row[5].to_owned()),
+            });
+        }
+        let connection = self.connection()?;
+        let mut planned = read_dictionary_entries(&connection)?;
+        for value in &values {
+            let entry = value.as_new();
+            validate_dictionary_entry(&entry)?;
+            validate_dictionary_collisions(&planned, &entry, None)?;
+            planned.push(DictionaryEntry {
+                id: -((planned.len() as i64) + 1),
+                reading: entry.reading.trim().into(),
+                surface: entry.surface.trim().into(),
+                category: entry
+                    .category
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
+                aliases: entry.aliases.to_vec(),
+                priority: entry.priority,
+                app_scope: normalized_scope(entry.app_scope),
+                source: "manual".into(),
+                created_at: String::new(),
+            });
+        }
+        let transaction = connection.unchecked_transaction()?;
+        for value in &values {
+            insert_dictionary_entry(&transaction, &value.as_new(), "manual", None)?;
+        }
+        transaction.commit()?;
+        Ok(values.len())
     }
 
     pub fn delete_dictionary_entry(&self, id: i64) -> Result<bool, StorageError> {
         Ok(self
             .connection()?
             .execute("DELETE FROM dictionary_entries WHERE id = ?1", [id])?
+            > 0)
+    }
+
+    pub fn add_dictionary_candidate_from_correction(
+        &self,
+        original: &str,
+        corrected: &str,
+        history_id: Option<i64>,
+    ) -> Result<Option<i64>, StorageError> {
+        if !self.get_settings()?.history_enabled {
+            return Ok(None);
+        }
+        let Some((original_span, preferred_span)) =
+            detect_dictionary_candidate(original, corrected)
+        else {
+            return Ok(None);
+        };
+        let now = Utc::now().to_rfc3339();
+        let connection = self.connection()?;
+        connection.execute(
+            "INSERT INTO dictionary_candidates(original_span, preferred_span, confidence, history_id, created_at, updated_at)
+             VALUES (?1, ?2, 0.95, ?3, ?4, ?4)",
+            params![original_span, preferred_span, history_id, now],
+        )?;
+        Ok(Some(connection.last_insert_rowid()))
+    }
+
+    pub fn list_dictionary_candidates(&self) -> Result<Vec<DictionaryCandidate>, StorageError> {
+        if !self.get_settings()?.history_enabled {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection.prepare("SELECT id, original_span, preferred_span, confidence, history_id, created_at FROM dictionary_candidates ORDER BY created_at DESC")?;
+        let rows = statement.query_map([], |row| {
+            Ok(DictionaryCandidate {
+                id: row.get(0)?,
+                original_span: row.get(1)?,
+                preferred_span: row.get(2)?,
+                confidence: row.get(3)?,
+                history_id: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn confirm_dictionary_candidate(
+        &self,
+        id: i64,
+    ) -> Result<Option<DictionaryEntry>, StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let candidate = transaction
+            .query_row(
+                "SELECT original_span, preferred_span FROM dictionary_candidates WHERE id = ?1",
+                [id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((reading, surface)) = candidate else {
+            return Ok(None);
+        };
+        let aliases = Vec::new();
+        let entry = NewDictionaryEntry {
+            reading: &reading,
+            surface: &surface,
+            category: None,
+            aliases: &aliases,
+            priority: 0,
+            app_scope: None,
+        };
+        let existing = read_dictionary_entries(&transaction)?;
+        let match_id = existing
+            .iter()
+            .find(|item| {
+                item.surface.trim().to_lowercase() == surface.trim().to_lowercase()
+                    && normalized_scope(item.app_scope.as_deref()).is_none()
+            })
+            .map(|item| item.id);
+        if let Some(entry_id) = match_id {
+            validate_dictionary_entry(&entry)?;
+            validate_dictionary_collisions(&existing, &entry, Some(entry_id))?;
+            transaction.execute("UPDATE dictionary_entries SET reading = ?1, surface = ?2, source = 'auto', updated_at = ?3 WHERE id = ?4", params![reading.trim(), surface.trim(), Utc::now().to_rfc3339(), entry_id])?;
+        } else {
+            insert_dictionary_entry(&transaction, &entry, "auto", None)?;
+        }
+        transaction.execute("DELETE FROM dictionary_candidates WHERE id = ?1", [id])?;
+        let result = read_dictionary_entries(&transaction)?
+            .into_iter()
+            .find(|item| {
+                item.surface.trim().to_lowercase() == surface.trim().to_lowercase()
+                    && normalized_scope(item.app_scope.as_deref()).is_none()
+            });
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    pub fn reject_dictionary_candidate(&self, id: i64) -> Result<bool, StorageError> {
+        Ok(self
+            .connection()?
+            .execute("DELETE FROM dictionary_candidates WHERE id = ?1", [id])?
             > 0)
     }
 
@@ -285,23 +526,31 @@ impl Storage {
         let mut terms = Vec::new();
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT surface, aliases, app_scope
+            "SELECT reading, surface, aliases, app_scope
              FROM dictionary_entries ORDER BY priority DESC, surface ASC",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
         })?;
         for row in rows {
-            let (surface, aliases, scope) = row?;
+            if terms.len() >= 100 {
+                break;
+            }
+            let (reading, surface, aliases, scope) = row?;
             if !scope_matches(scope.as_deref(), context) {
                 continue;
             }
-            terms.push(surface);
-            terms.extend(serde_json::from_str::<Vec<String>>(&aliases)?);
+            let aliases = serde_json::from_str::<Vec<String>>(&aliases)?;
+            let mut term = format!("{} => {}", reading.trim(), surface.trim());
+            if !aliases.is_empty() {
+                term.push_str(&format!(" (aliases: {})", aliases.join(", ")));
+            }
+            terms.push(term.chars().take(300).collect());
         }
         Ok(terms)
     }
@@ -364,6 +613,246 @@ impl Storage {
         )?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone)]
+struct OwnedDictionaryEntry {
+    reading: String,
+    surface: String,
+    category: Option<String>,
+    aliases: Vec<String>,
+    priority: i64,
+    app_scope: Option<String>,
+}
+
+impl OwnedDictionaryEntry {
+    fn as_new(&self) -> NewDictionaryEntry<'_> {
+        NewDictionaryEntry {
+            reading: &self.reading,
+            surface: &self.surface,
+            category: self.category.as_deref(),
+            aliases: &self.aliases,
+            priority: self.priority,
+            app_scope: self.app_scope.as_deref(),
+        }
+    }
+}
+
+fn normalized_scope(scope: Option<&str>) -> Option<String> {
+    scope
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty() && *scope != "global")
+        .map(ToOwned::to_owned)
+}
+
+fn validate_dictionary_entry(entry: &NewDictionaryEntry<'_>) -> Result<(), StorageError> {
+    for (name, value, required) in [
+        ("reading", entry.reading, true),
+        ("surface", entry.surface, true),
+        ("category", entry.category.unwrap_or(""), false),
+    ] {
+        let trimmed = value.trim();
+        if (required && trimmed.is_empty())
+            || trimmed.chars().count() > MAX_DICTIONARY_TEXT_CHARS
+            || trimmed.chars().any(char::is_control)
+        {
+            return Err(StorageError::Validation(format!(
+                "{name} is empty, too long, or contains control characters"
+            )));
+        }
+    }
+    crate::personalization::validate_dictionary_scope(entry.app_scope.map(str::trim))
+        .map_err(|error| StorageError::Validation(error.into()))?;
+    let mut aliases = std::collections::HashSet::new();
+    for alias in entry.aliases {
+        let alias = alias.trim();
+        if alias.is_empty()
+            || alias.chars().count() > MAX_DICTIONARY_TEXT_CHARS
+            || alias.chars().any(char::is_control)
+            || !aliases.insert(alias.to_lowercase())
+        {
+            return Err(StorageError::Validation(
+                "aliases must be unique, non-empty, and valid".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_dictionary_collisions(
+    existing: &[DictionaryEntry],
+    entry: &NewDictionaryEntry<'_>,
+    excluded_id: Option<i64>,
+) -> Result<(), StorageError> {
+    let scope = normalized_scope(entry.app_scope);
+    let surface = entry.surface.trim().to_lowercase();
+    let aliases = entry
+        .aliases
+        .iter()
+        .map(|value| value.trim().to_lowercase())
+        .collect::<Vec<_>>();
+    for current in existing.iter().filter(|current| {
+        Some(current.id) != excluded_id && normalized_scope(current.app_scope.as_deref()) == scope
+    }) {
+        let current_surface = current.surface.trim().to_lowercase();
+        let current_aliases = current
+            .aliases
+            .iter()
+            .map(|value| value.trim().to_lowercase())
+            .collect::<Vec<_>>();
+        if current_surface == surface {
+            return Err(StorageError::Validation(
+                "surface already exists in this scope".into(),
+            ));
+        }
+        if current_aliases.iter().any(|value| value == &surface)
+            || aliases.iter().any(|value| {
+                value == &current_surface || current_aliases.iter().any(|current| current == value)
+            })
+        {
+            return Err(StorageError::Validation(
+                "surface or alias collides with another entry in this scope".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn read_dictionary_entries<C: std::ops::Deref<Target = Connection>>(
+    connection: &C,
+) -> Result<Vec<DictionaryEntry>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT id, reading, surface, category, aliases, priority, app_scope, source, created_at
+         FROM dictionary_entries ORDER BY priority DESC, surface ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (id, reading, surface, category, aliases, priority, app_scope, source, created_at) =
+            row?;
+        Ok(DictionaryEntry {
+            id,
+            reading,
+            surface,
+            category,
+            aliases: serde_json::from_str(&aliases)?,
+            priority,
+            app_scope: normalized_scope(app_scope.as_deref()),
+            source,
+            created_at,
+        })
+    })
+    .collect()
+}
+
+fn insert_dictionary_entry<C: std::ops::Deref<Target = Connection>>(
+    connection: &C,
+    entry: &NewDictionaryEntry<'_>,
+    source: &str,
+    excluded_id: Option<i64>,
+) -> Result<i64, StorageError> {
+    validate_dictionary_entry(entry)?;
+    validate_dictionary_collisions(&read_dictionary_entries(connection)?, entry, excluded_id)?;
+    let now = Utc::now().to_rfc3339();
+    connection.execute(
+        "INSERT INTO dictionary_entries(reading, surface, category, aliases, priority, app_scope, source, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+        params![entry.reading.trim(), entry.surface.trim(), entry.category.map(str::trim).filter(|value| !value.is_empty()), serde_json::to_string(entry.aliases)?, entry.priority, normalized_scope(entry.app_scope), source, now],
+    )?;
+    Ok(connection.last_insert_rowid())
+}
+
+pub(crate) fn detect_dictionary_candidate(
+    original: &str,
+    corrected: &str,
+) -> Option<(String, String)> {
+    if original == corrected {
+        return None;
+    }
+    let has_code_or_url = |value: &str| {
+        let lower = value.to_ascii_lowercase();
+        let dotted_identifier = value.as_bytes().windows(3).any(|window| {
+            window[1] == b'.'
+                && window[0].is_ascii_alphanumeric()
+                && window[2].is_ascii_alphanumeric()
+        });
+        lower.contains("http://")
+            || lower.contains("https://")
+            || lower.contains("www.")
+            || dotted_identifier
+            || value.contains(['/', '\\'])
+            || value.contains([
+                '`', '{', '}', ';', '(', ')', '[', ']', '=', '<', '>', '#', '@', '$', '&', '|',
+                '"', '\'', '+', '*', '%', '!', '^',
+            ])
+            || value.contains("::")
+            || value.contains("->")
+            || value.contains("=>")
+    };
+    if has_code_or_url(original) || has_code_or_url(corrected) {
+        return None;
+    }
+    let original_chars = original.chars().collect::<Vec<_>>();
+    let corrected_chars = corrected.chars().collect::<Vec<_>>();
+    let mut prefix = 0;
+    while prefix < original_chars.len()
+        && prefix < corrected_chars.len()
+        && original_chars[prefix] == corrected_chars[prefix]
+    {
+        prefix += 1;
+    }
+    let mut original_end = original_chars.len();
+    let mut corrected_end = corrected_chars.len();
+    while original_end > prefix
+        && corrected_end > prefix
+        && original_chars[original_end - 1] == corrected_chars[corrected_end - 1]
+    {
+        original_end -= 1;
+        corrected_end -= 1;
+    }
+    let original_span = original_chars[prefix..original_end]
+        .iter()
+        .collect::<String>();
+    let preferred_span = corrected_chars[prefix..corrected_end]
+        .iter()
+        .collect::<String>();
+    let normalized = |value: &str| {
+        value
+            .chars()
+            .filter(|character| !character.is_whitespace() && !matches!(character, '-' | '_'))
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let original_normalized = normalized(&original_span);
+    let preferred_normalized = normalized(&preferred_span);
+    let invalid = |value: &str| {
+        value.trim().is_empty()
+            || value.chars().count() > MAX_CANDIDATE_CHARS
+            || value.contains(['\n', '\r'])
+            || value.chars().any(char::is_control)
+            || value
+                .chars()
+                .all(|character| character.is_ascii_digit() || matches!(character, ' ' | '-' | '_'))
+    };
+    if invalid(&original_span)
+        || invalid(&preferred_span)
+        || original_normalized.is_empty()
+        || original_normalized != preferred_normalized
+    {
+        return None;
+    }
+    Some((original_span, preferred_span))
 }
 
 #[cfg(test)]
@@ -588,15 +1077,14 @@ mod tests {
     }
 
     #[test]
-    fn dictionary_prompt_terms_include_surfaces() {
+    fn dictionary_prompt_terms_include_reading_surface_and_aliases() {
         let storage = Storage::in_memory().unwrap();
         let aliases = vec!["ChatGPT".into()];
         storage
             .add_dictionary_entry(&dictionary_entry(&aliases))
             .unwrap();
         let terms = storage.dictionary_prompt_terms().unwrap();
-        assert!(terms.contains(&"OpenAI".to_string()));
-        assert!(terms.contains(&"ChatGPT".to_string()));
+        assert_eq!(terms, vec!["おーぷんえーあい => OpenAI (aliases: ChatGPT)"]);
     }
 
     #[test]
@@ -625,12 +1113,18 @@ mod tests {
             category: "development".into(),
         };
         let terms = storage.dictionary_prompt_terms_for(Some(&context)).unwrap();
-        assert!(
-            terms.contains(&"Global".into())
-                && terms.contains(&"App".into())
-                && terms.contains(&"Category".into())
-                && !terms.contains(&"Other".into())
-        );
+        assert!(terms
+            .iter()
+            .any(|term| term.starts_with("global-alias => Global")));
+        assert!(terms
+            .iter()
+            .any(|term| term.starts_with("app-alias => App")));
+        assert!(terms
+            .iter()
+            .any(|term| term.starts_with("category-alias => Category")));
+        assert!(!terms
+            .iter()
+            .any(|term| term.starts_with("other-alias => Other")));
         let hints = storage
             .dictionary_correction_hints(
                 "global-alias app-alias category-alias other-alias",
@@ -663,9 +1157,45 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_correction_hints_follow_priority_order() {
+        let storage = Storage::in_memory().unwrap();
+        let low = vec!["low alias".to_owned()];
+        let high = vec!["high alias".to_owned()];
+        storage
+            .add_dictionary_entry(&NewDictionaryEntry {
+                reading: "low",
+                surface: "Low",
+                category: None,
+                aliases: &low,
+                priority: 1,
+                app_scope: None,
+            })
+            .unwrap();
+        storage
+            .add_dictionary_entry(&NewDictionaryEntry {
+                reading: "high",
+                surface: "High",
+                category: None,
+                aliases: &high,
+                priority: 9,
+                app_scope: None,
+            })
+            .unwrap();
+        assert_eq!(
+            storage
+                .dictionary_correction_hints("high alias and low alias", None)
+                .unwrap(),
+            vec!["High<=high alias", "Low<=low alias"]
+        );
+    }
+
+    #[test]
     fn disabling_history_purges_existing_rows() {
         let storage = Storage::in_memory().unwrap();
         storage.add_history(&item()).unwrap();
+        storage
+            .add_dictionary_candidate_from_correction("open ai", "OpenAI", None)
+            .unwrap();
         let previous = storage.get_settings().unwrap();
         let mut settings = previous.clone();
         settings.history_enabled = false;
@@ -679,6 +1209,7 @@ mod tests {
                 .unwrap(),
             0
         );
+        assert!(storage.list_dictionary_candidates().unwrap().is_empty());
     }
 
     #[test]
@@ -698,5 +1229,229 @@ mod tests {
         let settings = storage.get_settings().unwrap();
         storage.apply_history_policy(&settings, &settings).unwrap();
         assert_eq!(storage.list_history(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dictionary_update_keeps_id_source_scope_and_aliases() {
+        let storage = Storage::in_memory().unwrap();
+        let aliases = vec!["First alias".into()];
+        let id = storage
+            .add_dictionary_entry(&NewDictionaryEntry {
+                reading: "read",
+                surface: "Surface",
+                category: Some("old"),
+                aliases: &aliases,
+                priority: 1,
+                app_scope: Some("app:code"),
+            })
+            .unwrap();
+        let replacement_aliases = vec!["Second alias".into()];
+        assert!(storage
+            .update_dictionary_entry(
+                id,
+                &NewDictionaryEntry {
+                    reading: "new read",
+                    surface: "New surface",
+                    category: Some("new"),
+                    aliases: &replacement_aliases,
+                    priority: 9,
+                    app_scope: Some("app:code"),
+                }
+            )
+            .unwrap());
+        assert_eq!(
+            storage.list_dictionary().unwrap(),
+            vec![DictionaryEntry {
+                id,
+                reading: "new read".into(),
+                surface: "New surface".into(),
+                category: Some("new".into()),
+                aliases: replacement_aliases,
+                priority: 9,
+                app_scope: Some("app:code".into()),
+                source: "manual".into(),
+                created_at: storage.list_dictionary().unwrap()[0].created_at.clone(),
+            }]
+        );
+    }
+
+    #[test]
+    fn dictionary_search_matches_every_field_and_source() {
+        let storage = Storage::in_memory().unwrap();
+        let aliases = vec!["alternate".into()];
+        storage
+            .add_dictionary_entry(&NewDictionaryEntry {
+                reading: "spoken",
+                surface: "Surface",
+                category: Some("group"),
+                aliases: &aliases,
+                priority: 0,
+                app_scope: Some("category:email"),
+            })
+            .unwrap();
+        storage
+            .add_dictionary_candidate_from_correction("auto value", "AutoValue", None)
+            .unwrap();
+        let candidate = storage.list_dictionary_candidates().unwrap().pop().unwrap();
+        storage.confirm_dictionary_candidate(candidate.id).unwrap();
+        for query in ["spoken", "surface", "group", "alternate", "email"] {
+            assert_eq!(
+                storage
+                    .search_dictionary(Some(query), Some("manual"))
+                    .unwrap()
+                    .len(),
+                1,
+                "{query}"
+            );
+        }
+        assert_eq!(
+            storage.search_dictionary(None, Some("auto")).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            storage
+                .search_dictionary(None, Some("manual"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn csv_import_quotes_and_rolls_back_invalid_or_colliding_rows() {
+        let storage = Storage::in_memory().unwrap();
+        let csv = "reading,surface,category,aliases,priority,app_scope\n\"read, ing\",Surface,group,\"one|two\",3,app:code\nnext,Other,,,0,\n";
+        assert_eq!(storage.import_dictionary_csv(csv).unwrap(), 2);
+        assert_eq!(storage.list_dictionary().unwrap().len(), 2);
+        for invalid in [
+            "reading,surface,category,aliases,priority,app_scope\nread,Surface,,,nope,\n",
+            "reading,surface,category,aliases,priority,app_scope\nfresh,Fresh,,,0,\nother,Other,,fresh,0,\n",
+            "reading,surface,category,aliases,priority,app_scope\nread,Surface,,,0,app:INVALID\n",
+            "reading,surface,category,aliases,priority,app_scope\n,Surface,,,0,\n",
+            "reading,surface,category,aliases,priority,app_scope\nread,Surface,,one||two,0,\n",
+            "reading,surface,category,aliases,priority,app_scope\nread,Surface,,bad\u{0007},0,\n",
+            "wrong,header\n",
+        ] {
+            assert!(storage.import_dictionary_csv(invalid).is_err());
+            assert_eq!(storage.list_dictionary().unwrap().len(), 2);
+        }
+        assert!(storage
+            .import_dictionary_csv(&"x".repeat(MAX_CSV_BYTES + 1))
+            .is_err());
+        assert!(storage
+            .import_dictionary_csv(&format!(
+                "reading,surface,category,aliases,priority,app_scope\n{},Surface,,,0,\n",
+                "x".repeat(MAX_DICTIONARY_TEXT_CHARS + 1)
+            ))
+            .is_err());
+        let too_many = format!(
+            "reading,surface,category,aliases,priority,app_scope\n{}",
+            (0..=MAX_CSV_ROWS)
+                .map(|index| format!("r{index},s{index},,,0,\n"))
+                .collect::<String>()
+        );
+        assert!(storage.import_dictionary_csv(&too_many).is_err());
+    }
+
+    #[test]
+    fn dictionary_collisions_are_scope_specific_and_case_insensitive() {
+        let storage = Storage::in_memory().unwrap();
+        let aliases = vec!["Alias".into()];
+        storage
+            .add_dictionary_entry(&NewDictionaryEntry {
+                reading: "one",
+                surface: "Surface",
+                category: None,
+                aliases: &aliases,
+                priority: 0,
+                app_scope: None,
+            })
+            .unwrap();
+        let no_aliases = Vec::new();
+        assert!(storage
+            .add_dictionary_entry(&NewDictionaryEntry {
+                reading: "two",
+                surface: "surface",
+                category: None,
+                aliases: &no_aliases,
+                priority: 0,
+                app_scope: Some("global")
+            })
+            .is_err());
+        assert!(storage
+            .add_dictionary_entry(&NewDictionaryEntry {
+                reading: "two",
+                surface: "Other",
+                category: None,
+                aliases: &["alias".into()],
+                priority: 0,
+                app_scope: None
+            })
+            .is_err());
+        assert!(storage
+            .add_dictionary_entry(&NewDictionaryEntry {
+                reading: "two",
+                surface: "Surface",
+                category: None,
+                aliases: &no_aliases,
+                priority: 0,
+                app_scope: Some("app:code")
+            })
+            .is_ok());
+    }
+
+    #[test]
+    fn candidate_detection_is_narrow_and_confirmation_is_explicit() {
+        assert_eq!(
+            detect_dictionary_candidate("Use open ai now", "Use OpenAI now"),
+            Some(("open ai".into(), "OpenAI".into()))
+        );
+        assert_eq!(
+            detect_dictionary_candidate("hello world", "goodbye world"),
+            None
+        );
+        for value in [
+            "https://example.com",
+            "See example.com",
+            "foo/bar",
+            "module.function",
+            "foo + bar",
+            "123-456",
+            "foo::bar",
+            "foo()",
+            "line\nbreak",
+        ] {
+            assert_eq!(
+                detect_dictionary_candidate(value, &value.to_uppercase()),
+                None,
+                "{value}"
+            );
+        }
+        assert_eq!(detect_dictionary_candidate("foo + bar", "Foo+Bar"), None);
+        let storage = Storage::in_memory().unwrap();
+        let id = storage
+            .add_dictionary_candidate_from_correction("open ai", "OpenAI", None)
+            .unwrap()
+            .unwrap();
+        assert!(storage.list_dictionary().unwrap().is_empty());
+        let confirmed = storage.confirm_dictionary_candidate(id).unwrap().unwrap();
+        assert_eq!(confirmed.source, "auto");
+        let rejected = storage
+            .add_dictionary_candidate_from_correction("chat gpt", "ChatGPT", None)
+            .unwrap()
+            .unwrap();
+        assert!(storage.reject_dictionary_candidate(rejected).unwrap());
+        assert_eq!(storage.list_dictionary().unwrap().len(), 1);
+        let disabled = Settings {
+            history_enabled: false,
+            ..Settings::default()
+        };
+        storage.update_settings(&disabled).unwrap();
+        assert_eq!(
+            storage
+                .add_dictionary_candidate_from_correction("open ai", "OpenAI", None)
+                .unwrap(),
+            None
+        );
     }
 }

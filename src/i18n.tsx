@@ -74,6 +74,7 @@ const en = {
   "The target changed and the clipboard is unavailable.": "The target changed and the clipboard is unavailable.",
   "Translation inserted.": "Translation inserted.",
   "Personalization profiles": "Personalization profiles", "Structured style settings are retained locally; no transcript examples are stored.": "Structured style settings are retained locally; no transcript examples are stored.", "Global profile": "Global profile", "Fallback style used when no app or category profile matches.": "Fallback style used when no app or category profile matches.", "Optional guidance": "Optional guidance", Clear: "Clear", "Scoped profiles": "Scoped profiles", "app:code or category:development": "app:code or category:development", Remove: "Remove", "Add scoped profile": "Add scoped profile", Formal: "Formal", Casual: "Casual", Concise: "Concise", Detailed: "Detailed",
+  "Import CSV": "Import CSV", "CSV format help": "UTF-8 CSV: reading,surface,category,aliases (use |),priority,app_scope", "Save entry": "Save entry", "Search dictionary": "Search dictionary", All: "All", "Auto-added": "Auto-added", "Manually-added": "Manually-added", "Suggested spellings": "Suggested spellings", Confirm: "Confirm", Reject: "Reject", "Edit": "Edit", "Dictionary entry updated.": "Dictionary entry updated.", "Imported dictionary entries.": "Imported dictionary entries.", "Dictionary candidate confirmed.": "Dictionary candidate confirmed.",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
@@ -149,6 +150,7 @@ const ja: Record<MessageKey, string> = {
   "The target changed; the translation remains on the clipboard.": "入力対象が変更されたため、翻訳結果はクリップボードに残っています。",
   "The target changed and the clipboard is unavailable.": "入力対象が変更され、クリップボードも利用できません。",
   "Translation inserted.": "翻訳結果を挿入しました。",
+  "Import CSV": "CSVをインポート", "CSV format help": "UTF-8 CSV: reading,surface,category,aliases（|区切り）,priority,app_scope", "Save entry": "項目を保存", "Search dictionary": "辞書を検索", All: "すべて", "Auto-added": "自動追加", "Manually-added": "手動追加", "Suggested spellings": "候補の表記", Confirm: "確認", Reject: "却下", "Edit": "編集", "Dictionary entry updated.": "辞書項目を更新しました。", "Imported dictionary entries.": "辞書項目をインポートしました。", "Dictionary candidate confirmed.": "辞書候補を確定しました。",
 } satisfies Record<MessageKey, string>;
 
 const appMessageKeys: ReadonlySet<MessageKey> = new Set(

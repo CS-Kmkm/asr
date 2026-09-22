@@ -430,6 +430,10 @@ pub(crate) async fn stop_recording(
             latency_ms: Some(latency_ms as i64),
         })
         .map_err(command_error)?;
+    if processed_text.is_some() {
+        let _ =
+            storage.add_dictionary_candidate_from_correction(&transcript.text, &final_text, None);
+    }
     storage
         .add_metric(
             "dictation",
@@ -950,8 +954,46 @@ pub(crate) fn list_history(
 }
 
 #[tauri::command]
-pub(crate) fn list_dictionary(storage: State<'_, Storage>) -> Result<Vec<DictionaryEntry>, String> {
-    storage.list_dictionary().map_err(command_error)
+pub(crate) fn list_dictionary(
+    query: Option<String>,
+    source: Option<String>,
+    storage: State<'_, Storage>,
+) -> Result<Vec<DictionaryEntry>, String> {
+    storage
+        .search_dictionary(query.as_deref(), source.as_deref())
+        .map_err(command_error)
+}
+
+#[tauri::command]
+pub(crate) fn update_dictionary_entry(
+    id: i64,
+    entry: DictionaryEntryInput,
+    storage: State<'_, Storage>,
+) -> Result<DictionaryEntry, String> {
+    personalization::validate_dictionary_scope(entry.app_scope.as_deref())
+        .map_err(str::to_owned)?;
+    if !storage
+        .update_dictionary_entry(
+            id,
+            &NewDictionaryEntry {
+                reading: &entry.reading,
+                surface: &entry.surface,
+                category: entry.category.as_deref(),
+                aliases: &entry.aliases,
+                priority: entry.priority,
+                app_scope: entry.app_scope.as_deref(),
+            },
+        )
+        .map_err(command_error)?
+    {
+        return Err("dictionary entry not found".into());
+    }
+    storage
+        .list_dictionary()
+        .map_err(command_error)?
+        .into_iter()
+        .find(|item| item.id == id)
+        .ok_or_else(|| "dictionary entry not found".into())
 }
 
 #[tauri::command]
@@ -985,6 +1027,49 @@ pub(crate) fn delete_dictionary_entry(id: i64, storage: State<'_, Storage>) -> R
         Ok(())
     } else {
         Err("dictionary entry not found".into())
+    }
+}
+
+#[tauri::command]
+pub(crate) fn import_dictionary_csv(
+    input: DictionaryImportInput,
+    storage: State<'_, Storage>,
+) -> Result<usize, String> {
+    storage
+        .import_dictionary_csv(&input.csv)
+        .map_err(command_error)
+}
+
+#[tauri::command]
+pub(crate) fn list_dictionary_candidates(
+    storage: State<'_, Storage>,
+) -> Result<Vec<DictionaryCandidate>, String> {
+    storage.list_dictionary_candidates().map_err(command_error)
+}
+
+#[tauri::command]
+pub(crate) fn confirm_dictionary_candidate(
+    id: i64,
+    storage: State<'_, Storage>,
+) -> Result<DictionaryEntry, String> {
+    storage
+        .confirm_dictionary_candidate(id)
+        .map_err(command_error)?
+        .ok_or_else(|| "dictionary candidate not found".into())
+}
+
+#[tauri::command]
+pub(crate) fn reject_dictionary_candidate(
+    id: i64,
+    storage: State<'_, Storage>,
+) -> Result<(), String> {
+    if storage
+        .reject_dictionary_candidate(id)
+        .map_err(command_error)?
+    {
+        Ok(())
+    } else {
+        Err("dictionary candidate not found".into())
     }
 }
 
