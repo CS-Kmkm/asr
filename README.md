@@ -132,6 +132,15 @@ The automatic editor has independent switches for:
 - formatting spoken lists, steps, action items, and key points;
 - light clarity and grammar repair without changing meaning, tone, or formality.
 
+Correction mode defaults to **Conservative**, which keeps the spoken order. The
+optional **Intent-aware** mode may organize the current transcript across its
+utterance order, apply a later explicit correction consistently, merge duplicate
+information, and select paragraph or list structure. It never invents details,
+learns automatically, or uses context beyond the current transcript and selected
+profile. URLs, digit-bearing tokens, backtick code, and explicit uncertainty
+markers are checked after intent-aware correction; a failed check uses the
+original transcript.
+
 For OpenAI correction, reasoning effort can be set to `none`, `low`, `medium`,
 `high`, `xhigh`, or `max`. Higher values can improve difficult corrections at
 the cost of additional latency and token usage; support depends on the selected
@@ -177,6 +186,13 @@ GEMINI_API_KEY=...
 
 Correction is disabled by default. The default model IDs can be changed in the
 UI without rebuilding the application.
+
+Manual provider quality check: with an explicitly configured OpenAI or Gemini
+credential, test conservative and intent-aware correction on Japanese and
+English dictation containing a name, URL, number, code span, and uncertainty.
+Confirm that intent-aware organization improves only the current transcript and
+never adds a concrete fact. This check is intentionally opt-in because it sends
+the sample text to the selected provider and may incur charges.
 
 ## Serve a local model through the OpenAI API shape
 
