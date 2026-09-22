@@ -98,7 +98,7 @@ interface CorrectionPreview {
 }
 
 interface VoiceModeEvent {
-  mode: "dictate" | "translate";
+  mode: "dictate" | "translate" | "edit";
   targetLanguage: string | null;
 }
 
@@ -219,7 +219,11 @@ function RecordingOverlay() {
       <div className="recording-overlay recording" role="status" aria-label={t("Recording in progress")}>
         <span className="recording-live-dot" aria-hidden="true" />
         <span className="recording-overlay-label">
-          {voiceMode.mode === "translate" ? t("Translating") : t("Listening")}
+          {voiceMode.mode === "translate"
+            ? t("Translating")
+            : voiceMode.mode === "edit"
+              ? t("Editing")
+              : t("Listening")}
         </span>
         <span className="recording-wave" aria-hidden="true">
           {waveform.map((amplitude, index) => (
@@ -249,8 +253,9 @@ function RecordingOverlay() {
   if (phase !== "processing" && phase !== "injecting") return null;
 
   const compactPreview = compactOverlayPreview(preview?.text ?? "");
-  const label =
-    phase === "injecting"
+  const label = voiceMode.mode === "edit"
+    ? t("Editing")
+    : phase === "injecting"
       ? message?.startsWith("Finalizing")
         ? t("Updating text")
         : t("Inserting")

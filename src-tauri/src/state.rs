@@ -17,6 +17,7 @@ pub enum PipelinePhase {
 pub enum PipelineMode {
     Dictate,
     Translate,
+    Edit,
 }
 
 struct PipelineOperation {
@@ -270,6 +271,33 @@ mod tests {
             lifecycle.begin_processing().unwrap_err(),
             "recording stop is already in progress"
         );
+    }
+
+    #[test]
+    fn edit_owns_the_pipeline_until_it_finishes() {
+        let lifecycle = PipelineLifecycle::default();
+        let id = lifecycle.begin_start(PipelineMode::Edit).unwrap();
+        lifecycle.mark_recording(id).unwrap();
+        let (_, mode, _) = lifecycle.begin_processing().unwrap();
+        assert_eq!(mode, PipelineMode::Edit);
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_err());
+        assert!(lifecycle.begin_start(PipelineMode::Translate).is_err());
+        lifecycle.finish(id);
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_ok());
+    }
+
+    #[test]
+    fn edit_cancel_during_start_prevents_recording_and_releases_ownership() {
+        let lifecycle = PipelineLifecycle::default();
+        let id = lifecycle.begin_start(PipelineMode::Edit).unwrap();
+        assert_eq!(
+            lifecycle.cancel().unwrap(),
+            Some((id, PipelinePhase::Starting))
+        );
+        assert!(lifecycle.mark_recording(id).is_err());
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_err());
+        lifecycle.finish(id);
+        assert!(lifecycle.begin_start(PipelineMode::Translate).is_ok());
     }
 
     #[test]

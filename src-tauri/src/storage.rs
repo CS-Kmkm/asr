@@ -71,6 +71,8 @@ impl Storage {
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                transcript_text TEXT NOT NULL,
                processed_text TEXT,
+               source_text TEXT,
+               instruction_text TEXT,
                mode TEXT NOT NULL,
                asr_provider TEXT NOT NULL,
                llm_provider TEXT,
@@ -104,6 +106,22 @@ impl Storage {
                 "ALTER TABLE dictation_history ADD COLUMN target_language TEXT",
                 [],
             )?;
+        }
+        for column in ["source_text", "instruction_text"] {
+            let exists: bool = connection.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM pragma_table_info('dictation_history')
+                   WHERE name = ?1
+                 )",
+                [column],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                connection.execute(
+                    &format!("ALTER TABLE dictation_history ADD COLUMN {column} TEXT"),
+                    [],
+                )?;
+            }
         }
         Ok(())
     }
@@ -165,12 +183,15 @@ impl Storage {
         }
         self.connection()?.execute(
             "INSERT INTO dictation_history(
-               transcript_text, processed_text, mode, asr_provider, llm_provider,
-               target_language, app_category, duration_ms, latency_ms, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+               transcript_text, processed_text, source_text, instruction_text, mode,
+               asr_provider, llm_provider, target_language, app_category, duration_ms,
+               latency_ms, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 item.transcript_text,
                 item.processed_text,
+                item.source_text,
+                item.instruction_text,
                 item.mode,
                 item.asr_provider,
                 item.llm_provider,
@@ -191,7 +212,8 @@ impl Storage {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, transcript_text, processed_text, mode, asr_provider, llm_provider,
-                    target_language, app_category, duration_ms, latency_ms, created_at
+                    target_language, app_category, duration_ms, latency_ms, created_at,
+                    source_text, instruction_text
              FROM dictation_history ORDER BY created_at DESC LIMIT ?1",
         )?;
         let rows = statement.query_map([limit.min(500)], |row| {
@@ -199,6 +221,8 @@ impl Storage {
                 id: row.get(0)?,
                 transcript_text: row.get(1)?,
                 processed_text: row.get(2)?,
+                source_text: row.get(11)?,
+                instruction_text: row.get(12)?,
                 mode: row.get(3)?,
                 asr_provider: row.get(4)?,
                 llm_provider: row.get(5)?,
@@ -365,6 +389,8 @@ mod tests {
         NewHistoryItem {
             transcript_text: "private transcript",
             processed_text: Some("processed transcript"),
+            source_text: None,
+            instruction_text: None,
             mode: "faithful",
             asr_provider: "test",
             llm_provider: None,
@@ -435,6 +461,21 @@ mod tests {
             )
             .unwrap();
         assert!(exists);
+        for column in ["source_text", "instruction_text"] {
+            let exists: bool = storage
+                .connection()
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM pragma_table_info('dictation_history')
+                       WHERE name = ?1
+                     )",
+                    [column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing migrated column {column}");
+        }
     }
 
     #[test]
@@ -448,6 +489,27 @@ mod tests {
         let stored = storage.list_history(1).unwrap().remove(0);
         assert_eq!(stored.mode, "translate");
         assert_eq!(stored.target_language.as_deref(), Some("ja"));
+    }
+
+    #[test]
+    fn edit_history_round_trips_source_instruction_and_result() {
+        let storage = Storage::in_memory().unwrap();
+        let mut edit = item();
+        edit.transcript_text = "make it concise";
+        edit.processed_text = Some("Short result.");
+        edit.source_text = Some("A verbose original selection.");
+        edit.instruction_text = Some("make it concise");
+        edit.mode = "edit";
+        edit.llm_provider = Some("local");
+        storage.add_history(&edit).unwrap();
+
+        let stored = storage.list_history(1).unwrap().remove(0);
+        assert_eq!(stored.mode, "edit");
+        assert_eq!(stored.transcript_text, "make it concise");
+        assert_eq!(stored.source_text.as_deref(), edit.source_text);
+        assert_eq!(stored.instruction_text.as_deref(), edit.instruction_text);
+        assert_eq!(stored.processed_text.as_deref(), edit.processed_text);
+        assert_eq!(stored.llm_provider.as_deref(), Some("local"));
     }
 
     #[test]
@@ -555,7 +617,10 @@ mod tests {
         settings.history_enabled = false;
         storage.update_settings(&settings).unwrap();
 
-        assert!(!storage.add_history(&item()).unwrap());
+        let mut private_edit = item();
+        private_edit.source_text = Some("private selected text");
+        private_edit.instruction_text = Some("private spoken instruction");
+        assert!(!storage.add_history(&private_edit).unwrap());
         let count: i64 = storage
             .connection()
             .unwrap()

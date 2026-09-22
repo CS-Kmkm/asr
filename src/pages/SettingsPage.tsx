@@ -26,6 +26,7 @@ export function SettingsPage({
   const [hotkey, setHotkey] = useState(settings.hotkey);
   const [translationHotkey, setTranslationHotkey] = useState(settings.translationHotkey);
   const [voiceTranslateHotkey, setVoiceTranslateHotkey] = useState(settings.voiceTranslateHotkey);
+  const [speakToEditHotkey, setSpeakToEditHotkey] = useState(settings.speakToEditHotkey);
   const [translationInstruction, setTranslationInstruction] = useState(settings.translationInstruction);
   const [languageToAdd, setLanguageToAdd] = useState("zh");
   const cancelHotkeyBlurRef = useRef(false);
@@ -34,12 +35,15 @@ export function SettingsPage({
   const suppressTranslationBlurRef = useRef(false);
   const cancelVoiceTranslateBlurRef = useRef(false);
   const suppressVoiceTranslateBlurRef = useRef(false);
+  const cancelSpeakToEditBlurRef = useRef(false);
+  const suppressSpeakToEditBlurRef = useRef(false);
   const cancelTranslationInstructionBlurRef = useRef(false);
   const suppressTranslationInstructionBlurRef = useRef(false);
 
   useEffect(() => setHotkey(settings.hotkey), [settings.hotkey]);
   useEffect(() => setTranslationHotkey(settings.translationHotkey), [settings.translationHotkey]);
   useEffect(() => setVoiceTranslateHotkey(settings.voiceTranslateHotkey), [settings.voiceTranslateHotkey]);
+  useEffect(() => setSpeakToEditHotkey(settings.speakToEditHotkey), [settings.speakToEditHotkey]);
   useEffect(() => setTranslationInstruction(settings.translationInstruction), [settings.translationInstruction]);
   useEffect(() => {
     if (!settings.translationTargetLanguages.includes(languageToAdd)) return;
@@ -86,6 +90,17 @@ export function SettingsPage({
     }
     if (voiceTranslateHotkey !== settings.voiceTranslateHotkey) {
       onSave({ voiceTranslateHotkey });
+    }
+  }
+
+  function commitSpeakToEditHotkey() {
+    if (cancelSpeakToEditBlurRef.current || suppressSpeakToEditBlurRef.current) {
+      cancelSpeakToEditBlurRef.current = false;
+      suppressSpeakToEditBlurRef.current = false;
+      return;
+    }
+    if (speakToEditHotkey !== settings.speakToEditHotkey) {
+      onSave({ speakToEditHotkey });
     }
   }
 
@@ -239,6 +254,29 @@ export function SettingsPage({
                 </button>
               </div>
             </div>
+          }
+        />
+        <SettingRow
+          title={t("Speak to edit hotkey")}
+          detail={t("Edits selected text from a spoken instruction; the default is Ctrl+Shift+E.")}
+          control={
+            <input
+              value={speakToEditHotkey}
+              onChange={(event) => setSpeakToEditHotkey(event.target.value)}
+              onBlur={commitSpeakToEditHotkey}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  commitSpeakToEditHotkey();
+                  suppressSpeakToEditBlurRef.current = true;
+                  event.currentTarget.blur();
+                } else if (event.key === "Escape") {
+                  setSpeakToEditHotkey(settings.speakToEditHotkey);
+                  cancelSpeakToEditBlurRef.current = true;
+                  event.currentTarget.blur();
+                }
+              }}
+            />
           }
         />
       <SettingRow

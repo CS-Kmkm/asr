@@ -237,6 +237,7 @@ impl InputMonitor {
     pub(crate) fn unchanged_since(&self, checkpoint: u64) -> bool {
         !self.cancelled()
             && self.available.load(Ordering::Acquire)
+            && !self.shortcut_pending()
             && self.sequence.load(Ordering::Acquire) == checkpoint
     }
 
@@ -274,6 +275,11 @@ impl InputMonitor {
     #[cfg(test)]
     pub(crate) fn test_record_input(&self) {
         self.sequence.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_shortcut_pending(&self, value: bool) {
+        self.shortcut_pending.store(value, Ordering::Release);
     }
 }
 
@@ -454,5 +460,16 @@ mod tests {
         assert!(monitor.unchanged_since(checkpoint));
         monitor.test_record_input();
         assert!(!monitor.unchanged_since(checkpoint));
+    }
+
+    #[test]
+    fn pending_recording_shortcut_blocks_an_unchanged_checkpoint() {
+        let monitor = InputMonitor::default();
+        monitor.test_set_available(true);
+        let checkpoint = monitor.checkpoint().unwrap();
+        monitor.test_set_shortcut_pending(true);
+        assert!(!monitor.unchanged_since(checkpoint));
+        monitor.test_set_shortcut_pending(false);
+        assert!(monitor.unchanged_since(checkpoint));
     }
 }

@@ -29,7 +29,9 @@ use audio::{
     AudioCapture, AudioDevice, AudioEnhancementConfig, CaptureConfig, CpalAudioCapture,
     NoiseSuppressionLevel,
 };
-use injection::{InjectionOptions, InsertResult, SystemTextInjector, TargetWindow, TextInjector};
+use injection::{
+    InjectionOptions, InsertResult, SelectedText, SystemTextInjector, TargetWindow, TextInjector,
+};
 use input_monitor::InputMonitor;
 use state::{AppState, PipelineLifecycle, PipelineMode, PipelinePhase};
 use storage::Storage;
@@ -87,6 +89,7 @@ pub(crate) fn model_identity(settings: &Settings) -> (Option<String>, String) {
 pub(crate) struct Services {
     audio: tokio::sync::Mutex<Box<dyn AudioCapture>>,
     live: tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
+    edit: tokio::sync::Mutex<Option<EditSession>>,
     target: Mutex<Option<TargetWindow>>,
     transcriber: Arc<dyn Transcriber>,
     input_monitor: Arc<InputMonitor>,
@@ -105,6 +108,7 @@ impl Services {
         Self {
             audio: tokio::sync::Mutex::new(Box::new(CpalAudioCapture::new())),
             live: tokio::sync::Mutex::new(None),
+            edit: tokio::sync::Mutex::new(None),
             target: Mutex::new(None),
             transcriber: Arc::new(JsonlTranscriber::new(
                 worker_command_for_settings(settings),
@@ -147,6 +151,7 @@ impl Services {
         if let Some(task) = self.live.lock().await.take() {
             let _ = task.finish().await;
         }
+        self.edit.lock().await.take();
         if let Ok(mut target) = self.target.lock() {
             target.take();
         }
@@ -155,6 +160,43 @@ impl Services {
         }
         self.input_monitor.shutdown();
         let _ = self.transcriber.shutdown().await;
+    }
+}
+
+pub(crate) struct EditSession {
+    selection: SelectedText,
+    injector: SystemTextInjector,
+    monitor: Arc<InputMonitor>,
+    checkpoint: u64,
+}
+
+impl EditSession {
+    fn new(settings: &Settings, from_shortcut: bool) -> Result<Self, String> {
+        let injector = SystemTextInjector::new(InjectionOptions {
+            restore_clipboard: settings.clipboard_restore,
+        });
+        let selection = injector
+            .capture_selection()
+            .map_err(|_| "Select text in a supported foreground edit control.".to_string())?;
+        let monitor = Arc::new(InputMonitor::default());
+        if !monitor.start_for_recording(&settings.speak_to_edit_hotkey, from_shortcut) {
+            return Err("Speak to edit could not monitor the original selection safely.".into());
+        }
+        let checkpoint = monitor
+            .checkpoint()
+            .ok_or("Speak to edit could not monitor the original selection safely.")?;
+        Ok(Self {
+            selection,
+            injector,
+            monitor,
+            checkpoint,
+        })
+    }
+}
+
+impl Drop for EditSession {
+    fn drop(&mut self) {
+        self.monitor.shutdown();
     }
 }
 
@@ -542,6 +584,16 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode) {
                 )
                 .await
             }
+            PipelineMode::Edit => {
+                commands::start_speak_to_edit_with_origin(
+                    app.clone(),
+                    app.state::<Services>(),
+                    app.state::<AppState>(),
+                    app.state::<Storage>(),
+                    true,
+                )
+                .await
+            }
         },
         PipelinePhase::Starting | PipelinePhase::Processing => Ok(()),
     };
@@ -657,10 +709,15 @@ fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
     let Ok(voice_translate) = parse_shortcut(&settings.voice_translate_hotkey) else {
         return;
     };
+    let Ok(speak_to_edit) = parse_shortcut(&settings.speak_to_edit_hotkey) else {
+        return;
+    };
     if shortcut == recording {
         tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Dictate));
     } else if shortcut == voice_translate {
         tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Translate));
+    } else if shortcut == speak_to_edit {
+        tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Edit));
     } else if shortcut == translation {
         tauri::async_runtime::spawn(translate_selection(app));
     }
@@ -739,13 +796,18 @@ pub fn run() {
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
             let voice_translate_shortcut = parse_shortcut(&settings.voice_translate_hotkey)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            let edit_shortcut = parse_shortcut(&settings.speak_to_edit_hotkey)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
             if shortcut == translation_shortcut
                 || shortcut == voice_translate_shortcut
                 || translation_shortcut == voice_translate_shortcut
+                || edit_shortcut == shortcut
+                || edit_shortcut == translation_shortcut
+                || edit_shortcut == voice_translate_shortcut
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "recording, selected-text translation, and voice Translate hotkeys must differ",
+                    "recording, selected-text translation, voice Translate, and Speak to edit hotkeys must differ",
                 )
                 .into());
             }
@@ -756,6 +818,7 @@ pub fn run() {
             app.global_shortcut().register(shortcut)?;
             app.global_shortcut().register(translation_shortcut)?;
             app.global_shortcut().register(voice_translate_shortcut)?;
+            app.global_shortcut().register(edit_shortcut)?;
             if cleanup_stale_artifacts(
                 &std::env::temp_dir(),
                 settings.delete_audio_after_processing,
@@ -799,6 +862,7 @@ pub fn run() {
             commands::list_audio_devices,
             commands::start_recording,
             commands::start_voice_translation,
+            commands::start_speak_to_edit,
             commands::stop_recording,
             commands::cancel_recording,
             commands::cycle_voice_translation_target,

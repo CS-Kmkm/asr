@@ -787,6 +787,130 @@ mod tests {
         assert!(state.select_recent("").is_none());
     }
 
+    fn selected_state() -> TargetText {
+        TargetText {
+            identity: vec![1],
+            before: "prefix ".into(),
+            selected: "original".into(),
+            after: " suffix".into(),
+        }
+    }
+
+    #[test]
+    fn unchanged_captured_selection_is_replaced_once() {
+        let backend = MockBackend::new();
+        *backend.text.borrow_mut() = selected_state();
+        let before = backend.text.borrow().clone();
+        let monitor = monitor();
+        let checkpoint = monitor.checkpoint().unwrap();
+
+        assert_eq!(
+            replace_selection(
+                &backend,
+                InjectionOptions::default(),
+                &target(),
+                &before,
+                "edited",
+                &monitor,
+                checkpoint,
+            )
+            .unwrap(),
+            InsertResult::ClipboardPaste
+        );
+        assert_eq!(backend.content(), "prefix edited suffix");
+        assert_eq!(
+            backend
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == "paste")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn changed_selection_context_falls_back_to_clipboard_without_target_edits() {
+        for change in [
+            "focus",
+            "selection",
+            "input",
+            "shortcut",
+            "ime_active",
+            "ime_unknown",
+        ] {
+            let backend = MockBackend::new();
+            *backend.text.borrow_mut() = selected_state();
+            let before = backend.text.borrow().clone();
+            let monitor = monitor();
+            let checkpoint = monitor.checkpoint().unwrap();
+            match change {
+                "focus" => backend.target_valid.set(false),
+                "selection" => backend.text.borrow_mut().selected.push('!'),
+                "input" => monitor.test_record_input(),
+                "shortcut" => monitor.test_set_shortcut_pending(true),
+                "ime_active" => backend.ime.set(Some(true)),
+                "ime_unknown" => backend.ime.set(None),
+                _ => unreachable!(),
+            }
+            let expected = backend.content();
+
+            assert_eq!(
+                replace_selection(
+                    &backend,
+                    InjectionOptions::default(),
+                    &target(),
+                    &before,
+                    "edited",
+                    &monitor,
+                    checkpoint,
+                )
+                .unwrap(),
+                InsertResult::ClipboardOnly,
+                "{change}"
+            );
+            assert_eq!(backend.content(), expected, "{change}");
+            assert_eq!(&*backend.clipboard.borrow(), "edited", "{change}");
+            assert!(!backend.calls.borrow().contains(&"paste"), "{change}");
+        }
+    }
+
+    #[test]
+    fn unconfirmed_selection_paste_is_not_retried_or_restored() {
+        let mut backend = MockBackend::new();
+        *backend.text.borrow_mut() = selected_state();
+        backend.settle_after = VERIFY_ATTEMPTS + 2;
+        let before = backend.text.borrow().clone();
+        let monitor = monitor();
+        let checkpoint = monitor.checkpoint().unwrap();
+
+        assert_eq!(
+            replace_selection(
+                &backend,
+                InjectionOptions::default(),
+                &target(),
+                &before,
+                "edited",
+                &monitor,
+                checkpoint,
+            )
+            .unwrap(),
+            InsertResult::PasteUnverified
+        );
+        assert_eq!(&*backend.clipboard.borrow(), "edited");
+        assert_eq!(backend.content(), "prefix original suffix");
+        assert_eq!(
+            backend
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == "paste")
+                .count(),
+            1
+        );
+        assert!(!backend.calls.borrow().contains(&"restore"));
+    }
+
     #[test]
     fn a_failed_paste_is_not_retried_as_character_input() {
         let backend = MockBackend::new();

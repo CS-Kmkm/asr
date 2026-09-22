@@ -103,6 +103,20 @@ const en = {
   "Translation failed; the raw transcript remains on the clipboard.": "Translation failed; the raw transcript remains on the clipboard.",
   "Translation paste could not be confirmed; the result remains available in this app.": "Translation paste could not be confirmed; the result remains available in this app.",
   "Voice translation inserted.": "Voice translation inserted.",
+  Editing: "Editing",
+  "Speak to edit hotkey": "Speak to edit hotkey",
+  "Edits selected text from a spoken instruction; the default is Ctrl+Shift+E.": "Edits selected text from a spoken instruction; the default is Ctrl+Shift+E.",
+  "Selected text": "Selected text",
+  "Spoken instruction": "Spoken instruction",
+  "Recording an edit instruction.": "Recording an edit instruction.",
+  "Applying the spoken edit instruction.": "Applying the spoken edit instruction.",
+  "Replacing the original selection.": "Replacing the original selection.",
+  "Editing cancelled.": "Editing cancelled.",
+  "Editing failed; the original selection was not changed.": "Editing failed; the original selection was not changed.",
+  "Selected text updated.": "Selected text updated.",
+  "The original selection changed; the edit remains on the clipboard.": "The original selection changed; the edit remains on the clipboard.",
+  "The edit paste could not be confirmed; the result remains on the clipboard.": "The edit paste could not be confirmed; the result remains on the clipboard.",
+  "Speak to edit could not monitor the original selection safely.": "Speak to edit could not monitor the original selection safely.",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
@@ -206,6 +220,20 @@ const ja: Record<MessageKey, string> = {
   "Translation failed; the raw transcript remains on the clipboard.": "翻訳に失敗しました。元の文字起こしはクリップボードに残っています。",
   "Translation paste could not be confirmed; the result remains available in this app.": "翻訳結果の貼り付けを確認できませんでした。結果はこのアプリで確認できます。",
   "Voice translation inserted.": "音声翻訳結果を挿入しました。",
+  Editing: "編集中",
+  "Speak to edit hotkey": "音声編集ホットキー",
+  "Edits selected text from a spoken instruction; the default is Ctrl+Shift+E.": "選択したテキストを音声指示で編集します。既定値は Ctrl+Shift+E です。",
+  "Selected text": "選択テキスト",
+  "Spoken instruction": "音声指示",
+  "Recording an edit instruction.": "編集指示を録音しています。",
+  "Applying the spoken edit instruction.": "音声編集指示を適用しています。",
+  "Replacing the original selection.": "元の選択範囲を置換しています。",
+  "Editing cancelled.": "音声編集をキャンセルしました。",
+  "Editing failed; the original selection was not changed.": "編集に失敗しました。元の選択範囲は変更されていません。",
+  "Selected text updated.": "選択テキストを更新しました。",
+  "The original selection changed; the edit remains on the clipboard.": "元の選択範囲が変わったため、編集結果をクリップボードに残しました。",
+  "The edit paste could not be confirmed; the result remains on the clipboard.": "編集結果の貼り付けを確認できませんでした。結果はクリップボードに残っています。",
+  "Speak to edit could not monitor the original selection safely.": "元の選択範囲を安全に監視できないため、音声編集を開始できませんでした。",
 } satisfies Record<MessageKey, string>;
 
 const appMessageKeys: ReadonlySet<MessageKey> = new Set(
@@ -245,6 +273,15 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "Translation failed; the raw transcript remains on the clipboard.",
       "Translation paste could not be confirmed; the result remains available in this app.",
       "Voice translation inserted.",
+      "Recording an edit instruction.",
+      "Applying the spoken edit instruction.",
+      "Replacing the original selection.",
+      "Editing cancelled.",
+      "Editing failed; the original selection was not changed.",
+      "Selected text updated.",
+      "The original selection changed; the edit remains on the clipboard.",
+      "The edit paste could not be confirmed; the result remains on the clipboard.",
+      "Speak to edit could not monitor the original selection safely.",
   ] satisfies MessageKey[],
 );
 

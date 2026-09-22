@@ -22,22 +22,25 @@ fn cancellation_copy(mode: PipelineMode) -> (&'static str, &'static str) {
     match mode {
         PipelineMode::Dictate => ("Dictation cancelled.", "dictation was cancelled"),
         PipelineMode::Translate => ("Translation cancelled.", "translation was cancelled"),
+        PipelineMode::Edit => ("Editing cancelled.", "editing was cancelled"),
     }
 }
 
-async fn take_published_session<T>(
+async fn take_published_sessions<T, U>(
     live: &tokio::sync::Mutex<Option<T>>,
+    edit: &tokio::sync::Mutex<Option<U>>,
     translation_target: &Mutex<Option<String>>,
-) -> Result<(Option<T>, Option<String>), String> {
+) -> Result<(Option<T>, Option<U>, Option<String>), String> {
     // Startup holds `live` while it publishes both the target language and the
     // session. Waiting for this lock prevents an immediate stop from observing
     // the lifecycle's Recording phase before that publication is complete.
     let live_task = live.lock().await.take();
+    let edit_session = edit.lock().await.take();
     let target_language = translation_target
         .lock()
         .map_err(|_| "translation target service is unavailable".to_string())?
         .take();
-    Ok((live_task, target_language))
+    Ok((live_task, edit_session, target_language))
 }
 
 fn validate_translation_targets(settings: &Settings) -> Result<(), String> {
@@ -98,6 +101,16 @@ pub(crate) async fn start_voice_translation(
     start_voice_translation_with_origin(app, services, state, storage, false).await
 }
 
+#[tauri::command]
+pub(crate) async fn start_speak_to_edit(
+    app: AppHandle,
+    services: State<'_, Services>,
+    state: State<'_, AppState>,
+    storage: State<'_, Storage>,
+) -> Result<(), String> {
+    start_speak_to_edit_with_origin(app, services, state, storage, false).await
+}
+
 pub(crate) async fn start_recording_with_origin(
     app: AppHandle,
     services: State<'_, Services>,
@@ -134,6 +147,24 @@ pub(crate) async fn start_voice_translation_with_origin(
     .await
 }
 
+pub(crate) async fn start_speak_to_edit_with_origin(
+    app: AppHandle,
+    services: State<'_, Services>,
+    state: State<'_, AppState>,
+    storage: State<'_, Storage>,
+    from_shortcut: bool,
+) -> Result<(), String> {
+    start_recording_mode(
+        app,
+        services,
+        state,
+        storage,
+        from_shortcut,
+        PipelineMode::Edit,
+    )
+    .await
+}
+
 async fn start_recording_mode(
     app: AppHandle,
     services: State<'_, Services>,
@@ -155,27 +186,41 @@ async fn start_recording_mode(
         return Err("selected-text translation is already active".into());
     }
     let settings = storage.get_settings().map_err(command_error)?;
+    let mut edit_session = (mode == PipelineMode::Edit)
+        .then(|| EditSession::new(&settings, from_shortcut))
+        .transpose()?;
     ensure_model_loaded(&app, &services, &settings).await?;
     if services.lifecycle.is_cancelled(operation_id) {
         emit_state(&app, &state, AppPhase::Idle, cancel_message);
         return Err(cancel_error.into());
     }
-    let target = SystemTextInjector::default()
-        .capture_target()
-        .map_err(command_error)?;
+    let target = (mode != PipelineMode::Edit)
+        .then(|| {
+            SystemTextInjector::default()
+                .capture_target()
+                .map_err(command_error)
+        })
+        .transpose()?;
     let mut live_slot = services.live.lock().await;
+    let mut edit_slot = services.edit.lock().await;
     let active_hotkey = match mode {
         PipelineMode::Dictate => settings.hotkey.as_str(),
         PipelineMode::Translate => settings.voice_translate_hotkey.as_str(),
+        PipelineMode::Edit => settings.speak_to_edit_hotkey.as_str(),
     };
-    let draft = live_dictation::LiveDraft::new(
-        target.clone(),
-        &settings,
-        active_hotkey,
-        from_shortcut,
-        mode == PipelineMode::Translate,
-    );
+    let draft = target.as_ref().map(|target| {
+        live_dictation::LiveDraft::new(
+            target.clone(),
+            &settings,
+            active_hotkey,
+            from_shortcut,
+            mode == PipelineMode::Translate,
+        )
+    });
     let cancel = services.lifecycle.cancellation(operation_id)?;
+    if let Some(session) = edit_session.as_ref() {
+        session.monitor.observe_cancellation(Some(cancel.clone()));
+    }
     let dictionary_terms = storage.dictionary_prompt_terms().unwrap_or_default();
     let prompt = (!dictionary_terms.is_empty()).then(|| dictionary_terms.join("\n"));
     let capture_config = capture_config(&settings);
@@ -197,7 +242,7 @@ async fn start_recording_mode(
     *services
         .target
         .lock()
-        .map_err(|_| "target service is unavailable".to_string())? = Some(target);
+        .map_err(|_| "target service is unavailable".to_string())? = target;
     let target_language =
         (mode == PipelineMode::Translate).then(|| settings.translation_target_language.clone());
     *services
@@ -208,7 +253,11 @@ async fn start_recording_mode(
     let _ = app.emit(
         "voice-mode",
         serde_json::json!({
-            "mode": if mode == PipelineMode::Translate { "translate" } else { "dictate" },
+            "mode": match mode {
+                PipelineMode::Dictate => "dictate",
+                PipelineMode::Translate => "translate",
+                PipelineMode::Edit => "edit",
+            },
             "targetLanguage": target_language,
         }),
     );
@@ -217,20 +266,17 @@ async fn start_recording_mode(
         &app,
         &state,
         AppPhase::Recording,
-        if mode == PipelineMode::Translate {
-            "Recording speech to translate."
-        } else {
-            "Recording from the selected microphone."
+        match mode {
+            PipelineMode::Translate => "Recording speech to translate.",
+            PipelineMode::Edit => "Recording an edit instruction.",
+            PipelineMode::Dictate => "Recording from the selected microphone.",
         },
     );
     recording_overlay::set_interactive(&app, mode == PipelineMode::Translate);
-    *live_slot = Some(live_dictation::start(
-        app.clone(),
-        operation_id,
-        draft,
-        prompt,
-        cancel,
-    ));
+    *live_slot =
+        draft.map(|draft| live_dictation::start(app.clone(), operation_id, draft, prompt, cancel));
+    *edit_slot = edit_session.take();
+    drop(edit_slot);
     drop(live_slot);
     std::mem::forget(guard);
 
@@ -294,8 +340,12 @@ pub(crate) async fn stop_recording(
         "Stopping recording and preparing audio.",
     );
     let started = Instant::now();
-    let (live_task, translation_target) =
-        take_published_session(&services.live, &services.voice_translation_target).await?;
+    let (live_task, mut edit_session, translation_target) = take_published_sessions(
+        &services.live,
+        &services.edit,
+        &services.voice_translation_target,
+    )
+    .await?;
     let mut audio = services.audio.lock().await;
     let artifact_result = audio.stop().await;
     // `stop` closes the input stream. Do not re-arm it while transcription is
@@ -307,10 +357,11 @@ pub(crate) async fn stop_recording(
         .as_ref()
         .ok()
         .map(|artifact| TempArtifact::new(artifact.path.clone(), false));
-    let mut draft = live_task
-        .ok_or("live dictation session is unavailable")?
-        .finish()
-        .await?;
+    let mut draft = match live_task {
+        Some(task) => Some(task.finish().await?),
+        None if mode == PipelineMode::Edit => None,
+        None => return Err("live dictation session is unavailable".into()),
+    };
     let settings = storage.get_settings().map_err(command_error)?;
     let artifact = artifact_result.map_err(|error| {
         emit_state(
@@ -394,6 +445,130 @@ pub(crate) async fn stop_recording(
         .lock()
         .map_err(|_| "target service is unavailable".to_string())?
         .take();
+    if mode == PipelineMode::Edit {
+        let session = edit_session.take().ok_or("edit session is unavailable")?;
+        let instruction_text = transcript.text.clone();
+        let source_text = session.selection.text().to_owned();
+        emit_correction_preview(&app, &instruction_text, "draft");
+        emit_state(
+            &app,
+            &state,
+            AppPhase::Processing,
+            "Applying the spoken edit instruction.",
+        );
+        let edit_started = Instant::now();
+        let edited = match correction::edit_selected_text(
+            &settings,
+            &source_text,
+            &instruction_text,
+            correction_cancel,
+            |delta| emit_correction_preview(&app, delta, "streaming"),
+        )
+        .await
+        {
+            Ok(edited) => edited,
+            Err(correction::CorrectionError::Cancelled) => {
+                emit_state(&app, &state, AppPhase::Idle, "Editing cancelled.");
+                return Err("editing was cancelled".into());
+            }
+            Err(_error) => {
+                let _ = storage.add_metric(
+                    "speak_to_edit",
+                    Some(settings.correction_provider.as_str()),
+                    Some(edit_started.elapsed().as_millis() as i64),
+                    false,
+                    Some("edit_failed"),
+                );
+                emit_state(
+                    &app,
+                    &state,
+                    AppPhase::Error,
+                    "Editing failed; the original selection was not changed.",
+                );
+                return Err("editing failed; the original selection was not changed".into());
+            }
+        };
+        emit_correction_preview(&app, &edited, "final");
+        if services.lifecycle.is_cancelled(operation_id) {
+            emit_state(&app, &state, AppPhase::Idle, "Editing cancelled.");
+            return Err("editing was cancelled".into());
+        }
+        session.monitor.wait_for_shortcut_release().await;
+        if services.lifecycle.is_cancelled(operation_id) {
+            emit_state(&app, &state, AppPhase::Idle, "Editing cancelled.");
+            return Err("editing was cancelled".into());
+        }
+        emit_state(
+            &app,
+            &state,
+            AppPhase::Injecting,
+            "Replacing the original selection.",
+        );
+        let insertion = match session.injector.replace_selection(
+            &session.selection,
+            &edited,
+            &session.monitor,
+            session.checkpoint,
+        ) {
+            Ok(result) => result,
+            Err(_) => {
+                session
+                    .injector
+                    .copy_to_clipboard(&edited)
+                    .map_err(command_error)?;
+                InsertResult::ClipboardOnly
+            }
+        };
+        recording_overlay::set_phase(&app, &AppPhase::Completed);
+        let latency_ms = started.elapsed().as_millis() as u64;
+        storage
+            .add_history(&NewHistoryItem {
+                transcript_text: &instruction_text,
+                processed_text: Some(&edited),
+                source_text: Some(&source_text),
+                instruction_text: Some(&instruction_text),
+                mode: "edit",
+                asr_provider: &transcript.model,
+                llm_provider: Some(settings.correction_provider.as_str()),
+                target_language: None,
+                app_category: None,
+                duration_ms: Some(duration_ms as i64),
+                latency_ms: Some(latency_ms as i64),
+            })
+            .map_err(command_error)?;
+        storage
+            .add_metric(
+                "speak_to_edit",
+                Some(settings.correction_provider.as_str()),
+                Some(edit_started.elapsed().as_millis() as i64),
+                true,
+                None,
+            )
+            .map_err(command_error)?;
+        let (insertion_label, completion) = match insertion {
+            InsertResult::ClipboardPaste => ("clipboard_paste", "Selected text updated."),
+            InsertResult::ClipboardOnly => (
+                "clipboard_only",
+                "The original selection changed; the edit remains on the clipboard.",
+            ),
+            InsertResult::PasteUnverified => (
+                "paste_unverified",
+                "The edit paste could not be confirmed; the result remains on the clipboard.",
+            ),
+        };
+        let snapshot = state.complete(edited.clone(), completion.into());
+        let _ = app.emit("app-state", snapshot);
+        emit_status(&app, insertion_label, completion);
+        return Ok(RecordingResult {
+            text: edited,
+            insertion: insertion_label.into(),
+            duration_ms,
+            latency_ms,
+        });
+    }
+    let mut draft = draft
+        .take()
+        .expect("non-edit recording has a live dictation session");
     let mut final_text = transcript.text.clone();
     let mut processed_text = None;
     let mut llm_provider = None;
@@ -587,6 +762,8 @@ pub(crate) async fn stop_recording(
         .add_history(&NewHistoryItem {
             transcript_text: &transcript.text,
             processed_text: processed_text.as_deref(),
+            source_text: None,
+            instruction_text: None,
             mode: if mode == PipelineMode::Translate {
                 "translate"
             } else if processed_text.is_some() {
@@ -707,6 +884,7 @@ pub(crate) async fn cancel_recording(
         &services.audio,
         &services.target,
         &services.live,
+        &services.edit,
     )
     .await?;
     recording_overlay::set_interactive(&app, false);
@@ -723,6 +901,8 @@ pub(crate) async fn cancel_recording(
             AppPhase::Idle,
             if mode == PipelineMode::Translate {
                 "Translation cancelled."
+            } else if mode == PipelineMode::Edit {
+                "Editing cancelled."
             } else {
                 "Dictation cancelled."
             },
@@ -736,6 +916,7 @@ async fn cancel_pipeline_operation(
     audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
     target: &Mutex<Option<TargetWindow>>,
     live: &tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
+    edit: &tokio::sync::Mutex<Option<EditSession>>,
 ) -> Result<bool, String> {
     let Some((operation_id, phase)) = lifecycle.cancel()? else {
         return Ok(false);
@@ -753,6 +934,7 @@ async fn cancel_pipeline_operation(
         target.take();
     }
     let live_task = live.lock().await.take();
+    edit.lock().await.take();
     let audio_result = {
         let mut audio = audio.lock().await;
         audio.cancel().await
@@ -858,14 +1040,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn immediate_stop_waits_for_translation_session_publication() {
+    async fn immediate_stop_waits_for_session_publication() {
         let live = Arc::new(tokio::sync::Mutex::new(None));
+        let edit = Arc::new(tokio::sync::Mutex::new(None));
         let translation_target = Arc::new(Mutex::new(None));
         let mut startup_publication = live.lock().await;
         let live_for_stop = Arc::clone(&live);
+        let edit_for_stop = Arc::clone(&edit);
         let target_for_stop = Arc::clone(&translation_target);
         let stopping = tokio::spawn(async move {
-            take_published_session(&live_for_stop, &target_for_stop)
+            take_published_sessions(&live_for_stop, &edit_for_stop, &target_for_stop)
                 .await
                 .unwrap()
         });
@@ -875,8 +1059,9 @@ mod tests {
         *startup_publication = Some(());
         drop(startup_publication);
 
-        let (session, target) = stopping.await.unwrap();
+        let (session, edit_session, target) = stopping.await.unwrap();
         assert_eq!(session, Some(()));
+        assert_eq!(edit_session, None::<()>);
         assert_eq!(target.as_deref(), Some("ja"));
     }
 
@@ -889,7 +1074,8 @@ mod tests {
         let target = Mutex::new(None);
         let audio_operation = audio.lock().await;
         let live = tokio::sync::Mutex::new(None);
-        let cancellation = cancel_pipeline_operation(&lifecycle, &audio, &target, &live);
+        let edit = tokio::sync::Mutex::new(None);
+        let cancellation = cancel_pipeline_operation(&lifecycle, &audio, &target, &live, &edit);
         tokio::pin!(cancellation);
 
         assert!(
@@ -898,7 +1084,7 @@ mod tests {
                 .is_err()
         );
         assert!(
-            !cancel_pipeline_operation(&lifecycle, &audio, &target, &live)
+            !cancel_pipeline_operation(&lifecycle, &audio, &target, &live, &edit)
                 .await
                 .unwrap()
         );
@@ -925,6 +1111,7 @@ mod tests {
             &lifecycle,
             &audio,
             &target,
+            &tokio::sync::Mutex::new(None),
             &tokio::sync::Mutex::new(None)
         )
         .await
@@ -942,6 +1129,7 @@ mod tests {
             &lifecycle,
             &test_audio(false),
             &Mutex::new(None),
+            &tokio::sync::Mutex::new(None),
             &tokio::sync::Mutex::new(None),
         )
         .await
@@ -991,6 +1179,9 @@ pub(crate) async fn update_settings(
     }
     if settings.voice_translate_hotkey.trim().is_empty() {
         return Err("voice Translate hotkey cannot be empty".into());
+    }
+    if settings.speak_to_edit_hotkey.trim().is_empty() {
+        return Err("Speak to edit hotkey cannot be empty".into());
     }
     validate_translation_targets(&settings)?;
     if !(1..=3650).contains(&settings.history_retention_days) {
@@ -1121,16 +1312,21 @@ pub(crate) async fn update_settings(
     let new_shortcut = parse_shortcut(&settings.hotkey)?;
     let new_translation_shortcut = parse_shortcut(&settings.translation_hotkey)?;
     let new_voice_translate_shortcut = parse_shortcut(&settings.voice_translate_hotkey)?;
+    let new_edit_shortcut = parse_shortcut(&settings.speak_to_edit_hotkey)?;
     let previous = storage.get_settings().map_err(command_error)?;
     let old_shortcut = parse_shortcut(&previous.hotkey)?;
     let old_translation_shortcut = parse_shortcut(&previous.translation_hotkey)?;
     let old_voice_translate_shortcut = parse_shortcut(&previous.voice_translate_hotkey)?;
+    let old_edit_shortcut = parse_shortcut(&previous.speak_to_edit_hotkey)?;
     if new_translation_shortcut == new_shortcut
         || new_voice_translate_shortcut == new_shortcut
         || new_voice_translate_shortcut == new_translation_shortcut
+        || new_edit_shortcut == new_shortcut
+        || new_edit_shortcut == new_translation_shortcut
+        || new_edit_shortcut == new_voice_translate_shortcut
     {
         return Err(
-            "recording, selected-text translation, and voice Translate hotkeys must differ".into(),
+            "recording, selected-text translation, voice Translate, and Speak to edit hotkeys must differ".into(),
         );
     }
     if settings.translation_instruction.chars().count() > 500
@@ -1149,6 +1345,7 @@ pub(crate) async fn update_settings(
     let recording_changed = new_shortcut != old_shortcut;
     let translation_changed = new_translation_shortcut != old_translation_shortcut;
     let voice_translate_changed = new_voice_translate_shortcut != old_voice_translate_shortcut;
+    let edit_changed = new_edit_shortcut != old_edit_shortcut;
     let rollback_shortcuts = || {
         if recording_changed {
             let _ = app.global_shortcut().unregister(new_shortcut);
@@ -1161,6 +1358,9 @@ pub(crate) async fn update_settings(
                 .global_shortcut()
                 .unregister(new_voice_translate_shortcut);
         }
+        if edit_changed {
+            let _ = app.global_shortcut().unregister(new_edit_shortcut);
+        }
         if recording_changed {
             let _ = app.global_shortcut().register(old_shortcut);
         }
@@ -1170,9 +1370,12 @@ pub(crate) async fn update_settings(
         if voice_translate_changed {
             let _ = app.global_shortcut().register(old_voice_translate_shortcut);
         }
+        if edit_changed {
+            let _ = app.global_shortcut().register(old_edit_shortcut);
+        }
     };
     // Remove every changed registration before adding any replacement. This
-    // makes swapping the three shortcuts an atomic-looking transaction.
+    // makes swapping the four shortcuts an atomic-looking transaction.
     if recording_changed {
         if let Err(error) = app.global_shortcut().unregister(old_shortcut) {
             rollback_shortcuts();
@@ -1194,6 +1397,12 @@ pub(crate) async fn update_settings(
             return Err(format!("voice Translate hotkey update failed: {error}"));
         }
     }
+    if edit_changed {
+        if let Err(error) = app.global_shortcut().unregister(old_edit_shortcut) {
+            rollback_shortcuts();
+            return Err(format!("Speak to edit hotkey update failed: {error}"));
+        }
+    }
     if recording_changed {
         if let Err(error) = app.global_shortcut().register(new_shortcut) {
             rollback_shortcuts();
@@ -1212,6 +1421,12 @@ pub(crate) async fn update_settings(
             return Err(format!(
                 "voice Translate hotkey registration failed: {error}"
             ));
+        }
+    }
+    if edit_changed {
+        if let Err(error) = app.global_shortcut().register(new_edit_shortcut) {
+            rollback_shortcuts();
+            return Err(format!("Speak to edit hotkey registration failed: {error}"));
         }
     }
     if let Err(error) = storage.apply_history_policy(&previous, &settings) {
