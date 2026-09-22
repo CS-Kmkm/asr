@@ -725,6 +725,9 @@ pub(crate) async fn update_settings(
     if !types::CORRECTION_PROVIDERS.contains(&settings.correction_provider.as_str()) {
         return Err("text correction provider must be openai or gemini".into());
     }
+    if !types::CORRECTION_MODES.contains(&settings.correction_mode.as_str()) {
+        return Err("correction mode must be conservative or intent_aware".into());
+    }
     if !types::OPENAI_REASONING_EFFORTS.contains(&settings.openai_reasoning_effort.as_str()) {
         return Err(
             "OpenAI reasoning effort must be none, low, medium, high, xhigh, or max".into(),

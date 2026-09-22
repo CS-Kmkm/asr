@@ -59,6 +59,7 @@ export interface Settings {
   geminiCorrectionModel: string;
   geminiApiKeyEnvVar: string;
   correctionInstruction: string;
+  correctionMode: CorrectionMode;
   correctionRemoveFillers: boolean;
   correctionRemoveRepetitions: boolean;
   correctionResolveSelfCorrections: boolean;
@@ -78,6 +79,7 @@ export type AsrBackend = "vibevoice" | "faster-whisper" | "openai-compatible";
 export type ModelQuantization = "4bit" | "8bit" | "bf16";
 export type NoiseSuppression = "off" | "low" | "medium" | "high";
 export type CorrectionProvider = "openai" | "gemini";
+export type CorrectionMode = "conservative" | "intent_aware";
 export type OpenAIReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface CustomModel {

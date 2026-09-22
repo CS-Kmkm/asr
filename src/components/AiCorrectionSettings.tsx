@@ -54,6 +54,21 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
           </select>
         }
       />
+      <SettingRow
+        title={t("Correction mode")}
+        detail={t("Conservative keeps utterance order. Intent-aware may reorganize phrasing within this transcript, but never invents details, learns automatically, or uses context beyond the current transcript and profile.")}
+        control={
+          <select
+            value={settings.correctionMode}
+            onChange={(event) =>
+              onSave({ correctionMode: event.target.value as Settings["correctionMode"] })
+            }
+          >
+            <option value="conservative">{t("Conservative")}</option>
+            <option value="intent_aware">{t("Intent-aware")}</option>
+          </select>
+        }
+      />
       <div className="correction-options-heading">
         <strong>{t("Automatic editing")}</strong>
         <p>{t("Each operation is independently applied when AI text correction is enabled.")}</p>

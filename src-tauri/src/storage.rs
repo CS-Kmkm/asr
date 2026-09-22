@@ -428,6 +428,7 @@ mod tests {
             correction_remove_fillers: false,
             correction_auto_format: false,
             correction_instruction: "Keep technical terms unchanged.".into(),
+            correction_mode: "intent_aware".into(),
             ..Settings::default()
         };
 
@@ -439,6 +440,7 @@ mod tests {
         assert_eq!(restored.gemini_correction_model, "gemini-custom");
         assert!(!restored.correction_remove_fillers);
         assert!(!restored.correction_auto_format);
+        assert_eq!(restored.correction_mode, "intent_aware");
         assert_eq!(
             restored.correction_instruction,
             "Keep technical terms unchanged."
@@ -477,6 +479,16 @@ mod tests {
         assert!(settings.correction_resolve_self_corrections);
         assert!(settings.correction_auto_format);
         assert!(settings.correction_improve_clarity);
+    }
+
+    #[test]
+    fn legacy_settings_receive_conservative_correction_mode() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value.as_object_mut().unwrap().remove("correctionMode");
+
+        let settings: Settings = serde_json::from_value(value).unwrap();
+
+        assert_eq!(settings.correction_mode, "conservative");
     }
 
     #[test]

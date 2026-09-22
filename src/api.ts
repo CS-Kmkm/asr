@@ -41,6 +41,7 @@ export const defaultSettings: Settings = {
   geminiCorrectionModel: "gemini-flash-lite-latest",
   geminiApiKeyEnvVar: "GEMINI_API_KEY",
   correctionInstruction: "",
+  correctionMode: "conservative",
   correctionRemoveFillers: true,
   correctionRemoveRepetitions: true,
   correctionResolveSelfCorrections: true,

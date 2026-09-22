@@ -68,6 +68,8 @@ pub struct Settings {
     pub gemini_api_key_env_var: String,
     #[serde(default = "default_correction_instruction")]
     pub correction_instruction: String,
+    #[serde(default = "default_correction_mode")]
+    pub correction_mode: String,
     #[serde(default = "default_enabled_correction_feature")]
     pub correction_remove_fillers: bool,
     #[serde(default = "default_enabled_correction_feature")]
@@ -120,6 +122,7 @@ pub struct CustomModel {
 
 pub const ASR_BACKENDS: [&str; 4] = ["vibevoice", "faster-whisper", "openai-compatible", "mock"];
 pub const CORRECTION_PROVIDERS: [&str; 2] = ["openai", "gemini"];
+pub const CORRECTION_MODES: [&str; 2] = ["conservative", "intent_aware"];
 pub const OPENAI_REASONING_EFFORTS: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];
 
 fn default_asr_backend() -> String {
@@ -174,6 +177,10 @@ fn default_correction_instruction() -> String {
     String::new()
 }
 
+fn default_correction_mode() -> String {
+    "conservative".into()
+}
+
 fn default_translation_hotkey() -> String {
     "Ctrl+Shift+T".into()
 }
@@ -220,6 +227,7 @@ impl Default for Settings {
             gemini_correction_model: default_gemini_correction_model(),
             gemini_api_key_env_var: default_gemini_api_key_env_var(),
             correction_instruction: default_correction_instruction(),
+            correction_mode: default_correction_mode(),
             correction_remove_fillers: true,
             correction_remove_repetitions: true,
             correction_resolve_self_corrections: true,
@@ -383,6 +391,7 @@ mod tests {
         assert_eq!(settings.gemini_correction_model, "gemini-flash-lite-latest");
         assert_eq!(settings.gemini_api_key_env_var, "GEMINI_API_KEY");
         assert!(settings.correction_instruction.is_empty());
+        assert_eq!(settings.correction_mode, "conservative");
         assert!(settings.correction_remove_fillers);
         assert!(settings.correction_remove_repetitions);
         assert!(settings.correction_resolve_self_corrections);
