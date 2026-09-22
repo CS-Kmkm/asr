@@ -15,6 +15,7 @@ tauri-build = { version = "2.2", features = [] }
 [dependencies]
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+csv = "1"
 directories = "6"
 dotenvy = "0.15"
 futures-util = "0.3"
