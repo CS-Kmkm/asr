@@ -49,3 +49,9 @@ Status (2026-09-22):
 - #7 and #8 are implemented, independently reviewed, verified, locally committed, and clean in their dedicated worktrees. #8 includes the reviewer-requested immediate-stop publication race fix.
 - #9 is stacked on completed #8 and #11 remains based on `origin/main`; both now have issue-local contracts and are assigned to isolated implementation agents.
 - Remaining dependency order after those reviews: #9 -> #10 -> #12 -> #14, plus #11 -> #13 and #11 -> #15. Hardware/provider/manual Windows checks remain explicit limitations until run by the user.
+
+Progress update (2026-09-23):
+- #9 and #11 are implemented, independently reviewed, verified, locally committed, and clean. #9 closes the immutable selected-text edit path; #11 activates privacy-safe app/category personalization and scoped profiles.
+- #13 and #15 are implemented, independently reviewed with all findings closed, verified, locally committed, and clean on their Issue #11-based branches. #13 adds managed dictionary/candidate/CSV workflows; #15 adds conservative-by-default intent-aware Dictate with deterministic protected-span fallback.
+- #10 is in review follow-up on its Issue #9-based branch. The fixed search boundary remains backend-only; remaining work is limited to reviewed state-cleanup, explicit translation target, versioned panel IPC, monitored caret insertion, strict raw planning, site boundaries, and insertion-result reporting.
+- #12 design is being fixed before its Issue #10-based worktree is created; #14 remains dependent on completed #12. No branch has been merged or pushed by this task.
