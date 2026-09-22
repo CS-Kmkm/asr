@@ -18,6 +18,7 @@ pub enum PipelineMode {
     Dictate,
     Translate,
     Edit,
+    Ask,
 }
 
 struct PipelineOperation {

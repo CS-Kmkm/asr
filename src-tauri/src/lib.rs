@@ -1,3 +1,5 @@
+mod answer_panel;
+mod ask;
 mod asr;
 mod audio;
 mod commands;
@@ -24,6 +26,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use ask::AskContextKind;
 use asr::{JsonlTranscriber, Transcriber, WorkerCommand};
 use audio::{
     AudioCapture, AudioDevice, AudioEnhancementConfig, CaptureConfig, CpalAudioCapture,
@@ -90,6 +93,8 @@ pub(crate) struct Services {
     audio: tokio::sync::Mutex<Box<dyn AudioCapture>>,
     live: tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
     edit: tokio::sync::Mutex<Option<EditSession>>,
+    ask: tokio::sync::Mutex<Option<AskSession>>,
+    answer_panel: answer_panel::AnswerPanelState,
     target: Mutex<Option<TargetWindow>>,
     transcriber: Arc<dyn Transcriber>,
     input_monitor: Arc<InputMonitor>,
@@ -109,6 +114,8 @@ impl Services {
             audio: tokio::sync::Mutex::new(Box::new(CpalAudioCapture::new())),
             live: tokio::sync::Mutex::new(None),
             edit: tokio::sync::Mutex::new(None),
+            ask: tokio::sync::Mutex::new(None),
+            answer_panel: answer_panel::AnswerPanelState::default(),
             target: Mutex::new(None),
             transcriber: Arc::new(JsonlTranscriber::new(
                 worker_command_for_settings(settings),
@@ -152,6 +159,7 @@ impl Services {
             let _ = task.finish().await;
         }
         self.edit.lock().await.take();
+        self.ask.lock().await.take();
         if let Ok(mut target) = self.target.lock() {
             target.take();
         }
@@ -197,6 +205,86 @@ impl EditSession {
 impl Drop for EditSession {
     fn drop(&mut self) {
         self.monitor.shutdown();
+    }
+}
+
+pub(crate) enum AskCapture {
+    Selected(SelectedText),
+    Caret(TargetWindow),
+    Unavailable,
+}
+
+pub(crate) struct AskSession {
+    pub(crate) capture: AskCapture,
+    pub(crate) injector: SystemTextInjector,
+    pub(crate) monitor: Option<Arc<InputMonitor>>,
+    pub(crate) checkpoint: Option<u64>,
+}
+
+impl AskSession {
+    fn new(settings: &Settings, from_shortcut: bool) -> Self {
+        let injector = SystemTextInjector::new(InjectionOptions {
+            restore_clipboard: settings.clipboard_restore,
+        });
+        // Only the known "no selection" result may become a caret capture.
+        // Any inaccessible/changed selection becomes panel-only, never an
+        // insertion target.
+        let capture = match injector.capture_selection() {
+            Ok(selection) => AskCapture::Selected(selection),
+            Err(injection::InjectionError::BackendFailure("no text is selected")) => {
+                match injector.capture_target() {
+                    Ok(target) => AskCapture::Caret(target),
+                    Err(_) => AskCapture::Unavailable,
+                }
+            }
+            Err(_) => AskCapture::Unavailable,
+        };
+        let monitor = match &capture {
+            AskCapture::Selected(_) | AskCapture::Caret(_) => {
+                let monitor = Arc::new(InputMonitor::default());
+                if monitor.start_for_recording(&settings.ask_hotkey, from_shortcut) {
+                    Some(monitor)
+                } else {
+                    None
+                }
+            }
+            AskCapture::Unavailable => None,
+        };
+        let checkpoint = monitor.as_ref().and_then(|monitor| monitor.checkpoint());
+        let capture = if matches!(&capture, AskCapture::Caret(_)) && checkpoint.is_none() {
+            AskCapture::Unavailable
+        } else {
+            capture
+        };
+        Self {
+            capture,
+            injector,
+            monitor,
+            checkpoint,
+        }
+    }
+
+    pub(crate) fn kind(&self) -> AskContextKind {
+        match self.capture {
+            AskCapture::Selected(_) => AskContextKind::Selected,
+            AskCapture::Caret(_) => AskContextKind::Caret,
+            AskCapture::Unavailable => AskContextKind::Unavailable,
+        }
+    }
+
+    pub(crate) fn selected_source(&self) -> Option<&str> {
+        match &self.capture {
+            AskCapture::Selected(selection) => Some(selection.text()),
+            _ => None,
+        }
+    }
+}
+
+impl Drop for AskSession {
+    fn drop(&mut self) {
+        if let Some(monitor) = &self.monitor {
+            monitor.shutdown();
+        }
     }
 }
 
@@ -594,6 +682,16 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode) {
                 )
                 .await
             }
+            PipelineMode::Ask => {
+                commands::start_ask_with_origin(
+                    app.clone(),
+                    app.state::<Services>(),
+                    app.state::<AppState>(),
+                    app.state::<Storage>(),
+                    true,
+                )
+                .await
+            }
         },
         PipelinePhase::Starting | PipelinePhase::Processing => Ok(()),
     };
@@ -712,12 +810,17 @@ fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
     let Ok(speak_to_edit) = parse_shortcut(&settings.speak_to_edit_hotkey) else {
         return;
     };
+    let Ok(ask) = parse_shortcut(&settings.ask_hotkey) else {
+        return;
+    };
     if shortcut == recording {
         tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Dictate));
     } else if shortcut == voice_translate {
         tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Translate));
     } else if shortcut == speak_to_edit {
         tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Edit));
+    } else if shortcut == ask {
+        tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Ask));
     } else if shortcut == translation {
         tauri::async_runtime::spawn(translate_selection(app));
     }
@@ -798,12 +901,15 @@ pub fn run() {
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
             let edit_shortcut = parse_shortcut(&settings.speak_to_edit_hotkey)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            let ask_shortcut = parse_shortcut(&settings.ask_hotkey)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
             if shortcut == translation_shortcut
                 || shortcut == voice_translate_shortcut
                 || translation_shortcut == voice_translate_shortcut
                 || edit_shortcut == shortcut
                 || edit_shortcut == translation_shortcut
                 || edit_shortcut == voice_translate_shortcut
+                || ask_shortcut == shortcut || ask_shortcut == translation_shortcut || ask_shortcut == voice_translate_shortcut || ask_shortcut == edit_shortcut
             {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -815,10 +921,12 @@ pub fn run() {
             app.manage(AppState::default());
             app.manage(Services::new(&settings));
             recording_overlay::create(app.handle())?;
+            answer_panel::create(app.handle())?;
             app.global_shortcut().register(shortcut)?;
             app.global_shortcut().register(translation_shortcut)?;
             app.global_shortcut().register(voice_translate_shortcut)?;
             app.global_shortcut().register(edit_shortcut)?;
+            app.global_shortcut().register(ask_shortcut)?;
             if cleanup_stale_artifacts(
                 &std::env::temp_dir(),
                 settings.delete_audio_after_processing,
@@ -863,6 +971,7 @@ pub fn run() {
             commands::start_recording,
             commands::start_voice_translation,
             commands::start_speak_to_edit,
+            commands::start_ask,
             commands::stop_recording,
             commands::cancel_recording,
             commands::cycle_voice_translation_target,
@@ -878,6 +987,8 @@ pub fn run() {
             commands::delete_dictionary_entry,
             commands::copy_history_item,
             commands::copy_to_clipboard,
+            commands::get_ask_answer,
+            commands::dismiss_ask_answer,
             commands::update_settings
         ])
         .on_window_event(|window, event| {

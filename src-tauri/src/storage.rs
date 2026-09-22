@@ -73,6 +73,8 @@ impl Storage {
                processed_text TEXT,
                source_text TEXT,
                instruction_text TEXT,
+               action_kind TEXT,
+               search_site TEXT,
                mode TEXT NOT NULL,
                asr_provider TEXT NOT NULL,
                llm_provider TEXT,
@@ -107,7 +109,12 @@ impl Storage {
                 [],
             )?;
         }
-        for column in ["source_text", "instruction_text"] {
+        for column in [
+            "source_text",
+            "instruction_text",
+            "action_kind",
+            "search_site",
+        ] {
             let exists: bool = connection.query_row(
                 "SELECT EXISTS(
                    SELECT 1 FROM pragma_table_info('dictation_history')
@@ -183,15 +190,17 @@ impl Storage {
         }
         self.connection()?.execute(
             "INSERT INTO dictation_history(
-               transcript_text, processed_text, source_text, instruction_text, mode,
+               transcript_text, processed_text, source_text, instruction_text, action_kind, search_site, mode,
                asr_provider, llm_provider, target_language, app_category, duration_ms,
                latency_ms, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 item.transcript_text,
                 item.processed_text,
                 item.source_text,
                 item.instruction_text,
+                item.action_kind,
+                item.search_site,
                 item.mode,
                 item.asr_provider,
                 item.llm_provider,
@@ -213,7 +222,7 @@ impl Storage {
         let mut statement = connection.prepare(
             "SELECT id, transcript_text, processed_text, mode, asr_provider, llm_provider,
                     target_language, app_category, duration_ms, latency_ms, created_at,
-                    source_text, instruction_text
+                    source_text, instruction_text, action_kind, search_site
              FROM dictation_history ORDER BY created_at DESC LIMIT ?1",
         )?;
         let rows = statement.query_map([limit.min(500)], |row| {
@@ -223,6 +232,8 @@ impl Storage {
                 processed_text: row.get(2)?,
                 source_text: row.get(11)?,
                 instruction_text: row.get(12)?,
+                action_kind: row.get(13)?,
+                search_site: row.get(14)?,
                 mode: row.get(3)?,
                 asr_provider: row.get(4)?,
                 llm_provider: row.get(5)?,
@@ -391,6 +402,8 @@ mod tests {
             processed_text: Some("processed transcript"),
             source_text: None,
             instruction_text: None,
+            action_kind: None,
+            search_site: None,
             mode: "faithful",
             asr_provider: "test",
             llm_provider: None,
@@ -461,7 +474,12 @@ mod tests {
             )
             .unwrap();
         assert!(exists);
-        for column in ["source_text", "instruction_text"] {
+        for column in [
+            "source_text",
+            "instruction_text",
+            "action_kind",
+            "search_site",
+        ] {
             let exists: bool = storage
                 .connection()
                 .unwrap()
@@ -510,6 +528,23 @@ mod tests {
         assert_eq!(stored.instruction_text.as_deref(), edit.instruction_text);
         assert_eq!(stored.processed_text.as_deref(), edit.processed_text);
         assert_eq!(stored.llm_provider.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn ask_history_round_trips_action_and_search_site() {
+        let storage = Storage::in_memory().unwrap();
+        let mut ask = item();
+        ask.mode = "ask";
+        ask.source_text = Some("selected source");
+        ask.instruction_text = Some("search GitHub for rust");
+        ask.processed_text = Some("rust");
+        ask.action_kind = Some("search");
+        ask.search_site = Some("github");
+        storage.add_history(&ask).unwrap();
+        let stored = storage.list_history(1).unwrap().remove(0);
+        assert_eq!(stored.action_kind.as_deref(), Some("search"));
+        assert_eq!(stored.search_site.as_deref(), Some("github"));
+        assert_eq!(stored.source_text.as_deref(), ask.source_text);
     }
 
     #[test]

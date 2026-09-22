@@ -9,6 +9,8 @@ import {
   defaultSettings,
   deleteDictionaryEntry,
   getAppState,
+  getAskAnswer,
+  dismissAskAnswer,
   getGpuDiagnostics,
   getModelStatus,
   getSettings,
@@ -89,6 +91,7 @@ const phaseMessageKeys: Record<AppState["phase"], MessageKey> = {
 };
 
 const isRecordingOverlay = getCurrentWebviewWindow().label === "recording-overlay";
+const isAskAnswer = getCurrentWebviewWindow().label === "ask-answer";
 const OVERLAY_WAVE_BAR_COUNT = 9;
 const OVERLAY_PREVIEW_CHARS = 140;
 
@@ -157,6 +160,46 @@ function compactOverlayPreview(text: string): string {
 
 if (isRecordingOverlay) {
   document.body.classList.add("recording-overlay-body");
+}
+
+function AskAnswerPanel() {
+  const [answer, setAnswer] = useState("");
+  const [operationId, setOperationId] = useState(0);
+  const operationRef = useRef(0);
+  useEffect(() => {
+    let active = true;
+    const setup = async () => {
+      const unlisten = await listen<{ operationId: number; payload: string }>("ask-answer", ({ payload }) => {
+        if (!active || payload.operationId < operationRef.current) return;
+        operationRef.current = payload.operationId;
+        setOperationId(payload.operationId);
+        setAnswer(payload.payload);
+      });
+      if (!active) {
+        unlisten();
+        return;
+      }
+      const current = await getAskAnswer();
+      if (active && current && current.operationId >= operationRef.current) {
+        operationRef.current = current.operationId;
+        setOperationId(current.operationId);
+        setAnswer(current.payload);
+      }
+      return unlisten;
+    };
+    let unlisten: (() => void) | undefined;
+    void setup().then((cleanup) => { unlisten = cleanup; if (!active) cleanup?.(); });
+    return () => { active = false; unlisten?.(); };
+  }, []);
+  const dismiss = async () => {
+    if (await dismissAskAnswer(operationId)) {
+      await getCurrentWebviewWindow().hide();
+    }
+  };
+  return <main className="ask-answer-panel" aria-live="polite">
+    <p className="eyebrow">ASK</p><div className="ask-answer-text">{answer}</div>
+    <div className="ask-answer-actions"><button className="secondary" type="button" disabled={!answer} onClick={() => void copyToClipboard(answer)}>Copy</button><button className="secondary" type="button" disabled={!answer} onClick={() => void dismiss()}>Dismiss</button></div>
+  </main>;
 }
 
 function RecordingOverlay() {
@@ -298,6 +341,8 @@ export default function App() {
     <I18nProvider language={language}>
       {isRecordingOverlay ? (
         <RecordingOverlay />
+      ) : isAskAnswer ? (
+        <AskAnswerPanel />
       ) : (
         <MainAppContent onLanguageChange={setLanguage} />
       )}

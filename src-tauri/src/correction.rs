@@ -38,7 +38,7 @@ pub async fn correct_transcript(
     on_update: impl FnMut(&str),
 ) -> Result<String, CorrectionError> {
     let instruction = build_correction_instruction(settings, dictionary_hints);
-    request_text(settings, transcript, &instruction, cancel, on_update).await
+    request_text(settings, transcript, &instruction, cancel, on_update, true).await
 }
 
 pub async fn translate_text(
@@ -47,7 +47,7 @@ pub async fn translate_text(
     cancel: watch::Receiver<bool>,
 ) -> Result<String, CorrectionError> {
     let instruction = build_translation_instruction(settings);
-    request_text(settings, transcript, &instruction, cancel, |_| {}).await
+    request_text(settings, transcript, &instruction, cancel, |_| {}, true).await
 }
 
 pub async fn translate_transcript(
@@ -58,7 +58,7 @@ pub async fn translate_transcript(
     on_update: impl FnMut(&str),
 ) -> Result<String, CorrectionError> {
     let instruction = build_voice_translation_instruction(target_language)?;
-    request_text(settings, transcript, &instruction, cancel, on_update).await
+    request_text(settings, transcript, &instruction, cancel, on_update, true).await
 }
 
 pub async fn edit_selected_text(
@@ -70,7 +70,7 @@ pub async fn edit_selected_text(
 ) -> Result<String, CorrectionError> {
     let instruction = build_edit_instruction();
     let input = edit_request_input(selected_text, spoken_instruction);
-    request_text(settings, &input, instruction, cancel, on_update).await
+    request_text(settings, &input, instruction, cancel, on_update, true).await
 }
 
 fn build_edit_instruction() -> &'static str {
@@ -124,6 +124,7 @@ async fn request_text(
     instruction: &str,
     mut cancel: watch::Receiver<bool>,
     mut on_update: impl FnMut(&str),
+    trim_output: bool,
 ) -> Result<String, CorrectionError> {
     if *cancel.borrow() {
         return Err(CorrectionError::Cancelled);
@@ -175,13 +176,38 @@ async fn request_text(
         &mut on_update,
     )
     .await?;
-    let corrected = corrected.trim();
+    let corrected = if trim_output {
+        corrected.trim()
+    } else {
+        &corrected
+    };
     if corrected.is_empty() {
         return Err(CorrectionError::InvalidResponse(
             "the model returned empty text".into(),
         ));
     }
     Ok(corrected.to_owned())
+}
+
+/// A deliberately narrow text-only provider seam for the second Ask stage.
+/// The caller owns the action policy; this function neither parses plans nor
+/// performs side effects.
+pub async fn generate_ask_text(
+    settings: &Settings,
+    input: &str,
+    instruction: &str,
+    cancel: watch::Receiver<bool>,
+) -> Result<String, CorrectionError> {
+    request_text(settings, input, instruction, cancel, |_| {}, true).await
+}
+
+pub async fn generate_ask_plan(
+    settings: &Settings,
+    input: &str,
+    instruction: &str,
+    cancel: watch::Receiver<bool>,
+) -> Result<String, CorrectionError> {
+    request_text(settings, input, instruction, cancel, |_| {}, false).await
 }
 
 fn api_key(environment_variable: &str) -> Result<String, CorrectionError> {

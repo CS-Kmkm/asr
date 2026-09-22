@@ -35,6 +35,8 @@ pub struct Settings {
     pub voice_translate_hotkey: String,
     #[serde(default = "default_speak_to_edit_hotkey")]
     pub speak_to_edit_hotkey: String,
+    #[serde(default = "default_ask_hotkey")]
+    pub ask_hotkey: String,
     #[serde(default = "default_translation_target_languages")]
     pub translation_target_languages: Vec<String>,
     #[serde(default = "default_translation_target_language")]
@@ -178,6 +180,9 @@ fn default_voice_translate_hotkey() -> String {
 fn default_speak_to_edit_hotkey() -> String {
     "Ctrl+Shift+E".into()
 }
+fn default_ask_hotkey() -> String {
+    "Ctrl+Shift+A".into()
+}
 
 fn default_translation_target_languages() -> Vec<String> {
     vec!["en".into(), "ja".into()]
@@ -209,6 +214,7 @@ impl Default for Settings {
             translation_instruction: String::new(),
             voice_translate_hotkey: default_voice_translate_hotkey(),
             speak_to_edit_hotkey: default_speak_to_edit_hotkey(),
+            ask_hotkey: default_ask_hotkey(),
             translation_target_languages: default_translation_target_languages(),
             translation_target_language: default_translation_target_language(),
             microphone_id: None,
@@ -260,6 +266,8 @@ pub struct HistoryItem {
     pub processed_text: Option<String>,
     pub source_text: Option<String>,
     pub instruction_text: Option<String>,
+    pub action_kind: Option<String>,
+    pub search_site: Option<String>,
     pub mode: String,
     pub asr_provider: String,
     pub llm_provider: Option<String>,
@@ -276,6 +284,8 @@ pub struct NewHistoryItem<'a> {
     pub processed_text: Option<&'a str>,
     pub source_text: Option<&'a str>,
     pub instruction_text: Option<&'a str>,
+    pub action_kind: Option<&'a str>,
+    pub search_site: Option<&'a str>,
     pub mode: &'a str,
     pub asr_provider: &'a str,
     pub llm_provider: Option<&'a str>,

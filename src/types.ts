@@ -39,6 +39,7 @@ export interface Settings {
   translationInstruction: string;
   voiceTranslateHotkey: string;
   speakToEditHotkey: string;
+  askHotkey: string;
   translationTargetLanguages: string[];
   translationTargetLanguage: string;
   microphoneId: string | null;
@@ -92,6 +93,8 @@ export interface HistoryItem {
   processedText: string | null;
   sourceText: string | null;
   instructionText: string | null;
+  actionKind: string | null;
+  searchSite: string | null;
   mode: string;
   asrProvider: string;
   llmProvider: string | null;
