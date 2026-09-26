@@ -422,7 +422,9 @@ pub(crate) async fn stop_recording(
     let mut artifact_cleanup = artifact_cleanup
         .take()
         .expect("successful audio has cleanup ownership");
-    artifact_cleanup.retain = !settings.delete_audio_after_processing;
+    // The temporary capture remains cleanup-owned until any retained History
+    // copy has committed. History never takes ownership of this path.
+    artifact_cleanup.retain = false;
     if services.lifecycle.is_cancelled(operation_id) {
         emit_state(&app, &state, AppPhase::Idle, cancel_message);
         return Err(cancel_error.into());
@@ -436,7 +438,7 @@ pub(crate) async fn stop_recording(
         .transcriber
         .transcribe(&artifact.path, prompt.as_deref(), cancel)
         .await;
-    let cleanup_result = artifact_cleanup.cleanup();
+    let cleanup_result: Result<(), std::io::Error> = Ok(());
     let transcript = match transcript_result {
         Ok(value) => value,
         Err(asr::AsrError::Cancelled) => {
@@ -568,31 +570,33 @@ pub(crate) async fn stop_recording(
         recording_overlay::set_phase(&app, &AppPhase::Completed);
         let latency_ms = started.elapsed().as_millis() as u64;
         storage
-            .add_history(&NewHistoryItem {
-                transcript_text: &instruction_text,
-                processed_text: Some(&edited),
-                source_text: Some(&source_text),
-                instruction_text: Some(&instruction_text),
-                action_kind: None,
-                search_site: None,
-                mode: "edit",
-                asr_provider: &transcript.model,
-                llm_provider: Some(settings.correction_provider.as_str()),
-                target_language: None,
-                app_category: None,
-                duration_ms: Some(duration_ms as i64),
-                latency_ms: Some(latency_ms as i64),
-            })
-            .map_err(command_error)?;
-        storage
-            .add_metric(
-                "speak_to_edit",
-                Some(settings.correction_provider.as_str()),
-                Some(edit_started.elapsed().as_millis() as i64),
-                true,
-                None,
+            .add_history_with_audio(
+                &NewHistoryItem {
+                    transcript_text: &instruction_text,
+                    processed_text: Some(&edited),
+                    source_text: Some(&source_text),
+                    instruction_text: Some(&instruction_text),
+                    action_kind: None,
+                    search_site: None,
+                    mode: "edit",
+                    asr_provider: &transcript.model,
+                    llm_provider: Some(settings.correction_provider.as_str()),
+                    target_language: None,
+                    app_category: None,
+                    duration_ms: Some(duration_ms as i64),
+                    latency_ms: Some(latency_ms as i64),
+                    retry_of_id: None,
+                },
+                Some(&artifact.path),
             )
             .map_err(command_error)?;
+        let _ = storage.add_metric(
+            "speak_to_edit",
+            Some(settings.correction_provider.as_str()),
+            Some(edit_started.elapsed().as_millis() as i64),
+            true,
+            None,
+        );
         let (insertion_label, completion) = match insertion {
             InsertResult::ClipboardPaste => ("clipboard_paste", "Selected text updated."),
             InsertResult::ClipboardOnly => (
@@ -631,6 +635,7 @@ pub(crate) async fn stop_recording(
             &transcript.model,
             duration_ms,
             started,
+            Some(&artifact.path),
         )
         .await;
         if let Err(error) = &result {
@@ -838,43 +843,45 @@ pub(crate) async fn stop_recording(
         }
     };
     storage
-        .add_history(&NewHistoryItem {
-            transcript_text: &transcript.text,
-            processed_text: processed_text.as_deref(),
-            source_text: None,
-            instruction_text: None,
-            action_kind: None,
-            search_site: None,
-            mode: if mode == PipelineMode::Translate {
-                "translate"
-            } else if processed_text.is_some() {
-                "ai_corrected"
-            } else if correction_failed {
-                "faithful_fallback"
-            } else {
-                "faithful"
+        .add_history_with_audio(
+            &NewHistoryItem {
+                transcript_text: &transcript.text,
+                processed_text: processed_text.as_deref(),
+                source_text: None,
+                instruction_text: None,
+                action_kind: None,
+                search_site: None,
+                mode: if mode == PipelineMode::Translate {
+                    "translate"
+                } else if processed_text.is_some() {
+                    "ai_corrected"
+                } else if correction_failed {
+                    "faithful_fallback"
+                } else {
+                    "faithful"
+                },
+                asr_provider: &transcript.model,
+                llm_provider: llm_provider.as_deref(),
+                target_language: translation_target.as_deref(),
+                app_category: None,
+                duration_ms: Some(duration_ms as i64),
+                latency_ms: Some(latency_ms as i64),
+                retry_of_id: None,
             },
-            asr_provider: &transcript.model,
-            llm_provider: llm_provider.as_deref(),
-            target_language: translation_target.as_deref(),
-            app_category: None,
-            duration_ms: Some(duration_ms as i64),
-            latency_ms: Some(latency_ms as i64),
-        })
-        .map_err(command_error)?;
-    storage
-        .add_metric(
-            if mode == PipelineMode::Translate {
-                "voice_translate"
-            } else {
-                "dictation"
-            },
-            Some(&transcript.model),
-            Some(latency_ms as i64),
-            !translation_failed,
-            translation_failed.then_some("translation_failed"),
+            Some(&artifact.path),
         )
         .map_err(command_error)?;
+    let _ = storage.add_metric(
+        if mode == PipelineMode::Translate {
+            "voice_translate"
+        } else {
+            "dictation"
+        },
+        Some(&transcript.model),
+        Some(latency_ms as i64),
+        !translation_failed,
+        translation_failed.then_some("translation_failed"),
+    );
     let completion = if translation_failed {
         "Translation failed; the raw transcript remains on the clipboard."
     } else if mode == PipelineMode::Translate && insertion == InsertResult::PasteUnverified {
@@ -917,6 +924,7 @@ async fn finish_ask(
     asr_provider: &str,
     duration_ms: u64,
     started: Instant,
+    audio_path: Option<&std::path::Path>,
 ) -> Result<RecordingResult, String> {
     use ask::{AskAction, AskError};
     if services.lifecycle.is_cancelled(operation_id) {
@@ -1006,21 +1014,25 @@ async fn finish_ask(
         }
         let latency_ms = started.elapsed().as_millis() as u64;
         storage
-            .add_history(&NewHistoryItem {
-                transcript_text: spoken,
-                processed_text: Some(query),
-                source_text: session.selected_source(),
-                instruction_text: Some(spoken),
-                mode: "ask",
-                asr_provider,
-                llm_provider: Some(settings.correction_provider.as_str()),
-                target_language: None,
-                action_kind: Some("search"),
-                search_site: Some(search_site_name(*site)),
-                app_category: None,
-                duration_ms: Some(duration_ms as i64),
-                latency_ms: Some(latency_ms as i64),
-            })
+            .add_history_with_audio(
+                &NewHistoryItem {
+                    transcript_text: spoken,
+                    processed_text: Some(query),
+                    source_text: session.selected_source(),
+                    instruction_text: Some(spoken),
+                    mode: "ask",
+                    asr_provider,
+                    llm_provider: Some(settings.correction_provider.as_str()),
+                    target_language: None,
+                    action_kind: Some("search"),
+                    search_site: Some(search_site_name(*site)),
+                    app_category: None,
+                    duration_ms: Some(duration_ms as i64),
+                    latency_ms: Some(latency_ms as i64),
+                    retry_of_id: None,
+                },
+                audio_path,
+            )
             .map_err(command_error)?;
         let snapshot = state.complete(query.clone(), "Opening the requested fixed search.".into());
         let _ = app.emit("app-state", snapshot);
@@ -1143,24 +1155,28 @@ async fn finish_ask(
     }
     let latency_ms = started.elapsed().as_millis() as u64;
     storage
-        .add_history(&NewHistoryItem {
-            transcript_text: spoken,
-            processed_text: Some(&output),
-            source_text: session.selected_source(),
-            instruction_text: Some(spoken),
-            mode: "ask",
-            asr_provider,
-            llm_provider: Some(settings.correction_provider.as_str()),
-            target_language: match &action {
-                AskAction::Translate { target_language } => Some(target_language.as_str()),
-                _ => None,
+        .add_history_with_audio(
+            &NewHistoryItem {
+                transcript_text: spoken,
+                processed_text: Some(&output),
+                source_text: session.selected_source(),
+                instruction_text: Some(spoken),
+                mode: "ask",
+                asr_provider,
+                llm_provider: Some(settings.correction_provider.as_str()),
+                target_language: match &action {
+                    AskAction::Translate { target_language } => Some(target_language.as_str()),
+                    _ => None,
+                },
+                action_kind: Some(action_name(&action)),
+                search_site: None,
+                app_category: None,
+                duration_ms: Some(duration_ms as i64),
+                latency_ms: Some(latency_ms as i64),
+                retry_of_id: None,
             },
-            action_kind: Some(action_name(&action)),
-            search_site: None,
-            app_category: None,
-            duration_ms: Some(duration_ms as i64),
-            latency_ms: Some(latency_ms as i64),
-        })
+            audio_path,
+        )
         .map_err(command_error)?;
     let message = if insertion == "paste_unverified" {
         "Ask insertion could not be confirmed; the result remains on the clipboard."
@@ -1613,9 +1629,6 @@ pub(crate) async fn update_settings(
         return Err("Ask hotkey cannot be empty".into());
     }
     validate_translation_targets(&settings)?;
-    if !(1..=3650).contains(&settings.history_retention_days) {
-        return Err("history retention must be between 1 and 3650 days".into());
-    }
     if !["off", "low", "medium", "high"].contains(&settings.noise_suppression.as_str()) {
         return Err("noise suppression must be off, low, medium, or high".into());
     }
@@ -1883,11 +1896,7 @@ pub(crate) async fn update_settings(
             return Err(format!("Ask hotkey registration failed: {error}"));
         }
     }
-    if let Err(error) = storage.apply_history_policy(&previous, &settings) {
-        rollback_shortcuts();
-        return Err(command_error(error));
-    }
-    if let Err(error) = storage.update_settings(&settings) {
+    if let Err(error) = storage.update_settings_and_apply_history_policy(&settings) {
         rollback_shortcuts();
         return Err(command_error(error));
     }
@@ -1934,12 +1943,276 @@ pub(crate) async fn update_settings(
 
 #[tauri::command]
 pub(crate) fn list_history(
+    filter: Option<types::HistoryFilter>,
     limit: Option<u32>,
     storage: State<'_, Storage>,
 ) -> Result<Vec<HistoryItem>, String> {
     storage
-        .list_history(limit.unwrap_or(100))
+        .list_history(
+            filter.unwrap_or(types::HistoryFilter::All),
+            limit.unwrap_or(100),
+        )
         .map_err(command_error)
+}
+
+#[tauri::command]
+pub(crate) fn delete_history_item(id: i64, storage: State<'_, Storage>) -> Result<bool, String> {
+    storage.delete_history(id).map_err(command_error)
+}
+
+#[tauri::command]
+pub(crate) fn delete_all_history(storage: State<'_, Storage>) -> Result<u64, String> {
+    storage.delete_all_history().map_err(command_error)
+}
+
+#[tauri::command]
+pub(crate) fn get_history_audio(
+    id: i64,
+    storage: State<'_, Storage>,
+) -> Result<types::HistoryAudioPayload, String> {
+    storage
+        .history_audio(id)
+        .map_err(command_error)?
+        .ok_or_else(|| "history audio is unavailable".into())
+}
+
+#[tauri::command]
+pub(crate) async fn retry_history_item(
+    id: i64,
+    app: AppHandle,
+    services: State<'_, Services>,
+    state: State<'_, AppState>,
+    storage: State<'_, Storage>,
+) -> Result<RecordingResult, String> {
+    let source = storage
+        .history_item(id)
+        .map_err(command_error)?
+        .ok_or_else(|| "history item not found".to_string())?;
+    let mode = history_pipeline_mode(&source.mode)?;
+    let (operation_id, cancel) = services
+        .lifecycle
+        .begin_retry(mode)
+        .map_err(str::to_string)?;
+    let _guard = PipelineGuard {
+        lifecycle: &services.lifecycle,
+        id: operation_id,
+    };
+    let result = async {
+        emit_state(
+            &app,
+            &state,
+            AppPhase::Processing,
+            "Retrying the saved recording.",
+        );
+        let retry_path = storage
+            .copy_history_audio_for_retry(id)
+            .map_err(command_error)?;
+        let mut retry_cleanup = TempArtifact::new(retry_path.clone(), false);
+        if services.lifecycle.is_cancelled(operation_id) {
+            return Err("history retry was cancelled".into());
+        }
+        let started = Instant::now();
+        let settings = storage.get_settings().map_err(command_error)?;
+        let prompt_terms = storage.dictionary_prompt_terms().unwrap_or_default();
+        let prompt = (!prompt_terms.is_empty()).then(|| prompt_terms.join("\n"));
+        let transcript = services
+            .transcriber
+            .transcribe(&retry_path, prompt.as_deref(), cancel.clone())
+            .await
+            .map_err(command_error)?;
+        if services.lifecycle.is_cancelled(operation_id) {
+            return Err("history retry was cancelled".into());
+        }
+        let mut output = transcript.text.clone();
+        let mut llm_provider = None;
+        if source.mode == "translate" {
+            let target = source
+                .target_language
+                .as_deref()
+                .ok_or("saved translation target is unavailable")?;
+            output = correction::translate_transcript(
+                &settings,
+                &transcript.text,
+                target,
+                cancel.clone(),
+                |_| {},
+            )
+            .await
+            .map_err(command_error)?;
+            llm_provider = Some(settings.correction_provider.as_str());
+        } else if source.mode == "edit" {
+            let selected = source
+                .source_text
+                .as_deref()
+                .ok_or("saved edit source is unavailable")?;
+            output = correction::edit_selected_text(
+                &settings,
+                selected,
+                &transcript.text,
+                cancel.clone(),
+                |_| {},
+            )
+            .await
+            .map_err(command_error)?;
+            llm_provider = Some(settings.correction_provider.as_str());
+        } else if source.mode == "ask" {
+            if source.action_kind.as_deref() == Some("search") {
+                let stored_site = stored_search_site(&source)?;
+                let plan = correction::generate_ask_plan(
+                    &settings,
+                    &transcript.text,
+                    &ask::planning_prompt(ask::AskContextKind::Caret),
+                    cancel.clone(),
+                )
+                .await
+                .map_err(|_| "Ask search retry planning failed".to_string())?;
+                output = ask::validate_fixed_search_retry_plan(
+                    &plan,
+                    &transcript.text,
+                    stored_site,
+                    &settings.translation_target_languages,
+                )
+                .map_err(|_| "Ask search retry plan was blocked".to_string())?;
+            } else {
+                let action = stored_ask_action(&source)?;
+                let input = ask::generation_input(source.source_text.as_deref(), &transcript.text);
+                output = correction::generate_ask_text(
+                    &settings,
+                    &input,
+                    &ask::generation_prompt_with_target(&action),
+                    cancel.clone(),
+                )
+                .await
+                .map_err(command_error)?;
+            }
+            llm_provider = Some(settings.correction_provider.as_str());
+        } else if settings.text_correction_enabled {
+            let hints = storage
+                .dictionary_correction_hints(&transcript.text)
+                .unwrap_or_default();
+            output = correction::correct_transcript(
+                &settings,
+                &transcript.text,
+                &hints,
+                cancel.clone(),
+                |_| {},
+            )
+            .await
+            .map_err(command_error)?;
+            llm_provider = Some(settings.correction_provider.as_str());
+        }
+        if services.lifecycle.is_cancelled(operation_id) {
+            return Err("history retry was cancelled".into());
+        }
+        let latency_ms = started.elapsed().as_millis() as i64;
+        services
+            .lifecycle
+            .commit_retry(operation_id, || {
+                storage.add_history_with_audio(
+                    &NewHistoryItem {
+                        transcript_text: &transcript.text,
+                        processed_text: (output != transcript.text).then_some(output.as_str()),
+                        source_text: source.source_text.as_deref(),
+                        instruction_text: if source.mode == "edit" || source.mode == "ask" {
+                            Some(transcript.text.as_str())
+                        } else {
+                            None
+                        },
+                        action_kind: source.action_kind.as_deref(),
+                        search_site: source.search_site.as_deref(),
+                        mode: &source.mode,
+                        asr_provider: &transcript.model,
+                        llm_provider,
+                        target_language: source.target_language.as_deref(),
+                        app_category: source.app_category.as_deref(),
+                        duration_ms: source.duration_ms,
+                        latency_ms: Some(latency_ms),
+                        retry_of_id: Some(id),
+                    },
+                    Some(&retry_path),
+                )
+            })
+            .map_err(str::to_string)?
+            .map_err(command_error)?;
+        if retry_cleanup.cleanup().is_err() {
+            emit_status(
+                &app,
+                "artifact_cleanup_failed",
+                "Temporary retry audio cleanup failed.",
+            );
+        }
+        recording_overlay::set_phase(&app, &AppPhase::Completed);
+        let snapshot = state.complete(
+            output.clone(),
+            "History retry completed without inserting text.".into(),
+        );
+        let _ = app.emit("app-state", snapshot);
+        Ok(RecordingResult {
+            text: output,
+            insertion: "history_only".into(),
+            duration_ms: source.duration_ms.unwrap_or_default() as u64,
+            latency_ms: latency_ms as u64,
+        })
+    }
+    .await;
+    if result.is_err() {
+        let message = if services.lifecycle.is_cancelled(operation_id) {
+            "History retry cancelled."
+        } else {
+            "History retry failed."
+        };
+        emit_state(
+            &app,
+            &state,
+            if services.lifecycle.is_cancelled(operation_id) {
+                AppPhase::Idle
+            } else {
+                AppPhase::Error
+            },
+            message,
+        );
+    }
+    result
+}
+
+fn history_pipeline_mode(mode: &str) -> Result<PipelineMode, String> {
+    match mode {
+        "translate" => Ok(PipelineMode::Translate),
+        "edit" => Ok(PipelineMode::Edit),
+        "ask" => Ok(PipelineMode::Ask),
+        "faithful" | "ai_corrected" | "faithful_fallback" => Ok(PipelineMode::Dictate),
+        _ => Err("history mode is not retryable".into()),
+    }
+}
+
+fn stored_ask_action(item: &HistoryItem) -> Result<ask::AskAction, String> {
+    Ok(match item.action_kind.as_deref() {
+        Some("rewrite") => ask::AskAction::Rewrite,
+        Some("shorten") => ask::AskAction::Shorten,
+        Some("expand") => ask::AskAction::Expand,
+        Some("change_tone") => ask::AskAction::ChangeTone,
+        Some("summarize") => ask::AskAction::Summarize,
+        Some("explain") => ask::AskAction::Explain,
+        Some("answer") => ask::AskAction::Answer,
+        Some("draft") => ask::AskAction::Draft,
+        Some("translate") => ask::AskAction::Translate {
+            target_language: item
+                .target_language
+                .clone()
+                .ok_or("saved Ask translation target is unavailable")?,
+        },
+        _ => return Err("saved Ask action is unavailable".into()),
+    })
+}
+
+fn stored_search_site(item: &HistoryItem) -> Result<ask::SearchSite, String> {
+    match item.search_site.as_deref() {
+        Some("google") => Ok(ask::SearchSite::Google),
+        Some("youtube") => Ok(ask::SearchSite::YouTube),
+        Some("amazon_japan") => Ok(ask::SearchSite::AmazonJapan),
+        Some("github") => Ok(ask::SearchSite::GitHub),
+        _ => Err("saved Ask search site is unavailable".into()),
+    }
 }
 
 #[tauri::command]

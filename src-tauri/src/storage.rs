@@ -1,13 +1,27 @@
 use std::{
-    path::Path,
+    fs, io,
+    path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
+};
+
+#[cfg(test)]
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 
-use crate::types::{DictionaryEntry, HistoryItem, NewDictionaryEntry, NewHistoryItem, Settings};
+use crate::types::{
+    DictionaryEntry, HistoryAudioPayload, HistoryFilter, HistoryItem, HistoryRetention,
+    NewDictionaryEntry, NewHistoryItem, Settings,
+};
+
+const MAX_HISTORY_AUDIO_BYTES: u64 = 50 * 1024 * 1024;
+#[cfg(test)]
+static AUDIO_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -17,10 +31,75 @@ pub enum StorageError {
     InvalidSettings(#[from] serde_json::Error),
     #[error("storage lock is unavailable")]
     Lock,
+    #[error("history audio operation failed")]
+    Io(#[from] io::Error),
+    #[error("invalid history audio filename")]
+    InvalidAudioFilename,
+    #[error("history audio is too large")]
+    AudioTooLarge,
 }
 
 pub struct Storage {
     connection: Mutex<Connection>,
+    history_audio_dir: PathBuf,
+}
+
+struct StagedHistoryAudio<'a> {
+    filename: String,
+    path: PathBuf,
+    armed: bool,
+    storage: &'a Storage,
+}
+
+impl StagedHistoryAudio<'_> {
+    fn filename(&self) -> &str {
+        &self.filename
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StagedHistoryAudio<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            match fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    // The finalized path is DB-owned-shaped but was never
+                    // committed. Queue a best-effort retry without panicking
+                    // or taking another long-lived lock during unwinding.
+                    if self.storage.audio_path(&self.filename).is_ok() {
+                        if let Ok(connection) = self.storage.connection() {
+                            let _ = connection.execute(
+                                "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
+                                params![self.filename, Utc::now().to_rfc3339()],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn random_audio_stem() -> String {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = AUDIO_NONCE.fetch_add(1, Ordering::Relaxed);
+    format!("{time:032x}{nonce:016x}")
+}
+
+fn random_history_audio_stem() -> Result<String, StorageError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| io::Error::other(format!("secure random generation failed: {error}")))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 impl Storage {
@@ -28,8 +107,13 @@ impl Storage {
         let connection = Connection::open(path)?;
         let storage = Self {
             connection: Mutex::new(connection),
+            history_audio_dir: path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("history-audio"),
         };
         storage.migrate()?;
+        storage.reconcile_history_audio()?;
         Ok(storage)
     }
 
@@ -37,6 +121,11 @@ impl Storage {
     fn in_memory() -> Result<Self, StorageError> {
         let storage = Self {
             connection: Mutex::new(Connection::open_in_memory()?),
+            history_audio_dir: std::env::temp_dir().join(format!(
+                "local-voice-history-test-{}-{}",
+                std::process::id(),
+                AUDIO_NONCE.fetch_add(1, Ordering::Relaxed)
+            )),
         };
         storage.migrate()?;
         Ok(storage)
@@ -85,6 +174,10 @@ impl Storage {
                created_at TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_history_created_at ON dictation_history(created_at DESC);
+             CREATE TABLE IF NOT EXISTS pending_audio_deletions (
+               filename TEXT PRIMARY KEY NOT NULL,
+               created_at TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS metrics (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                event_type TEXT NOT NULL,
@@ -130,6 +223,41 @@ impl Storage {
                 )?;
             }
         }
+        for (column, definition) in [
+            ("audio_filename", "TEXT"),
+            (
+                "retry_of_id",
+                "INTEGER REFERENCES dictation_history(id) ON DELETE SET NULL",
+            ),
+        ] {
+            let exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('dictation_history') WHERE name = ?1)",
+                [column],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                connection.execute(
+                    &format!("ALTER TABLE dictation_history ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+            }
+        }
+        // A legacy/corrupt database may have shared a filename before this
+        // ownership invariant existed. Preserve the oldest association and
+        // clear later duplicates so the new partial unique index can migrate.
+        connection.execute(
+            "UPDATE dictation_history SET audio_filename = NULL
+             WHERE audio_filename IS NOT NULL AND id NOT IN (
+               SELECT MIN(id) FROM dictation_history
+               WHERE audio_filename IS NOT NULL GROUP BY audio_filename
+             )",
+            [],
+        )?;
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_history_audio_filename
+             ON dictation_history(audio_filename) WHERE audio_filename IS NOT NULL",
+            [],
+        )?;
         Ok(())
     }
 
@@ -142,11 +270,52 @@ impl Storage {
                 |row| row.get(0),
             )
             .optional()?;
-        stored
-            .map(|value| serde_json::from_str(&value))
-            .transpose()
-            .map(|value| value.unwrap_or_default())
-            .map_err(Into::into)
+        let Some(raw) = stored else {
+            return Ok(Settings::default());
+        };
+        let mut value: serde_json::Value = serde_json::from_str(&raw)?;
+        let object = value.as_object_mut().ok_or_else(|| {
+            serde_json::Error::io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "settings must be an object",
+            ))
+        })?;
+        let legacy = !object.contains_key("historyRetention");
+        if legacy {
+            let enabled = object
+                .remove("historyEnabled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+            let days = object
+                .remove("historyRetentionDays")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(30);
+            let retention = if !enabled {
+                "never"
+            } else if days < 7 {
+                "24_hours"
+            } else if days < 30 {
+                "one_week"
+            } else if days < 365 {
+                "one_month"
+            } else {
+                "one_year"
+            };
+            object.insert("historyRetention".into(), retention.into());
+        }
+        let settings: Settings = serde_json::from_value(value.clone())?;
+        if legacy {
+            // Persist the normalized V2 retention value, but keep fields that
+            // this version does not own. A migration must not erase a newer
+            // client's unrelated setting merely because it encountered an
+            // older retention representation.
+            self.connection()?.execute(
+                "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                params![serde_json::to_string(&value)?, Utc::now().to_rfc3339()],
+            )?;
+        }
+        Ok(settings)
     }
 
     pub fn update_settings(&self, settings: &Settings) -> Result<(), StorageError> {
@@ -159,24 +328,82 @@ impl Storage {
         Ok(())
     }
 
-    pub fn apply_history_policy(
+    /// Persist settings and apply their retention policy as one database
+    /// transaction. Files are handled only after the commit, so a settings
+    /// write failure cannot erase existing History.
+    pub fn update_settings_and_apply_history_policy(
         &self,
-        previous: &Settings,
         settings: &Settings,
     ) -> Result<(), StorageError> {
-        let connection = self.connection()?;
-        if previous.history_enabled && !settings.history_enabled {
-            connection.execute("DELETE FROM dictation_history", [])?;
-            return Ok(());
-        }
-        if settings.history_enabled {
-            connection.execute(
-                "DELETE FROM dictation_history
-                 WHERE datetime(created_at) < datetime('now', ?1)",
-                [format!("-{} days", settings.history_retention_days)],
+        let value = serde_json::to_string(settings)?;
+        let cutoff = match settings.history_retention {
+            HistoryRetention::Never => None,
+            HistoryRetention::Forever => {
+                self.update_settings(settings)?;
+                let _ = self.retry_pending_audio_deletions();
+                return Ok(());
+            }
+            HistoryRetention::TwentyFourHours => {
+                Some((Utc::now() - chrono::Duration::days(1)).to_rfc3339())
+            }
+            HistoryRetention::OneWeek => {
+                Some((Utc::now() - chrono::Duration::days(7)).to_rfc3339())
+            }
+            HistoryRetention::OneMonth => {
+                Some((Utc::now() - chrono::Duration::days(30)).to_rfc3339())
+            }
+            HistoryRetention::OneYear => {
+                Some((Utc::now() - chrono::Duration::days(365)).to_rfc3339())
+            }
+        };
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![value, Utc::now().to_rfc3339()],
+        )?;
+        let removed = {
+            let mut statement = transaction.prepare(
+                "SELECT id, audio_filename FROM dictation_history WHERE ?1 IS NULL OR created_at < ?1",
             )?;
+            let rows = statement
+                .query_map(params![cutoff], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for (_, filename) in &removed {
+            if let Some(filename) = filename {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
+                    params![filename, Utc::now().to_rfc3339()],
+                )?;
+            }
         }
+        for (id, _) in &removed {
+            transaction.execute("DELETE FROM dictation_history WHERE id = ?1", [id])?;
+        }
+        transaction.commit()?;
+        drop(connection);
+        let _ = self.retry_pending_audio_deletions();
         Ok(())
+    }
+
+    pub fn apply_history_policy(
+        &self,
+        _previous: &Settings,
+        settings: &Settings,
+    ) -> Result<(), StorageError> {
+        match settings.history_retention {
+            HistoryRetention::Never => self.delete_history_matching(None),
+            HistoryRetention::Forever => {
+                let _ = self.retry_pending_audio_deletions();
+                Ok(())
+            }
+            retention => self.delete_history_matching(retention.days()),
+        }
     }
 
     pub fn enforce_current_history_policy(&self) -> Result<(), StorageError> {
@@ -184,16 +411,70 @@ impl Storage {
         self.apply_history_policy(&settings, &settings)
     }
 
+    #[cfg(test)]
     pub fn add_history(&self, item: &NewHistoryItem<'_>) -> Result<bool, StorageError> {
-        if !self.get_settings()?.history_enabled {
+        self.add_history_with_audio(item, None)
+    }
+
+    pub fn add_history_with_audio(
+        &self,
+        item: &NewHistoryItem<'_>,
+        source_audio: Option<&Path>,
+    ) -> Result<bool, StorageError> {
+        let settings = self.get_settings()?;
+        if settings.history_retention == HistoryRetention::Never {
             return Ok(false);
         }
-        self.connection()?.execute(
+        // Prune before insertion. After a row/file association commits, this
+        // method must not turn cleanup trouble into a false command failure.
+        self.apply_history_policy(&settings, &settings)?;
+        let mut staged_audio = if !settings.delete_audio_after_processing {
+            source_audio
+                .map(|path| self.stage_history_audio(path))
+                .transpose()?
+        } else {
+            None
+        };
+        let mut connection = self.connection()?;
+        // Serialize the final privacy decision with the insert. Settings can
+        // change while the WAV is being staged, so the earlier snapshot alone
+        // cannot decide whether this row or its audio may be retained.
+        let current_raw: Option<String> = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'app_settings'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let current_settings = current_raw
+            .as_deref()
+            .map(serde_json::from_str::<Settings>)
+            .transpose()?
+            .unwrap_or_default();
+        if current_settings.history_retention == HistoryRetention::Never {
+            return Ok(false);
+        }
+        if !current_settings.delete_audio_after_processing
+            && staged_audio.is_none()
+            && source_audio.is_some()
+        {
+            staged_audio = source_audio
+                .map(|path| self.stage_history_audio(path))
+                .transpose()?;
+        }
+        let audio_filename = if current_settings.delete_audio_after_processing {
+            None
+        } else {
+            staged_audio.as_ref().map(|audio| audio.filename())
+        };
+        let retained_audio = audio_filename.is_some();
+        let transaction = connection.transaction()?;
+        let insert = transaction.execute(
             "INSERT INTO dictation_history(
                transcript_text, processed_text, source_text, instruction_text, action_kind, search_site, mode,
                asr_provider, llm_provider, target_language, app_category, duration_ms,
-               latency_ms, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+               latency_ms, created_at, audio_filename, retry_of_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 item.transcript_text,
                 item.processed_text,
@@ -208,24 +489,58 @@ impl Storage {
                 item.app_category,
                 item.duration_ms,
                 item.latency_ms,
-                Utc::now().to_rfc3339()
+                Utc::now().to_rfc3339(),
+                audio_filename,
+                item.retry_of_id,
             ],
-        )?;
+        );
+        if let Err(error) = insert {
+            return Err(error.into());
+        }
+        if let Err(error) = transaction.commit() {
+            return Err(error.into());
+        }
+        if retained_audio {
+            if let Some(audio) = &mut staged_audio {
+                audio.disarm();
+            }
+        }
+        drop(connection);
         Ok(true)
     }
 
-    pub fn list_history(&self, limit: u32) -> Result<Vec<HistoryItem>, StorageError> {
-        if !self.get_settings()?.history_enabled {
+    pub fn list_history(
+        &self,
+        filter: HistoryFilter,
+        limit: u32,
+    ) -> Result<Vec<HistoryItem>, StorageError> {
+        let settings = self.get_settings()?;
+        if settings.history_retention == HistoryRetention::Never {
             return Ok(Vec::new());
         }
+        self.apply_history_policy(&settings, &settings)?;
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, transcript_text, processed_text, mode, asr_provider, llm_provider,
                     target_language, app_category, duration_ms, latency_ms, created_at,
-                    source_text, instruction_text, action_kind, search_site
-             FROM dictation_history ORDER BY created_at DESC LIMIT ?1",
+                    source_text, instruction_text, action_kind, search_site,
+                    audio_filename IS NOT NULL, retry_of_id
+             FROM dictation_history
+             WHERE ?1 = 'all' OR
+               (?1 = 'dictate' AND mode IN ('faithful', 'ai_corrected', 'faithful_fallback')) OR
+               (?1 = 'translate' AND mode = 'translate') OR
+               (?1 = 'edit' AND mode = 'edit') OR
+               (?1 = 'ask' AND mode = 'ask')
+             ORDER BY created_at DESC LIMIT ?2",
         )?;
-        let rows = statement.query_map([limit.min(500)], |row| {
+        let filter = match filter {
+            HistoryFilter::All => "all",
+            HistoryFilter::Dictate => "dictate",
+            HistoryFilter::Translate => "translate",
+            HistoryFilter::Edit => "edit",
+            HistoryFilter::Ask => "ask",
+        };
+        let rows = statement.query_map(params![filter, limit.min(500)], |row| {
             Ok(HistoryItem {
                 id: row.get(0)?,
                 transcript_text: row.get(1)?,
@@ -242,6 +557,8 @@ impl Storage {
                 duration_ms: row.get(8)?,
                 latency_ms: row.get(9)?,
                 created_at: row.get(10)?,
+                has_audio: row.get(15)?,
+                retry_of_id: row.get(16)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -253,6 +570,347 @@ impl Storage {
             [id],
             |row| row.get(0),
         ).optional().map_err(Into::into)
+    }
+
+    pub fn history_item(&self, id: i64) -> Result<Option<HistoryItem>, StorageError> {
+        self.connection()?
+            .query_row(
+                "SELECT id, transcript_text, processed_text, mode, asr_provider, llm_provider,
+                    target_language, app_category, duration_ms, latency_ms, created_at,
+                    source_text, instruction_text, action_kind, search_site,
+                    audio_filename IS NOT NULL, retry_of_id
+             FROM dictation_history WHERE id = ?1",
+                [id],
+                |row| {
+                    Ok(HistoryItem {
+                        id: row.get(0)?,
+                        transcript_text: row.get(1)?,
+                        processed_text: row.get(2)?,
+                        mode: row.get(3)?,
+                        asr_provider: row.get(4)?,
+                        llm_provider: row.get(5)?,
+                        target_language: row.get(6)?,
+                        app_category: row.get(7)?,
+                        duration_ms: row.get(8)?,
+                        latency_ms: row.get(9)?,
+                        created_at: row.get(10)?,
+                        source_text: row.get(11)?,
+                        instruction_text: row.get(12)?,
+                        action_kind: row.get(13)?,
+                        search_site: row.get(14)?,
+                        has_audio: row.get(15)?,
+                        retry_of_id: row.get(16)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn delete_history(&self, id: i64) -> Result<bool, StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let filename: Option<String> = transaction
+            .query_row(
+                "SELECT audio_filename FROM dictation_history WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(filename) = &filename {
+            transaction.execute(
+                "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
+                params![filename, Utc::now().to_rfc3339()],
+            )?;
+        }
+        let changed =
+            transaction.execute("DELETE FROM dictation_history WHERE id = ?1", [id])? != 0;
+        transaction.commit()?;
+        drop(connection);
+        let _ = self.retry_pending_audio_deletions();
+        Ok(changed)
+    }
+
+    pub fn delete_all_history(&self) -> Result<u64, StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let filenames = {
+            let mut statement = transaction.prepare(
+                "SELECT audio_filename FROM dictation_history WHERE audio_filename IS NOT NULL",
+            )?;
+            let values = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            values
+        };
+        for filename in &filenames {
+            transaction.execute(
+                "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
+                params![filename, Utc::now().to_rfc3339()],
+            )?;
+        }
+        let changed = transaction.execute("DELETE FROM dictation_history", [])? as u64;
+        transaction.commit()?;
+        drop(connection);
+        let _ = self.retry_pending_audio_deletions();
+        Ok(changed)
+    }
+
+    pub fn history_audio(&self, id: i64) -> Result<Option<HistoryAudioPayload>, StorageError> {
+        let filename: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT audio_filename FROM dictation_history WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let Some(filename) = filename else {
+            return Ok(None);
+        };
+        let path = self.audio_path(&filename)?;
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.connection()?.execute(
+                    "UPDATE dictation_history SET audio_filename = NULL WHERE id = ?1",
+                    [id],
+                )?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.len() > MAX_HISTORY_AUDIO_BYTES {
+            return Err(StorageError::AudioTooLarge);
+        }
+        let bytes = fs::read(path)?;
+        if bytes.len() as u64 > MAX_HISTORY_AUDIO_BYTES {
+            return Err(StorageError::AudioTooLarge);
+        }
+        Ok(Some(HistoryAudioPayload {
+            bytes,
+            filename: format!("local-voice-history-{id}.wav"),
+            mime_type: "audio/wav".into(),
+        }))
+    }
+
+    pub fn copy_history_audio_for_retry(&self, id: i64) -> Result<PathBuf, StorageError> {
+        let filename: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT audio_filename FROM dictation_history WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let filename = filename.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "history audio is unavailable")
+        })?;
+        let source = self.audio_path(&filename)?;
+        let metadata = fs::metadata(&source)?;
+        if metadata.len() > MAX_HISTORY_AUDIO_BYTES {
+            return Err(StorageError::AudioTooLarge);
+        }
+        let target = std::env::temp_dir().join(format!(
+            "local-ai-voice-retry-{}-{}.wav",
+            std::process::id(),
+            random_history_audio_stem()?
+        ));
+        if let Err(error) = fs::copy(source, &target) {
+            let _ = fs::remove_file(&target);
+            return Err(error.into());
+        }
+        Ok(target)
+    }
+
+    fn stage_history_audio(&self, source: &Path) -> Result<StagedHistoryAudio<'_>, StorageError> {
+        fs::create_dir_all(&self.history_audio_dir)?;
+        let metadata = fs::metadata(source)?;
+        if metadata.len() > MAX_HISTORY_AUDIO_BYTES {
+            return Err(StorageError::AudioTooLarge);
+        }
+        let filename = format!("{}.wav", random_history_audio_stem()?);
+        let final_path = self.audio_path(&filename)?;
+        let staged = self.history_audio_dir.join(format!(".{filename}.stage"));
+        if let Err(error) = fs::copy(source, &staged) {
+            let _ = fs::remove_file(&staged);
+            return Err(error.into());
+        }
+        let file = match fs::OpenOptions::new().write(true).open(&staged) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = fs::remove_file(&staged);
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = file.sync_all() {
+            let _ = fs::remove_file(&staged);
+            return Err(error.into());
+        }
+        if let Err(error) = fs::rename(&staged, &final_path) {
+            let _ = fs::remove_file(&staged);
+            return Err(error.into());
+        }
+        Ok(StagedHistoryAudio {
+            filename,
+            path: final_path,
+            armed: true,
+            storage: self,
+        })
+    }
+
+    fn audio_path(&self, filename: &str) -> Result<PathBuf, StorageError> {
+        let path = Path::new(filename);
+        let stem = filename.strip_suffix(".wav").unwrap_or_default();
+        if filename.is_empty()
+            || path.is_absolute()
+            || path.components().count() != 1
+            || path.extension().and_then(|value| value.to_str()) != Some("wav")
+            || stem.len() != 32
+            || !stem.chars().all(|character| character.is_ascii_hexdigit())
+            || filename.chars().any(|character| character.is_control())
+        {
+            return Err(StorageError::InvalidAudioFilename);
+        }
+        Ok(self.history_audio_dir.join(filename))
+    }
+
+    fn remove_or_queue_audio(&self, filename: &str) -> Result<(), StorageError> {
+        let path = self.audio_path(filename)?;
+        match fs::remove_file(path) {
+            Ok(()) => {
+                self.connection()?.execute(
+                    "DELETE FROM pending_audio_deletions WHERE filename = ?1",
+                    [filename],
+                )?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.connection()?.execute(
+                    "DELETE FROM pending_audio_deletions WHERE filename = ?1",
+                    [filename],
+                )?;
+            }
+            Err(_) => {
+                self.connection()?.execute(
+                "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
+                params![filename, Utc::now().to_rfc3339()],
+            )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn retry_pending_audio_deletions(&self) -> Result<(), StorageError> {
+        let filenames = {
+            let connection = self.connection()?;
+            let mut statement =
+                connection.prepare("SELECT filename FROM pending_audio_deletions")?;
+            let values = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            values
+        };
+        for filename in filenames {
+            self.remove_or_queue_audio(&filename)?;
+        }
+        Ok(())
+    }
+
+    pub fn reconcile_history_audio(&self) -> Result<(), StorageError> {
+        fs::create_dir_all(&self.history_audio_dir)?;
+        self.retry_pending_audio_deletions()?;
+        let referenced = {
+            let connection = self.connection()?;
+            let mut statement = connection.prepare(
+                "SELECT id, audio_filename FROM dictation_history WHERE audio_filename IS NOT NULL",
+            )?;
+            let values = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            values
+        };
+        for (id, filename) in &referenced {
+            let exists = self.audio_path(filename).is_ok_and(|path| path.is_file());
+            if !exists {
+                self.connection()?.execute(
+                    "UPDATE dictation_history SET audio_filename = NULL WHERE id = ?1",
+                    [id],
+                )?;
+            }
+        }
+        let live_filenames = {
+            let connection = self.connection()?;
+            let mut statement = connection.prepare(
+                "SELECT audio_filename FROM dictation_history WHERE audio_filename IS NOT NULL",
+            )?;
+            let values = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            values
+        };
+        for entry in fs::read_dir(&self.history_audio_dir)? {
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let filename = entry.file_name().to_string_lossy().into_owned();
+            if !live_filenames.iter().any(|value| value == &filename) {
+                // `read_dir` produced this contained path. Delete that path directly
+                // so a malformed orphan cannot turn startup into a path-validation
+                // failure or escape the owned directory.
+                if fs::remove_file(entry.path()).is_err() && self.audio_path(&filename).is_ok() {
+                    let _ = self.connection()?.execute(
+                        "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
+                        params![filename, Utc::now().to_rfc3339()],
+                    );
+                }
+            } else if filename.ends_with(".stage") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_history_matching(&self, days: Option<i64>) -> Result<(), StorageError> {
+        let cutoff = days.map(|days| (Utc::now() - chrono::Duration::days(days)).to_rfc3339());
+        self.delete_history_before(cutoff.as_deref())
+    }
+
+    fn delete_history_before(&self, cutoff: Option<&str>) -> Result<(), StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let removed = {
+            let mut statement = transaction.prepare(
+                "SELECT id, audio_filename FROM dictation_history
+                 WHERE ?1 IS NULL OR created_at < ?1",
+            )?;
+            let values = statement
+                .query_map(params![cutoff], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            values
+        };
+        for (_, filename) in &removed {
+            if let Some(filename) = filename {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
+                    params![filename, Utc::now().to_rfc3339()],
+                )?;
+            }
+        }
+        for (id, _) in &removed {
+            transaction.execute("DELETE FROM dictation_history WHERE id = ?1", [id])?;
+        }
+        transaction.commit()?;
+        drop(connection);
+        let _ = self.retry_pending_audio_deletions();
+        Ok(())
     }
 
     pub fn list_dictionary(&self) -> Result<Vec<DictionaryEntry>, StorageError> {
@@ -411,6 +1069,7 @@ mod tests {
             app_category: None,
             duration_ms: Some(1000),
             latency_ms: Some(200),
+            retry_of_id: None,
         }
     }
 
@@ -456,6 +1115,8 @@ mod tests {
             .unwrap();
         let storage = Storage {
             connection: Mutex::new(connection),
+            history_audio_dir: std::env::temp_dir()
+                .join(format!("history-migration-{}", random_audio_stem())),
         };
 
         storage.migrate().unwrap();
@@ -504,7 +1165,10 @@ mod tests {
         translation.target_language = Some("ja");
         storage.add_history(&translation).unwrap();
 
-        let stored = storage.list_history(1).unwrap().remove(0);
+        let stored = storage
+            .list_history(HistoryFilter::All, 1)
+            .unwrap()
+            .remove(0);
         assert_eq!(stored.mode, "translate");
         assert_eq!(stored.target_language.as_deref(), Some("ja"));
     }
@@ -521,7 +1185,10 @@ mod tests {
         edit.llm_provider = Some("local");
         storage.add_history(&edit).unwrap();
 
-        let stored = storage.list_history(1).unwrap().remove(0);
+        let stored = storage
+            .list_history(HistoryFilter::All, 1)
+            .unwrap()
+            .remove(0);
         assert_eq!(stored.mode, "edit");
         assert_eq!(stored.transcript_text, "make it concise");
         assert_eq!(stored.source_text.as_deref(), edit.source_text);
@@ -541,7 +1208,10 @@ mod tests {
         ask.action_kind = Some("search");
         ask.search_site = Some("github");
         storage.add_history(&ask).unwrap();
-        let stored = storage.list_history(1).unwrap().remove(0);
+        let stored = storage
+            .list_history(HistoryFilter::All, 1)
+            .unwrap()
+            .remove(0);
         assert_eq!(stored.action_kind.as_deref(), Some("search"));
         assert_eq!(stored.search_site.as_deref(), Some("github"));
         assert_eq!(stored.source_text.as_deref(), ask.source_text);
@@ -552,7 +1222,7 @@ mod tests {
         let storage = Storage::in_memory().unwrap();
         let mut settings = Settings::default();
         settings.hotkey = "Ctrl+Alt+V".into();
-        settings.history_retention_days = 7;
+        settings.history_retention = HistoryRetention::OneWeek;
         settings.local_correction_base_url = "http://127.0.0.1:1234/v1".into();
         settings.local_correction_model = "local-model".into();
         settings.custom_models.push(crate::types::CustomModel {
@@ -649,7 +1319,7 @@ mod tests {
     fn history_disabled_never_stores_transcript() {
         let storage = Storage::in_memory().unwrap();
         let mut settings = Settings::default();
-        settings.history_enabled = false;
+        settings.history_retention = HistoryRetention::Never;
         storage.update_settings(&settings).unwrap();
 
         let mut private_edit = item();
@@ -670,7 +1340,7 @@ mod tests {
     fn history_returns_processed_text_for_copy() {
         let storage = Storage::in_memory().unwrap();
         storage.add_history(&item()).unwrap();
-        let id = storage.list_history(10).unwrap()[0].id;
+        let id = storage.list_history(HistoryFilter::All, 10).unwrap()[0].id;
         assert_eq!(
             storage.history_text(id).unwrap().as_deref(),
             Some("processed transcript")
@@ -760,7 +1430,7 @@ mod tests {
         storage.add_history(&item()).unwrap();
         let previous = storage.get_settings().unwrap();
         let mut settings = previous.clone();
-        settings.history_enabled = false;
+        settings.history_retention = HistoryRetention::Never;
         storage.apply_history_policy(&previous, &settings).unwrap();
         assert_eq!(
             storage
@@ -771,6 +1441,27 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn settings_write_and_history_off_retention_commit_together() {
+        let storage = Storage::in_memory().unwrap();
+        storage.add_history(&item()).unwrap();
+        let settings = Settings {
+            history_retention: HistoryRetention::Never,
+            ..Settings::default()
+        };
+        storage
+            .update_settings_and_apply_history_policy(&settings)
+            .unwrap();
+        assert_eq!(
+            storage.get_settings().unwrap().history_retention,
+            HistoryRetention::Never
+        );
+        assert!(storage
+            .list_history(HistoryFilter::All, 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -789,6 +1480,212 @@ mod tests {
             .unwrap();
         let settings = storage.get_settings().unwrap();
         storage.apply_history_policy(&settings, &settings).unwrap();
-        assert_eq!(storage.list_history(10).unwrap().len(), 1);
+        assert_eq!(
+            storage.list_history(HistoryFilter::All, 10).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn retention_uses_strict_utc_cutoff_boundary() {
+        let storage = Storage::in_memory().unwrap();
+        let cutoff = "2030-01-01T00:00:00+00:00";
+        storage
+            .connection()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO dictation_history(transcript_text, mode, asr_provider, created_at)
+             VALUES ('exact', 'faithful', 'test', '2030-01-01T00:00:00+00:00');
+             INSERT INTO dictation_history(transcript_text, mode, asr_provider, created_at)
+             VALUES ('older', 'faithful', 'test', '2029-12-31T23:59:59+00:00');",
+            )
+            .unwrap();
+        storage.delete_history_before(Some(cutoff)).unwrap();
+        let texts = storage
+            .list_history(HistoryFilter::All, 10)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.transcript_text)
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["exact"]);
+    }
+
+    #[test]
+    fn all_retention_presets_use_their_documented_windows() {
+        for (retention, days) in [
+            (HistoryRetention::TwentyFourHours, 1),
+            (HistoryRetention::OneWeek, 7),
+            (HistoryRetention::OneMonth, 30),
+            (HistoryRetention::OneYear, 365),
+        ] {
+            let storage = Storage::in_memory().unwrap();
+            let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+            storage
+                .connection()
+                .unwrap()
+                .execute(
+                    "INSERT INTO dictation_history(transcript_text, mode, asr_provider, created_at)
+                 VALUES ('old', 'faithful', 'test', ?1)",
+                    [(Utc::now() - chrono::Duration::days(days + 1)).to_rfc3339()],
+                )
+                .unwrap();
+            storage.delete_history_before(Some(&cutoff)).unwrap();
+            assert!(storage
+                .list_history(HistoryFilter::All, 10)
+                .unwrap()
+                .is_empty());
+            assert_ne!(retention, HistoryRetention::Forever);
+        }
+    }
+
+    #[test]
+    fn legacy_retention_migration_preserves_unrelated_json_fields() {
+        let storage = Storage::in_memory().unwrap();
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("historyRetention");
+        object.insert("historyEnabled".into(), serde_json::Value::Bool(true));
+        object.insert("historyRetentionDays".into(), serde_json::Value::from(7));
+        object.insert("futureSetting".into(), serde_json::Value::from("keep-me"));
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, ?2)",
+                params![
+                    serde_json::to_string(&value).unwrap(),
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            storage.get_settings().unwrap().history_retention,
+            HistoryRetention::OneWeek
+        );
+        let persisted: serde_json::Value = storage
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'app_settings'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|raw| serde_json::from_str(&raw).unwrap())
+            .unwrap();
+        assert_eq!(persisted["historyRetention"], "one_week");
+        assert_eq!(persisted["futureSetting"], "keep-me");
+    }
+
+    #[test]
+    fn history_filter_applies_before_limit() {
+        let storage = Storage::in_memory().unwrap();
+        let mut dictate = item();
+        dictate.mode = "faithful";
+        storage.add_history(&dictate).unwrap();
+        let mut translate = item();
+        translate.mode = "translate";
+        storage.add_history(&translate).unwrap();
+        storage.connection().unwrap().execute(
+            "UPDATE dictation_history SET created_at = CASE mode WHEN 'faithful' THEN '2099-01-01T00:00:00Z' ELSE '2099-01-02T00:00:00Z' END", []
+        ).unwrap();
+
+        let rows = storage.list_history(HistoryFilter::Dictate, 1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mode, "faithful");
+    }
+
+    #[test]
+    fn retained_audio_is_id_only_and_removed_with_its_row() {
+        let storage = Storage::in_memory().unwrap();
+        let settings = Settings {
+            delete_audio_after_processing: false,
+            ..Settings::default()
+        };
+        storage.update_settings(&settings).unwrap();
+        let source =
+            std::env::temp_dir().join(format!("history-source-{}.wav", random_audio_stem()));
+        fs::write(&source, b"RIFF test wav").unwrap();
+
+        assert!(storage
+            .add_history_with_audio(&item(), Some(&source))
+            .unwrap());
+        let row = storage
+            .list_history(HistoryFilter::All, 1)
+            .unwrap()
+            .remove(0);
+        let payload = storage.history_audio(row.id).unwrap().unwrap();
+        assert_eq!(
+            payload.filename,
+            format!("local-voice-history-{}.wav", row.id)
+        );
+        assert_eq!(payload.mime_type, "audio/wav");
+        assert_eq!(payload.bytes, b"RIFF test wav");
+        assert!(storage.delete_history(row.id).unwrap());
+        assert!(storage.history_audio(row.id).unwrap().is_none());
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
+    }
+
+    #[test]
+    fn audio_paths_require_generated_relative_wav_names() {
+        let storage = Storage::in_memory().unwrap();
+        let valid = format!("{}.wav", random_history_audio_stem().unwrap());
+        assert!(storage.audio_path(&valid).is_ok());
+        for invalid in [
+            "..\\outside.wav",
+            "C:\\outside.wav",
+            "ordinary.wav",
+            "abc.txt",
+        ] {
+            assert!(matches!(
+                storage.audio_path(invalid),
+                Err(StorageError::InvalidAudioFilename)
+            ));
+        }
+    }
+
+    #[test]
+    fn reconciliation_clears_missing_references_and_removes_orphans() {
+        let storage = Storage::in_memory().unwrap();
+        fs::create_dir_all(&storage.history_audio_dir).unwrap();
+        let missing = format!("{}.wav", random_history_audio_stem().unwrap());
+        storage.connection().unwrap().execute(
+            "INSERT INTO dictation_history(transcript_text, mode, asr_provider, created_at, audio_filename)
+             VALUES ('missing', 'faithful', 'test', ?1, ?2)",
+            params![Utc::now().to_rfc3339(), missing],
+        ).unwrap();
+        let orphan = storage.history_audio_dir.join("untrusted-orphan.tmp");
+        fs::write(&orphan, b"orphan").unwrap();
+
+        storage.reconcile_history_audio().unwrap();
+        let has_audio: bool = storage
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT audio_filename IS NOT NULL FROM dictation_history",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!has_audio);
+        assert!(!orphan.exists());
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
+    }
+
+    #[test]
+    fn retained_audio_filename_is_unique_when_present() {
+        let storage = Storage::in_memory().unwrap();
+        let filename = format!("{}.wav", random_history_audio_stem().unwrap());
+        let now = Utc::now().to_rfc3339();
+        storage.connection().unwrap().execute(
+            "INSERT INTO dictation_history(transcript_text, mode, asr_provider, created_at, audio_filename)
+             VALUES ('first', 'faithful', 'test', ?1, ?2)", params![&now, &filename]
+        ).unwrap();
+        assert!(storage.connection().unwrap().execute(
+            "INSERT INTO dictation_history(transcript_text, mode, asr_provider, created_at, audio_filename)
+             VALUES ('second', 'faithful', 'test', ?1, ?2)",
+            params![Utc::now().to_rfc3339(), &filename]
+        ).is_err());
     }
 }

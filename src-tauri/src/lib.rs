@@ -550,7 +550,7 @@ mod model_configuration_tests {
     }
 
     #[test]
-    fn stale_artifact_cleanup_is_skipped_when_audio_is_retained() {
+    fn stale_capture_cleanup_runs_when_history_audio_is_retained() {
         let directory = tempfile::tempdir().unwrap();
         let retained = directory
             .path()
@@ -561,16 +561,22 @@ mod model_configuration_tests {
             cleanup_stale_artifacts(&directory.path().join("missing"), false).unwrap(),
             0
         );
-        assert_eq!(cleanup_stale_artifacts(directory.path(), false).unwrap(), 0);
-        assert!(retained.exists());
+        assert_eq!(cleanup_stale_artifacts(directory.path(), false).unwrap(), 1);
+        assert!(!retained.exists());
     }
 }
 
 fn artifact_process_id(name: &std::ffi::OsStr) -> Option<u32> {
+    let name = name.to_str()?.strip_suffix(".wav")?;
+    if let Some(retry) = name.strip_prefix("local-ai-voice-retry-") {
+        let (process_id, token) = retry.split_once('-')?;
+        if token.len() == 32 && token.chars().all(|character| character.is_ascii_hexdigit()) {
+            return process_id.parse().ok();
+        }
+        return None;
+    }
     let components = name
-        .to_str()?
         .strip_prefix("local-ai-voice-")?
-        .strip_suffix(".wav")?
         .split('-')
         .collect::<Vec<_>>();
     if components.len() != 3 {
@@ -614,9 +620,9 @@ fn process_is_live(process_id: u32) -> bool {
 
 fn cleanup_stale_artifacts(
     directory: &Path,
-    delete_audio_after_processing: bool,
+    _delete_audio_after_processing: bool,
 ) -> io::Result<usize> {
-    if !delete_audio_after_processing {
+    if !directory.exists() {
         return Ok(0);
     }
     let mut removed = 0;
@@ -982,6 +988,10 @@ pub fn run() {
             commands::get_gpu_diagnostics,
             commands::run_gpu_diagnostics,
             commands::list_history,
+            commands::delete_history_item,
+            commands::delete_all_history,
+            commands::get_history_audio,
+            commands::retry_history_item,
             commands::list_dictionary,
             commands::add_dictionary_entry,
             commands::delete_dictionary_entry,

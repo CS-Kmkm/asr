@@ -153,9 +153,13 @@ enum WireAction {
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WireSearchSite {
+    #[serde(rename = "google")]
     Google,
+    #[serde(rename = "youtube")]
     YouTube,
+    #[serde(rename = "amazon_japan")]
     AmazonJapan,
+    #[serde(rename = "github")]
     GitHub,
 }
 
@@ -275,6 +279,30 @@ pub fn validate_action(
         _ => {}
     }
     Ok(action)
+}
+
+/// Re-plan a retained Ask search without granting the planner authority to
+/// change its originally stored fixed site or open anything.
+pub fn validate_fixed_search_retry_plan(
+    raw: &str,
+    spoken_instruction: &str,
+    stored_site: SearchSite,
+    translation_languages: &[String],
+) -> Result<String, AskError> {
+    let action = validate_action(
+        parse_plan(raw)?,
+        AskContextKind::Caret,
+        spoken_instruction,
+        translation_languages,
+    )?;
+    let AskAction::Search { site, query } = action else {
+        return Err(AskError::Policy);
+    };
+    if site != stored_site {
+        return Err(AskError::Policy);
+    }
+    site.fixed_url(&query)?;
+    Ok(query)
 }
 
 pub fn planning_prompt(context: AskContextKind) -> String {
@@ -425,5 +453,27 @@ mod tests {
             source
         );
         assert!(!generation_prompt(&AskAction::Rewrite).contains(source));
+    }
+
+    #[test]
+    fn fixed_search_retry_accepts_only_the_stored_site() {
+        let plan = r#"{"version":1,"action":{"kind":"search","site":"github","query":"Rust"}}"#;
+        assert_eq!(
+            validate_fixed_search_retry_plan(
+                plan,
+                "Search GitHub for Rust",
+                SearchSite::GitHub,
+                &languages()
+            )
+            .unwrap(),
+            "Rust"
+        );
+        assert!(validate_fixed_search_retry_plan(
+            plan,
+            "Search GitHub for Rust",
+            SearchSite::Google,
+            &languages()
+        )
+        .is_err());
     }
 }

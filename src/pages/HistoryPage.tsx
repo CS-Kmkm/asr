@@ -1,99 +1,92 @@
-import { Empty, Toggle } from "../components/ui";
-import type { HistoryItem, Settings } from "../types";
+import { useEffect, useState } from "react";
+import { Empty } from "../components/ui";
+import type { HistoryAudioPayload, HistoryFilter, HistoryItem, Settings } from "../types";
 import { useI18n } from "../i18n";
 
-export function HistoryPage({
-  settings,
-  history,
-  onSave,
-  onCopyItem,
-}: {
+const filters = [
+  { value: "all", label: "All" }, { value: "dictate", label: "Dictate" },
+  { value: "translate", label: "Translate" }, { value: "edit", label: "Edit" },
+  { value: "ask", label: "Ask" },
+] as const;
+
+export function HistoryPage({ settings, history, filter, onSave, onFilter, onCopyItem, onRetry, onDelete, onDeleteAll, onLoadAudio, retryActive, onCancelRetry }: {
   settings: Settings;
   history: HistoryItem[];
+  filter: HistoryFilter;
   onSave: (patch: Partial<Settings>) => void;
+  onFilter: (filter: HistoryFilter) => void;
   onCopyItem: (text: string) => void;
+  onRetry: (id: number) => void;
+  onDelete: (id: number) => void;
+  onDeleteAll: () => void;
+  onLoadAudio: (id: number) => Promise<HistoryAudioPayload>;
+  retryActive: boolean;
+  onCancelRetry: () => void;
 }) {
   const { t } = useI18n();
-  return (
-    <section className="panel compact-page-panel">
-      <div className="history-controls">
-        <span>{t("Save history")}</span>
-        <Toggle
-          checked={settings.historyEnabled}
-          onChange={(value) => onSave({ historyEnabled: value })}
-          label={t("Save history")}
-        />
-      </div>
-      {!settings.historyEnabled ? (
-        <Empty
-          title={t("History is disabled")}
-          detail={t("New transcripts will not be written to SQLite.")}
-        />
-      ) : history.length === 0 ? (
-        <Empty
-          title={t("No dictations yet")}
-          detail={t("Completed local dictations will appear here.")}
-        />
-      ) : (
-        <div className="history-list">
-          {history.map((item) => (
-            <article className="history-item" key={item.id}>
-              <div className="history-meta">
-                <time dateTime={item.createdAt}>
-                  {new Date(item.createdAt).toLocaleString()}
-                </time>
-                <span className="history-mode">
-                  {item.mode}{item.targetLanguage ? ` · ${item.targetLanguage}` : ""}
-                </span>
-              </div>
-              {item.sourceText && (
-                <HistoryText text={item.sourceText} onCopy={onCopyItem} label={t("Selected text")} />
-              )}
-              {item.instructionText && (
-                <HistoryText text={item.instructionText} onCopy={onCopyItem} label={t("Spoken instruction")} />
-              )}
-              {!item.sourceText && !item.instructionText && (
-                <HistoryText text={item.transcriptText} onCopy={onCopyItem} />
-              )}
-              {item.processedText && (
-                <HistoryText
-                  text={item.processedText}
-                  onCopy={onCopyItem}
-                  corrected
-                />
-              )}
-            </article>
-          ))}
-        </div>
-      )}
-    </section>
-  );
+  const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [playingId, setPlayingId] = useState<number | null>(null);
+  useEffect(() => () => { if (audioUrl) URL.revokeObjectURL(audioUrl); }, [audioUrl]);
+  useEffect(() => {
+    if (playingId !== null && (settings.historyRetention === "never" || !history.some((item) => item.id === playingId))) {
+      if (audioUrl) URL.revokeObjectURL(audioUrl);
+      setAudioUrl(null);
+      setPlayingId(null);
+    }
+  }, [audioUrl, history, playingId, settings.historyRetention]);
+
+  async function audio(item: HistoryItem, download: boolean) {
+    const payload = await onLoadAudio(item.id);
+    const url = URL.createObjectURL(new Blob([new Uint8Array(payload.bytes)], { type: payload.mimeType }));
+    if (download) {
+      const anchor = document.createElement("a");
+      anchor.href = url; anchor.download = payload.filename; anchor.click();
+      URL.revokeObjectURL(url);
+    } else {
+      if (audioUrl) URL.revokeObjectURL(audioUrl);
+      setAudioUrl(url);
+      setPlayingId(item.id);
+    }
+  }
+
+  return <section className="panel compact-page-panel">
+    <div className="history-toolbar">
+      <select value={filter} aria-label={t("History filter")} onChange={(event) => {
+        onFilter(event.target.value as HistoryFilter);
+      }}>
+        {filters.map(({ value, label }) => <option key={value} value={value}>{t(label)}</option>)}
+      </select>
+      <select value={settings.historyRetention} onChange={(event) => onSave({ historyRetention: event.target.value as Settings["historyRetention"] })}>
+        <option value="never">{t("Never")}</option><option value="24_hours">{t("24 hours")}</option>
+        <option value="one_week">{t("1 week")}</option><option value="one_month">{t("1 month")}</option>
+        <option value="one_year">{t("1 year")}</option><option value="forever">{t("Forever")}</option>
+      </select>
+      <button className="danger-button" onClick={() => { if (window.confirm(t("Delete all history?"))) onDeleteAll(); }}>{t("Delete all")}</button>
+      {retryActive && <button onClick={onCancelRetry}>{t("Cancel")}</button>}
+    </div>
+    {audioUrl && <audio className="history-player" src={audioUrl} controls autoPlay />}
+    {settings.historyRetention === "never" ? <Empty title={t("History is disabled")} detail={t("New transcripts will not be written to SQLite.")} />
+      : history.length === 0 ? <Empty title={t("No dictations yet")} detail={t("Completed local dictations will appear here.")} />
+      : <div className="history-list">{history.map(item => <article className="history-item" key={item.id}>
+          <div className="history-meta"><time dateTime={item.createdAt}>{new Date(item.createdAt).toLocaleString()}</time>
+            <span className="history-mode">{item.mode}{item.targetLanguage ? ` · ${item.targetLanguage}` : ""}</span></div>
+          {item.sourceText && <HistoryText text={item.sourceText} label={t("Selected text")} />}
+          {item.instructionText && <HistoryText text={item.instructionText} label={t("Spoken instruction")} />}
+          {!item.sourceText && !item.instructionText && <HistoryText text={item.transcriptText} />}
+          {item.processedText && <HistoryText text={item.processedText} corrected />}
+          <div className="history-actions">
+            <button onClick={() => onCopyItem(item.processedText ?? item.transcriptText)}>{t("Copy")}</button>
+            <button disabled={!item.hasAudio} onClick={() => onRetry(item.id)}>{t("Retry")}</button>
+            <button disabled={!item.hasAudio} onClick={() => void audio(item, false)}>{t("Play")}</button>
+            <button disabled={!item.hasAudio} onClick={() => void audio(item, true)}>{t("Download")}</button>
+            <button className="danger-button" onClick={() => onDelete(item.id)}>{t("Delete")}</button>
+          </div>
+        </article>)}</div>}
+  </section>;
 }
 
-function HistoryText({
-  text,
-  corrected = false,
-  label,
-  onCopy,
-}: {
-  text: string;
-  corrected?: boolean;
-  label?: string;
-  onCopy: (text: string) => void;
-}) {
-  const { t } = useI18n();
-  return (
-    <div
-      className={`history-text${corrected ? " api-corrected" : ""}`}
-      role="button"
-      tabIndex={0}
-      title={t("Double-click to copy")}
-      onDoubleClick={() => onCopy(text)}
-      onKeyDown={(event) => {
-        if (event.key === "Enter") onCopy(text);
-      }}
-    >
-      {label && <strong>{label}: </strong>}{text}
-    </div>
-  );
+function HistoryText({ text, corrected = false, label }: { text: string; corrected?: boolean; label?: string }) {
+  return <div className={`history-text${corrected ? " api-corrected" : ""}`}>
+    {label && <strong>{label}: </strong>}{text}
+  </div>;
 }

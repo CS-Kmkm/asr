@@ -43,6 +43,30 @@ impl Default for PipelineLifecycle {
 }
 
 impl PipelineLifecycle {
+    pub fn begin_retry(
+        &self,
+        mode: PipelineMode,
+    ) -> Result<(u64, watch::Receiver<bool>), &'static str> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "pipeline lifecycle is unavailable")?;
+        if inner.is_some() {
+            return Err("a recording or processing operation is already active");
+        }
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (cancel, receiver) = watch::channel(false);
+        *inner = Some(PipelineOperation {
+            id,
+            mode,
+            phase: PipelinePhase::Processing,
+            cancel,
+        });
+        Ok((id, receiver))
+    }
+
     pub fn begin_start(&self, mode: PipelineMode) -> Result<u64, &'static str> {
         let mut inner = self
             .inner
@@ -147,6 +171,30 @@ impl PipelineLifecycle {
                     .map(|operation| *operation.cancel.borrow())
             })
             .unwrap_or(true)
+    }
+
+    /// Hold the lifecycle decision across the final durable side effect. This
+    /// makes cancellation either win before a retry writes History or observe
+    /// an already committed retry; it cannot interleave the check and insert.
+    pub fn commit_retry<T, E>(
+        &self,
+        id: u64,
+        commit: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Result<T, E>, &'static str> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "pipeline lifecycle is unavailable")?;
+        let operation = inner
+            .as_ref()
+            .filter(|operation| operation.id == id && !*operation.cancel.borrow())
+            .ok_or("history retry was cancelled")?;
+        let _ = operation;
+        let result = commit();
+        if result.is_ok() {
+            *inner = None;
+        }
+        Ok(result)
     }
 
     fn transition(
@@ -320,6 +368,41 @@ mod tests {
         lifecycle.cancel().unwrap();
         assert!(lifecycle.mark_recording(id).is_err());
         lifecycle.finish(id);
+        assert_eq!(lifecycle.phase(), PipelinePhase::Idle);
+    }
+
+    #[test]
+    fn retry_claims_processing_and_releases_after_cancellation() {
+        let lifecycle = PipelineLifecycle::default();
+        let (id, cancel) = lifecycle.begin_retry(PipelineMode::Ask).unwrap();
+        assert_eq!(lifecycle.phase(), PipelinePhase::Processing);
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_err());
+        assert_eq!(
+            lifecycle.cancel().unwrap(),
+            Some((id, PipelinePhase::Processing))
+        );
+        assert!(*cancel.borrow());
+        lifecycle.finish(id);
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_ok());
+    }
+
+    #[test]
+    fn retry_commit_rejects_prior_cancellation() {
+        let lifecycle = PipelineLifecycle::default();
+        let (id, _) = lifecycle.begin_retry(PipelineMode::Dictate).unwrap();
+        lifecycle.cancel().unwrap();
+        assert!(lifecycle.commit_retry(id, || Ok::<(), ()>(())).is_err());
+    }
+
+    #[test]
+    fn retry_commit_consumes_lifecycle_before_a_waiting_cancel_can_win() {
+        let lifecycle = PipelineLifecycle::default();
+        let (id, _) = lifecycle.begin_retry(PipelineMode::Dictate).unwrap();
+        assert!(lifecycle
+            .commit_retry(id, || Ok::<(), ()>(()))
+            .unwrap()
+            .is_ok());
+        assert_eq!(lifecycle.cancel().unwrap(), None);
         assert_eq!(lifecycle.phase(), PipelinePhase::Idle);
     }
 }

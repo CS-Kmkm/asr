@@ -42,8 +42,8 @@ pub struct Settings {
     #[serde(default = "default_translation_target_language")]
     pub translation_target_language: String,
     pub microphone_id: Option<String>,
-    pub history_enabled: bool,
-    pub history_retention_days: u32,
+    #[serde(default)]
+    pub history_retention: HistoryRetention,
     pub delete_audio_after_processing: bool,
     pub auto_start: bool,
     pub clipboard_restore: bool,
@@ -218,8 +218,7 @@ impl Default for Settings {
             translation_target_languages: default_translation_target_languages(),
             translation_target_language: default_translation_target_language(),
             microphone_id: None,
-            history_enabled: true,
-            history_retention_days: 30,
+            history_retention: HistoryRetention::OneMonth,
             delete_audio_after_processing: true,
             auto_start: false,
             clipboard_restore: true,
@@ -276,6 +275,52 @@ pub struct HistoryItem {
     pub duration_ms: Option<i64>,
     pub latency_ms: Option<i64>,
     pub created_at: String,
+    pub has_audio: bool,
+    pub retry_of_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryFilter {
+    All,
+    Dictate,
+    Translate,
+    Edit,
+    Ask,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryAudioPayload {
+    pub bytes: Vec<u8>,
+    pub filename: String,
+    pub mime_type: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryRetention {
+    Never,
+    #[serde(rename = "24_hours")]
+    TwentyFourHours,
+    OneWeek,
+    #[default]
+    OneMonth,
+    OneYear,
+    Forever,
+}
+
+impl HistoryRetention {
+    pub fn days(self) -> Option<i64> {
+        match self {
+            Self::Never => Some(0),
+            Self::TwentyFourHours => Some(1),
+            Self::OneWeek => Some(7),
+            Self::OneMonth => Some(30),
+            Self::OneYear => Some(365),
+            Self::Forever => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -293,6 +338,7 @@ pub struct NewHistoryItem<'a> {
     pub app_category: Option<&'a str>,
     pub duration_ms: Option<i64>,
     pub latency_ms: Option<i64>,
+    pub retry_of_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

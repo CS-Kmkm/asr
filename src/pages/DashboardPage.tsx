@@ -101,7 +101,7 @@ export function DashboardPage({
         label={t("PRIVACY")}
         value={t("Local only")}
         detail={
-          settings.historyEnabled
+          settings.historyRetention !== "never"
             ? t("History stored locally on this device")
             : t("History disabled; nothing is stored")
         }
