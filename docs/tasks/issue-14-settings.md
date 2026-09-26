@@ -1,0 +1,31 @@
+Goal: Complete GitHub issue #14 Settings parity for the four voice modes with safe Windows integration and preserved legacy settings.
+
+Scope / non-scope:
+- Add multiple shortcuts for Dictate, voice Translate, Ask Anything, and Speak to edit; keep selected-text translation as its existing separate shortcut. Expose microphone selection and an independent live level test in Settings, interaction start/stop sounds, Light/Dark/System theme, an extensible UI locale registry, and Dictate speech locale variants.
+- Do not control other applications' volume or send media keys. Current CPAL capture does not provide a safe, reversible per-session ducking mechanism; report mute/pause as unavailable until a supported WASAPI design is approved. Do not add a toggle that falsely promises it.
+- Do not merge, push, or change other issue branches.
+
+Constraints and fixed design:
+- Base: issue #12 commit `1f9c7a6`. Preserve its History/privacy and Retry contracts.
+- Canonical V2 shortcut settings are `shortcuts: { dictate, translate, ask, edit }`, each a nonempty array of one to four chord strings. Keep `translationHotkey` as the single selected-text translation chord. Raw JSON migration maps legacy `hotkey`, `voiceTranslateHotkey`, `askHotkey`, and `speakToEditHotkey` into V2 without discarding unrelated values. New persistence emits canonical V2. Validate parsed chords and reject duplicates across all five actions before registration or settings persistence.
+- Route each registered chord to its action using an immutable validated map. A shortcut update registers added chords, unregisters removed chords, persists settings, and swaps routing; on any failure restore the old registration and routing, reporting an explicit restart-required error if restoration fails. Chord swaps require only a routing change. Preserve the InputMonitor's actual trigger chord.
+- Independent microphone test opens the chosen CPAL input, emits bounded RMS/peak level events, and stops/cleans up on Stop, page exit, error, or recording start. It never creates History, target insertion, or retained audio. Exclusive ownership prevents microphone test and recording from capturing simultaneously.
+- Interaction sounds are local Windows start/stop cues gated by a persisted boolean; keep playback outside the capture callback and fail without breaking recording.
+- Theme is `system|light|dark` and applies to main, overlay, and answer windows via shared CSS variables and `prefers-color-scheme`. UI locale uses a typed registry with existing English/Japanese catalogs; other UI catalogs are not invented.
+- `speechLocale: string|null` is null for auto detection. Supported variants include en-US/en-GB, zh-CN/zh-TW, es-ES/es-MX, fr-FR/fr-CA, pt-BR/pt-PT. Validate against a fixed allowlist, pass the full tag to the ASR worker and AI correction context, and document when a backend only honors the base language. Keep Translate targets shared with issue #8.
+
+Acceptance criteria and checks:
+1. Legacy settings migrate idempotently; shortcut arrays persist and re-register at startup. Unit tests cover migration, collision, swap, and rollback; manual Windows shortcut smoke check remains explicit.
+2. Settings microphone selection and live level test use the selected device and release ownership after stop/error/recording start. Unit-level ownership/cleanup tests and manual device check.
+3. Interaction sound On/Off changes start/stop cues without blocking capture; lifecycle tests and manual listening check.
+4. Light/Dark/System updates all windows, with a system preference listener. Frontend build and visual manual check.
+5. English/Japanese locale registry remains complete; all new visible strings are localized. Frontend type/build checks.
+6. Regional variants persist and propagate to worker and correction prompts with fixed validation. Rust/Python tests and manual provider quality check.
+7. Rust format/check/test, Python focused tests, frontend build, `git diff --check`, and an independent code/contract audit pass. Existing History/privacy behavior remains green.
+
+Context:
+- Public issue #14 was re-read 2026-09-27; it was last updated 2026-09-21. The issue explicitly conditions audio muting on a safe Windows mechanism.
+- Existing seams: `src-tauri/src/{types,storage,commands,lib,audio,asr,correction}.rs`, `asr_worker/{worker,backends}.py`, `src/{App,types,i18n,styles.css}`, `src/pages/SettingsPage.tsx`.
+- Windows CPAL Bluetooth behavior requires test stream teardown outside idle recording; do not leave the microphone armed.
+
+Status: Design fixed; implementation not started. Next: implement disjoint frontend/settings and backend/audio slices, integrate, verify, independently audit, and commit locally. Manual hardware/provider checks will be reported rather than inferred.
