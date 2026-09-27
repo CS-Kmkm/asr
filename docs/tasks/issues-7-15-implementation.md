@@ -45,13 +45,8 @@ Context:
 - `.worktrees/issue-7-local-llm-correction/docs/tasks/issue-7-local-llm-correction.md` is the existing #7 contract.
 - `C:/Users/Koshi/agent-memory/tasks/asr--live-dictation.md` records prior live-dictation verification limits and protected runtime artifacts.
 
-Status (2026-09-22):
-- #7 and #8 are implemented, independently reviewed, verified, locally committed, and clean in their dedicated worktrees. #8 includes the reviewer-requested immediate-stop publication race fix.
-- #9 is stacked on completed #8 and #11 remains based on `origin/main`; both now have issue-local contracts and are assigned to isolated implementation agents.
-- Remaining dependency order after those reviews: #9 -> #10 -> #12 -> #14, plus #11 -> #13 and #11 -> #15. Hardware/provider/manual Windows checks remain explicit limitations until run by the user.
+Completion (2026-09-27): All nine actionable child issues are implemented, independently audited, locally committed, and clean in dedicated branches/worktrees. The final local tips are #7 `6198845`, #8 `acadb3c`, #9 `3d0b1a7`, #10 `6411024`, #11 `99436d5`, #12 `1f9c7a6`, #13 `b950c8b`, #14 `da1a58e`, and #15 `f4170fd`. The dependency stack remains #7 -> #8 -> #9 -> #10 -> #12 -> #14, plus #11 -> #13 and #11 -> #15. Parent issues #16-#19 map to those child branches and have no duplicate code worktrees.
 
-Progress update (2026-09-23):
-- #9 and #11 are implemented, independently reviewed, verified, locally committed, and clean. #9 closes the immutable selected-text edit path; #11 activates privacy-safe app/category personalization and scoped profiles.
-- #13 and #15 are implemented, independently reviewed with all findings closed, verified, locally committed, and clean on their Issue #11-based branches. #13 adds managed dictionary/candidate/CSV workflows; #15 adds conservative-by-default intent-aware Dictate with deterministic protected-span fallback.
-- #10 is in review follow-up on its Issue #9-based branch. The fixed search boundary remains backend-only; remaining work is limited to reviewed state-cleanup, explicit translation target, versioned panel IPC, monitored caret insertion, strict raw planning, site boundaries, and insertion-result reporting.
-- #12 design is being fixed before its Issue #10-based worktree is created; #14 remains dependent on completed #12. No branch has been merged or pushed by this task.
+Verification by issue is recorded in each issue-local contract. Final #12 checks passed Rust 164/4 ignored and frontend production build; final #14 checks passed Rust 175/4 ignored, Python 53, frontend production build, TypeScript, format/check, and diff checks. All independent review findings were resolved or explicitly documented as manual/backend limitations. No branch has been pushed or merged into `main`.
+
+Manual verification remains for Windows global shortcut registration, microphone selection/level/teardown, audible interaction cues, theme appearance across windows, retained History playback/download and locked-file recovery, cancellation timing, and live ASR/AI provider quality. #14 does not mute or pause other applications: safe Windows ducking requires a communications-stream integration absent from the current CPAL path; the limitation is visible in Settings and documented in the issue contract. Provider locale behavior is disclosed there too: faster-whisper/OpenAI-compatible honor base language only, and VibeVoice currently ignores the locale setting.
