@@ -35,7 +35,7 @@ export function DashboardPage({
           <p className="eyebrow">{t("RECORDING STATUS")}</p>
           <h2>{state.phase === "idle" ? t("Ready when you are") : statusLabel}</h2>
           <p>
-            {state.message ?? `${t("Use the recording hotkey to start or stop dictation:")} ${settings.hotkey}`}
+            {state.message ?? `${t("Use the recording hotkey to start or stop dictation:")} ${settings.shortcuts.dictate[0]}`}
           </p>
           <button
             className="primary"
@@ -70,7 +70,7 @@ export function DashboardPage({
         )}
       </article>
 
-      <InfoCard label={t("HOTKEY")} value={settings.hotkey} detail={t("Global toggle shortcut")} />
+      <InfoCard label={t("HOTKEY")} value={settings.shortcuts.dictate[0]} detail={t("Global toggle shortcut")} />
       <InfoCard
         label={t("MODEL")}
         value={model?.installed ? model.modelId ?? t("Ready") : t("Not installed")}

@@ -122,6 +122,16 @@ pub trait Transcriber: Send + Sync {
         prompt: Option<&str>,
         cancel: watch::Receiver<bool>,
     ) -> Result<Transcript, AsrError>;
+    async fn transcribe_with_locale(
+        &self,
+        audio_path: &Path,
+        prompt: Option<&str>,
+        locale: Option<&str>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Transcript, AsrError> {
+        let _ = locale;
+        self.transcribe(audio_path, prompt, cancel).await
+    }
     async fn shutdown(&self) -> Result<(), AsrError>;
     /// Reconfigure the worker command (for example when the ASR backend
     /// setting changes) and tear down any running worker so the next request
@@ -440,11 +450,23 @@ impl Transcriber for JsonlTranscriber {
         prompt: Option<&str>,
         cancel: watch::Receiver<bool>,
     ) -> Result<Transcript, AsrError> {
+        self.transcribe_with_locale(audio_path, prompt, None, cancel)
+            .await
+    }
+
+    async fn transcribe_with_locale(
+        &self,
+        audio_path: &Path,
+        prompt: Option<&str>,
+        locale: Option<&str>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Transcript, AsrError> {
         let request = json!({
             "id": self.next_id.fetch_add(1, Ordering::Relaxed),
             "command": "transcribe",
             "audio_path": audio_path,
             "prompt": prompt,
+            "language": locale,
         });
         let response = self
             .request(request, Some(cancel), self.request_timeout)

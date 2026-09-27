@@ -37,7 +37,8 @@ pub async fn correct_transcript(
     cancel: watch::Receiver<bool>,
     on_update: impl FnMut(&str),
 ) -> Result<String, CorrectionError> {
-    let instruction = build_correction_instruction(settings, dictionary_hints);
+    let mut instruction = build_correction_instruction(settings, dictionary_hints);
+    append_speech_locale(&mut instruction, settings);
     request_text(settings, transcript, &instruction, cancel, on_update, true).await
 }
 
@@ -57,7 +58,8 @@ pub async fn translate_transcript(
     cancel: watch::Receiver<bool>,
     on_update: impl FnMut(&str),
 ) -> Result<String, CorrectionError> {
-    let instruction = build_voice_translation_instruction(target_language)?;
+    let mut instruction = build_voice_translation_instruction(target_language)?;
+    append_speech_locale(&mut instruction, settings);
     request_text(settings, transcript, &instruction, cancel, on_update, true).await
 }
 
@@ -68,9 +70,19 @@ pub async fn edit_selected_text(
     cancel: watch::Receiver<bool>,
     on_update: impl FnMut(&str),
 ) -> Result<String, CorrectionError> {
-    let instruction = build_edit_instruction();
+    let mut instruction = build_edit_instruction().to_owned();
+    append_speech_locale(&mut instruction, settings);
     let input = edit_request_input(selected_text, spoken_instruction);
-    request_text(settings, &input, instruction, cancel, on_update, true).await
+    request_text(settings, &input, &instruction, cancel, on_update, true).await
+}
+
+fn append_speech_locale(instruction: &mut String, settings: &Settings) {
+    if let Some(locale) = settings.speech_locale.as_deref() {
+        // The command validates this against a fixed allowlist before saving.
+        instruction.push_str("\nThe spoken transcript was recorded with speech locale ");
+        instruction.push_str(locale);
+        instruction.push_str(". Respect its regional spelling and vocabulary where appropriate.");
+    }
 }
 
 fn build_edit_instruction() -> &'static str {
@@ -1250,5 +1262,17 @@ mod tests {
             build_voice_translation_instruction("not-a-language"),
             Err(CorrectionError::InvalidResponse(_))
         ));
+    }
+
+    #[test]
+    fn speech_locale_is_available_to_correction_prompt() {
+        let settings = Settings {
+            speech_locale: Some("en-GB".into()),
+            ..Settings::default()
+        };
+        let mut instruction = build_correction_instruction(&settings, &[]);
+        append_speech_locale(&mut instruction, &settings);
+        assert!(instruction.contains("speech locale en-GB"));
+        assert!(instruction.contains("regional spelling and vocabulary"));
     }
 }

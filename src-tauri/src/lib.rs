@@ -9,6 +9,7 @@ mod injection;
 mod input_monitor;
 mod live_dictation;
 mod recording_overlay;
+mod shortcuts;
 mod state;
 mod storage;
 mod types;
@@ -52,6 +53,32 @@ use types::{
 
 const ASR_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const ASR_MODEL_LOAD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+
+#[derive(Default)]
+struct MicrophoneTestState {
+    generation: u64,
+    active: Option<u64>,
+}
+
+impl MicrophoneTestState {
+    fn start(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.active = Some(self.generation);
+        self.generation
+    }
+
+    fn stop(&mut self) -> bool {
+        self.active.take().is_some()
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.active == Some(generation)
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+}
 
 pub(crate) fn model_identity(settings: &Settings) -> (Option<String>, String) {
     let custom_model = settings
@@ -105,6 +132,9 @@ pub(crate) struct Services {
     shutdown_started: AtomicBool,
     translation_active: AtomicBool,
     voice_translation_target: Mutex<Option<String>>,
+    shortcut_routes: Mutex<shortcuts::Routes>,
+    settings_update: tokio::sync::Mutex<()>,
+    microphone_test: tokio::sync::Mutex<MicrophoneTestState>,
 }
 
 impl Services {
@@ -135,6 +165,11 @@ impl Services {
             shutdown_started: AtomicBool::new(false),
             translation_active: AtomicBool::new(false),
             voice_translation_target: Mutex::new(None),
+            shortcut_routes: Mutex::new(
+                shortcuts::Routes::parse(settings).expect("validated settings"),
+            ),
+            settings_update: tokio::sync::Mutex::new(()),
+            microphone_test: tokio::sync::Mutex::new(MicrophoneTestState::default()),
         }
     }
 
@@ -152,8 +187,10 @@ impl Services {
             }
         }
         {
+            self.microphone_test.lock().await.stop();
             let mut audio = self.audio.lock().await;
             let _ = audio.cancel().await;
+            let _ = audio.disarm().await;
         }
         if let Some(task) = self.live.lock().await.take() {
             let _ = task.finish().await;
@@ -179,7 +216,7 @@ pub(crate) struct EditSession {
 }
 
 impl EditSession {
-    fn new(settings: &Settings, from_shortcut: bool) -> Result<Self, String> {
+    fn new(settings: &Settings, active_hotkey: &str, from_shortcut: bool) -> Result<Self, String> {
         let injector = SystemTextInjector::new(InjectionOptions {
             restore_clipboard: settings.clipboard_restore,
         });
@@ -187,7 +224,7 @@ impl EditSession {
             .capture_selection()
             .map_err(|_| "Select text in a supported foreground edit control.".to_string())?;
         let monitor = Arc::new(InputMonitor::default());
-        if !monitor.start_for_recording(&settings.speak_to_edit_hotkey, from_shortcut) {
+        if !monitor.start_for_recording(active_hotkey, from_shortcut) {
             return Err("Speak to edit could not monitor the original selection safely.".into());
         }
         let checkpoint = monitor
@@ -222,7 +259,7 @@ pub(crate) struct AskSession {
 }
 
 impl AskSession {
-    fn new(settings: &Settings, from_shortcut: bool) -> Self {
+    fn new(settings: &Settings, active_hotkey: &str, from_shortcut: bool) -> Self {
         let injector = SystemTextInjector::new(InjectionOptions {
             restore_clipboard: settings.clipboard_restore,
         });
@@ -242,7 +279,7 @@ impl AskSession {
         let monitor = match &capture {
             AskCapture::Selected(_) | AskCapture::Caret(_) => {
                 let monitor = Arc::new(InputMonitor::default());
-                if monitor.start_for_recording(&settings.ask_hotkey, from_shortcut) {
+                if monitor.start_for_recording(active_hotkey, from_shortcut) {
                     Some(monitor)
                 } else {
                     None
@@ -474,6 +511,25 @@ fn environment_file_candidates(
 }
 
 #[cfg(test)]
+mod microphone_test_tests {
+    use super::MicrophoneTestState;
+
+    #[test]
+    fn stop_releases_ownership_and_invalidates_old_meter_task() {
+        let mut state = MicrophoneTestState::default();
+        let first = state.start();
+        assert!(state.is_current(first));
+        assert!(state.stop());
+        assert!(!state.stop());
+        assert!(!state.is_current(first));
+        let second = state.start();
+        assert_ne!(first, second);
+        assert!(!state.is_current(first));
+        assert!(state.is_current(second));
+    }
+}
+
+#[cfg(test)]
 mod model_configuration_tests {
     use super::*;
 
@@ -641,7 +697,7 @@ fn cleanup_stale_artifacts(
     Ok(removed)
 }
 
-async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode) {
+async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode, trigger_chord: String) {
     let phase = app.state::<Services>().lifecycle.phase();
     let result = match phase {
         PipelinePhase::Recording
@@ -665,6 +721,7 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode) {
                     app.state::<AppState>(),
                     app.state::<Storage>(),
                     true,
+                    Some(trigger_chord),
                 )
                 .await
             }
@@ -675,6 +732,7 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode) {
                     app.state::<AppState>(),
                     app.state::<Storage>(),
                     true,
+                    Some(trigger_chord),
                 )
                 .await
             }
@@ -685,6 +743,7 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode) {
                     app.state::<AppState>(),
                     app.state::<Storage>(),
                     true,
+                    Some(trigger_chord),
                 )
                 .await
             }
@@ -695,6 +754,7 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode) {
                     app.state::<AppState>(),
                     app.state::<Storage>(),
                     true,
+                    Some(trigger_chord),
                 )
                 .await
             }
@@ -801,35 +861,30 @@ async fn translate_selection(app: AppHandle) {
 }
 
 fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
-    let Ok(settings) = app.state::<Storage>().get_settings() else {
+    let route = app
+        .state::<Services>()
+        .shortcut_routes
+        .lock()
+        .ok()
+        .and_then(|routes| routes.find(shortcut).cloned());
+    let Some(route) = route else {
         return;
     };
-    let Ok(recording) = parse_shortcut(&settings.hotkey) else {
-        return;
+    match route.action {
+        shortcuts::Action::Dictate => {
+            tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Dictate, route.text))
+        }
+        shortcuts::Action::Translate => {
+            tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Translate, route.text))
+        }
+        shortcuts::Action::Edit => {
+            tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Edit, route.text))
+        }
+        shortcuts::Action::Ask => {
+            tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Ask, route.text))
+        }
+        shortcuts::Action::SelectedText => tauri::async_runtime::spawn(translate_selection(app)),
     };
-    let Ok(translation) = parse_shortcut(&settings.translation_hotkey) else {
-        return;
-    };
-    let Ok(voice_translate) = parse_shortcut(&settings.voice_translate_hotkey) else {
-        return;
-    };
-    let Ok(speak_to_edit) = parse_shortcut(&settings.speak_to_edit_hotkey) else {
-        return;
-    };
-    let Ok(ask) = parse_shortcut(&settings.ask_hotkey) else {
-        return;
-    };
-    if shortcut == recording {
-        tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Dictate));
-    } else if shortcut == voice_translate {
-        tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Translate));
-    } else if shortcut == speak_to_edit {
-        tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Edit));
-    } else if shortcut == ask {
-        tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Ask));
-    } else if shortcut == translation {
-        tauri::async_runtime::spawn(translate_selection(app));
-    }
 }
 
 async fn initialize_model_runtime(app: AppHandle, settings: Settings) {
@@ -899,40 +954,16 @@ pub fn run() {
                     );
                 }
             }
-            let shortcut = parse_shortcut(&settings.hotkey)
+            let routes = shortcuts::Routes::parse(&settings)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-            let translation_shortcut = parse_shortcut(&settings.translation_hotkey)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-            let voice_translate_shortcut = parse_shortcut(&settings.voice_translate_hotkey)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-            let edit_shortcut = parse_shortcut(&settings.speak_to_edit_hotkey)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-            let ask_shortcut = parse_shortcut(&settings.ask_hotkey)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-            if shortcut == translation_shortcut
-                || shortcut == voice_translate_shortcut
-                || translation_shortcut == voice_translate_shortcut
-                || edit_shortcut == shortcut
-                || edit_shortcut == translation_shortcut
-                || edit_shortcut == voice_translate_shortcut
-                || ask_shortcut == shortcut || ask_shortcut == translation_shortcut || ask_shortcut == voice_translate_shortcut || ask_shortcut == edit_shortcut
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "recording, selected-text translation, voice Translate, and Speak to edit hotkeys must differ",
-                )
-                .into());
-            }
             app.manage(storage);
             app.manage(AppState::default());
             app.manage(Services::new(&settings));
             recording_overlay::create(app.handle())?;
             answer_panel::create(app.handle())?;
-            app.global_shortcut().register(shortcut)?;
-            app.global_shortcut().register(translation_shortcut)?;
-            app.global_shortcut().register(voice_translate_shortcut)?;
-            app.global_shortcut().register(edit_shortcut)?;
-            app.global_shortcut().register(ask_shortcut)?;
+            for route in &routes.0 {
+                app.global_shortcut().register(route.chord)?;
+            }
             if cleanup_stale_artifacts(
                 &std::env::temp_dir(),
                 settings.delete_audio_after_processing,
@@ -975,6 +1006,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::list_audio_devices,
             commands::start_recording,
+            commands::start_microphone_test,
+            commands::stop_microphone_test,
             commands::start_voice_translation,
             commands::start_speak_to_edit,
             commands::start_ask,

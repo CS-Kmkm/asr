@@ -118,6 +118,33 @@ const en = {
   "The original selection changed; the edit remains on the clipboard.": "The original selection changed; the edit remains on the clipboard.",
   "The edit paste could not be confirmed; the result remains on the clipboard.": "The edit paste could not be confirmed; the result remains on the clipboard.",
   "Speak to edit could not monitor the original selection safely.": "Speak to edit could not monitor the original selection safely.",
+  "Appearance": "Appearance",
+  "Choose the app color theme.": "Choose the app color theme.",
+  "System": "System", "Light": "Light", "Dark": "Dark",
+  "Speech language": "Speech language",
+  "Choose a speech recognition language, or use automatic detection.": "Choose a speech recognition language, or use automatic detection.",
+  "Choose a speech recognition language, or use automatic detection. The faster-whisper and OpenAI-compatible backends honor the base language only; VibeVoice currently ignores this setting.": "Choose a speech recognition language, or use automatic detection. The faster-whisper and OpenAI-compatible backends honor the base language only; VibeVoice currently ignores this setting.",
+  "Automatic detection": "Automatic detection",
+  "English (United States)": "English (United States)", "English (United Kingdom)": "English (United Kingdom)",
+  "Chinese (Simplified)": "Chinese (Simplified)", "Chinese (Traditional)": "Chinese (Traditional)",
+  "Spanish (Spain)": "Spanish (Spain)", "Spanish (Mexico)": "Spanish (Mexico)",
+  "French (France)": "French (France)", "French (Canada)": "French (Canada)",
+  "Portuguese (Brazil)": "Portuguese (Brazil)", "Portuguese (Portugal)": "Portuguese (Portugal)",
+  "Choose the input device used for recording and microphone testing.": "Choose the input device used for recording and microphone testing.",
+  "Default": "Default", "Microphone level test": "Microphone level test",
+  "Test the selected microphone. Audio is measured live and never saved.": "Test the selected microphone. Audio is measured live and never saved.",
+  "Stop test": "Stop test", "Start test": "Start test", "Microphone input level": "Microphone input level",
+  "Microphone test failed.": "Microphone test failed.", "Interaction sounds": "Interaction sounds",
+  "Play a brief local sound when recording starts and stops.": "Play a brief local sound when recording starts and stops.",
+  "Muting or pausing other applications is unavailable because this app cannot safely control their audio.": "Muting or pausing other applications is unavailable because this app cannot safely control their audio.",
+  "Voice mode shortcuts": "Voice mode shortcuts", "Dictation shortcuts": "Dictation shortcuts",
+  "Voice Translate shortcuts": "Voice Translate shortcuts", "Ask Anything shortcuts": "Ask Anything shortcuts",
+  "Speak to edit shortcuts": "Speak to edit shortcuts",
+  "Add one to four keyboard shortcuts for each voice mode. A shortcut must be unique across all actions.": "Add one to four keyboard shortcuts for each voice mode. A shortcut must be unique across all actions.",
+  "Enter a shortcut chord such as Ctrl+Shift+Space.": "Enter a shortcut chord such as Ctrl+Shift+Space.",
+  "Remove shortcut": "Remove shortcut", "Add shortcut": "Add shortcut", "Save voice shortcuts": "Save voice shortcuts",
+  "Each voice mode needs one to four non-empty shortcuts.": "Each voice mode needs one to four non-empty shortcuts.",
+  "Shortcuts must be non-empty and unique across all actions.": "Shortcuts must be non-empty and unique across all actions.",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
@@ -236,7 +263,36 @@ const ja: Record<MessageKey, string> = {
   "The original selection changed; the edit remains on the clipboard.": "元の選択範囲が変わったため、編集結果をクリップボードに残しました。",
   "The edit paste could not be confirmed; the result remains on the clipboard.": "編集結果の貼り付けを確認できませんでした。結果はクリップボードに残っています。",
   "Speak to edit could not monitor the original selection safely.": "元の選択範囲を安全に監視できないため、音声編集を開始できませんでした。",
+  "Appearance": "外観",
+  "Choose the app color theme.": "アプリの配色を選択します。",
+  "System": "システム", "Light": "ライト", "Dark": "ダーク",
+  "Speech language": "音声認識の言語",
+  "Choose a speech recognition language, or use automatic detection.": "音声認識の言語を選択するか、自動検出を使用します。",
+  "Choose a speech recognition language, or use automatic detection. The faster-whisper and OpenAI-compatible backends honor the base language only; VibeVoice currently ignores this setting.": "音声認識の言語を選択するか、自動検出を使用します。faster-whisper と OpenAI 互換バックエンドは基本言語のみを使用し、VibeVoice は現在この設定を無視します。",
+  "Automatic detection": "自動検出",
+  "English (United States)": "英語（米国）", "English (United Kingdom)": "英語（英国）",
+  "Chinese (Simplified)": "中国語（簡体字）", "Chinese (Traditional)": "中国語（繁体字）",
+  "Spanish (Spain)": "スペイン語（スペイン）", "Spanish (Mexico)": "スペイン語（メキシコ）",
+  "French (France)": "フランス語（フランス）", "French (Canada)": "フランス語（カナダ）",
+  "Portuguese (Brazil)": "ポルトガル語（ブラジル）", "Portuguese (Portugal)": "ポルトガル語（ポルトガル）",
+  "Choose the input device used for recording and microphone testing.": "録音とマイクテストに使用する入力デバイスを選択します。",
+  "Default": "既定", "Microphone level test": "マイク入力テスト",
+  "Test the selected microphone. Audio is measured live and never saved.": "選択したマイクをテストします。音声はリアルタイム測定のみで保存されません。",
+  "Stop test": "テストを停止", "Start test": "テストを開始", "Microphone input level": "マイク入力レベル",
+  "Microphone test failed.": "マイクテストに失敗しました。", "Interaction sounds": "操作音",
+  "Play a brief local sound when recording starts and stops.": "録音の開始時と停止時に短い効果音を再生します。",
+  "Muting or pausing other applications is unavailable because this app cannot safely control their audio.": "他のアプリの音声を安全に制御できないため、ミュートや一時停止は利用できません。",
+  "Voice mode shortcuts": "音声モードのショートカット", "Dictation shortcuts": "音声入力のショートカット",
+  "Voice Translate shortcuts": "音声翻訳のショートカット", "Ask Anything shortcuts": "質問のショートカット",
+  "Speak to edit shortcuts": "音声編集のショートカット",
+  "Add one to four keyboard shortcuts for each voice mode. A shortcut must be unique across all actions.": "各音声モードに1～4個のショートカットを設定できます。すべての操作で重複しないようにしてください。",
+  "Enter a shortcut chord such as Ctrl+Shift+Space.": "Ctrl+Shift+Space のようなキーの組み合わせを入力します。",
+  "Remove shortcut": "ショートカットを削除", "Add shortcut": "ショートカットを追加", "Save voice shortcuts": "音声ショートカットを保存",
+  "Each voice mode needs one to four non-empty shortcuts.": "各音声モードに1～4個の空でないショートカットが必要です。",
+  "Shortcuts must be non-empty and unique across all actions.": "ショートカットは空欄にできず、すべての操作で重複できません。",
 } satisfies Record<MessageKey, string>;
+
+const catalogs = { en, ja } satisfies Record<UiLanguage, Record<MessageKey, string>>;
 
 const appMessageKeys: ReadonlySet<MessageKey> = new Set(
   [
@@ -288,7 +344,7 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
 );
 
 export function translate(language: UiLanguage, key: MessageKey): string {
-  return (language === "ja" ? ja : en)[key];
+  return catalogs[language][key];
 }
 
 export function translateAppMessage(language: UiLanguage, message: string | null): string | null {

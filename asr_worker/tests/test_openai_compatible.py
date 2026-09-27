@@ -58,7 +58,7 @@ class OpenAICompatibleBackendTests(unittest.TestCase):
             audio.write(b"RIFF-test")
             audio_path = Path(audio.name)
         try:
-            text, segments = backend.transcribe(audio_path, "product names", "en")
+            text, segments = backend.transcribe(audio_path, "product names", "en-GB")
         finally:
             audio_path.unlink(missing_ok=True)
 
@@ -70,6 +70,8 @@ class OpenAICompatibleBackendTests(unittest.TestCase):
         self.assertIn(b'name="file"', captured_body)
         self.assertIn(b'name="prompt"', captured_body)
         self.assertIn(b'name="language"', captured_body)
+        self.assertIn(b"\r\n\r\nen\r\n", captured_body)
+        self.assertNotIn(b"en-GB", captured_body)
         self.assertIn(b'name="response_format"', captured_body)
         self.assertIn(b"json", captured_body)
 

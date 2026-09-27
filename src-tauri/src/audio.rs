@@ -47,6 +47,9 @@ pub trait AudioCapture: Send {
     fn cancel(&mut self) -> AudioFuture<'_, ()>;
     fn state(&self) -> CaptureState;
     fn level(&self) -> LevelMeter;
+    fn stream_error(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Boundary for replacing the deterministic fallback with WebRTC VAD later.
@@ -709,6 +712,16 @@ impl AudioCapture for CpalAudioCapture {
             .as_ref()
             .and_then(|active| active.shared.lock().ok().map(|shared| shared.level))
             .unwrap_or_default()
+    }
+
+    fn stream_error(&self) -> Option<String> {
+        self.active.as_ref().and_then(|active| {
+            active
+                .shared
+                .lock()
+                .ok()
+                .and_then(|shared| shared.stream_error.clone())
+        })
     }
 }
 

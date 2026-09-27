@@ -280,8 +280,8 @@ impl Storage {
                 "settings must be an object",
             ))
         })?;
-        let legacy = !object.contains_key("historyRetention");
-        if legacy {
+        let legacy_history = !object.contains_key("historyRetention");
+        if legacy_history {
             let enabled = object
                 .remove("historyEnabled")
                 .and_then(|value| value.as_bool())
@@ -303,8 +303,42 @@ impl Storage {
             };
             object.insert("historyRetention".into(), retention.into());
         }
+        let legacy_shortcuts = !object.contains_key("shortcuts");
+        if legacy_shortcuts {
+            let scalar = |name: &str, fallback: &str| {
+                object
+                    .get(name)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(fallback)
+                    .to_owned()
+            };
+            object.insert(
+                "shortcuts".into(),
+                serde_json::json!({
+                    "dictate": [scalar("hotkey", "Ctrl+Shift+Space")],
+                    "translate": [scalar("voiceTranslateHotkey", "Ctrl+Shift+Y")],
+                    "ask": [scalar("askHotkey", "Ctrl+Shift+A")],
+                    "edit": [scalar("speakToEditHotkey", "Ctrl+Shift+E")],
+                }),
+            );
+        }
+        let mut had_legacy_shortcut_fields = false;
+        for key in [
+            "hotkey",
+            "voiceTranslateHotkey",
+            "askHotkey",
+            "speakToEditHotkey",
+        ] {
+            had_legacy_shortcut_fields |= object.remove(key).is_some();
+        }
         let settings: Settings = serde_json::from_value(value.clone())?;
-        if legacy {
+        if legacy_history || legacy_shortcuts || had_legacy_shortcut_fields {
+            crate::shortcuts::Routes::parse(&settings).map_err(|message| {
+                StorageError::InvalidSettings(serde_json::Error::io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    message,
+                )))
+            })?;
             // Persist the normalized V2 retention value, but keep fields that
             // this version does not own. A migration must not erase a newer
             // client's unrelated setting merely because it encountered an
@@ -1221,7 +1255,7 @@ mod tests {
     fn settings_round_trip() {
         let storage = Storage::in_memory().unwrap();
         let mut settings = Settings::default();
-        settings.hotkey = "Ctrl+Alt+V".into();
+        settings.shortcuts.dictate = vec!["Ctrl+Alt+V".into()];
         settings.history_retention = HistoryRetention::OneWeek;
         settings.local_correction_base_url = "http://127.0.0.1:1234/v1".into();
         settings.local_correction_model = "local-model".into();
@@ -1231,6 +1265,75 @@ mod tests {
         });
         storage.update_settings(&settings).unwrap();
         assert_eq!(storage.get_settings().unwrap(), settings);
+    }
+
+    #[test]
+    fn scalar_shortcuts_migrate_once_without_losing_unrelated_json() {
+        let storage = Storage::in_memory().unwrap();
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("shortcuts");
+        object.insert("hotkey".into(), "Ctrl+Alt+V".into());
+        object.insert("voiceTranslateHotkey".into(), "Ctrl+Alt+Y".into());
+        object.insert("askHotkey".into(), "Ctrl+Alt+A".into());
+        object.insert("speakToEditHotkey".into(), "Ctrl+Alt+E".into());
+        object.insert("futureSetting".into(), serde_json::json!({"keep": true}));
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, 'now')",
+                [value.to_string()],
+            )
+            .unwrap();
+        let settings = storage.get_settings().unwrap();
+        assert_eq!(settings.shortcuts.dictate, ["Ctrl+Alt+V"]);
+        assert_eq!(settings.shortcuts.translate, ["Ctrl+Alt+Y"]);
+        assert_eq!(settings.shortcuts.ask, ["Ctrl+Alt+A"]);
+        assert_eq!(settings.shortcuts.edit, ["Ctrl+Alt+E"]);
+        assert_eq!(storage.get_settings().unwrap(), settings);
+        let raw: String = storage
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key='app_settings'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let migrated: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(migrated["futureSetting"]["keep"], true);
+        assert!(migrated.get("hotkey").is_none());
+        assert_eq!(migrated["shortcuts"]["dictate"][0], "Ctrl+Alt+V");
+    }
+
+    #[test]
+    fn colliding_legacy_shortcuts_do_not_persist_migration() {
+        let storage = Storage::in_memory().unwrap();
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("shortcuts");
+        object.insert("hotkey".into(), "Ctrl+Shift+T".into());
+        let raw = value.to_string();
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, 'now')",
+                [raw.as_str()],
+            )
+            .unwrap();
+        assert!(storage.get_settings().is_err());
+        let saved: String = storage
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key='app_settings'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved, raw);
     }
 
     #[test]

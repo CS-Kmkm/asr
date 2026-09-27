@@ -33,13 +33,13 @@ export interface RecordingResult {
 
 export interface Settings {
   uiLanguage: UiLanguage;
+  theme: Theme;
+  interactionSounds: boolean;
+  speechLocale: SpeechLocale | null;
   setupComplete: boolean;
-  hotkey: string;
+  shortcuts: Record<ShortcutMode, string[]>;
   translationHotkey: string;
   translationInstruction: string;
-  voiceTranslateHotkey: string;
-  speakToEditHotkey: string;
-  askHotkey: string;
   translationTargetLanguages: string[];
   translationTargetLanguage: string;
   microphoneId: string | null;
@@ -73,7 +73,26 @@ export interface Settings {
   customModels: CustomModel[];
 }
 
-export type UiLanguage = "en" | "ja";
+export const uiLocaleRegistry = [
+  { tag: "en", label: "English" },
+  { tag: "ja", label: "Japanese" },
+] as const;
+export type UiLanguage = (typeof uiLocaleRegistry)[number]["tag"];
+export type Theme = "system" | "light" | "dark";
+export type ShortcutMode = "dictate" | "translate" | "ask" | "edit";
+export const speechLocaleRegistry = [
+  { tag: "en-US", label: "English (United States)" },
+  { tag: "en-GB", label: "English (United Kingdom)" },
+  { tag: "zh-CN", label: "Chinese (Simplified)" },
+  { tag: "zh-TW", label: "Chinese (Traditional)" },
+  { tag: "es-ES", label: "Spanish (Spain)" },
+  { tag: "es-MX", label: "Spanish (Mexico)" },
+  { tag: "fr-FR", label: "French (France)" },
+  { tag: "fr-CA", label: "French (Canada)" },
+  { tag: "pt-BR", label: "Portuguese (Brazil)" },
+  { tag: "pt-PT", label: "Portuguese (Portugal)" },
+] as const;
+export type SpeechLocale = (typeof speechLocaleRegistry)[number]["tag"];
 export type HistoryRetention = "never" | "24_hours" | "one_week" | "one_month" | "one_year" | "forever";
 export type HistoryFilter = "all" | "dictate" | "translate" | "edit" | "ask";
 

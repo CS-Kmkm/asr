@@ -334,12 +334,41 @@ function RecordingOverlay() {
 
 export default function App() {
   const [language, setLanguage] = useState<Settings["uiLanguage"] | null>(null);
+  const [theme, setTheme] = useState<Settings["theme"]>(defaultSettings.theme);
 
   useEffect(() => {
     getSettings()
-      .then((settings) => setLanguage(settings.uiLanguage))
+      .then((settings) => {
+        setLanguage(settings.uiLanguage);
+        setTheme(settings.theme);
+      })
       .catch(() => setLanguage(defaultSettings.uiLanguage));
+    let unlisten: (() => void) | undefined;
+    let active = true;
+    void listen<Settings>("settings-changed", ({ payload }) => {
+      setLanguage(payload.uiLanguage);
+      setTheme(payload.theme);
+    }).then((stop) => {
+      if (active) unlisten = stop;
+      else stop();
+    });
+    return () => {
+      active = false;
+      unlisten?.();
+    };
   }, []);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const apply = () => {
+      root.dataset.theme = theme;
+      root.dataset.systemTheme = media.matches ? "dark" : "light";
+    };
+    apply();
+    media.addEventListener("change", apply);
+    return () => media.removeEventListener("change", apply);
+  }, [theme]);
 
   if (language === null) return null;
   return (
@@ -706,8 +735,10 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
         )}
 
         {page === "settings" && (
-          <SettingsPage
+        <SettingsPage
             settings={settings}
+            devices={devices}
+            recording={state.phase === "recording"}
             onSave={(patch) => void saveSettings(patch)}
           />
         )}
