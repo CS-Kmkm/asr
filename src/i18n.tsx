@@ -55,6 +55,8 @@ const en = {
   "Dictation cancelled.": "Dictation cancelled.",
   "Transcription failed. Check model and GPU diagnostics.": "Transcription failed. Check model and GPU diagnostics.",
   "Temporary audio cleanup failed.": "Temporary audio cleanup failed.",
+  "History text was saved, but the recording could not be retained.": "History text was saved, but the recording could not be retained.",
+  "The result completed, but History could not be saved.": "The result completed, but History could not be saved.",
   "Correcting the transcript with the configured AI provider.": "Correcting the transcript with the configured AI provider.",
   "Inserting the provisional transcript into the captured target.": "Inserting the provisional transcript into the captured target.",
   "Draft insertion failed; the transcript is available in this app.": "Draft insertion failed; the transcript is available in this app.",
@@ -121,6 +123,8 @@ const en = {
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
+  "The result completed, but History could not be saved.": "結果は完了しましたが、履歴を保存できませんでした。",
+  "History text was saved, but the recording could not be retained.": "履歴のテキストは保存しましたが、録音は保存できませんでした。",
   "API model ID (for example gpt-4o-mini-transcribe)": "APIモデルID（例: gpt-4o-mini-transcribe）", "Model name or Hugging Face repository ID": "モデル名またはHugging FaceリポジトリID",
   "Fast local transcription on CPU or CUDA.": "CPUまたはCUDAで高速にローカル文字起こし。", "Long-form transcription on a CUDA GPU.": "CUDA GPUで長時間音声を文字起こし。", "OpenAI Audio Transcriptions API or a compatible local server.": "OpenAI Audio Transcriptions APIまたは互換ローカルサーバー。", "Whisper model": "Whisperモデル", "VibeVoice model": "VibeVoiceモデル", "OpenAI-compatible API model": "OpenAI互換APIモデル", "Choose a local model or an OpenAI-compatible transcription endpoint. Local model files are downloaded on first use and cached.": "ローカルモデルまたはOpenAI互換の文字起こしエンドポイントを選択します。モデルは初回使用時にダウンロードしてキャッシュします。", "faster-whisper (recommended / CPU supported)": "faster-whisper（推奨 / CPU対応）", "VibeVoice (CUDA GPU required)": "VibeVoice（CUDA GPU必須）", "OpenAI-compatible API": "OpenAI互換API", "When enabled, the transcript is sent to the selected external provider after local transcription. Audio is never sent by this feature.": "有効にすると、ローカル文字起こし後に選択した外部プロバイダーへテキストを送信します。この機能で音声を送信することはありません。", "Choose the quality, latency, and cost tradeoff. None is fastest; high and above spend more time reasoning. Availability depends on the selected model.": "品質・遅延・コストのバランスを選択します。Noneが最速で、High以上は推論に時間をかけます。利用可能な設定はモデルによって異なります。", Ready: "準備完了", "Not installed": "未インストール", "Checking local cache": "ローカルキャッシュを確認中", "Delete dictionary entry": "辞書項目を削除", "aliases:": "別名:", "priority": "優先度", "Input level": "入力レベル", "percent": "パーセント",
   Status: "ステータス", Setup: "初期設定", Settings: "設定", History: "履歴", Dictionary: "辞書", Privacy: "プライバシー", Diagnostics: "診断", Models: "モデル",
@@ -251,6 +255,8 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "Dictation cancelled.",
       "Transcription failed. Check model and GPU diagnostics.",
       "Temporary audio cleanup failed.",
+      "History text was saved, but the recording could not be retained.",
+      "The result completed, but History could not be saved.",
       "Correcting the transcript with the configured AI provider.",
       "Inserting the provisional transcript into the captured target.",
       "Finalizing the provisional text in the captured target.",
