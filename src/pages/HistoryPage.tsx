@@ -2,6 +2,13 @@ import { Empty, Toggle } from "../components/ui";
 import type { HistoryItem, Settings } from "../types";
 import { useI18n } from "../i18n";
 
+const modeLabels = {
+  faithful: "Dictation (faithful)",
+  ai_corrected: "Dictation (AI corrected)",
+  faithful_fallback: "Dictation (AI fallback)",
+  translate: "Voice Translate",
+} as const;
+
 export function HistoryPage({
   settings,
   history,
@@ -43,7 +50,9 @@ export function HistoryPage({
                   {new Date(item.createdAt).toLocaleString()}
                 </time>
                 <span className="history-mode">
-                  {item.mode}{item.targetLanguage ? ` · ${item.targetLanguage}` : ""}
+                  {item.mode in modeLabels
+                    ? t(modeLabels[item.mode as keyof typeof modeLabels])
+                    : item.mode}{item.targetLanguage ? ` · ${item.targetLanguage}` : ""}
                 </span>
               </div>
               <HistoryText text={item.transcriptText} onCopy={onCopyItem} />

@@ -199,7 +199,7 @@ export function SettingsPage({
         />
         <SettingRow
           title={t("Voice Translate target")}
-          detail={t("The first language is the default. Reorder the list or choose the active target.")}
+          detail={`${t("The first language is the default. Reorder the list or choose the active target.")} ${t("Voice and selected-text Translate send text to the provider shown under AI text correction, even when correction is off.")} ${t("Provider")}: ${settings.correctionProvider === "gemini" ? "Google Gemini" : settings.correctionProvider === "local" ? t("Local (OpenAI-compatible)") : "OpenAI"}.`}
           control={
             <div className="translation-target-settings">
               <select

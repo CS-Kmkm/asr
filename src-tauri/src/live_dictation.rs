@@ -37,6 +37,13 @@ pub(crate) struct LiveDraft {
 }
 
 impl LiveDraft {
+    fn can_insert_final(&self, text: &str) -> bool {
+        !text.is_empty()
+            && self
+                .checkpoint
+                .is_some_and(|checkpoint| self.monitor.unchanged_since(checkpoint))
+    }
+
     pub(crate) fn new(
         target: TargetWindow,
         settings: &Settings,
@@ -104,11 +111,7 @@ impl LiveDraft {
     pub(crate) fn finish(&mut self, text: &str) -> Result<InsertResult, injection::InjectionError> {
         if self.defer_insertion && self.session.is_none() && !self.attempted {
             self.attempted = true;
-            if !text.is_empty()
-                && self
-                    .checkpoint
-                    .is_some_and(|checkpoint| self.monitor.unchanged_since(checkpoint))
-            {
+            if self.can_insert_final(text) {
                 self.session = self.injector.begin_live_provisional(
                     text,
                     &self.target,
@@ -286,6 +289,52 @@ mod tests {
     use audio::{AudioArtifact, AudioFuture, AudioSnapshot, CaptureState, LevelMeter};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
+
+    fn deferred_test_draft() -> LiveDraft {
+        let monitor = Arc::new(InputMonitor::default());
+        monitor.test_set_available(true);
+        LiveDraft {
+            injector: SystemTextInjector::new(InjectionOptions::default()),
+            monitor,
+            target: TargetWindow {
+                window_handle: 0,
+                control_handle: 0,
+                process_id: 0,
+                thread_id: 0,
+                is_secure: false,
+            },
+            session: None,
+            checkpoint: Some(0),
+            attempted: false,
+            defer_insertion: true,
+            pasted: false,
+        }
+    }
+
+    #[test]
+    fn translate_draft_defers_raw_text_and_keeps_original_checkpoint() {
+        let mut draft = deferred_test_draft();
+        draft.update("raw speech").unwrap();
+        assert!(!draft.attempted);
+        assert!(draft.session.is_none());
+        assert!(!draft.pasted);
+        assert!(draft.can_insert_final("translated speech"));
+        draft.monitor.test_record_input();
+        assert!(!draft.can_insert_final("translated speech"));
+    }
+
+    #[test]
+    fn translate_final_requires_available_monitor_and_uncancelled_checkpoint() {
+        let draft = deferred_test_draft();
+        assert!(!draft.can_insert_final(""));
+        draft.monitor.test_set_available(false);
+        assert!(!draft.can_insert_final("translated speech"));
+        draft.monitor.test_set_available(true);
+        let (cancel, cancelled) = watch::channel(false);
+        draft.monitor.observe_cancellation(Some(cancelled));
+        cancel.send_replace(true);
+        assert!(!draft.can_insert_final("translated speech"));
+    }
 
     struct Capture {
         directory: PathBuf,
