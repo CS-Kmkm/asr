@@ -100,6 +100,12 @@ impl Storage {
                FOREIGN KEY(history_id) REFERENCES dictation_history(id) ON DELETE SET NULL
              );
              CREATE INDEX IF NOT EXISTS idx_dictionary_candidates_created_at ON dictionary_candidates(created_at DESC);
+             CREATE TABLE IF NOT EXISTS dictionary_candidate_decisions (
+               original_span TEXT NOT NULL,
+               preferred_span TEXT NOT NULL,
+               created_at TEXT NOT NULL,
+               PRIMARY KEY(original_span, preferred_span)
+             );
              CREATE TABLE IF NOT EXISTS dictation_history (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                transcript_text TEXT NOT NULL,
@@ -137,6 +143,20 @@ impl Storage {
             )?;
         }
         connection.execute("UPDATE dictionary_entries SET source = 'manual' WHERE source IS NULL OR source NOT IN ('manual', 'auto')", [])?;
+        let decision_columns = {
+            let mut statement =
+                connection.prepare("PRAGMA table_info(dictionary_candidate_decisions)")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        if !decision_columns.iter().any(|column| column == "created_at") {
+            // An unreleased development database may have the old table. Its
+            // undated private spans cannot be retained under a time policy.
+            connection.execute(
+                "ALTER TABLE dictionary_candidate_decisions ADD COLUMN created_at TEXT",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -168,22 +188,56 @@ impl Storage {
 
     pub fn apply_history_policy(
         &self,
-        previous: &Settings,
+        _previous: &Settings,
         settings: &Settings,
     ) -> Result<(), StorageError> {
         let connection = self.connection()?;
-        if previous.history_enabled && !settings.history_enabled {
+        Self::apply_history_policy_on_connection(&connection, settings)
+    }
+
+    fn apply_history_policy_on_connection(
+        connection: &Connection,
+        settings: &Settings,
+    ) -> Result<(), StorageError> {
+        if !settings.history_enabled {
             connection.execute("DELETE FROM dictation_history", [])?;
             connection.execute("DELETE FROM dictionary_candidates", [])?;
+            connection.execute("DELETE FROM dictionary_candidate_decisions", [])?;
             return Ok(());
         }
         if settings.history_enabled {
+            let cutoff = format!("-{} days", settings.history_retention_days);
             connection.execute(
                 "DELETE FROM dictation_history
                  WHERE datetime(created_at) < datetime('now', ?1)",
-                [format!("-{} days", settings.history_retention_days)],
+                [&cutoff],
+            )?;
+            connection.execute(
+                "DELETE FROM dictionary_candidates WHERE datetime(created_at) < datetime('now', ?1)",
+                [&cutoff],
+            )?;
+            connection.execute(
+                "DELETE FROM dictionary_candidate_decisions WHERE created_at IS NULL OR datetime(created_at) < datetime('now', ?1)",
+                [&cutoff],
             )?;
         }
+        Ok(())
+    }
+
+    pub fn update_settings_with_history_policy(
+        &self,
+        settings: &Settings,
+    ) -> Result<(), StorageError> {
+        let value = serde_json::to_string(settings)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        Self::apply_history_policy_on_connection(&transaction, settings)?;
+        transaction.execute(
+            "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![value, Utc::now().to_rfc3339()],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -327,6 +381,11 @@ impl Storage {
     }
 
     pub fn import_dictionary_csv(&self, csv_text: &str) -> Result<usize, StorageError> {
+        if csv_text.contains('\u{fffd}') {
+            return Err(StorageError::Validation(
+                "CSV contains replacement characters; check its encoding".into(),
+            ));
+        }
         if csv_text.len() > MAX_CSV_BYTES {
             return Err(StorageError::Validation("CSV input exceeds 1 MiB".into()));
         }
@@ -424,9 +483,6 @@ impl Storage {
         corrected: &str,
         history_id: Option<i64>,
     ) -> Result<Option<i64>, StorageError> {
-        if !self.get_settings()?.history_enabled {
-            return Ok(None);
-        }
         let Some((original_span, preferred_span)) =
             detect_dictionary_candidate(original, corrected)
         else {
@@ -434,6 +490,34 @@ impl Storage {
         };
         let now = Utc::now().to_rfc3339();
         let connection = self.connection()?;
+        let stored_settings: Option<String> = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'app_settings'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let history_enabled = stored_settings
+            .map(|value| serde_json::from_str::<Settings>(&value))
+            .transpose()?
+            .unwrap_or_default()
+            .history_enabled;
+        if !history_enabled {
+            return Ok(None);
+        }
+        let already_seen: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dictionary_candidates WHERE original_span = ?1 AND preferred_span = ?2
+              UNION SELECT 1 FROM dictionary_candidate_decisions WHERE original_span = ?1 AND preferred_span = ?2)",
+            params![original_span, preferred_span], |row| row.get(0),
+        )?;
+        if already_seen
+            || read_dictionary_entries(&connection)?.iter().any(|entry| {
+                normalized_scope(entry.app_scope.as_deref()).is_none()
+                    && entry.surface.eq_ignore_ascii_case(&preferred_span)
+            })
+        {
+            return Ok(None);
+        }
         connection.execute(
             "INSERT INTO dictionary_candidates(original_span, preferred_span, confidence, history_id, created_at, updated_at)
              VALUES (?1, ?2, 0.95, ?3, ?4, ?4)",
@@ -494,14 +578,14 @@ impl Storage {
                     && normalized_scope(item.app_scope.as_deref()).is_none()
             })
             .map(|item| item.id);
-        if let Some(entry_id) = match_id {
-            validate_dictionary_entry(&entry)?;
-            validate_dictionary_collisions(&existing, &entry, Some(entry_id))?;
-            transaction.execute("UPDATE dictionary_entries SET reading = ?1, surface = ?2, source = 'auto', updated_at = ?3 WHERE id = ?4", params![reading.trim(), surface.trim(), Utc::now().to_rfc3339(), entry_id])?;
-        } else {
+        if match_id.is_none() {
             insert_dictionary_entry(&transaction, &entry, "auto", None)?;
         }
-        transaction.execute("DELETE FROM dictionary_candidates WHERE id = ?1", [id])?;
+        transaction.execute("INSERT OR IGNORE INTO dictionary_candidate_decisions(original_span, preferred_span, created_at) VALUES (?1, ?2, ?3)", params![reading, surface, Utc::now().to_rfc3339()])?;
+        transaction.execute(
+            "DELETE FROM dictionary_candidates WHERE original_span = ?1 AND preferred_span = ?2",
+            params![reading, surface],
+        )?;
         let result = read_dictionary_entries(&transaction)?
             .into_iter()
             .find(|item| {
@@ -513,10 +597,25 @@ impl Storage {
     }
 
     pub fn reject_dictionary_candidate(&self, id: i64) -> Result<bool, StorageError> {
-        Ok(self
-            .connection()?
-            .execute("DELETE FROM dictionary_candidates WHERE id = ?1", [id])?
-            > 0)
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let candidate = transaction
+            .query_row(
+                "SELECT original_span, preferred_span FROM dictionary_candidates WHERE id = ?1",
+                [id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let Some((original, preferred)) = candidate else {
+            return Ok(false);
+        };
+        transaction.execute("INSERT OR IGNORE INTO dictionary_candidate_decisions(original_span, preferred_span, created_at) VALUES (?1, ?2, ?3)", params![original, preferred, Utc::now().to_rfc3339()])?;
+        transaction.execute(
+            "DELETE FROM dictionary_candidates WHERE original_span = ?1 AND preferred_span = ?2",
+            params![original, preferred],
+        )?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     pub fn dictionary_prompt_terms_for(
@@ -557,6 +656,63 @@ impl Storage {
 
     pub fn dictionary_prompt_terms(&self) -> Result<Vec<String>, StorageError> {
         self.dictionary_prompt_terms_for(None)
+    }
+
+    pub fn dictionary_asr_prompt_for(
+        &self,
+        context: Option<&crate::types::AppContext>,
+        backend: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let entries = self.list_dictionary()?;
+        let mut terms = Vec::new();
+        let mut length = 0;
+        let budget = if backend == "faster-whisper" {
+            200
+        } else {
+            1200
+        };
+        for entry in entries
+            .into_iter()
+            .filter(|entry| scope_matches(entry.app_scope.as_deref(), context))
+        {
+            if backend == "faster-whisper" {
+                // Hotwords are plain terms, not the `reading => surface`
+                // syntax used by prompt-based backends. Prefer the surface,
+                // then aliases and manual readings within its small budget.
+                for term in std::iter::once(entry.surface.as_str())
+                    .chain(entry.aliases.iter().map(String::as_str))
+                    .chain((entry.source == "manual").then_some(entry.reading.as_str()))
+                {
+                    let separator = if terms.is_empty() { 0 } else { 2 };
+                    if length + term.chars().count() + separator <= budget {
+                        length += term.chars().count() + separator;
+                        terms.push(term.to_owned());
+                    }
+                }
+            } else {
+                let aliases = if entry.aliases.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (aliases: {})", entry.aliases.join(", "))
+                };
+                let term = if entry.source == "auto" {
+                    format!("{}{}", entry.surface, aliases)
+                } else {
+                    format!("{} => {}{}", entry.reading, entry.surface, aliases)
+                };
+                let separator = if terms.is_empty() { 0 } else { 1 };
+                if length + term.chars().count() + separator <= budget {
+                    length += term.chars().count() + separator;
+                    terms.push(term);
+                }
+            }
+        }
+        let separator = if backend == "faster-whisper" {
+            ", "
+        } else {
+            "\n"
+        };
+        Ok((!terms.is_empty()).then(|| terms.join(separator)))
     }
 
     pub fn dictionary_correction_hints(
@@ -821,10 +977,27 @@ pub(crate) fn detect_dictionary_candidate(
         original_end -= 1;
         corrected_end -= 1;
     }
-    let original_span = original_chars[prefix..original_end]
+    // The shortest character diff can be a single letter or an empty span for
+    // spacing changes. Expand both sides to complete adjacent terms.
+    let is_term = |character: char| character.is_alphanumeric() || matches!(character, '-' | '_');
+    let mut original_start = prefix;
+    let mut preferred_start = prefix;
+    while original_start > 0 && is_term(original_chars[original_start - 1]) {
+        original_start -= 1;
+    }
+    while preferred_start > 0 && is_term(corrected_chars[preferred_start - 1]) {
+        preferred_start -= 1;
+    }
+    while original_end < original_chars.len() && is_term(original_chars[original_end]) {
+        original_end += 1;
+    }
+    while corrected_end < corrected_chars.len() && is_term(corrected_chars[corrected_end]) {
+        corrected_end += 1;
+    }
+    let original_span = original_chars[original_start..original_end]
         .iter()
         .collect::<String>();
-    let preferred_span = corrected_chars[prefix..corrected_end]
+    let preferred_span = corrected_chars[preferred_start..corrected_end]
         .iter()
         .collect::<String>();
     let normalized = |value: &str| {
@@ -1428,6 +1601,18 @@ mod tests {
             );
         }
         assert_eq!(detect_dictionary_candidate("foo + bar", "Foo+Bar"), None);
+        assert_eq!(
+            detect_dictionary_candidate("use Github", "use GitHub"),
+            Some(("Github".into(), "GitHub".into()))
+        );
+        assert_eq!(
+            detect_dictionary_candidate("Chat GPT", "ChatGPT"),
+            Some(("Chat GPT".into(), "ChatGPT".into()))
+        );
+        assert_eq!(
+            detect_dictionary_candidate("open AI", "OpenAI"),
+            Some(("open AI".into(), "OpenAI".into()))
+        );
         let storage = Storage::in_memory().unwrap();
         let id = storage
             .add_dictionary_candidate_from_correction("open ai", "OpenAI", None)
@@ -1453,5 +1638,169 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn confirming_candidate_preserves_manual_entry_and_suppresses_repeats() {
+        let storage = Storage::in_memory().unwrap();
+        let aliases = vec!["Existing alias".into()];
+        let manual = storage
+            .add_dictionary_entry(&NewDictionaryEntry {
+                reading: "正しい読み",
+                surface: "GitHub",
+                category: Some("service"),
+                aliases: &aliases,
+                priority: 9,
+                app_scope: None,
+            })
+            .unwrap();
+        let candidate_id = storage
+            .add_dictionary_candidate_from_correction("Github", "GitHub", None)
+            .unwrap();
+        assert_eq!(candidate_id, None);
+        // A candidate generated before a manual entry was created must also be safe.
+        let pending = storage
+            .add_dictionary_candidate_from_correction("open ai", "OpenAI", None)
+            .unwrap()
+            .unwrap();
+        let open_aliases = vec!["Other alias".into()];
+        let manual_open = storage
+            .add_dictionary_entry(&NewDictionaryEntry {
+                reading: "おーぷんえーあい",
+                surface: "OpenAI",
+                category: Some("service"),
+                aliases: &open_aliases,
+                priority: 9,
+                app_scope: None,
+            })
+            .unwrap();
+        let confirmed = storage
+            .confirm_dictionary_candidate(pending)
+            .unwrap()
+            .unwrap();
+        assert_eq!(confirmed.id, manual_open);
+        assert_eq!(confirmed.reading, "おーぷんえーあい");
+        assert_eq!(confirmed.source, "manual");
+        assert_eq!(confirmed.aliases, open_aliases);
+        assert_eq!(confirmed.priority, 9);
+        assert_eq!(storage.list_dictionary().unwrap().len(), 2);
+        assert!(storage
+            .list_dictionary()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.id == manual && entry.source == "manual"));
+        assert_eq!(
+            storage
+                .add_dictionary_candidate_from_correction("open ai", "OpenAI", None)
+                .unwrap(),
+            None
+        );
+
+        let rejected = storage
+            .add_dictionary_candidate_from_correction("chat gpt", "ChatGPT", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            storage
+                .add_dictionary_candidate_from_correction("chat gpt", "ChatGPT", None)
+                .unwrap(),
+            None
+        );
+        assert!(storage.reject_dictionary_candidate(rejected).unwrap());
+        assert_eq!(
+            storage
+                .add_dictionary_candidate_from_correction("chat gpt", "ChatGPT", None)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn asr_prompt_is_backend_specific_and_bounded() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .add_dictionary_entry(&dictionary_entry(&["ChatGPT".into()]))
+            .unwrap();
+        let hotwords = storage
+            .dictionary_asr_prompt_for(None, "faster-whisper")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hotwords, "OpenAI, ChatGPT, おーぷんえーあい");
+        let prompt = storage
+            .dictionary_asr_prompt_for(None, "openai-compatible")
+            .unwrap()
+            .unwrap();
+        assert!(prompt.contains("おーぷんえーあい => OpenAI"));
+        assert!(prompt.contains("ChatGPT"));
+    }
+
+    #[test]
+    fn history_policy_expires_pending_and_decided_candidate_text() {
+        let storage = Storage::in_memory().unwrap();
+        let pending = storage
+            .add_dictionary_candidate_from_correction("use Github", "use GitHub", None)
+            .unwrap()
+            .unwrap();
+        let rejected = storage
+            .add_dictionary_candidate_from_correction("open ai", "OpenAI", None)
+            .unwrap()
+            .unwrap();
+        assert!(storage.reject_dictionary_candidate(rejected).unwrap());
+        let connection = storage.connection().unwrap();
+        connection.execute("UPDATE dictionary_candidates SET created_at = '2000-01-01T00:00:00Z' WHERE id = ?1", [pending]).unwrap();
+        connection
+            .execute(
+                "UPDATE dictionary_candidate_decisions SET created_at = '2000-01-01T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let settings = storage.get_settings().unwrap();
+        storage.apply_history_policy(&settings, &settings).unwrap();
+        let connection = storage.connection().unwrap();
+        let pending_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM dictionary_candidates", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let decision_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM dictionary_candidate_decisions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((pending_count, decision_count), (0, 0));
+        drop(connection);
+        assert!(storage
+            .add_dictionary_candidate_from_correction("open ai", "OpenAI", None)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn disabling_history_atomically_prevents_new_candidate_text() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .add_dictionary_candidate_from_correction("open ai", "OpenAI", None)
+            .unwrap();
+        let mut settings = storage.get_settings().unwrap();
+        settings.history_enabled = false;
+        storage
+            .update_settings_with_history_policy(&settings)
+            .unwrap();
+        assert_eq!(
+            storage
+                .add_dictionary_candidate_from_correction("chat gpt", "ChatGPT", None)
+                .unwrap(),
+            None
+        );
+        let connection = storage.connection().unwrap();
+        let pending: i64 = connection
+            .query_row("SELECT COUNT(*) FROM dictionary_candidates", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pending, 0);
     }
 }

@@ -66,10 +66,9 @@ pub(crate) async fn start_recording_with_origin(
     let mut live_slot = services.live.lock().await;
     let draft = live_dictation::LiveDraft::new(target.clone(), &settings, from_shortcut);
     let cancel = services.lifecycle.cancellation(operation_id)?;
-    let dictionary_terms = storage
-        .dictionary_prompt_terms_for(Some(&app_context))
+    let prompt = storage
+        .dictionary_asr_prompt_for(Some(&app_context), &settings.asr_backend)
         .unwrap_or_default();
-    let prompt = (!dictionary_terms.is_empty()).then(|| dictionary_terms.join("\n"));
     let capture_config = capture_config(&settings);
     let mut audio = services.audio.lock().await;
     // Open the stream only when dictation starts. Keeping a Bluetooth headset
@@ -211,10 +210,9 @@ pub(crate) async fn stop_recording(
         .lock()
         .map_err(|_| "target service is unavailable".to_string())?
         .clone();
-    let dictionary_terms = storage
-        .dictionary_prompt_terms_for(app_context.as_ref())
+    let prompt = storage
+        .dictionary_asr_prompt_for(app_context.as_ref(), &settings.asr_backend)
         .unwrap_or_default();
-    let prompt = (!dictionary_terms.is_empty()).then(|| dictionary_terms.join("\n"));
     let correction_cancel = cancel.clone();
     let transcript_result = services
         .transcriber
@@ -894,11 +892,7 @@ pub(crate) async fn update_settings(
             return Err(format!("translation hotkey registration failed: {error}"));
         }
     }
-    if let Err(error) = storage.apply_history_policy(&previous, &settings) {
-        rollback_shortcuts();
-        return Err(command_error(error));
-    }
-    if let Err(error) = storage.update_settings(&settings) {
+    if let Err(error) = storage.update_settings_with_history_policy(&settings) {
         rollback_shortcuts();
         return Err(command_error(error));
     }

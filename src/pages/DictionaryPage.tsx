@@ -10,7 +10,7 @@ function toInput(form: Form): DictionaryEntryInput {
   const priority = Number(form.priority);
   return {
     reading: form.reading.trim(), surface: form.surface.trim(), category: form.category.trim() || null,
-    aliases: form.aliases.split(",").map((value) => value.trim()).filter(Boolean),
+    aliases: form.aliases.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
     priority: Number.isFinite(priority) ? priority : 0, appScope: form.appScope.trim() || null,
   };
 }
@@ -27,6 +27,7 @@ export function DictionaryPage({ entries, candidates, onAdd, onUpdate, onDelete,
   const [editing, setEditing] = useState<number | null>(null);
   const [query, setQuery] = useState("");
   const [source, setSource] = useState<"all" | "manual" | "auto">("all");
+  const [importError, setImportError] = useState(false);
   const importInput = useRef<HTMLInputElement>(null);
   const visible = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
@@ -40,17 +41,32 @@ export function DictionaryPage({ entries, candidates, onAdd, onUpdate, onDelete,
   }
   function edit(entry: DictionaryEntry) {
     setEditing(entry.id);
-    setForm({ reading: entry.reading, surface: entry.surface, category: entry.category ?? "", aliases: entry.aliases.join(", "), priority: String(entry.priority), appScope: entry.appScope ?? "" });
+    setForm({ reading: entry.reading, surface: entry.surface, category: entry.category ?? "", aliases: entry.aliases.join("\n"), priority: String(entry.priority), appScope: entry.appScope ?? "" });
   }
   async function importFile(file: File | undefined) {
     if (!file) return;
-    await onImport(await file.text());
-    if (importInput.current) importInput.current.value = "";
+    let csv: string;
+    try {
+      const bytes = await file.arrayBuffer();
+      try {
+        csv = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      } catch {
+        csv = new TextDecoder("shift_jis", { fatal: true }).decode(bytes);
+      }
+    } catch {
+      setImportError(true);
+      return;
+    } finally {
+      if (importInput.current) importInput.current.value = "";
+    }
+    setImportError(false);
+    await onImport(csv);
   }
   return <section className="panel compact-page-panel">
     <div className="setting-row"><div><strong>{t("Import CSV")}</strong><p>{t("CSV format help")}</p></div><div><input ref={importInput} type="file" accept=".csv,text/csv" onChange={(event) => void importFile(event.target.files?.[0])} /></div></div>
+    {importError && <p role="alert">{t("CSV encoding error")}</p>}
     <form className="steps dictionary-form" onSubmit={(event) => void submit(event)}>
-      {([ ["Reading", "reading", true], ["Surface", "surface", true], ["Category", "category", false], ["Aliases", "aliases", false], ["Scope", "appScope", false] ] as const).map(([label, key, required]) => <div className="setting-row" key={key}><div><strong>{t(label)}</strong></div><input value={form[key]} required={required} onChange={(event) => setForm({ ...form, [key]: event.target.value })} /></div>)}
+      {([ ["Reading", "reading", true], ["Surface", "surface", true], ["Category", "category", false], ["Aliases", "aliases", false], ["Scope", "appScope", false] ] as const).map(([label, key, required]) => <div className="setting-row" key={key}><div><strong>{t(label)}</strong>{key === "aliases" && <p>{t("One alias per line")}</p>}</div>{key === "aliases" ? <textarea value={form.aliases} onChange={(event) => setForm({ ...form, aliases: event.target.value })} /> : <input value={form[key]} required={required} onChange={(event) => setForm({ ...form, [key]: event.target.value })} />}</div>)}
       <div className="setting-row"><div><strong>{t("Priority")}</strong></div><input type="number" value={form.priority} onChange={(event) => setForm({ ...form, priority: event.target.value })} /></div>
       <div><button className="primary" type="submit">{editing === null ? t("Add entry") : t("Save entry")}</button>{editing !== null && <button className="secondary" type="button" onClick={() => { setEditing(null); setForm(emptyForm); }}>{t("Cancel")}</button>}</div>
     </form>
