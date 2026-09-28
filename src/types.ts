@@ -64,6 +64,7 @@ export interface Settings {
   geminiApiKeyEnvVar: string;
   localCorrectionBaseUrl: string;
   localCorrectionModel: string;
+  localCorrectionMaxTokens: number;
   correctionInstruction: string;
   correctionRemoveFillers: boolean;
   correctionRemoveRepetitions: boolean;

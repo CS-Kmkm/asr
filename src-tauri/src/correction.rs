@@ -137,7 +137,7 @@ async fn request_text(
     let provider = settings.correction_provider.as_str();
     let client_builder = Client::builder().timeout(REQUEST_TIMEOUT);
     let client = if provider == "local" {
-        client_builder.redirect(Policy::none()).no_proxy().build()?
+        local_client()?
     } else {
         client_builder.build()?
     };
@@ -187,6 +187,20 @@ async fn request_text(
         ));
     }
     Ok(corrected.to_owned())
+}
+
+fn local_client() -> Result<Client, reqwest::Error> {
+    local_client_with_proxy(None)
+}
+
+fn local_client_with_proxy(proxy: Option<reqwest::Proxy>) -> Result<Client, reqwest::Error> {
+    let mut builder = Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(Policy::none());
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
+    }
+    builder.no_proxy().build()
 }
 
 fn api_key(environment_variable: &str) -> Result<String, CorrectionError> {
@@ -294,7 +308,7 @@ fn local_request(settings: &Settings, transcript: &str, instruction: &str) -> Va
             {"role": "system", "content": instruction},
             {"role": "user", "content": transcript}
         ],
-        "max_tokens": request_output_tokens(transcript, instruction),
+        "max_tokens": settings.local_correction_max_tokens,
         "stream": true
     })
 }
@@ -378,10 +392,14 @@ fn apply_stream_event(
     on_update: &mut impl FnMut(&str),
 ) -> Result<bool, CorrectionError> {
     if data == "[DONE]" {
-        // `[DONE]` only terminates the SSE framing. Success requires the
-        // provider's semantic completion event for Responses/Interactions.
-        // Chat Completions defines `[DONE]` as its terminal event.
-        return Ok(provider == "local");
+        // Transport termination alone cannot prove that a local completion
+        // reached finish_reason=stop. A partial response must fall back.
+        if provider == "local" {
+            return Err(CorrectionError::InvalidResponse(
+                "local completion ended without finish_reason stop".into(),
+            ));
+        }
+        return Ok(false);
     }
     let value: Value = serde_json::from_str(data)
         .map_err(|error| CorrectionError::InvalidResponse(error.to_string()))?;
@@ -665,6 +683,108 @@ fn compact_error_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+
+    #[tokio::test]
+    async fn local_transport_sends_no_credentials_and_rejects_redirect() {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let handler = thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let headers = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(headers.starts_with("post /v1/chat/completions http/1.1"));
+            assert!(!headers.contains("authorization:"));
+            assert!(!headers.contains("proxy-authorization:"));
+            socket.write_all(b"HTTP/1.1 302 Found\r\nLocation: https://example.com/escaped\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        let settings = Settings {
+            correction_provider: "local".into(),
+            local_correction_base_url: format!("http://127.0.0.1:{port}/v1"),
+            ..Settings::default()
+        };
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let result = correct_transcript(&settings, "private transcript", &[], cancel, |_| {}).await;
+        handler.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(CorrectionError::Api {
+                status: StatusCode::FOUND,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_transport_bypasses_a_configured_proxy() {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let handler = thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut buffer = [0; 4096];
+            let count = socket.read(&mut buffer).unwrap();
+            assert!(count > 0);
+            assert!(String::from_utf8_lossy(&buffer[..count])
+                .starts_with("POST /v1/chat/completions HTTP/1.1"));
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 91\r\nConnection: close\r\n\r\n{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"corrected\"},\"finish_reason\":\"stop\"}]}").unwrap();
+        });
+        let proxy = reqwest::Proxy::all("http://127.0.0.1:9").unwrap();
+        let client = local_client_with_proxy(Some(proxy)).unwrap();
+        let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let response = client.post(url).body("test").send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        handler.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_transport_streams_preview_through_correction_path() {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let handler = thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut buffer = [0; 4096];
+            assert!(socket.read(&mut buffer).unwrap() > 0);
+            let events = "data: {\"choices\":[{\"delta\":{\"content\":\"fixed\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}",
+                events.len()
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+        });
+        let settings = Settings {
+            correction_provider: "local".into(),
+            local_correction_base_url: format!("http://127.0.0.1:{port}/v1"),
+            ..Settings::default()
+        };
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let mut preview = Vec::new();
+        let result = correct_transcript(&settings, "private transcript", &[], cancel, |delta| {
+            preview.push(delta.to_owned());
+        })
+        .await;
+        handler.join().unwrap();
+        assert_eq!(result.unwrap(), "fixed");
+        assert_eq!(preview, ["fixed"]);
+    }
 
     // Opt-in semantic evaluation through the production streaming path. Uses
     // synthetic text only; requires credentials and incurs provider charges.
@@ -781,7 +901,7 @@ mod tests {
         assert_eq!(local["messages"][0]["content"], "correct it");
         assert_eq!(local["messages"][1]["role"], "user");
         assert_eq!(local["messages"][1]["content"], "raw text");
-        assert_eq!(local["max_tokens"], 128);
+        assert_eq!(local["max_tokens"], 4096);
         assert_eq!(local["stream"], true);
         assert!(local.get("authorization").is_none());
     }
@@ -1031,6 +1151,10 @@ mod tests {
         assert!(matches!(gemini, Err(CorrectionError::InvalidResponse(_))));
 
         assert!(!apply_stream_event("openai", "[DONE]", &mut text, &mut preview).unwrap());
+        assert!(matches!(
+            apply_stream_event("local", "[DONE]", &mut text, &mut preview),
+            Err(CorrectionError::InvalidResponse(_))
+        ));
     }
 
     #[test]
@@ -1225,9 +1349,17 @@ mod tests {
             );
             assert_eq!(
                 local_request(&settings, input, instruction)["max_tokens"],
-                expected
+                4096
             );
         }
+        let configured = Settings {
+            local_correction_max_tokens: 32_768,
+            ..settings
+        };
+        assert_eq!(
+            local_request(&configured, &large, instruction)["max_tokens"],
+            32_768
+        );
     }
 
     #[test]

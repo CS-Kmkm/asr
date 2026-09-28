@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { SettingRow, Toggle } from "./ui";
 import type { Settings } from "../types";
 import { useI18n } from "../i18n";
@@ -10,6 +11,30 @@ interface AiCorrectionSettingsProps {
 export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsProps) {
   const { t } = useI18n();
   const status = settings.textCorrectionEnabled ? t("On") : t("Off");
+  const [localBaseUrl, setLocalBaseUrl] = useState(settings.localCorrectionBaseUrl);
+  const [localMaxTokens, setLocalMaxTokens] = useState(String(settings.localCorrectionMaxTokens));
+  const cancelLocalBaseUrlBlur = useRef(false);
+  useEffect(() => setLocalBaseUrl(settings.localCorrectionBaseUrl), [settings.localCorrectionBaseUrl]);
+  useEffect(() => setLocalMaxTokens(String(settings.localCorrectionMaxTokens)), [settings.localCorrectionMaxTokens]);
+
+  function commitLocalBaseUrl() {
+    if (cancelLocalBaseUrlBlur.current) {
+      cancelLocalBaseUrlBlur.current = false;
+      return;
+    }
+    if (localBaseUrl !== settings.localCorrectionBaseUrl) {
+      onSave({ localCorrectionBaseUrl: localBaseUrl });
+    }
+  }
+
+  function commitLocalMaxTokens() {
+    const value = Number(localMaxTokens);
+    if (Number.isInteger(value) && value >= 128 && value <= 32768 && value !== settings.localCorrectionMaxTokens) {
+      onSave({ localCorrectionMaxTokens: value });
+    } else if (!Number.isInteger(value) || value < 128 || value > 32768) {
+      setLocalMaxTokens(String(settings.localCorrectionMaxTokens));
+    }
+  }
 
   return (
     <section className="panel ai-correction-panel">
@@ -17,7 +42,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         <div>
       <h2>{t("AI text correction")}</h2>
           <p className="muted">
-            {t("When enabled, the transcript is sent to the selected correction provider after local transcription. Audio is never sent by this feature.")}
+            {t("Dictation sends its transcript to the selected provider only when AI correction is on. Voice and selected-text Translate send text whenever used. Speak to edit sends selected source text and the transcribed spoken instruction whenever used, even when AI correction is off. These text-processing features do not send audio, but the selected ASR backend may.")}
           </p>
         </div>
         <div className="ai-correction-master">
@@ -34,7 +59,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
       <p className="ai-correction-master-detail">
         {settings.textCorrectionEnabled
           ? t("AI correction is applied before text is inserted. If the API fails, the original transcript is used.")
-          : t("AI correction requests are disabled. You can configure the options below before enabling it.")}
+          : t("AI correction requests are disabled for Dictation. Translate and Speak to edit still use the selected provider when invoked.")}
       </p>
 
       <SettingRow
@@ -186,9 +211,20 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
             detail={t("Use a numeric loopback URL ending in /v1. Requests bypass proxies and redirects are rejected.")}
             control={
               <input
-                value={settings.localCorrectionBaseUrl}
+                value={localBaseUrl}
                 placeholder="http://127.0.0.1:11434/v1"
-                onChange={(event) => onSave({ localCorrectionBaseUrl: event.target.value })}
+                onChange={(event) => setLocalBaseUrl(event.target.value)}
+                onBlur={commitLocalBaseUrl}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    event.currentTarget.blur();
+                  } else if (event.key === "Escape") {
+                    cancelLocalBaseUrlBlur.current = true;
+                    setLocalBaseUrl(settings.localCorrectionBaseUrl);
+                    event.currentTarget.blur();
+                  }
+                }}
               />
             }
           />
@@ -200,6 +236,27 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
                 value={settings.localCorrectionModel}
                 placeholder="qwen3:8b"
                 onChange={(event) => onSave({ localCorrectionModel: event.target.value })}
+              />
+            }
+          />
+          <SettingRow
+            title={t("Local output token limit")}
+            detail={t("Includes thinking tokens. Increase for reasoning models; supported range is 128 to 32768.")}
+            control={
+              <input
+                type="number"
+                min={128}
+                max={32768}
+                step={1}
+                value={localMaxTokens}
+                onChange={(event) => setLocalMaxTokens(event.target.value)}
+                onBlur={commitLocalMaxTokens}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    event.currentTarget.blur();
+                  }
+                }}
               />
             }
           />
