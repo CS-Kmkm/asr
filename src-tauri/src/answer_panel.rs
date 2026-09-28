@@ -35,12 +35,18 @@ impl AnswerPanelState {
         true
     }
     pub(crate) fn dismiss(&self, operation_id: u64) -> bool {
+        self.dismiss_with(operation_id, || true)
+    }
+    /// Keep the ownership check and window hide in one critical section so an
+    /// older dismiss cannot hide a newly published answer.
+    pub(crate) fn dismiss_with(&self, operation_id: u64, hide: impl FnOnce() -> bool) -> bool {
         let Ok(mut current) = self.current.lock() else {
             return false;
         };
         if current
             .as_ref()
             .is_some_and(|value| value.operation_id == operation_id)
+            && hide()
         {
             *current = None;
             true
@@ -59,6 +65,7 @@ pub(crate) fn create(app: &AppHandle) -> tauri::Result<()> {
         .inner_size(500.0, 330.0)
         .min_inner_size(320.0, 180.0)
         .always_on_top(true)
+        .focused(false)
         .visible(false)
         .build()?;
     Ok(())
@@ -93,6 +100,17 @@ mod tests {
         assert!(!state.dismiss(1));
         assert_eq!(state.current().unwrap().payload, "new");
         assert!(state.dismiss(2));
+    }
+
+    #[test]
+    fn failed_hide_keeps_the_answer_and_stale_dismiss_does_not_hide() {
+        let state = AnswerPanelState::default();
+        assert!(state.publish(1, "first".into()));
+        assert!(!state.dismiss_with(1, || false));
+        assert_eq!(state.current().unwrap().operation_id, 1);
+        assert!(state.publish(2, "new".into()));
+        assert!(!state.dismiss_with(1, || panic!("stale hide was called")));
+        assert_eq!(state.current().unwrap().operation_id, 2);
     }
 
     #[test]

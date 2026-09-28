@@ -992,6 +992,12 @@ pub fn run() {
             commands::update_settings
         ])
         .on_window_event(|window, event| {
+            if window.label() == answer_panel::WINDOW_LABEL {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
             if window.label() == "main" && matches!(event, WindowEvent::CloseRequested { .. }) {
                 // A tray icon keeps a Tauri process alive after its last window
                 // is closed. Treat the main window's close button as an actual

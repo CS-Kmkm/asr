@@ -101,7 +101,7 @@ interface CorrectionPreview {
 }
 
 interface VoiceModeEvent {
-  mode: "dictate" | "translate" | "edit";
+  mode: "dictate" | "translate" | "edit" | "ask";
   targetLanguage: string | null;
 }
 
@@ -131,6 +131,7 @@ const WARNING_STATUS_KINDS = new Set([
   "autostart_update_failed",
   "clipboard_only",
   "gpu_unavailable",
+  "history_save_failed",
   "paste_unverified",
   "streaming_insertion_unavailable",
   "text_correction_failed",
@@ -163,6 +164,7 @@ if (isRecordingOverlay) {
 }
 
 function AskAnswerPanel() {
+  const { t } = useI18n();
   const [answer, setAnswer] = useState("");
   const [operationId, setOperationId] = useState(0);
   const operationRef = useRef(0);
@@ -192,13 +194,11 @@ function AskAnswerPanel() {
     return () => { active = false; unlisten?.(); };
   }, []);
   const dismiss = async () => {
-    if (await dismissAskAnswer(operationId)) {
-      await getCurrentWebviewWindow().hide();
-    }
+    await dismissAskAnswer(operationId);
   };
   return <main className="ask-answer-panel" aria-live="polite">
-    <p className="eyebrow">ASK</p><div className="ask-answer-text">{answer}</div>
-    <div className="ask-answer-actions"><button className="secondary" type="button" disabled={!answer} onClick={() => void copyToClipboard(answer)}>Copy</button><button className="secondary" type="button" disabled={!answer} onClick={() => void dismiss()}>Dismiss</button></div>
+    <p className="eyebrow">{t("Ask Anything")}</p><div className="ask-answer-text">{answer}</div>
+    <div className="ask-answer-actions"><button className="secondary" type="button" disabled={!answer} onClick={() => void copyToClipboard(answer)}>{t("Copy")}</button><button className="secondary" type="button" disabled={!answer} onClick={() => void dismiss()}>{t("Dismiss")}</button></div>
   </main>;
 }
 
@@ -266,6 +266,8 @@ function RecordingOverlay() {
             ? t("Translating")
             : voiceMode.mode === "edit"
               ? t("Editing")
+              : voiceMode.mode === "ask"
+                ? t("Ask Anything")
               : t("Listening")}
         </span>
         <span className="recording-wave" aria-hidden="true">
@@ -296,7 +298,9 @@ function RecordingOverlay() {
   if (phase !== "processing" && phase !== "injecting") return null;
 
   const compactPreview = compactOverlayPreview(preview?.text ?? "");
-  const label = voiceMode.mode === "edit"
+  const label = voiceMode.mode === "ask"
+    ? t("Ask Anything")
+    : voiceMode.mode === "edit"
     ? t("Editing")
     : phase === "injecting"
       ? message?.startsWith("Finalizing")

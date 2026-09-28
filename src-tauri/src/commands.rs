@@ -993,7 +993,9 @@ async fn finish_ask(
         }
         Err(_) => return Err("Ask planner returned an invalid action".into()),
     };
-    if let AskAction::Search { site, query } = &action {
+    if let AskAction::Search { site } = &action {
+        // The planner may choose a fixed site, but never the external payload.
+        let query = spoken.trim();
         let url = site
             .fixed_url(query)
             .map_err(|_| "Ask search query was invalid".to_string())?;
@@ -1001,11 +1003,8 @@ async fn finish_ask(
             return Err("ask was cancelled".into());
         }
         open_fixed_search(&url)?;
-        if services.lifecycle.is_cancelled(operation_id) {
-            return Err("ask was cancelled".into());
-        }
         let latency_ms = started.elapsed().as_millis() as u64;
-        storage
+        if storage
             .add_history(&NewHistoryItem {
                 transcript_text: spoken,
                 processed_text: Some(query),
@@ -1021,11 +1020,18 @@ async fn finish_ask(
                 duration_ms: Some(duration_ms as i64),
                 latency_ms: Some(latency_ms as i64),
             })
-            .map_err(command_error)?;
-        let snapshot = state.complete(query.clone(), "Opening the requested fixed search.".into());
+            .is_err()
+        {
+            emit_status(
+                app,
+                "history_save_failed",
+                "Search opened, but History could not be saved.",
+            );
+        }
+        let snapshot = state.complete(query.into(), "Opening the requested fixed search.".into());
         let _ = app.emit("app-state", snapshot);
         return Ok(RecordingResult {
-            text: query.clone(),
+            text: query.into(),
             insertion: "search".into(),
             duration_ms,
             latency_ms,
@@ -1138,11 +1144,8 @@ async fn finish_ask(
             }
         }
     }
-    if services.lifecycle.is_cancelled(operation_id) {
-        return Err("ask was cancelled".into());
-    }
     let latency_ms = started.elapsed().as_millis() as u64;
-    storage
+    if storage
         .add_history(&NewHistoryItem {
             transcript_text: spoken,
             processed_text: Some(&output),
@@ -1161,7 +1164,14 @@ async fn finish_ask(
             duration_ms: Some(duration_ms as i64),
             latency_ms: Some(latency_ms as i64),
         })
-        .map_err(command_error)?;
+        .is_err()
+    {
+        emit_status(
+            app,
+            "history_save_failed",
+            "Ask completed, but History could not be saved.",
+        );
+    }
     let message = if insertion == "paste_unverified" {
         "Ask insertion could not be confirmed; the result remains on the clipboard."
     } else if insertion == "clipboard_only" {
@@ -2021,9 +2031,13 @@ pub(crate) fn get_ask_answer(
 #[tauri::command]
 pub(crate) fn dismiss_ask_answer(
     operation_id: u64,
+    app: AppHandle,
     services: State<'_, Services>,
 ) -> Result<bool, String> {
-    Ok(services.answer_panel.dismiss(operation_id))
+    Ok(services.answer_panel.dismiss_with(operation_id, || {
+        app.get_webview_window(answer_panel::WINDOW_LABEL)
+            .is_some_and(|window| window.hide().is_ok())
+    }))
 }
 
 #[tauri::command]

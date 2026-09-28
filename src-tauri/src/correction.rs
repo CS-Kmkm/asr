@@ -11,6 +11,8 @@ const OPENAI_RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 const GEMINI_INTERACTIONS_URL: &str = "https://generativelanguage.googleapis.com/v1/interactions";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_ERROR_BODY_CHARS: usize = 500;
+const ASK_PLAN_MIN_OUTPUT_TOKENS: usize = 512;
+const ASK_TEXT_MIN_OUTPUT_TOKENS: usize = 4096;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CorrectionError {
@@ -38,7 +40,16 @@ pub async fn correct_transcript(
     on_update: impl FnMut(&str),
 ) -> Result<String, CorrectionError> {
     let instruction = build_correction_instruction(settings, dictionary_hints);
-    request_text(settings, transcript, &instruction, cancel, on_update, true).await
+    request_text(
+        settings,
+        transcript,
+        &instruction,
+        cancel,
+        on_update,
+        true,
+        None,
+    )
+    .await
 }
 
 pub async fn translate_text(
@@ -47,7 +58,16 @@ pub async fn translate_text(
     cancel: watch::Receiver<bool>,
 ) -> Result<String, CorrectionError> {
     let instruction = build_translation_instruction(settings);
-    request_text(settings, transcript, &instruction, cancel, |_| {}, true).await
+    request_text(
+        settings,
+        transcript,
+        &instruction,
+        cancel,
+        |_| {},
+        true,
+        None,
+    )
+    .await
 }
 
 pub async fn translate_transcript(
@@ -58,7 +78,16 @@ pub async fn translate_transcript(
     on_update: impl FnMut(&str),
 ) -> Result<String, CorrectionError> {
     let instruction = build_voice_translation_instruction(target_language)?;
-    request_text(settings, transcript, &instruction, cancel, on_update, true).await
+    request_text(
+        settings,
+        transcript,
+        &instruction,
+        cancel,
+        on_update,
+        true,
+        None,
+    )
+    .await
 }
 
 pub async fn edit_selected_text(
@@ -70,7 +99,7 @@ pub async fn edit_selected_text(
 ) -> Result<String, CorrectionError> {
     let instruction = build_edit_instruction();
     let input = edit_request_input(selected_text, spoken_instruction);
-    request_text(settings, &input, instruction, cancel, on_update, true).await
+    request_text(settings, &input, instruction, cancel, on_update, true, None).await
 }
 
 fn build_edit_instruction() -> &'static str {
@@ -125,6 +154,7 @@ async fn request_text(
     mut cancel: watch::Receiver<bool>,
     mut on_update: impl FnMut(&str),
     trim_output: bool,
+    minimum_output_tokens: Option<usize>,
 ) -> Result<String, CorrectionError> {
     if *cancel.borrow() {
         return Err(CorrectionError::Cancelled);
@@ -140,23 +170,38 @@ async fn request_text(
     let request = match settings.correction_provider.as_str() {
         "openai" => {
             let key = api_key(&settings.openai_api_key_env_var)?;
+            let mut body = openai_request(settings, transcript, instruction);
+            if let Some(minimum) = minimum_output_tokens {
+                body["max_output_tokens"] = json!(max_output_tokens(transcript).max(minimum));
+            }
             client
                 .post(OPENAI_RESPONSES_URL)
                 .bearer_auth(key)
-                .json(&openai_request(settings, transcript, instruction))
+                .json(&body)
         }
         "gemini" => {
             let key = api_key(&settings.gemini_api_key_env_var)?;
+            let mut body = gemini_request(settings, transcript, instruction);
+            if let Some(minimum) = minimum_output_tokens {
+                body["generation_config"]["max_output_tokens"] =
+                    json!(max_output_tokens(transcript).max(minimum));
+            }
             client
                 .post(GEMINI_INTERACTIONS_URL)
                 .header("x-goog-api-key", key)
-                .json(&gemini_request(settings, transcript, instruction))
+                .json(&body)
         }
-        "local" => client
-            .post(local_chat_completions_url(
-                &settings.local_correction_base_url,
-            )?)
-            .json(&local_request(settings, transcript, instruction)),
+        "local" => {
+            let mut body = local_request(settings, transcript, instruction);
+            if let Some(minimum) = minimum_output_tokens {
+                body["max_tokens"] = json!(max_output_tokens(transcript).max(minimum));
+            }
+            client
+                .post(local_chat_completions_url(
+                    &settings.local_correction_base_url,
+                )?)
+                .json(&body)
+        }
         provider => return Err(CorrectionError::UnsupportedProvider(provider.into())),
     };
 
@@ -198,7 +243,16 @@ pub async fn generate_ask_text(
     instruction: &str,
     cancel: watch::Receiver<bool>,
 ) -> Result<String, CorrectionError> {
-    request_text(settings, input, instruction, cancel, |_| {}, true).await
+    request_text(
+        settings,
+        input,
+        instruction,
+        cancel,
+        |_| {},
+        true,
+        Some(ASK_TEXT_MIN_OUTPUT_TOKENS),
+    )
+    .await
 }
 
 pub async fn generate_ask_plan(
@@ -207,7 +261,16 @@ pub async fn generate_ask_plan(
     instruction: &str,
     cancel: watch::Receiver<bool>,
 ) -> Result<String, CorrectionError> {
-    request_text(settings, input, instruction, cancel, |_| {}, false).await
+    request_text(
+        settings,
+        input,
+        instruction,
+        cancel,
+        |_| {},
+        false,
+        Some(ASK_PLAN_MIN_OUTPUT_TOKENS),
+    )
+    .await
 }
 
 fn api_key(environment_variable: &str) -> Result<String, CorrectionError> {
