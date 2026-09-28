@@ -45,6 +45,7 @@ export const defaultSettings: Settings = {
   geminiApiKeyEnvVar: "GEMINI_API_KEY",
   localCorrectionBaseUrl: "http://127.0.0.1:11434/v1",
   localCorrectionModel: "qwen3:8b",
+  localCorrectionMaxTokens: 4096,
   correctionInstruction: "",
   correctionRemoveFillers: true,
   correctionRemoveRepetitions: true,

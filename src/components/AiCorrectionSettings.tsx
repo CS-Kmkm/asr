@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { SettingRow, Toggle } from "./ui";
 import type { Settings } from "../types";
 import { useI18n } from "../i18n";
@@ -10,6 +11,30 @@ interface AiCorrectionSettingsProps {
 export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsProps) {
   const { t } = useI18n();
   const status = settings.textCorrectionEnabled ? t("On") : t("Off");
+  const [localBaseUrl, setLocalBaseUrl] = useState(settings.localCorrectionBaseUrl);
+  const [localMaxTokens, setLocalMaxTokens] = useState(String(settings.localCorrectionMaxTokens));
+  const cancelLocalBaseUrlBlur = useRef(false);
+  useEffect(() => setLocalBaseUrl(settings.localCorrectionBaseUrl), [settings.localCorrectionBaseUrl]);
+  useEffect(() => setLocalMaxTokens(String(settings.localCorrectionMaxTokens)), [settings.localCorrectionMaxTokens]);
+
+  function commitLocalBaseUrl() {
+    if (cancelLocalBaseUrlBlur.current) {
+      cancelLocalBaseUrlBlur.current = false;
+      return;
+    }
+    if (localBaseUrl !== settings.localCorrectionBaseUrl) {
+      onSave({ localCorrectionBaseUrl: localBaseUrl });
+    }
+  }
+
+  function commitLocalMaxTokens() {
+    const value = Number(localMaxTokens);
+    if (Number.isInteger(value) && value >= 128 && value <= 32768 && value !== settings.localCorrectionMaxTokens) {
+      onSave({ localCorrectionMaxTokens: value });
+    } else if (!Number.isInteger(value) || value < 128 || value > 32768) {
+      setLocalMaxTokens(String(settings.localCorrectionMaxTokens));
+    }
+  }
 
   return (
     <section className="panel ai-correction-panel">
@@ -186,9 +211,20 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
             detail={t("Use a numeric loopback URL ending in /v1. Requests bypass proxies and redirects are rejected.")}
             control={
               <input
-                value={settings.localCorrectionBaseUrl}
+                value={localBaseUrl}
                 placeholder="http://127.0.0.1:11434/v1"
-                onChange={(event) => onSave({ localCorrectionBaseUrl: event.target.value })}
+                onChange={(event) => setLocalBaseUrl(event.target.value)}
+                onBlur={commitLocalBaseUrl}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    event.currentTarget.blur();
+                  } else if (event.key === "Escape") {
+                    cancelLocalBaseUrlBlur.current = true;
+                    setLocalBaseUrl(settings.localCorrectionBaseUrl);
+                    event.currentTarget.blur();
+                  }
+                }}
               />
             }
           />
@@ -200,6 +236,27 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
                 value={settings.localCorrectionModel}
                 placeholder="qwen3:8b"
                 onChange={(event) => onSave({ localCorrectionModel: event.target.value })}
+              />
+            }
+          />
+          <SettingRow
+            title={t("Local output token limit")}
+            detail={t("Includes thinking tokens. Increase for reasoning models; supported range is 128 to 32768.")}
+            control={
+              <input
+                type="number"
+                min={128}
+                max={32768}
+                step={1}
+                value={localMaxTokens}
+                onChange={(event) => setLocalMaxTokens(event.target.value)}
+                onBlur={commitLocalMaxTokens}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    event.currentTarget.blur();
+                  }
+                }}
               />
             }
           />
