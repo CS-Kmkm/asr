@@ -14,6 +14,7 @@ import {
   getGpuDiagnostics,
   getModelStatus,
   getSettings,
+  getStartupHotkeyWarning,
   listAudioDevices,
   listDictionary,
   listHistory,
@@ -131,7 +132,10 @@ const WARNING_STATUS_KINDS = new Set([
   "autostart_update_failed",
   "clipboard_only",
   "gpu_unavailable",
+  "history_and_metric_save_failed",
   "history_save_failed",
+  "history_metric_save_failed",
+  "metric_save_failed",
   "paste_unverified",
   "streaming_insertion_unavailable",
   "text_correction_failed",
@@ -373,6 +377,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const [gpu, setGpu] = useState<GpuDiagnostics | null>(null);
   const [gpuChecking, setGpuChecking] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
+  const [startupHotkeyWarning, setStartupHotkeyWarning] = useState<string | null>(null);
   const showNotice = (message: string, severity: Notice["severity"] = "info") =>
     setNotice({ message, severity });
   const [noticeCopied, setNoticeCopied] = useState(false);
@@ -381,6 +386,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const [dictionary, setDictionary] = useState<DictionaryEntry[]>([]);
 
   useEffect(() => {
+    void getStartupHotkeyWarning().then(setStartupHotkeyWarning).catch(() => {});
     Promise.all([
       getAppState(),
       getSettings(),
@@ -439,7 +445,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
 
   useEffect(() => {
     setNoticeCopied(false);
-  }, [notice]);
+  }, [notice, startupHotkeyWarning]);
 
   const statusLabel = t(phaseMessageKeys[state.phase]);
   const localizedState = useMemo(
@@ -448,11 +454,16 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   );
   // A load started from the Models page or automatically at startup.
   const preparingModel = modelLoading || model?.state === "loading";
+  const shownNotice: Notice | null = notice ?? (startupHotkeyWarning
+    ? { message: startupHotkeyWarning, severity: "warning" }
+    : null);
+  const showingStartupWarning = !notice && Boolean(startupHotkeyWarning);
+  const shownProgress = showingStartupWarning ? null : modelProgress;
 
   async function copyNotice() {
-    if (!notice) return;
+    if (!shownNotice) return;
     try {
-      await copyToClipboard(translateAppMessage(language, notice.message) ?? notice.message);
+      await copyToClipboard(translateAppMessage(language, shownNotice.message) ?? shownNotice.message);
       setNoticeCopied(true);
     } catch (error) {
       showNotice(String(error), "error");
@@ -475,6 +486,11 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     try {
       const saved = await updateSettings(next);
       setSettings(saved);
+      try {
+        setStartupHotkeyWarning(await getStartupHotkeyWarning());
+      } catch {
+        // Keep the known warning if diagnostics cannot be refreshed.
+      }
       onLanguageChange(saved.uiLanguage);
       showNotice(translate(saved.uiLanguage, "Settings saved locally."), "success");
     } catch (error) {
@@ -504,7 +520,11 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     try {
       if (state.phase === "recording") {
         await stopRecording();
-        setHistory(await listHistory());
+        try {
+          setHistory(await listHistory());
+        } catch {
+          showNotice(t("Recording completed, but history could not be refreshed."), "warning");
+        }
       } else {
         await startRecording();
       }
@@ -714,31 +734,33 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
         )}
       </main>
 
-      {(notice || modelProgress) && (
+      {(shownNotice || shownProgress) && (
         <div
-          className={`notice ${notice?.severity ?? "info"}${preparingModel ? " loading" : ""}`}
+          className={`notice ${shownNotice?.severity ?? "info"}${preparingModel && !showingStartupWarning ? " loading" : ""}`}
           aria-live="polite"
         >
-          {preparingModel && <span className="progress-ring" aria-hidden="true" />}
+          {preparingModel && !showingStartupWarning && <span className="progress-ring" aria-hidden="true" />}
           <div className="notice-body">
             <button
               className="notice-message"
               onDoubleClick={() => void copyNotice()}
               title={t("Double-click to copy")}
             >
-              {translateAppMessage(language, notice?.message ?? null) ??
-                (modelProgress?.stage === "download"
+              {translateAppMessage(language, shownNotice?.message ?? null) ??
+                (shownProgress?.stage === "download"
                   ? t("Downloading the speech model files.")
                   : t("Loading the speech model."))}
             </button>
-            {modelProgress && <ModelProgressBar progress={modelProgress} />}
+            {shownProgress && <ModelProgressBar progress={shownProgress} />}
           </div>
           {noticeCopied && <span className="notice-copied">{t("Copied")}</span>}
           <button
             className="notice-dismiss"
             onClick={() => {
-              setNotice(null);
-              setModelProgress(null);
+              if (notice) {
+                setNotice(null);
+                setModelProgress(null);
+              } else setStartupHotkeyWarning(null);
             }}
             aria-label={t("Dismiss notification")}
           >

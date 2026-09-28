@@ -227,7 +227,7 @@ export function SettingsPage({
         />
         <SettingRow
           title={t("Voice Translate target")}
-          detail={t("The first language is the default. Reorder the list or choose the active target.")}
+          detail={`${t("The first language is the default. Reorder the list or choose the active target.")} ${t("Voice and selected-text Translate send text to the provider shown under AI text correction, even when correction is off.")} ${t("Provider")}: ${settings.correctionProvider === "gemini" ? "Google Gemini" : settings.correctionProvider === "local" ? t("Local (OpenAI-compatible)") : "OpenAI"}.`}
           control={
             <div className="translation-target-settings">
               <select
@@ -271,7 +271,7 @@ export function SettingsPage({
         />
         <SettingRow
           title={t("Speak to edit hotkey")}
-          detail={t("Edits selected text from a spoken instruction; the default is Ctrl+Shift+E.")}
+          detail={`${t("Edits selected text from a spoken instruction; the default is Ctrl+Shift+E.")} ${t("Speak to edit sends selected source text and the transcribed spoken instruction to the provider shown under AI text correction, even when correction is off. The selected ASR backend may send audio.")}`}
           control={
             <input
               value={speakToEditHotkey}
@@ -294,7 +294,7 @@ export function SettingsPage({
         />
         <SettingRow
           title={t("Ask Anything hotkey")}
-          detail={t("Asks or acts on a spoken instruction; the default is Ctrl+Shift+A.")}
+          detail={`${t("Asks or acts on a spoken instruction; the default is Ctrl+Shift+A.")} ${t("Ask sends only the transcribed spoken instruction to the selected provider for planning. Answer generation using a selection also sends the selected source text with the instruction, even when Dictation AI correction is off. The selected ASR backend may send audio.")}`}
           control={
             <input
               value={askHotkey}

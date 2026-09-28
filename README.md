@@ -146,7 +146,11 @@ the model ID and a numeric loopback base URL such as
 requires no API key, bypasses system proxies, rejects redirects, and refuses
 non-loopback hosts so transcript text cannot be sent to an obvious remote
 endpoint through this provider. The local model server itself is not bundled
-or started by the app.
+or started by the app. The endpoint URL is saved when the field loses focus or
+Enter is pressed, so it can be edited from an empty draft. The local output
+token limit defaults to 4096 and can be set from 128 to 32768; some servers
+count thinking tokens toward this limit. Increase it if a reasoning model
+returns a length limit, subject to the server's context and memory limits.
 
 The automatic editor has independent switches for:
 

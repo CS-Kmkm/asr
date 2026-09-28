@@ -27,6 +27,27 @@ fn cancellation_copy(mode: PipelineMode) -> (&'static str, &'static str) {
     }
 }
 
+fn persist_edit_completion(
+    storage: &Storage,
+    item: &NewHistoryItem<'_>,
+    provider: &str,
+    elapsed_ms: i64,
+) -> (bool, bool) {
+    // The target may already have accepted a paste. Persistence is best effort
+    // so a database failure cannot turn that completed edit into command failure.
+    let history_failed = storage.add_history(item).is_err();
+    let metric_failed = storage
+        .add_metric(
+            "speak_to_edit",
+            Some(provider),
+            Some(elapsed_ms),
+            true,
+            None,
+        )
+        .is_err();
+    (history_failed, metric_failed)
+}
+
 async fn take_published_sessions<T, U>(
     live: &tokio::sync::Mutex<Option<T>>,
     edit: &tokio::sync::Mutex<Option<U>>,
@@ -495,6 +516,15 @@ pub(crate) async fn stop_recording(
         let session = edit_session.take().ok_or("edit session is unavailable")?;
         let instruction_text = transcript.text.clone();
         let source_text = session.selection.text().to_owned();
+        if instruction_text.trim().is_empty() {
+            emit_state(
+                &app,
+                &state,
+                AppPhase::Error,
+                "No edit instruction was captured; the original selection was not changed.",
+            );
+            return Err("no edit instruction was captured".into());
+        }
         emit_correction_preview(&app, &instruction_text, "draft");
         emit_state(
             &app,
@@ -567,8 +597,9 @@ pub(crate) async fn stop_recording(
         };
         recording_overlay::set_phase(&app, &AppPhase::Completed);
         let latency_ms = started.elapsed().as_millis() as u64;
-        storage
-            .add_history(&NewHistoryItem {
+        let (history_failed, metric_failed) = persist_edit_completion(
+            &storage,
+            &NewHistoryItem {
                 transcript_text: &instruction_text,
                 processed_text: Some(&edited),
                 source_text: Some(&source_text),
@@ -582,22 +613,15 @@ pub(crate) async fn stop_recording(
                 app_category: None,
                 duration_ms: Some(duration_ms as i64),
                 latency_ms: Some(latency_ms as i64),
-            })
-            .map_err(command_error)?;
-        storage
-            .add_metric(
-                "speak_to_edit",
-                Some(settings.correction_provider.as_str()),
-                Some(edit_started.elapsed().as_millis() as i64),
-                true,
-                None,
-            )
-            .map_err(command_error)?;
+            },
+            settings.correction_provider.as_str(),
+            edit_started.elapsed().as_millis() as i64,
+        );
         let (insertion_label, completion) = match insertion {
             InsertResult::ClipboardPaste => ("clipboard_paste", "Selected text updated."),
             InsertResult::ClipboardOnly => (
                 "clipboard_only",
-                "The original selection changed; the edit remains on the clipboard.",
+                "Automatic replacement was skipped; the edit remains on the clipboard.",
             ),
             InsertResult::PasteUnverified => (
                 "paste_unverified",
@@ -607,6 +631,25 @@ pub(crate) async fn stop_recording(
         let snapshot = state.complete(edited.clone(), completion.into());
         let _ = app.emit("app-state", snapshot);
         emit_status(&app, insertion_label, completion);
+        if history_failed && metric_failed {
+            emit_status(
+                &app,
+                "history_metric_save_failed",
+                "The edit was completed, but history and usage metrics could not be saved.",
+            );
+        } else if history_failed {
+            emit_status(
+                &app,
+                "history_save_failed",
+                "The edit was completed, but history could not be saved.",
+            );
+        } else if metric_failed {
+            emit_status(
+                &app,
+                "metric_save_failed",
+                "The edit was completed, but usage metrics could not be saved.",
+            );
+        }
         return Ok(RecordingResult {
             text: edited,
             insertion: insertion_label.into(),
@@ -837,44 +880,40 @@ pub(crate) async fn stop_recording(
             InsertResult::PasteUnverified => "paste_unverified",
         }
     };
-    storage
-        .add_history(&NewHistoryItem {
-            transcript_text: &transcript.text,
-            processed_text: processed_text.as_deref(),
-            source_text: None,
-            instruction_text: None,
-            action_kind: None,
-            search_site: None,
-            mode: if mode == PipelineMode::Translate {
-                "translate"
-            } else if processed_text.is_some() {
-                "ai_corrected"
-            } else if correction_failed {
-                "faithful_fallback"
-            } else {
-                "faithful"
-            },
-            asr_provider: &transcript.model,
-            llm_provider: llm_provider.as_deref(),
-            target_language: translation_target.as_deref(),
-            app_category: None,
-            duration_ms: Some(duration_ms as i64),
-            latency_ms: Some(latency_ms as i64),
-        })
-        .map_err(command_error)?;
-    storage
-        .add_metric(
-            if mode == PipelineMode::Translate {
-                "voice_translate"
-            } else {
-                "dictation"
-            },
-            Some(&transcript.model),
-            Some(latency_ms as i64),
-            !translation_failed,
-            translation_failed.then_some("translation_failed"),
-        )
-        .map_err(command_error)?;
+    let history_result = storage.add_history(&NewHistoryItem {
+        transcript_text: &transcript.text,
+        processed_text: processed_text.as_deref(),
+        source_text: None,
+        instruction_text: None,
+        action_kind: None,
+        search_site: None,
+        mode: if mode == PipelineMode::Translate {
+            "translate"
+        } else if processed_text.is_some() {
+            "ai_corrected"
+        } else if correction_failed {
+            "faithful_fallback"
+        } else {
+            "faithful"
+        },
+        asr_provider: &transcript.model,
+        llm_provider: llm_provider.as_deref(),
+        target_language: translation_target.as_deref(),
+        app_category: None,
+        duration_ms: Some(duration_ms as i64),
+        latency_ms: Some(latency_ms as i64),
+    });
+    let metric_result = storage.add_metric(
+        if mode == PipelineMode::Translate {
+            "voice_translate"
+        } else {
+            "dictation"
+        },
+        Some(&transcript.model),
+        Some(latency_ms as i64),
+        !translation_failed,
+        translation_failed.then_some("translation_failed"),
+    );
     let completion = if translation_failed {
         "Translation failed; the raw transcript remains on the clipboard."
     } else if mode == PipelineMode::Translate && insertion == InsertResult::PasteUnverified {
@@ -897,6 +936,11 @@ pub(crate) async fn stop_recording(
     let snapshot = state.complete(final_text.clone(), completion.into());
     let _ = app.emit("app-state", snapshot);
     emit_status(&app, insertion_label, completion);
+    if let Some((kind, message)) =
+        persistence_warning(history_result.is_err(), metric_result.is_err())
+    {
+        emit_status(&app, kind, message);
+    }
     Ok(RecordingResult {
         text: final_text,
         insertion: insertion_label.into(),
@@ -1243,6 +1287,56 @@ fn open_fixed_search(_: &str) -> Result<(), String> {
     Err("Search launch is only supported on Windows.".into())
 }
 
+fn persistence_warning(
+    history_failed: bool,
+    metric_failed: bool,
+) -> Option<(&'static str, &'static str)> {
+    match (history_failed, metric_failed) {
+        (true, true) => Some((
+            "history_and_metric_save_failed",
+            "Text was published, but History and usage metrics could not be saved.",
+        )),
+        (true, false) => Some((
+            "history_save_failed",
+            "Text was published, but History could not be saved.",
+        )),
+        (false, true) => Some((
+            "metric_save_failed",
+            "Text was published, but usage metrics could not be saved.",
+        )),
+        (false, false) => None,
+    }
+}
+
+fn hotkey_changes(registered: &[Shortcut], desired: &[Shortcut]) -> (Vec<Shortcut>, Vec<Shortcut>) {
+    (
+        registered
+            .iter()
+            .copied()
+            .filter(|shortcut| !desired.contains(shortcut))
+            .collect(),
+        desired
+            .iter()
+            .copied()
+            .filter(|shortcut| !registered.contains(shortcut))
+            .collect(),
+    )
+}
+
+fn hotkeys_repaired(registered: &[Shortcut], desired: &[Shortcut]) -> bool {
+    desired.len() == 5 && desired.iter().all(|shortcut| registered.contains(shortcut))
+}
+
+#[tauri::command]
+pub(crate) fn get_startup_hotkey_warning(services: State<'_, Services>) -> Option<String> {
+    services
+        .startup_hotkey_issues
+        .lock()
+        .ok()?
+        .message()
+        .map(str::to_owned)
+}
+
 fn emit_correction_preview(app: &AppHandle, text: &str, stage: &str) {
     let _ = app.emit(
         "correction-preview",
@@ -1384,6 +1478,7 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
         correction::CorrectionError::Cancelled => "cancelled",
         correction::CorrectionError::InvalidEndpoint(_) => "invalid_endpoint",
         correction::CorrectionError::UnsupportedProvider(_) => "unsupported_provider",
+        correction::CorrectionError::EmptyEditInstruction => "empty_edit_instruction",
     };
     format!("AI correction failed; using the original transcript. Error kind: {kind}.")
 }
@@ -1392,6 +1487,77 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
 mod tests {
     use super::*;
     use crate::audio::{AudioArtifact, AudioError, AudioFuture, CaptureState, LevelMeter};
+
+    #[test]
+    fn edit_persistence_failure_does_not_skip_metrics_or_propagate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit.sqlite");
+        let storage = Storage::open(&path).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute("DROP TABLE dictation_history", [])
+            .unwrap();
+        let item = NewHistoryItem {
+            transcript_text: "shorten this",
+            processed_text: Some("short"),
+            source_text: Some("long selection"),
+            instruction_text: Some("shorten this"),
+            action_kind: None,
+            search_site: None,
+            mode: "edit",
+            asr_provider: "test",
+            llm_provider: Some("local"),
+            target_language: None,
+            app_category: None,
+            duration_ms: Some(100),
+            latency_ms: Some(200),
+        };
+        assert_eq!(
+            persist_edit_completion(&storage, &item, "local", 200),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn persistence_failures_choose_one_complete_warning() {
+        assert_eq!(persistence_warning(false, false), None);
+        assert_eq!(
+            persistence_warning(true, false).unwrap().0,
+            "history_save_failed"
+        );
+        assert_eq!(
+            persistence_warning(false, true).unwrap().0,
+            "metric_save_failed"
+        );
+        assert_eq!(
+            persistence_warning(true, true).unwrap().0,
+            "history_and_metric_save_failed"
+        );
+    }
+
+    #[test]
+    fn hotkey_repair_uses_only_confirmed_registrations() {
+        let dictate = parse_shortcut("CommandOrControl+Shift+D").unwrap();
+        let translate = parse_shortcut("CommandOrControl+Shift+T").unwrap();
+        let selected = parse_shortcut("CommandOrControl+Shift+Y").unwrap();
+        let unavailable = parse_shortcut("CommandOrControl+Shift+U").unwrap();
+        let edit = parse_shortcut("CommandOrControl+Shift+E").unwrap();
+        let ask = parse_shortcut("CommandOrControl+Shift+A").unwrap();
+        let registered = vec![dictate, selected, edit, ask];
+        let unchanged = vec![dictate, unavailable, selected, edit, ask];
+        assert_eq!(
+            hotkey_changes(&registered, &unchanged),
+            (vec![], vec![unavailable])
+        );
+        assert!(!hotkeys_repaired(&registered, &unchanged));
+
+        let repaired = vec![dictate, translate, selected, edit, ask];
+        assert_eq!(
+            hotkey_changes(&registered, &repaired),
+            (vec![], vec![translate])
+        );
+        assert!(hotkeys_repaired(&repaired, &repaired));
+    }
 
     #[test]
     fn translation_targets_require_supported_unique_current_language() {
@@ -1702,6 +1868,9 @@ pub(crate) async fn update_settings(
     }
     correction::local_chat_completions_url(&settings.local_correction_base_url)
         .map_err(|error| error.to_string())?;
+    if !(128..=32768).contains(&settings.local_correction_max_tokens) {
+        return Err("local correction max tokens must be between 128 and 32768".into());
+    }
     for (label, environment_variable) in [
         (
             "OpenAI API key environment variable",
@@ -1754,11 +1923,6 @@ pub(crate) async fn update_settings(
     let new_edit_shortcut = parse_shortcut(&settings.speak_to_edit_hotkey)?;
     let new_ask_shortcut = parse_shortcut(&settings.ask_hotkey)?;
     let previous = storage.get_settings().map_err(command_error)?;
-    let old_shortcut = parse_shortcut(&previous.hotkey)?;
-    let old_translation_shortcut = parse_shortcut(&previous.translation_hotkey)?;
-    let old_voice_translate_shortcut = parse_shortcut(&previous.voice_translate_hotkey)?;
-    let old_edit_shortcut = parse_shortcut(&previous.speak_to_edit_hotkey)?;
-    let old_ask_shortcut = parse_shortcut(&previous.ask_hotkey)?;
     if new_translation_shortcut == new_shortcut
         || new_voice_translate_shortcut == new_shortcut
         || new_voice_translate_shortcut == new_translation_shortcut
@@ -1771,7 +1935,7 @@ pub(crate) async fn update_settings(
         || new_ask_shortcut == new_edit_shortcut
     {
         return Err(
-            "recording, selected-text translation, voice Translate, and Speak to edit hotkeys must differ".into(),
+            "recording, selected-text translation, voice Translate, Speak to edit, and Ask hotkeys must differ".into(),
         );
     }
     if settings.translation_instruction.chars().count() > 500
@@ -1787,119 +1951,64 @@ pub(crate) async fn update_settings(
                 .into(),
         );
     }
-    let recording_changed = new_shortcut != old_shortcut;
-    let translation_changed = new_translation_shortcut != old_translation_shortcut;
-    let voice_translate_changed = new_voice_translate_shortcut != old_voice_translate_shortcut;
-    let edit_changed = new_edit_shortcut != old_edit_shortcut;
-    let ask_changed = new_ask_shortcut != old_ask_shortcut;
-    let rollback_shortcuts = || {
-        if recording_changed {
-            let _ = app.global_shortcut().unregister(new_shortcut);
+    let new_shortcuts = unique_shortcuts([
+        new_shortcut,
+        new_voice_translate_shortcut,
+        new_edit_shortcut,
+        new_ask_shortcut,
+        new_translation_shortcut,
+    ]);
+    let repaired = {
+        let mut registered = services
+            .registered_hotkeys
+            .lock()
+            .map_err(|_| "hotkey registration state is unavailable".to_string())?;
+        let (to_remove, to_add) = hotkey_changes(&registered, &new_shortcuts);
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        let rollback_shortcuts =
+            |removed: &[Shortcut], added: &[Shortcut], registered: &mut Vec<Shortcut>| {
+                for shortcut in added.iter().rev() {
+                    if app.global_shortcut().unregister(*shortcut).is_ok() {
+                        registered.retain(|active| active != shortcut);
+                    }
+                }
+                for shortcut in removed {
+                    if app.global_shortcut().register(*shortcut).is_ok() {
+                        registered.push(*shortcut);
+                    }
+                }
+            };
+        for shortcut in to_remove {
+            if let Err(error) = app.global_shortcut().unregister(shortcut) {
+                rollback_shortcuts(&removed, &added, &mut registered);
+                return Err(format!("hotkey update failed: {error}"));
+            }
+            registered.retain(|active| *active != shortcut);
+            removed.push(shortcut);
         }
-        if translation_changed {
-            let _ = app.global_shortcut().unregister(new_translation_shortcut);
+        for shortcut in to_add {
+            if let Err(error) = app.global_shortcut().register(shortcut) {
+                rollback_shortcuts(&removed, &added, &mut registered);
+                return Err(format!("hotkey registration failed: {error}"));
+            }
+            registered.push(shortcut);
+            added.push(shortcut);
         }
-        if voice_translate_changed {
-            let _ = app
-                .global_shortcut()
-                .unregister(new_voice_translate_shortcut);
+        if let Err(error) = storage.apply_history_policy(&previous, &settings) {
+            rollback_shortcuts(&removed, &added, &mut registered);
+            return Err(command_error(error));
         }
-        if edit_changed {
-            let _ = app.global_shortcut().unregister(new_edit_shortcut);
+        if let Err(error) = storage.update_settings(&settings) {
+            rollback_shortcuts(&removed, &added, &mut registered);
+            return Err(command_error(error));
         }
-        if ask_changed {
-            let _ = app.global_shortcut().unregister(new_ask_shortcut);
-        }
-        if recording_changed {
-            let _ = app.global_shortcut().register(old_shortcut);
-        }
-        if translation_changed {
-            let _ = app.global_shortcut().register(old_translation_shortcut);
-        }
-        if voice_translate_changed {
-            let _ = app.global_shortcut().register(old_voice_translate_shortcut);
-        }
-        if edit_changed {
-            let _ = app.global_shortcut().register(old_edit_shortcut);
-        }
-        if ask_changed {
-            let _ = app.global_shortcut().register(old_ask_shortcut);
-        }
+        hotkeys_repaired(&registered, &new_shortcuts)
     };
-    // Remove every changed registration before adding any replacement. This
-    // makes swapping the four shortcuts an atomic-looking transaction.
-    if recording_changed {
-        if let Err(error) = app.global_shortcut().unregister(old_shortcut) {
-            rollback_shortcuts();
-            return Err(format!("hotkey update failed: {error}"));
+    if repaired {
+        if let Ok(mut issues) = services.startup_hotkey_issues.lock() {
+            *issues = StartupHotkeyIssues::default();
         }
-    }
-    if translation_changed {
-        if let Err(error) = app.global_shortcut().unregister(old_translation_shortcut) {
-            rollback_shortcuts();
-            return Err(format!("translation hotkey update failed: {error}"));
-        }
-    }
-    if voice_translate_changed {
-        if let Err(error) = app
-            .global_shortcut()
-            .unregister(old_voice_translate_shortcut)
-        {
-            rollback_shortcuts();
-            return Err(format!("voice Translate hotkey update failed: {error}"));
-        }
-    }
-    if edit_changed {
-        if let Err(error) = app.global_shortcut().unregister(old_edit_shortcut) {
-            rollback_shortcuts();
-            return Err(format!("Speak to edit hotkey update failed: {error}"));
-        }
-    }
-    if ask_changed {
-        if let Err(error) = app.global_shortcut().unregister(old_ask_shortcut) {
-            rollback_shortcuts();
-            return Err(format!("Ask hotkey update failed: {error}"));
-        }
-    }
-    if recording_changed {
-        if let Err(error) = app.global_shortcut().register(new_shortcut) {
-            rollback_shortcuts();
-            return Err(format!("hotkey registration failed: {error}"));
-        }
-    }
-    if translation_changed {
-        if let Err(error) = app.global_shortcut().register(new_translation_shortcut) {
-            rollback_shortcuts();
-            return Err(format!("translation hotkey registration failed: {error}"));
-        }
-    }
-    if voice_translate_changed {
-        if let Err(error) = app.global_shortcut().register(new_voice_translate_shortcut) {
-            rollback_shortcuts();
-            return Err(format!(
-                "voice Translate hotkey registration failed: {error}"
-            ));
-        }
-    }
-    if edit_changed {
-        if let Err(error) = app.global_shortcut().register(new_edit_shortcut) {
-            rollback_shortcuts();
-            return Err(format!("Speak to edit hotkey registration failed: {error}"));
-        }
-    }
-    if ask_changed {
-        if let Err(error) = app.global_shortcut().register(new_ask_shortcut) {
-            rollback_shortcuts();
-            return Err(format!("Ask hotkey registration failed: {error}"));
-        }
-    }
-    if let Err(error) = storage.apply_history_policy(&previous, &settings) {
-        rollback_shortcuts();
-        return Err(command_error(error));
-    }
-    if let Err(error) = storage.update_settings(&settings) {
-        rollback_shortcuts();
-        return Err(command_error(error));
     }
     if settings.auto_start != previous.auto_start {
         let result = if settings.auto_start {

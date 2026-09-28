@@ -105,6 +105,25 @@ pub(crate) struct Services {
     shutdown_started: AtomicBool,
     translation_active: AtomicBool,
     voice_translation_target: Mutex<Option<String>>,
+    startup_hotkey_issues: Mutex<StartupHotkeyIssues>,
+    registered_hotkeys: Mutex<Vec<Shortcut>>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct StartupHotkeyIssues {
+    collision: bool,
+    registration_failed: bool,
+}
+
+impl StartupHotkeyIssues {
+    fn message(self) -> Option<&'static str> {
+        match (self.collision, self.registration_failed) {
+            (false, false) => None,
+            (true, false) => Some("Some saved hotkeys overlap. Change them in Settings to enable each action independently."),
+            (false, true) => Some("A saved hotkey could not be registered. Change it in Settings."),
+            (true, true) => Some("Some saved hotkeys overlap or could not be registered. Change them in Settings."),
+        }
+    }
 }
 
 impl Services {
@@ -135,6 +154,8 @@ impl Services {
             shutdown_started: AtomicBool::new(false),
             translation_active: AtomicBool::new(false),
             voice_translation_target: Mutex::new(None),
+            startup_hotkey_issues: Mutex::new(StartupHotkeyIssues::default()),
+            registered_hotkeys: Mutex::new(Vec::new()),
         }
     }
 
@@ -431,6 +452,55 @@ fn database_path(app: &AppHandle) -> Result<PathBuf, Box<dyn std::error::Error>>
 
 fn parse_shortcut(value: &str) -> Result<Shortcut, String> {
     Shortcut::from_str(value.trim()).map_err(|_| "hotkey is invalid".to_string())
+}
+
+fn unique_shortcuts<const N: usize>(shortcuts: [Shortcut; N]) -> Vec<Shortcut> {
+    let mut unique = Vec::new();
+    for shortcut in shortcuts {
+        if !unique.contains(&shortcut) {
+            unique.push(shortcut);
+        }
+    }
+    unique
+}
+
+#[cfg(test)]
+mod shortcut_startup_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_collisions_register_each_chord_once() {
+        let recording = parse_shortcut("Ctrl+Shift+Space").unwrap();
+        let voice = parse_shortcut("Ctrl+Shift+Y").unwrap();
+        let old_selected = parse_shortcut("Ctrl+Shift+Space").unwrap();
+        let edit = parse_shortcut("Ctrl+Shift+E").unwrap();
+        assert_eq!(
+            unique_shortcuts([recording, voice, edit, old_selected]),
+            vec![recording, voice, edit]
+        );
+        assert_eq!(
+            unique_shortcuts([recording, voice, voice]),
+            vec![recording, voice]
+        );
+    }
+
+    #[test]
+    fn startup_hotkey_diagnostics_cover_collision_registration_and_both() {
+        let mut issues = StartupHotkeyIssues::default();
+        assert_eq!(issues.message(), None);
+        issues.collision = true;
+        assert!(issues.message().unwrap().contains("overlap"));
+        issues.registration_failed = true;
+        assert!(issues
+            .message()
+            .unwrap()
+            .contains("could not be registered"));
+        issues.collision = false;
+        assert!(issues
+            .message()
+            .unwrap()
+            .contains("could not be registered"));
+    }
 }
 
 fn load_environment_file() {
@@ -903,30 +973,37 @@ pub fn run() {
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
             let ask_shortcut = parse_shortcut(&settings.ask_hotkey)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-            if shortcut == translation_shortcut
-                || shortcut == voice_translate_shortcut
-                || translation_shortcut == voice_translate_shortcut
-                || edit_shortcut == shortcut
-                || edit_shortcut == translation_shortcut
-                || edit_shortcut == voice_translate_shortcut
-                || ask_shortcut == shortcut || ask_shortcut == translation_shortcut || ask_shortcut == voice_translate_shortcut || ask_shortcut == edit_shortcut
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "recording, selected-text translation, voice Translate, and Speak to edit hotkeys must differ",
-                )
-                .into());
-            }
             app.manage(storage);
             app.manage(AppState::default());
             app.manage(Services::new(&settings));
             recording_overlay::create(app.handle())?;
             answer_panel::create(app.handle())?;
-            app.global_shortcut().register(shortcut)?;
-            app.global_shortcut().register(translation_shortcut)?;
-            app.global_shortcut().register(voice_translate_shortcut)?;
-            app.global_shortcut().register(edit_shortcut)?;
-            app.global_shortcut().register(ask_shortcut)?;
+            // Older settings may share a chord with a newly added mode. Dispatch
+            // gives Dictate, voice Translate, Speak to edit, Ask, then
+            // selected-text translation precedence; register each chord once.
+            let shortcuts = unique_shortcuts([
+                shortcut,
+                voice_translate_shortcut,
+                edit_shortcut,
+                ask_shortcut,
+                translation_shortcut,
+            ]);
+            if shortcuts.len() != 5 {
+                if let Ok(mut issues) = app.state::<Services>().startup_hotkey_issues.lock() {
+                    issues.collision = true;
+                }
+            }
+            for shortcut in shortcuts {
+                if app.global_shortcut().register(shortcut).is_ok() {
+                    if let Ok(mut registered) = app.state::<Services>().registered_hotkeys.lock() {
+                        registered.push(shortcut);
+                    }
+                } else {
+                    if let Ok(mut issues) = app.state::<Services>().startup_hotkey_issues.lock() {
+                        issues.registration_failed = true;
+                    }
+                }
+            }
             if cleanup_stale_artifacts(
                 &std::env::temp_dir(),
                 settings.delete_audio_after_processing,
@@ -976,6 +1053,7 @@ pub fn run() {
             commands::cancel_recording,
             commands::cycle_voice_translation_target,
             commands::get_app_state,
+            commands::get_startup_hotkey_warning,
             commands::get_settings,
             commands::get_model_status,
             commands::load_model,
