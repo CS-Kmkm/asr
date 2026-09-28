@@ -482,22 +482,37 @@ impl Storage {
         self.add_history_with_audio(item, None)
     }
 
+    #[cfg(test)]
     pub fn add_history_with_audio(
         &self,
         item: &NewHistoryItem<'_>,
         source_audio: Option<&Path>,
     ) -> Result<bool, StorageError> {
+        self.add_history_with_audio_report(item, source_audio)
+            .map(|(saved, _)| saved)
+    }
+
+    pub fn add_history_with_audio_report(
+        &self,
+        item: &NewHistoryItem<'_>,
+        source_audio: Option<&Path>,
+    ) -> Result<(bool, bool), StorageError> {
         let settings = self.get_settings()?;
         if settings.history_retention == HistoryRetention::Never {
-            return Ok(false);
+            return Ok((false, false));
         }
         // Prune before insertion. After a row/file association commits, this
         // method must not turn cleanup trouble into a false command failure.
         self.apply_history_policy(&settings, &settings)?;
+        let mut audio_stage_failed = false;
         let mut staged_audio = if !settings.delete_audio_after_processing {
-            source_audio
-                .map(|path| self.stage_history_audio(path))
-                .transpose()?
+            source_audio.and_then(|path| match self.stage_history_audio(path) {
+                Ok(audio) => Some(audio),
+                Err(_) => {
+                    audio_stage_failed = true;
+                    None
+                }
+            })
         } else {
             None
         };
@@ -518,15 +533,20 @@ impl Storage {
             .transpose()?
             .unwrap_or_default();
         if current_settings.history_retention == HistoryRetention::Never {
-            return Ok(false);
+            return Ok((false, false));
         }
         if !current_settings.delete_audio_after_processing
             && staged_audio.is_none()
             && source_audio.is_some()
+            && settings.delete_audio_after_processing
         {
-            staged_audio = source_audio
-                .map(|path| self.stage_history_audio(path))
-                .transpose()?;
+            staged_audio = source_audio.and_then(|path| match self.stage_history_audio(path) {
+                Ok(audio) => Some(audio),
+                Err(_) => {
+                    audio_stage_failed = true;
+                    None
+                }
+            });
         }
         let audio_filename = if current_settings.delete_audio_after_processing {
             None
@@ -540,7 +560,8 @@ impl Storage {
                transcript_text, processed_text, source_text, instruction_text, action_kind, search_site, mode,
                asr_provider, llm_provider, target_language, app_category, duration_ms,
                latency_ms, created_at, audio_filename, retry_of_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                      CASE WHEN EXISTS (SELECT 1 FROM dictation_history WHERE id = ?16) THEN ?16 ELSE NULL END)",
             params![
                 item.transcript_text,
                 item.processed_text,
@@ -572,7 +593,10 @@ impl Storage {
             }
         }
         drop(connection);
-        Ok(true)
+        Ok((
+            true,
+            audio_stage_failed && !current_settings.delete_audio_after_processing,
+        ))
     }
 
     pub fn list_history(
@@ -763,8 +787,11 @@ impl Storage {
     }
 
     pub fn copy_history_audio_for_retry(&self, id: i64) -> Result<PathBuf, StorageError> {
-        let filename: Option<String> = self
-            .connection()?
+        // Keep the storage lock through the copy. Delete/retention use the
+        // same lock before unlinking, so the source remains owned until the
+        // guarded temporary copy is complete.
+        let connection = self.connection()?;
+        let filename: Option<String> = connection
             .query_row(
                 "SELECT audio_filename FROM dictation_history WHERE id = ?1",
                 [id],
@@ -789,6 +816,7 @@ impl Storage {
             let _ = fs::remove_file(&target);
             return Err(error.into());
         }
+        drop(connection);
         Ok(target)
     }
 
@@ -1761,7 +1789,11 @@ mod tests {
             (HistoryRetention::OneYear, 365),
         ] {
             let storage = Storage::in_memory().unwrap();
-            let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+            let settings = Settings {
+                history_retention: retention,
+                ..Settings::default()
+            };
+            storage.update_settings(&settings).unwrap();
             storage
                 .connection()
                 .unwrap()
@@ -1771,13 +1803,80 @@ mod tests {
                     [(Utc::now() - chrono::Duration::days(days + 1)).to_rfc3339()],
                 )
                 .unwrap();
-            storage.delete_history_before(Some(&cutoff)).unwrap();
+            storage.apply_history_policy(&settings, &settings).unwrap();
             assert!(storage
                 .list_history(HistoryFilter::All, 10)
                 .unwrap()
                 .is_empty());
-            assert_ne!(retention, HistoryRetention::Forever);
+            assert_eq!(retention.days(), Some(days));
         }
+    }
+
+    #[test]
+    fn failed_audio_stage_preserves_text_only_history() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .update_settings(&Settings {
+                delete_audio_after_processing: false,
+                ..Settings::default()
+            })
+            .unwrap();
+        let unavailable =
+            std::env::temp_dir().join(format!("missing-history-{}.wav", random_audio_stem()));
+        let (saved, audio_stage_failed) = storage
+            .add_history_with_audio_report(&item(), Some(&unavailable))
+            .unwrap();
+        assert!(saved);
+        assert!(audio_stage_failed);
+        let row = storage
+            .list_history(HistoryFilter::All, 1)
+            .unwrap()
+            .remove(0);
+        assert!(!row.has_audio);
+        assert_eq!(row.transcript_text, "private transcript");
+    }
+
+    #[test]
+    fn deleted_retry_source_keeps_result_without_link() {
+        let storage = Storage::in_memory().unwrap();
+        storage.add_history(&item()).unwrap();
+        let source_id = storage.list_history(HistoryFilter::All, 1).unwrap()[0].id;
+        storage.delete_history(source_id).unwrap();
+        let mut retry = item();
+        retry.retry_of_id = Some(source_id);
+        assert!(storage.add_history(&retry).unwrap());
+        let row = storage
+            .list_history(HistoryFilter::All, 1)
+            .unwrap()
+            .remove(0);
+        assert_eq!(row.retry_of_id, None);
+    }
+
+    #[test]
+    fn retry_audio_copy_remains_readable_after_source_deletion() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .update_settings(&Settings {
+                delete_audio_after_processing: false,
+                ..Settings::default()
+            })
+            .unwrap();
+        let source =
+            std::env::temp_dir().join(format!("history-source-{}.wav", random_audio_stem()));
+        fs::write(&source, b"RIFF retry wav").unwrap();
+        storage
+            .add_history_with_audio(&item(), Some(&source))
+            .unwrap();
+        let row = storage
+            .list_history(HistoryFilter::All, 1)
+            .unwrap()
+            .remove(0);
+        let retry_copy = storage.copy_history_audio_for_retry(row.id).unwrap();
+        assert!(storage.delete_history(row.id).unwrap());
+        assert_eq!(fs::read(&retry_copy).unwrap(), b"RIFF retry wav");
+        let _ = fs::remove_file(retry_copy);
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
     }
 
     #[test]
@@ -1863,8 +1962,82 @@ mod tests {
         );
         assert_eq!(payload.mime_type, "audio/wav");
         assert_eq!(payload.bytes, b"RIFF test wav");
+        let owned_audio: String = storage
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT audio_filename FROM dictation_history WHERE id = ?1",
+                [row.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let owned_path = storage.audio_path(&owned_audio).unwrap();
+        assert!(owned_path.exists());
         assert!(storage.delete_history(row.id).unwrap());
         assert!(storage.history_audio(row.id).unwrap().is_none());
+        assert!(!owned_path.exists());
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
+    }
+
+    #[test]
+    fn delete_all_and_history_off_remove_owned_audio() {
+        let storage = Storage::in_memory().unwrap();
+        let mut settings = Settings {
+            delete_audio_after_processing: false,
+            ..Settings::default()
+        };
+        storage.update_settings(&settings).unwrap();
+        let source =
+            std::env::temp_dir().join(format!("history-source-{}.wav", random_audio_stem()));
+        fs::write(&source, b"RIFF test wav").unwrap();
+        storage
+            .add_history_with_audio(&item(), Some(&source))
+            .unwrap();
+        let first = storage
+            .list_history(HistoryFilter::All, 1)
+            .unwrap()
+            .remove(0);
+        let first_filename: String = storage
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT audio_filename FROM dictation_history WHERE id = ?1",
+                [first.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let first_path = storage.audio_path(&first_filename).unwrap();
+        assert!(first_path.exists());
+        assert_eq!(storage.delete_all_history().unwrap(), 1);
+        assert!(!first_path.exists());
+        storage
+            .add_history_with_audio(&item(), Some(&source))
+            .unwrap();
+        let second = storage
+            .list_history(HistoryFilter::All, 1)
+            .unwrap()
+            .remove(0);
+        let second_filename: String = storage
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT audio_filename FROM dictation_history WHERE id = ?1",
+                [second.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let second_path = storage.audio_path(&second_filename).unwrap();
+        assert!(second_path.exists());
+        settings.history_retention = HistoryRetention::Never;
+        storage
+            .update_settings_and_apply_history_policy(&settings)
+            .unwrap();
+        assert!(storage
+            .list_history(HistoryFilter::All, 1)
+            .unwrap()
+            .is_empty());
+        assert!(!second_path.exists());
         let _ = fs::remove_file(source);
         let _ = fs::remove_dir_all(&storage.history_audio_dir);
     }

@@ -1028,6 +1028,7 @@ pub fn run() {
             commands::cancel_recording,
             commands::cycle_voice_translation_target,
             commands::get_app_state,
+            commands::get_startup_hotkey_warning,
             commands::get_settings,
             commands::get_shortcut_warning,
             commands::get_model_status,
@@ -1049,6 +1050,12 @@ pub fn run() {
             commands::update_settings
         ])
         .on_window_event(|window, event| {
+            if window.label() == answer_panel::WINDOW_LABEL {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
             if window.label() == "main" && matches!(event, WindowEvent::CloseRequested { .. }) {
                 // A tray icon keeps a Tauri process alive after its last window
                 // is closed. Treat the main window's close button as an actual

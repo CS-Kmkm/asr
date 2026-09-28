@@ -55,6 +55,7 @@ export function SettingsPage({
     setShortcuts(settings.shortcuts);
   }, [settings.shortcuts]);
   useEffect(() => setTranslationHotkey(settings.translationHotkey), [settings.translationHotkey]);
+
   useEffect(() => setTranslationInstruction(settings.translationInstruction), [settings.translationInstruction]);
   useEffect(() => {
     void getShortcutWarning().then(setStartupShortcutWarning).catch(() => {});
@@ -245,7 +246,11 @@ export function SettingsPage({
         <h3>{t("Voice mode shortcuts")}</h3>
         <p>{t("Add one to four keyboard shortcuts for each voice mode. A shortcut must be unique across all actions.")}</p>
         {shortcutModes.map(({ mode, label }) => (
-          <SettingRow key={mode} title={t(label)} detail={t("Enter a shortcut chord such as Ctrl+Shift+Space.")}
+          <SettingRow key={mode} title={t(label)} detail={`${t("Enter a shortcut chord such as Ctrl+Shift+Space.")} ${mode === "edit"
+            ? t("Speak to edit sends selected source text and the transcribed spoken instruction to the provider shown under AI text correction, even when correction is off. The selected ASR backend may send audio.")
+            : mode === "ask"
+              ? t("Ask sends only the transcribed spoken instruction to the selected provider for planning. Answer generation using a selection also sends the selected source text with the instruction, even when Dictation AI correction is off. The selected ASR backend may send audio.")
+              : ""}`}
             control={<div className="shortcut-list">
               {shortcuts[mode].map((chord, index) => <div className="shortcut-item" key={`${mode}-${index}`}>
                 <input aria-label={`${t(label)} ${index + 1}`} value={chord} onChange={(event) => setShortcut(mode, index, event.target.value)} />
@@ -265,7 +270,7 @@ export function SettingsPage({
             if (event.key === "Enter") { event.preventDefault(); commitTranslationHotkey(); suppressTranslationHotkeyBlurRef.current = true; event.currentTarget.blur(); }
             if (event.key === "Escape") { setTranslationHotkey(settings.translationHotkey); suppressTranslationHotkeyBlurRef.current = true; event.currentTarget.blur(); }
           }} />} />
-        <SettingRow title={t("Voice Translate target")} detail={t("The first language is the default. Reorder the list or choose the active target.")}
+        <SettingRow title={t("Voice Translate target")} detail={`${t("The first language is the default. Reorder the list or choose the active target.")} ${t("Voice and selected-text Translate send text to the provider shown under AI text correction, even when correction is off.")}`}
           control={<div className="translation-target-settings">
             <select value={settings.translationTargetLanguage} onChange={(event) => onSave({ translationTargetLanguage: event.target.value })}>
               {settings.translationTargetLanguages.map((language) => {
