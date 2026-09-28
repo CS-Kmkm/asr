@@ -108,7 +108,7 @@ pub(crate) fn guidance(profile: &StyleProfile) -> String {
         _ => "Use casual, conversational wording.",
     };
     let detail = match profile.detail.as_str() {
-        "detailed" => "Prefer sufficiently detailed phrasing.",
+        "detailed" => "Prefer detailed phrasing of existing facts; never add new details.",
         _ => "Prefer concise phrasing.",
     };
     let mut result = format!("{formality} {detail}");

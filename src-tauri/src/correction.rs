@@ -850,6 +850,37 @@ mod tests {
     }
 
     #[test]
+    fn opted_in_style_has_explicit_precedence_without_adding_facts() {
+        let settings = Settings {
+            correction_improve_clarity: false,
+            ..Settings::default()
+        };
+        let guidance = crate::personalization::guidance(&crate::types::StyleProfile {
+            formality: "formal".into(),
+            detail: "detailed".into(),
+            guidance: None,
+        });
+        let instruction = build_correction_instruction(&settings, &[], Some(&guidance));
+        assert!(instruction.contains("Preserve tone unless a trusted style profile"));
+        assert!(instruction.contains("except for the limited formality/detail changes"));
+        assert!(instruction.contains("never add new facts"));
+        assert!(instruction.contains("never add new details"));
+    }
+
+    #[test]
+    fn valid_full_length_profile_guidance_reaches_provider_instruction() {
+        let profile = crate::types::StyleProfile {
+            formality: "formal".into(),
+            detail: "detailed".into(),
+            guidance: Some(format!("{}TAIL", "x".repeat(296))),
+        };
+        crate::personalization::validate_profile(&profile).unwrap();
+        let guidance = crate::personalization::guidance(&profile);
+        let instruction = build_correction_instruction(&Settings::default(), &[], Some(&guidance));
+        assert!(instruction.contains("TAIL"));
+    }
+
+    #[test]
     fn compacts_structured_api_errors() {
         assert_eq!(
             compact_error_body(r#"{"error":{"message":"invalid key"}}"#),

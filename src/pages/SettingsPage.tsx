@@ -4,6 +4,15 @@ import { AiCorrectionSettings } from "../components/AiCorrectionSettings";
 import type { ScopedStyleProfile, Settings, StyleProfile } from "../types";
 import { useI18n } from "../i18n";
 
+const profileCategories = new Set(["browser", "email", "messaging", "development", "document", "other"]);
+
+function isValidProfileScope(scope: string): boolean {
+  if (Array.from(scope).length > 80 || scope.trim() !== scope) return false;
+  if (scope.startsWith("app:")) return /^app:[a-z0-9_-]+$/.test(scope);
+  if (scope.startsWith("category:")) return profileCategories.has(scope.slice("category:".length));
+  return false;
+}
+
 export function SettingsPage({
   settings,
   onSave,
@@ -30,11 +39,14 @@ export function SettingsPage({
 
   function saveProfiles(next: ScopedStyleProfile[]) {
     setProfiles(next);
-    if (next.every((item) => /^(app|category):[^:\s]+$/.test(item.scope)) &&
+    if (next.every((item) => isValidProfileScope(item.scope)) &&
         new Set(next.map((item) => item.scope)).size === next.length) {
       onSave({ scopedStyleProfiles: next });
     }
   }
+
+  const profileDraftIsInvalid = profiles.some((item) => !isValidProfileScope(item.scope)) ||
+    new Set(profiles.map((item) => item.scope)).size !== profiles.length;
 
   function saveGlobalProfile(profile: StyleProfile | null) {
     onSave({ globalStyleProfile: profile });
@@ -223,7 +235,7 @@ export function SettingsPage({
           }
         />
       </section>
-      <PersonalizationProfiles settings={settings} profiles={profiles} onSaveGlobal={saveGlobalProfile} onSaveProfiles={saveProfiles} />
+      <PersonalizationProfiles settings={settings} profiles={profiles} profileDraftIsInvalid={profileDraftIsInvalid} onSaveGlobal={saveGlobalProfile} onSaveProfiles={saveProfiles} />
       <AiCorrectionSettings settings={settings} onSave={onSave} />
     </div>
   );
@@ -232,31 +244,40 @@ export function SettingsPage({
 function PersonalizationProfiles({
   settings,
   profiles,
+  profileDraftIsInvalid,
   onSaveGlobal,
   onSaveProfiles,
 }: {
   settings: Settings;
   profiles: ScopedStyleProfile[];
+  profileDraftIsInvalid: boolean;
   onSaveGlobal: (profile: StyleProfile | null) => void;
   onSaveProfiles: (profiles: ScopedStyleProfile[]) => void;
 }) {
   const { t } = useI18n();
-  const global = settings.globalStyleProfile ?? { formality: "formal", detail: "concise", guidance: "" };
-  const updateGlobal = (patch: Partial<StyleProfile>) => onSaveGlobal({ ...global, ...patch });
+  const global = settings.globalStyleProfile;
+  const defaultGlobal: StyleProfile = { formality: "formal", detail: "concise", guidance: "" };
+  const updateGlobal = (patch: Partial<StyleProfile>) => onSaveGlobal({ ...(global ?? defaultGlobal), ...patch });
   return (
     <section className="panel">
       <h2>{t("Personalization profiles")}</h2>
       <p>{t("Structured style settings are retained locally; no transcript examples are stored.")}</p>
       <SettingRow title={t("Global profile")} detail={t("Fallback style used when no app or category profile matches.")} control={
         <div className="profile-controls">
-          <select value={global.formality} onChange={(e) => updateGlobal({ formality: e.target.value as StyleProfile["formality"] })}><option value="formal">{t("Formal")}</option><option value="casual">{t("Casual")}</option></select>
-          <select value={global.detail} onChange={(e) => updateGlobal({ detail: e.target.value as StyleProfile["detail"] })}><option value="concise">{t("Concise")}</option><option value="detailed">{t("Detailed")}</option></select>
-          <input maxLength={300} placeholder={t("Optional guidance")} value={global.guidance ?? ""} onChange={(e) => updateGlobal({ guidance: e.target.value })} />
-          <button className="secondary" onClick={() => onSaveGlobal(null)}>{t("Clear")}</button>
+          {global ? <>
+            <select value={global.formality} onChange={(e) => updateGlobal({ formality: e.target.value as StyleProfile["formality"] })}><option value="formal">{t("Formal")}</option><option value="casual">{t("Casual")}</option></select>
+            <select value={global.detail} onChange={(e) => updateGlobal({ detail: e.target.value as StyleProfile["detail"] })}><option value="concise">{t("Concise")}</option><option value="detailed">{t("Detailed")}</option></select>
+            <input maxLength={300} placeholder={t("Optional guidance")} value={global.guidance ?? ""} onChange={(e) => updateGlobal({ guidance: e.target.value })} />
+            <button className="secondary" onClick={() => onSaveGlobal(null)}>{t("Clear")}</button>
+          </> : <>
+            <span>{t("Not configured")}</span>
+            <button className="secondary" onClick={() => onSaveGlobal(defaultGlobal)}>{t("Configure global profile")}</button>
+          </>}
         </div>
       } />
       <div className="profile-list">
         <strong>{t("Scoped profiles")}</strong>
+        {profileDraftIsInvalid && <p role="alert">{t("Profile scopes must be valid and unique before changes are saved.")}</p>}
         {profiles.map((item, index) => (
           <div className="setting-row" key={index}>
             <input value={item.scope} maxLength={80} placeholder={t("app:code or category:development")} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, scope: e.target.value }; onSaveProfiles(next); }} />
