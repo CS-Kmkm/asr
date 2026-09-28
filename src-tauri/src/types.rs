@@ -80,6 +80,8 @@ pub struct Settings {
     pub local_correction_base_url: String,
     #[serde(default = "default_local_correction_model")]
     pub local_correction_model: String,
+    #[serde(default = "default_local_correction_max_tokens")]
+    pub local_correction_max_tokens: usize,
     #[serde(default = "default_correction_instruction")]
     pub correction_instruction: String,
     #[serde(default = "default_enabled_correction_feature")]
@@ -165,6 +167,10 @@ fn default_local_correction_model() -> String {
     "qwen3:8b".into()
 }
 
+fn default_local_correction_max_tokens() -> usize {
+    4096
+}
+
 fn default_correction_instruction() -> String {
     String::new()
 }
@@ -239,6 +245,7 @@ impl Default for Settings {
             gemini_api_key_env_var: default_gemini_api_key_env_var(),
             local_correction_base_url: default_local_correction_base_url(),
             local_correction_model: default_local_correction_model(),
+            local_correction_max_tokens: default_local_correction_max_tokens(),
             correction_instruction: default_correction_instruction(),
             correction_remove_fillers: true,
             correction_remove_repetitions: true,
@@ -465,6 +472,7 @@ mod tests {
             "http://127.0.0.1:11434/v1"
         );
         assert_eq!(settings.local_correction_model, "qwen3:8b");
+        assert_eq!(settings.local_correction_max_tokens, 4096);
         assert!(settings.correction_instruction.is_empty());
         assert!(settings.correction_remove_fillers);
         assert!(settings.correction_remove_repetitions);

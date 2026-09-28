@@ -9,6 +9,13 @@ const filters = [
   { value: "ask", label: "Ask" },
 ] as const;
 
+const modeLabels = {
+  faithful: "Dictation (faithful)",
+  ai_corrected: "Dictation (AI corrected)",
+  faithful_fallback: "Dictation (AI fallback)",
+  translate: "Voice Translate",
+} as const;
+
 export function HistoryPage({ settings, history, filter, onSave, onFilter, onCopyItem, onRetry, onDelete, onDeleteAll, onLoadAudio, retryActive, onCancelRetry }: {
   settings: Settings;
   history: HistoryItem[];
@@ -69,7 +76,9 @@ export function HistoryPage({ settings, history, filter, onSave, onFilter, onCop
       : history.length === 0 ? <Empty title={t("No dictations yet")} detail={t("Completed local dictations will appear here.")} />
       : <div className="history-list">{history.map(item => <article className="history-item" key={item.id}>
           <div className="history-meta"><time dateTime={item.createdAt}>{new Date(item.createdAt).toLocaleString()}</time>
-            <span className="history-mode">{item.mode}{item.targetLanguage ? ` · ${item.targetLanguage}` : ""}</span></div>
+            <span className="history-mode">{item.mode in modeLabels
+              ? t(modeLabels[item.mode as keyof typeof modeLabels])
+              : item.mode}{item.targetLanguage ? ` · ${item.targetLanguage}` : ""}</span></div>
           {item.sourceText && <HistoryText text={item.sourceText} label={t("Selected text")} />}
           {item.instructionText && <HistoryText text={item.instructionText} label={t("Spoken instruction")} />}
           {!item.sourceText && !item.instructionText && <HistoryText text={item.transcriptText} />}

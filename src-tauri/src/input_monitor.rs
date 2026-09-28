@@ -24,6 +24,8 @@ pub(crate) struct InputMonitor {
     sequence: std::sync::Arc<AtomicU64>,
     available: std::sync::Arc<AtomicBool>,
     shortcut_pending: std::sync::Arc<AtomicBool>,
+    #[cfg(test)]
+    async_modifier_pending: AtomicBool,
     recording_shortcut: std::sync::Mutex<Option<String>>,
     started_by_shortcut: AtomicBool,
     cancellation: std::sync::Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
@@ -47,6 +49,8 @@ impl Default for InputMonitor {
             sequence: std::sync::Arc::new(AtomicU64::new(0)),
             available: std::sync::Arc::new(AtomicBool::new(false)),
             shortcut_pending: std::sync::Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            async_modifier_pending: AtomicBool::new(false),
             recording_shortcut: std::sync::Mutex::new(None),
             started_by_shortcut: AtomicBool::new(false),
             cancellation: std::sync::Mutex::new(None),
@@ -88,6 +92,10 @@ impl InputMonitor {
     }
 
     pub(crate) fn shortcut_pending(&self) -> bool {
+        #[cfg(test)]
+        if self.async_modifier_pending.load(Ordering::Acquire) {
+            return true;
+        }
         #[cfg(all(target_os = "windows", not(test)))]
         {
             use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
@@ -241,6 +249,16 @@ impl InputMonitor {
             && self.sequence.load(Ordering::Acquire) == checkpoint
     }
 
+    /// After our own paste is queued, injected Ctrl may briefly be visible to
+    /// GetAsyncKeyState. The helper ignores marked injected keys but still
+    /// reports physical shortcut activity and increments the input sequence.
+    pub(crate) fn unchanged_since_injected_paste(&self, checkpoint: u64) -> bool {
+        !self.cancelled()
+            && self.available.load(Ordering::Acquire)
+            && !self.shortcut_pending.load(Ordering::Acquire)
+            && self.sequence.load(Ordering::Acquire) == checkpoint
+    }
+
     pub(crate) fn shutdown(&self) {
         #[cfg(all(target_os = "windows", not(test)))]
         {
@@ -280,6 +298,11 @@ impl InputMonitor {
     #[cfg(test)]
     pub(crate) fn test_set_shortcut_pending(&self, value: bool) {
         self.shortcut_pending.store(value, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_async_modifier_pending(&self, value: bool) {
+        self.async_modifier_pending.store(value, Ordering::Release);
     }
 }
 
@@ -471,5 +494,22 @@ mod tests {
         assert!(!monitor.unchanged_since(checkpoint));
         monitor.test_set_shortcut_pending(false);
         assert!(monitor.unchanged_since(checkpoint));
+    }
+
+    #[test]
+    fn injected_paste_guard_still_rejects_physical_shortcut_and_input() {
+        let monitor = InputMonitor::default();
+        monitor.test_set_available(true);
+        let checkpoint = monitor.checkpoint().unwrap();
+        assert!(monitor.unchanged_since_injected_paste(checkpoint));
+        monitor.test_set_async_modifier_pending(true);
+        assert!(!monitor.unchanged_since(checkpoint));
+        assert!(monitor.unchanged_since_injected_paste(checkpoint));
+        monitor.test_set_async_modifier_pending(false);
+        monitor.test_set_shortcut_pending(true);
+        assert!(!monitor.unchanged_since_injected_paste(checkpoint));
+        monitor.test_set_shortcut_pending(false);
+        monitor.test_record_input();
+        assert!(!monitor.unchanged_since_injected_paste(checkpoint));
     }
 }
