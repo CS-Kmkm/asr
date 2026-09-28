@@ -44,6 +44,18 @@ pub struct Storage {
     history_audio_dir: PathBuf,
 }
 
+fn serialized_settings(settings: &Settings) -> Result<String, StorageError> {
+    let mut value = serde_json::to_value(settings)?;
+    let primary = settings.shortcuts.dictate.first().ok_or_else(|| {
+        StorageError::InvalidSettings(serde_json::Error::io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dictation shortcut list is empty",
+        )))
+    })?;
+    value["hotkey"] = primary.clone().into();
+    Ok(serde_json::to_string(&value)?)
+}
+
 struct StagedHistoryAudio<'a> {
     filename: String,
     path: PathBuf,
@@ -323,22 +335,42 @@ impl Storage {
             );
         }
         let mut had_legacy_shortcut_fields = false;
-        for key in [
-            "hotkey",
-            "voiceTranslateHotkey",
-            "askHotkey",
-            "speakToEditHotkey",
-        ] {
+        for key in ["voiceTranslateHotkey", "askHotkey", "speakToEditHotkey"] {
             had_legacy_shortcut_fields |= object.remove(key).is_some();
         }
-        let settings: Settings = serde_json::from_value(value.clone())?;
-        if legacy_history || legacy_shortcuts || had_legacy_shortcut_fields {
-            crate::shortcuts::Routes::parse(&settings).map_err(|message| {
-                StorageError::InvalidSettings(serde_json::Error::io(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    message,
-                )))
-            })?;
+        let mut settings: Settings = serde_json::from_value(value.clone())?;
+        let defaults = crate::types::VoiceShortcuts::default();
+        let mut recovered_empty_shortcuts = false;
+        for (key, saved, fallback) in [
+            ("dictate", &mut settings.shortcuts.dictate, defaults.dictate),
+            (
+                "translate",
+                &mut settings.shortcuts.translate,
+                defaults.translate,
+            ),
+            ("ask", &mut settings.shortcuts.ask, defaults.ask),
+            ("edit", &mut settings.shortcuts.edit, defaults.edit),
+        ] {
+            if saved.is_empty() {
+                *saved = fallback;
+                value["shortcuts"][key] = serde_json::to_value(&*saved)?;
+                recovered_empty_shortcuts = true;
+            }
+        }
+        crate::shortcuts::Routes::parse_saved(&settings).map_err(|message| {
+            StorageError::InvalidSettings(serde_json::Error::io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                message,
+            )))
+        })?;
+        let compatibility_hotkey_missing = value["hotkey"] != settings.shortcuts.dictate[0];
+        value["hotkey"] = settings.shortcuts.dictate[0].clone().into();
+        if legacy_history
+            || legacy_shortcuts
+            || had_legacy_shortcut_fields
+            || compatibility_hotkey_missing
+            || recovered_empty_shortcuts
+        {
             // Persist the normalized V2 retention value, but keep fields that
             // this version does not own. A migration must not erase a newer
             // client's unrelated setting merely because it encountered an
@@ -353,7 +385,7 @@ impl Storage {
     }
 
     pub fn update_settings(&self, settings: &Settings) -> Result<(), StorageError> {
-        let value = serde_json::to_string(settings)?;
+        let value = serialized_settings(settings)?;
         self.connection()?.execute(
             "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
@@ -369,7 +401,7 @@ impl Storage {
         &self,
         settings: &Settings,
     ) -> Result<(), StorageError> {
-        let value = serde_json::to_string(settings)?;
+        let value = serialized_settings(settings)?;
         let cutoff = match settings.history_retention {
             HistoryRetention::Never => None,
             HistoryRetention::Forever => {
@@ -1303,12 +1335,12 @@ mod tests {
             .unwrap();
         let migrated: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(migrated["futureSetting"]["keep"], true);
-        assert!(migrated.get("hotkey").is_none());
+        assert_eq!(migrated["hotkey"], "Ctrl+Alt+V");
         assert_eq!(migrated["shortcuts"]["dictate"][0], "Ctrl+Alt+V");
     }
 
     #[test]
-    fn colliding_legacy_shortcuts_do_not_persist_migration() {
+    fn colliding_legacy_shortcuts_migrate_and_remain_editable() {
         let storage = Storage::in_memory().unwrap();
         let mut value = serde_json::to_value(Settings::default()).unwrap();
         let object = value.as_object_mut().unwrap();
@@ -1323,7 +1355,15 @@ mod tests {
                 [raw.as_str()],
             )
             .unwrap();
-        assert!(storage.get_settings().is_err());
+        let settings = storage.get_settings().unwrap();
+        assert_eq!(settings.shortcuts.dictate, ["Ctrl+Shift+T"]);
+        assert_eq!(
+            crate::shortcuts::Routes::parse_saved(&settings)
+                .unwrap()
+                .0
+                .len(),
+            4
+        );
         let saved: String = storage
             .connection()
             .unwrap()
@@ -1333,7 +1373,106 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(saved, raw);
+        let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(saved["hotkey"], "Ctrl+Shift+T");
+        assert_eq!(saved["shortcuts"]["dictate"][0], "Ctrl+Shift+T");
+    }
+
+    #[test]
+    fn saved_settings_keep_legacy_hotkey_synced_to_primary_dictation_chord() {
+        let storage = Storage::in_memory().unwrap();
+        let mut settings = Settings::default();
+        settings.shortcuts.dictate = vec!["Ctrl+Alt+V".into(), "Ctrl+Shift+Space".into()];
+        storage.update_settings(&settings).unwrap();
+        let raw: String = storage
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key='app_settings'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["hotkey"], "Ctrl+Alt+V");
+        assert_eq!(
+            storage.get_settings().unwrap().shortcuts,
+            settings.shortcuts
+        );
+    }
+
+    #[test]
+    fn empty_persisted_dictation_shortcuts_recover_before_primary_lookup() {
+        let storage = Storage::in_memory().unwrap();
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value["shortcuts"]["dictate"] = serde_json::json!([]);
+        value["futureSetting"] = serde_json::json!({"keep": true});
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, 'now')",
+                [value.to_string()],
+            )
+            .unwrap();
+        let recovered = storage.get_settings().unwrap();
+        assert_eq!(recovered.shortcuts.dictate, ["Ctrl+Shift+Space"]);
+        let raw: String = storage
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key='app_settings'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(saved["hotkey"], "Ctrl+Shift+Space");
+        assert_eq!(saved["shortcuts"]["dictate"][0], "Ctrl+Shift+Space");
+        assert_eq!(saved["futureSetting"]["keep"], true);
+    }
+
+    #[test]
+    fn empty_shortcut_recovery_preserves_unknown_nested_chords() {
+        let storage = Storage::in_memory().unwrap();
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value["shortcuts"]["dictate"] = serde_json::json!([]);
+        value["shortcuts"]["ask"] = serde_json::json!([]);
+        value["shortcuts"]["futureMode"] = serde_json::json!(["Ctrl+Alt+F"]);
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, 'now')",
+                [value.to_string()],
+            )
+            .unwrap();
+
+        let recovered = storage.get_settings().unwrap();
+        assert_eq!(recovered.shortcuts.dictate, ["Ctrl+Shift+Space"]);
+        assert_eq!(recovered.shortcuts.ask, ["Ctrl+Shift+A"]);
+        let raw: String = storage
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM settings WHERE key='app_settings'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            saved["shortcuts"]["futureMode"],
+            serde_json::json!(["Ctrl+Alt+F"])
+        );
+        assert_eq!(
+            saved["shortcuts"]["dictate"],
+            serde_json::json!(["Ctrl+Shift+Space"])
+        );
+        assert_eq!(
+            saved["shortcuts"]["ask"],
+            serde_json::json!(["Ctrl+Shift+A"])
+        );
     }
 
     #[test]

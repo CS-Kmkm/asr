@@ -119,6 +119,11 @@ export async function getSettings(): Promise<Settings> {
   return invoke("get_settings");
 }
 
+export async function getShortcutWarning(): Promise<boolean> {
+  if (!inTauri) return false;
+  return invoke("get_shortcut_warning");
+}
+
 export async function updateSettings(settings: Settings): Promise<Settings> {
   if (!inTauri) return settings;
   return invoke("update_settings", { settings });

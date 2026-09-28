@@ -133,6 +133,7 @@ pub(crate) struct Services {
     translation_active: AtomicBool,
     voice_translation_target: Mutex<Option<String>>,
     shortcut_routes: Mutex<shortcuts::Routes>,
+    shortcut_startup_warning: AtomicBool,
     settings_update: tokio::sync::Mutex<()>,
     microphone_test: tokio::sync::Mutex<MicrophoneTestState>,
 }
@@ -166,8 +167,9 @@ impl Services {
             translation_active: AtomicBool::new(false),
             voice_translation_target: Mutex::new(None),
             shortcut_routes: Mutex::new(
-                shortcuts::Routes::parse(settings).expect("validated settings"),
+                shortcuts::Routes::parse_saved(settings).expect("validated settings"),
             ),
+            shortcut_startup_warning: AtomicBool::new(false),
             settings_update: tokio::sync::Mutex::new(()),
             microphone_test: tokio::sync::Mutex::new(MicrophoneTestState::default()),
         }
@@ -224,7 +226,7 @@ impl EditSession {
             .capture_selection()
             .map_err(|_| "Select text in a supported foreground edit control.".to_string())?;
         let monitor = Arc::new(InputMonitor::default());
-        if !monitor.start_for_recording(active_hotkey, from_shortcut) {
+        if !monitor.start_for_recording(active_hotkey, &settings.shortcuts.edit, from_shortcut) {
             return Err("Speak to edit could not monitor the original selection safely.".into());
         }
         let checkpoint = monitor
@@ -279,7 +281,11 @@ impl AskSession {
         let monitor = match &capture {
             AskCapture::Selected(_) | AskCapture::Caret(_) => {
                 let monitor = Arc::new(InputMonitor::default());
-                if monitor.start_for_recording(active_hotkey, from_shortcut) {
+                if monitor.start_for_recording(
+                    active_hotkey,
+                    &settings.shortcuts.ask,
+                    from_shortcut,
+                ) {
                     Some(monitor)
                 } else {
                     None
@@ -954,15 +960,22 @@ pub fn run() {
                     );
                 }
             }
-            let routes = shortcuts::Routes::parse(&settings)
+            let routes = shortcuts::Routes::parse_saved(&settings)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
             app.manage(storage);
             app.manage(AppState::default());
             app.manage(Services::new(&settings));
             recording_overlay::create(app.handle())?;
             answer_panel::create(app.handle())?;
-            for route in &routes.0 {
-                app.global_shortcut().register(route.chord)?;
+            if shortcuts::Routes::parse(&settings).is_err() {
+                app.state::<Services>().shortcut_startup_warning.store(true, Ordering::Release);
+            }
+            let (active_routes, failures) = shortcuts::register_available(&routes, |chord| app.global_shortcut().register(chord));
+            *app.state::<Services>().shortcut_routes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = active_routes;
+            for (route, error) in failures {
+                    app.state::<Services>().shortcut_startup_warning.store(true, Ordering::Release);
+                    emit_status(app.handle(), "shortcut_registration_failed", "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.");
+                    eprintln!("Shortcut registration failed for {}: {error}", route.text);
             }
             if cleanup_stale_artifacts(
                 &std::env::temp_dir(),
@@ -1016,6 +1029,7 @@ pub fn run() {
             commands::cycle_voice_translation_target,
             commands::get_app_state,
             commands::get_settings,
+            commands::get_shortcut_warning,
             commands::get_model_status,
             commands::load_model,
             commands::get_gpu_diagnostics,

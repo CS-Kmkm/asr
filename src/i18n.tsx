@@ -145,6 +145,14 @@ const en = {
   "Remove shortcut": "Remove shortcut", "Add shortcut": "Add shortcut", "Save voice shortcuts": "Save voice shortcuts",
   "Each voice mode needs one to four non-empty shortcuts.": "Each voice mode needs one to four non-empty shortcuts.",
   "Shortcuts must be non-empty and unique across all actions.": "Shortcuts must be non-empty and unique across all actions.",
+  "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.": "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.",
+  "shortcut cannot be empty": "Shortcut cannot be empty.",
+  "shortcuts must be unique across all actions": "Shortcuts must be unique across all actions.",
+  "each voice mode requires one to four shortcuts": "Each voice mode requires one to four shortcuts.",
+  "hotkey is invalid": "Shortcut is invalid.",
+  "shortcut registration failed:": "Shortcut registration failed:",
+  "shortcut removal failed:": "Shortcut removal failed:",
+  "shortcut restoration failed, restart required:": "Shortcut restoration failed; restart required:",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
@@ -290,6 +298,14 @@ const ja: Record<MessageKey, string> = {
   "Remove shortcut": "ショートカットを削除", "Add shortcut": "ショートカットを追加", "Save voice shortcuts": "音声ショートカットを保存",
   "Each voice mode needs one to four non-empty shortcuts.": "各音声モードに1～4個の空でないショートカットが必要です。",
   "Shortcuts must be non-empty and unique across all actions.": "ショートカットは空欄にできず、すべての操作で重複できません。",
+  "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.": "起動時に一部のショートカットを有効にできませんでした。設定で変更し、再起動して確認してください。",
+  "shortcut cannot be empty": "ショートカットは空欄にできません。",
+  "shortcuts must be unique across all actions": "すべての操作でショートカットを重複させないでください。",
+  "each voice mode requires one to four shortcuts": "各音声モードには1～4個のショートカットが必要です。",
+  "hotkey is invalid": "ショートカットが無効です。",
+  "shortcut registration failed:": "ショートカットの登録に失敗しました:",
+  "shortcut removal failed:": "ショートカットの解除に失敗しました:",
+  "shortcut restoration failed, restart required:": "ショートカットを元に戻せませんでした。再起動が必要です:",
 } satisfies Record<MessageKey, string>;
 
 const catalogs = { en, ja } satisfies Record<UiLanguage, Record<MessageKey, string>>;
@@ -340,6 +356,11 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "The original selection changed; the edit remains on the clipboard.",
       "The edit paste could not be confirmed; the result remains on the clipboard.",
       "Speak to edit could not monitor the original selection safely.",
+      "shortcut cannot be empty",
+      "shortcuts must be unique across all actions",
+      "each voice mode requires one to four shortcuts",
+      "hotkey is invalid",
+      "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.",
   ] satisfies MessageKey[],
 );
 
@@ -351,6 +372,12 @@ export function translateAppMessage(language: UiLanguage, message: string | null
   if (message === null) return null;
   const key = message as MessageKey;
   if (appMessageKeys.has(key)) return translate(language, key);
+
+  for (const prefix of ["shortcut registration failed:", "shortcut removal failed:"] as const) {
+    if (message.startsWith(prefix)) {
+      return `${translate(language, prefix)}${message.slice(prefix.length).replace("shortcut restoration failed, restart required:", translate(language, "shortcut restoration failed, restart required:"))}`;
+    }
+  }
 
   const draftInsertionFailure = "Draft insertion failed; the transcript is available in this app.";
   if (message.startsWith(`${draftInsertionFailure} `)) {

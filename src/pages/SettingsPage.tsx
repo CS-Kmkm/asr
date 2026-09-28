@@ -4,7 +4,7 @@ import { SettingRow, Toggle } from "../components/ui";
 import { AiCorrectionSettings } from "../components/AiCorrectionSettings";
 import type { AudioDevice, AudioLevel, Settings, ShortcutMode } from "../types";
 import { speechLocaleRegistry, uiLocaleRegistry } from "../types";
-import { startMicrophoneTest, stopMicrophoneTest } from "../api";
+import { getShortcutWarning, startMicrophoneTest, stopMicrophoneTest } from "../api";
 import { useI18n } from "../i18n";
 
 const translationLanguages = [
@@ -39,6 +39,7 @@ export function SettingsPage({
   const [testStopping, setTestStopping] = useState(false);
   const [testError, setTestError] = useState<string | null>(null);
   const [shortcutError, setShortcutError] = useState<string | null>(null);
+  const [startupShortcutWarning, setStartupShortcutWarning] = useState(false);
   const [level, setLevel] = useState<AudioLevel>({ rms: 0, peak: 0 });
   const testRunningRef = useRef(false);
   const mountedRef = useRef(false);
@@ -55,6 +56,9 @@ export function SettingsPage({
   }, [settings.shortcuts]);
   useEffect(() => setTranslationHotkey(settings.translationHotkey), [settings.translationHotkey]);
   useEffect(() => setTranslationInstruction(settings.translationInstruction), [settings.translationInstruction]);
+  useEffect(() => {
+    void getShortcutWarning().then(setStartupShortcutWarning).catch(() => {});
+  }, [settings.shortcuts, settings.translationHotkey]);
   useEffect(() => {
     if (!settings.translationTargetLanguages.includes(languageToAdd)) return;
     const firstAvailable = translationLanguages.find(([code]) => !settings.translationTargetLanguages.includes(code));
@@ -252,6 +256,7 @@ export function SettingsPage({
         ))}
         <button type="button" className="primary shortcut-save" onClick={commitShortcuts}>{t("Save voice shortcuts")}</button>
         {shortcutError && <p className="settings-error" role="alert">{shortcutError}</p>}
+        {startupShortcutWarning && <p className="settings-error" role="alert">{t("Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.")}</p>}
         <SettingRow title={t("Selected-text translation hotkey")} detail={t("Translates selected text; the default is Ctrl+Shift+T.")}
           control={<input value={translationHotkey} aria-label={t("Selected-text translation hotkey")} onChange={(event) => setTranslationHotkey(event.target.value)} onBlur={() => {
             if (suppressTranslationHotkeyBlurRef.current) { suppressTranslationHotkeyBlurRef.current = false; return; }

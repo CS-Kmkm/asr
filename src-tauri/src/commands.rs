@@ -346,6 +346,12 @@ async fn start_recording_mode(
         PipelineMode::Edit => &settings.shortcuts.edit[0],
         PipelineMode::Ask => &settings.shortcuts.ask[0],
     });
+    let mode_shortcuts = match mode {
+        PipelineMode::Dictate => &settings.shortcuts.dictate,
+        PipelineMode::Translate => &settings.shortcuts.translate,
+        PipelineMode::Edit => &settings.shortcuts.edit,
+        PipelineMode::Ask => &settings.shortcuts.ask,
+    };
     let mut edit_session = (mode == PipelineMode::Edit)
         .then(|| EditSession::new(&settings, active_hotkey, from_shortcut))
         .transpose()?;
@@ -371,6 +377,7 @@ async fn start_recording_mode(
             target.clone(),
             &settings,
             active_hotkey,
+            mode_shortcuts,
             from_shortcut,
             mode == PipelineMode::Translate || mode == PipelineMode::Ask,
         )
@@ -1848,6 +1855,11 @@ pub(crate) fn get_settings(storage: State<'_, Storage>) -> Result<Settings, Stri
 }
 
 #[tauri::command]
+pub(crate) fn get_shortcut_warning(services: State<'_, Services>) -> bool {
+    services.shortcut_startup_warning.load(Ordering::Acquire)
+}
+
+#[tauri::command]
 pub(crate) async fn update_settings(
     app: AppHandle,
     settings: Settings,
@@ -1991,9 +2003,13 @@ pub(crate) async fn update_settings(
             );
         }
     }
-    let new_routes = shortcuts::Routes::parse(&settings)?;
     let previous = storage.get_settings().map_err(command_error)?;
-    let old_routes = shortcuts::Routes::parse(&previous)?;
+    let old_routes = services
+        .shortcut_routes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let desired_routes = shortcuts::desired_routes_for_update(&previous, &settings, &old_routes)?;
     if settings.translation_instruction.chars().count() > 500
         || settings.translation_instruction.chars().any(|character| {
             character.is_control() && character != '\n' && character != '\r' && character != '\t'
@@ -2007,24 +2023,21 @@ pub(crate) async fn update_settings(
                 .into(),
         );
     }
-    {
-        let mut routes = services
-            .shortcut_routes
-            .lock()
-            .map_err(|_| "shortcut routing service is unavailable".to_string())?;
-        shortcuts::update_registrations(
-            &old_routes,
-            &new_routes,
-            |chord| app.global_shortcut().register(chord),
-            |chord| app.global_shortcut().unregister(chord),
-            || {
-                storage
-                    .update_settings_and_apply_history_policy(&settings)
-                    .map_err(command_error)
-            },
-        )?;
-        *routes = new_routes;
-    }
+    shortcuts::update_registrations(
+        &old_routes,
+        &desired_routes,
+        |chord| app.global_shortcut().register(chord),
+        |chord| app.global_shortcut().unregister(chord),
+        || {
+            storage
+                .update_settings_and_apply_history_policy(&settings)
+                .map_err(command_error)
+        },
+    )?;
+    *services
+        .shortcut_routes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = desired_routes;
     if settings.auto_start != previous.auto_start {
         let result = if settings.auto_start {
             app.autolaunch().enable()

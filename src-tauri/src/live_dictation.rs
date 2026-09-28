@@ -41,12 +41,13 @@ impl LiveDraft {
         target: TargetWindow,
         settings: &Settings,
         active_hotkey: &str,
+        mode_shortcuts: &[String],
         from_shortcut: bool,
         defer_insertion: bool,
     ) -> Self {
         let monitor = Arc::new(InputMonitor::default());
         let checkpoint = monitor
-            .start_for_recording(active_hotkey, from_shortcut)
+            .start_for_recording(active_hotkey, mode_shortcuts, from_shortcut)
             .then(|| monitor.checkpoint())
             .flatten();
         Self {
