@@ -15,9 +15,9 @@ pub(crate) fn category_for_stem(stem: Option<&str>) -> String {
     let stem = stem.unwrap_or_default();
     let category = if ["chrome", "msedge", "firefox", "brave", "opera"].contains(&stem) {
         "browser"
-    } else if ["outlook", "thunderbird", "mail"].contains(&stem) {
+    } else if ["outlook", "olk", "thunderbird", "mail"].contains(&stem) {
         "email"
-    } else if ["slack", "teams", "discord", "telegram"].contains(&stem) {
+    } else if ["slack", "teams", "ms-teams", "discord", "telegram"].contains(&stem) {
         "messaging"
     } else if ["code", "devenv", "idea64", "rider", "sublime_text"].contains(&stem) {
         "development"
@@ -82,6 +82,8 @@ mod tests {
     #[test]
     fn maps_known_categories_and_fallback() {
         assert_eq!(category_for_stem(Some("msedge")), "browser");
+        assert_eq!(category_for_stem(Some("ms-teams")), "messaging");
+        assert_eq!(category_for_stem(Some("olk")), "email");
         assert_eq!(category_for_stem(Some("unknown")), "other");
         assert_eq!(category_for_stem(None), "other");
     }

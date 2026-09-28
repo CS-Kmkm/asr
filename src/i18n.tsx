@@ -2,6 +2,9 @@ import { createContext, useContext, useMemo, type ReactNode } from "react";
 import type { UiLanguage } from "./types";
 
 const en = {
+  "Not configured": "Not configured",
+  "Configure global profile": "Configure global profile",
+  "Profile scopes must be valid and unique before changes are saved.": "Profile scopes must be valid and unique before changes are saved.",
   "Live transcription failed. The full recording will be transcribed after stopping.": "Live transcription failed. The full recording will be transcribed after stopping.",
   "Live text insertion paused. The final result will remain available in this app.": "Live text insertion paused. The final result will remain available in this app.",
   "API model ID (for example gpt-4o-mini-transcribe)": "API model ID (for example gpt-4o-mini-transcribe)", "Model name or Hugging Face repository ID": "Model name or Hugging Face repository ID",
@@ -80,6 +83,9 @@ const en = {
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
+  "Not configured": "未設定",
+  "Configure global profile": "共通プロフィールを設定",
+  "Profile scopes must be valid and unique before changes are saved.": "スコープが有効かつ重複しない状態になるまで変更は保存されません。",
   "Personalization profiles": "パーソナライズプロファイル", "Structured style settings are retained locally; no transcript examples are stored.": "構造化されたスタイル設定はローカルに保存され、文字起こし例は保存されません。", "Global profile": "グローバルプロファイル", "Fallback style used when no app or category profile matches.": "アプリまたはカテゴリに一致する設定がない場合のフォールバックです。", "Optional guidance": "任意のガイダンス", Clear: "クリア", "Scoped profiles": "スコープ別プロファイル", "app:code or category:development": "app:code または category:development", Remove: "削除", "Add scoped profile": "スコープ別プロファイルを追加", Formal: "フォーマル", Casual: "カジュアル", Concise: "簡潔", Detailed: "詳細",
   Scope: "スコープ", "scope:": "スコープ:", "App category": "アプリカテゴリ", Personalization: "パーソナライズ", "Optional global, app:key, or category:name scope.": "global、app:key、category:name のいずれかのスコープ（任意）です。", "Use manually configured abstract style profiles for the captured app category.": "取得したアプリカテゴリ向けの抽象的なスタイルプロファイルを手動設定します。",
   "API model ID (for example gpt-4o-mini-transcribe)": "APIモデルID（例: gpt-4o-mini-transcribe）", "Model name or Hugging Face repository ID": "モデル名またはHugging FaceリポジトリID",
