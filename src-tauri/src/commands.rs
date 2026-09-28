@@ -762,6 +762,9 @@ pub(crate) async fn update_settings(
     }
     correction::local_chat_completions_url(&settings.local_correction_base_url)
         .map_err(|error| error.to_string())?;
+    if !(128..=32768).contains(&settings.local_correction_max_tokens) {
+        return Err("local correction max tokens must be between 128 and 32768".into());
+    }
     for (label, environment_variable) in [
         (
             "OpenAI API key environment variable",
