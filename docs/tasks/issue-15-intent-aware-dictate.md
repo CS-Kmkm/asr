@@ -51,3 +51,26 @@ Status (2026-09-23):
   present, and local-provider integration remains part of later branch integration.
 - Manual provider quality remains an opt-in Japanese/English check documented in
   `README.md`; it was not run because it requires credentials and may incur cost.
+
+Review remediation (2026-09-27):
+- Protected numbers are extracted as individual numeric/ASCII identifier spans,
+  including common kanji numerals, instead of whitespace-delimited Japanese sentences.
+  Sentence punctuation after URLs is excluded from URL identity.
+- Intent-aware output may omit an earlier numeric/URL/code value only when a nearby
+  explicit repair cue is followed by another source value of the same kind and the
+  self-correction switch is enabled. Both modes reject newly introduced numeric,
+  URL, and backtick-code values; intent-aware mode still requires all other values.
+- Input/output fixtures exercise Japanese numeric repairs, reordered context,
+  duplicate merging, URL punctuation, polite uncertainty, and invented values.
+- Signed numbers retain their leading `+` or `-`. A later repair may cross up to
+  two short sentence boundaries only when its cue begins a new sentence and a
+  same-kind replacement occurs in the cue's first clause; unrelated later
+  values do not license dropping the original value.
+- This validator checks observable syntax, not semantic truth. It cannot reliably
+  identify unspoken names, unquoted code, changed relationships using existing
+  numbers, implicit corrections, or all paraphrases of uncertainty. Some legitimate
+  edits may still fall back to the raw transcript; provider quality/rejection rates
+  require opt-in real-provider evaluation.
+- The #7 local provider is absent from this branch. On an explicit integration
+  branch, verify local request separation and intent-aware validation/fallback
+  with a stub local endpoint after resolving the overlapping provider files.

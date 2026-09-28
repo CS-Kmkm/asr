@@ -38,81 +38,549 @@ pub async fn correct_transcript(
 ) -> Result<String, CorrectionError> {
     let instruction = build_correction_instruction(settings, dictionary_hints, style_guidance);
     let corrected = request_text(settings, transcript, &instruction, cancel, on_update).await?;
-    validate_correction_output(settings, transcript, &corrected)?;
+    let prompted_hints = instruction
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("Terms: "))
+        .map(|terms| {
+            terms
+                .split("; ")
+                .filter(|term| dictionary_hints.iter().any(|hint| hint.trim() == *term))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    validate_correction_output_with_hints(settings, transcript, &corrected, &prompted_hints)?;
     Ok(corrected)
 }
 
+#[cfg(test)]
 fn validate_correction_output(
     settings: &Settings,
     transcript: &str,
     corrected: &str,
 ) -> Result<(), CorrectionError> {
-    if settings.correction_mode == "intent_aware"
-        && !preserves_protected_spans(transcript, corrected)
-    {
+    validate_correction_output_with_hints(settings, transcript, corrected, &[])
+}
+
+fn validate_correction_output_with_hints(
+    settings: &Settings,
+    transcript: &str,
+    corrected: &str,
+    dictionary_hints: &[String],
+) -> Result<(), CorrectionError> {
+    let safe = if settings.correction_mode == "intent_aware" {
+        preserves_protected_spans_with_hints(
+            transcript,
+            corrected,
+            settings.correction_resolve_self_corrections,
+            dictionary_hints,
+        )
+    } else {
+        contains_only_source_facts(transcript, corrected, dictionary_hints)
+    };
+    if !safe {
         return Err(CorrectionError::InvalidResponse(
-            "intent-aware correction omitted protected transcript content".into(),
+            "correction changed protected transcript content".into(),
         ));
     }
     Ok(())
 }
 
-fn preserves_protected_spans(transcript: &str, corrected: &str) -> bool {
-    protected_spans(transcript)
-        .iter()
-        .all(|span| contains_protected_span(corrected, span))
+#[cfg(test)]
+fn preserves_protected_spans(transcript: &str, corrected: &str, allow_corrections: bool) -> bool {
+    preserves_protected_spans_with_hints(transcript, corrected, allow_corrections, &[])
 }
 
-fn contains_protected_span(text: &str, span: &str) -> bool {
-    text.match_indices(span).any(|(start, _)| {
-        let end = start + span.len();
-        let before = text[..start].chars().next_back();
-        let after = text[end..].chars().next();
-        if span
-            .get(..8)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
-            || span
-                .get(..7)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
-        {
-            return !before.is_some_and(is_url_character) && !after.is_some_and(is_url_character);
+fn preserves_protected_spans_with_hints(
+    transcript: &str,
+    corrected: &str,
+    allow_corrections: bool,
+    dictionary_hints: &[String],
+) -> bool {
+    if !contains_only_source_facts(transcript, corrected, dictionary_hints) {
+        return false;
+    }
+    for (source, kind) in [
+        (extract_urls(transcript), ProtectedKind::Url),
+        (extract_numbers(transcript), ProtectedKind::Number),
+        (extract_code_spans(transcript), ProtectedKind::Code),
+    ] {
+        if source.iter().any(|value| {
+            let source_count = protected_occurrence_count(transcript, value, kind);
+            let output_count = protected_occurrence_count(corrected, value, kind);
+            let superseded = if allow_corrections {
+                superseded_occurrence_count(transcript, value, &source, kind)
+            } else {
+                0
+            };
+            output_count < source_count.saturating_sub(superseded)
+        }) {
+            return false;
         }
-        let starts_word = span.chars().next().is_some_and(is_english_word_character);
-        let ends_word = span
-            .chars()
-            .next_back()
-            .is_some_and(is_english_word_character);
-        (!starts_word || !before.is_some_and(is_english_word_character))
-            && (!ends_word || !after.is_some_and(is_english_word_character))
+    }
+    if !number_occurrences_preserved(transcript, corrected, allow_corrections) {
+        return false;
+    }
+    uncertainty_preserved(transcript, corrected)
+}
+
+fn number_occurrences_preserved(source: &str, output: &str, allow_corrections: bool) -> bool {
+    let source_occurrences = number_occurrences(source);
+    let output_occurrences = number_occurrences(output);
+    let values = extract_numbers(source);
+    source_occurrences.iter().all(|(range, value)| {
+        let unit = number_unit(source, range);
+        let source_count = source_occurrences
+            .iter()
+            .filter(|(candidate_range, candidate)| {
+                candidate == value && number_unit(source, candidate_range) == unit
+            })
+            .count();
+        let output_count = output_occurrences
+            .iter()
+            .filter(|(candidate_range, candidate)| {
+                candidate == value && number_unit(output, candidate_range) == unit
+            })
+            .count();
+        let superseded = if allow_corrections {
+            superseded_number_occurrence_count(source, value, unit, &values)
+        } else {
+            0
+        };
+        // When identical facts occur more than once and only some are repaired,
+        // a count cannot tell whether the output retained the unrelated fact.
+        // Fall back to the transcript instead of guessing which copy survived.
+        let ambiguous_partial_repair =
+            source_count > 1 && superseded > 0 && superseded < source_count;
+        !ambiguous_partial_repair && output_count >= source_count.saturating_sub(superseded)
     })
 }
 
-fn protected_spans(transcript: &str) -> Vec<String> {
-    let mut spans = Vec::new();
-    for url in extract_urls(transcript) {
-        push_unique_span(&mut spans, url);
+fn number_unit(text: &str, range: &std::ops::Range<usize>) -> Option<char> {
+    text[range.end..]
+        .chars()
+        .next()
+        .filter(|character| character.is_alphabetic())
+}
+
+fn superseded_number_occurrence_count(
+    transcript: &str,
+    old: &str,
+    unit: Option<char>,
+    values: &[String],
+) -> usize {
+    let positions = number_occurrences(transcript)
+        .into_iter()
+        .filter_map(|(range, value)| (value == old).then_some(range))
+        .collect::<Vec<_>>();
+    positions
+        .iter()
+        .enumerate()
+        .filter(|(index, range)| {
+            if number_unit(transcript, range) != unit {
+                return false;
+            }
+            let end = positions
+                .get(index + 1)
+                .map_or(transcript.len(), |next| next.start);
+            let source_clause = transcript[..range.start]
+                .rsplit(['。', '、', ',', '.', '!', '?', '！', '？'])
+                .next()
+                .unwrap_or_default()
+                .trim();
+            explicitly_superseded_at(
+                &transcript[range.end..end],
+                source_clause,
+                values,
+                old,
+                ProtectedKind::Number,
+            )
+        })
+        .count()
+}
+
+fn contains_only_source_facts(
+    transcript: &str,
+    corrected: &str,
+    dictionary_hints: &[String],
+) -> bool {
+    let mut without_dictionary_surfaces = corrected.to_owned();
+    for hint in dictionary_hints {
+        let Some((surface, readings)) = hint.split_once("<=") else {
+            continue;
+        };
+        if surface.is_empty() {
+            continue;
+        }
+        let source_lower = transcript.to_lowercase();
+        let allowed = readings
+            .split('|')
+            .filter(|reading| !reading.is_empty())
+            .map(|reading| source_lower.matches(&reading.to_lowercase()).count())
+            .sum::<usize>();
+        if allowed == 0
+            || corrected.matches(surface).count() > allowed + transcript.matches(surface).count()
+        {
+            return false;
+        }
+        without_dictionary_surfaces = without_dictionary_surfaces.replace(surface, "");
     }
-    for token in transcript.split_whitespace().map(trim_token_punctuation) {
-        if token.chars().any(|character| character.is_numeric()) {
-            push_unique_span(&mut spans, token);
+    [
+        (
+            protected_occurrence_values(transcript, ProtectedKind::Url),
+            protected_occurrence_values(&without_dictionary_surfaces, ProtectedKind::Url),
+        ),
+        (
+            protected_occurrence_values(transcript, ProtectedKind::Number),
+            protected_occurrence_values(&without_dictionary_surfaces, ProtectedKind::Number),
+        ),
+        (
+            protected_occurrence_values(transcript, ProtectedKind::Code),
+            protected_occurrence_values(&without_dictionary_surfaces, ProtectedKind::Code),
+        ),
+    ]
+    .iter()
+    .all(|(source, output)| {
+        output.iter().all(|value| {
+            output
+                .iter()
+                .filter(|candidate| *candidate == value)
+                .count()
+                <= source
+                    .iter()
+                    .filter(|candidate| *candidate == value)
+                    .count()
+        })
+    })
+}
+
+#[derive(Clone, Copy)]
+enum ProtectedKind {
+    Url,
+    Number,
+    Code,
+}
+
+fn superseded_occurrence_count(
+    transcript: &str,
+    old: &str,
+    values: &[String],
+    kind: ProtectedKind,
+) -> usize {
+    let positions = match kind {
+        ProtectedKind::Number => number_occurrences(transcript)
+            .into_iter()
+            .filter_map(|(range, value)| (value == old).then_some(range))
+            .collect::<Vec<_>>(),
+        ProtectedKind::Url | ProtectedKind::Code => transcript
+            .match_indices(old)
+            .map(|(at, _)| at..at + old.len())
+            .collect::<Vec<_>>(),
+    };
+    positions
+        .iter()
+        .enumerate()
+        .filter(|(index, range)| {
+            let end = positions
+                .get(index + 1)
+                .map_or(transcript.len(), |next| next.start);
+            let source_clause = transcript[..range.start]
+                .rsplit(['。', '、', ',', '.', '!', '?', '！', '？'])
+                .next()
+                .unwrap_or_default()
+                .trim();
+            explicitly_superseded_at(
+                &transcript[range.end..end],
+                source_clause,
+                values,
+                old,
+                kind,
+            )
+        })
+        .count()
+}
+
+fn protected_occurrence_count(text: &str, value: &str, kind: ProtectedKind) -> usize {
+    match kind {
+        ProtectedKind::Number => number_occurrences(text)
+            .iter()
+            .filter(|(_, candidate)| candidate == value)
+            .count(),
+        ProtectedKind::Url | ProtectedKind::Code => text.matches(value).count(),
+    }
+}
+
+fn protected_occurrence_values(text: &str, kind: ProtectedKind) -> Vec<String> {
+    match kind {
+        ProtectedKind::Number => number_occurrences(text)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect(),
+        ProtectedKind::Url => extract_urls(text),
+        ProtectedKind::Code => extract_code_spans(text)
+            .into_iter()
+            .flat_map(|value| std::iter::repeat_n(value.clone(), text.matches(&value).count()))
+            .collect(),
+    }
+}
+
+fn explicitly_superseded_at(
+    tail: &str,
+    source_clause: &str,
+    values: &[String],
+    old: &str,
+    kind: ProtectedKind,
+) -> bool {
+    // Only a nearby repair cue with a replacement in its first clause can
+    // license dropping a value. A value in a later topic is not a repair.
+    let Some((cue_at, cue)) = [
+        "いや",
+        "じゃなくて",
+        "訂正",
+        "正しくは",
+        "actually",
+        "I mean",
+        "rather",
+    ]
+    .iter()
+    .filter_map(|cue| tail.find(cue).map(|at| (at, *cue)))
+    .min_by_key(|(at, _)| *at) else {
+        return false;
+    };
+    let before_cue = &tail[..cue_at];
+    let sentence_breaks = before_cue
+        .char_indices()
+        .filter(|(index, character)| is_sentence_break_at(before_cue, *index, *character))
+        .collect::<Vec<_>>();
+    if before_cue.chars().count() > 80 || sentence_breaks.len() > 2 {
+        return false;
+    }
+    if let Some((last_break, character)) = sentence_breaks.last() {
+        let after_break = &before_cue[*last_break + character.len_utf8()..];
+        if !after_break.trim().is_empty() {
+            return false;
         }
     }
+    // A second same-kind value before the cue makes its target ambiguous.
+    if source_values_in(before_cue, values)
+        .iter()
+        .any(|value| value != old)
+    {
+        return false;
+    }
+    let after = &tail[cue_at + cue.len()..];
+    let repair = after
+        .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '、' | ',' | ':' | '：'));
+    let limit = repair
+        .char_indices()
+        .nth(80)
+        .map_or(repair.len(), |(at, _)| at);
+    let clause = &repair[..limit];
+    let end = clause
+        .char_indices()
+        .find(|(index, character)| {
+            is_sentence_break_at(clause, *index, *character) || matches!(character, '、' | ',')
+        })
+        .map_or(clause.len(), |(index, _)| index);
+    let clause = &clause[..end];
+    let replacement = match kind {
+        ProtectedKind::Number => number_occurrences(clause).into_iter().next(),
+        ProtectedKind::Url => extract_urls(clause).into_iter().next().and_then(|value| {
+            clause
+                .find(&value)
+                .map(|start| (start..start + value.len(), value))
+        }),
+        ProtectedKind::Code => extract_code_spans(clause)
+            .into_iter()
+            .next()
+            .and_then(|value| {
+                clause
+                    .find(&value)
+                    .map(|start| (start..start + value.len(), value))
+            }),
+    };
+    let Some((range, replacement)) = replacement else {
+        return false;
+    };
+    if replacement == old || !values.contains(&replacement) {
+        return false;
+    }
+    let prefix = clause[..range.start].trim();
+    if !prefix.is_empty() && !source_clause.ends_with(prefix) {
+        return false;
+    }
+    if matches!(kind, ProtectedKind::Number) {
+        let source_unit = tail.chars().next().filter(|c| c.is_alphabetic());
+        let replacement_unit = clause[range.end..]
+            .chars()
+            .next()
+            .filter(|c| c.is_alphabetic());
+        if source_unit.is_some() && replacement_unit.is_some() && source_unit != replacement_unit {
+            return false;
+        }
+    }
+    true
+}
 
+fn is_sentence_break_at(text: &str, index: usize, character: char) -> bool {
+    if character == '.' {
+        let before = text[..index].chars().next_back();
+        let after = text[index + 1..].chars().next();
+        return !(before.is_some_and(|value| value.is_ascii_alphanumeric())
+            && after.is_some_and(|value| value.is_ascii_alphanumeric()));
+    }
+    matches!(character, '。' | '!' | '?' | '！' | '？')
+}
+
+fn source_values_in(text: &str, values: &[String]) -> Vec<String> {
+    extract_urls(text)
+        .into_iter()
+        .chain(extract_numbers(text))
+        .chain(extract_code_spans(text))
+        .filter(|value| values.contains(value))
+        .collect()
+}
+
+fn extract_code_spans(text: &str) -> Vec<String> {
+    let mut spans = Vec::new();
     let mut cursor = 0;
-    while let Some(relative_start) = transcript[cursor..].find('`') {
+    while let Some(relative_start) = text[cursor..].find('`') {
         let start = cursor + relative_start;
-        let delimiter_length = transcript[start..]
+        let delimiter_length = text[start..]
             .bytes()
             .take_while(|byte| *byte == b'`')
             .count();
         let delimiter = "`".repeat(delimiter_length);
         let content_start = start + delimiter_length;
-        let Some(relative_end) = transcript[content_start..].find(&delimiter) else {
+        let Some(relative_end) = text[content_start..].find(&delimiter) else {
             break;
         };
         let end = content_start + relative_end + delimiter_length;
-        push_unique_span(&mut spans, &transcript[start..end]);
+        push_unique_span(&mut spans, &text[start..end]);
         cursor = end;
+    }
+    spans
+}
+
+fn extract_numbers(text: &str) -> Vec<String> {
+    let mut numbers = Vec::new();
+    for (_, value) in number_occurrences(text) {
+        push_unique_span(&mut numbers, &value);
+    }
+    numbers
+}
+
+fn number_occurrences(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    let urls = extract_urls(text);
+    let url_ranges = urls
+        .iter()
+        .flat_map(|url| {
+            text.match_indices(url)
+                .map(|(start, _)| start..start + url.len())
+        })
+        .collect::<Vec<_>>();
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (index, character) in text
+        .char_indices()
+        .chain(std::iter::once((text.len(), ' ')))
+    {
+        let numeric = is_number_character(character);
+        let separator = matches!(character, ':' | '.' | ',' | '/' | '-')
+            && start.is_some()
+            && text[index + character.len_utf8()..]
+                .chars()
+                .next()
+                .is_some_and(is_number_character);
+        if numeric || separator {
+            if start.is_none() {
+                let mut prefix = text[..index]
+                    .rfind(|c: char| !is_english_word_character(c))
+                    .map_or(0, |at| at + text[at..].chars().next().unwrap().len_utf8());
+                if let Some((sign_at, sign)) = text[..index].char_indices().next_back() {
+                    if matches!(sign, '-' | '+') && sign_at < prefix {
+                        prefix = sign_at;
+                    }
+                }
+                let before = text[..index].trim_end_matches([' ', '\t']);
+                if index - before.len() <= 2 {
+                    if let Some((sign_at, sign)) = before.char_indices().next_back() {
+                        if matches!(sign, '-' | '+') && sign_at < prefix {
+                            prefix = sign_at;
+                        }
+                    }
+                }
+                start = Some(prefix);
+            }
+        } else if start.is_some() && is_english_word_character(character) {
+            continue;
+        } else if let Some(begin) = start.take() {
+            let number = &text[begin..index];
+            if !url_ranges.iter().any(|range| range.contains(&begin)) {
+                let normalized = if matches!(number.chars().next(), Some('+' | '-')) {
+                    let mut chars = number.chars();
+                    let sign = chars.next().unwrap();
+                    format!("{sign}{}", chars.as_str().trim_start_matches([' ', '\t']))
+                } else {
+                    number.to_owned()
+                };
+                spans.push((begin..index, normalized));
+            }
+        }
+    }
+    spans
+}
+
+fn is_number_character(character: char) -> bool {
+    character.is_numeric() || "〇零一二三四五六七八九十百千万億兆壱弐参".contains(character)
+}
+
+fn uncertainty_preserved(source: &str, output: &str) -> bool {
+    let english = [
+        "maybe",
+        "perhaps",
+        "possibly",
+        "uncertain",
+        "not sure",
+        "i think",
+        "i guess",
+    ];
+    for marker in english {
+        if find_english_uncertainty_marker(source, marker).is_some()
+            && find_english_uncertainty_marker(output, marker).is_none()
+        {
+            return false;
+        }
+    }
+    for variants in [
+        &["たぶん", "多分"][..],
+        &["おそらく", "恐らく"][..],
+        &["かもしれない", "かもしれません", "かも"][..],
+        &["不明"][..],
+        &["わからない", "分からない", "わかりません", "分かりません"][..],
+        &["と思う", "と思います"][..],
+    ] {
+        if variants.iter().any(|marker| source.contains(marker))
+            && !variants.iter().any(|marker| output.contains(marker))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+fn protected_spans(transcript: &str) -> Vec<String> {
+    let mut spans = Vec::new();
+    for url in extract_urls(transcript) {
+        push_unique_span(&mut spans, &url);
+    }
+    for number in extract_numbers(transcript) {
+        push_unique_span(&mut spans, &number);
+    }
+    for code in extract_code_spans(transcript) {
+        push_unique_span(&mut spans, &code);
     }
 
     for marker in [
@@ -147,7 +615,7 @@ fn protected_spans(transcript: &str) -> Vec<String> {
     spans
 }
 
-fn extract_urls(text: &str) -> Vec<&str> {
+fn extract_urls(text: &str) -> Vec<String> {
     let mut urls = Vec::new();
     let mut cursor = 0;
     while cursor < text.len() {
@@ -179,7 +647,7 @@ fn extract_urls(text: &str) -> Vec<&str> {
             .map_or(text.len(), |(index, _)| cursor + index);
         let url = trim_url_sentence_delimiter(&text[cursor..end]);
         if url.len() > scheme_length {
-            urls.push(url);
+            urls.push(url.to_string());
         }
         cursor = end.max(cursor + scheme_length);
     }
@@ -234,31 +702,6 @@ fn english_word_boundary_after(text: &str, index: usize) -> bool {
 
 fn is_english_word_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || character == '_'
-}
-
-fn trim_token_punctuation(token: &str) -> &str {
-    token.trim_matches(|character: char| {
-        matches!(
-            character,
-            '.' | ','
-                | ';'
-                | ':'
-                | '!'
-                | '?'
-                | ')'
-                | ']'
-                | '}'
-                | '"'
-                | '\''
-                | '。'
-                | '、'
-                | '！'
-                | '？'
-                | '('
-                | '['
-                | '{'
-        )
-    })
 }
 
 fn push_unique_span(spans: &mut Vec<String>, span: &str) {
@@ -1109,7 +1552,7 @@ mod tests {
                 "missing {expected}"
             );
         }
-        assert!(preserves_protected_spans(transcript, transcript));
+        assert!(preserves_protected_spans(transcript, transcript, true));
     }
 
     #[test]
@@ -1125,17 +1568,146 @@ mod tests {
             .any(|span| span.eq_ignore_ascii_case("Maybelline")));
 
         let unicode_prefix = "İ maybe";
-        assert!(preserves_protected_spans(unicode_prefix, unicode_prefix));
+        assert!(preserves_protected_spans(
+            unicode_prefix,
+            unicode_prefix,
+            true
+        ));
     }
 
     #[test]
     fn protected_spans_require_boundaries_and_preserve_uppercase_urls() {
         let transcript = "See HTTP://Example.test/path and version 42 maybe";
-        assert!(preserves_protected_spans(transcript, transcript));
+        assert!(preserves_protected_spans(transcript, transcript, true));
         assert!(!preserves_protected_spans(
             transcript,
-            "See HTTP://Example.test/path.evil and version 142 maybes"
+            "See HTTP://Example.test/path.evil and version 142 maybes",
+            true,
         ));
+    }
+
+    #[test]
+    fn intent_aware_real_input_output_fixtures() {
+        let accepted = [
+            ("えーと、参加者は3人、いや4人です。", "参加者は4人です。"),
+            (
+                "参加者は3人です。後で確認しました。いや、4人です。",
+                "参加者は4人です。",
+            ),
+            ("値は3.5です。いや、4.5です。", "値は4.5です。"),
+            (
+                "参照はhttps://example.test/a、いやhttps://example.test/bです。",
+                "参照はhttps://example.test/bです。",
+            ),
+            (
+                "会議は火曜日です。場所は本社です。いや、会議は水曜日です。",
+                "会議は水曜日、本社で行います。",
+            ),
+            ("項目はAとBです。項目はAとBです。", "項目はAとBです。"),
+            ("えーと、3人が来ます。", "3人が来ます。"),
+            (
+                "詳細はhttps://example.test/pathです",
+                "詳細はhttps://example.test/path、です",
+            ),
+            ("たぶん成功すると思う。", "たぶん成功すると思います。"),
+            ("かもしれない。", "かもしれません。"),
+            ("Maybe we can go.", "We can maybe go."),
+            ("三時に会います。", "三時に会います。"),
+        ];
+        for (input, output) in accepted {
+            assert!(
+                preserves_protected_spans(input, output, true),
+                "rejected {input} => {output}"
+            );
+        }
+        let rejected = [
+            (
+                "参加者は3人、いや、その件は後で。予算は4円。",
+                "予算は4円。",
+            ),
+            ("参加者は3人、いや4人。予算は3円。", "参加者は4人。"),
+            ("参加者は3人。予算は3円。", "参加者は3人。"),
+            (
+                "参加者は3人、いや4人。予算は3円。",
+                "参加者は4人。予算は3人。",
+            ),
+            (
+                "参加者は3人、いや4人。補欠は3人。",
+                "参加者は4人。補欠は3人。",
+            ),
+            ("参加者は3人、いや予算は4円。", "予算は4円。"),
+            ("参加者は3人です。", "参加者は4人です。"),
+            ("温度は-3度です。", "温度は3度です。"),
+            ("温度は- 3度です。", "温度は3度です。"),
+            ("誤差は+ 3です。", "誤差は3です。"),
+            ("誤差は+3です。", "誤差は3です。"),
+            ("温度は-3度です。", "温度は+3度です。"),
+            ("3人、いや4人です。", "5人です。"),
+            (
+                "URLはhttps://example.test/aです。",
+                "URLはhttps://example.test/bです。",
+            ),
+            (
+                "URLはhttps://example.test/aです。",
+                "URLはhttps://example.test/a.evilです。",
+            ),
+            ("たぶん成功します。", "成功します。"),
+            ("`cargo test`を実行", "`cargo build`を実行"),
+            ("三時に会います。", "四時に会います。"),
+            ("version v2", "version x2"),
+        ];
+        for (input, output) in rejected {
+            assert!(
+                !preserves_protected_spans(input, output, true),
+                "accepted {input} => {output}"
+            );
+        }
+        assert!(!preserves_protected_spans("3人、いや4人", "4人", false));
+        assert!(preserves_protected_spans(
+            "温度は-3度です。",
+            "温度は-3度です。",
+            true
+        ));
+        assert_eq!(extract_numbers("温度は-3度、誤差は+3です。"), ["-3", "+3"]);
+        assert_eq!(
+            extract_numbers("温度は- 3度、誤差は+ 3です。"),
+            ["-3", "+3"]
+        );
+    }
+
+    #[test]
+    fn trusted_dictionary_mapping_allows_only_its_prompted_surface() {
+        let settings = Settings {
+            correction_mode: "intent_aware".into(),
+            ..Settings::default()
+        };
+        let hint = "GPT-4<=GPT four".to_owned();
+        let instruction = build_correction_instruction(&settings, &[hint.clone()], None);
+        assert!(instruction
+            .lines()
+            .any(|line| line == "Terms: GPT-4<=GPT four"));
+        assert!(validate_correction_output(&settings, "GPT fourを使う", "GPT-4を使う").is_err());
+        assert!(validate_correction_output_with_hints(
+            &settings,
+            "GPT fourを使う",
+            "GPT-4を使う",
+            &[hint.clone()],
+        )
+        .is_ok());
+        assert!(validate_correction_output_with_hints(
+            &settings,
+            "GPT fourを使う",
+            "GPT-4と別の-4を使う",
+            &[hint],
+        )
+        .is_err());
+        assert!(validate_correction_output_with_hints(
+            &settings,
+            "GPT fourを使う",
+            "GPT-4とGPT-4を使う",
+            &["GPT-4<=GPT four".to_owned()],
+        )
+        .is_err());
     }
 
     #[test]
@@ -1158,6 +1730,14 @@ mod tests {
     fn conservative_mode_does_not_apply_intent_aware_postcondition() {
         let settings = Settings::default();
         assert!(validate_correction_output(&settings, "Maybe version 42", "Edited text").is_ok());
+        assert!(validate_correction_output(&settings, "version 42", "version 43").is_err());
+        assert!(validate_correction_output(&settings, "version 2", "version 2 2").is_err());
+        assert!(validate_correction_output(
+            &settings,
+            "see example.test",
+            "see https://example.test"
+        )
+        .is_err());
     }
 
     #[test]
