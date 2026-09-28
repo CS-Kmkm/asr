@@ -28,6 +28,8 @@ pub enum CorrectionError {
     InvalidEndpoint(String),
     #[error("unsupported text correction provider: {0}")]
     UnsupportedProvider(String),
+    #[error("the spoken edit instruction is empty")]
+    EmptyEditInstruction,
 }
 
 pub async fn correct_transcript(
@@ -68,6 +70,9 @@ pub async fn edit_selected_text(
     cancel: watch::Receiver<bool>,
     on_update: impl FnMut(&str),
 ) -> Result<String, CorrectionError> {
+    if spoken_instruction.trim().is_empty() {
+        return Err(CorrectionError::EmptyEditInstruction);
+    }
     let instruction = build_edit_instruction();
     let input = edit_request_input(selected_text, spoken_instruction);
     request_text(settings, &input, instruction, cancel, on_update).await
@@ -252,7 +257,7 @@ fn openai_request(settings: &Settings, transcript: &str, instruction: &str) -> V
         "model": model,
         "instructions": instruction,
         "input": transcript,
-        "max_output_tokens": max_output_tokens(transcript),
+        "max_output_tokens": request_output_tokens(transcript, instruction),
         "store": false,
         "stream": true
     });
@@ -271,7 +276,7 @@ fn gemini_request(settings: &Settings, transcript: &str, instruction: &str) -> V
         "system_instruction": instruction,
         "input": transcript,
         "generation_config": {
-            "max_output_tokens": max_output_tokens(transcript)
+            "max_output_tokens": request_output_tokens(transcript, instruction)
         },
         "store": false,
         "stream": true
@@ -289,7 +294,7 @@ fn local_request(settings: &Settings, transcript: &str, instruction: &str) -> Va
             {"role": "system", "content": instruction},
             {"role": "user", "content": transcript}
         ],
-        "max_tokens": max_output_tokens(transcript),
+        "max_tokens": request_output_tokens(transcript, instruction),
         "stream": true
     })
 }
@@ -544,6 +549,21 @@ fn max_output_tokens(transcript: &str) -> usize {
         .saturating_mul(2)
         .saturating_add(64)
         .clamp(128, 32_768)
+}
+
+fn request_output_tokens(input: &str, instruction: &str) -> usize {
+    if instruction == build_edit_instruction() {
+        // Rewrites may expand the selection substantially; retain a bounded
+        // budget across all three provider request formats.
+        input
+            .chars()
+            .count()
+            .saturating_mul(4)
+            .saturating_add(1024)
+            .clamp(2048, 32_768)
+    } else {
+        max_output_tokens(input)
+    }
 }
 
 fn supports_openai_none_reasoning(model: &str) -> bool {
@@ -1174,6 +1194,40 @@ mod tests {
         assert_eq!(gemini["input"], input);
         assert_eq!(local["messages"][0]["content"], instruction);
         assert_eq!(local["messages"][1]["content"], input);
+    }
+
+    #[tokio::test]
+    async fn blank_edit_instruction_is_rejected_before_provider_request() {
+        let settings = Settings {
+            correction_provider: "unavailable-provider".into(),
+            ..Settings::default()
+        };
+        let (_, cancel) = watch::channel(false);
+        let result = edit_selected_text(&settings, "selected", " \t\n", cancel, |_| {}).await;
+        assert!(matches!(result, Err(CorrectionError::EmptyEditInstruction)));
+    }
+
+    #[test]
+    fn edit_budget_supports_expansion_and_is_bounded_for_all_providers() {
+        let settings = Settings::default();
+        let instruction = build_edit_instruction();
+        let short = edit_request_input("short", "expand substantially");
+        let large = edit_request_input(&"a".repeat(20_000), "rewrite in detail");
+        for (input, expected) in [(&short, 2048), (&large, 32_768)] {
+            assert_eq!(
+                openai_request(&settings, input, instruction)["max_output_tokens"],
+                expected
+            );
+            assert_eq!(
+                gemini_request(&settings, input, instruction)["generation_config"]
+                    ["max_output_tokens"],
+                expected
+            );
+            assert_eq!(
+                local_request(&settings, input, instruction)["max_tokens"],
+                expected
+            );
+        }
     }
 
     #[test]

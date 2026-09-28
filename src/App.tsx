@@ -128,6 +128,9 @@ const WARNING_STATUS_KINDS = new Set([
   "autostart_update_failed",
   "clipboard_only",
   "gpu_unavailable",
+  "history_save_failed",
+  "history_metric_save_failed",
+  "metric_save_failed",
   "paste_unverified",
   "streaming_insertion_unavailable",
   "text_correction_failed",
@@ -455,7 +458,11 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     try {
       if (state.phase === "recording") {
         await stopRecording();
-        setHistory(await listHistory());
+        try {
+          setHistory(await listHistory());
+        } catch {
+          showNotice(t("Recording completed, but history could not be refreshed."), "warning");
+        }
       } else {
         await startRecording();
       }

@@ -26,6 +26,27 @@ fn cancellation_copy(mode: PipelineMode) -> (&'static str, &'static str) {
     }
 }
 
+fn persist_edit_completion(
+    storage: &Storage,
+    item: &NewHistoryItem<'_>,
+    provider: &str,
+    elapsed_ms: i64,
+) -> (bool, bool) {
+    // The target may already have accepted a paste. Persistence is best effort
+    // so a database failure cannot turn that completed edit into command failure.
+    let history_failed = storage.add_history(item).is_err();
+    let metric_failed = storage
+        .add_metric(
+            "speak_to_edit",
+            Some(provider),
+            Some(elapsed_ms),
+            true,
+            None,
+        )
+        .is_err();
+    (history_failed, metric_failed)
+}
+
 async fn take_published_sessions<T, U>(
     live: &tokio::sync::Mutex<Option<T>>,
     edit: &tokio::sync::Mutex<Option<U>>,
@@ -449,6 +470,15 @@ pub(crate) async fn stop_recording(
         let session = edit_session.take().ok_or("edit session is unavailable")?;
         let instruction_text = transcript.text.clone();
         let source_text = session.selection.text().to_owned();
+        if instruction_text.trim().is_empty() {
+            emit_state(
+                &app,
+                &state,
+                AppPhase::Error,
+                "No edit instruction was captured; the original selection was not changed.",
+            );
+            return Err("no edit instruction was captured".into());
+        }
         emit_correction_preview(&app, &instruction_text, "draft");
         emit_state(
             &app,
@@ -521,8 +551,9 @@ pub(crate) async fn stop_recording(
         };
         recording_overlay::set_phase(&app, &AppPhase::Completed);
         let latency_ms = started.elapsed().as_millis() as u64;
-        storage
-            .add_history(&NewHistoryItem {
+        let (history_failed, metric_failed) = persist_edit_completion(
+            &storage,
+            &NewHistoryItem {
                 transcript_text: &instruction_text,
                 processed_text: Some(&edited),
                 source_text: Some(&source_text),
@@ -534,22 +565,15 @@ pub(crate) async fn stop_recording(
                 app_category: None,
                 duration_ms: Some(duration_ms as i64),
                 latency_ms: Some(latency_ms as i64),
-            })
-            .map_err(command_error)?;
-        storage
-            .add_metric(
-                "speak_to_edit",
-                Some(settings.correction_provider.as_str()),
-                Some(edit_started.elapsed().as_millis() as i64),
-                true,
-                None,
-            )
-            .map_err(command_error)?;
+            },
+            settings.correction_provider.as_str(),
+            edit_started.elapsed().as_millis() as i64,
+        );
         let (insertion_label, completion) = match insertion {
             InsertResult::ClipboardPaste => ("clipboard_paste", "Selected text updated."),
             InsertResult::ClipboardOnly => (
                 "clipboard_only",
-                "The original selection changed; the edit remains on the clipboard.",
+                "Automatic replacement was skipped; the edit remains on the clipboard.",
             ),
             InsertResult::PasteUnverified => (
                 "paste_unverified",
@@ -559,6 +583,25 @@ pub(crate) async fn stop_recording(
         let snapshot = state.complete(edited.clone(), completion.into());
         let _ = app.emit("app-state", snapshot);
         emit_status(&app, insertion_label, completion);
+        if history_failed && metric_failed {
+            emit_status(
+                &app,
+                "history_metric_save_failed",
+                "The edit was completed, but history and usage metrics could not be saved.",
+            );
+        } else if history_failed {
+            emit_status(
+                &app,
+                "history_save_failed",
+                "The edit was completed, but history could not be saved.",
+            );
+        } else if metric_failed {
+            emit_status(
+                &app,
+                "metric_save_failed",
+                "The edit was completed, but usage metrics could not be saved.",
+            );
+        }
         return Ok(RecordingResult {
             text: edited,
             insertion: insertion_label.into(),
@@ -960,6 +1003,7 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
         correction::CorrectionError::Cancelled => "cancelled",
         correction::CorrectionError::InvalidEndpoint(_) => "invalid_endpoint",
         correction::CorrectionError::UnsupportedProvider(_) => "unsupported_provider",
+        correction::CorrectionError::EmptyEditInstruction => "empty_edit_instruction",
     };
     format!("AI correction failed; using the original transcript. Error kind: {kind}.")
 }
@@ -968,6 +1012,34 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
 mod tests {
     use super::*;
     use crate::audio::{AudioArtifact, AudioError, AudioFuture, CaptureState, LevelMeter};
+
+    #[test]
+    fn edit_persistence_failure_does_not_skip_metrics_or_propagate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit.sqlite");
+        let storage = Storage::open(&path).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute("DROP TABLE dictation_history", [])
+            .unwrap();
+        let item = NewHistoryItem {
+            transcript_text: "shorten this",
+            processed_text: Some("short"),
+            source_text: Some("long selection"),
+            instruction_text: Some("shorten this"),
+            mode: "edit",
+            asr_provider: "test",
+            llm_provider: Some("local"),
+            target_language: None,
+            app_category: None,
+            duration_ms: Some(100),
+            latency_ms: Some(200),
+        };
+        assert_eq!(
+            persist_edit_completion(&storage, &item, "local", 200),
+            (true, false)
+        );
+    }
 
     #[test]
     fn translation_targets_require_supported_unique_current_language() {
