@@ -137,9 +137,11 @@ optional **Intent-aware** mode may organize the current transcript across its
 utterance order, apply a later explicit correction consistently, merge duplicate
 information, and select paragraph or list structure. It never invents details,
 learns automatically, or uses context beyond the current transcript and selected
-profile. URLs, digit-bearing tokens, backtick code, and explicit uncertainty
-markers are checked after intent-aware correction; a failed check uses the
-original transcript.
+profile. Only intent-aware results are checked after correction: a result that
+drops or adds URLs, digit-bearing tokens, backtick code, or listed explicit
+uncertainty markers is discarded and the original transcript is used.
+Conservative results are inserted without this additional check, exactly as
+before the mode switch existed.
 
 For OpenAI correction, reasoning effort can be set to `none`, `low`, `medium`,
 `high`, `xhigh`, or `max`. Higher values can improve difficult corrections at

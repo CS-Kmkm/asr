@@ -56,7 +56,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
       />
       <SettingRow
         title={t("Correction mode")}
-        detail={t("Conservative keeps utterance order. Intent-aware may reorganize phrasing within this transcript, but never invents details, learns automatically, or uses context beyond the current transcript and profile.")}
+        detail={t("Conservative keeps utterance order. Intent-aware may reorganize phrasing within this transcript, but never invents details, learns automatically, or uses context beyond the current transcript and profile. Only intent-aware results are checked for changed numbers, URLs, backtick code, and uncertainty markers; a failed check inserts the original transcript.")}
         control={
           <select
             value={settings.correctionMode}

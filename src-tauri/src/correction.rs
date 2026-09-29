@@ -38,6 +38,23 @@ pub async fn correct_transcript(
 ) -> Result<String, CorrectionError> {
     let instruction = build_correction_instruction(settings, dictionary_hints, style_guidance);
     let corrected = request_text(settings, transcript, &instruction, cancel, on_update).await?;
+    accept_provider_correction(settings, transcript, &instruction, dictionary_hints, corrected)
+}
+
+/// Decides whether a completed provider result may replace the transcript.
+///
+/// Conservative mode returns the provider text unchanged, exactly as before
+/// intent-aware mode existed. Only intent-aware output is fact-checked.
+fn accept_provider_correction(
+    settings: &Settings,
+    transcript: &str,
+    instruction: &str,
+    dictionary_hints: &[String],
+    corrected: String,
+) -> Result<String, CorrectionError> {
+    if settings.correction_mode != "intent_aware" {
+        return Ok(corrected);
+    }
     let prompted_hints = instruction
         .lines()
         .rev()
@@ -69,16 +86,15 @@ fn validate_correction_output_with_hints(
     corrected: &str,
     dictionary_hints: &[String],
 ) -> Result<(), CorrectionError> {
-    let safe = if settings.correction_mode == "intent_aware" {
-        preserves_protected_spans_with_hints(
-            transcript,
-            corrected,
-            settings.correction_resolve_self_corrections,
-            dictionary_hints,
-        )
-    } else {
-        contains_only_source_facts(transcript, corrected, dictionary_hints)
-    };
+    if settings.correction_mode != "intent_aware" {
+        return Ok(());
+    }
+    let safe = preserves_protected_spans_with_hints(
+        transcript,
+        corrected,
+        settings.correction_resolve_self_corrections,
+        dictionary_hints,
+    );
     if !safe {
         return Err(CorrectionError::InvalidResponse(
             "correction changed protected transcript content".into(),
@@ -1717,26 +1733,59 @@ mod tests {
         };
         let transcript = "Maybe deploy version 42 from https://example.test with `cargo test`.";
         let provider_output = "Deploy the current version.";
+        let instruction = build_correction_instruction(&settings, &[], None);
 
         assert!(validate_correction_output(&settings, transcript, provider_output).is_err());
-        let inserted = validate_correction_output(&settings, transcript, provider_output)
-            .map(|_| provider_output)
-            .unwrap_or(transcript);
-        assert_eq!(inserted, transcript);
+        // The dictation pipeline inserts the original transcript on any error.
+        assert!(accept_provider_correction(
+            &settings,
+            transcript,
+            &instruction,
+            &[],
+            provider_output.into(),
+        )
+        .is_err());
     }
 
     #[test]
-    fn conservative_mode_does_not_apply_intent_aware_postcondition() {
-        let settings = Settings::default();
-        assert!(validate_correction_output(&settings, "Maybe version 42", "Edited text").is_ok());
-        assert!(validate_correction_output(&settings, "version 42", "version 43").is_err());
-        assert!(validate_correction_output(&settings, "version 2", "version 2 2").is_err());
-        assert!(validate_correction_output(
-            &settings,
-            "see example.test",
-            "see https://example.test"
-        )
-        .is_err());
+    fn conservative_mode_accepts_provider_output_without_fact_validation() {
+        let conservative = Settings::default();
+        assert_eq!(conservative.correction_mode, "conservative");
+        let instruction = build_correction_instruction(&conservative, &[], None);
+        for (transcript, provider_output) in [
+            (
+                "買うものは牛乳と卵とパンです",
+                "買うもの:\n1. 牛乳\n2. 卵\n3. パン",
+            ),
+            ("予算は3000円です", "予算は3,000円です"),
+            ("参加者は３人です", "参加者は3人です"),
+            ("三千円です", "3,000円です"),
+            ("mp3 を GPT 4 で変換", "MP3 を GPT-4 で変換"),
+            ("いっしょに行きます", "一緒に行きます"),
+            ("Maybe version 42", "Edited text"),
+        ] {
+            assert!(
+                validate_correction_output(&conservative, transcript, provider_output).is_ok(),
+                "rejected {transcript} => {provider_output}"
+            );
+            assert_eq!(
+                accept_provider_correction(
+                    &conservative,
+                    transcript,
+                    &instruction,
+                    &[],
+                    provider_output.into(),
+                )
+                .unwrap(),
+                provider_output
+            );
+        }
+
+        let intent_aware = Settings {
+            correction_mode: "intent_aware".into(),
+            ..Settings::default()
+        };
+        assert!(validate_correction_output(&intent_aware, "version 42", "version 43").is_err());
     }
 
     #[test]
