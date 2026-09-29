@@ -265,6 +265,7 @@ pub(crate) async fn stop_recording(
     let mut processed_text = None;
     let mut llm_provider = None;
     let mut correction_failed = false;
+    let mut correction_output_limited = false;
     let _ = app.emit("app-state", state.publish_result(transcript.text.clone()));
     // Full-recording recognition reconciles the last live hypothesis before AI correction.
     draft.monitor.wait_for_shortcut_release().await;
@@ -328,6 +329,8 @@ pub(crate) async fn stop_recording(
             }
             Err(error) => {
                 correction_failed = true;
+                correction_output_limited =
+                    matches!(error, correction::CorrectionError::OutputLimit);
                 emit_correction_preview(&app, &transcript.text, "fallback");
                 let _ = storage.add_metric(
                     "text_correction",
@@ -420,6 +423,8 @@ pub(crate) async fn stop_recording(
         "The provisional text could not be safely replaced; the final result remains on the clipboard."
     } else if insertion == InsertResult::ClipboardOnly {
         "Automatic insertion failed; the result remains on the clipboard."
+    } else if correction_output_limited {
+        "AI correction stopped at the local output token limit; the original transcript was inserted. Increase the local output token limit."
     } else if correction_failed {
         "AI correction failed; the original transcript was inserted."
     } else {
@@ -509,6 +514,9 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
             );
         }
         correction::CorrectionError::InvalidResponse(_) => "invalid_response",
+        correction::CorrectionError::OutputLimit => {
+            return "AI correction stopped at the local output token limit; using the original transcript. Increase the local output token limit.".into();
+        }
         correction::CorrectionError::Cancelled => "cancelled",
         correction::CorrectionError::InvalidEndpoint(_) => "invalid_endpoint",
         correction::CorrectionError::UnsupportedProvider(_) => "unsupported_provider",
@@ -659,6 +667,20 @@ mod tests {
             "AI correction failed; using the original transcript. HTTP status 400."
         );
         assert!(!message.contains(marker));
+    }
+
+    #[test]
+    fn correction_failure_status_distinguishes_the_output_limit() {
+        assert_eq!(
+            correction_failure_status(&correction::CorrectionError::OutputLimit),
+            "AI correction stopped at the local output token limit; using the original transcript. Increase the local output token limit."
+        );
+        assert_eq!(
+            correction_failure_status(&correction::CorrectionError::InvalidResponse(
+                "missing output text".into()
+            )),
+            "AI correction failed; using the original transcript. Error kind: invalid_response."
+        );
     }
 }
 

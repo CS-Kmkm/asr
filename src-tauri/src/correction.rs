@@ -22,6 +22,8 @@ pub enum CorrectionError {
     Api { status: StatusCode, message: String },
     #[error("text correction API returned an invalid response: {0}")]
     InvalidResponse(String),
+    #[error("the local model reached its output token limit")]
+    OutputLimit,
     #[error("text correction was cancelled")]
     Cancelled,
     #[error("invalid local correction endpoint: {0}")]
@@ -364,6 +366,7 @@ fn apply_local_stream_event(
             push_visible_delta(&think.finish()?, text, on_update);
             Ok(true)
         }
+        Some(Value::String(reason)) if reason == "length" => Err(CorrectionError::OutputLimit),
         Some(Value::String(reason)) => Err(CorrectionError::InvalidResponse(format!(
             "local completion stopped with finish reason {reason}"
         ))),
@@ -682,6 +685,9 @@ fn parse_gemini_response(value: &Value) -> Result<String, CorrectionError> {
 fn parse_local_response(value: &Value) -> Result<String, CorrectionError> {
     match value.pointer("/choices/0/finish_reason") {
         Some(Value::String(reason)) if reason == "stop" => {}
+        Some(Value::String(reason)) if reason == "length" => {
+            return Err(CorrectionError::OutputLimit)
+        }
         Some(Value::String(reason)) => {
             return Err(CorrectionError::InvalidResponse(format!(
                 "local completion stopped with finish reason {reason}"
@@ -880,6 +886,28 @@ mod tests {
         handler.join().unwrap();
         assert_eq!(result.unwrap(), "fixed text");
         assert_eq!(preview, ["fixed", " text"]);
+    }
+
+    #[tokio::test]
+    async fn local_transport_reports_output_limit_after_unfinished_thinking() {
+        let (port, handler) = serve_local_events_once(&[
+            r#"{"choices":[{"delta":{"content":"<think>long reasoning"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+        ]);
+        let settings = Settings {
+            correction_provider: "local".into(),
+            local_correction_base_url: format!("http://127.0.0.1:{port}/v1"),
+            ..Settings::default()
+        };
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let mut preview = Vec::new();
+        let result = correct_transcript(&settings, "private transcript", &[], cancel, |delta| {
+            preview.push(delta.to_owned());
+        })
+        .await;
+        handler.join().unwrap();
+        assert!(matches!(result, Err(CorrectionError::OutputLimit)));
+        assert!(preview.is_empty());
     }
 
     // Opt-in semantic evaluation through the production streaming path. Uses
@@ -1086,30 +1114,31 @@ mod tests {
         fn ignore_preview(_: &str) {}
 
         for reason in ["length", "content_filter", "tool_calls"] {
+            let expected_kind = |result: &Result<_, CorrectionError>| match reason {
+                "length" => matches!(result, Err(CorrectionError::OutputLimit)),
+                _ => matches!(result, Err(CorrectionError::InvalidResponse(_))),
+            };
             let value = json!({
                 "choices": [{
                     "message": {"role": "assistant", "content": "partial"},
                     "finish_reason": reason
                 }]
             });
-            assert!(matches!(
-                parse_local_response(&value),
-                Err(CorrectionError::InvalidResponse(_))
-            ));
+            assert!(expected_kind(&parse_local_response(&value).map(|_| ())));
 
             let mut text = String::new();
             let mut preview = ignore_preview;
             let event = json!({
                 "choices": [{"delta": {"content": "partial"}, "finish_reason": reason}]
             });
-            assert!(matches!(
-                apply_local_stream_event(
+            assert!(expected_kind(
+                &apply_local_stream_event(
                     &event.to_string(),
                     &mut LeadingThinkFilter::default(),
                     &mut text,
                     &mut preview,
-                ),
-                Err(CorrectionError::InvalidResponse(_))
+                )
+                .map(|_| ())
             ));
         }
     }
