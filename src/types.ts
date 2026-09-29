@@ -148,6 +148,7 @@ export interface DictionaryCandidate {
   id: number;
   originalSpan: string;
   preferredSpan: string;
+  /** Fixed marker of the rule-based detector, not a measured probability; do not display it as one. */
   confidence: number;
   historyId: number | null;
   createdAt: string;

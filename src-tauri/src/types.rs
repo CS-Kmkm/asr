@@ -312,6 +312,8 @@ pub struct DictionaryCandidate {
     pub id: i64,
     pub original_span: String,
     pub preferred_span: String,
+    /// Fixed marker of the narrow rule-based detector, not a measured
+    /// probability; it must not be presented as one.
     pub confidence: f64,
     pub history_id: Option<i64>,
     pub created_at: String,
