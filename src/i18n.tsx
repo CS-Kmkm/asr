@@ -80,6 +80,7 @@ const en = {
   "Import CSV": "Import CSV", "CSV format help": "UTF-8 CSV: reading,surface,category,aliases (use |),priority,app_scope", "Save entry": "Save entry", "Search dictionary": "Search dictionary", All: "All", "Auto-added": "Auto-added", "Manually-added": "Manually-added", "Suggested spellings": "Suggested spellings", Confirm: "Confirm", Reject: "Reject", "Edit": "Edit", "Dictionary entry updated.": "Dictionary entry updated.", "Imported dictionary entries.": "Imported dictionary entries.", "Dictionary candidate confirmed.": "Dictionary candidate confirmed.",
   "One alias per line": "One alias per line",
   "CSV encoding error": "Could not read the CSV encoding. Use UTF-8 or CP932.",
+  "No matching dictionary entries": "No matching dictionary entries", "Change the search text or source filter.": "Change the search text or source filter.",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
@@ -161,6 +162,7 @@ const ja: Record<MessageKey, string> = {
   "Import CSV": "CSVをインポート", "CSV format help": "UTF-8 CSV: reading,surface,category,aliases（|区切り）,priority,app_scope", "Save entry": "項目を保存", "Search dictionary": "辞書を検索", All: "すべて", "Auto-added": "自動追加", "Manually-added": "手動追加", "Suggested spellings": "候補の表記", Confirm: "確認", Reject: "却下", "Edit": "編集", "Dictionary entry updated.": "辞書項目を更新しました。", "Imported dictionary entries.": "辞書項目をインポートしました。", "Dictionary candidate confirmed.": "辞書候補を確定しました。",
   "One alias per line": "別名は1行に1つ入力してください",
   "CSV encoding error": "CSVの文字コードを読み取れません。UTF-8またはCP932を使用してください。",
+  "No matching dictionary entries": "一致する辞書項目はありません", "Change the search text or source filter.": "検索語または追加元フィルターを変更してください。",
 } satisfies Record<MessageKey, string>;
 
 const appMessageKeys: ReadonlySet<MessageKey> = new Set(
