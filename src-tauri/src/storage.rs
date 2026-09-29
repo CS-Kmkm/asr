@@ -936,29 +936,6 @@ pub(crate) fn detect_dictionary_candidate(
     if original == corrected {
         return None;
     }
-    let has_code_or_url = |value: &str| {
-        let lower = value.to_ascii_lowercase();
-        let dotted_identifier = value.as_bytes().windows(3).any(|window| {
-            window[1] == b'.'
-                && window[0].is_ascii_alphanumeric()
-                && window[2].is_ascii_alphanumeric()
-        });
-        lower.contains("http://")
-            || lower.contains("https://")
-            || lower.contains("www.")
-            || dotted_identifier
-            || value.contains(['/', '\\'])
-            || value.contains([
-                '`', '{', '}', ';', '(', ')', '[', ']', '=', '<', '>', '#', '@', '$', '&', '|',
-                '"', '\'', '+', '*', '%', '!', '^',
-            ])
-            || value.contains("::")
-            || value.contains("->")
-            || value.contains("=>")
-    };
-    if has_code_or_url(original) || has_code_or_url(corrected) {
-        return None;
-    }
     let original_chars = original.chars().collect::<Vec<_>>();
     let corrected_chars = corrected.chars().collect::<Vec<_>>();
     let mut prefix = 0;
@@ -1044,10 +1021,69 @@ pub(crate) fn detect_dictionary_candidate(
             &preferred_span,
             &corrected_chars[..preferred_start],
         )
+        // Code and URL exclusion applies to the token around each span, so
+        // an unrelated contraction or symbol elsewhere does not disable
+        // detection, while `github.com` or `foo()` still does.
+        || has_code_or_url(&span_token(&original_chars, original_start, original_end))
+        || has_code_or_url(&span_token(&corrected_chars, preferred_start, corrected_end))
     {
         return None;
     }
     Some((original_span, preferred_span))
+}
+
+/// The whitespace-delimited ASCII token containing a span, without
+/// surrounding sentence punctuation and intra-word apostrophes (`GitHub's`).
+fn span_token(chars: &[char], start: usize, end: usize) -> String {
+    let in_token = |character: char| character.is_ascii() && !character.is_ascii_whitespace();
+    let mut start = start;
+    let mut end = end;
+    while start > 0 && in_token(chars[start - 1]) {
+        start -= 1;
+    }
+    while end < chars.len() && in_token(chars[end]) {
+        end += 1;
+    }
+    let token = chars[start..end]
+        .iter()
+        .collect::<String>()
+        .trim()
+        .trim_start_matches(['(', '[', '"', '\''])
+        .trim_end_matches(['.', ',', '!', '?', ':', ')', ']', '"', '\''])
+        .chars()
+        .collect::<Vec<_>>();
+    token
+        .iter()
+        .enumerate()
+        .filter(|(index, character)| {
+            **character != '\''
+                || *index == 0
+                || !token[index - 1].is_ascii_alphabetic()
+                || !token
+                    .get(index + 1)
+                    .is_some_and(|next| next.is_ascii_alphabetic())
+        })
+        .map(|(_, character)| *character)
+        .collect()
+}
+
+fn has_code_or_url(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let dotted_identifier = value.as_bytes().windows(3).any(|window| {
+        window[1] == b'.' && window[0].is_ascii_alphanumeric() && window[2].is_ascii_alphanumeric()
+    });
+    lower.contains("http://")
+        || lower.contains("https://")
+        || lower.contains("www.")
+        || dotted_identifier
+        || value.contains(['/', '\\'])
+        || value.contains([
+            '`', '{', '}', ';', '(', ')', '[', ']', '=', '<', '>', '#', '@', '$', '&', '|', '"',
+            '\'', '+', '*', '%', '!', '^',
+        ])
+        || value.contains("::")
+        || value.contains("->")
+        || value.contains("=>")
 }
 
 /// True when the spans differ only in the case of their first letter and the
@@ -1829,6 +1865,45 @@ mod tests {
             ("so i think", "so I think"),
             ("i think", "I think"),
             ("これはaです", "これはAです"),
+        ] {
+            assert_eq!(
+                detect_dictionary_candidate(original, corrected),
+                None,
+                "{original}"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_code_and_url_exclusion_applies_to_the_span_only() {
+        for (original, corrected) in [
+            ("I don't use github", "I don't use GitHub"),
+            ("Wow! we use github", "Wow! we use GitHub"),
+            ("50% of github users", "50% of GitHub users"),
+            ("gpt 3.5 and github", "gpt 3.5 and GitHub"),
+            ("(see notes) then github", "(see notes) then GitHub"),
+            (
+                "see https://example.com and github",
+                "see https://example.com and GitHub",
+            ),
+            ("we like github.", "we like GitHub."),
+            ("is it github?", "is it GitHub?"),
+            ("we love github's API", "we love GitHub's API"),
+            ("これはgithub!です", "これはGitHub!です"),
+        ] {
+            assert_eq!(
+                detect_dictionary_candidate(original, corrected),
+                Some(("github".into(), "GitHub".into())),
+                "{original}"
+            );
+        }
+        for (original, corrected) in [
+            ("open github.com now", "open GitHub.com now"),
+            ("open https://github.com now", "open https://GitHub.com now"),
+            ("mail me@github now", "mail me@GitHub now"),
+            ("call github() now", "call GitHub() now"),
+            ("set github; now", "set GitHub; now"),
+            ("詳細はwww.github.ioへ", "詳細はwww.GitHub.ioへ"),
         ] {
             assert_eq!(
                 detect_dictionary_candidate(original, corrected),
