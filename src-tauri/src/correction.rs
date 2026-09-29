@@ -22,6 +22,9 @@ pub enum CorrectionError {
     Api { status: StatusCode, message: String },
     #[error("text correction API returned an invalid response: {0}")]
     InvalidResponse(String),
+    /// The intent-aware fact check rejected an otherwise complete result.
+    #[error("intent-aware correction changed protected transcript content")]
+    ProtectedContentChanged,
     #[error("text correction was cancelled")]
     Cancelled,
     #[error("unsupported text correction provider: {0}")]
@@ -100,9 +103,7 @@ fn validate_correction_output_with_hints(
         merge_duplicates: settings.correction_remove_repetitions,
     };
     if !preserves_protected_spans_with_hints(transcript, corrected, edits, dictionary_hints) {
-        return Err(CorrectionError::InvalidResponse(
-            "correction changed protected transcript content".into(),
-        ));
+        return Err(CorrectionError::ProtectedContentChanged);
     }
     Ok(())
 }
@@ -2092,16 +2093,21 @@ mod tests {
         let provider_output = "Deploy the current version.";
         let instruction = build_correction_instruction(&settings, &[], None);
 
-        assert!(validate_correction_output(&settings, transcript, provider_output).is_err());
+        assert!(matches!(
+            validate_correction_output(&settings, transcript, provider_output),
+            Err(CorrectionError::ProtectedContentChanged)
+        ));
         // The dictation pipeline inserts the original transcript on any error.
-        assert!(accept_provider_correction(
-            &settings,
-            transcript,
-            &instruction,
-            &[],
-            provider_output.into(),
-        )
-        .is_err());
+        assert!(matches!(
+            accept_provider_correction(
+                &settings,
+                transcript,
+                &instruction,
+                &[],
+                provider_output.into(),
+            ),
+            Err(CorrectionError::ProtectedContentChanged)
+        ));
     }
 
     #[test]

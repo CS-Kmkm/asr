@@ -357,7 +357,7 @@ pub(crate) async fn stop_recording(
                     Some(settings.correction_provider.as_str()),
                     Some(correction_started.elapsed().as_millis() as i64),
                     false,
-                    Some("correction_failed"),
+                    Some(correction_failure_metric_code(&error)),
                 );
                 emit_status(
                     &app,
@@ -534,10 +534,19 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
             );
         }
         correction::CorrectionError::InvalidResponse(_) => "invalid_response",
+        correction::CorrectionError::ProtectedContentChanged => "protected_content_changed",
         correction::CorrectionError::Cancelled => "cancelled",
         correction::CorrectionError::UnsupportedProvider(_) => "unsupported_provider",
     };
     format!("AI correction failed; using the original transcript. Error kind: {kind}.")
+}
+
+/// Metric code for a failed correction; validator rejects stay countable.
+fn correction_failure_metric_code(error: &correction::CorrectionError) -> &'static str {
+    match error {
+        correction::CorrectionError::ProtectedContentChanged => "protected_content_changed",
+        _ => "correction_failed",
+    }
 }
 
 #[cfg(test)]
@@ -683,6 +692,26 @@ mod tests {
             "AI correction failed; using the original transcript. HTTP status 400."
         );
         assert!(!message.contains(marker));
+    }
+
+    #[test]
+    fn protected_content_rejection_has_distinct_status_and_metric() {
+        let rejected = correction::CorrectionError::ProtectedContentChanged;
+        assert_eq!(
+            correction_failure_status(&rejected),
+            "AI correction failed; using the original transcript. Error kind: protected_content_changed."
+        );
+        assert_eq!(
+            correction_failure_metric_code(&rejected),
+            "protected_content_changed"
+        );
+
+        let invalid = correction::CorrectionError::InvalidResponse("missing output text".into());
+        assert!(correction_failure_status(&invalid).ends_with("Error kind: invalid_response."));
+        assert_eq!(
+            correction_failure_metric_code(&invalid),
+            "correction_failed"
+        );
     }
 }
 
