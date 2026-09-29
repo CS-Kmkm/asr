@@ -9,6 +9,10 @@ const filters = [
   { value: "ask", label: "Ask" },
 ] as const;
 
+// The browser may read a blob download after click() returns, so revoking the
+// URL synchronously can cancel the download.
+const DOWNLOAD_URL_REVOKE_DELAY_MS = 30_000;
+
 const modeLabels = {
   faithful: "Dictation (faithful)",
   ai_corrected: "Dictation (AI corrected)",
@@ -16,7 +20,7 @@ const modeLabels = {
   translate: "Voice Translate",
 } as const;
 
-export function HistoryPage({ settings, history, filter, onSave, onFilter, onCopyItem, onRetry, onDelete, onDeleteAll, onLoadAudio, retryActive, onCancelRetry }: {
+export function HistoryPage({ settings, history, filter, onSave, onFilter, onCopyItem, onRetry, onDelete, onDeleteAll, onLoadAudio, onAudioError, retryActive, onCancelRetry }: {
   settings: Settings;
   history: HistoryItem[];
   filter: HistoryFilter;
@@ -27,6 +31,7 @@ export function HistoryPage({ settings, history, filter, onSave, onFilter, onCop
   onDelete: (id: number) => void;
   onDeleteAll: () => void;
   onLoadAudio: (id: number) => Promise<HistoryAudioPayload>;
+  onAudioError: () => void;
   retryActive: boolean;
   onCancelRetry: () => void;
 }) {
@@ -43,12 +48,22 @@ export function HistoryPage({ settings, history, filter, onSave, onFilter, onCop
   }, [audioUrl, history, playingId, settings.historyRetention]);
 
   async function audio(item: HistoryItem, download: boolean) {
-    const payload = await onLoadAudio(item.id);
-    const url = URL.createObjectURL(new Blob([new Uint8Array(payload.bytes)], { type: payload.mimeType }));
+    let url: string;
+    let filename: string;
+    try {
+      const payload = await onLoadAudio(item.id);
+      url = URL.createObjectURL(new Blob([new Uint8Array(payload.bytes)], { type: payload.mimeType }));
+      filename = payload.filename;
+    } catch {
+      // A missing or unreadable recording clears its association on the
+      // backend; the caller reports it and refreshes the list.
+      onAudioError();
+      return;
+    }
     if (download) {
       const anchor = document.createElement("a");
-      anchor.href = url; anchor.download = payload.filename; anchor.click();
-      URL.revokeObjectURL(url);
+      anchor.href = url; anchor.download = filename; anchor.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), DOWNLOAD_URL_REVOKE_DELAY_MS);
     } else {
       if (audioUrl) URL.revokeObjectURL(audioUrl);
       setAudioUrl(url);
@@ -71,7 +86,7 @@ export function HistoryPage({ settings, history, filter, onSave, onFilter, onCop
       <button className="danger-button" onClick={() => { if (window.confirm(t("Delete all history?"))) onDeleteAll(); }}>{t("Delete all")}</button>
       {retryActive && <button onClick={onCancelRetry}>{t("Cancel")}</button>}
     </div>
-    {audioUrl && <audio className="history-player" src={audioUrl} controls autoPlay />}
+    {audioUrl && <audio className="history-player" src={audioUrl} controls autoPlay onError={onAudioError} />}
     {settings.historyRetention === "never" ? <Empty title={t("History is disabled")} detail={t("New transcripts will not be written to SQLite.")} />
       : history.length === 0 ? <Empty title={t("No dictations yet")} detail={t("Completed local dictations will appear here.")} />
       : <div className="history-list">{history.map(item => <article className="history-item" key={item.id}>
@@ -79,10 +94,10 @@ export function HistoryPage({ settings, history, filter, onSave, onFilter, onCop
             <span className="history-mode">{item.mode in modeLabels
               ? t(modeLabels[item.mode as keyof typeof modeLabels])
               : item.mode}{item.targetLanguage ? ` · ${item.targetLanguage}` : ""}</span></div>
-          {item.sourceText && <HistoryText text={item.sourceText} label={t("Selected text")} />}
-          {item.instructionText && <HistoryText text={item.instructionText} label={t("Spoken instruction")} />}
-          {!item.sourceText && !item.instructionText && <HistoryText text={item.transcriptText} />}
-          {item.processedText && <HistoryText text={item.processedText} corrected />}
+          {item.sourceText && <HistoryText text={item.sourceText} label={t("Selected text")} onCopy={onCopyItem} />}
+          {item.instructionText && <HistoryText text={item.instructionText} label={t("Spoken instruction")} onCopy={onCopyItem} />}
+          {!item.sourceText && !item.instructionText && <HistoryText text={item.transcriptText} onCopy={onCopyItem} />}
+          {item.processedText && <HistoryText text={item.processedText} onCopy={onCopyItem} corrected />}
           <div className="history-actions">
             <button onClick={() => onCopyItem(item.processedText ?? item.transcriptText)}>{t("Copy")}</button>
             <button disabled={!item.hasAudio} onClick={() => onRetry(item.id)}>{t("Retry")}</button>
@@ -94,8 +109,28 @@ export function HistoryPage({ settings, history, filter, onSave, onFilter, onCop
   </section>;
 }
 
-function HistoryText({ text, corrected = false, label }: { text: string; corrected?: boolean; label?: string }) {
-  return <div className={`history-text${corrected ? " api-corrected" : ""}`}>
+function HistoryText({ text, corrected = false, label, onCopy }: {
+  text: string;
+  corrected?: boolean;
+  label?: string;
+  onCopy: (text: string) => void;
+}) {
+  const { t } = useI18n();
+  const field = <div
+    className={`history-text${corrected ? " api-corrected" : ""}`}
+    role="button"
+    tabIndex={0}
+    title={t("Double-click to copy")}
+    onDoubleClick={() => onCopy(text)}
+    onKeyDown={(event) => { if (event.key === "Enter") onCopy(text); }}
+  >
     {label && <strong>{label}: </strong>}{text}
+  </div>;
+  // Labeled operands (selected text, spoken instruction) are not what the
+  // row-level Copy button copies, so each gets its own explicit Copy.
+  if (!label) return field;
+  return <div className="history-field">
+    {field}
+    <button type="button" aria-label={`${t("Copy")}: ${label}`} onClick={() => onCopy(text)}>{t("Copy")}</button>
   </div>;
 }

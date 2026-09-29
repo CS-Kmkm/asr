@@ -683,6 +683,12 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     catch (error) { showNotice(String(error), "error"); }
   }
 
+  async function reportHistoryAudioFailure() {
+    showNotice(t("The recording could not be loaded. History was refreshed."), "error");
+    try { await refreshHistory(); }
+    catch { /* The notice already reports the unavailable recording. */ }
+  }
+
   async function retryHistory(id: number) {
     try {
       await retryHistoryItem(id);
@@ -797,6 +803,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             onDelete={(id) => void removeHistory(id)}
             onDeleteAll={() => void clearHistory()}
             onLoadAudio={getHistoryAudio}
+            onAudioError={() => void reportHistoryAudioFailure()}
             retryActive={state.phase === "processing" && state.message === "Retrying the saved recording."}
             onCancelRetry={() => void cancelRecording()}
           />

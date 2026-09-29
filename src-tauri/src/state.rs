@@ -26,6 +26,10 @@ struct PipelineOperation {
     mode: PipelineMode,
     phase: PipelinePhase,
     cancel: watch::Sender<bool>,
+    /// Set once a Retry committed its History row. The operation keeps the
+    /// lifecycle claimed until its owner publishes completion and finishes,
+    /// but it can no longer be cancelled.
+    committed: bool,
 }
 
 pub struct PipelineLifecycle {
@@ -63,6 +67,7 @@ impl PipelineLifecycle {
             mode,
             phase: PipelinePhase::Processing,
             cancel,
+            committed: false,
         });
         Ok((id, receiver))
     }
@@ -84,6 +89,7 @@ impl PipelineLifecycle {
             mode,
             phase: PipelinePhase::Starting,
             cancel,
+            committed: false,
         });
         Ok(id)
     }
@@ -130,7 +136,7 @@ impl PipelineLifecycle {
         let Some(operation) = inner.as_ref() else {
             return Ok(None);
         };
-        if *operation.cancel.borrow() {
+        if operation.committed || *operation.cancel.borrow() {
             return Ok(None);
         }
         operation.cancel.send_replace(true);
@@ -176,6 +182,12 @@ impl PipelineLifecycle {
     /// Hold the lifecycle decision across the final durable side effect. This
     /// makes cancellation either win before a retry writes History or observe
     /// an already committed retry; it cannot interleave the check and insert.
+    ///
+    /// A successful commit seals the operation instead of releasing it: a
+    /// later cancel is a no-op, and the lifecycle stays claimed until the
+    /// caller has published the Retry completion and calls `finish`. A new
+    /// recording therefore cannot start and then be overwritten by that
+    /// completion.
     pub fn commit_retry<T, E>(
         &self,
         id: u64,
@@ -186,13 +198,14 @@ impl PipelineLifecycle {
             .lock()
             .map_err(|_| "pipeline lifecycle is unavailable")?;
         let operation = inner
-            .as_ref()
-            .filter(|operation| operation.id == id && !*operation.cancel.borrow())
+            .as_mut()
+            .filter(|operation| {
+                operation.id == id && !operation.committed && !*operation.cancel.borrow()
+            })
             .ok_or("history retry was cancelled")?;
-        let _ = operation;
         let result = commit();
         if result.is_ok() {
-            *inner = None;
+            operation.committed = true;
         }
         Ok(result)
     }
@@ -395,14 +408,49 @@ mod tests {
     }
 
     #[test]
-    fn retry_commit_consumes_lifecycle_before_a_waiting_cancel_can_win() {
+    fn retry_commit_seals_the_operation_before_a_waiting_cancel_can_win() {
         let lifecycle = PipelineLifecycle::default();
-        let (id, _) = lifecycle.begin_retry(PipelineMode::Dictate).unwrap();
+        let (id, cancel) = lifecycle.begin_retry(PipelineMode::Dictate).unwrap();
         assert!(lifecycle
             .commit_retry(id, || Ok::<(), ()>(()))
             .unwrap()
             .is_ok());
         assert_eq!(lifecycle.cancel().unwrap(), None);
+        assert!(!*cancel.borrow());
+        assert!(!lifecycle.is_cancelled(id));
+        assert!(lifecycle.commit_retry(id, || Ok::<(), ()>(())).is_err());
+    }
+
+    #[test]
+    fn committed_retry_keeps_the_lifecycle_until_completion_is_published() {
+        let lifecycle = PipelineLifecycle::default();
+        let (id, _) = lifecycle.begin_retry(PipelineMode::Ask).unwrap();
+        assert!(lifecycle
+            .commit_retry(id, || Ok::<(), ()>(()))
+            .unwrap()
+            .is_ok());
+
+        // Completion is published between commit and finish; no recording
+        // may start in that window and later be overwritten by it.
+        assert_eq!(lifecycle.phase(), PipelinePhase::Processing);
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_err());
+        assert!(lifecycle.begin_retry(PipelineMode::Dictate).is_err());
+        lifecycle.finish(id);
         assert_eq!(lifecycle.phase(), PipelinePhase::Idle);
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_ok());
+    }
+
+    #[test]
+    fn failed_retry_commit_stays_cancellable() {
+        let lifecycle = PipelineLifecycle::default();
+        let (id, _) = lifecycle.begin_retry(PipelineMode::Dictate).unwrap();
+        assert!(lifecycle
+            .commit_retry(id, || Err::<(), ()>(()))
+            .unwrap()
+            .is_err());
+        assert_eq!(
+            lifecycle.cancel().unwrap(),
+            Some((id, PipelinePhase::Processing))
+        );
     }
 }

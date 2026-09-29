@@ -1507,6 +1507,17 @@ fn completion_persistence_warning(
     persistence_warning(history_status == HistorySaveStatus::Failed, metric_failed)
 }
 
+/// The single persistence step of `update_settings`. Settings and their
+/// History retention (including the History-off purge) commit in one SQLite
+/// transaction, so a failed settings write cannot erase History and an insert
+/// cannot observe the old settings after the purge. Shortcut registrations are
+/// rolled back by `shortcuts::update_registrations` when this fails.
+fn persist_settings(storage: &Storage, settings: &Settings) -> Result<(), String> {
+    storage
+        .update_settings_and_apply_history_policy(settings)
+        .map_err(command_error)
+}
+
 #[tauri::command]
 pub(crate) fn get_startup_hotkey_warning(services: State<'_, Services>) -> Option<String> {
     services
@@ -1724,6 +1735,95 @@ mod tests {
         assert_eq!(status, HistorySaveStatus::Failed);
         drop(storage);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn settings_history_item() -> NewHistoryItem<'static> {
+        NewHistoryItem {
+            transcript_text: "private transcript",
+            processed_text: None,
+            source_text: None,
+            instruction_text: None,
+            action_kind: None,
+            search_site: None,
+            mode: "faithful",
+            asr_provider: "test",
+            llm_provider: None,
+            target_language: None,
+            app_category: None,
+            duration_ms: None,
+            latency_ms: None,
+            retry_of_id: None,
+        }
+    }
+
+    fn stored_history_rows(database: &std::path::Path) -> i64 {
+        rusqlite::Connection::open(database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM dictation_history", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn update_settings_persistence_purges_history_in_the_settings_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("settings.sqlite");
+        let storage = Storage::open(&database).unwrap();
+        assert!(
+            storage
+                .add_history_with_audio_report(&settings_history_item(), None)
+                .unwrap()
+                .0
+        );
+        let settings = Settings {
+            history_retention: types::HistoryRetention::Never,
+            ..Settings::default()
+        };
+        persist_settings(&storage, &settings).unwrap();
+
+        assert_eq!(
+            storage.get_settings().unwrap().history_retention,
+            types::HistoryRetention::Never
+        );
+        assert_eq!(stored_history_rows(&database), 0);
+    }
+
+    #[test]
+    fn failed_update_settings_write_keeps_history_and_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("settings.sqlite");
+        let storage = Storage::open(&database).unwrap();
+        assert!(
+            storage
+                .add_history_with_audio_report(&settings_history_item(), None)
+                .unwrap()
+                .0
+        );
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_settings_insert BEFORE INSERT ON settings
+                 BEGIN SELECT RAISE(ABORT, 'settings write rejected'); END;
+                 CREATE TRIGGER reject_settings_update BEFORE UPDATE ON settings
+                 BEGIN SELECT RAISE(ABORT, 'settings write rejected'); END;",
+            )
+            .unwrap();
+        let settings = Settings {
+            history_retention: types::HistoryRetention::Never,
+            ..Settings::default()
+        };
+        assert!(persist_settings(&storage, &settings).is_err());
+
+        // The purge shares the failed settings transaction, so History-off
+        // cannot erase rows while the stored settings stay unchanged. The
+        // shortcut rollback on this error is covered by
+        // `shortcuts::tests::persistence_failure_rolls_back_registrations`.
+        assert_eq!(stored_history_rows(&database), 1);
+        assert_eq!(
+            storage.get_settings().unwrap().history_retention,
+            Settings::default().history_retention
+        );
     }
 
     #[test]
@@ -2250,11 +2350,7 @@ pub(crate) async fn update_settings(
         &desired_routes,
         |chord| app.global_shortcut().register(chord),
         |chord| app.global_shortcut().unregister(chord),
-        || {
-            storage
-                .update_settings_and_apply_history_policy(&settings)
-                .map_err(command_error)
-        },
+        || persist_settings(&storage, &settings),
     )?;
     *services
         .shortcut_routes
@@ -2513,12 +2609,16 @@ pub(crate) async fn retry_history_item(
             })
             .map_err(str::to_string)?
             .map_err(command_error)?;
+        // The committed Retry still owns the lifecycle. Publish its completion
+        // before releasing it, so a recording started afterwards cannot have
+        // its state overwritten by this completion.
         recording_overlay::set_phase(&app, &AppPhase::Completed);
         let snapshot = state.complete(
             output.clone(),
             "History retry completed without inserting text.".into(),
         );
         let _ = app.emit("app-state", snapshot);
+        services.lifecycle.finish(operation_id);
         report_history_save_warning(&app, history_save_status);
         Ok(RecordingResult {
             text: output,
