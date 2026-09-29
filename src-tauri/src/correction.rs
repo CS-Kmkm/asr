@@ -221,11 +221,27 @@ fn fact_occurrences(text: &str, kind: ProtectedKind) -> Vec<FactOccurrence> {
     }
 }
 
+/// Returns the counter or unit after a number, with equivalent counters
+/// (人/名, 回/度, つ/個) mapped to one representative.
 fn number_unit(text: &str, range: &std::ops::Range<usize>) -> Option<char> {
-    text[range.end..]
+    let unit = text[range.end..]
         .chars()
         .next()
-        .filter(|character| character.is_alphabetic())
+        .filter(|character| is_counter_character(*character))?;
+    Some(match unit {
+        '名' => '人',
+        '度' => '回',
+        '個' => 'つ',
+        other => other,
+    })
+}
+
+fn is_counter_character(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}'
+    ) || ('ァ'..='ヺ').contains(&character)
+        || character == 'つ'
 }
 
 /// Matches source occurrences by position: each one is kept, superseded by a
@@ -572,7 +588,10 @@ fn number_occurrences(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
             continue;
         } else if let Some(begin) = start.take() {
             let number = &text[begin..index];
-            if !url_ranges.iter().any(|range| range.contains(&begin)) {
+            if !url_ranges.iter().any(|range| range.contains(&begin))
+                && (!is_kanji_numeral_only(number)
+                    || kanji_numeral_in_numeric_context(text, begin..index))
+            {
                 let normalized = if matches!(number.chars().next(), Some('+' | '-')) {
                     let mut chars = number.chars();
                     let sign = chars.next().unwrap();
@@ -587,8 +606,41 @@ fn number_occurrences(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
     spans
 }
 
+const KANJI_NUMERALS: &str = "〇零一二三四五六七八九十百千万億兆壱弐参";
+// Counters that make a lone kanji numeral a number. 番, 緒, and 旦 are
+// deliberately absent so 一番, 一緒, and 一旦 stay ordinary words.
+const KANJI_NUMERAL_COUNTERS: &str =
+    "人名回度つ個時分秒日月年円件本枚台冊階歳才週割倍点位号杯匹頭羽曲社店泊軒票行列章節条項期席箇ヶヵかカケ桁";
+// Compounds whose lone numeral is idiomatic rather than a count.
+const KANJI_NUMERAL_IDIOMS: [&str; 2] = ["十分", "一時的"];
+
 fn is_number_character(character: char) -> bool {
-    character.is_numeric() || "〇零一二三四五六七八九十百千万億兆壱弐参".contains(character)
+    character.is_numeric() || KANJI_NUMERALS.contains(character)
+}
+
+fn is_kanji_numeral_only(token: &str) -> bool {
+    !token
+        .chars()
+        .any(|character| character.is_numeric() && !KANJI_NUMERALS.contains(character))
+}
+
+/// Kanji numerals count as numbers only next to other numerals or before a
+/// counter, so words such as 一緒, 一番, and 一旦 are not protected numbers.
+fn kanji_numeral_in_numeric_context(text: &str, range: std::ops::Range<usize>) -> bool {
+    let numerals = text[range.clone()]
+        .chars()
+        .filter(|character| KANJI_NUMERALS.contains(*character))
+        .count();
+    if numerals >= 2 {
+        return true;
+    }
+    text[range.end..]
+        .chars()
+        .next()
+        .is_some_and(|counter| KANJI_NUMERAL_COUNTERS.contains(counter))
+        && !KANJI_NUMERAL_IDIOMS
+            .iter()
+            .any(|idiom| text[range.start..].starts_with(idiom))
 }
 
 fn uncertainty_preserved(source: &str, output: &str) -> bool {
@@ -1834,6 +1886,43 @@ mod tests {
             "参加者は4人です。",
             false
         ));
+    }
+
+    #[test]
+    fn intent_aware_treats_equivalent_counters_and_kanji_words_consistently() {
+        for (input, output) in [
+            ("参加者は3人です。", "参加者は3名です。"),
+            ("確認は一回です。", "確認は一度です。"),
+            ("箱は3つです。", "箱は3個です。"),
+            ("参加者は3人、いや4名です。", "参加者は4人です。"),
+            ("これが一番大事です。", "これが最も重要です。"),
+            ("いっしょに行きます。", "一緒に行きます。"),
+            ("一旦止めます。", "いったん止めます。"),
+            ("十分な時間があります。", "時間は足りています。"),
+            ("値は3.5です。", "値は3.5となります。"),
+        ] {
+            assert!(
+                accepts_with_corrections(input, output, false),
+                "rejected {input} => {output}"
+            );
+        }
+        for (input, output) in [
+            ("参加者は3人です。", "参加者は3円です。"),
+            ("確認は一回です。", "確認は二回です。"),
+            ("三時に会います。", "四時に会います。"),
+            ("三千円です。", "五千円です。"),
+            ("これが一番大事です。", "これが一番大事で、三人が来ます。"),
+        ] {
+            assert!(
+                !accepts_with_corrections(input, output, true),
+                "accepted {input} => {output}"
+            );
+        }
+        assert!(extract_numbers("一緒に一番、一旦止める").is_empty());
+        assert_eq!(
+            extract_numbers("三時に二人、三千円、十一"),
+            ["三", "二", "三千", "十一"]
+        );
     }
 
     #[test]
