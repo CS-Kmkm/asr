@@ -689,18 +689,13 @@ fn hotkey_changes(registered: &[Shortcut], desired: &[Shortcut]) -> (Vec<Shortcu
     )
 }
 
-fn hotkeys_repaired(registered: &[Shortcut], desired: &[Shortcut]) -> bool {
-    desired.len() == 3 && desired.iter().all(|shortcut| registered.contains(shortcut))
-}
-
 #[tauri::command]
-pub(crate) fn get_startup_hotkey_warning(services: State<'_, Services>) -> Option<String> {
+pub(crate) fn get_startup_hotkey_warning(services: State<'_, Services>) -> Vec<String> {
     services
         .startup_hotkey_issues
         .lock()
-        .ok()?
-        .message()
-        .map(str::to_owned)
+        .map(|issues| issues.messages().into_iter().map(str::to_owned).collect())
+        .unwrap_or_default()
 }
 
 fn emit_correction_preview(app: &AppHandle, text: &str, stage: &str) {
@@ -875,14 +870,12 @@ mod tests {
             hotkey_changes(&registered, &unchanged),
             (vec![], vec![unavailable])
         );
-        assert!(!hotkeys_repaired(&registered, &unchanged));
 
         let repaired = vec![dictate, translate, selected];
         assert_eq!(
             hotkey_changes(&registered, &repaired),
             (vec![], vec![translate])
         );
-        assert!(hotkeys_repaired(&repaired, &repaired));
     }
 
     #[test]
@@ -1233,14 +1226,9 @@ pub(crate) async fn update_settings(
             );
         }
     }
-    let new_shortcut = parse_shortcut(&settings.hotkey)?;
-    let new_translation_shortcut = parse_shortcut(&settings.translation_hotkey)?;
-    let new_voice_translate_shortcut = parse_shortcut(&settings.voice_translate_hotkey)?;
+    let hotkeys = assign_hotkeys(&hotkey_bindings(&settings)?);
     let previous = storage.get_settings().map_err(command_error)?;
-    if new_translation_shortcut == new_shortcut
-        || new_voice_translate_shortcut == new_shortcut
-        || new_voice_translate_shortcut == new_translation_shortcut
-    {
+    if !hotkeys.collisions.is_empty() {
         return Err(
             "recording, selected-text translation, and voice Translate hotkeys must differ".into(),
         );
@@ -1258,12 +1246,12 @@ pub(crate) async fn update_settings(
                 .into(),
         );
     }
-    let new_shortcuts = unique_shortcuts([
-        new_shortcut,
-        new_voice_translate_shortcut,
-        new_translation_shortcut,
-    ]);
-    let repaired = {
+    let new_shortcuts: Vec<Shortcut> = hotkeys
+        .active
+        .iter()
+        .map(|&(_, shortcut)| shortcut)
+        .collect();
+    {
         let mut registered = services
             .registered_hotkeys
             .lock()
@@ -1308,12 +1296,10 @@ pub(crate) async fn update_settings(
             rollback_shortcuts(&removed, &added, &mut registered);
             return Err(command_error(error));
         }
-        hotkeys_repaired(&registered, &new_shortcuts)
-    };
-    if repaired {
-        if let Ok(mut issues) = services.startup_hotkey_issues.lock() {
-            *issues = StartupHotkeyIssues::default();
-        }
+    }
+    // Saved chords are distinct and every one is registered.
+    if let Ok(mut issues) = services.startup_hotkey_issues.lock() {
+        *issues = HotkeyIssues::default();
     }
     if settings.auto_start != previous.auto_start {
         let result = if settings.auto_start {

@@ -19,6 +19,10 @@ and the current target. The recording overlay shows that target and can cycle
 the list; clicking the overlay counts as user activity, so that recording uses
 the clipboard fallback instead of modifying a target after interaction.
 `Ctrl+Shift+T` remains the separate selected-text translation action.
+If saved hotkeys overlap, for example when an older selected-text translation
+hotkey is `Ctrl+Shift+Y`, the older action keeps the chord: recording, then
+selected-text translation, then voice Translate. The overlapped action stays off
+until it is assigned a different hotkey, and the main window names it.
 
 Audio is deleted after processing by default. Transcript history is optional and
 stored in the application SQLite database. Logs and status events must never

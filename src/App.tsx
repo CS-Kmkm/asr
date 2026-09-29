@@ -323,7 +323,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const [gpu, setGpu] = useState<GpuDiagnostics | null>(null);
   const [gpuChecking, setGpuChecking] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
-  const [startupHotkeyWarning, setStartupHotkeyWarning] = useState<string | null>(null);
+  const [startupHotkeyWarnings, setStartupHotkeyWarnings] = useState<string[]>([]);
   const showNotice = (message: string, severity: Notice["severity"] = "info") =>
     setNotice({ message, severity });
   const [noticeCopied, setNoticeCopied] = useState(false);
@@ -332,7 +332,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const [dictionary, setDictionary] = useState<DictionaryEntry[]>([]);
 
   useEffect(() => {
-    void getStartupHotkeyWarning().then(setStartupHotkeyWarning).catch(() => {});
+    void getStartupHotkeyWarning().then(setStartupHotkeyWarnings).catch(() => {});
     Promise.all([
       getAppState(),
       getSettings(),
@@ -391,7 +391,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
 
   useEffect(() => {
     setNoticeCopied(false);
-  }, [notice, startupHotkeyWarning]);
+  }, [notice, startupHotkeyWarnings]);
 
   const statusLabel = t(phaseMessageKeys[state.phase]);
   const localizedState = useMemo(
@@ -400,6 +400,11 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   );
   // A load started from the Models page or automatically at startup.
   const preparingModel = modelLoading || model?.state === "loading";
+  // Each hotkey warning is a fixed backend sentence naming one action.
+  const startupHotkeyWarning =
+    startupHotkeyWarnings.length > 0
+      ? startupHotkeyWarnings.map((message) => translateAppMessage(language, message)).join(" ")
+      : null;
   const shownNotice: Notice | null = notice ?? (startupHotkeyWarning
     ? { message: startupHotkeyWarning, severity: "warning" }
     : null);
@@ -433,7 +438,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       const saved = await updateSettings(next);
       setSettings(saved);
       try {
-        setStartupHotkeyWarning(await getStartupHotkeyWarning());
+        setStartupHotkeyWarnings(await getStartupHotkeyWarning());
       } catch {
         // Keep the known warning if diagnostics cannot be refreshed.
       }
@@ -702,7 +707,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
               if (notice) {
                 setNotice(null);
                 setModelProgress(null);
-              } else setStartupHotkeyWarning(null);
+              } else setStartupHotkeyWarnings([]);
             }}
             aria-label={t("Dismiss notification")}
           >
