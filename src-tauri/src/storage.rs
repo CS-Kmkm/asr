@@ -21,29 +21,39 @@ pub enum StorageError {
 
 pub struct Storage {
     connection: Mutex<Connection>,
+    settings_writes: Mutex<()>,
 }
 
 impl Storage {
     pub fn open(path: &Path) -> Result<Self, StorageError> {
-        let connection = Connection::open(path)?;
-        let storage = Self {
-            connection: Mutex::new(connection),
-        };
+        let storage = Self::with_connection(Connection::open(path)?);
         storage.migrate()?;
         Ok(storage)
     }
 
     #[cfg(test)]
-    fn in_memory() -> Result<Self, StorageError> {
-        let storage = Self {
-            connection: Mutex::new(Connection::open_in_memory()?),
-        };
+    pub(crate) fn in_memory() -> Result<Self, StorageError> {
+        let storage = Self::with_connection(Connection::open_in_memory()?);
         storage.migrate()?;
         Ok(storage)
     }
 
+    fn with_connection(connection: Connection) -> Self {
+        Self {
+            connection: Mutex::new(connection),
+            settings_writes: Mutex::new(()),
+        }
+    }
+
     fn connection(&self) -> Result<MutexGuard<'_, Connection>, StorageError> {
         self.connection.lock().map_err(|_| StorageError::Lock)
+    }
+
+    /// Serializes settings read-modify-write sequences. Every writer holds this
+    /// from reading the settings its change is based on until the result is
+    /// written, so concurrent writers cannot revert each other's changes.
+    pub fn lock_settings_writes(&self) -> Result<MutexGuard<'_, ()>, StorageError> {
+        self.settings_writes.lock().map_err(|_| StorageError::Lock)
     }
 
     fn migrate(&self) -> Result<(), StorageError> {
@@ -415,9 +425,7 @@ mod tests {
                  );",
             )
             .unwrap();
-        let storage = Storage {
-            connection: Mutex::new(connection),
-        };
+        let storage = Storage::with_connection(connection);
 
         storage.migrate().unwrap();
         storage.migrate().unwrap();

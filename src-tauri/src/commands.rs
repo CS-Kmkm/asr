@@ -796,6 +796,33 @@ fn emit_correction_preview(app: &AppHandle, text: &str, stage: &str) {
     );
 }
 
+fn next_translation_target(languages: &[String], current: &str) -> Option<String> {
+    let current_index = languages
+        .iter()
+        .position(|language| language == current)
+        .unwrap_or(0);
+    languages
+        .get((current_index + 1) % languages.len().max(1))
+        .cloned()
+}
+
+/// Persists the target after `active` (the recording's target, falling back
+/// to the saved one). Holding the settings-write lock keeps this
+/// read-modify-write from reverting a concurrent `update_settings`.
+fn store_next_translation_target(
+    storage: &Storage,
+    active: Option<&str>,
+) -> Result<Settings, String> {
+    let _settings_writes = storage.lock_settings_writes().map_err(command_error)?;
+    let mut settings = storage.get_settings().map_err(command_error)?;
+    let current = active.unwrap_or(settings.translation_target_language.as_str());
+    settings.translation_target_language =
+        next_translation_target(&settings.translation_target_languages, current)
+            .ok_or("at least one translation target language is required")?;
+    storage.update_settings(&settings).map_err(command_error)?;
+    Ok(settings)
+}
+
 #[tauri::command]
 pub(crate) fn cycle_voice_translation_target(
     app: AppHandle,
@@ -811,23 +838,8 @@ pub(crate) fn cycle_voice_translation_target(
     {
         return Err("voice translation is not recording".into());
     }
-    let mut settings = storage.get_settings().map_err(command_error)?;
-    if settings.translation_target_languages.is_empty() {
-        return Err("at least one translation target language is required".into());
-    }
-    let current = active
-        .as_deref()
-        .unwrap_or(settings.translation_target_language.as_str());
-    let current_index = settings
-        .translation_target_languages
-        .iter()
-        .position(|language| language == current)
-        .unwrap_or(0);
-    let next = settings.translation_target_languages
-        [(current_index + 1) % settings.translation_target_languages.len()]
-    .clone();
-    settings.translation_target_language = next.clone();
-    storage.update_settings(&settings).map_err(command_error)?;
+    let settings = store_next_translation_target(&storage, active.as_deref())?;
+    let next = settings.translation_target_language.clone();
     *active = Some(next.clone());
     let _ = app.emit("settings-changed", settings);
     let _ = app.emit(
@@ -1093,6 +1105,48 @@ mod tests {
         settings.translation_target_languages = vec!["ja".into()];
         settings.translation_target_language = "en".into();
         assert!(validate_translation_targets(&settings).is_err());
+    }
+
+    #[test]
+    fn next_translation_target_wraps_and_falls_back_to_the_first_entry() {
+        let languages = vec!["en".to_string(), "ja".to_string(), "de".to_string()];
+        assert_eq!(
+            next_translation_target(&languages, "ja").as_deref(),
+            Some("de")
+        );
+        assert_eq!(
+            next_translation_target(&languages, "de").as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            next_translation_target(&languages, "xx").as_deref(),
+            Some("ja")
+        );
+        assert_eq!(next_translation_target(&[], "en"), None);
+    }
+
+    #[test]
+    fn target_cycling_waits_for_an_in_progress_settings_save() {
+        let storage = Arc::new(Storage::in_memory().unwrap());
+        let settings_save = storage.lock_settings_writes().unwrap();
+        let cycling = {
+            let storage = Arc::clone(&storage);
+            std::thread::spawn(move || store_next_translation_target(&storage, Some("en")))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!cycling.is_finished());
+
+        // The save was based on settings read before cycling started.
+        let mut saved = storage.get_settings().unwrap();
+        saved.history_enabled = false;
+        storage.update_settings(&saved).unwrap();
+        drop(settings_save);
+
+        let cycled = cycling.join().unwrap().unwrap();
+        assert_eq!(cycled.translation_target_language, "ja");
+        let stored = storage.get_settings().unwrap();
+        assert!(!stored.history_enabled);
+        assert_eq!(stored.translation_target_language, "ja");
     }
 
     struct TestAudio {
@@ -1427,7 +1481,6 @@ pub(crate) async fn update_settings(
         }
     }
     let hotkeys = assign_hotkeys(&hotkey_bindings(&settings)?);
-    let previous = storage.get_settings().map_err(command_error)?;
     if !hotkeys.collisions.is_empty() {
         return Err(
             "recording, selected-text translation, and voice Translate hotkeys must differ".into(),
@@ -1440,13 +1493,17 @@ pub(crate) async fn update_settings(
     {
         return Err("translation instruction must be at most 500 characters and contain no unsupported control characters".into());
     }
-    if cfg!(debug_assertions) && settings.auto_start && !previous.auto_start {
-        return Err(
-            "autostart cannot be enabled from a development build; install and run a release build"
-                .into(),
-        );
-    }
-    let unavailable_hotkeys = {
+    // Hold the settings-write lock from reading `previous` until the new
+    // settings are written, so overlay target cycling cannot interleave.
+    let (previous, unavailable_hotkeys) = {
+        let _settings_writes = storage.lock_settings_writes().map_err(command_error)?;
+        let previous = storage.get_settings().map_err(command_error)?;
+        if cfg!(debug_assertions) && settings.auto_start && !previous.auto_start {
+            return Err(
+                "autostart cannot be enabled from a development build; install and run a release build"
+                    .into(),
+            );
+        }
         let mut registered = services
             .registered_hotkeys
             .lock()
@@ -1467,7 +1524,7 @@ pub(crate) async fn update_settings(
             rollback_hotkey_update(&mut registrar, &mut registered, &update);
             return Err(command_error(error));
         }
-        update.unavailable
+        (previous, update.unavailable)
     };
     // Saved chords are distinct; only unchanged chords that still cannot be
     // registered remain as warnings.
