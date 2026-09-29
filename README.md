@@ -140,6 +140,9 @@ increase it, subject to the server's context and memory limits.
 A leading `<think>...</think>` block in the response text is removed before it
 reaches the preview or the inserted result; a response whose leading think
 block never closes falls back to the original transcript.
+Local requests use a 10-second connect timeout and fail when no data arrives
+for 90 seconds, with no total deadline, so a long generation that keeps
+streaming is not cut off.
 
 The automatic editor has independent switches for:
 

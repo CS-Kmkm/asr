@@ -10,6 +10,10 @@ use crate::{correction_prompt::build_correction_instruction, types::Settings};
 const OPENAI_RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 const GEMINI_INTERACTIONS_URL: &str = "https://generativelanguage.googleapis.com/v1/interactions";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+// A local server may keep streaming a long (or thinking) answer for minutes, so
+// local requests use connect and idle timeouts instead of a total deadline.
+const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const LOCAL_READ_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_ERROR_BODY_CHARS: usize = 500;
 
 #[derive(Debug, thiserror::Error)]
@@ -76,11 +80,10 @@ async fn request_text(
     }
 
     let provider = settings.correction_provider.as_str();
-    let client_builder = Client::builder().timeout(REQUEST_TIMEOUT);
     let client = if provider == "local" {
         local_client()?
     } else {
-        client_builder.build()?
+        Client::builder().timeout(REQUEST_TIMEOUT).build()?
     };
     let request = match settings.correction_provider.as_str() {
         "openai" => {
@@ -131,12 +134,16 @@ async fn request_text(
 }
 
 fn local_client() -> Result<Client, reqwest::Error> {
-    local_client_with_proxy(None)
+    local_client_with(None, LOCAL_READ_TIMEOUT)
 }
 
-fn local_client_with_proxy(proxy: Option<reqwest::Proxy>) -> Result<Client, reqwest::Error> {
+fn local_client_with(
+    proxy: Option<reqwest::Proxy>,
+    read_timeout: Duration,
+) -> Result<Client, reqwest::Error> {
     let mut builder = Client::builder()
-        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(LOCAL_CONNECT_TIMEOUT)
+        .read_timeout(read_timeout)
         .redirect(Policy::none());
     if let Some(proxy) = proxy {
         builder = builder.proxy(proxy);
@@ -797,7 +804,7 @@ mod tests {
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 91\r\nConnection: close\r\n\r\n{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"corrected\"},\"finish_reason\":\"stop\"}]}").unwrap();
         });
         let proxy = reqwest::Proxy::all("http://127.0.0.1:9").unwrap();
-        let client = local_client_with_proxy(Some(proxy)).unwrap();
+        let client = local_client_with(Some(proxy), LOCAL_READ_TIMEOUT).unwrap();
         let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
         let response = client.post(url).body("test").send().await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -908,6 +915,86 @@ mod tests {
         handler.join().unwrap();
         assert!(matches!(result, Err(CorrectionError::OutputLimit)));
         assert!(preview.is_empty());
+    }
+
+    fn accept_sse_request(server: &TcpListener) -> std::net::TcpStream {
+        let (mut socket, _) = server.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socket.set_nodelay(true).unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let count = socket.read(&mut buffer).unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&buffer[..count]);
+        }
+        socket
+    }
+
+    #[tokio::test]
+    async fn local_client_has_an_idle_timeout_instead_of_a_total_deadline() {
+        const IDLE: Duration = Duration::from_millis(500);
+        const GAP: Duration = Duration::from_millis(50);
+        const DELTAS: usize = 20;
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let handler = thread::spawn(move || {
+            let mut socket = accept_sse_request(&server);
+            let delta =
+                "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}\n\n";
+            let stop = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+            let length = delta.len() * DELTAS + stop.len();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").as_bytes()).unwrap();
+            for _ in 0..DELTAS {
+                thread::sleep(GAP);
+                socket.write_all(delta.as_bytes()).unwrap();
+            }
+            socket.write_all(stop.as_bytes()).unwrap();
+        });
+        let client = local_client_with(None, IDLE).unwrap();
+        let started = std::time::Instant::now();
+        let response = client
+            .get(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .send()
+            .await
+            .unwrap();
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let text = collect_response(response, "local", &mut cancel, &mut |_: &str| {}).await;
+        handler.join().unwrap();
+        assert_eq!(text.unwrap(), "x".repeat(DELTAS));
+        assert!(
+            started.elapsed() > IDLE,
+            "the stream must outlast one idle period"
+        );
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let handler = thread::spawn(move || {
+            let mut socket = accept_sse_request(&server);
+            let delta =
+                "data: {\"choices\":[{\"delta\":{\"content\":\"x\"},\"finish_reason\":null}]}\n\n";
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n{delta}").as_bytes()).unwrap();
+            // Keep the connection open without sending data until the client
+            // has observed the idle timeout.
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        });
+        let client = local_client_with(None, Duration::from_millis(200)).unwrap();
+        let response = client
+            .get(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .send()
+            .await
+            .unwrap();
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let result = collect_response(response, "local", &mut cancel, &mut |_: &str| {}).await;
+        release_tx.send(()).unwrap();
+        handler.join().unwrap();
+        assert!(
+            matches!(&result, Err(CorrectionError::Request(error)) if error.is_timeout()),
+            "{result:?}"
+        );
     }
 
     // Opt-in semantic evaluation through the production streaming path. Uses
