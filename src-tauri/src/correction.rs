@@ -75,7 +75,19 @@ pub async fn edit_selected_text(
     }
     let instruction = build_edit_instruction();
     let input = edit_request_input(selected_text, spoken_instruction);
-    request_text(settings, &input, instruction, cancel, on_update).await
+    let edited = request_text(settings, &input, instruction, cancel, on_update).await?;
+    Ok(restore_selection_whitespace(selected_text, &edited))
+}
+
+/// The shared provider path trims its output, and an empty result is already
+/// rejected there. The edit replaces the whole original selection, so put the
+/// selection's own leading and trailing whitespace back around the result to
+/// keep word and paragraph boundaries next to the selection intact.
+fn restore_selection_whitespace(selected_text: &str, edited: &str) -> String {
+    let body = selected_text.trim_start();
+    let leading = &selected_text[..selected_text.len() - body.len()];
+    let trailing = &body[body.trim_end().len()..];
+    format!("{leading}{}{trailing}", edited.trim())
 }
 
 fn build_edit_instruction() -> &'static str {
@@ -1329,6 +1341,117 @@ mod tests {
         let (_, cancel) = watch::channel(false);
         let result = edit_selected_text(&settings, "selected", " \t\n", cancel, |_| {}).await;
         assert!(matches!(result, Err(CorrectionError::EmptyEditInstruction)));
+    }
+
+    #[test]
+    fn edit_result_keeps_the_selection_boundary_whitespace() {
+        for (selected, edited, expected) in [
+            ("Monday ", "MONDAY", "MONDAY "),
+            (" Monday", "MONDAY", " MONDAY"),
+            (
+                "\r\nold paragraph\r\n\r\n",
+                "new paragraph",
+                "\r\nnew paragraph\r\n\r\n",
+            ),
+            ("\u{3000}月曜日\u{3000}", "火曜日", "\u{3000}火曜日\u{3000}"),
+            ("no padding", "edited", "edited"),
+            // The model's own padding is dropped; only the selection's is used.
+            ("tail\t", "  edited \n", "edited\t"),
+            // Inner whitespace of the result is left to the provider.
+            ("a b", "a\n\nb", "a\n\nb"),
+            // An all-whitespace selection is restored once, not twice.
+            ("  ", "x", "  x"),
+        ] {
+            assert_eq!(
+                restore_selection_whitespace(selected, edited),
+                expected,
+                "selection {selected:?}"
+            );
+        }
+    }
+
+    fn serve_local_completion(content: &'static str) -> (u16, thread::JoinHandle<()>) {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let handler = thread::spawn(move || {
+            let (mut socket, _) = server.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            let header_end = loop {
+                let count = socket.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+            let body_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .map_or(0, |value| value.trim().parse::<usize>().unwrap());
+            while request.len() < header_end + body_length {
+                let count = socket.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let body = json!({
+                "choices": [{
+                    "message": { "role": "assistant", "content": content },
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).unwrap();
+        });
+        (port, handler)
+    }
+
+    fn local_settings(port: u16) -> Settings {
+        Settings {
+            correction_provider: "local".into(),
+            local_correction_base_url: format!("http://127.0.0.1:{port}/v1"),
+            ..Settings::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_restores_selection_whitespace_around_the_provider_result() {
+        let (port, handler) = serve_local_completion("  MONDAY is\n");
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let result = edit_selected_text(
+            &local_settings(port),
+            "Monday is ",
+            "capitalize Monday",
+            cancel,
+            |_| {},
+        )
+        .await;
+        handler.join().unwrap();
+        assert_eq!(result.unwrap(), "MONDAY is ");
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_an_empty_provider_result_instead_of_deleting() {
+        let (port, handler) = serve_local_completion(" \n\t ");
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let result = edit_selected_text(
+            &local_settings(port),
+            " remove me ",
+            "delete this",
+            cancel,
+            |_| {},
+        )
+        .await;
+        handler.join().unwrap();
+        assert!(matches!(result, Err(CorrectionError::InvalidResponse(_))));
     }
 
     #[test]

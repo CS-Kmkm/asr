@@ -24,9 +24,11 @@ the clipboard fallback instead of modifying a target after interaction.
 Speak an instruction such as “make this concise” or “translate this to
 Japanese,” then press the shortcut again. The provider receives the immutable
 selected text and spoken instruction as separate untrusted fields and may only
-return replacement text. If focus, selection, user input, shortcut release, or
-IME safety checks fail, the original text is left alone and the generated edit
-remains on the clipboard.
+return replacement text. The replacement keeps the selection's leading and
+trailing spaces and line breaks. Deleting the selection is not an Edit result:
+an empty provider response is rejected and the selection is left unchanged. If
+focus, selection, user input, shortcut release, or IME safety checks fail, the
+original text is left alone and the generated edit remains on the clipboard.
 
 Audio is deleted after processing by default. Transcript history is optional and
 stored in the application SQLite database. Logs and status events must never
