@@ -13,6 +13,16 @@ function isValidProfileScope(scope: string): boolean {
   return false;
 }
 
+function sameProfiles(left: ScopedStyleProfile[], right: ScopedStyleProfile[]): boolean {
+  return left.length === right.length && left.every((item, index) => {
+    const other = right[index];
+    return item.scope === other.scope &&
+      item.profile.formality === other.profile.formality &&
+      item.profile.detail === other.profile.detail &&
+      (item.profile.guidance ?? "") === (other.profile.guidance ?? "");
+  });
+}
+
 export function SettingsPage({
   settings,
   onSave,
@@ -25,6 +35,7 @@ export function SettingsPage({
   const [translationHotkey, setTranslationHotkey] = useState(settings.translationHotkey);
   const [translationInstruction, setTranslationInstruction] = useState(settings.translationInstruction);
   const [profiles, setProfiles] = useState(settings.scopedStyleProfiles);
+  const savedProfilesRef = useRef(settings.scopedStyleProfiles);
   const cancelHotkeyBlurRef = useRef(false);
   const suppressHotkeyBlurRef = useRef(false);
   const cancelTranslationBlurRef = useRef(false);
@@ -35,7 +46,15 @@ export function SettingsPage({
   useEffect(() => setHotkey(settings.hotkey), [settings.hotkey]);
   useEffect(() => setTranslationHotkey(settings.translationHotkey), [settings.translationHotkey]);
   useEffect(() => setTranslationInstruction(settings.translationInstruction), [settings.translationInstruction]);
-  useEffect(() => setProfiles(settings.scopedStyleProfiles), [settings.scopedStyleProfiles]);
+  useEffect(() => {
+    const previous = savedProfilesRef.current;
+    const incoming = settings.scopedStyleProfiles;
+    savedProfilesRef.current = incoming;
+    // Every settings save returns a new array. Adopt it only while the local
+    // draft has no unsaved edits, so an unrelated save cannot discard a new or
+    // invalid scoped row.
+    setProfiles((draft) => (sameProfiles(draft, previous) ? incoming : draft));
+  }, [settings.scopedStyleProfiles]);
 
   function saveProfiles(next: ScopedStyleProfile[]) {
     setProfiles(next);
@@ -288,7 +307,7 @@ function PersonalizationProfiles({
             <button className="secondary" onClick={() => onSaveProfiles(profiles.filter((_, i) => i !== index))}>{t("Remove")}</button>
           </div>
         ))}
-        <button className="primary" onClick={() => onSaveProfiles([...profiles, { scope: "category:other", profile: { formality: "formal", detail: "concise", guidance: "" } }])}>{t("Add scoped profile")}</button>
+        <button className="primary" onClick={() => onSaveProfiles([...profiles, { scope: "", profile: { formality: "formal", detail: "concise", guidance: "" } }])}>{t("Add scoped profile")}</button>
       </div>
     </section>
   );
