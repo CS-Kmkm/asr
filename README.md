@@ -275,7 +275,11 @@ Full usage and Phase 0 gate criteria are documented in
 - Local processing remains the default. Cloud/API processing is used only when
   the OpenAI-compatible backend is explicitly selected.
 - History can be disabled; when disabled, transcript rows are not written.
-- Temporary WAV deletion defaults to enabled.
+- Temporary WAV deletion defaults to enabled. When History is on and "Delete
+  audio after processing" is off, History keeps a copy of each new recording
+  for playback, download, and Retry. Turning it on stops keeping new recordings
+  but does not delete recordings already in History; delete them there or let
+  History retention remove them.
 - The captured target must still be foreground and non-secure at insertion time.
 - UI Automation security inspection exists and is used to avoid secure targets.
   Direct UI Automation insertion is available where supported, but some controls

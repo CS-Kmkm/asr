@@ -1732,6 +1732,51 @@ mod tests {
     }
 
     #[test]
+    fn enabling_delete_audio_keeps_retained_recordings_but_stops_new_retention() {
+        let storage = Storage::in_memory().unwrap();
+        let mut settings = Settings {
+            delete_audio_after_processing: false,
+            ..Settings::default()
+        };
+        storage.update_settings(&settings).unwrap();
+        let source = source_wav();
+        storage
+            .add_history_with_audio(&item(), Some(&source))
+            .unwrap();
+        let retained = storage
+            .list_history(HistoryFilter::All, 1)
+            .unwrap()
+            .remove(0);
+        assert!(retained.has_audio);
+
+        settings.delete_audio_after_processing = true;
+        storage
+            .update_settings_and_apply_history_policy(&settings)
+            .unwrap();
+        storage
+            .add_history_with_audio(&item(), Some(&source))
+            .unwrap();
+
+        // Decision D3: switching the setting on is non-destructive. The old
+        // recording stays visible, playable, and deletable; the new row has
+        // no audio and no new file is written.
+        let rows = storage.list_history(HistoryFilter::All, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        let kept = rows.iter().find(|row| row.id == retained.id).unwrap();
+        assert!(kept.has_audio);
+        assert!(storage.history_audio(retained.id).unwrap().is_some());
+        assert!(rows
+            .iter()
+            .filter(|row| row.id != retained.id)
+            .all(|row| !row.has_audio));
+        assert_eq!(history_audio_files(&storage).len(), 1);
+        assert!(storage.delete_history(retained.id).unwrap());
+        assert!(history_audio_files(&storage).is_empty());
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
+    }
+
+    #[test]
     fn failed_audio_stage_preserves_text_only_history() {
         let storage = Storage::in_memory().unwrap();
         storage

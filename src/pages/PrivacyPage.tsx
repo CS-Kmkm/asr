@@ -14,7 +14,7 @@ export function PrivacyPage({
     <section className="panel">
       <SettingRow
         title={t("Delete audio after processing")}
-        detail={t("Audio cleanup is enabled by default.")}
+        detail={t("On by default: new recordings are deleted after processing and are not kept for History playback, download, or Retry. Turning this on keeps recordings already saved in History until you delete them there or History retention removes them.")}
         control={
           <Toggle
             checked={settings.deleteAudioAfterProcessing}
