@@ -46,3 +46,13 @@ Status (2026-09-29):
   large rewrites (review F5).
 - Manual Windows verification is documented in `docs/windows_verification.md` and
   remains unverified in this environment.
+
+Status (2026-09-30, PR-review propagation):
+- Merged the local #8 review fixes into #9. The shared shortcut assignment now
+  includes Speak to edit after Dictate, selected-text Translate, and voice
+  Translate; legacy collisions retain their owner and warnings, while newly
+  introduced collisions are rejected on save. The edit-specific whitespace,
+  empty-result, error, and persistence-warning fixes remain intact.
+- Verified 176 Rust library tests passed (4 ignored), `cargo fmt --check`,
+  Clippy including all targets, TypeScript typecheck, production frontend build,
+  and `git diff --check`. Manual Windows verification remains pending.

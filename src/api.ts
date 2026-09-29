@@ -73,8 +73,8 @@ export async function startRecording(): Promise<void> {
   return invoke("start_recording");
 }
 
-export async function getStartupHotkeyWarning(): Promise<string | null> {
-  if (!inTauri) return null;
+export async function getStartupHotkeyWarning(): Promise<string[]> {
+  if (!inTauri) return [];
   return invoke("get_startup_hotkey_warning");
 }
 
