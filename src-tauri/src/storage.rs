@@ -510,11 +510,12 @@ impl Storage {
               UNION SELECT 1 FROM dictionary_candidate_decisions WHERE original_span = ?1 AND preferred_span = ?2)",
             params![original_span, preferred_span], |row| row.get(0),
         )?;
+        // Any entry, in any scope, that already spells the preferred span as
+        // its surface or an alias represents it. Proposing it again would
+        // either duplicate that entry globally or fail on an alias collision
+        // at every confirmation.
         if already_seen
-            || read_dictionary_entries(&connection)?.iter().any(|entry| {
-                normalized_scope(entry.app_scope.as_deref()).is_none()
-                    && entry.surface.eq_ignore_ascii_case(&preferred_span)
-            })
+            || represented_entry(&read_dictionary_entries(&connection)?, &preferred_span).is_some()
         {
             return Ok(None);
         }
@@ -570,17 +571,14 @@ impl Storage {
             priority: 0,
             app_scope: None,
         };
+        // A candidate proposed before a matching entry existed resolves to
+        // that entry unchanged instead of creating a duplicate or failing.
         let existing = read_dictionary_entries(&transaction)?;
-        let match_id = existing
-            .iter()
-            .find(|item| {
-                item.surface.trim().to_lowercase() == surface.trim().to_lowercase()
-                    && normalized_scope(item.app_scope.as_deref()).is_none()
-            })
-            .map(|item| item.id);
-        if match_id.is_none() {
-            insert_dictionary_entry(&transaction, &entry, "auto", None)?;
-        }
+        let match_id = represented_entry(&existing, &surface).map(|item| item.id);
+        let result_id = match match_id {
+            Some(id) => id,
+            None => insert_dictionary_entry(&transaction, &entry, "auto", None)?,
+        };
         transaction.execute("INSERT OR IGNORE INTO dictionary_candidate_decisions(original_span, preferred_span, created_at) VALUES (?1, ?2, ?3)", params![reading, surface, Utc::now().to_rfc3339()])?;
         transaction.execute(
             "DELETE FROM dictionary_candidates WHERE original_span = ?1 AND preferred_span = ?2",
@@ -588,10 +586,7 @@ impl Storage {
         )?;
         let result = read_dictionary_entries(&transaction)?
             .into_iter()
-            .find(|item| {
-                item.surface.trim().to_lowercase() == surface.trim().to_lowercase()
-                    && normalized_scope(item.app_scope.as_deref()).is_none()
-            });
+            .find(|item| item.id == result_id);
         transaction.commit()?;
         Ok(result)
     }
@@ -792,6 +787,30 @@ impl OwnedDictionaryEntry {
             app_scope: self.app_scope.as_deref(),
         }
     }
+}
+
+/// The entry that already spells `span` as its surface or an alias,
+/// case-insensitively and in any scope. A global surface match is preferred,
+/// then any surface, then any alias.
+fn represented_entry<'a>(
+    entries: &'a [DictionaryEntry],
+    span: &str,
+) -> Option<&'a DictionaryEntry> {
+    let span = span.trim().to_lowercase();
+    let surface_matches = |entry: &&DictionaryEntry| entry.surface.trim().to_lowercase() == span;
+    entries
+        .iter()
+        .filter(surface_matches)
+        .find(|entry| normalized_scope(entry.app_scope.as_deref()).is_none())
+        .or_else(|| entries.iter().find(surface_matches))
+        .or_else(|| {
+            entries.iter().find(|entry| {
+                entry
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.trim().to_lowercase() == span)
+            })
+        })
 }
 
 fn normalized_scope(scope: Option<&str>) -> Option<String> {
@@ -1986,6 +2005,98 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn candidates_already_represented_in_any_scope_are_suppressed_and_resolve() {
+        let storage = Storage::in_memory().unwrap();
+        let open_aliases = vec!["open ai".to_owned()];
+        let scoped = storage
+            .add_dictionary_entry(&NewDictionaryEntry {
+                reading: "おーぷんえーあい",
+                surface: "OpenAI",
+                category: None,
+                aliases: &open_aliases,
+                priority: 5,
+                app_scope: Some("app:code"),
+            })
+            .unwrap();
+        let chat_aliases = vec!["chatgpt".to_owned()];
+        storage
+            .add_dictionary_entry(&NewDictionaryEntry {
+                reading: "ちゃっとじーぴーてぃー",
+                surface: "Chat GPT service",
+                category: None,
+                aliases: &chat_aliases,
+                priority: 0,
+                app_scope: None,
+            })
+            .unwrap();
+        // A scoped surface and a global alias both already represent the span.
+        for (original, corrected) in [("open ai", "OpenAI"), ("chat gpt", "ChatGPT")] {
+            assert_eq!(
+                storage
+                    .add_dictionary_candidate_from_correction(original, corrected, None)
+                    .unwrap(),
+                None,
+                "{corrected}"
+            );
+        }
+        assert!(storage.list_dictionary_candidates().unwrap().is_empty());
+
+        // Candidates proposed before a matching entry existed resolve to that
+        // entry instead of creating a global duplicate or failing on a
+        // collision at every confirmation.
+        let alias_pending = storage
+            .add_dictionary_candidate_from_correction("git hub", "GitHub", None)
+            .unwrap()
+            .unwrap();
+        let surface_pending = storage
+            .add_dictionary_candidate_from_correction("type script", "TypeScript", None)
+            .unwrap()
+            .unwrap();
+        let hub_aliases = vec!["github".to_owned()];
+        let alias_owner = storage
+            .add_dictionary_entry(&NewDictionaryEntry {
+                reading: "ぎっとはぶ",
+                surface: "GitHub Enterprise",
+                category: None,
+                aliases: &hub_aliases,
+                priority: 0,
+                app_scope: None,
+            })
+            .unwrap();
+        let no_aliases = Vec::new();
+        let scoped_surface = storage
+            .add_dictionary_entry(&NewDictionaryEntry {
+                reading: "たいぷすくりぷと",
+                surface: "typescript",
+                category: None,
+                aliases: &no_aliases,
+                priority: 0,
+                app_scope: Some("category:development"),
+            })
+            .unwrap();
+        let before = storage.list_dictionary().unwrap();
+        assert_eq!(
+            storage
+                .confirm_dictionary_candidate(alias_pending)
+                .unwrap()
+                .map(|entry| entry.id),
+            Some(alias_owner)
+        );
+        assert_eq!(
+            storage
+                .confirm_dictionary_candidate(surface_pending)
+                .unwrap()
+                .map(|entry| entry.id),
+            Some(scoped_surface)
+        );
+        assert_eq!(storage.list_dictionary().unwrap(), before);
+        assert!(storage.list_dictionary_candidates().unwrap().is_empty());
+        assert!(before
+            .iter()
+            .any(|entry| entry.id == scoped && entry.source == "manual"));
     }
 
     #[test]
