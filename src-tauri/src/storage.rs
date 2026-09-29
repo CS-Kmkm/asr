@@ -420,9 +420,16 @@ impl Storage {
                     index + 2
                 )));
             }
-            let priority = row[4].trim().parse::<i64>().map_err(|_| {
-                StorageError::Validation(format!("CSV row {} has an invalid priority", index + 2))
-            })?;
+            // A blank priority cell means the default priority, as in the form.
+            let priority = match row[4].trim() {
+                "" => 0,
+                value => value.parse::<i64>().map_err(|_| {
+                    StorageError::Validation(format!(
+                        "CSV row {} has an invalid priority",
+                        index + 2
+                    ))
+                })?,
+            };
             values.push(OwnedDictionaryEntry {
                 reading: row[0].to_owned(),
                 surface: row[1].to_owned(),
@@ -1678,9 +1685,18 @@ mod tests {
     #[test]
     fn csv_import_quotes_and_rolls_back_invalid_or_colliding_rows() {
         let storage = Storage::in_memory().unwrap();
-        let csv = "reading,surface,category,aliases,priority,app_scope\n\"read, ing\",Surface,group,\"one|two\",3,app:code\nnext,Other,,,0,\n";
-        assert_eq!(storage.import_dictionary_csv(csv).unwrap(), 2);
-        assert_eq!(storage.list_dictionary().unwrap().len(), 2);
+        let csv = "reading,surface,category,aliases,priority,app_scope\n\"read, ing\",Surface,group,\"one|two\",3,app:code\nnext,Other,,,0,\nblank,Blank,,,,\n";
+        assert_eq!(storage.import_dictionary_csv(csv).unwrap(), 3);
+        let imported = storage.list_dictionary().unwrap();
+        assert_eq!(imported.len(), 3);
+        // A blank priority cell imports with the default priority.
+        assert_eq!(
+            imported
+                .iter()
+                .find(|entry| entry.surface == "Blank")
+                .map(|entry| entry.priority),
+            Some(0)
+        );
         for invalid in [
             "reading,surface,category,aliases,priority,app_scope\nread,Surface,,,nope,\n",
             "reading,surface,category,aliases,priority,app_scope\nfresh,Fresh,,,0,\nother,Other,,fresh,0,\n",
@@ -1691,7 +1707,7 @@ mod tests {
             "wrong,header\n",
         ] {
             assert!(storage.import_dictionary_csv(invalid).is_err());
-            assert_eq!(storage.list_dictionary().unwrap().len(), 2);
+            assert_eq!(storage.list_dictionary().unwrap().len(), 3);
         }
         assert!(storage
             .import_dictionary_csv(&"x".repeat(MAX_CSV_BYTES + 1))
