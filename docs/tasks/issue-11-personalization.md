@@ -9,7 +9,7 @@ Scope / non-scope:
 - Do not implement automatic learning, edit watching, content-derived preferences, or new providers.
 
 Fixed design:
-- Add an `AppContext { app_key, category }` contract. On Windows, derive a lowercase executable stem from `TargetWindow.process_id` using a read-only process query; map known application stems into stable coarse categories (`browser`, `email`, `messaging`, `development`, `document`, `other`). On lookup failure use no app key and category `other`; do not fail dictation.
+- Add an `AppContext { app_key, category }` contract. On Windows, derive a lowercase executable stem from `TargetWindow.process_id` using a read-only process query; map known application stems into stable coarse categories (`browser`, `email`, `messaging`, `development`, `document`, `other`). On lookup failure record no app context (no app key and no History category), so routing uses global dictionary entries and the global profile only; do not fail dictation. An identified executable with no known category uses `other`.
 - Never store full executable paths or window titles. Validate manual profile fields and scope strings with bounded length and no control characters.
 - Store profiles in the existing Settings JSON as a global `StyleProfile` plus an ordered list of scoped profiles. A scoped profile key is exactly `app:<key>` or `category:<category>`; exact app wins over category, which wins over global. Disabled personalization supplies no style profile.
 - Keep abstract profile settings structured (`formality`, `detail`, optional bounded guidance). The report is the Settings UI representation of those values; no transcript examples are displayed or retained.

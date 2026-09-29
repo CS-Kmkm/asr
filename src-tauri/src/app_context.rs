@@ -54,15 +54,31 @@ fn executable_path(process_id: u32) -> Option<String> {
         .map(|_| String::from_utf16_lossy(&buffer[..size as usize]))
 }
 
-pub(crate) fn from_target(target: &TargetWindow) -> AppContext {
-    #[cfg(target_os = "windows")]
-    let stem = executable_path(target.process_id).and_then(|path| normalize_executable_stem(&path));
-    #[cfg(not(target_os = "windows"))]
-    let stem: Option<String> = None;
-    AppContext {
+/// Returns `None` when the process lookup fails, so routing falls back to
+/// global dictionary entries and the global profile only. An identified
+/// executable without a known category is `category:other`.
+pub(crate) fn from_executable_path(path: Option<&str>) -> Option<AppContext> {
+    let stem = normalize_executable_stem(path?);
+    Some(AppContext {
         category: category_for_stem(stem.as_deref()),
         app_key: stem,
-    }
+    })
+}
+
+pub(crate) fn from_target(target: &TargetWindow) -> Option<AppContext> {
+    #[cfg(target_os = "windows")]
+    let path = executable_path(target.process_id);
+    #[cfg(not(target_os = "windows"))]
+    let path: Option<String> = {
+        let _ = target;
+        None
+    };
+    from_executable_path(path.as_deref())
+}
+
+/// The coarse category recorded in History; unknown when the lookup failed.
+pub(crate) fn history_category(context: Option<&AppContext>) -> Option<&str> {
+    context.map(|context| context.category.as_str())
 }
 
 #[cfg(test)]
@@ -89,7 +105,7 @@ mod tests {
     }
 
     #[test]
-    fn lookup_failure_falls_back_without_a_path_or_app_key() {
+    fn lookup_failure_yields_no_context_or_history_category() {
         let context = from_target(&TargetWindow {
             window_handle: 0,
             control_handle: 0,
@@ -97,7 +113,24 @@ mod tests {
             thread_id: 0,
             is_secure: false,
         });
-        assert_eq!(context.app_key, None);
+        assert_eq!(context, None);
+        assert_eq!(from_executable_path(None), None);
+        assert_eq!(history_category(context.as_ref()), None);
+    }
+
+    #[test]
+    fn identified_unclassified_app_stays_category_other() {
+        let context = from_executable_path(Some(r"C:\Tools\MyEditor.exe")).unwrap();
+        assert_eq!(context.app_key.as_deref(), Some("myeditor"));
         assert_eq!(context.category, "other");
+        assert_eq!(history_category(Some(&context)), Some("other"));
+
+        // A path whose stem cannot be keyed is still an identified app.
+        let context = from_executable_path(Some(r"C:\Tools\メモ.exe")).unwrap();
+        assert_eq!(context.app_key, None);
+        assert_eq!(history_category(Some(&context)), Some("other"));
+
+        let context = from_executable_path(Some(r"C:\Program Files\Code.exe")).unwrap();
+        assert_eq!(history_category(Some(&context)), Some("development"));
     }
 }

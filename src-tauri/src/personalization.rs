@@ -82,22 +82,30 @@ fn validate_text(value: &str, max: usize) -> Result<(), &'static str> {
     }
 }
 
-pub(crate) fn resolve_profile(settings: &Settings, context: &AppContext) -> Option<StyleProfile> {
+/// Fixed precedence: exact app > category > global. Without an app context
+/// (lookup failure) only the global profile applies.
+pub(crate) fn resolve_profile(
+    settings: &Settings,
+    context: Option<&AppContext>,
+) -> Option<StyleProfile> {
     if !settings.personalization_enabled {
         return None;
     }
-    let app_scope = context.app_key.as_deref().map(|key| format!("app:{key}"));
-    let category_scope = format!("category:{}", context.category);
-    settings
-        .scoped_style_profiles
-        .iter()
-        .find(|item| app_scope.as_deref() == Some(item.scope.as_str()))
-        .or_else(|| {
-            settings
-                .scoped_style_profiles
-                .iter()
-                .find(|item| item.scope == category_scope)
-        })
+    let scoped = context.and_then(|context| {
+        let app_scope = context.app_key.as_deref().map(|key| format!("app:{key}"));
+        let category_scope = format!("category:{}", context.category);
+        settings
+            .scoped_style_profiles
+            .iter()
+            .find(|item| app_scope.as_deref() == Some(item.scope.as_str()))
+            .or_else(|| {
+                settings
+                    .scoped_style_profiles
+                    .iter()
+                    .find(|item| item.scope == category_scope)
+            })
+    });
+    scoped
         .map(|item| item.profile.clone())
         .or_else(|| settings.global_style_profile.clone())
 }
@@ -165,20 +173,48 @@ mod tests {
             },
         ];
         for _ in 0..2 {
-            let exact_app = resolve_profile(&settings, &context("code", "development")).unwrap();
+            let exact_app =
+                resolve_profile(&settings, Some(&context("code", "development"))).unwrap();
             assert_eq!(exact_app.formality, "formal");
             assert_eq!(exact_app, app);
             let category_only =
-                resolve_profile(&settings, &context("rider", "development")).unwrap();
+                resolve_profile(&settings, Some(&context("rider", "development"))).unwrap();
             assert_eq!(category_only.formality, "casual");
             assert_eq!(category_only, category);
-            let no_match = resolve_profile(&settings, &context("chrome", "browser")).unwrap();
+            let no_match = resolve_profile(&settings, Some(&context("chrome", "browser"))).unwrap();
             assert_eq!(no_match, global);
             // Precedence is fixed; reordering the scoped list has no effect.
             settings.scoped_style_profiles.reverse();
         }
         settings.personalization_enabled = false;
-        assert!(resolve_profile(&settings, &context("code", "development")).is_none());
+        assert!(resolve_profile(&settings, Some(&context("code", "development"))).is_none());
+    }
+
+    #[test]
+    fn profile_resolution_without_app_context_uses_global_only() {
+        let global = profile("formal", "concise");
+        let other = profile("casual", "detailed");
+        let settings = Settings {
+            personalization_enabled: true,
+            global_style_profile: Some(global.clone()),
+            scoped_style_profiles: vec![ScopedStyleProfile {
+                scope: "category:other".into(),
+                profile: other.clone(),
+            }],
+            ..Settings::default()
+        };
+        assert_eq!(resolve_profile(&settings, None), Some(global));
+        // A successfully identified but unclassified app is still category:other.
+        let unclassified = AppContext {
+            app_key: Some("myeditor".into()),
+            category: "other".into(),
+        };
+        assert_eq!(resolve_profile(&settings, Some(&unclassified)), Some(other));
+        let no_global = Settings {
+            global_style_profile: None,
+            ..settings
+        };
+        assert_eq!(resolve_profile(&no_global, None), None);
     }
 
     #[test]
