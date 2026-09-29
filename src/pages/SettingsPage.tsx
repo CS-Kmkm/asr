@@ -281,6 +281,8 @@ function PersonalizationProfiles({
     <section className="panel">
       <h2>{t("Personalization profiles")}</h2>
       <p>{t("Structured style settings are retained locally; no transcript examples are stored.")}</p>
+      {!settings.personalizationEnabled && <p role="status">{t("Inactive: Personalization is off, so these profiles are not used.")}</p>}
+      {!settings.textCorrectionEnabled && <p role="status">{t("Inactive: profiles are used only when AI text correction is on.")}</p>}
       <SettingRow title={t("Global profile")} detail={t("Fallback style used when no app or category profile matches.")} control={
         <div className="profile-controls">
           {global ? <>
