@@ -620,28 +620,81 @@ mod model_configuration_tests {
     }
 
     #[test]
-    fn stale_capture_cleanup_runs_when_history_audio_is_retained() {
+    fn legacy_keep_audio_setting_preserves_stale_captures_but_not_retry_copies() {
         let directory = tempfile::tempdir().unwrap();
-        let retained = directory
+        let legacy_capture = directory
             .path()
             .join(format!("local-ai-voice-{}-1-0.wav", u32::MAX));
-        fs::write(&retained, b"retained").unwrap();
+        let retry_copy = directory.path().join(format!(
+            "local-ai-voice-retry-{}-{}.wav",
+            u32::MAX,
+            "0123456789abcdef0123456789abcdef"
+        ));
+        fs::write(&legacy_capture, b"legacy").unwrap();
+        fs::write(&retry_copy, b"retry").unwrap();
 
         assert_eq!(
             cleanup_stale_artifacts(&directory.path().join("missing"), false).unwrap(),
             0
         );
         assert_eq!(cleanup_stale_artifacts(directory.path(), false).unwrap(), 1);
-        assert!(!retained.exists());
+        assert!(legacy_capture.exists());
+        assert!(!retry_copy.exists());
+        assert_eq!(cleanup_stale_artifacts(directory.path(), true).unwrap(), 1);
+        assert!(!legacy_capture.exists());
+    }
+
+    #[test]
+    fn stale_artifact_removal_decision_respects_legacy_keep_audio_setting() {
+        assert!(removes_stale_artifact(StaleArtifactKind::Capture, true));
+        assert!(!removes_stale_artifact(StaleArtifactKind::Capture, false));
+        assert!(removes_stale_artifact(StaleArtifactKind::RetryCopy, true));
+        assert!(removes_stale_artifact(StaleArtifactKind::RetryCopy, false));
+        assert_eq!(
+            stale_artifact(std::ffi::OsStr::new(&format!(
+                "local-ai-voice-{}-1-0.wav",
+                u32::MAX
+            ))),
+            Some((u32::MAX, StaleArtifactKind::Capture))
+        );
+        assert_eq!(
+            stale_artifact(std::ffi::OsStr::new(&format!(
+                "local-ai-voice-retry-7-{}.wav",
+                "0123456789abcdef0123456789abcdef"
+            ))),
+            Some((7, StaleArtifactKind::RetryCopy))
+        );
+        assert_eq!(
+            stale_artifact(std::ffi::OsStr::new("local-ai-voice-retry-7-short.wav")),
+            None
+        );
     }
 }
 
-fn artifact_process_id(name: &std::ffi::OsStr) -> Option<u32> {
+/// Temporary audio owned by a process that may have exited without cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StaleArtifactKind {
+    /// A capture WAV. Versions before History audio kept these in the
+    /// temporary directory when "Delete audio after processing" was off, so
+    /// they may be the user's only copy of a recording.
+    Capture,
+    /// A guarded History Retry copy. It is always cleanup-owned.
+    RetryCopy,
+}
+
+fn removes_stale_artifact(kind: StaleArtifactKind, delete_audio_after_processing: bool) -> bool {
+    match kind {
+        StaleArtifactKind::Capture => delete_audio_after_processing,
+        StaleArtifactKind::RetryCopy => true,
+    }
+}
+
+fn stale_artifact(name: &std::ffi::OsStr) -> Option<(u32, StaleArtifactKind)> {
     let name = name.to_str()?.strip_suffix(".wav")?;
     if let Some(retry) = name.strip_prefix("local-ai-voice-retry-") {
         let (process_id, token) = retry.split_once('-')?;
         if token.len() == 32 && token.chars().all(|character| character.is_ascii_hexdigit()) {
-            return process_id.parse().ok();
+            return Some((process_id.parse().ok()?, StaleArtifactKind::RetryCopy));
         }
         return None;
     }
@@ -655,7 +708,7 @@ fn artifact_process_id(name: &std::ffi::OsStr) -> Option<u32> {
     let process_id = components[0].parse().ok()?;
     components[1].parse::<u128>().ok()?;
     components[2].parse::<u64>().ok()?;
-    Some(process_id)
+    Some((process_id, StaleArtifactKind::Capture))
 }
 
 #[cfg(target_os = "windows")]
@@ -690,7 +743,7 @@ fn process_is_live(process_id: u32) -> bool {
 
 fn cleanup_stale_artifacts(
     directory: &Path,
-    _delete_audio_after_processing: bool,
+    delete_audio_after_processing: bool,
 ) -> io::Result<usize> {
     if !directory.exists() {
         return Ok(0);
@@ -698,9 +751,10 @@ fn cleanup_stale_artifacts(
     let mut removed = 0;
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        if artifact_process_id(&entry.file_name())
-            .is_some_and(|process_id| !process_is_live(process_id))
-        {
+        if stale_artifact(&entry.file_name()).is_some_and(|(process_id, kind)| {
+            removes_stale_artifact(kind, delete_audio_after_processing)
+                && !process_is_live(process_id)
+        }) {
             match fs::remove_file(entry.path()) {
                 Ok(()) => removed += 1,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
