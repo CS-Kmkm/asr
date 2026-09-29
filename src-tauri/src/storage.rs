@@ -658,56 +658,65 @@ impl Storage {
         context: Option<&crate::types::AppContext>,
         backend: &str,
     ) -> Result<Option<String>, StorageError> {
-        let entries = self.list_dictionary()?;
-        let mut terms = Vec::new();
-        let mut length = 0;
-        let budget = if backend == "faster-whisper" {
-            200
-        } else {
-            1200
-        };
-        for entry in entries
+        let entries = self
+            .list_dictionary()?
             .into_iter()
             .filter(|entry| scope_matches(entry.app_scope.as_deref(), context))
-        {
-            if backend == "faster-whisper" {
-                // Hotwords are plain terms, not the `reading => surface`
-                // syntax used by prompt-based backends. Prefer the surface,
-                // then aliases and manual readings within its small budget.
-                for term in std::iter::once(entry.surface.as_str())
-                    .chain(entry.aliases.iter().map(String::as_str))
-                    .chain((entry.source == "manual").then_some(entry.reading.as_str()))
-                {
-                    let separator = if terms.is_empty() { 0 } else { 2 };
-                    if length + term.chars().count() + separator <= budget {
-                        length += term.chars().count() + separator;
-                        terms.push(term.to_owned());
-                    }
-                }
-            } else {
-                let aliases = if entry.aliases.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (aliases: {})", entry.aliases.join(", "))
-                };
-                let term = if entry.source == "auto" {
-                    format!("{}{}", entry.surface, aliases)
-                } else {
-                    format!("{} => {}{}", entry.reading, entry.surface, aliases)
-                };
-                let separator = if terms.is_empty() { 0 } else { 1 };
-                if length + term.chars().count() + separator <= budget {
-                    length += term.chars().count() + separator;
-                    terms.push(term);
+            .collect::<Vec<_>>();
+        let mut terms = Vec::new();
+        let mut length = 0;
+        let mut push_within = |term: String, separator: usize, budget: usize| {
+            let separator = if terms.is_empty() { 0 } else { separator };
+            let size = term.chars().count() + separator;
+            if length + size <= budget {
+                length += size;
+                terms.push(term);
+            }
+        };
+        if backend == "faster-whisper" {
+            // Hotwords are plain terms, not the `reading => surface` syntax
+            // used by prompt-based backends. Every surface, in priority
+            // order, comes before any alias, and aliases before readings, so
+            // a high-priority entry's variants cannot spend the small budget
+            // ahead of lower-priority surfaces. Readings of auto entries are
+            // the misrecognized form and are never hotwords.
+            let mut seen = std::collections::HashSet::new();
+            for term in entries
+                .iter()
+                .map(|entry| entry.surface.as_str())
+                .chain(
+                    entries
+                        .iter()
+                        .flat_map(|entry| entry.aliases.iter().map(String::as_str)),
+                )
+                .chain(
+                    entries
+                        .iter()
+                        .filter(|entry| entry.source == "manual")
+                        .map(|entry| entry.reading.as_str()),
+                )
+            {
+                let term = term.trim();
+                if !term.is_empty() && seen.insert(term.to_lowercase()) {
+                    push_within(term.to_owned(), 2, 200);
                 }
             }
+            return Ok((!terms.is_empty()).then(|| terms.join(", ")));
         }
-        let separator = if backend == "faster-whisper" {
-            ", "
-        } else {
-            "\n"
-        };
-        Ok((!terms.is_empty()).then(|| terms.join(separator)))
+        for entry in entries {
+            let aliases = if entry.aliases.is_empty() {
+                String::new()
+            } else {
+                format!(" (aliases: {})", entry.aliases.join(", "))
+            };
+            let term = if entry.source == "auto" {
+                format!("{}{}", entry.surface, aliases)
+            } else {
+                format!("{} => {}{}", entry.reading, entry.surface, aliases)
+            };
+            push_within(term, 1, 1200);
+        }
+        Ok((!terms.is_empty()).then(|| terms.join("\n")))
     }
 
     pub fn dictionary_correction_hints(
@@ -2116,6 +2125,67 @@ mod tests {
             .unwrap();
         assert!(prompt.contains("おーぷんえーあい => OpenAI"));
         assert!(prompt.contains("ChatGPT"));
+    }
+
+    #[test]
+    fn hotwords_list_surfaces_then_aliases_then_readings_without_duplicates() {
+        let storage = Storage::in_memory().unwrap();
+        let high_aliases = vec!["High Alias".to_owned()];
+        let no_aliases = Vec::new();
+        for (reading, surface, aliases, priority) in [
+            ("high reading", "High", &high_aliases, 9),
+            // Readings equal to an earlier term are not repeated.
+            ("high alias", "Mid", &no_aliases, 5),
+            ("low", "Low", &no_aliases, 1),
+        ] {
+            storage
+                .add_dictionary_entry(&NewDictionaryEntry {
+                    reading,
+                    surface,
+                    category: None,
+                    aliases,
+                    priority,
+                    app_scope: None,
+                })
+                .unwrap();
+        }
+        let candidate = storage
+            .add_dictionary_candidate_from_correction("auto term", "AutoTerm", None)
+            .unwrap()
+            .unwrap();
+        storage.confirm_dictionary_candidate(candidate).unwrap();
+        assert_eq!(
+            storage
+                .dictionary_asr_prompt_for(None, "faster-whisper")
+                .unwrap()
+                .as_deref(),
+            Some("High, Mid, Low, AutoTerm, High Alias, high reading")
+        );
+
+        // A long reading of a high-priority entry no longer consumes the
+        // budget ahead of a lower-priority surface.
+        let storage = Storage::in_memory().unwrap();
+        let long_reading = "x".repeat(190);
+        for (reading, surface, priority) in [(long_reading.as_str(), "Alpha", 9), ("b", "Beta", 1)]
+        {
+            storage
+                .add_dictionary_entry(&NewDictionaryEntry {
+                    reading,
+                    surface,
+                    category: None,
+                    aliases: &no_aliases,
+                    priority,
+                    app_scope: None,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            storage
+                .dictionary_asr_prompt_for(None, "faster-whisper")
+                .unwrap()
+                .as_deref(),
+            Some("Alpha, Beta, b")
+        );
     }
 
     #[test]
