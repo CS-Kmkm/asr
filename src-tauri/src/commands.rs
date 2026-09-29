@@ -454,6 +454,9 @@ pub(crate) async fn stop_recording(
             Ok(translated) => {
                 final_text = translated;
                 processed_text = Some(final_text.clone());
+                // Publish before insertion so an insertion error cannot lose
+                // the completed translation.
+                let _ = app.emit("app-state", state.publish_result(final_text.clone()));
                 emit_correction_preview(&app, &final_text, "final");
                 let _ = storage.add_metric(
                     "voice_translation",
