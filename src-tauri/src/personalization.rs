@@ -1,6 +1,4 @@
-#[cfg(test)]
-use crate::types::ScopedStyleProfile;
-use crate::types::{AppContext, Settings, StyleProfile};
+use crate::types::{AppContext, ScopedStyleProfile, Settings, StyleProfile};
 
 pub(crate) const MAX_GUIDANCE_CHARS: usize = 300;
 pub(crate) const MAX_SCOPE_CHARS: usize = 80;
