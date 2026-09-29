@@ -25,11 +25,24 @@ Acceptance checks:
 7. Rust full library tests, `cargo fmt --check`, Clippy, all-target check, frontend TypeScript/build, and `git diff --check` pass.
 8. Manual Windows checks remain documented for a normal edit control, changed focus/selection, user input, IME, shortcut press/release, real microphone, and provider behavior.
 
-Status (2026-09-22):
-- Implementation complete in the stacked worktree; parent integration review remains.
-- Automated verification passed: `cargo test --lib` (141 passed, 0 failed, 4 ignored),
-  `cargo fmt --all -- --check`, `cargo clippy --all-targets --quiet`,
-  `cargo check --all-targets --quiet`, `pnpm.cmd run build` (`tsc && vite build`),
-  and `git diff --check`.
+Status (2026-09-29):
+- Implementation complete; PR #25 review fixes applied on this branch (not yet pushed):
+  - F1 (D4): the result keeps the selection's leading/trailing whitespace; other modes
+    keep the shared trim. Empty provider output is still rejected, and the README states
+    that deletion is not an Edit result.
+  - F2: when replacement and the clipboard fallback both fail, the edit is published to
+    app state, the overlay finishes, and a localized Error state is emitted.
+  - F3 (D1): Dictate and both Translate actions keep a chord shared with Edit; Edit is not
+    dispatched on it and the startup warning names Speak to edit. The voice Translate vs
+    selected-text translation order is fixed in the #8 branch.
+  - F6: History/metric save warnings describe the edit as completed only after a
+    confirmed paste; otherwise they say the edit remains on the clipboard (ja/en).
+- Automated verification passed (2026-09-29): `cargo test --lib -j 4` (162 passed,
+  0 failed, 4 ignored), `cargo fmt --check`, `cargo clippy -j 4` and
+  `cargo clippy --all-targets -j 4` (no errors; existing warnings are in unchanged
+  code only), `pnpm exec tsc --noEmit`, `pnpm build`, and `git diff --check`.
+- Open follow-ups (out of scope for this fix wave): command-level tests for the
+  `stop_recording` Edit branch (review F4) and the local provider output limit for
+  large rewrites (review F5).
 - Manual Windows verification is documented in `docs/windows_verification.md` and
   remains unverified in this environment.
