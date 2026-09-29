@@ -277,6 +277,7 @@ function PersonalizationProfiles({
       } />
       <div className="profile-list">
         <strong>{t("Scoped profiles")}</strong>
+        <p>{t("Precedence is fixed: exact app > category > global. List order has no effect.")}</p>
         {profileDraftIsInvalid && <p role="alert">{t("Profile scopes must be valid and unique before changes are saved.")}</p>}
         {profiles.map((item, index) => (
           <div className="setting-row" key={index}>
@@ -285,8 +286,6 @@ function PersonalizationProfiles({
             <select value={item.profile.detail} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, detail: e.target.value as StyleProfile["detail"] } }; onSaveProfiles(next); }}><option value="concise">{t("Concise")}</option><option value="detailed">{t("Detailed")}</option></select>
             <input maxLength={300} placeholder={t("Optional guidance")} value={item.profile.guidance ?? ""} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, guidance: e.target.value } }; onSaveProfiles(next); }} />
             <button className="secondary" onClick={() => onSaveProfiles(profiles.filter((_, i) => i !== index))}>{t("Remove")}</button>
-            <button className="secondary" disabled={index === 0} onClick={() => { const next = [...profiles]; [next[index - 1], next[index]] = [next[index], next[index - 1]]; onSaveProfiles(next); }}>↑</button>
-            <button className="secondary" disabled={index === profiles.length - 1} onClick={() => { const next = [...profiles]; [next[index], next[index + 1]] = [next[index + 1], next[index]]; onSaveProfiles(next); }}>↓</button>
           </div>
         ))}
         <button className="primary" onClick={() => onSaveProfiles([...profiles, { scope: "category:other", profile: { formality: "formal", detail: "concise", guidance: "" } }])}>{t("Add scoped profile")}</button>
