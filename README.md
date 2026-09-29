@@ -290,4 +290,6 @@ Full usage and Phase 0 gate criteria are documented in
 - Model download progress/resume UI and checksum verification remain future model
   management work; Transformers manages the current cache download.
 - The default shortcut is registered at startup, and persisted custom shortcuts
-  are re-registered on launch.
+  are re-registered on launch. If another app holds a saved hotkey, the app
+  names the action that stays unavailable; saving other settings still works,
+  while choosing a new hotkey that cannot be registered is rejected.

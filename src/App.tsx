@@ -131,6 +131,7 @@ const WARNING_STATUS_KINDS = new Set([
   "gpu_unavailable",
   "history_and_metric_save_failed",
   "history_save_failed",
+  "hotkey_unavailable",
   "metric_save_failed",
   "paste_unverified",
   "streaming_insertion_unavailable",
@@ -437,13 +438,23 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     try {
       const saved = await updateSettings(next);
       setSettings(saved);
+      let hotkeyWarnings: string[] = [];
       try {
-        setStartupHotkeyWarnings(await getStartupHotkeyWarning());
+        hotkeyWarnings = await getStartupHotkeyWarning();
+        setStartupHotkeyWarnings(hotkeyWarnings);
       } catch {
         // Keep the known warning if diagnostics cannot be refreshed.
       }
       onLanguageChange(saved.uiLanguage);
-      showNotice(translate(saved.uiLanguage, "Settings saved locally."), "success");
+      // A saved hotkey that still cannot be registered does not fail the save,
+      // but the notice names the action that stays unavailable.
+      showNotice(
+        [
+          translate(saved.uiLanguage, "Settings saved locally."),
+          ...hotkeyWarnings.map((message) => translateAppMessage(saved.uiLanguage, message)),
+        ].join(" "),
+        hotkeyWarnings.length > 0 ? "warning" : "success",
+      );
     } catch (error) {
       setSettings(previous);
       showNotice(String(error), "error");

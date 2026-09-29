@@ -689,6 +689,97 @@ fn hotkey_changes(registered: &[Shortcut], desired: &[Shortcut]) -> (Vec<Shortcu
     )
 }
 
+/// The OS global-shortcut service, abstracted so the save-time registration
+/// policy can be tested without it.
+trait HotkeyRegistrar {
+    fn register(&mut self, shortcut: Shortcut) -> Result<(), String>;
+    fn unregister(&mut self, shortcut: Shortcut) -> Result<(), String>;
+}
+
+struct GlobalHotkeys<'a>(&'a AppHandle);
+
+impl HotkeyRegistrar for GlobalHotkeys<'_> {
+    fn register(&mut self, shortcut: Shortcut) -> Result<(), String> {
+        self.0
+            .global_shortcut()
+            .register(shortcut)
+            .map_err(|error| error.to_string())
+    }
+
+    fn unregister(&mut self, shortcut: Shortcut) -> Result<(), String> {
+        self.0
+            .global_shortcut()
+            .unregister(shortcut)
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HotkeyUpdate {
+    removed: Vec<Shortcut>,
+    added: Vec<Shortcut>,
+    /// Actions saved with an unchanged chord that still cannot be registered.
+    unavailable: Vec<HotkeyAction>,
+}
+
+/// Moves `registered` to the chords in `desired`. When an action keeps the
+/// chord it already had (for example one another app held at startup) and
+/// that chord still cannot be registered, the action is reported as
+/// unavailable instead of failing an unrelated save. Any other failure rolls
+/// back this update and fails.
+fn update_hotkey_registrations(
+    registrar: &mut impl HotkeyRegistrar,
+    registered: &mut Vec<Shortcut>,
+    desired: &[HotkeyBinding],
+    previous: &[HotkeyBinding],
+) -> Result<HotkeyUpdate, String> {
+    let chords: Vec<Shortcut> = desired.iter().map(|&(_, shortcut)| shortcut).collect();
+    let (to_remove, to_add) = hotkey_changes(registered, &chords);
+    let mut update = HotkeyUpdate::default();
+    for shortcut in to_remove {
+        if let Err(error) = registrar.unregister(shortcut) {
+            rollback_hotkey_update(registrar, registered, &update);
+            return Err(format!("hotkey update failed: {error}"));
+        }
+        registered.retain(|active| *active != shortcut);
+        update.removed.push(shortcut);
+    }
+    for &(action, shortcut) in desired
+        .iter()
+        .filter(|(_, shortcut)| to_add.contains(shortcut))
+    {
+        match registrar.register(shortcut) {
+            Ok(()) => {
+                registered.push(shortcut);
+                update.added.push(shortcut);
+            }
+            Err(_) if previous.contains(&(action, shortcut)) => update.unavailable.push(action),
+            Err(error) => {
+                rollback_hotkey_update(registrar, registered, &update);
+                return Err(format!("hotkey registration failed: {error}"));
+            }
+        }
+    }
+    Ok(update)
+}
+
+fn rollback_hotkey_update(
+    registrar: &mut impl HotkeyRegistrar,
+    registered: &mut Vec<Shortcut>,
+    update: &HotkeyUpdate,
+) {
+    for shortcut in update.added.iter().rev() {
+        if registrar.unregister(*shortcut).is_ok() {
+            registered.retain(|active| active != shortcut);
+        }
+    }
+    for shortcut in &update.removed {
+        if registrar.register(*shortcut).is_ok() {
+            registered.push(*shortcut);
+        }
+    }
+}
+
 #[tauri::command]
 pub(crate) fn get_startup_hotkey_warning(services: State<'_, Services>) -> Vec<String> {
     services
@@ -859,7 +950,7 @@ mod tests {
     }
 
     #[test]
-    fn hotkey_repair_uses_only_confirmed_registrations() {
+    fn hotkey_changes_add_only_unregistered_chords() {
         let dictate = parse_shortcut("CommandOrControl+Shift+D").unwrap();
         let translate = parse_shortcut("CommandOrControl+Shift+T").unwrap();
         let selected = parse_shortcut("CommandOrControl+Shift+Y").unwrap();
@@ -876,6 +967,115 @@ mod tests {
             hotkey_changes(&registered, &repaired),
             (vec![], vec![translate])
         );
+    }
+
+    /// Registers every chord except those another app holds.
+    struct TestRegistrar {
+        held_elsewhere: Vec<Shortcut>,
+    }
+
+    impl HotkeyRegistrar for TestRegistrar {
+        fn register(&mut self, shortcut: Shortcut) -> Result<(), String> {
+            if self.held_elsewhere.contains(&shortcut) {
+                Err("held by another app".into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn unregister(&mut self, _shortcut: Shortcut) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn chord(value: &str) -> Shortcut {
+        parse_shortcut(value).unwrap()
+    }
+
+    #[test]
+    fn unchanged_unregistrable_hotkey_warns_without_failing_unrelated_saves() {
+        use HotkeyAction::{Dictate, SelectedTextTranslate, VoiceTranslate};
+        let (dictate, selected, voice) = (
+            chord("Ctrl+Shift+Space"),
+            chord("Ctrl+Shift+T"),
+            chord("Ctrl+Shift+Y"),
+        );
+        // Another app held voice Translate's chord at startup.
+        let previous = vec![
+            (Dictate, dictate),
+            (SelectedTextTranslate, selected),
+            (VoiceTranslate, voice),
+        ];
+        let mut registrar = TestRegistrar {
+            held_elsewhere: vec![voice],
+        };
+        let mut registered = vec![dictate, selected];
+
+        let unrelated_save =
+            update_hotkey_registrations(&mut registrar, &mut registered, &previous, &previous)
+                .unwrap();
+        assert_eq!(unrelated_save.unavailable, vec![VoiceTranslate]);
+        assert_eq!(registered, vec![dictate, selected]);
+
+        let moved_selected = chord("Ctrl+Shift+U");
+        let desired = vec![
+            (Dictate, dictate),
+            (SelectedTextTranslate, moved_selected),
+            (VoiceTranslate, voice),
+        ];
+        let update =
+            update_hotkey_registrations(&mut registrar, &mut registered, &desired, &previous)
+                .unwrap();
+        assert_eq!(update.removed, vec![selected]);
+        assert_eq!(update.added, vec![moved_selected]);
+        assert_eq!(update.unavailable, vec![VoiceTranslate]);
+        assert_eq!(registered, vec![dictate, moved_selected]);
+    }
+
+    #[test]
+    fn newly_assigned_unregistrable_hotkey_fails_and_rolls_back() {
+        use HotkeyAction::{Dictate, SelectedTextTranslate, VoiceTranslate};
+        let (dictate, selected, voice, held) = (
+            chord("Ctrl+Shift+Space"),
+            chord("Ctrl+Shift+T"),
+            chord("Ctrl+Shift+Y"),
+            chord("Ctrl+Shift+H"),
+        );
+        let previous = vec![
+            (Dictate, dictate),
+            (SelectedTextTranslate, selected),
+            (VoiceTranslate, voice),
+        ];
+        let mut registrar = TestRegistrar {
+            held_elsewhere: vec![held],
+        };
+        let mut registered = vec![dictate, selected, voice];
+        let desired = vec![
+            (Dictate, dictate),
+            (SelectedTextTranslate, chord("Ctrl+Shift+U")),
+            (VoiceTranslate, held),
+        ];
+        assert_eq!(
+            update_hotkey_registrations(&mut registrar, &mut registered, &desired, &previous),
+            Err("hotkey registration failed: held by another app".into())
+        );
+        assert_eq!(registered, vec![dictate, selected, voice]);
+
+        // A chord that only another action had before is also a new choice.
+        let mut registrar = TestRegistrar {
+            held_elsewhere: vec![voice],
+        };
+        let mut registered = vec![dictate, selected];
+        let swapped = vec![
+            (Dictate, voice),
+            (SelectedTextTranslate, selected),
+            (VoiceTranslate, dictate),
+        ];
+        assert!(
+            update_hotkey_registrations(&mut registrar, &mut registered, &swapped, &previous)
+                .is_err()
+        );
+        assert_eq!(registered, vec![dictate, selected]);
     }
 
     #[test]
@@ -1246,60 +1446,43 @@ pub(crate) async fn update_settings(
                 .into(),
         );
     }
-    let new_shortcuts: Vec<Shortcut> = hotkeys
-        .active
-        .iter()
-        .map(|&(_, shortcut)| shortcut)
-        .collect();
-    {
+    let unavailable_hotkeys = {
         let mut registered = services
             .registered_hotkeys
             .lock()
             .map_err(|_| "hotkey registration state is unavailable".to_string())?;
-        let (to_remove, to_add) = hotkey_changes(&registered, &new_shortcuts);
-        let mut removed = Vec::new();
-        let mut added = Vec::new();
-        let rollback_shortcuts =
-            |removed: &[Shortcut], added: &[Shortcut], registered: &mut Vec<Shortcut>| {
-                for shortcut in added.iter().rev() {
-                    if app.global_shortcut().unregister(*shortcut).is_ok() {
-                        registered.retain(|active| active != shortcut);
-                    }
-                }
-                for shortcut in removed {
-                    if app.global_shortcut().register(*shortcut).is_ok() {
-                        registered.push(*shortcut);
-                    }
-                }
-            };
-        for shortcut in to_remove {
-            if let Err(error) = app.global_shortcut().unregister(shortcut) {
-                rollback_shortcuts(&removed, &added, &mut registered);
-                return Err(format!("hotkey update failed: {error}"));
-            }
-            registered.retain(|active| *active != shortcut);
-            removed.push(shortcut);
-        }
-        for shortcut in to_add {
-            if let Err(error) = app.global_shortcut().register(shortcut) {
-                rollback_shortcuts(&removed, &added, &mut registered);
-                return Err(format!("hotkey registration failed: {error}"));
-            }
-            registered.push(shortcut);
-            added.push(shortcut);
-        }
+        let mut registrar = GlobalHotkeys(&app);
+        let previous_hotkeys = hotkey_bindings(&previous).unwrap_or_default();
+        let update = update_hotkey_registrations(
+            &mut registrar,
+            &mut registered,
+            &hotkeys.active,
+            &previous_hotkeys,
+        )?;
         if let Err(error) = storage.apply_history_policy(&previous, &settings) {
-            rollback_shortcuts(&removed, &added, &mut registered);
+            rollback_hotkey_update(&mut registrar, &mut registered, &update);
             return Err(command_error(error));
         }
         if let Err(error) = storage.update_settings(&settings) {
-            rollback_shortcuts(&removed, &added, &mut registered);
+            rollback_hotkey_update(&mut registrar, &mut registered, &update);
             return Err(command_error(error));
         }
-    }
-    // Saved chords are distinct and every one is registered.
+        update.unavailable
+    };
+    // Saved chords are distinct; only unchanged chords that still cannot be
+    // registered remain as warnings.
     if let Ok(mut issues) = services.startup_hotkey_issues.lock() {
-        *issues = HotkeyIssues::default();
+        *issues = HotkeyIssues {
+            collisions: Vec::new(),
+            unregistered: unavailable_hotkeys.clone(),
+        };
+    }
+    for action in unavailable_hotkeys {
+        emit_status(
+            &app,
+            "hotkey_unavailable",
+            action.registration_failed_message(),
+        );
     }
     if settings.auto_start != previous.auto_start {
         let result = if settings.auto_start {
