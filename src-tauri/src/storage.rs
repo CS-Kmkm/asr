@@ -978,8 +978,11 @@ pub(crate) fn detect_dictionary_candidate(
         corrected_end -= 1;
     }
     // The shortest character diff can be a single letter or an empty span for
-    // spacing changes. Expand both sides to complete adjacent terms.
-    let is_term = |character: char| character.is_alphanumeric() || matches!(character, '-' | '_');
+    // spacing changes. Expand both sides to complete adjacent ASCII terms only:
+    // Japanese text has no spaces, so expanding over every alphanumeric
+    // character would absorb the surrounding kana/kanji clause.
+    let is_term =
+        |character: char| character.is_ascii_alphanumeric() || matches!(character, '-' | '_');
     let mut original_start = prefix;
     let mut preferred_start = prefix;
     while original_start > 0 && is_term(original_chars[original_start - 1]) {
@@ -996,10 +999,17 @@ pub(crate) fn detect_dictionary_candidate(
     }
     let original_span = original_chars[original_start..original_end]
         .iter()
-        .collect::<String>();
+        .collect::<String>()
+        .trim()
+        .to_owned();
     let preferred_span = corrected_chars[preferred_start..corrected_end]
         .iter()
-        .collect::<String>();
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    if original_span == preferred_span {
+        return None;
+    }
     let normalized = |value: &str| {
         value
             .chars()
@@ -1014,18 +1024,75 @@ pub(crate) fn detect_dictionary_candidate(
             || value.chars().count() > MAX_CANDIDATE_CHARS
             || value.contains(['\n', '\r'])
             || value.chars().any(char::is_control)
+            // A changed region that still contains other scripts or
+            // punctuation spans more than one ASCII term (for example two
+            // terms joined by Japanese text) and is not a preferred spelling.
+            || !value
+                .chars()
+                .all(|character| is_term(character) || character.is_whitespace())
             || value
                 .chars()
                 .all(|character| character.is_ascii_digit() || matches!(character, ' ' | '-' | '_'))
     };
     if invalid(&original_span)
         || invalid(&preferred_span)
-        || original_normalized.is_empty()
+        // A single letter (`i` -> `I`) is grammar, not vocabulary.
+        || original_normalized.chars().count() <= 1
         || original_normalized != preferred_normalized
+        || is_sentence_start_capitalization(
+            &original_span,
+            &preferred_span,
+            &corrected_chars[..preferred_start],
+        )
     {
         return None;
     }
     Some((original_span, preferred_span))
+}
+
+/// True when the spans differ only in the case of their first letter and the
+/// span starts a sentence, which is ordinary capitalization rather than a
+/// preferred spelling (`hello` -> `Hello`).
+fn is_sentence_start_capitalization(original: &str, preferred: &str, before: &[char]) -> bool {
+    let mut original_chars = original.chars();
+    let mut preferred_chars = preferred.chars();
+    let (Some(original_first), Some(preferred_first)) =
+        (original_chars.next(), preferred_chars.next())
+    else {
+        return false;
+    };
+    if original_first == preferred_first
+        || !original_first.eq_ignore_ascii_case(&preferred_first)
+        || original_chars.as_str() != preferred_chars.as_str()
+    {
+        return false;
+    }
+    before
+        .iter()
+        .rev()
+        .find(|character| !character.is_whitespace() || matches!(character, '\n' | '\r'))
+        .is_none_or(|character| {
+            matches!(
+                character,
+                '\n' | '\r'
+                    | '.'
+                    | '!'
+                    | '?'
+                    | ':'
+                    | '。'
+                    | '！'
+                    | '？'
+                    | '：'
+                    | '「'
+                    | '『'
+                    | '“'
+                    | '"'
+                    | '-'
+                    | '*'
+                    | '•'
+                    | '・'
+            )
+        })
 }
 
 #[cfg(test)]
@@ -1654,7 +1721,6 @@ mod tests {
             "foo/bar",
             "module.function",
             "foo + bar",
-            "123-456",
             "foo::bar",
             "foo()",
             "line\nbreak",
@@ -1666,6 +1732,16 @@ mod tests {
             );
         }
         assert_eq!(detect_dictionary_candidate("foo + bar", "Foo+Bar"), None);
+        // Only the numeric-only rule rejects this spacing change: the same
+        // change between letters is a candidate.
+        assert_eq!(
+            detect_dictionary_candidate("call 123 456", "call 123-456"),
+            None
+        );
+        assert_eq!(
+            detect_dictionary_candidate("call abc def", "call abc-def"),
+            Some(("abc def".into(), "abc-def".into()))
+        );
         assert_eq!(
             detect_dictionary_candidate("use Github", "use GitHub"),
             Some(("Github".into(), "GitHub".into()))
@@ -1703,6 +1779,63 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn candidate_spans_stay_on_ascii_terms_in_mixed_script_text() {
+        for (original, corrected, expected) in [
+            (
+                "これはgithubです。",
+                "これはGitHubです。",
+                ("github", "GitHub"),
+            ),
+            (
+                "明日chat gptを使います",
+                "明日ChatGPTを使います",
+                ("chat gpt", "ChatGPT"),
+            ),
+            (
+                "資料はopen aiのサイトにあります。",
+                "資料はOpenAIのサイトにあります。",
+                ("open ai", "OpenAI"),
+            ),
+            (
+                "今日はpythonを書く",
+                "今日はPythonを書く",
+                ("python", "Python"),
+            ),
+            (
+                "I use python daily",
+                "I use Python daily",
+                ("python", "Python"),
+            ),
+        ] {
+            assert_eq!(
+                detect_dictionary_candidate(original, corrected),
+                Some((expected.0.to_owned(), expected.1.to_owned())),
+                "{original}"
+            );
+        }
+        for (original, corrected) in [
+            // Two changed terms joined by Japanese text are not one term.
+            ("githubとgitlab", "GitHubとGitLab"),
+            // Sentence-start capitalization is not a preferred spelling.
+            ("hello world", "Hello world"),
+            ("Thanks. hello there", "Thanks. Hello there"),
+            ("githubは便利です", "Githubは便利です"),
+            ("了解です。github", "了解です。Github"),
+            ("first line\nhello there", "first line\nHello there"),
+            // Single-letter spans are grammar, not vocabulary.
+            ("so i think", "so I think"),
+            ("i think", "I think"),
+            ("これはaです", "これはAです"),
+        ] {
+            assert_eq!(
+                detect_dictionary_candidate(original, corrected),
+                None,
+                "{original}"
+            );
+        }
     }
 
     #[test]
