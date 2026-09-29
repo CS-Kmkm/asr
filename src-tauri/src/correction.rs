@@ -861,9 +861,13 @@ mod tests {
             guidance: None,
         });
         let instruction = build_correction_instruction(&settings, &[], Some(&guidance));
-        assert!(instruction.contains("Preserve tone unless a trusted style profile"));
-        assert!(instruction.contains("except for the limited formality/detail changes"));
-        assert!(instruction.contains("never add new facts"));
+        assert!(
+            instruction.contains("Apart from applying the trusted style profile, preserve tone")
+        );
+        assert!(
+            instruction.contains("except to apply the trusted style profile's writing preferences")
+        );
+        assert!(instruction.contains("must never add, remove, or change facts"));
         assert!(instruction.contains("never add new details"));
     }
 

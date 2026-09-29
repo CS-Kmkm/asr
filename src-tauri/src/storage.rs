@@ -1311,6 +1311,71 @@ mod tests {
     }
 
     #[test]
+    fn app_lookup_failure_uses_global_entries_and_records_no_category() {
+        let storage = Storage::in_memory().unwrap();
+        let aliases = Vec::new();
+        for (reading, surface, scope) in [
+            ("global-reading", "Global", None),
+            ("other-reading", "OtherCategory", Some("category:other")),
+            ("editor-reading", "EditorApp", Some("app:myeditor")),
+        ] {
+            storage
+                .add_dictionary_entry(&NewDictionaryEntry {
+                    reading,
+                    surface,
+                    category: None,
+                    aliases: &aliases,
+                    priority: 1,
+                    app_scope: scope,
+                })
+                .unwrap();
+        }
+
+        let failed = crate::app_context::from_executable_path(None);
+        assert_eq!(
+            storage
+                .dictionary_prompt_terms_for(failed.as_ref())
+                .unwrap(),
+            vec!["global-reading => Global".to_string()]
+        );
+        let hints = storage
+            .dictionary_correction_hints(
+                "global-reading other-reading editor-reading",
+                failed.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(hints, vec!["Global<=global-reading".to_string()]);
+        let mut value = item();
+        value.app_category = crate::app_context::history_category(failed.as_ref());
+        storage.add_history(&value).unwrap();
+        assert_eq!(storage.list_history(10).unwrap()[0].app_category, None);
+
+        let unclassified = crate::app_context::from_executable_path(Some(r"C:\Tools\MyEditor.exe"));
+        let terms = storage
+            .dictionary_prompt_terms_for(unclassified.as_ref())
+            .unwrap();
+        for surface in ["Global", "OtherCategory", "EditorApp"] {
+            assert!(
+                terms
+                    .iter()
+                    .any(|term| term.ends_with(&format!("=> {surface}"))),
+                "missing {surface}"
+            );
+        }
+        let mut value = item();
+        value.app_category = crate::app_context::history_category(unclassified.as_ref());
+        storage.add_history(&value).unwrap();
+        let mut categories = storage
+            .list_history(10)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.app_category)
+            .collect::<Vec<_>>();
+        categories.sort();
+        assert_eq!(categories, vec![None, Some("other".to_string())]);
+    }
+
+    #[test]
     fn dictionary_correction_hints_map_aliases_to_preferred_surface() {
         let storage = Storage::in_memory().unwrap();
         let aliases = vec!["Chat GPT".into()];
