@@ -65,6 +65,44 @@ fn persist_edit_completion(
     (history_failed, metric_failed)
 }
 
+/// This warning follows, and visually replaces, the completion notice. Only a
+/// confirmed paste may be described as a completed edit.
+fn edit_persistence_warning(
+    insertion: InsertResult,
+    history_failed: bool,
+    metric_failed: bool,
+) -> Option<(&'static str, &'static str)> {
+    let replaced = insertion == InsertResult::ClipboardPaste;
+    let warning = match (history_failed, metric_failed, replaced) {
+        (false, false, _) => return None,
+        (true, true, true) => (
+            "history_metric_save_failed",
+            "The edit was completed, but history and usage metrics could not be saved.",
+        ),
+        (true, false, true) => (
+            "history_save_failed",
+            "The edit was completed, but history could not be saved.",
+        ),
+        (false, true, true) => (
+            "metric_save_failed",
+            "The edit was completed, but usage metrics could not be saved.",
+        ),
+        (true, true, false) => (
+            "history_metric_save_failed",
+            "The edit remains on the clipboard, but history and usage metrics could not be saved.",
+        ),
+        (true, false, false) => (
+            "history_save_failed",
+            "The edit remains on the clipboard, but history could not be saved.",
+        ),
+        (false, true, false) => (
+            "metric_save_failed",
+            "The edit remains on the clipboard, but usage metrics could not be saved.",
+        ),
+    };
+    Some(warning)
+}
+
 async fn take_published_sessions<T, U>(
     live: &tokio::sync::Mutex<Option<T>>,
     edit: &tokio::sync::Mutex<Option<U>>,
@@ -602,24 +640,10 @@ pub(crate) async fn stop_recording(
         let snapshot = state.complete(edited.clone(), completion.into());
         let _ = app.emit("app-state", snapshot);
         emit_status(&app, insertion_label, completion);
-        if history_failed && metric_failed {
-            emit_status(
-                &app,
-                "history_metric_save_failed",
-                "The edit was completed, but history and usage metrics could not be saved.",
-            );
-        } else if history_failed {
-            emit_status(
-                &app,
-                "history_save_failed",
-                "The edit was completed, but history could not be saved.",
-            );
-        } else if metric_failed {
-            emit_status(
-                &app,
-                "metric_save_failed",
-                "The edit was completed, but usage metrics could not be saved.",
-            );
+        if let Some((kind, message)) =
+            edit_persistence_warning(insertion, history_failed, metric_failed)
+        {
+            emit_status(&app, kind, message);
         }
         return Ok(RecordingResult {
             text: edited,
@@ -1131,6 +1155,38 @@ mod tests {
             edit_insertion_outcome(Err::<InsertResult, _>("replace"), || Err("clipboard")),
             None
         );
+    }
+
+    #[test]
+    fn edit_persistence_warning_claims_completion_only_after_a_confirmed_paste() {
+        for insertion in [
+            InsertResult::ClipboardPaste,
+            InsertResult::ClipboardOnly,
+            InsertResult::PasteUnverified,
+        ] {
+            assert_eq!(edit_persistence_warning(insertion, false, false), None);
+            for (history_failed, metric_failed, kind) in [
+                (true, true, "history_metric_save_failed"),
+                (true, false, "history_save_failed"),
+                (false, true, "metric_save_failed"),
+            ] {
+                let (actual_kind, message) =
+                    edit_persistence_warning(insertion, history_failed, metric_failed).unwrap();
+                assert_eq!(actual_kind, kind);
+                if insertion == InsertResult::ClipboardPaste {
+                    assert!(message.starts_with("The edit was completed"), "{message}");
+                } else {
+                    assert!(!message.contains("completed"), "{message}");
+                    assert!(message.contains("remains on the clipboard"), "{message}");
+                }
+                assert_eq!(message.contains("history"), history_failed, "{message}");
+                assert_eq!(
+                    message.contains("usage metrics"),
+                    metric_failed,
+                    "{message}"
+                );
+            }
+        }
     }
 
     #[test]
