@@ -26,6 +26,24 @@ fn cancellation_copy(mode: PipelineMode) -> (&'static str, &'static str) {
     }
 }
 
+const EDIT_CLIPBOARD_UNAVAILABLE: &str =
+    "The original selection was not changed, and the clipboard is unavailable; the edit is available in this app.";
+
+/// A replacement error happens before any paste, so the original selection is
+/// unchanged and the clipboard is the fallback. `None` means the edit reached
+/// neither the target nor the clipboard.
+fn edit_insertion_outcome<E, F>(
+    replaced: Result<InsertResult, E>,
+    copy_to_clipboard: impl FnOnce() -> Result<(), F>,
+) -> Option<InsertResult> {
+    match replaced {
+        Ok(result) => Some(result),
+        Err(_) => copy_to_clipboard()
+            .ok()
+            .map(|()| InsertResult::ClipboardOnly),
+    }
+}
+
 fn persist_edit_completion(
     storage: &Storage,
     item: &NewHistoryItem<'_>,
@@ -534,22 +552,23 @@ pub(crate) async fn stop_recording(
             AppPhase::Injecting,
             "Replacing the original selection.",
         );
-        let insertion = match session.injector.replace_selection(
-            &session.selection,
-            &edited,
-            &session.monitor,
-            session.checkpoint,
-        ) {
-            Ok(result) => result,
-            Err(_) => {
-                session
-                    .injector
-                    .copy_to_clipboard(&edited)
-                    .map_err(command_error)?;
-                InsertResult::ClipboardOnly
-            }
-        };
+        let insertion = edit_insertion_outcome(
+            session.injector.replace_selection(
+                &session.selection,
+                &edited,
+                &session.monitor,
+                session.checkpoint,
+            ),
+            || session.injector.copy_to_clipboard(&edited),
+        );
         recording_overlay::set_phase(&app, &AppPhase::Completed);
+        let Some(insertion) = insertion else {
+            // Neither the target nor the clipboard received the edit. Keep it
+            // recoverable in this app and end the operation visibly.
+            state.publish_result(edited.clone());
+            emit_state(&app, &state, AppPhase::Error, EDIT_CLIPBOARD_UNAVAILABLE);
+            return Err(EDIT_CLIPBOARD_UNAVAILABLE.into());
+        };
         let latency_ms = started.elapsed().as_millis() as u64;
         let (history_failed, metric_failed) = persist_edit_completion(
             &storage,
@@ -1089,6 +1108,28 @@ mod tests {
         assert_eq!(
             persist_edit_completion(&storage, &item, "local", 200),
             (true, false)
+        );
+    }
+
+    #[test]
+    fn edit_replacement_failure_falls_back_to_clipboard_or_reports_no_outcome() {
+        for result in [
+            InsertResult::ClipboardPaste,
+            InsertResult::ClipboardOnly,
+            InsertResult::PasteUnverified,
+        ] {
+            let outcome = edit_insertion_outcome(Ok::<_, ()>(result), || -> Result<(), ()> {
+                panic!("a completed replacement must not copy again")
+            });
+            assert_eq!(outcome, Some(result));
+        }
+        assert_eq!(
+            edit_insertion_outcome(Err::<InsertResult, _>("replace"), || Ok::<_, ()>(())),
+            Some(InsertResult::ClipboardOnly)
+        );
+        assert_eq!(
+            edit_insertion_outcome(Err::<InsertResult, _>("replace"), || Err("clipboard")),
+            None
         );
     }
 
