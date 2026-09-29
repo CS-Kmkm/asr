@@ -1569,6 +1569,168 @@ mod tests {
         }
     }
 
+    fn insert_history_at(storage: &Storage, text: &str, created_at: chrono::DateTime<Utc>) {
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO dictation_history(transcript_text, mode, asr_provider, created_at)
+                 VALUES (?1, 'faithful', 'test', ?2)",
+                params![text, created_at.to_rfc3339()],
+            )
+            .unwrap();
+    }
+
+    fn history_texts(storage: &Storage) -> Vec<String> {
+        storage
+            .list_history(HistoryFilter::All, 10)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.transcript_text)
+            .collect()
+    }
+
+    fn stored_row_count(storage: &Storage) -> i64 {
+        storage
+            .connection()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM dictation_history", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    fn history_audio_files(storage: &Storage) -> Vec<PathBuf> {
+        match fs::read_dir(&storage.history_audio_dir) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_file())
+                .collect(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("history audio directory is unreadable: {error}"),
+        }
+    }
+
+    fn source_wav() -> PathBuf {
+        let source =
+            std::env::temp_dir().join(format!("history-source-{}.wav", random_audio_stem()));
+        fs::write(&source, b"RIFF test wav").unwrap();
+        source
+    }
+
+    #[test]
+    fn forever_retention_keeps_rows_of_any_age() {
+        let storage = Storage::in_memory().unwrap();
+        let settings = Settings {
+            history_retention: HistoryRetention::Forever,
+            ..Settings::default()
+        };
+        insert_history_at(
+            &storage,
+            "ancient",
+            Utc::now() - chrono::Duration::days(3650),
+        );
+        insert_history_at(&storage, "recent", Utc::now());
+
+        storage
+            .update_settings_and_apply_history_policy(&settings)
+            .unwrap();
+        storage.enforce_current_history_policy().unwrap();
+        assert!(storage.add_history(&item()).unwrap());
+
+        let texts = history_texts(&storage);
+        assert_eq!(texts.len(), 3);
+        assert!(texts.iter().any(|text| text == "ancient"));
+    }
+
+    #[test]
+    fn finite_retention_keeps_rows_inside_the_window_and_purges_older_rows() {
+        for retention in [
+            HistoryRetention::TwentyFourHours,
+            HistoryRetention::OneWeek,
+            HistoryRetention::OneMonth,
+            HistoryRetention::OneYear,
+        ] {
+            let storage = Storage::in_memory().unwrap();
+            let window = chrono::Duration::days(retention.days().unwrap());
+            insert_history_at(
+                &storage,
+                "inside",
+                Utc::now() - window + chrono::Duration::hours(1),
+            );
+            insert_history_at(
+                &storage,
+                "outside",
+                Utc::now() - window - chrono::Duration::hours(1),
+            );
+
+            storage
+                .update_settings_and_apply_history_policy(&Settings {
+                    history_retention: retention,
+                    ..Settings::default()
+                })
+                .unwrap();
+
+            assert_eq!(history_texts(&storage), vec!["inside"], "{retention:?}");
+        }
+    }
+
+    #[test]
+    fn never_with_source_audio_stores_neither_row_nor_file() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .update_settings(&Settings {
+                history_retention: HistoryRetention::Never,
+                delete_audio_after_processing: false,
+                ..Settings::default()
+            })
+            .unwrap();
+        let source = source_wav();
+
+        assert_eq!(
+            storage
+                .add_history_with_audio_report(&item(), Some(&source))
+                .unwrap(),
+            (false, false)
+        );
+
+        assert_eq!(stored_row_count(&storage), 0);
+        assert!(history_audio_files(&storage).is_empty());
+        assert!(source.exists(), "the caller still owns its temporary audio");
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
+    }
+
+    #[test]
+    fn delete_audio_on_with_source_wav_keeps_text_but_no_history_audio_file() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .update_settings(&Settings {
+                delete_audio_after_processing: true,
+                ..Settings::default()
+            })
+            .unwrap();
+        let source = source_wav();
+
+        assert_eq!(
+            storage
+                .add_history_with_audio_report(&item(), Some(&source))
+                .unwrap(),
+            (true, false)
+        );
+
+        let row = storage
+            .list_history(HistoryFilter::All, 1)
+            .unwrap()
+            .remove(0);
+        assert!(!row.has_audio);
+        assert!(storage.history_audio(row.id).unwrap().is_none());
+        assert!(history_audio_files(&storage).is_empty());
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
+    }
+
     #[test]
     fn failed_audio_stage_preserves_text_only_history() {
         let storage = Storage::in_memory().unwrap();
