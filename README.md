@@ -135,11 +135,14 @@ The automatic editor has independent switches for:
 Correction mode defaults to **Conservative**, which keeps the spoken order. The
 optional **Intent-aware** mode may organize the current transcript across its
 utterance order, apply a later explicit correction consistently, merge duplicate
-information, and select paragraph or list structure. It never invents details,
-learns automatically, or uses context beyond the current transcript and selected
-profile. Only intent-aware results are checked after correction: a result that
-drops or adds URLs, digit-bearing tokens, backtick code, or listed explicit
-uncertainty markers is discarded and the original transcript is used.
+information, and select paragraph or list structure. The provider is instructed
+not to add details; the mode does not learn automatically or use context beyond
+the current transcript and selected profile. Only intent-aware results are
+checked after correction: a result that drops or adds URLs, digit-bearing
+tokens, backtick code, or listed explicit uncertainty markers is discarded and
+the original transcript is used. This check is syntactic, so it cannot detect
+changed names, spelled-out numbers, unquoted code, domains without a scheme, or
+other invented details; review important text before relying on it.
 Conservative results are inserted without this additional check, exactly as
 before the mode switch existed.
 

@@ -668,13 +668,24 @@ fn uncertainty_preserved(source: &str, output: &str) -> bool {
         &["わからない", "分からない", "わかりません", "分かりません"][..],
         &["と思う", "と思います"][..],
     ] {
-        if variants.iter().any(|marker| source.contains(marker))
-            && !variants.iter().any(|marker| output.contains(marker))
+        if variants
+            .iter()
+            .any(|marker| contains_japanese_uncertainty(source, marker))
+            && !variants
+                .iter()
+                .any(|marker| contains_japanese_uncertainty(output, marker))
         {
             return false;
         }
     }
     true
+}
+
+fn contains_japanese_uncertainty(text: &str, marker: &str) -> bool {
+    text.match_indices(marker).any(|(at, _)| {
+        // しかも ("moreover") contains かも but expresses no uncertainty.
+        !(marker == "かも" && text[..at].ends_with('し'))
+    })
 }
 
 #[cfg(test)]
@@ -715,7 +726,7 @@ fn protected_spans(transcript: &str) -> Vec<String> {
         "分からない",
         "と思う",
     ] {
-        if transcript.contains(marker) {
+        if contains_japanese_uncertainty(transcript, marker) {
             push_unique_span(&mut spans, marker);
         }
     }
@@ -1923,6 +1934,28 @@ mod tests {
             extract_numbers("三時に二人、三千円、十一"),
             ["三", "二", "三千", "十一"]
         );
+    }
+
+    #[test]
+    fn shikamo_is_not_an_uncertainty_marker() {
+        assert!(!accepts_with_corrections(
+            "雨が降るかもしれない。",
+            "雨が降る。しかも寒い。",
+            true
+        ));
+        assert!(accepts_with_corrections(
+            "しかも安いです。",
+            "さらに安いです。",
+            false
+        ));
+        assert!(accepts_with_corrections(
+            "雨かも。",
+            "雨かもしれません。",
+            false
+        ));
+        assert!(!protected_spans("しかも安い")
+            .iter()
+            .any(|span| span == "かも"));
     }
 
     #[test]
