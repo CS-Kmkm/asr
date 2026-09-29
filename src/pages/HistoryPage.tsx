@@ -79,10 +79,10 @@ export function HistoryPage({ settings, history, filter, onSave, onFilter, onCop
             <span className="history-mode">{item.mode in modeLabels
               ? t(modeLabels[item.mode as keyof typeof modeLabels])
               : item.mode}{item.targetLanguage ? ` · ${item.targetLanguage}` : ""}</span></div>
-          {item.sourceText && <HistoryText text={item.sourceText} label={t("Selected text")} />}
-          {item.instructionText && <HistoryText text={item.instructionText} label={t("Spoken instruction")} />}
-          {!item.sourceText && !item.instructionText && <HistoryText text={item.transcriptText} />}
-          {item.processedText && <HistoryText text={item.processedText} corrected />}
+          {item.sourceText && <HistoryText text={item.sourceText} label={t("Selected text")} onCopy={onCopyItem} />}
+          {item.instructionText && <HistoryText text={item.instructionText} label={t("Spoken instruction")} onCopy={onCopyItem} />}
+          {!item.sourceText && !item.instructionText && <HistoryText text={item.transcriptText} onCopy={onCopyItem} />}
+          {item.processedText && <HistoryText text={item.processedText} onCopy={onCopyItem} corrected />}
           <div className="history-actions">
             <button onClick={() => onCopyItem(item.processedText ?? item.transcriptText)}>{t("Copy")}</button>
             <button disabled={!item.hasAudio} onClick={() => onRetry(item.id)}>{t("Retry")}</button>
@@ -94,8 +94,28 @@ export function HistoryPage({ settings, history, filter, onSave, onFilter, onCop
   </section>;
 }
 
-function HistoryText({ text, corrected = false, label }: { text: string; corrected?: boolean; label?: string }) {
-  return <div className={`history-text${corrected ? " api-corrected" : ""}`}>
+function HistoryText({ text, corrected = false, label, onCopy }: {
+  text: string;
+  corrected?: boolean;
+  label?: string;
+  onCopy: (text: string) => void;
+}) {
+  const { t } = useI18n();
+  const field = <div
+    className={`history-text${corrected ? " api-corrected" : ""}`}
+    role="button"
+    tabIndex={0}
+    title={t("Double-click to copy")}
+    onDoubleClick={() => onCopy(text)}
+    onKeyDown={(event) => { if (event.key === "Enter") onCopy(text); }}
+  >
     {label && <strong>{label}: </strong>}{text}
+  </div>;
+  // Labeled operands (selected text, spoken instruction) are not what the
+  // row-level Copy button copies, so each gets its own explicit Copy.
+  if (!label) return field;
+  return <div className="history-field">
+    {field}
+    <button type="button" aria-label={`${t("Copy")}: ${label}`} onClick={() => onCopy(text)}>{t("Copy")}</button>
   </div>;
 }
