@@ -126,52 +126,61 @@ pub(crate) fn guidance(profile: &StyleProfile) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile(formality: &str, detail: &str) -> StyleProfile {
+        StyleProfile {
+            formality: formality.into(),
+            detail: detail.into(),
+            guidance: None,
+        }
+    }
+
+    fn context(app_key: &str, category: &str) -> AppContext {
+        AppContext {
+            app_key: Some(app_key.into()),
+            category: category.into(),
+        }
+    }
+
     #[test]
     fn profile_resolution_prefers_app_then_category_then_global() {
-        let mut settings = Settings::default();
-        settings.personalization_enabled = true;
-        settings.global_style_profile = Some(StyleProfile {
-            formality: "formal".into(),
-            detail: "concise".into(),
-            guidance: None,
-        });
+        let global = profile("formal", "concise");
+        let category = profile("casual", "detailed");
+        let app = profile("formal", "detailed");
+        let mut settings = Settings {
+            personalization_enabled: true,
+            global_style_profile: Some(global.clone()),
+            ..Settings::default()
+        };
+        // The category profile is listed first so list order cannot explain an
+        // exact-app win.
         settings.scoped_style_profiles = vec![
             ScopedStyleProfile {
                 scope: "category:development".into(),
-                profile: StyleProfile {
-                    formality: "casual".into(),
-                    detail: "detailed".into(),
-                    guidance: None,
-                },
+                profile: category.clone(),
             },
             ScopedStyleProfile {
                 scope: "app:code".into(),
-                profile: StyleProfile {
-                    formality: "formal".into(),
-                    detail: "detailed".into(),
-                    guidance: None,
-                },
+                profile: app.clone(),
             },
         ];
-        let context = AppContext {
-            app_key: Some("code".into()),
-            category: "development".into(),
-        };
-        assert_eq!(
-            resolve_profile(&settings, &context).unwrap().detail,
-            "detailed"
-        );
-        let context = AppContext {
-            app_key: Some("other".into()),
-            category: "development".into(),
-        };
-        assert_eq!(
-            resolve_profile(&settings, &context).unwrap().formality,
-            "casual"
-        );
+        for _ in 0..2 {
+            let exact_app = resolve_profile(&settings, &context("code", "development")).unwrap();
+            assert_eq!(exact_app.formality, "formal");
+            assert_eq!(exact_app, app);
+            let category_only =
+                resolve_profile(&settings, &context("rider", "development")).unwrap();
+            assert_eq!(category_only.formality, "casual");
+            assert_eq!(category_only, category);
+            let no_match = resolve_profile(&settings, &context("chrome", "browser")).unwrap();
+            assert_eq!(no_match, global);
+            // Precedence is fixed; reordering the scoped list has no effect.
+            settings.scoped_style_profiles.reverse();
+        }
         settings.personalization_enabled = false;
-        assert!(resolve_profile(&settings, &context).is_none());
+        assert!(resolve_profile(&settings, &context("code", "development")).is_none());
     }
+
     #[test]
     fn profile_validation_rejects_controls_and_oversize_guidance() {
         let profile = StyleProfile {
