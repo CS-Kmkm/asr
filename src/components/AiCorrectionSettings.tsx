@@ -12,9 +12,12 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
   const { t } = useI18n();
   const status = settings.textCorrectionEnabled ? t("On") : t("Off");
   const [localBaseUrl, setLocalBaseUrl] = useState(settings.localCorrectionBaseUrl);
+  const [localModel, setLocalModel] = useState(settings.localCorrectionModel);
   const [localMaxTokens, setLocalMaxTokens] = useState(String(settings.localCorrectionMaxTokens));
   const cancelLocalBaseUrlBlur = useRef(false);
+  const cancelLocalModelBlur = useRef(false);
   useEffect(() => setLocalBaseUrl(settings.localCorrectionBaseUrl), [settings.localCorrectionBaseUrl]);
+  useEffect(() => setLocalModel(settings.localCorrectionModel), [settings.localCorrectionModel]);
   useEffect(() => setLocalMaxTokens(String(settings.localCorrectionMaxTokens)), [settings.localCorrectionMaxTokens]);
 
   function commitLocalBaseUrl() {
@@ -24,6 +27,16 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
     }
     if (localBaseUrl !== settings.localCorrectionBaseUrl) {
       onSave({ localCorrectionBaseUrl: localBaseUrl });
+    }
+  }
+
+  function commitLocalModel() {
+    if (cancelLocalModelBlur.current) {
+      cancelLocalModelBlur.current = false;
+      return;
+    }
+    if (localModel !== settings.localCorrectionModel) {
+      onSave({ localCorrectionModel: localModel });
     }
   }
 
@@ -233,9 +246,20 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
             detail={t("Model ID exposed by the local OpenAI-compatible Chat Completions server. No API key is sent.")}
             control={
               <input
-                value={settings.localCorrectionModel}
+                value={localModel}
                 placeholder="qwen3:8b"
-                onChange={(event) => onSave({ localCorrectionModel: event.target.value })}
+                onChange={(event) => setLocalModel(event.target.value)}
+                onBlur={commitLocalModel}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    event.currentTarget.blur();
+                  } else if (event.key === "Escape") {
+                    cancelLocalModelBlur.current = true;
+                    setLocalModel(settings.localCorrectionModel);
+                    event.currentTarget.blur();
+                  }
+                }}
               />
             }
           />

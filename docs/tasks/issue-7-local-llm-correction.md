@@ -38,9 +38,14 @@ Context:
 - Relevant existing paths: `src-tauri/src/correction.rs`, `src-tauri/src/correction_prompt.rs`, `src-tauri/src/types.rs`, `src-tauri/src/commands.rs`, `src/components/AiCorrectionSettings.tsx`, `src/types.ts`, `src/api.ts`, `src/i18n.tsx`, `README.md`.
 - Shared memory `C:/Users/Koshi/agent-memory/tasks/asr--live-dictation.md` describes prior streaming-insertion work; do not alter its artifacts or resurrect its paused hands-on verification scope.
 
-Status (2026-09-22):
+Status (2026-09-29):
 - Backend settings, validation, unauthenticated local transport, non-streaming parsing, streaming deltas/completion, error classification, defaults, and focused tests are implemented.
 - Frontend settings types/defaults, provider selector, local endpoint/model controls, Japanese/English copy, and README privacy/server-contract documentation are implemented.
-- Independent completion review found three response-safety gaps: non-text/truncated finish reasons were accepted, response-body reads were not cancellation-aware, and terminal SSE events did not end collection immediately. All three were fixed and the reviewer confirmed no remaining blocker.
-- Verification passed: frontend TypeScript check; frontend production build; Rust formatting and Clippy; focused correction tests (23 passed, 1 ignored); full Rust library suite (128 passed, 4 ignored); all-target check; `git diff --check`.
-- Remaining: none. A live local model server was not required for the deterministic transport/parser contract checks and remains a manual interoperability check.
+- Independent completion review found three response-safety gaps: non-text/truncated finish reasons were accepted, response-body reads were not cancellation-aware, and terminal SSE events did not end collection immediately. All three were fixed and the reviewer confirmed no remaining blocker. Verification on 2026-09-22 passed (full Rust library suite 128 passed, 4 ignored).
+- PR #20 review fixes (2026-09-29, `docs/tasks/pr-review-fixes.md`):
+  - F1: a leading `<think>...</think>` block is withheld from the streaming preview and removed from streaming and non-streaming results, including tags split across deltas; a leading block that never closes falls back to the raw transcript.
+  - F2: `finish_reason: "length"` is a distinct `OutputLimit` error with Japanese/English status and completion text; local requests use a 10 s connect timeout and a 90 s read (idle) timeout with no total deadline, while OpenAI/Gemini keep the 90 s total timeout.
+  - F3: the local model ID field is a draft committed on blur or Enter; Escape reverts it.
+  - F4: empty or suppressed local content deltas are not forwarded to the preview.
+- Verification passed at `a6313fb`: `cargo fmt --check`; `cargo clippy -j 4` (no errors; warnings are pre-existing); `cargo test --lib -j 4` (138 passed, 4 ignored); `pnpm exec tsc --noEmit`; `pnpm build`; `git diff --check`. Intermediate fix commits were also tested (135 and 137 passed, 4 ignored).
+- Remaining: F5 test backfill (in-flight cancellation through the `select!` branch, non-streaming local responses through `correct_transcript`, fallback and error-kind mapping) is outside this fix wave. Live local servers (Ollama / LM Studio / llama.cpp) and the UI behavior remain manual checks.
