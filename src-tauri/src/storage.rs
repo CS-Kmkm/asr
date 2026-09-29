@@ -391,11 +391,10 @@ impl Storage {
         Ok(())
     }
 
-    pub fn apply_history_policy(
-        &self,
-        _previous: &Settings,
-        settings: &Settings,
-    ) -> Result<(), StorageError> {
+    /// Enforce the stored retention without writing settings. A settings
+    /// change must use `update_settings_and_apply_history_policy` instead, so
+    /// the purge and the settings write cannot be split.
+    fn apply_history_policy(&self, settings: &Settings) -> Result<(), StorageError> {
         match settings.history_retention {
             HistoryRetention::Never => self.delete_history_matching(None),
             HistoryRetention::Forever => {
@@ -408,7 +407,7 @@ impl Storage {
 
     pub fn enforce_current_history_policy(&self) -> Result<(), StorageError> {
         let settings = self.get_settings()?;
-        self.apply_history_policy(&settings, &settings)
+        self.apply_history_policy(&settings)
     }
 
     #[cfg(test)]
@@ -437,7 +436,7 @@ impl Storage {
         }
         // Prune before insertion. After a row/file association commits, this
         // method must not turn cleanup trouble into a false command failure.
-        self.apply_history_policy(&settings, &settings)?;
+        self.apply_history_policy(&settings)?;
         let mut audio_stage_failed = false;
         let mut staged_audio = if !settings.delete_audio_after_processing {
             source_audio.and_then(|path| match self.stage_history_audio(path) {
@@ -542,7 +541,7 @@ impl Storage {
         if settings.history_retention == HistoryRetention::Never {
             return Ok(Vec::new());
         }
-        self.apply_history_policy(&settings, &settings)?;
+        self.apply_history_policy(&settings)?;
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, transcript_text, processed_text, mode, asr_provider, llm_provider,
@@ -1459,7 +1458,7 @@ mod tests {
         let previous = storage.get_settings().unwrap();
         let mut settings = previous.clone();
         settings.history_retention = HistoryRetention::Never;
-        storage.apply_history_policy(&previous, &settings).unwrap();
+        storage.apply_history_policy(&settings).unwrap();
         assert_eq!(
             storage
                 .connection()
@@ -1507,7 +1506,7 @@ mod tests {
             )
             .unwrap();
         let settings = storage.get_settings().unwrap();
-        storage.apply_history_policy(&settings, &settings).unwrap();
+        storage.apply_history_policy(&settings).unwrap();
         assert_eq!(
             storage.list_history(HistoryFilter::All, 10).unwrap().len(),
             1
@@ -1561,7 +1560,7 @@ mod tests {
                     [(Utc::now() - chrono::Duration::days(days + 1)).to_rfc3339()],
                 )
                 .unwrap();
-            storage.apply_history_policy(&settings, &settings).unwrap();
+            storage.apply_history_policy(&settings).unwrap();
             assert!(storage
                 .list_history(HistoryFilter::All, 10)
                 .unwrap()

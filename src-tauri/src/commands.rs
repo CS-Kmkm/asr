@@ -1351,6 +1351,24 @@ fn completion_persistence_warning(
     persistence_warning(history_status == HistorySaveStatus::Failed, metric_failed)
 }
 
+/// The single persistence step of `update_settings`. Settings and their
+/// History retention (including the History-off purge) commit in one SQLite
+/// transaction, so a failed settings write cannot erase History and an insert
+/// cannot observe the old settings after the purge. Any failure runs
+/// `rollback` so registered shortcuts match the unchanged stored settings.
+fn persist_settings_or_rollback(
+    storage: &Storage,
+    settings: &Settings,
+    rollback: impl FnOnce(),
+) -> Result<(), String> {
+    storage
+        .update_settings_and_apply_history_policy(settings)
+        .map_err(|error| {
+            rollback();
+            command_error(error)
+        })
+}
+
 fn hotkey_changes(registered: &[Shortcut], desired: &[Shortcut]) -> (Vec<Shortcut>, Vec<Shortcut>) {
     (
         registered
@@ -1574,6 +1592,99 @@ mod tests {
         assert_eq!(status, HistorySaveStatus::Failed);
         drop(storage);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn settings_history_item() -> NewHistoryItem<'static> {
+        NewHistoryItem {
+            transcript_text: "private transcript",
+            processed_text: None,
+            source_text: None,
+            instruction_text: None,
+            action_kind: None,
+            search_site: None,
+            mode: "faithful",
+            asr_provider: "test",
+            llm_provider: None,
+            target_language: None,
+            app_category: None,
+            duration_ms: None,
+            latency_ms: None,
+            retry_of_id: None,
+        }
+    }
+
+    fn stored_history_rows(database: &std::path::Path) -> i64 {
+        rusqlite::Connection::open(database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM dictation_history", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn update_settings_persistence_purges_history_in_the_settings_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("settings.sqlite");
+        let storage = Storage::open(&database).unwrap();
+        assert!(
+            storage
+                .add_history_with_audio_report(&settings_history_item(), None)
+                .unwrap()
+                .0
+        );
+        let settings = Settings {
+            history_retention: types::HistoryRetention::Never,
+            ..Settings::default()
+        };
+        let mut rolled_back = false;
+
+        persist_settings_or_rollback(&storage, &settings, || rolled_back = true).unwrap();
+
+        assert!(!rolled_back);
+        assert_eq!(
+            storage.get_settings().unwrap().history_retention,
+            types::HistoryRetention::Never
+        );
+        assert_eq!(stored_history_rows(&database), 0);
+    }
+
+    #[test]
+    fn failed_update_settings_write_keeps_history_and_rolls_back_shortcuts() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("settings.sqlite");
+        let storage = Storage::open(&database).unwrap();
+        assert!(
+            storage
+                .add_history_with_audio_report(&settings_history_item(), None)
+                .unwrap()
+                .0
+        );
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_settings_insert BEFORE INSERT ON settings
+                 BEGIN SELECT RAISE(ABORT, 'settings write rejected'); END;
+                 CREATE TRIGGER reject_settings_update BEFORE UPDATE ON settings
+                 BEGIN SELECT RAISE(ABORT, 'settings write rejected'); END;",
+            )
+            .unwrap();
+        let settings = Settings {
+            history_retention: types::HistoryRetention::Never,
+            ..Settings::default()
+        };
+        let mut rolled_back = false;
+
+        assert!(persist_settings_or_rollback(&storage, &settings, || rolled_back = true).is_err());
+
+        // The purge shares the failed settings transaction, so History-off
+        // cannot erase rows while the stored settings stay unchanged.
+        assert!(rolled_back);
+        assert_eq!(stored_history_rows(&database), 1);
+        assert_eq!(
+            storage.get_settings().unwrap().history_retention,
+            Settings::default().history_retention
+        );
     }
 
     #[test]
@@ -2093,14 +2204,9 @@ pub(crate) async fn update_settings(
             registered.push(shortcut);
             added.push(shortcut);
         }
-        if let Err(error) = storage.apply_history_policy(&previous, &settings) {
-            rollback_shortcuts(&removed, &added, &mut registered);
-            return Err(command_error(error));
-        }
-        if let Err(error) = storage.update_settings(&settings) {
-            rollback_shortcuts(&removed, &added, &mut registered);
-            return Err(command_error(error));
-        }
+        persist_settings_or_rollback(&storage, &settings, || {
+            rollback_shortcuts(&removed, &added, &mut registered)
+        })?;
         hotkeys_repaired(&registered, &new_shortcuts)
     };
     if repaired {
