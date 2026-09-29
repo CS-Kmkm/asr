@@ -26,6 +26,8 @@ Acceptance checks:
 6. Rust full library tests, `cargo fmt --check`, Clippy, all-target check, frontend TypeScript/build, and `git diff --check` pass.
 7. Manual Windows checks remain documented for process lookup across normal/elevated targets, app-category History display, scoped dictionary behavior, and visibly different correction styles.
 
-Status (2026-09-22):
-- Implemented in this dedicated worktree. Automated Rust/frontend gates are covered by the implementation report.
+Status (2026-09-29):
+- Implemented in this dedicated worktree. PR #21 review fixes applied: without style guidance the correction instruction equals the pre-personalization prompt byte for byte, and profile exceptions (formality, detail, written guidance; never facts) appear only with a trusted profile (F1); scoped-profile reorder buttons removed and the fixed precedence "exact app > category > global; list order has no effect" stated in en/ja (F2); precedence test asserts formality and a no-match -> global case (F3); new or invalid scoped rows stay local drafts and survive unrelated saves (F4); the profiles panel shows when Personalization or AI text correction is off, and the ja toggle copy is fixed (F6); lookup failure uses global dictionary entries and the global profile only and records no History category, while an identified unclassified app stays `category:other` (D6).
+- Verified at `7a6cf58` (2026-09-29): `cargo fmt --check`; `cargo clippy -j 4` (pre-existing warnings only); `cargo test --lib -j 4` 140 passed, 0 failed, 4 ignored; `pnpm exec tsc --noEmit`; `pnpm build`; `git diff --check`. The frontend has no test runner, so the F2/F4/F6 Settings UI behavior is checked only by type check and build.
+- Follow-up (review F5, out of this fix wave): app keys are not discoverable in the UI and UWP apps all report `applicationframehost`.
 - Manual Windows verification remains outstanding: process lookup across normal/elevated targets, app-category History display, scoped dictionary behavior, and visibly different correction styles.
