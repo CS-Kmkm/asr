@@ -358,18 +358,7 @@ fn replacement_index(source: &str, occurrences: &[FactOccurrence], index: usize)
         .trim();
     // Only a nearby repair cue with a replacement in its first clause can
     // license dropping a value. A value in a later topic is not a repair.
-    let (cue_at, cue) = [
-        "いや",
-        "じゃなくて",
-        "訂正",
-        "正しくは",
-        "actually",
-        "I mean",
-        "rather",
-    ]
-    .iter()
-    .filter_map(|cue| tail.find(cue).map(|at| (at, *cue)))
-    .min_by_key(|(at, _)| *at)?;
+    let (cue_at, cue_len) = find_repair_cue(tail)?;
     let before_cue = &tail[..cue_at];
     let sentence_breaks = before_cue
         .char_indices()
@@ -391,9 +380,7 @@ fn replacement_index(source: &str, occurrences: &[FactOccurrence], index: usize)
     }) {
         return None;
     }
-    let after = &tail[cue_at + cue.len()..];
-    let repair = after
-        .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '、' | ',' | ':' | '：'));
+    let repair = skip_repair_separators_and_fillers(&tail[cue_at + cue_len..]);
     let repair_start = tail_end - repair.len();
     let limit = repair
         .char_indices()
@@ -423,6 +410,75 @@ fn replacement_index(source: &str, occurrences: &[FactOccurrence], index: usize)
         return None;
     }
     Some(replacement_index)
+}
+
+// Longer cues precede their prefixes so ties resolve to the full cue.
+const REPAIR_CUES: [&str; 12] = [
+    "いや",
+    "ではなくて",
+    "ではなく",
+    "じゃなくて",
+    "じゃなく",
+    "違う",
+    "訂正",
+    "正しくは",
+    "actually",
+    "I meant",
+    "I mean",
+    "rather",
+];
+// Empty hesitations that may sit between a repair cue and its replacement.
+const REPAIR_FILLERS: [&str; 11] = [
+    "えーっと",
+    "えーと",
+    "ええと",
+    "えっと",
+    "えー",
+    "あのー",
+    "あの",
+    "うーん",
+    "um",
+    "uh",
+    "er",
+];
+
+/// Finds the earliest repair cue in `text` as `(byte offset, byte length)`.
+/// English cues match case-insensitively on word boundaries.
+fn find_repair_cue(text: &str) -> Option<(usize, usize)> {
+    REPAIR_CUES
+        .iter()
+        .filter_map(|cue| {
+            let at = if cue.is_ascii() {
+                find_english_phrase(text, cue)
+            } else {
+                text.find(cue)
+            };
+            at.map(|at| (at, cue.len()))
+        })
+        .min_by_key(|(at, length)| (*at, std::cmp::Reverse(*length)))
+}
+
+fn skip_repair_separators_and_fillers(text: &str) -> &str {
+    let mut rest = text;
+    loop {
+        rest = rest.trim_start_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '、' | ',' | ':' | '：')
+        });
+        let filler = REPAIR_FILLERS.iter().find(|filler| {
+            rest.get(..filler.len()).is_some_and(|candidate| {
+                if filler.is_ascii() {
+                    candidate.eq_ignore_ascii_case(filler)
+                        && english_word_boundary_after(rest, filler.len())
+                } else {
+                    candidate == **filler
+                }
+            })
+        });
+        match filler {
+            Some(filler) => rest = &rest[filler.len()..],
+            None => return rest,
+        }
+    }
 }
 
 fn is_sentence_break_at(text: &str, index: usize, character: char) -> bool {
@@ -676,21 +732,20 @@ fn trim_url_sentence_delimiter(url: &str) -> &str {
 }
 
 fn find_english_uncertainty_marker<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
-    for (start, _) in text.char_indices() {
-        let Some(candidate) = text
-            .get(start..)
-            .and_then(|remaining| remaining.get(..marker.len()))
-        else {
-            continue;
-        };
-        if candidate.eq_ignore_ascii_case(marker)
-            && english_word_boundary_before(text, start)
-            && english_word_boundary_after(text, start + marker.len())
-        {
-            return Some(candidate);
-        }
-    }
-    None
+    find_english_phrase(text, marker).map(|start| &text[start..start + marker.len()])
+}
+
+/// Finds an ASCII phrase case-insensitively on English word boundaries.
+fn find_english_phrase(text: &str, phrase: &str) -> Option<usize> {
+    text.char_indices().map(|(start, _)| start).find(|start| {
+        text.get(*start..)
+            .and_then(|remaining| remaining.get(..phrase.len()))
+            .is_some_and(|candidate| {
+                candidate.eq_ignore_ascii_case(phrase)
+                    && english_word_boundary_before(text, *start)
+                    && english_word_boundary_after(text, start + phrase.len())
+            })
+    })
 }
 
 fn english_word_boundary_before(text: &str, index: usize) -> bool {
@@ -1729,6 +1784,56 @@ mod tests {
             "参加者は3人です。"
         )
         .is_err());
+    }
+
+    #[test]
+    fn intent_aware_repairs_accept_listed_cues_and_skip_fillers() {
+        for input in [
+            "参加者は3人ではなく4人です。",
+            "参加者は3人ではなくて4人です。",
+            "参加者は3人じゃなく4人です。",
+            "参加者は3人じゃなくて4人です。",
+            "参加者は3人、違う、4人です。",
+            "参加者は3人、いや、えーと、4人です。",
+            "参加者は3人ではなく、えっと、あの、4人です。",
+        ] {
+            assert!(
+                accepts_with_corrections(input, "参加者は4人です。", false),
+                "rejected {input}"
+            );
+        }
+        for input in [
+            "We need 3 seats, I meant 4 seats.",
+            "We need 3 seats, I mean, um, 4 seats.",
+            "We need 3 seats. Actually, uh, 4 seats.",
+        ] {
+            assert!(
+                accepts_with_corrections(input, "We need 4 seats.", false),
+                "rejected {input}"
+            );
+        }
+        for (input, output) in [
+            ("参加者は3人、違うチームは4人です。", "参加者は4人です。"),
+            (
+                "参加者は3人、いや、えーと、予算は4円です。",
+                "予算は4円です。",
+            ),
+            (
+                "We need 3 seats, I mean it, 4 is too many.",
+                "We need 4 seats.",
+            ),
+            ("参加者は3人ではなく4人です。", "参加者は5人です。"),
+        ] {
+            assert!(
+                !accepts_with_corrections(input, output, true),
+                "accepted {input} => {output}"
+            );
+        }
+        assert!(!preserves_protected_spans(
+            "参加者は3人ではなく4人です。",
+            "参加者は4人です。",
+            false
+        ));
     }
 
     #[test]
