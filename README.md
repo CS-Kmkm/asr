@@ -135,6 +135,9 @@ Enter is pressed, so it can be edited from an empty draft. The local output
 token limit defaults to 4096 and can be set from 128 to 32768; some servers
 count thinking tokens toward this limit. Increase it if a reasoning model
 returns a length limit, subject to the server's context and memory limits.
+A leading `<think>...</think>` block in the response text is removed before it
+reaches the preview or the inserted result; a response whose leading think
+block never closes falls back to the original transcript.
 
 The automatic editor has independent switches for:
 
