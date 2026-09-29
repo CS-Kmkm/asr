@@ -613,46 +613,6 @@ impl Storage {
         Ok(true)
     }
 
-    pub fn dictionary_prompt_terms_for(
-        &self,
-        context: Option<&crate::types::AppContext>,
-    ) -> Result<Vec<String>, StorageError> {
-        let mut terms = Vec::new();
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT reading, surface, aliases, app_scope
-             FROM dictionary_entries ORDER BY priority DESC, surface ASC",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-            ))
-        })?;
-        for row in rows {
-            if terms.len() >= 100 {
-                break;
-            }
-            let (reading, surface, aliases, scope) = row?;
-            if !scope_matches(scope.as_deref(), context) {
-                continue;
-            }
-            let aliases = serde_json::from_str::<Vec<String>>(&aliases)?;
-            let mut term = format!("{} => {}", reading.trim(), surface.trim());
-            if !aliases.is_empty() {
-                term.push_str(&format!(" (aliases: {})", aliases.join(", ")));
-            }
-            terms.push(term.chars().take(300).collect());
-        }
-        Ok(terms)
-    }
-
-    pub fn dictionary_prompt_terms(&self) -> Result<Vec<String>, StorageError> {
-        self.dictionary_prompt_terms_for(None)
-    }
-
     pub fn dictionary_asr_prompt_for(
         &self,
         context: Option<&crate::types::AppContext>,
@@ -1380,14 +1340,23 @@ mod tests {
         assert_eq!(storage.list_dictionary().unwrap()[0].aliases, aliases);
     }
 
+    /// Lines of the production ASR prompt for a prompt-based backend.
+    fn prompt_lines(storage: &Storage, context: Option<&crate::types::AppContext>) -> Vec<String> {
+        storage
+            .dictionary_asr_prompt_for(context, "openai-compatible")
+            .unwrap()
+            .map(|prompt| prompt.lines().map(str::to_owned).collect())
+            .unwrap_or_default()
+    }
+
     #[test]
-    fn dictionary_prompt_terms_include_reading_surface_and_aliases() {
+    fn asr_prompt_lines_include_reading_surface_and_aliases() {
         let storage = Storage::in_memory().unwrap();
         let aliases = vec!["ChatGPT".into()];
         storage
             .add_dictionary_entry(&dictionary_entry(&aliases))
             .unwrap();
-        let terms = storage.dictionary_prompt_terms().unwrap();
+        let terms = prompt_lines(&storage, None);
         assert_eq!(terms, vec!["おーぷんえーあい => OpenAI (aliases: ChatGPT)"]);
     }
 
@@ -1416,7 +1385,8 @@ mod tests {
             app_key: Some("code".into()),
             category: "development".into(),
         };
-        let terms = storage.dictionary_prompt_terms_for(Some(&context)).unwrap();
+        let terms = prompt_lines(&storage, Some(&context));
+        assert_eq!(terms.len(), 3);
         assert!(terms
             .iter()
             .any(|term| term.starts_with("global-alias => Global")));
@@ -1429,6 +1399,21 @@ mod tests {
         assert!(!terms
             .iter()
             .any(|term| term.starts_with("other-alias => Other")));
+        // Hotwords route by the same scope rules.
+        let hotwords = storage
+            .dictionary_asr_prompt_for(Some(&context), "faster-whisper")
+            .unwrap()
+            .unwrap();
+        let hotwords = hotwords.split(", ").collect::<Vec<_>>();
+        for surface in ["Global", "App", "Category"] {
+            assert!(hotwords.contains(&surface), "missing {surface}");
+        }
+        assert!(!hotwords.contains(&"Other") && !hotwords.contains(&"other-alias"));
+        // Without a context only global entries apply.
+        assert_eq!(
+            prompt_lines(&storage, None),
+            vec!["global-alias => Global (aliases: global-alias)"]
+        );
         let hints = storage
             .dictionary_correction_hints(
                 "global-alias app-alias category-alias other-alias",
@@ -1464,10 +1449,15 @@ mod tests {
 
         let failed = crate::app_context::from_executable_path(None);
         assert_eq!(
-            storage
-                .dictionary_prompt_terms_for(failed.as_ref())
-                .unwrap(),
+            prompt_lines(&storage, failed.as_ref()),
             vec!["global-reading => Global".to_string()]
+        );
+        assert_eq!(
+            storage
+                .dictionary_asr_prompt_for(failed.as_ref(), "faster-whisper")
+                .unwrap()
+                .as_deref(),
+            Some("Global, global-reading")
         );
         let hints = storage
             .dictionary_correction_hints(
@@ -1482,9 +1472,8 @@ mod tests {
         assert_eq!(storage.list_history(10).unwrap()[0].app_category, None);
 
         let unclassified = crate::app_context::from_executable_path(Some(r"C:\Tools\MyEditor.exe"));
-        let terms = storage
-            .dictionary_prompt_terms_for(unclassified.as_ref())
-            .unwrap();
+        let terms = prompt_lines(&storage, unclassified.as_ref());
+        assert_eq!(terms.len(), 3);
         for surface in ["Global", "OtherCategory", "EditorApp"] {
             assert!(
                 terms
@@ -2125,6 +2114,74 @@ mod tests {
             .unwrap();
         assert!(prompt.contains("おーぷんえーあい => OpenAI"));
         assert!(prompt.contains("ChatGPT"));
+    }
+
+    #[test]
+    fn asr_prompt_orders_by_priority_truncates_to_budget_and_omits_auto_readings() {
+        let storage = Storage::in_memory().unwrap();
+        let no_aliases = Vec::new();
+        let long_reading = "x".repeat(100);
+        // Inserted out of order; each manual line is 110 characters, so ten
+        // lines plus separators fit the 1200-character prompt budget.
+        for index in [3, 12, 1, 7, 10, 2, 5, 11, 4, 9, 6, 8] {
+            let surface = format!("Term{index:02}");
+            storage
+                .add_dictionary_entry(&NewDictionaryEntry {
+                    reading: &long_reading,
+                    surface: &surface,
+                    category: None,
+                    aliases: &no_aliases,
+                    priority: index,
+                    app_scope: None,
+                })
+                .unwrap();
+        }
+        let prompt = storage
+            .dictionary_asr_prompt_for(None, "openai-compatible")
+            .unwrap()
+            .unwrap();
+        assert!(prompt.chars().count() <= 1200);
+        let expected = (3..=12)
+            .rev()
+            .map(|index| format!("{long_reading} => Term{index:02}"))
+            .collect::<Vec<_>>();
+        assert_eq!(prompt.lines().collect::<Vec<_>>(), expected);
+        let hotwords = storage
+            .dictionary_asr_prompt_for(None, "faster-whisper")
+            .unwrap()
+            .unwrap();
+        // Every surface precedes the shared reading, which appears once.
+        let surfaces = (1..=12)
+            .rev()
+            .map(|index| format!("Term{index:02}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(hotwords, format!("{surfaces}, {long_reading}"));
+        assert!(hotwords.chars().count() <= 200);
+
+        // A confirmed candidate's reading is the misrecognized form: prompts
+        // carry only its surface and hotwords never include it.
+        let storage = Storage::in_memory().unwrap();
+        let candidate = storage
+            .add_dictionary_candidate_from_correction("auto term", "AutoTerm", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            storage
+                .confirm_dictionary_candidate(candidate)
+                .unwrap()
+                .unwrap()
+                .reading,
+            "auto term"
+        );
+        assert_eq!(prompt_lines(&storage, None), vec!["AutoTerm"]);
+        assert_eq!(
+            storage
+                .dictionary_asr_prompt_for(None, "faster-whisper")
+                .unwrap()
+                .as_deref(),
+            Some("AutoTerm")
+        );
     }
 
     #[test]
