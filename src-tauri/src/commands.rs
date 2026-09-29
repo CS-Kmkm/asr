@@ -416,9 +416,23 @@ pub(crate) async fn stop_recording(
     }
     let streamed_into_target = draft.pasted;
     if mode == PipelineMode::Translate {
-        let target_language = translation_target
-            .as_deref()
-            .ok_or("translation target language is unavailable")?;
+        let Some(target_language) = translation_target.as_deref() else {
+            // Startup publishes the target with the session. If it is missing,
+            // keep the speech the same way a translation failure does.
+            let copied = draft.injector.copy_to_clipboard(&transcript.text).is_ok();
+            emit_correction_preview(&app, &transcript.text, "fallback");
+            emit_state(
+                &app,
+                &state,
+                AppPhase::Error,
+                if copied {
+                    "The translation target language was unavailable; the raw transcript remains on the clipboard."
+                } else {
+                    "The translation target language was unavailable and the clipboard could not be updated; the raw transcript remains available in this app."
+                },
+            );
+            return Err("translation target language is unavailable".into());
+        };
         emit_correction_preview(&app, &transcript.text, "draft");
         emit_state(
             &app,
@@ -860,16 +874,16 @@ pub(crate) async fn cancel_recording(
         &services.lifecycle,
         &services.audio,
         &services.target,
+        &services.voice_translation_target,
         &services.live,
     )
     .await?;
-    recording_overlay::set_interactive(&app, false);
-    if let Ok(mut language) = services.voice_translation_target.lock() {
-        language.take();
-    }
+    // Nothing was cancelled: any published session belongs to another
+    // operation, so leave its target language and overlay untouched.
     if !cancelled {
         return Ok(());
     }
+    recording_overlay::set_interactive(&app, false);
     if services.lifecycle.phase() == PipelinePhase::Idle {
         emit_state(
             &app,
@@ -889,6 +903,7 @@ async fn cancel_pipeline_operation(
     lifecycle: &PipelineLifecycle,
     audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
     target: &Mutex<Option<TargetWindow>>,
+    translation_target: &Mutex<Option<String>>,
     live: &tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
 ) -> Result<bool, String> {
     let Some((operation_id, phase)) = lifecycle.cancel()? else {
@@ -907,6 +922,12 @@ async fn cancel_pipeline_operation(
         target.take();
     }
     let live_task = live.lock().await.take();
+    // Startup publishes the target language before releasing `live`. Clear it
+    // while this operation still owns the lifecycle, so a later recording's
+    // target is never removed.
+    if let Ok(mut language) = translation_target.lock() {
+        language.take();
+    }
     let audio_result = {
         let mut audio = audio.lock().await;
         audio.cancel().await
@@ -1234,7 +1255,8 @@ mod tests {
         let target = Mutex::new(None);
         let audio_operation = audio.lock().await;
         let live = tokio::sync::Mutex::new(None);
-        let cancellation = cancel_pipeline_operation(&lifecycle, &audio, &target, &live);
+        let language = Mutex::new(None);
+        let cancellation = cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live);
         tokio::pin!(cancellation);
 
         assert!(
@@ -1243,7 +1265,7 @@ mod tests {
                 .is_err()
         );
         assert!(
-            !cancel_pipeline_operation(&lifecycle, &audio, &target, &live)
+            !cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live)
                 .await
                 .unwrap()
         );
@@ -1270,6 +1292,7 @@ mod tests {
             &lifecycle,
             &audio,
             &target,
+            &Mutex::new(None),
             &tokio::sync::Mutex::new(None)
         )
         .await
@@ -1287,6 +1310,7 @@ mod tests {
             &lifecycle,
             &test_audio(false),
             &Mutex::new(None),
+            &Mutex::new(None),
             &tokio::sync::Mutex::new(None),
         )
         .await
@@ -1295,6 +1319,43 @@ mod tests {
         assert!(lifecycle.begin_start(PipelineMode::Translate).is_err());
         lifecycle.finish(id);
         assert!(lifecycle.begin_start(PipelineMode::Translate).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancel_clears_the_translation_target_only_when_it_cancels_a_recording() {
+        let lifecycle = PipelineLifecycle::default();
+        let audio = test_audio(false);
+        let target = Mutex::new(None);
+        let live = tokio::sync::Mutex::new(None);
+        // Nothing to cancel: a target published by a concurrent start stays.
+        let language = Mutex::new(Some("ja".to_string()));
+        assert!(
+            !cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live)
+                .await
+                .unwrap()
+        );
+        assert_eq!(language.lock().unwrap().as_deref(), Some("ja"));
+
+        // Processing owns its published target; cancellation only signals it.
+        let id = lifecycle.begin_start(PipelineMode::Translate).unwrap();
+        lifecycle.mark_recording(id).unwrap();
+        lifecycle.begin_processing().unwrap();
+        assert!(
+            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live)
+                .await
+                .unwrap()
+        );
+        assert_eq!(language.lock().unwrap().as_deref(), Some("ja"));
+        lifecycle.finish(id);
+
+        let id = lifecycle.begin_start(PipelineMode::Translate).unwrap();
+        lifecycle.mark_recording(id).unwrap();
+        assert!(
+            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live)
+                .await
+                .unwrap()
+        );
+        assert_eq!(*language.lock().unwrap(), None);
     }
 
     #[test]
