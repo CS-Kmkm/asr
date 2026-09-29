@@ -1,4 +1,4 @@
-use std::{env, time::Duration};
+use std::{collections::HashMap, env, time::Duration};
 
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
@@ -38,7 +38,13 @@ pub async fn correct_transcript(
 ) -> Result<String, CorrectionError> {
     let instruction = build_correction_instruction(settings, dictionary_hints, style_guidance);
     let corrected = request_text(settings, transcript, &instruction, cancel, on_update).await?;
-    accept_provider_correction(settings, transcript, &instruction, dictionary_hints, corrected)
+    accept_provider_correction(
+        settings,
+        transcript,
+        &instruction,
+        dictionary_hints,
+        corrected,
+    )
 }
 
 /// Decides whether a completed provider result may replace the transcript.
@@ -89,13 +95,11 @@ fn validate_correction_output_with_hints(
     if settings.correction_mode != "intent_aware" {
         return Ok(());
     }
-    let safe = preserves_protected_spans_with_hints(
-        transcript,
-        corrected,
-        settings.correction_resolve_self_corrections,
-        dictionary_hints,
-    );
-    if !safe {
+    let edits = FactEdits {
+        corrections: settings.correction_resolve_self_corrections,
+        merge_duplicates: settings.correction_remove_repetitions,
+    };
+    if !preserves_protected_spans_with_hints(transcript, corrected, edits, dictionary_hints) {
         return Err(CorrectionError::InvalidResponse(
             "correction changed protected transcript content".into(),
         ));
@@ -103,124 +107,52 @@ fn validate_correction_output_with_hints(
     Ok(())
 }
 
+/// Editing switches that decide which source facts the output may drop.
+#[derive(Clone, Copy)]
+struct FactEdits {
+    /// Explicitly superseded values may be dropped or applied globally.
+    corrections: bool,
+    /// Repeated mentions of one value may be merged into a single mention.
+    merge_duplicates: bool,
+}
+
 #[cfg(test)]
 fn preserves_protected_spans(transcript: &str, corrected: &str, allow_corrections: bool) -> bool {
-    preserves_protected_spans_with_hints(transcript, corrected, allow_corrections, &[])
+    let edits = FactEdits {
+        corrections: allow_corrections,
+        merge_duplicates: false,
+    };
+    preserves_protected_spans_with_hints(transcript, corrected, edits, &[])
 }
 
 fn preserves_protected_spans_with_hints(
     transcript: &str,
     corrected: &str,
-    allow_corrections: bool,
+    edits: FactEdits,
     dictionary_hints: &[String],
 ) -> bool {
-    if !contains_only_source_facts(transcript, corrected, dictionary_hints) {
+    let Some(output_for_new_values) =
+        remove_prompted_dictionary_surfaces(transcript, corrected, dictionary_hints)
+    else {
         return false;
-    }
-    for (source, kind) in [
-        (extract_urls(transcript), ProtectedKind::Url),
-        (extract_numbers(transcript), ProtectedKind::Number),
-        (extract_code_spans(transcript), ProtectedKind::Code),
-    ] {
-        if source.iter().any(|value| {
-            let source_count = protected_occurrence_count(transcript, value, kind);
-            let output_count = protected_occurrence_count(corrected, value, kind);
-            let superseded = if allow_corrections {
-                superseded_occurrence_count(transcript, value, &source, kind)
-            } else {
-                0
-            };
-            output_count < source_count.saturating_sub(superseded)
-        }) {
-            return false;
-        }
-    }
-    if !number_occurrences_preserved(transcript, corrected, allow_corrections) {
-        return false;
-    }
-    uncertainty_preserved(transcript, corrected)
+    };
+    [
+        ProtectedKind::Url,
+        ProtectedKind::Number,
+        ProtectedKind::Code,
+    ]
+    .into_iter()
+    .all(|kind| facts_preserved(transcript, corrected, &output_for_new_values, kind, edits))
+        && uncertainty_preserved(transcript, corrected)
 }
 
-fn number_occurrences_preserved(source: &str, output: &str, allow_corrections: bool) -> bool {
-    let source_occurrences = number_occurrences(source);
-    let output_occurrences = number_occurrences(output);
-    let values = extract_numbers(source);
-    source_occurrences.iter().all(|(range, value)| {
-        let unit = number_unit(source, range);
-        let source_count = source_occurrences
-            .iter()
-            .filter(|(candidate_range, candidate)| {
-                candidate == value && number_unit(source, candidate_range) == unit
-            })
-            .count();
-        let output_count = output_occurrences
-            .iter()
-            .filter(|(candidate_range, candidate)| {
-                candidate == value && number_unit(output, candidate_range) == unit
-            })
-            .count();
-        let superseded = if allow_corrections {
-            superseded_number_occurrence_count(source, value, unit, &values)
-        } else {
-            0
-        };
-        // When identical facts occur more than once and only some are repaired,
-        // a count cannot tell whether the output retained the unrelated fact.
-        // Fall back to the transcript instead of guessing which copy survived.
-        let ambiguous_partial_repair =
-            source_count > 1 && superseded > 0 && superseded < source_count;
-        !ambiguous_partial_repair && output_count >= source_count.saturating_sub(superseded)
-    })
-}
-
-fn number_unit(text: &str, range: &std::ops::Range<usize>) -> Option<char> {
-    text[range.end..]
-        .chars()
-        .next()
-        .filter(|character| character.is_alphabetic())
-}
-
-fn superseded_number_occurrence_count(
-    transcript: &str,
-    old: &str,
-    unit: Option<char>,
-    values: &[String],
-) -> usize {
-    let positions = number_occurrences(transcript)
-        .into_iter()
-        .filter_map(|(range, value)| (value == old).then_some(range))
-        .collect::<Vec<_>>();
-    positions
-        .iter()
-        .enumerate()
-        .filter(|(index, range)| {
-            if number_unit(transcript, range) != unit {
-                return false;
-            }
-            let end = positions
-                .get(index + 1)
-                .map_or(transcript.len(), |next| next.start);
-            let source_clause = transcript[..range.start]
-                .rsplit(['。', '、', ',', '.', '!', '?', '！', '？'])
-                .next()
-                .unwrap_or_default()
-                .trim();
-            explicitly_superseded_at(
-                &transcript[range.end..end],
-                source_clause,
-                values,
-                old,
-                ProtectedKind::Number,
-            )
-        })
-        .count()
-}
-
-fn contains_only_source_facts(
+/// Removes trusted dictionary spellings before new values are counted. Returns
+/// `None` when a surface appears more often than its spoken readings allow.
+fn remove_prompted_dictionary_surfaces(
     transcript: &str,
     corrected: &str,
     dictionary_hints: &[String],
-) -> bool {
+) -> Option<String> {
     let mut without_dictionary_surfaces = corrected.to_owned();
     for hint in dictionary_hints {
         let Some((surface, readings)) = hint.split_once("<=") else {
@@ -238,37 +170,11 @@ fn contains_only_source_facts(
         if allowed == 0
             || corrected.matches(surface).count() > allowed + transcript.matches(surface).count()
         {
-            return false;
+            return None;
         }
         without_dictionary_surfaces = without_dictionary_surfaces.replace(surface, "");
     }
-    [
-        (
-            protected_occurrence_values(transcript, ProtectedKind::Url),
-            protected_occurrence_values(&without_dictionary_surfaces, ProtectedKind::Url),
-        ),
-        (
-            protected_occurrence_values(transcript, ProtectedKind::Number),
-            protected_occurrence_values(&without_dictionary_surfaces, ProtectedKind::Number),
-        ),
-        (
-            protected_occurrence_values(transcript, ProtectedKind::Code),
-            protected_occurrence_values(&without_dictionary_surfaces, ProtectedKind::Code),
-        ),
-    ]
-    .iter()
-    .all(|(source, output)| {
-        output.iter().all(|value| {
-            output
-                .iter()
-                .filter(|candidate| *candidate == value)
-                .count()
-                <= source
-                    .iter()
-                    .filter(|candidate| *candidate == value)
-                    .count()
-        })
-    })
+    Some(without_dictionary_surfaces)
 }
 
 #[derive(Clone, Copy)]
@@ -278,79 +184,181 @@ enum ProtectedKind {
     Code,
 }
 
-fn superseded_occurrence_count(
-    transcript: &str,
-    old: &str,
-    values: &[String],
-    kind: ProtectedKind,
-) -> usize {
-    let positions = match kind {
-        ProtectedKind::Number => number_occurrences(transcript)
-            .into_iter()
-            .filter_map(|(range, value)| (value == old).then_some(range))
-            .collect::<Vec<_>>(),
-        ProtectedKind::Url | ProtectedKind::Code => transcript
-            .match_indices(old)
-            .map(|(at, _)| at..at + old.len())
-            .collect::<Vec<_>>(),
-    };
-    positions
-        .iter()
-        .enumerate()
-        .filter(|(index, range)| {
-            let end = positions
-                .get(index + 1)
-                .map_or(transcript.len(), |next| next.start);
-            let source_clause = transcript[..range.start]
-                .rsplit(['。', '、', ',', '.', '!', '?', '！', '？'])
-                .next()
-                .unwrap_or_default()
-                .trim();
-            explicitly_superseded_at(
-                &transcript[range.end..end],
-                source_clause,
-                values,
-                old,
-                kind,
-            )
-        })
-        .count()
+/// A protected value. Numbers keep their counter so 3人 and 3円 differ.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FactKey {
+    value: String,
+    unit: Option<char>,
 }
 
-fn protected_occurrence_count(text: &str, value: &str, kind: ProtectedKind) -> usize {
-    match kind {
-        ProtectedKind::Number => number_occurrences(text)
-            .iter()
-            .filter(|(_, candidate)| candidate == value)
-            .count(),
-        ProtectedKind::Url | ProtectedKind::Code => text.matches(value).count(),
-    }
+type FactOccurrence = (std::ops::Range<usize>, FactKey);
+
+/// How the output may treat one source occurrence, decided by its position.
+#[derive(Clone, PartialEq)]
+enum OccurrenceRole {
+    /// The value must survive.
+    Kept,
+    /// An explicit repair cue replaced this occurrence; it may be dropped.
+    Superseded,
+    /// An earlier mention of a value that a later repair replaced. A global
+    /// correction may turn it into the final replacement instead of keeping it.
+    Replaceable(FactKey),
 }
 
-fn protected_occurrence_values(text: &str, kind: ProtectedKind) -> Vec<String> {
+fn fact_occurrences(text: &str, kind: ProtectedKind) -> Vec<FactOccurrence> {
+    let plain =
+        |(range, value): (std::ops::Range<usize>, String)| (range, FactKey { value, unit: None });
     match kind {
         ProtectedKind::Number => number_occurrences(text)
             .into_iter()
-            .map(|(_, value)| value)
+            .map(|(range, value)| {
+                let unit = number_unit(text, &range);
+                (range, FactKey { value, unit })
+            })
             .collect(),
-        ProtectedKind::Url => extract_urls(text),
-        ProtectedKind::Code => extract_code_spans(text)
-            .into_iter()
-            .flat_map(|value| std::iter::repeat_n(value.clone(), text.matches(&value).count()))
-            .collect(),
+        ProtectedKind::Url => url_occurrences(text).into_iter().map(plain).collect(),
+        ProtectedKind::Code => code_span_occurrences(text).into_iter().map(plain).collect(),
     }
 }
 
-fn explicitly_superseded_at(
-    tail: &str,
-    source_clause: &str,
-    values: &[String],
-    old: &str,
+fn number_unit(text: &str, range: &std::ops::Range<usize>) -> Option<char> {
+    text[range.end..]
+        .chars()
+        .next()
+        .filter(|character| character.is_alphabetic())
+}
+
+/// Matches source occurrences by position: each one is kept, superseded by a
+/// nearby explicit repair, or (before a later repair of the same value)
+/// replaceable by that repair's final value. The output must retain every kept
+/// occurrence and may not contain a value more often than the source allows.
+fn facts_preserved(
+    source: &str,
+    output: &str,
+    output_for_new_values: &str,
     kind: ProtectedKind,
+    edits: FactEdits,
 ) -> bool {
+    let occurrences = fact_occurrences(source, kind);
+    let roles = occurrence_roles(source, &occurrences, edits.corrections);
+    let count_keys = |text: &str| {
+        let mut counts = HashMap::<FactKey, usize>::new();
+        for (_, key) in fact_occurrences(text, kind) {
+            *counts.entry(key).or_default() += 1;
+        }
+        counts
+    };
+
+    // No new facts: a value may appear as often as in the source, plus once
+    // for each earlier mention that a later correction may replace with it.
+    for (key, count) in count_keys(output_for_new_values) {
+        let in_source = occurrences
+            .iter()
+            .filter(|(_, value)| *value == key)
+            .count();
+        let replaced_into = roles
+            .iter()
+            .filter(
+                |role| matches!(role, OccurrenceRole::Replaceable(final_key) if *final_key == key),
+            )
+            .count();
+        if count > in_source + replaced_into {
+            return false;
+        }
+    }
+
+    let mut available = count_keys(output);
+    let mut kept = HashMap::<&FactKey, usize>::new();
+    for ((_, key), role) in occurrences.iter().zip(&roles) {
+        if *role == OccurrenceRole::Kept {
+            *kept.entry(key).or_default() += 1;
+        }
+    }
+    for (key, required) in kept {
+        let found = available.get(key).copied().unwrap_or_default();
+        if edits.merge_duplicates {
+            // Merged duplicates must still leave one mention of the value.
+            if found == 0 {
+                return false;
+            }
+        } else if found < required {
+            return false;
+        } else {
+            available.insert(key.clone(), found - required);
+        }
+    }
+    for ((_, key), role) in occurrences.iter().zip(&roles) {
+        let OccurrenceRole::Replaceable(final_key) = role else {
+            continue;
+        };
+        let original = available.get(key).copied().unwrap_or_default();
+        let replacement = available.get(final_key).copied().unwrap_or_default();
+        if edits.merge_duplicates {
+            if original == 0 && replacement == 0 {
+                return false;
+            }
+        } else if original > 0 {
+            available.insert(key.clone(), original - 1);
+        } else if replacement > 0 {
+            available.insert(final_key.clone(), replacement - 1);
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+fn occurrence_roles(
+    source: &str,
+    occurrences: &[FactOccurrence],
+    allow_corrections: bool,
+) -> Vec<OccurrenceRole> {
+    let mut roles = vec![OccurrenceRole::Kept; occurrences.len()];
+    if !allow_corrections {
+        return roles;
+    }
+    let replacements = (0..occurrences.len())
+        .map(|index| replacement_index(source, occurrences, index))
+        .collect::<Vec<_>>();
+    for index in 0..occurrences.len() {
+        let Some(mut target) = replacements[index] else {
+            continue;
+        };
+        roles[index] = OccurrenceRole::Superseded;
+        // Replacements always lie later in the transcript, so following
+        // successive revisions terminates at the final explicit choice.
+        while let Some(next) = replacements[target] {
+            target = next;
+        }
+        let final_key = &occurrences[target].1;
+        for earlier in 0..index {
+            if roles[earlier] == OccurrenceRole::Kept
+                && occurrences[earlier].1 == occurrences[index].1
+            {
+                roles[earlier] = OccurrenceRole::Replaceable(final_key.clone());
+            }
+        }
+    }
+    roles
+}
+
+/// Returns the occurrence that explicitly replaces `occurrences[index]`, if any.
+fn replacement_index(source: &str, occurrences: &[FactOccurrence], index: usize) -> Option<usize> {
+    let (old_range, old) = &occurrences[index];
+    let tail_start = old_range.end;
+    let tail_end = occurrences[index + 1..]
+        .iter()
+        .find(|(_, key)| key.value == old.value)
+        .map_or(source.len(), |(range, _)| range.start);
+    let tail = &source[tail_start..tail_end];
+    let source_clause = source[..old_range.start]
+        .rsplit(['。', '、', ',', '.', '!', '?', '！', '？'])
+        .next()
+        .unwrap_or_default()
+        .trim();
     // Only a nearby repair cue with a replacement in its first clause can
     // license dropping a value. A value in a later topic is not a repair.
-    let Some((cue_at, cue)) = [
+    let (cue_at, cue) = [
         "いや",
         "じゃなくて",
         "訂正",
@@ -361,82 +369,60 @@ fn explicitly_superseded_at(
     ]
     .iter()
     .filter_map(|cue| tail.find(cue).map(|at| (at, *cue)))
-    .min_by_key(|(at, _)| *at) else {
-        return false;
-    };
+    .min_by_key(|(at, _)| *at)?;
     let before_cue = &tail[..cue_at];
     let sentence_breaks = before_cue
         .char_indices()
         .filter(|(index, character)| is_sentence_break_at(before_cue, *index, *character))
         .collect::<Vec<_>>();
     if before_cue.chars().count() > 80 || sentence_breaks.len() > 2 {
-        return false;
+        return None;
     }
     if let Some((last_break, character)) = sentence_breaks.last() {
         let after_break = &before_cue[*last_break + character.len_utf8()..];
         if !after_break.trim().is_empty() {
-            return false;
+            return None;
         }
     }
     // A second same-kind value before the cue makes its target ambiguous.
-    if source_values_in(before_cue, values)
-        .iter()
-        .any(|value| value != old)
-    {
-        return false;
+    let cue_start = tail_start + cue_at;
+    if occurrences.iter().any(|(range, key)| {
+        range.start >= tail_start && range.start < cue_start && key.value != old.value
+    }) {
+        return None;
     }
     let after = &tail[cue_at + cue.len()..];
     let repair = after
         .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '、' | ',' | ':' | '：'));
+    let repair_start = tail_end - repair.len();
     let limit = repair
         .char_indices()
         .nth(80)
         .map_or(repair.len(), |(at, _)| at);
     let clause = &repair[..limit];
-    let end = clause
-        .char_indices()
-        .find(|(index, character)| {
-            is_sentence_break_at(clause, *index, *character) || matches!(character, '、' | ',')
-        })
-        .map_or(clause.len(), |(index, _)| index);
-    let clause = &clause[..end];
-    let replacement = match kind {
-        ProtectedKind::Number => number_occurrences(clause).into_iter().next(),
-        ProtectedKind::Url => extract_urls(clause).into_iter().next().and_then(|value| {
-            clause
-                .find(&value)
-                .map(|start| (start..start + value.len(), value))
-        }),
-        ProtectedKind::Code => extract_code_spans(clause)
-            .into_iter()
-            .next()
-            .and_then(|value| {
-                clause
-                    .find(&value)
-                    .map(|start| (start..start + value.len(), value))
-            }),
-    };
-    let Some((range, replacement)) = replacement else {
-        return false;
-    };
-    if replacement == old || !values.contains(&replacement) {
-        return false;
+    let clause_end = repair_start
+        + clause
+            .char_indices()
+            .find(|(index, character)| {
+                is_sentence_break_at(clause, *index, *character) || matches!(character, '、' | ',')
+            })
+            .map_or(clause.len(), |(index, _)| index);
+    let (replacement_index, (replacement_range, replacement)) = occurrences
+        .iter()
+        .enumerate()
+        .skip(index + 1)
+        .find(|(_, (range, _))| range.start >= repair_start && range.start < clause_end)?;
+    if replacement.value == old.value {
+        return None;
     }
-    let prefix = clause[..range.start].trim();
+    let prefix = source[repair_start..replacement_range.start].trim();
     if !prefix.is_empty() && !source_clause.ends_with(prefix) {
-        return false;
+        return None;
     }
-    if matches!(kind, ProtectedKind::Number) {
-        let source_unit = tail.chars().next().filter(|c| c.is_alphabetic());
-        let replacement_unit = clause[range.end..]
-            .chars()
-            .next()
-            .filter(|c| c.is_alphabetic());
-        if source_unit.is_some() && replacement_unit.is_some() && source_unit != replacement_unit {
-            return false;
-        }
+    if old.unit.is_some() && replacement.unit.is_some() && old.unit != replacement.unit {
+        return None;
     }
-    true
+    Some(replacement_index)
 }
 
 fn is_sentence_break_at(text: &str, index: usize, character: char) -> bool {
@@ -449,16 +435,7 @@ fn is_sentence_break_at(text: &str, index: usize, character: char) -> bool {
     matches!(character, '。' | '!' | '?' | '！' | '？')
 }
 
-fn source_values_in(text: &str, values: &[String]) -> Vec<String> {
-    extract_urls(text)
-        .into_iter()
-        .chain(extract_numbers(text))
-        .chain(extract_code_spans(text))
-        .filter(|value| values.contains(value))
-        .collect()
-}
-
-fn extract_code_spans(text: &str) -> Vec<String> {
+fn code_span_occurrences(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
     let mut spans = Vec::new();
     let mut cursor = 0;
     while let Some(relative_start) = text[cursor..].find('`') {
@@ -473,12 +450,22 @@ fn extract_code_spans(text: &str) -> Vec<String> {
             break;
         };
         let end = content_start + relative_end + delimiter_length;
-        push_unique_span(&mut spans, &text[start..end]);
+        spans.push((start..end, text[start..end].to_owned()));
         cursor = end;
     }
     spans
 }
 
+#[cfg(test)]
+fn extract_code_spans(text: &str) -> Vec<String> {
+    let mut spans = Vec::new();
+    for (_, span) in code_span_occurrences(text) {
+        push_unique_span(&mut spans, &span);
+    }
+    spans
+}
+
+#[cfg(test)]
 fn extract_numbers(text: &str) -> Vec<String> {
     let mut numbers = Vec::new();
     for (_, value) in number_occurrences(text) {
@@ -488,13 +475,9 @@ fn extract_numbers(text: &str) -> Vec<String> {
 }
 
 fn number_occurrences(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
-    let urls = extract_urls(text);
-    let url_ranges = urls
-        .iter()
-        .flat_map(|url| {
-            text.match_indices(url)
-                .map(|(start, _)| start..start + url.len())
-        })
+    let url_ranges = url_occurrences(text)
+        .into_iter()
+        .map(|(range, _)| range)
         .collect::<Vec<_>>();
     let mut spans = Vec::new();
     let mut start = None;
@@ -631,7 +614,15 @@ fn protected_spans(transcript: &str) -> Vec<String> {
     spans
 }
 
+#[cfg(test)]
 fn extract_urls(text: &str) -> Vec<String> {
+    url_occurrences(text)
+        .into_iter()
+        .map(|(_, url)| url)
+        .collect()
+}
+
+fn url_occurrences(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
     let mut urls = Vec::new();
     let mut cursor = 0;
     while cursor < text.len() {
@@ -663,7 +654,7 @@ fn extract_urls(text: &str) -> Vec<String> {
             .map_or(text.len(), |(index, _)| cursor + index);
         let url = trim_url_sentence_delimiter(&text[cursor..end]);
         if url.len() > scheme_length {
-            urls.push(url.to_string());
+            urls.push((cursor..cursor + url.len(), url.to_string()));
         }
         cursor = end.max(cursor + scheme_length);
     }
@@ -720,6 +711,7 @@ fn is_english_word_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || character == '_'
 }
 
+#[cfg(test)]
 fn push_unique_span(spans: &mut Vec<String>, span: &str) {
     if !span.is_empty() && !spans.iter().any(|existing| existing == span) {
         spans.push(span.into());
@@ -1640,6 +1632,105 @@ mod tests {
         ));
     }
 
+    fn accepts_with_corrections(input: &str, output: &str, merge_duplicates: bool) -> bool {
+        let edits = FactEdits {
+            corrections: true,
+            merge_duplicates,
+        };
+        preserves_protected_spans_with_hints(input, output, edits, &[])
+    }
+
+    #[test]
+    fn intent_aware_matches_repeated_values_by_position() {
+        // A repair of one mention keeps an unrelated later mention of the value.
+        let partial = "参加者は3人、いや4人。補欠は3人。";
+        assert!(accepts_with_corrections(
+            partial,
+            "参加者は4人。補欠は3人。",
+            false
+        ));
+        assert!(!accepts_with_corrections(
+            partial,
+            "参加者は4人。補欠は4人。",
+            true
+        ));
+        assert!(!accepts_with_corrections(partial, "参加者は4人。", true));
+
+        // A later correction may replace every earlier mention of the value.
+        let global = "会議は3時から。3時に集合。いや、4時です。";
+        assert!(accepts_with_corrections(
+            global,
+            "会議は4時から。4時に集合です。",
+            false
+        ));
+        assert!(accepts_with_corrections(
+            global,
+            "会議は3時から。4時に集合です。",
+            false
+        ));
+        assert!(!accepts_with_corrections(
+            global,
+            "会議は4時から。4時に集合。5時に解散。",
+            true
+        ));
+        assert!(!accepts_with_corrections(
+            global,
+            "会議は4時から。4時に集合。4時に解散。",
+            true
+        ));
+        assert!(!preserves_protected_spans(
+            global,
+            "会議は4時から。4時に集合です。",
+            false
+        ));
+
+        // Successive revisions resolve to the final explicit choice only.
+        let successive = "会議は3時から。3時、いや4時、訂正、5時に集合。";
+        assert!(accepts_with_corrections(
+            successive,
+            "会議は5時から。5時に集合。",
+            false
+        ));
+        assert!(!accepts_with_corrections(
+            successive,
+            "会議は4時から。5時に集合。",
+            false
+        ));
+
+        // Duplicate merging follows the repetition switch.
+        let duplicate = "参加者は3人です。参加者は3人です。";
+        assert!(accepts_with_corrections(
+            duplicate,
+            "参加者は3人です。",
+            true
+        ));
+        assert!(!accepts_with_corrections(
+            duplicate,
+            "参加者は3人です。",
+            false
+        ));
+        assert!(!accepts_with_corrections(
+            duplicate,
+            "参加者は4人です。",
+            true
+        ));
+        let intent_aware = Settings {
+            correction_mode: "intent_aware".into(),
+            ..Settings::default()
+        };
+        assert!(validate_correction_output(&intent_aware, duplicate, "参加者は3人です。").is_ok());
+        let without_repetition_removal = Settings {
+            correction_remove_repetitions: false,
+            ..intent_aware
+        };
+        assert!(validate_correction_output(
+            &without_repetition_removal,
+            duplicate,
+            "参加者は3人です。"
+        )
+        .is_err());
+    }
+
     #[test]
     fn intent_aware_real_input_output_fixtures() {
         let accepted = [
@@ -1667,10 +1758,14 @@ mod tests {
             ("かもしれない。", "かもしれません。"),
             ("Maybe we can go.", "We can maybe go."),
             ("三時に会います。", "三時に会います。"),
+            (
+                "参加者は3人、いや4人。補欠は3人。",
+                "参加者は4人。補欠は3人。",
+            ),
         ];
         for (input, output) in accepted {
             assert!(
-                preserves_protected_spans(input, output, true),
+                accepts_with_corrections(input, output, false),
                 "rejected {input} => {output}"
             );
         }
@@ -1684,10 +1779,6 @@ mod tests {
             (
                 "参加者は3人、いや4人。予算は3円。",
                 "参加者は4人。予算は3人。",
-            ),
-            (
-                "参加者は3人、いや4人。補欠は3人。",
-                "参加者は4人。補欠は3人。",
             ),
             ("参加者は3人、いや予算は4円。", "予算は4円。"),
             ("参加者は3人です。", "参加者は4人です。"),
@@ -1712,7 +1803,7 @@ mod tests {
         ];
         for (input, output) in rejected {
             assert!(
-                !preserves_protected_spans(input, output, true),
+                !accepts_with_corrections(input, output, true),
                 "accepted {input} => {output}"
             );
         }
