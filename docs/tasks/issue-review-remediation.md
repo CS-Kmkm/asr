@@ -39,6 +39,7 @@ Context:
 Status:
 - Done: issue-local review fixes for #7-#15 have independent audits, passing focused/full relevant tests and local Conventional Commits. #11 fixes are merged into #13 and #15; #7 fixes are merged into #8. Those integrated trees passed Rust and UI builds.
 - Done: a separate local `test/issue-7-15-integration` worktree combines local correction with intent-aware validation and personalization. Its stub local-server test covers accepted and rejected numeric self-correction; 157 Rust tests passed (4 ignored), UI build passed, and independent merge audit found no concrete defect.
-- Done: #8 -> #9 -> #10 -> #12 -> #14 were propagated with ordinary local merge commits. The #12 merge passed 187 Rust tests (4 ignored), UI build, and independent audit; the #14 merge passed 203 Rust tests (4 ignored), UI build, and independent audit. No remediation commits or merge commits from this task have been pushed.
+- Done: #8 -> #9 -> #10 -> #12 -> #14 were propagated with ordinary local merge commits. The #12 merge passed 187 Rust tests (4 ignored), UI build, and independent audit; the #14 merge passed 203 Rust tests (4 ignored), UI build, and independent audit.
+- Follow-on PR request (2026-09-29): issue branches #7-#15 were pushed and nine issue-scoped Draft PRs were opened (#20-#28). Bases follow the two dependency stacks; #13 and #15 had unrelated diff noise removed before publication. Main and the test-only integration branch were not pushed; no PR was merged.
 - Manual-only: Windows hotkey/IME/overlay timing, real microphone, provider quality, and retained-audio playback remain unverified.
-- Next: perform the documented manual Windows/provider checks before considering PRs or a main-branch merge. Push and PR creation require separate authorization.
+- Next: perform the documented manual Windows/provider checks and review Draft PRs before marking them ready; merge only after separate review and authorization.
