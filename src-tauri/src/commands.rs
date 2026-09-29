@@ -2454,12 +2454,16 @@ pub(crate) async fn retry_history_item(
             })
             .map_err(str::to_string)?
             .map_err(command_error)?;
+        // The committed Retry still owns the lifecycle. Publish its completion
+        // before releasing it, so a recording started afterwards cannot have
+        // its state overwritten by this completion.
         recording_overlay::set_phase(&app, &AppPhase::Completed);
         let snapshot = state.complete(
             output.clone(),
             "History retry completed without inserting text.".into(),
         );
         let _ = app.emit("app-state", snapshot);
+        services.lifecycle.finish(operation_id);
         report_history_save_warning(&app, history_save_status);
         Ok(RecordingResult {
             text: output,
