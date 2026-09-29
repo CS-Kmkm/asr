@@ -107,11 +107,20 @@ pub(crate) struct Services {
 #[derive(Default, Clone, Copy)]
 struct StartupHotkeyIssues {
     collision: bool,
+    // Speak to edit shares its chord with an older action and is not dispatched.
+    edit_disabled: bool,
     registration_failed: bool,
 }
 
 impl StartupHotkeyIssues {
     fn message(self) -> Option<&'static str> {
+        if self.edit_disabled {
+            return Some(if self.registration_failed {
+                "Speak to edit is disabled because its saved hotkey is already used by another action, and a saved hotkey could not be registered. Change them in Settings."
+            } else {
+                "Speak to edit is disabled because its saved hotkey is already used by another action. Change the overlapping hotkeys in Settings."
+            });
+        }
         match (self.collision, self.registration_failed) {
             (false, false) => None,
             (true, false) => Some("Some saved hotkeys overlap. Change them in Settings to enable each action independently."),
@@ -412,6 +421,43 @@ mod shortcut_startup_tests {
             .message()
             .unwrap()
             .contains("could not be registered"));
+    }
+
+    #[test]
+    fn speak_to_edit_yields_a_shared_chord_to_every_older_action() {
+        let recording = parse_shortcut("Ctrl+Shift+Space").unwrap();
+        let selected = parse_shortcut("Ctrl+Shift+T").unwrap();
+        let voice = parse_shortcut("Ctrl+Shift+Y").unwrap();
+        let edit = parse_shortcut("Ctrl+Shift+E").unwrap();
+        assert!(!speak_to_edit_yields(edit, [recording, selected, voice]));
+        // A legacy selected-text translation chord of Ctrl+Shift+E keeps it.
+        assert!(speak_to_edit_yields(edit, [recording, edit, voice]));
+        assert!(speak_to_edit_yields(edit, [edit, selected, voice]));
+        assert!(speak_to_edit_yields(edit, [recording, selected, edit]));
+    }
+
+    #[test]
+    fn startup_warning_names_speak_to_edit_when_it_yields() {
+        let mut issues = StartupHotkeyIssues {
+            collision: true,
+            edit_disabled: true,
+            registration_failed: false,
+        };
+        let message = issues.message().unwrap();
+        assert!(
+            message.starts_with("Speak to edit is disabled"),
+            "{message}"
+        );
+        assert!(message.contains("already used by another action"));
+        issues.registration_failed = true;
+        let message = issues.message().unwrap();
+        assert!(
+            message.starts_with("Speak to edit is disabled"),
+            "{message}"
+        );
+        assert!(message.contains("could not be registered"));
+        issues.edit_disabled = false;
+        assert!(!issues.message().unwrap().contains("Speak to edit"));
     }
 }
 
@@ -786,11 +832,20 @@ fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
         tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Dictate));
     } else if shortcut == voice_translate {
         tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Translate));
-    } else if shortcut == speak_to_edit {
+    } else if shortcut == speak_to_edit
+        && !speak_to_edit_yields(speak_to_edit, [recording, translation, voice_translate])
+    {
         tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Edit));
     } else if shortcut == translation {
         tauri::async_runtime::spawn(translate_selection(app));
     }
+}
+
+/// Shortcut collision precedence (D1): an older action keeps a shared chord.
+/// Speak to edit is newer than Dictate and both Translate actions, so it is
+/// not dispatched on a chord that any of them also uses.
+fn speak_to_edit_yields(edit: Shortcut, older: [Shortcut; 3]) -> bool {
+    older.contains(&edit)
 }
 
 async fn initialize_model_runtime(app: AppHandle, settings: Settings) {
@@ -873,8 +928,9 @@ pub fn run() {
             app.manage(Services::new(&settings));
             recording_overlay::create(app.handle())?;
             // Older settings may share a chord with a newly added mode. Dispatch
-            // gives Dictate, voice Translate, Speak to edit, then selected-text
-            // translation precedence; register that chord only once at startup.
+            // gives it to Dictate, then voice Translate, then selected-text
+            // translation; Speak to edit yields to all of them (D1). Register
+            // that chord only once at startup.
             let shortcuts = unique_shortcuts([
                 shortcut,
                 voice_translate_shortcut,
@@ -884,6 +940,10 @@ pub fn run() {
             if shortcuts.len() != 4 {
                 if let Ok(mut issues) = app.state::<Services>().startup_hotkey_issues.lock() {
                     issues.collision = true;
+                    issues.edit_disabled = speak_to_edit_yields(
+                        edit_shortcut,
+                        [shortcut, translation_shortcut, voice_translate_shortcut],
+                    );
                 }
             }
             for shortcut in shortcuts {

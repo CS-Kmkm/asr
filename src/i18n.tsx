@@ -128,6 +128,8 @@ const en = {
   "The edit paste could not be confirmed; the result remains on the clipboard.": "The edit paste could not be confirmed; the result remains on the clipboard.",
   "Speak to edit could not monitor the original selection safely.": "Speak to edit could not monitor the original selection safely.",
   "The original selection was not changed, and the clipboard is unavailable; the edit is available in this app.": "The original selection was not changed, and the clipboard is unavailable; the edit is available in this app.",
+  "Speak to edit is disabled because its saved hotkey is already used by another action. Change the overlapping hotkeys in Settings.": "Speak to edit is disabled because its saved hotkey is already used by another action. Change the overlapping hotkeys in Settings.",
+  "Speak to edit is disabled because its saved hotkey is already used by another action, and a saved hotkey could not be registered. Change them in Settings.": "Speak to edit is disabled because its saved hotkey is already used by another action, and a saved hotkey could not be registered. Change them in Settings.",
   "Dictation sends its transcript to the selected provider only when AI correction is on. Voice and selected-text Translate send text whenever used. Speak to edit sends selected source text and the transcribed spoken instruction whenever used, even when AI correction is off. These text-processing features do not send audio, but the selected ASR backend may.": "Dictation sends its transcript to the selected provider only when AI correction is on. Voice and selected-text Translate send text whenever used. Speak to edit sends selected source text and the transcribed spoken instruction whenever used, even when AI correction is off. These text-processing features do not send audio, but the selected ASR backend may.",
   "AI correction requests are disabled for Dictation. Translate and Speak to edit still use the selected provider when invoked.": "AI correction requests are disabled for Dictation. Translate and Speak to edit still use the selected provider when invoked.",
   "Speak to edit sends selected source text and the transcribed spoken instruction to the provider shown under AI text correction, even when correction is off. The selected ASR backend may send audio.": "Speak to edit sends selected source text and the transcribed spoken instruction to the provider shown under AI text correction, even when correction is off. The selected ASR backend may send audio.",
@@ -274,6 +276,8 @@ const ja: Record<MessageKey, string> = {
   "The edit paste could not be confirmed; the result remains on the clipboard.": "編集結果の貼り付けを確認できませんでした。結果はクリップボードに残っています。",
   "Speak to edit could not monitor the original selection safely.": "元の選択範囲を安全に監視できないため、音声編集を開始できませんでした。",
   "The original selection was not changed, and the clipboard is unavailable; the edit is available in this app.": "元の選択範囲は変更されていません。クリップボードも利用できないため、編集結果はこのアプリで確認できます。",
+  "Speak to edit is disabled because its saved hotkey is already used by another action. Change the overlapping hotkeys in Settings.": "音声編集のホットキーが他の操作と重複しているため、音声編集は無効です。重複しているホットキーを設定で変更してください。",
+  "Speak to edit is disabled because its saved hotkey is already used by another action, and a saved hotkey could not be registered. Change them in Settings.": "音声編集のホットキーが他の操作と重複しているため音声編集は無効で、登録できないホットキーもあります。設定で変更してください。",
   "Dictation sends its transcript to the selected provider only when AI correction is on. Voice and selected-text Translate send text whenever used. Speak to edit sends selected source text and the transcribed spoken instruction whenever used, even when AI correction is off. These text-processing features do not send audio, but the selected ASR backend may.": "音声入力はAI修正が有効なときだけ、選択したプロバイダーへ文字起こしを送信します。音声翻訳と選択テキスト翻訳は使用時にテキストを送信します。音声編集はAI修正が無効でも、使用時に選択元のテキストと文字起こしした音声指示を送信します。これらのテキスト処理機能は音声を送信しませんが、選択した音声認識バックエンドは送信する場合があります。",
   "AI correction requests are disabled for Dictation. Translate and Speak to edit still use the selected provider when invoked.": "音声入力のAI修正リクエストは無効です。翻訳と音声編集は使用時に引き続き選択したプロバイダーを使用します。",
   "Speak to edit sends selected source text and the transcribed spoken instruction to the provider shown under AI text correction, even when correction is off. The selected ASR backend may send audio.": "音声編集はAI修正が無効でも、選択元のテキストと文字起こしした音声指示をAIテキスト修正欄のプロバイダーへ送信します。選択した音声認識バックエンドは音声を送信する場合があります。",
@@ -346,6 +350,8 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "The edit paste could not be confirmed; the result remains on the clipboard.",
       "Speak to edit could not monitor the original selection safely.",
       "The original selection was not changed, and the clipboard is unavailable; the edit is available in this app.",
+      "Speak to edit is disabled because its saved hotkey is already used by another action. Change the overlapping hotkeys in Settings.",
+      "Speak to edit is disabled because its saved hotkey is already used by another action, and a saved hotkey could not be registered. Change them in Settings.",
   ] satisfies MessageKey[],
 );
 
