@@ -841,11 +841,14 @@ fn store_next_translation_target(
 }
 
 #[tauri::command]
-pub(crate) fn cycle_voice_translation_target(
+pub(crate) async fn cycle_voice_translation_target(
     app: AppHandle,
     services: State<'_, Services>,
     storage: State<'_, Storage>,
 ) -> Result<String, String> {
+    // An async command runs off the main thread. Settings saves can hold the
+    // settings-write lock while the global-shortcut plugin waits on that
+    // thread; waiting for the lock here must not block shortcut registration.
     let mut active = services
         .voice_translation_target
         .lock()
@@ -1544,12 +1547,8 @@ pub(crate) async fn update_settings(
             );
         }
     }
-    let hotkeys = assign_hotkeys(&hotkey_bindings(&settings)?);
-    if !hotkeys.collisions.is_empty() {
-        return Err(
-            "recording, selected-text translation, and voice Translate hotkeys must differ".into(),
-        );
-    }
+    let proposed_hotkeys = hotkey_bindings(&settings)?;
+    let hotkeys = assign_hotkeys(&proposed_hotkeys);
     if settings.translation_instruction.chars().count() > 500
         || settings.translation_instruction.chars().any(|character| {
             character.is_control() && character != '\n' && character != '\r' && character != '\t'
@@ -1562,6 +1561,13 @@ pub(crate) async fn update_settings(
     let (previous, unavailable_hotkeys) = {
         let _settings_writes = storage.lock_settings_writes().map_err(command_error)?;
         let previous = storage.get_settings().map_err(command_error)?;
+        let previous_hotkeys = hotkey_bindings(&previous).unwrap_or_default();
+        if has_new_hotkey_collision(&proposed_hotkeys, &previous_hotkeys) {
+            return Err(
+                "recording, selected-text translation, and voice Translate hotkeys must differ"
+                    .into(),
+            );
+        }
         if cfg!(debug_assertions) && settings.auto_start && !previous.auto_start {
             return Err(
                 "autostart cannot be enabled from a development build; install and run a release build"
@@ -1573,7 +1579,6 @@ pub(crate) async fn update_settings(
             .lock()
             .map_err(|_| "hotkey registration state is unavailable".to_string())?;
         let mut registrar = GlobalHotkeys(&app);
-        let previous_hotkeys = hotkey_bindings(&previous).unwrap_or_default();
         let update = update_hotkey_registrations(
             &mut registrar,
             &mut registered,
@@ -1590,11 +1595,10 @@ pub(crate) async fn update_settings(
         }
         (previous, update.unavailable)
     };
-    // Saved chords are distinct; only unchanged chords that still cannot be
-    // registered remain as warnings.
+    // Preserve warnings for saved legacy collisions and unavailable chords.
     if let Ok(mut issues) = services.startup_hotkey_issues.lock() {
         *issues = HotkeyIssues {
-            collisions: Vec::new(),
+            collisions: hotkeys.collisions,
             unregistered: unavailable_hotkeys.clone(),
         };
     }

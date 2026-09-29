@@ -171,6 +171,23 @@ fn assign_hotkeys(bindings: &[HotkeyBinding]) -> HotkeyAssignment {
     assignment
 }
 
+/// A saved legacy collision may survive an unrelated settings edit. A new
+/// collision is one whose losing action or owner did not previously share the
+/// exact same chord.
+fn has_new_hotkey_collision(proposed: &[HotkeyBinding], previous: &[HotkeyBinding]) -> bool {
+    assign_hotkeys(proposed)
+        .collisions
+        .iter()
+        .any(|&(loser, owner)| {
+            let chord = proposed
+                .iter()
+                .find(|(action, _)| *action == loser)
+                .map(|(_, chord)| *chord)
+                .expect("colliding action has a proposed chord");
+            !previous.contains(&(loser, chord)) || !previous.contains(&(owner, chord))
+        })
+}
+
 /// The action a pressed chord runs. Only the chord's owner is dispatched, so
 /// an action that lost a collision never runs on that chord.
 fn dispatched_action(bindings: &[HotkeyBinding], pressed: Shortcut) -> Option<HotkeyAction> {
@@ -474,6 +491,18 @@ mod shortcut_startup_tests {
             dispatched_action(&bindings, parse_shortcut("Ctrl+Shift+U").unwrap()),
             None
         );
+    }
+
+    #[test]
+    fn existing_collision_survives_unrelated_save_but_new_collision_is_rejected() {
+        let existing = bindings("Ctrl+Shift+Space", "Ctrl+Shift+T", "Ctrl+Shift+T");
+        assert!(!has_new_hotkey_collision(&existing, &existing));
+
+        let newly_colliding = bindings("Ctrl+Shift+Space", "Ctrl+Shift+T", "Ctrl+Shift+Space");
+        assert!(has_new_hotkey_collision(&newly_colliding, &existing));
+
+        let moved_together = bindings("Ctrl+Shift+Space", "Ctrl+Shift+Y", "Ctrl+Shift+Y");
+        assert!(has_new_hotkey_collision(&moved_together, &existing));
     }
 
     #[test]
