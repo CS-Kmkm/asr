@@ -19,14 +19,20 @@ and the current target. The recording overlay shows that target and can cycle
 the list; clicking the overlay counts as user activity, so that recording uses
 the clipboard fallback instead of modifying a target after interaction.
 `Ctrl+Shift+T` remains the separate selected-text translation action.
+If saved hotkeys overlap, for example when an older selected-text translation
+hotkey is `Ctrl+Shift+Y`, the older action keeps the chord: recording, then
+selected-text translation, then voice Translate. The overlapped action stays off
+until it is assigned a different hotkey, and the main window names it.
 
 `Ctrl+Shift+E` starts **Speak to edit** for the text selected at that moment.
 Speak an instruction such as “make this concise” or “translate this to
 Japanese,” then press the shortcut again. The provider receives the immutable
 selected text and spoken instruction as separate untrusted fields and may only
-return replacement text. If focus, selection, user input, shortcut release, or
-IME safety checks fail, the original text is left alone and the generated edit
-remains on the clipboard.
+return replacement text. The replacement keeps the selection's leading and
+trailing spaces and line breaks. Deleting the selection is not an Edit result:
+an empty provider response is rejected and the selection is left unchanged. If
+focus, selection, user input, shortcut release, or IME safety checks fail, the
+original text is left alone and the generated edit remains on the clipboard.
 
 Audio is deleted after processing by default. Transcript history is optional and
 stored in the application SQLite database. Logs and status events must never
@@ -146,11 +152,20 @@ the model ID and a numeric loopback base URL such as
 requires no API key, bypasses system proxies, rejects redirects, and refuses
 non-loopback hosts so transcript text cannot be sent to an obvious remote
 endpoint through this provider. The local model server itself is not bundled
-or started by the app. The endpoint URL is saved when the field loses focus or
-Enter is pressed, so it can be edited from an empty draft. The local output
-token limit defaults to 4096 and can be set from 128 to 32768; some servers
-count thinking tokens toward this limit. Increase it if a reasoning model
-returns a length limit, subject to the server's context and memory limits.
+or started by the app. The endpoint URL and model ID are saved when the field
+loses focus or Enter is pressed (Escape reverts the draft), so they can be
+edited from an empty draft.
+The local output token limit defaults to 4096 and can be set from 128 to
+32768; some servers count thinking tokens toward this limit. When a response
+stops at this limit (`finish_reason: "length"`), the original transcript is
+used and the notice says that the local output token limit was reached;
+increase it, subject to the server's context and memory limits.
+A leading `<think>...</think>` block in the response text is removed before it
+reaches the preview or the inserted result; a response whose leading think
+block never closes falls back to the original transcript.
+Local requests use a 10-second connect timeout and fail when no data arrives
+for 90 seconds, with no total deadline, so a long generation that keeps
+streaming is not cut off.
 
 The automatic editor has independent switches for:
 
@@ -285,4 +300,6 @@ Full usage and Phase 0 gate criteria are documented in
 - Model download progress/resume UI and checksum verification remain future model
   management work; Transformers manages the current cache download.
 - The default shortcut is registered at startup, and persisted custom shortcuts
-  are re-registered on launch.
+  are re-registered on launch. If another app holds a saved hotkey, the app
+  names the action that stays unavailable; saving other settings still works,
+  while choosing a new hotkey that cannot be registered is rejected.

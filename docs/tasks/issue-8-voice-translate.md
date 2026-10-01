@@ -44,5 +44,13 @@ Context:
 - `src/App.tsx` renders the non-focusable recording overlay; `src/pages/SettingsPage.tsx`, `src/types.ts`, and `src/api.ts` own frontend settings.
 - `docs/tasks/issue-7-local-llm-correction.md` records the provider/privacy foundation used here.
 
-Status (2026-09-22):
+Status (2026-09-29):
 - Implementation and automated acceptance complete. The mode-aware lifecycle, deferred insertion, target-language settings/overlay, history migration, provider prompt, shortcut rollback, cancellation, and immediate-stop publication race are covered by focused and full checks. Independent review found one rapid-stop race; the stop path now waits for atomic session/target publication and the reviewer confirmed the fix. Manual Windows checks for real microphone/provider quality, foreground insertion, IME/focus/input fallback, shortcut handling, and overlay no-activation behavior remain required.
+- PR #22 review fixes (2026-09-29, `docs/tasks/pr-review-fixes.md`, decision D1):
+  - F1: startup registration and dispatch share one precedence order (Dictate > selected-text Translate > voice Translate). The older action keeps a shared chord; the losing action is not dispatched on it until reassigned, and the startup/Settings warning is one localized sentence per unassigned action.
+  - F2: a settings save whose unchanged chord still cannot be registered keeps the save, records the action as unavailable, emits a `hotkey_unavailable` warning, and names the action in the saved notice. A newly chosen chord that cannot be registered still fails and rolls back.
+  - F3: `Storage` has one settings-write lock. `update_settings` holds it from reading the previous settings until writing, and overlay target cycling does its read-modify-write under it.
+  - F4: (a) a voice Translate stop without a target language copies the raw transcript to the clipboard and ends in Error; `cancel_recording` clears the target language only while cancelling a Recording operation it owns. (b) The completed translation is published to app state before insertion.
+- The 2026-09-30 follow-up fixes F3's main-thread lock inversion by making overlay target cycling an async Tauri command. Existing legacy collisions may survive unrelated settings saves; a new collision is still rejected, and saved collision warnings remain visible. The collision rule has a focused regression test.
+- Verification passed for this follow-up: `cargo fmt --check`; `cargo clippy -j 4` (warnings only); `cargo test --lib -j 4` (157 passed, 4 ignored); `pnpm exec tsc --noEmit`; `pnpm build`; `git diff --check`.
+- Remaining: independent cross-stack audit and propagation are tracked in `docs/tasks/pr-review-fixes.md`. F5 test backfill is outside this fix wave. The F4 missing-target Error path and the F4(b) publication order have no automated test because `stop_recording` needs a Tauri app harness. Manual Windows checks listed above remain required.
