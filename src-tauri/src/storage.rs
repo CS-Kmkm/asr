@@ -44,15 +44,57 @@ pub struct Storage {
     history_audio_dir: PathBuf,
 }
 
+/// Builds without the V2 `shortcuts` field read one scalar chord per mode.
+/// Mirroring each mode's primary chord keeps those chords after a downgrade;
+/// an older build that rewrites settings drops `shortcuts`, and the next
+/// migration rebuilds it from these keys.
+const LEGACY_SHORTCUT_KEYS: [&str; 4] = [
+    "hotkey",
+    "voiceTranslateHotkey",
+    "askHotkey",
+    "speakToEditHotkey",
+];
+
+fn legacy_shortcut_primaries(
+    shortcuts: &crate::types::VoiceShortcuts,
+) -> Result<[&str; 4], StorageError> {
+    fn primary(chords: &[String]) -> Result<&str, StorageError> {
+        chords.first().map(String::as_str).ok_or_else(|| {
+            StorageError::InvalidSettings(serde_json::Error::io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "voice mode shortcut list is empty",
+            )))
+        })
+    }
+    Ok([
+        primary(&shortcuts.dictate)?,
+        primary(&shortcuts.translate)?,
+        primary(&shortcuts.ask)?,
+        primary(&shortcuts.edit)?,
+    ])
+}
+
+/// Writes the legacy scalar keys; returns whether any value changed.
+fn mirror_legacy_shortcut_keys(
+    value: &mut serde_json::Value,
+    shortcuts: &crate::types::VoiceShortcuts,
+) -> Result<bool, StorageError> {
+    let mut changed = false;
+    for (key, primary) in LEGACY_SHORTCUT_KEYS
+        .into_iter()
+        .zip(legacy_shortcut_primaries(shortcuts)?)
+    {
+        if value[key] != primary {
+            value[key] = primary.into();
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 fn serialized_settings(settings: &Settings) -> Result<String, StorageError> {
     let mut value = serde_json::to_value(settings)?;
-    let primary = settings.shortcuts.dictate.first().ok_or_else(|| {
-        StorageError::InvalidSettings(serde_json::Error::io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "dictation shortcut list is empty",
-        )))
-    })?;
-    value["hotkey"] = primary.clone().into();
+    mirror_legacy_shortcut_keys(&mut value, &settings.shortcuts)?;
     Ok(serde_json::to_string(&value)?)
 }
 
@@ -334,10 +376,6 @@ impl Storage {
                 }),
             );
         }
-        let mut had_legacy_shortcut_fields = false;
-        for key in ["voiceTranslateHotkey", "askHotkey", "speakToEditHotkey"] {
-            had_legacy_shortcut_fields |= object.remove(key).is_some();
-        }
         let mut settings: Settings = serde_json::from_value(value.clone())?;
         let defaults = crate::types::VoiceShortcuts::default();
         let mut recovered_empty_shortcuts = false;
@@ -363,14 +401,9 @@ impl Storage {
                 message,
             )))
         })?;
-        let compatibility_hotkey_missing = value["hotkey"] != settings.shortcuts.dictate[0];
-        value["hotkey"] = settings.shortcuts.dictate[0].clone().into();
-        if legacy_history
-            || legacy_shortcuts
-            || had_legacy_shortcut_fields
-            || compatibility_hotkey_missing
-            || recovered_empty_shortcuts
-        {
+        // V2 `shortcuts` is canonical; the scalar keys only mirror primaries.
+        let legacy_keys_changed = mirror_legacy_shortcut_keys(&mut value, &settings.shortcuts)?;
+        if legacy_history || legacy_shortcuts || legacy_keys_changed || recovered_empty_shortcuts {
             // Persist the normalized V2 retention value, but keep fields that
             // this version does not own. A migration must not erase a newer
             // client's unrelated setting merely because it encountered an
@@ -1363,6 +1396,9 @@ mod tests {
         let migrated: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(migrated["futureSetting"]["keep"], true);
         assert_eq!(migrated["hotkey"], "Ctrl+Alt+V");
+        assert_eq!(migrated["voiceTranslateHotkey"], "Ctrl+Alt+Y");
+        assert_eq!(migrated["askHotkey"], "Ctrl+Alt+A");
+        assert_eq!(migrated["speakToEditHotkey"], "Ctrl+Alt+E");
         assert_eq!(migrated["shortcuts"]["dictate"][0], "Ctrl+Alt+V");
     }
 
@@ -1384,12 +1420,19 @@ mod tests {
             .unwrap();
         let settings = storage.get_settings().unwrap();
         assert_eq!(settings.shortcuts.dictate, ["Ctrl+Shift+T"]);
+        let (routes, shadowed) =
+            crate::shortcuts::Routes::parse_saved_with_shadowed(&settings).unwrap();
+        assert_eq!(routes.0.len(), 4);
         assert_eq!(
-            crate::shortcuts::Routes::parse_saved(&settings)
+            routes
+                .find(crate::parse_shortcut("Ctrl+Shift+T").unwrap())
                 .unwrap()
-                .0
-                .len(),
-            4
+                .action,
+            crate::shortcuts::Action::Dictate
+        );
+        assert_eq!(
+            shadowed[0].describe(),
+            "Selected-text translation (Ctrl+Shift+T)"
         );
         let saved: String = storage
             .connection()
@@ -1406,26 +1449,89 @@ mod tests {
     }
 
     #[test]
-    fn saved_settings_keep_legacy_hotkey_synced_to_primary_dictation_chord() {
+    fn legacy_selected_text_chord_equal_to_voice_default_stays_selected_text() {
+        // A pre-voice-Translate build saved Ctrl+Shift+Y for selected-text
+        // translation; migration gives voice Translate the same default.
+        let storage = Storage::in_memory().unwrap();
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("shortcuts");
+        object.insert("hotkey".into(), "Ctrl+Shift+Space".into());
+        object.insert("translationHotkey".into(), "Ctrl+Shift+Y".into());
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, 'now')",
+                [value.to_string()],
+            )
+            .unwrap();
+        let settings = storage.get_settings().unwrap();
+        assert_eq!(settings.shortcuts.translate, ["Ctrl+Shift+Y"]);
+        let (routes, shadowed) =
+            crate::shortcuts::Routes::parse_saved_with_shadowed(&settings).unwrap();
+        assert_eq!(
+            routes
+                .find(crate::parse_shortcut("Ctrl+Shift+Y").unwrap())
+                .unwrap()
+                .action,
+            crate::shortcuts::Action::SelectedText
+        );
+        assert_eq!(shadowed.len(), 1);
+        assert_eq!(shadowed[0].describe(), "Voice Translate (Ctrl+Shift+Y)");
+    }
+
+    #[test]
+    fn saved_settings_mirror_each_primary_chord_for_older_builds() {
         let storage = Storage::in_memory().unwrap();
         let mut settings = Settings::default();
         settings.shortcuts.dictate = vec!["Ctrl+Alt+V".into(), "Ctrl+Shift+Space".into()];
-        storage.update_settings(&settings).unwrap();
-        let raw: String = storage
+        settings.shortcuts.translate = vec!["Ctrl+Alt+Y".into(), "Ctrl+Alt+U".into()];
+        settings.shortcuts.ask = vec!["Ctrl+Alt+A".into()];
+        settings.shortcuts.edit = vec!["Ctrl+Alt+E".into(), "Ctrl+Alt+R".into()];
+        let read_raw = |storage: &Storage| -> serde_json::Value {
+            let raw: String = storage
+                .connection()
+                .unwrap()
+                .query_row(
+                    "SELECT value FROM settings WHERE key='app_settings'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&raw).unwrap()
+        };
+        for persist in [
+            Storage::update_settings as fn(&Storage, &Settings) -> Result<(), StorageError>,
+            Storage::update_settings_and_apply_history_policy,
+        ] {
+            persist(&storage, &settings).unwrap();
+            let value = read_raw(&storage);
+            assert_eq!(value["hotkey"], "Ctrl+Alt+V");
+            assert_eq!(value["voiceTranslateHotkey"], "Ctrl+Alt+Y");
+            assert_eq!(value["askHotkey"], "Ctrl+Alt+A");
+            assert_eq!(value["speakToEditHotkey"], "Ctrl+Alt+E");
+            // Reading keeps the canonical arrays and their mirrors intact.
+            assert_eq!(storage.get_settings().unwrap(), settings);
+            assert_eq!(read_raw(&storage), value);
+        }
+
+        // An older build rewrites settings with its scalar fields only.
+        let mut downgraded = read_raw(&storage);
+        downgraded.as_object_mut().unwrap().remove("shortcuts");
+        storage
             .connection()
             .unwrap()
-            .query_row(
-                "SELECT value FROM settings WHERE key='app_settings'",
-                [],
-                |row| row.get(0),
+            .execute(
+                "UPDATE settings SET value = ?1 WHERE key = 'app_settings'",
+                [downgraded.to_string()],
             )
             .unwrap();
-        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(value["hotkey"], "Ctrl+Alt+V");
-        assert_eq!(
-            storage.get_settings().unwrap().shortcuts,
-            settings.shortcuts
-        );
+        let upgraded = storage.get_settings().unwrap();
+        assert_eq!(upgraded.shortcuts.dictate, ["Ctrl+Alt+V"]);
+        assert_eq!(upgraded.shortcuts.translate, ["Ctrl+Alt+Y"]);
+        assert_eq!(upgraded.shortcuts.ask, ["Ctrl+Alt+A"]);
+        assert_eq!(upgraded.shortcuts.edit, ["Ctrl+Alt+E"]);
     }
 
     #[test]
