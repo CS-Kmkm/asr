@@ -5,7 +5,7 @@ import { AiCorrectionSettings } from "../components/AiCorrectionSettings";
 import type { AudioDevice, AudioLevel, Settings, ShortcutMode } from "../types";
 import { speechLocaleRegistry, uiLocaleRegistry } from "../types";
 import { getShortcutWarning, startMicrophoneTest, stopMicrophoneTest } from "../api";
-import { useI18n } from "../i18n";
+import { translateAppMessage, useI18n } from "../i18n";
 
 const translationLanguages = [
   ["en", "English"], ["ja", "Japanese"], ["zh", "Chinese"], ["es", "Spanish"],
@@ -30,7 +30,7 @@ export function SettingsPage({
   devices: AudioDevice[];
   recording: boolean;
 }) {
-  const { t } = useI18n();
+  const { language, t } = useI18n();
   const [shortcuts, setShortcuts] = useState(settings.shortcuts);
   const [translationHotkey, setTranslationHotkey] = useState(settings.translationHotkey);
   const [translationInstruction, setTranslationInstruction] = useState(settings.translationInstruction);
@@ -169,8 +169,33 @@ export function SettingsPage({
       setShortcutError(t("Each voice mode needs one to four non-empty shortcuts."));
       return;
     }
-    if (!translationHotkey.trim() || new Set(allChords.map((chord) => chord.toLocaleLowerCase())).size !== allChords.length) {
-      setShortcutError(t("Shortcuts must be non-empty and unique across all actions."));
+    const collisions = (voiceShortcuts: Settings["shortcuts"], selectedTextChord: string) => {
+      const entries = [
+        ...Object.entries(voiceShortcuts).flatMap(([mode, chords]) => chords.map((chord) => [chord.toLocaleLowerCase(), mode] as const)),
+        [selectedTextChord.toLocaleLowerCase(), "selected-text-translate"] as const,
+      ];
+      const groups = new Map<string, string[]>();
+      for (const [chord, action] of entries) groups.set(chord, [...(groups.get(chord) ?? []), action]);
+      return groups;
+    };
+    const previousCollisions = collisions(settings.shortcuts, settings.translationHotkey);
+    const nextCollisions = collisions(next, translationHotkey.trim());
+    const collisionOrder = ["dictate", "selected-text-translate", "translate", "edit", "ask"];
+    const newCollision = [...nextCollisions].find(([chord, actions]) => actions.length > 1
+      && JSON.stringify([...actions].sort()) !== JSON.stringify([...(previousCollisions.get(chord) ?? [])].sort()));
+    if (!translationHotkey.trim() || newCollision) {
+      if (newCollision) {
+        const orderedActions = [...newCollision[1]].sort((left, right) => collisionOrder.indexOf(left) - collisionOrder.indexOf(right));
+        const losingAction = orderedActions[orderedActions.length - 1];
+        const actionLabel = losingAction === "selected-text-translate" ? t("Selected-text translation hotkey")
+          : losingAction === "dictate" ? t("Dictation shortcuts")
+            : losingAction === "translate" ? t("Voice Translate shortcuts")
+              : losingAction === "edit" ? t("Speak to edit shortcuts")
+                : t("Ask Anything shortcuts");
+        setShortcutError(`${t("This shortcut conflicts with")} ${actionLabel}.`);
+      } else {
+        setShortcutError(t("Shortcuts must be non-empty and unique across all actions."));
+      }
       return;
     }
     setShortcutError(null);
@@ -238,7 +263,7 @@ export function SettingsPage({
               <span style={{ width: `${testRunning ? levelPercent : 0}%` }} />
             </div>
           </div>} />
-        {testError && <p className="settings-error" role="alert">{t("Microphone test failed.")} {testError}</p>}
+        {testError && <p className="settings-error" role="alert">{translateAppMessage(language, testError)}</p>}
         <SettingRow title={t("Interaction sounds")} detail={t("Play a brief local sound when recording starts and stops.")}
           control={<Toggle checked={settings.interactionSounds} onChange={(value) => onSave({ interactionSounds: value })} label={t("Interaction sounds")} />} />
         <p className="settings-note">{t("Muting or pausing other applications is unavailable because this app cannot safely control their audio.")}</p>
@@ -270,7 +295,7 @@ export function SettingsPage({
             if (event.key === "Enter") { event.preventDefault(); commitTranslationHotkey(); suppressTranslationHotkeyBlurRef.current = true; event.currentTarget.blur(); }
             if (event.key === "Escape") { setTranslationHotkey(settings.translationHotkey); suppressTranslationHotkeyBlurRef.current = true; event.currentTarget.blur(); }
           }} />} />
-        <SettingRow title={t("Voice Translate target")} detail={`${t("The first language is the default. Reorder the list or choose the active target.")} ${t("Voice and selected-text Translate send text to the provider shown under AI text correction, even when correction is off.")}`}
+        <SettingRow title={t("Voice Translate target")} detail={`${t("The first language is the default. Reorder the list or choose the active target.")} ${t("Voice and selected-text Translate send text to the provider shown under AI text correction, even when correction is off.")} ${t("Provider:")} ${settings.correctionProvider === "openai" ? "OpenAI" : settings.correctionProvider === "gemini" ? "Google Gemini" : t("Local (OpenAI-compatible)")}.`}
           control={<div className="translation-target-settings">
             <select value={settings.translationTargetLanguage} onChange={(event) => onSave({ translationTargetLanguage: event.target.value })}>
               {settings.translationTargetLanguages.map((language) => {

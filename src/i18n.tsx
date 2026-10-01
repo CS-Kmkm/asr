@@ -3,6 +3,8 @@ import type { UiLanguage } from "./types";
 
 const en = {
   "Ask Anything": "Ask Anything",
+  "Dictation": "Dictation",
+  "Selected-text translation": "Selected-text translation",
   "Ask Anything hotkey": "Ask Anything hotkey",
   "Asks or acts on a spoken instruction; the default is Ctrl+Shift+A.": "Asks or acts on a spoken instruction; the default is Ctrl+Shift+A.",
   Dismiss: "Dismiss",
@@ -161,7 +163,15 @@ const en = {
   "Default": "Default", "Microphone level test": "Microphone level test",
   "Test the selected microphone. Audio is measured live and never saved.": "Test the selected microphone. Audio is measured live and never saved.",
   "Stop test": "Stop test", "Start test": "Start test", "Microphone input level": "Microphone input level",
-  "Microphone test failed.": "Microphone test failed.", "Interaction sounds": "Interaction sounds",
+  "Microphone test failed.": "Microphone test failed.",
+  "Microphone test could not start.": "Microphone test could not start.",
+  "Microphone test could not stop.": "Microphone test could not stop.",
+  "microphone test requires an idle recording pipeline": "The microphone test requires recording to be idle.",
+  "microphone test was interrupted by recording": "The microphone test was interrupted because recording started.",
+  "theme must be system, light, or dark": "Choose System, Light, or Dark for the theme.",
+  "ui language must be en or ja": "Choose English or Japanese for the app language.",
+  "speech locale is unsupported": "The selected speech language is not supported.",
+  "Provider:": "Provider:", "Interaction sounds": "Interaction sounds",
   "Play a brief local sound when recording starts and stops.": "Play a brief local sound when recording starts and stops.",
   "Muting or pausing other applications is unavailable because this app cannot safely control their audio.": "Muting or pausing other applications is unavailable because this app cannot safely control their audio.",
   "Voice mode shortcuts": "Voice mode shortcuts", "Dictation shortcuts": "Dictation shortcuts",
@@ -172,6 +182,7 @@ const en = {
   "Remove shortcut": "Remove shortcut", "Add shortcut": "Add shortcut", "Save voice shortcuts": "Save voice shortcuts",
   "Each voice mode needs one to four non-empty shortcuts.": "Each voice mode needs one to four non-empty shortcuts.",
   "Shortcuts must be non-empty and unique across all actions.": "Shortcuts must be non-empty and unique across all actions.",
+  "This shortcut conflicts with": "This shortcut conflicts with",
   "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.": "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.",
   "shortcut cannot be empty": "Shortcut cannot be empty.",
   "shortcuts must be unique across all actions": "Shortcuts must be unique across all actions.",
@@ -195,6 +206,7 @@ const en = {
   "Dictation (AI corrected)": "Dictation (AI corrected)",
   "Dictation (AI fallback)": "Dictation (AI fallback)",
   "Voice Translate": "Voice Translate",
+  "Speak to edit": "Speak to edit",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
@@ -360,7 +372,15 @@ const ja: Record<MessageKey, string> = {
   "Default": "既定", "Microphone level test": "マイク入力テスト",
   "Test the selected microphone. Audio is measured live and never saved.": "選択したマイクをテストします。音声はリアルタイム測定のみで保存されません。",
   "Stop test": "テストを停止", "Start test": "テストを開始", "Microphone input level": "マイク入力レベル",
-  "Microphone test failed.": "マイクテストに失敗しました。", "Interaction sounds": "操作音",
+  "Microphone test failed.": "マイクテストに失敗しました。",
+  "Microphone test could not start.": "マイクテストを開始できませんでした。",
+  "Microphone test could not stop.": "マイクテストを停止できませんでした。",
+  "microphone test requires an idle recording pipeline": "録音中はマイクテストを実行できません。",
+  "microphone test was interrupted by recording": "録音が開始されたため、マイクテストを中断しました。",
+  "theme must be system, light, or dark": "テーマはシステム、ライト、ダークから選択してください。",
+  "ui language must be en or ja": "アプリの言語は英語または日本語から選択してください。",
+  "speech locale is unsupported": "選択した音声言語はサポートされていません。",
+  "Provider:": "プロバイダー：", "Interaction sounds": "操作音",
   "Play a brief local sound when recording starts and stops.": "録音の開始時と停止時に短い効果音を再生します。",
   "Muting or pausing other applications is unavailable because this app cannot safely control their audio.": "他のアプリの音声を安全に制御できないため、ミュートや一時停止は利用できません。",
   "Voice mode shortcuts": "音声モードのショートカット", "Dictation shortcuts": "音声入力のショートカット",
@@ -371,6 +391,7 @@ const ja: Record<MessageKey, string> = {
   "Remove shortcut": "ショートカットを削除", "Add shortcut": "ショートカットを追加", "Save voice shortcuts": "音声ショートカットを保存",
   "Each voice mode needs one to four non-empty shortcuts.": "各音声モードに1～4個の空でないショートカットが必要です。",
   "Shortcuts must be non-empty and unique across all actions.": "ショートカットは空欄にできず、すべての操作で重複できません。",
+  "This shortcut conflicts with": "このショートカットは次のモードと重複しています：",
   "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.": "起動時に一部のショートカットを有効にできませんでした。設定で変更し、再起動して確認してください。",
   "shortcut cannot be empty": "ショートカットは空欄にできません。",
   "shortcuts must be unique across all actions": "すべての操作でショートカットを重複させないでください。",
@@ -390,6 +411,9 @@ const ja: Record<MessageKey, string> = {
   "Dictation (AI corrected)": "音声入力（AI修正）",
   "Dictation (AI fallback)": "音声入力（AI失敗時の原文）",
   "Voice Translate": "音声翻訳",
+  "Speak to edit": "音声編集",
+  "Dictation": "音声入力",
+  "Selected-text translation": "選択テキスト翻訳",
 } satisfies Record<MessageKey, string>;
 
 const catalogs = { en, ja } satisfies Record<UiLanguage, Record<MessageKey, string>>;
@@ -457,6 +481,14 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "shortcuts must be unique across all actions",
       "each voice mode requires one to four shortcuts",
       "hotkey is invalid",
+      "Microphone test failed.",
+      "Microphone test could not start.",
+      "Microphone test could not stop.",
+      "microphone test requires an idle recording pipeline",
+      "microphone test was interrupted by recording",
+      "theme must be system, light, or dark",
+      "ui language must be en or ja",
+      "speech locale is unsupported",
       "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.",
       "Recording an Ask instruction.",
       "Ask cancelled.",
@@ -481,9 +513,26 @@ export function translateAppMessage(language: UiLanguage, message: string | null
   const key = message as MessageKey;
   if (appMessageKeys.has(key)) return translate(language, key);
 
+  const localizeActions = (details: string) => details
+    .replaceAll("Dictation", translate(language, "Dictation"))
+    .replaceAll("Selected-text translation", translate(language, "Selected-text translation"))
+    .replaceAll("Voice Translate", translate(language, "Voice Translate"))
+    .replaceAll("Ask Anything", translate(language, "Ask Anything"))
+    .replaceAll("Speak to edit", translate(language, "Speak to edit"));
+
+  for (const prefix of ["Microphone test failed. ", "Microphone test could not start. ", "Microphone test could not stop. "] as const) {
+    if (message.startsWith(prefix)) return `${translate(language, prefix.slice(0, -1) as MessageKey)}${message.slice(prefix.length) ? ` ${message.slice(prefix.length)}` : ""}`;
+  }
+
+  const shortcutValidation = /^(shortcut cannot be empty|shortcuts must be unique across all actions|each voice mode requires one to four shortcuts|hotkey is invalid):?\s*(.*)$/s.exec(message);
+  if (shortcutValidation) {
+    const [, prefix, details] = shortcutValidation;
+    return `${translate(language, prefix as MessageKey)}${details ? `: ${localizeActions(details)}` : ""}`;
+  }
+
   for (const prefix of ["shortcut registration failed:", "shortcut removal failed:"] as const) {
     if (message.startsWith(prefix)) {
-      return `${translate(language, prefix)}${message.slice(prefix.length).replace("shortcut restoration failed, restart required:", translate(language, "shortcut restoration failed, restart required:"))}`;
+      return `${translate(language, prefix)}${localizeActions(message.slice(prefix.length).replace("shortcut restoration failed, restart required:", translate(language, "shortcut restoration failed, restart required:")))}`;
     }
   }
 
