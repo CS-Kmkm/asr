@@ -90,7 +90,8 @@ impl SearchSite {
     }
 
     pub fn fixed_url(self, query: &str) -> Result<String, AskError> {
-        validate_text(query, 512)?;
+        let query = self.derive_search_query(query);
+        validate_text(&query, 512)?;
         if query.trim().is_empty() {
             return Err(AskError::Invalid("search query is empty"));
         }
@@ -102,6 +103,81 @@ impl SearchSite {
             Self::GitHub => format!("https://github.com/search?q={query}"),
         })
     }
+
+    /// Derive the query from the user's spoken instruction. The planner's
+    /// output is intentionally absent from this function's inputs.
+    pub fn derive_search_query(self, spoken: &str) -> String {
+        let mut query = spoken.trim().to_owned();
+        let site_aliases: &[&str] = match self {
+            Self::Google => &["google", "グーグル"],
+            Self::YouTube => &["youtube", "ユーチューブ"],
+            Self::AmazonJapan => &["amazon", "アマゾン"],
+            Self::GitHub => &["github", "ギットハブ"],
+        };
+        for alias in site_aliases {
+            query = if alias.is_ascii() {
+                replace_ascii_word_case_insensitive(&query, alias, " ")
+            } else {
+                query.replace(alias, " ")
+            };
+        }
+
+        // Fixed command phrases only; words that may be part of a query are
+        // not interpreted as arbitrary stop words.
+        let ja_phrases = [
+            "で検索してください",
+            "で検索して",
+            "で検索",
+            "を検索してください",
+            "を検索して",
+            "を検索",
+            "検索してください",
+            "検索して",
+            "検索する",
+            "検索",
+        ];
+        for phrase in ja_phrases {
+            query = query.replace(phrase, " ");
+        }
+        for phrase in ["search for", "look up", "find", "search"] {
+            query = replace_ascii_phrase_case_insensitive(&query, phrase, " ");
+        }
+        for phrase in [" on ", " using ", " please ", " for "] {
+            query = replace_ascii_phrase_case_insensitive(&query, phrase, " ");
+        }
+        query = query.trim().trim_start_matches('で').trim().to_owned();
+        query.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+}
+
+fn replace_ascii_word_case_insensitive(input: &str, needle: &str, replacement: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let mut result = String::with_capacity(input.len());
+    let mut start = 0;
+    for (index, _) in lower.match_indices(needle) {
+        let end = index + needle.len();
+        let before_ok = index == 0 || !lower.as_bytes()[index - 1].is_ascii_alphanumeric();
+        let after_ok = end == lower.len() || !lower.as_bytes()[end].is_ascii_alphanumeric();
+        if before_ok && after_ok && index >= start {
+            result.push_str(&input[start..index]);
+            result.push_str(replacement);
+            start = end;
+        }
+    }
+    result.push_str(&input[start..]);
+    result
+}
+
+fn replace_ascii_phrase_case_insensitive(input: &str, phrase: &str, replacement: &str) -> String {
+    let mut result = input.to_owned();
+    loop {
+        let lower = result.to_ascii_lowercase();
+        let Some(index) = lower.find(phrase) else {
+            break;
+        };
+        result.replace_range(index..index + phrase.len(), replacement);
+    }
+    result
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -433,6 +509,34 @@ mod tests {
         assert!(!SearchSite::Google.named_in("search googled for rust"));
         assert!(!SearchSite::AmazonJapan.named_in("search amazong for rust"));
         assert!(SearchSite::YouTube.named_in("ユーチューブで検索"));
+    }
+
+    #[test]
+    fn search_query_is_derived_from_fixed_english_and_japanese_templates() {
+        assert_eq!(
+            SearchSite::Google.derive_search_query("Search Google for Rust language"),
+            "Rust language"
+        );
+        assert_eq!(
+            SearchSite::YouTube.derive_search_query("ユーチューブで猫動画を検索して"),
+            "猫動画"
+        );
+        assert_eq!(
+            SearchSite::GitHub.derive_search_query("find GitHub projects for rust"),
+            "projects rust"
+        );
+        assert_eq!(
+            SearchSite::AmazonJapan.derive_search_query("アマゾンでコーヒー豆を検索"),
+            "コーヒー豆"
+        );
+    }
+
+    #[test]
+    fn fixed_url_uses_the_derived_query() {
+        let url = SearchSite::Google
+            .fixed_url("Search Google for cats")
+            .unwrap();
+        assert!(url.ends_with("q=cats"), "{url}");
     }
 
     #[test]
