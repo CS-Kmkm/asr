@@ -169,7 +169,7 @@ if (isRecordingOverlay) {
 }
 
 function AskAnswerPanel() {
-  const { t } = useI18n();
+  const { language, t } = useI18n();
   const [answer, setAnswer] = useState("");
   const [operationId, setOperationId] = useState(0);
   const operationRef = useRef(0);
@@ -201,9 +201,10 @@ function AskAnswerPanel() {
   const dismiss = async () => {
     await dismissAskAnswer(operationId);
   };
+  const displayedAnswer = translateAppMessage(language, answer) ?? answer;
   return <main className="ask-answer-panel" aria-live="polite">
-    <p className="eyebrow">{t("Ask Anything")}</p><div className="ask-answer-text">{answer}</div>
-    <div className="ask-answer-actions"><button className="secondary" type="button" disabled={!answer} onClick={() => void copyToClipboard(answer)}>{t("Copy")}</button><button className="secondary" type="button" disabled={!answer} onClick={() => void dismiss()}>{t("Dismiss")}</button></div>
+    <p className="eyebrow">{t("Ask Anything")}</p><div className="ask-answer-text">{displayedAnswer}</div>
+    <div className="ask-answer-actions"><button className="secondary" type="button" disabled={!answer} onClick={() => void copyToClipboard(displayedAnswer)}>{t("Copy")}</button><button className="secondary" type="button" disabled={!answer} onClick={() => void dismiss()}>{t("Dismiss")}</button></div>
   </main>;
 }
 
