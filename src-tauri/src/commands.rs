@@ -151,24 +151,59 @@ pub(crate) async fn list_audio_devices(
     audio.list_devices().await.map_err(command_error)
 }
 
-fn play_interaction_sound(enabled: bool, start: bool) {
-    dispatch_interaction_sound(enabled, start, |start| {
-        tauri::async_runtime::spawn_blocking(move || {
+/// Upper bound on waiting for the start cue before capture opens. Windows
+/// Plays the start cue to completion before opening the microphone. Timing
+/// out an in-flight `spawn_blocking` sound would let capture start while that
+/// sound is still audible, so the fixed OS cue must finish first.
+async fn play_start_cue_before_capture<Cue>(enabled: bool, cue: impl FnOnce() -> Cue)
+where
+    Cue: std::future::Future<Output = ()>,
+{
+    if enabled {
+        cue().await;
+    }
+}
+
+async fn play_start_cue_to_completion() {
+    let _ = tauri::async_runtime::spawn_blocking(|| {
+        #[cfg(target_os = "windows")]
+        {
+            use windows::core::w;
+            use windows::Win32::Foundation::HMODULE;
+            use windows::Win32::Media::Audio::{
+                PlaySoundW, SND_ALIAS, SND_NODEFAULT, SND_SYNC, SND_SYSTEM,
+            };
+            // The SystemAsterisk cue formerly sent through MessageBeep, played
+            // synchronously so completion is observable.
+            let _ = unsafe {
+                PlaySoundW(
+                    w!("SystemAsterisk"),
+                    HMODULE::default(),
+                    SND_ALIAS | SND_NODEFAULT | SND_SYNC | SND_SYSTEM,
+                )
+            };
+        }
+    })
+    .await;
+}
+
+/// Stop and cancel cues play after capture has closed, so they need not block.
+fn play_stop_cue(enabled: bool) {
+    dispatch_interaction_sound(enabled, || {
+        tauri::async_runtime::spawn_blocking(|| {
             #[cfg(target_os = "windows")]
             {
                 use windows::Win32::System::Diagnostics::Debug::MessageBeep;
-                use windows::Win32::UI::WindowsAndMessaging::{MB_ICONASTERISK, MB_OK};
-                let _ = unsafe { MessageBeep(if start { MB_ICONASTERISK } else { MB_OK }) };
+                use windows::Win32::UI::WindowsAndMessaging::MB_OK;
+                let _ = unsafe { MessageBeep(MB_OK) };
             }
-            #[cfg(not(target_os = "windows"))]
-            let _ = start;
         });
     });
 }
 
-fn dispatch_interaction_sound(enabled: bool, start: bool, dispatch: impl FnOnce(bool)) {
+fn dispatch_interaction_sound(enabled: bool, dispatch: impl FnOnce()) {
     if enabled {
-        dispatch(start);
+        dispatch();
     }
 }
 
@@ -197,18 +232,27 @@ pub(crate) async fn start_microphone_test(
     let mut audio = services.audio.lock().await;
     if !release_microphone_test(&mut test, audio.as_mut())
         .await
-        .map_err(command_error)?
+        .map_err(|error| format!("Microphone test could not start. {error}"))?
     {
-        audio.disarm().await.map_err(command_error)?;
+        audio
+            .disarm()
+            .await
+            .map_err(|error| format!("Microphone test could not start. {error}"))?;
     }
     let config = CaptureConfig {
         device_id,
         preroll: Duration::ZERO,
         ..CaptureConfig::default()
     };
-    audio.arm(config).await.map_err(command_error)?;
+    audio
+        .arm(config)
+        .await
+        .map_err(|error| format!("Microphone test could not start. {error}"))?;
     if services.lifecycle.phase() != PipelinePhase::Idle {
-        audio.disarm().await.map_err(command_error)?;
+        audio
+            .disarm()
+            .await
+            .map_err(|error| format!("Microphone test could not start. {error}"))?;
         return Err("microphone test was interrupted by recording".into());
     }
     let generation = test.start();
@@ -239,7 +283,12 @@ pub(crate) async fn start_microphone_test(
                 drop(audio);
                 drop(test);
                 if let Some(error) = first_error {
-                    emit_status(&app, "microphone_test_failed", &error);
+                    // A stable prefix lets the frontend localize the device error.
+                    emit_status(
+                        &app,
+                        "microphone_test_failed",
+                        &format!("Microphone test failed. {error}"),
+                    );
                 }
                 if released {
                     break;
@@ -261,7 +310,7 @@ pub(crate) async fn stop_microphone_test(services: State<'_, Services>) -> Resul
     let mut audio = services.audio.lock().await;
     release_microphone_test(&mut test, audio.as_mut())
         .await
-        .map_err(command_error)?;
+        .map_err(|error| format!("Microphone test could not stop. {error}"))?;
     Ok(())
 }
 
@@ -436,6 +485,13 @@ async fn start_recording_mode(
                 .map_err(command_error)
         })
         .transpose()?;
+    // The start cue finishes before the microphone opens (`arm` below), so it
+    // is neither recorded nor detected as speech by the live draft.
+    play_start_cue_before_capture(settings.interaction_sounds, play_start_cue_to_completion).await;
+    if services.lifecycle.is_cancelled(operation_id) {
+        emit_state(&app, &state, AppPhase::Idle, cancel_message);
+        return Err(cancel_error.into());
+    }
     let mut live_slot = services.live.lock().await;
     let mut edit_slot = services.edit.lock().await;
     let mut ask_slot = services.ask.lock().await;
@@ -533,7 +589,6 @@ async fn start_recording_mode(
     drop(edit_slot);
     drop(live_slot);
     std::mem::forget(guard);
-    play_interaction_sound(settings.interaction_sounds, true);
 
     let app_for_levels = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -609,12 +664,11 @@ pub(crate) async fn stop_recording(
     // running: on Bluetooth headsets an open microphone selects the low-quality
     // HFP playback profile until the stream is released.
     drop(audio);
-    play_interaction_sound(
+    play_stop_cue(
         storage
             .get_settings()
             .map(|settings| settings.interaction_sounds)
             .unwrap_or(false),
-        false,
     );
     // Keep the full artifact owned even if joining live work or loading settings fails.
     let mut artifact_cleanup = artifact_result
@@ -1518,15 +1572,25 @@ fn persist_settings(storage: &Storage, settings: &Settings) -> Result<(), String
         .map_err(command_error)
 }
 
+/// Names each inactive saved shortcut; the frontend localizes the fixed text
+/// and the action names.
+fn startup_shortcut_warning(inactive: &[String]) -> Option<String> {
+    (!inactive.is_empty()).then(|| {
+        format!(
+            "Some saved hotkeys overlap or could not be registered. Change them in Settings. Inactive: {}",
+            inactive.join(", ")
+        )
+    })
+}
+
 #[tauri::command]
 pub(crate) fn get_startup_hotkey_warning(services: State<'_, Services>) -> Option<String> {
-    services
-        .shortcut_startup_warning
-        .load(Ordering::Acquire)
-        .then(|| {
-            "Some saved hotkeys overlap or could not be registered. Change them in Settings."
-                .to_owned()
-        })
+    startup_shortcut_warning(
+        &services
+            .inactive_shortcuts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    )
 }
 
 fn emit_correction_preview(app: &AppHandle, text: &str, stage: &str) {
@@ -1603,12 +1667,11 @@ pub(crate) async fn cancel_recording(
         return Ok(());
     }
     if cancelled == Some(PipelinePhase::Recording) {
-        play_interaction_sound(
+        play_stop_cue(
             storage
                 .get_settings()
                 .map(|settings| settings.interaction_sounds)
                 .unwrap_or(false),
-            false,
         );
     }
     if services.lifecycle.phase() == PipelinePhase::Idle {
@@ -2029,12 +2092,55 @@ mod tests {
 
     #[test]
     fn interaction_sound_gate_dispatches_only_enabled_cues() {
-        let mut cues = Vec::new();
-        dispatch_interaction_sound(false, true, |start| cues.push(start));
-        dispatch_interaction_sound(true, true, |start| cues.push(start));
-        dispatch_interaction_sound(true, false, |start| cues.push(start));
-        dispatch_interaction_sound(false, false, |start| cues.push(start));
-        assert_eq!(cues, [true, false]);
+        let mut cues = 0;
+        dispatch_interaction_sound(false, || cues += 1);
+        dispatch_interaction_sound(true, || cues += 1);
+        assert_eq!(cues, 1);
+    }
+
+    #[tokio::test]
+    async fn start_cue_finishes_before_capture_opens() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let cue_events = Arc::clone(&events);
+        play_start_cue_before_capture(true, move || async move {
+            cue_events.lock().unwrap().push("cue started");
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            cue_events.lock().unwrap().push("cue finished");
+        })
+        .await;
+        // start_recording_mode arms the microphone only after the helper returns.
+        events.lock().unwrap().push("capture armed");
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["cue started", "cue finished", "capture armed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_start_cue_is_not_played_and_does_not_delay_capture() {
+        let played = Arc::new(AtomicUsize::new(0));
+        let cue_played = Arc::clone(&played);
+        let started = Instant::now();
+        play_start_cue_before_capture(false, move || async move {
+            cue_played.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        })
+        .await;
+        assert_eq!(played.load(Ordering::SeqCst), 0);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn startup_shortcut_warning_names_inactive_actions() {
+        assert_eq!(startup_shortcut_warning(&[]), None);
+        assert_eq!(
+            startup_shortcut_warning(&[
+                "Voice Translate (Ctrl+Shift+Y)".into(),
+                "Ask Anything (Ctrl+Shift+A)".into(),
+            ])
+            .unwrap(),
+            "Some saved hotkeys overlap or could not be registered. Change them in Settings. Inactive: Voice Translate (Ctrl+Shift+Y), Ask Anything (Ctrl+Shift+A)"
+        );
     }
 
     #[tokio::test]
@@ -2174,8 +2280,12 @@ pub(crate) fn get_settings(storage: State<'_, Storage>) -> Result<Settings, Stri
 }
 
 #[tauri::command]
-pub(crate) fn get_shortcut_warning(services: State<'_, Services>) -> bool {
-    services.shortcut_startup_warning.load(Ordering::Acquire)
+pub(crate) fn get_shortcut_warning(services: State<'_, Services>) -> Vec<String> {
+    services
+        .inactive_shortcuts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 #[tauri::command]
@@ -2352,17 +2462,15 @@ pub(crate) async fn update_settings(
         |chord| app.global_shortcut().unregister(chord),
         || persist_settings(&storage, &settings),
     )?;
+    let inactive = shortcuts::inactive_descriptions(&settings, &desired_routes)?;
     *services
         .shortcut_routes
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = desired_routes;
-    if settings.shortcuts != previous.shortcuts
-        || settings.translation_hotkey != previous.translation_hotkey
-    {
-        services
-            .shortcut_startup_warning
-            .store(false, Ordering::Release);
-    }
+    *services
+        .inactive_shortcuts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = inactive;
     if settings.auto_start != previous.auto_start {
         let result = if settings.auto_start {
             app.autolaunch().enable()

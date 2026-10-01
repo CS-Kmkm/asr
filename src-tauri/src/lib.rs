@@ -133,7 +133,9 @@ pub(crate) struct Services {
     translation_active: AtomicBool,
     voice_translation_target: Mutex<Option<String>>,
     shortcut_routes: Mutex<shortcuts::Routes>,
-    shortcut_startup_warning: AtomicBool,
+    /// Saved shortcuts not dispatched since startup, named by action and
+    /// chord: collision losers and chords the OS refused.
+    inactive_shortcuts: Mutex<Vec<String>>,
     settings_update: tokio::sync::Mutex<()>,
     microphone_test: tokio::sync::Mutex<MicrophoneTestState>,
 }
@@ -169,7 +171,7 @@ impl Services {
             shortcut_routes: Mutex::new(
                 shortcuts::Routes::parse_saved(settings).expect("validated settings"),
             ),
-            shortcut_startup_warning: AtomicBool::new(false),
+            inactive_shortcuts: Mutex::new(Vec::new()),
             settings_update: tokio::sync::Mutex::new(()),
             microphone_test: tokio::sync::Mutex::new(MicrophoneTestState::default()),
         }
@@ -1014,23 +1016,26 @@ pub fn run() {
                     );
                 }
             }
-            let routes = shortcuts::Routes::parse_saved(&settings)
+            let (routes, shadowed) = shortcuts::Routes::parse_saved_with_shadowed(&settings)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
             app.manage(storage);
             app.manage(AppState::default());
             app.manage(Services::new(&settings));
             recording_overlay::create(app.handle())?;
             answer_panel::create(app.handle())?;
-            if shortcuts::Routes::parse(&settings).is_err() {
-                app.state::<Services>().shortcut_startup_warning.store(true, Ordering::Release);
-            }
+            // Collision losers stay inactive until reassigned (older action
+            // keeps the chord); the warning names them with refused chords.
+            let mut inactive: Vec<String> = shadowed.iter().map(shortcuts::Route::describe).collect();
             let (active_routes, failures) = shortcuts::register_available(&routes, |chord| app.global_shortcut().register(chord));
             *app.state::<Services>().shortcut_routes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = active_routes;
-            for (route, error) in failures {
-                    app.state::<Services>().shortcut_startup_warning.store(true, Ordering::Release);
-                    emit_status(app.handle(), "shortcut_registration_failed", "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.");
-                    eprintln!("Shortcut registration failed for {}: {error}", route.text);
+            if !failures.is_empty() {
+                emit_status(app.handle(), "shortcut_registration_failed", "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.");
             }
+            for (route, error) in failures {
+                eprintln!("Shortcut registration failed for {}: {error}", route.text);
+                inactive.push(route.describe());
+            }
+            *app.state::<Services>().inactive_shortcuts.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = inactive;
             if cleanup_stale_artifacts(
                 &std::env::temp_dir(),
                 settings.delete_audio_after_processing,

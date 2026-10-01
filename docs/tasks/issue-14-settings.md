@@ -32,3 +32,18 @@ Context:
 Status (2026-09-27): Criteria 1-7 are implemented and independently audited in this branch. Legacy scalar shortcuts migrate idempotently to canonical V2; registration adds new chords before removing old ones, rolls back on failure, and routes the actual trigger chord. Settings exposes microphone selection and an independently owned live meter, interaction cues, all three theme choices, English/Japanese catalog registry, and the ten regional speech locale choices. The raw locale reaches the ASR worker and correction context; faster-whisper and OpenAI-compatible use its base language, while VibeVoice currently ignores it, as disclosed in Settings. Microsoft documents that Windows ducking follows a communications stream and user Sound settings, so other-application muting is reported unavailable with the current CPAL capture path.
 
 Verification: `cargo fmt --all -- --check`, `cargo check --all-targets --quiet`, and `cargo test --lib --quiet` passed (175 passed, 4 ignored). `uv run --extra serve -m unittest asr_worker.tests.test_worker asr_worker.tests.test_faster_whisper asr_worker.tests.test_openai_compatible` passed (53). `pnpm.cmd exec tsc --noEmit`, `pnpm.cmd run build`, and `git diff --check` passed. Two independent code audits found and closed settings-update races, draft loss, theme propagation/contrast, Escape blur persistence, locale disclosure, cancellation cue, and microphone error cleanup issues; no remaining P1/P2 findings. Manual Windows checks remain: real shortcut registration and triggering, physical microphone selection/level/teardown, audible cues, theme across windows, and provider-specific locale quality. No hardware or provider check is claimed from automated tests.
+
+Status (2026-10-01, PR-review remediation before #12 propagation):
+- Finished the preserved uncommitted PR-review work: the start cue completes
+  before microphone capture opens; legacy scalar shortcut keys mirror the
+  primary V2 chords; Ask planning and generation receive speech-locale
+  context; ASR request tests cover `language`; shortcut errors name modes.
+- Saved legacy collisions remain savable when other shortcuts change, and an
+  unchanged OS-unavailable chord remains a warning rather than blocking such
+  saves. New collisions are rejected. Frontend validation follows the same
+  rule, preserves the Translate privacy disclosure, shows the selected
+  provider, and localizes microphone, shortcut, theme, and locale errors.
+- Verified 224 Rust library tests passed (4 ignored), `cargo fmt --check`,
+  Clippy, TypeScript typecheck, production frontend build, and
+  `git diff --check`. Manual Windows verification remains pending. The #12
+  propagation merge and independent audit are still required.
