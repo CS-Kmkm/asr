@@ -142,6 +142,7 @@ const WARNING_STATUS_KINDS = new Set([
   "gpu_unavailable",
   "history_and_metric_save_failed",
   "history_metric_save_failed",
+  "hotkey_unavailable",
   "metric_save_failed",
   "paste_unverified",
   "streaming_insertion_unavailable",
@@ -175,7 +176,7 @@ if (isRecordingOverlay) {
 }
 
 function AskAnswerPanel() {
-  const { t } = useI18n();
+  const { language, t } = useI18n();
   const [answer, setAnswer] = useState("");
   const [operationId, setOperationId] = useState(0);
   const operationRef = useRef(0);
@@ -207,9 +208,10 @@ function AskAnswerPanel() {
   const dismiss = async () => {
     await dismissAskAnswer(operationId);
   };
+  const displayedAnswer = translateAppMessage(language, answer) ?? answer;
   return <main className="ask-answer-panel" aria-live="polite">
-    <p className="eyebrow">{t("Ask Anything")}</p><div className="ask-answer-text">{answer}</div>
-    <div className="ask-answer-actions"><button className="secondary" type="button" disabled={!answer} onClick={() => void copyToClipboard(answer)}>{t("Copy")}</button><button className="secondary" type="button" disabled={!answer} onClick={() => void dismiss()}>{t("Dismiss")}</button></div>
+    <p className="eyebrow">{t("Ask Anything")}</p><div className="ask-answer-text">{displayedAnswer}</div>
+    <div className="ask-answer-actions"><button className="secondary" type="button" disabled={!answer} onClick={() => void copyToClipboard(displayedAnswer)}>{t("Copy")}</button><button className="secondary" type="button" disabled={!answer} onClick={() => void dismiss()}>{t("Dismiss")}</button></div>
   </main>;
 }
 
@@ -416,7 +418,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const [gpu, setGpu] = useState<GpuDiagnostics | null>(null);
   const [gpuChecking, setGpuChecking] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
-  const [startupHotkeyWarning, setStartupHotkeyWarning] = useState<string | null>(null);
+  const [startupHotkeyWarnings, setStartupHotkeyWarnings] = useState<string[]>([]);
   const showNotice = (message: string, severity: Notice["severity"] = "info") =>
     setNotice({ message, severity });
   const [noticeCopied, setNoticeCopied] = useState(false);
@@ -429,7 +431,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   }, [historyFilter]);
 
   useEffect(() => {
-    void getStartupHotkeyWarning().then(setStartupHotkeyWarning).catch(() => {});
+    void getStartupHotkeyWarning().then(setStartupHotkeyWarnings).catch(() => {});
     Promise.all([
       getAppState(),
       getSettings(),
@@ -490,7 +492,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
 
   useEffect(() => {
     setNoticeCopied(false);
-  }, [notice, startupHotkeyWarning]);
+  }, [notice, startupHotkeyWarnings]);
 
   const statusLabel = t(phaseMessageKeys[state.phase]);
   const localizedState = useMemo(
@@ -499,6 +501,11 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   );
   // A load started from the Models page or automatically at startup.
   const preparingModel = modelLoading || model?.state === "loading";
+  // Each hotkey warning is a fixed backend sentence naming one action.
+  const startupHotkeyWarning =
+    startupHotkeyWarnings.length > 0
+      ? startupHotkeyWarnings.map((message) => translateAppMessage(language, message)).join(" ")
+      : null;
   const shownNotice: Notice | null = notice ?? (startupHotkeyWarning
     ? { message: startupHotkeyWarning, severity: "warning" }
     : null);
@@ -539,13 +546,23 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     try {
       const saved = await updateSettings(next);
       setSettings(saved);
+      let hotkeyWarnings: string[] = [];
       try {
-        setStartupHotkeyWarning(await getStartupHotkeyWarning());
+        hotkeyWarnings = await getStartupHotkeyWarning();
+        setStartupHotkeyWarnings(hotkeyWarnings);
       } catch {
         // Keep the known warning if diagnostics cannot be refreshed.
       }
       onLanguageChange(saved.uiLanguage);
-      showNotice(translate(saved.uiLanguage, "Settings saved locally."), "success");
+      // A saved hotkey that still cannot be registered does not fail the save,
+      // but the notice names the action that stays unavailable.
+      showNotice(
+        [
+          translate(saved.uiLanguage, "Settings saved locally."),
+          ...hotkeyWarnings.map((message) => translateAppMessage(saved.uiLanguage, message)),
+        ].join(" "),
+        hotkeyWarnings.length > 0 ? "warning" : "success",
+      );
     } catch (error) {
       setSettings(previous);
       showNotice(String(error), "error");
@@ -857,7 +874,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
               if (notice) {
                 setNotice(null);
                 setModelProgress(null);
-              } else setStartupHotkeyWarning(null);
+              } else setStartupHotkeyWarnings([]);
             }}
             aria-label={t("Dismiss notification")}
           >

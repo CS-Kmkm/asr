@@ -255,6 +255,12 @@ pub(crate) enum AskCapture {
     Unavailable,
 }
 
+// The answer panel and all other app windows share our process. Never use
+// their focused text as a fresh Ask source or insertion target.
+fn is_external_ask_target(target: &TargetWindow) -> bool {
+    target.process_id != std::process::id()
+}
+
 pub(crate) struct AskSession {
     pub(crate) capture: AskCapture,
     pub(crate) injector: SystemTextInjector,
@@ -271,10 +277,14 @@ impl AskSession {
         // Any inaccessible/changed selection becomes panel-only, never an
         // insertion target.
         let capture = match injector.capture_selection() {
-            Ok(selection) => AskCapture::Selected(selection),
+            Ok(selection) if is_external_ask_target(selection.target()) => {
+                AskCapture::Selected(selection)
+            }
+            Ok(_) => AskCapture::Unavailable,
             Err(injection::InjectionError::BackendFailure("no text is selected")) => {
                 match injector.capture_target() {
-                    Ok(target) => AskCapture::Caret(target),
+                    Ok(target) if is_external_ask_target(&target) => AskCapture::Caret(target),
+                    Ok(_) => AskCapture::Unavailable,
                     Err(_) => AskCapture::Unavailable,
                 }
             }
@@ -474,10 +484,28 @@ fn database_path(app: &AppHandle) -> Result<PathBuf, Box<dyn std::error::Error>>
     Ok(directory.join("local-voice-input.sqlite3"))
 }
 
+#[cfg(test)]
+mod ask_capture_tests {
+    use super::*;
+
+    #[test]
+    fn ask_never_captures_an_answer_panel_in_its_own_process() {
+        let mut target = TargetWindow {
+            window_handle: 1,
+            control_handle: 1,
+            process_id: std::process::id(),
+            thread_id: 1,
+            is_secure: false,
+        };
+        assert!(!is_external_ask_target(&target));
+        target.process_id = target.process_id.saturating_add(1);
+        assert!(is_external_ask_target(&target));
+    }
+}
+
 fn parse_shortcut(value: &str) -> Result<Shortcut, String> {
     Shortcut::from_str(value.trim()).map_err(|_| "hotkey is invalid".to_string())
 }
-
 fn load_environment_file() {
     let current_dir = std::env::current_dir().ok();
     let executable = std::env::current_exe().ok();

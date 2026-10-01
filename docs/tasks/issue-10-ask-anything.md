@@ -12,7 +12,7 @@ Fixed context and delivery design:
 - Unsafe replacement/draft copies the generated result to clipboard, never recaptures/retries, and uses the existing focus/text/selection/input/shortcut/IME/paste guards.
 
 Typed action boundary:
-- Use a strict versioned serde enum with `deny_unknown_fields`: rewrite, shorten, expand, change_tone, summarize, explain, translate(target_language), answer, draft, or search(site, query). Supported search sites are only Google, YouTube, Amazon Japan, and GitHub.
+- Use a strict versioned serde enum with `deny_unknown_fields`: rewrite, shorten, expand, change_tone, summarize, explain, translate(target_language), answer, draft, or search(site). Supported search sites are only Google, YouTube, Amazon Japan, and GitHub. Search queries are derived deterministically from the spoken instruction, never from planner output.
 - Planning receives only spoken instruction, context kind, and protocol version; it never receives selected text. Rust enforces an explicit context/intent policy table before generation or delivery.
 - Generation is a second provider request with an action-specific trusted prompt; selected source and spoken instruction stay separate untrusted fields and output is text only.
 - Strictly reject malformed/fenced/unknown/oversized/control-character JSON. Fail closed without mutation/action; never heuristically repair it.
@@ -43,3 +43,18 @@ Status (2026-09-23):
 - Added Ask lifecycle/session capture, monitored selection/caret clipboard fallbacks, versioned answer-panel get/dismiss ownership, Ask History fields/migration, default `Ctrl+Shift+A`, and the minimal `ask-answer` capability allowlist entry. Translation and fixed-site search now require explicit spoken names, and cancellation cannot introduce a new clipboard mutation.
 - Automated checks: `cargo test --lib` (151 passed, 4 ignored), `cargo fmt --all -- --check`, `cargo check --lib`, `pnpm.cmd exec tsc --noEmit`, production frontend build, and `git diff --check` passed. Strict clippy remains blocked by pre-existing unrelated warnings in injection/input-monitor code; Issue #10 additions produce no strict-Clippy diagnostic.
 - Manual Windows verification remains required: microphone/provider; original selected/caret target and focus changes; IME/shortcut release; multi-monitor panel focus/copy/dismiss and display fallback; fixed browser failure/all four searches; History-off and retention privacy.
+
+Status (2026-10-01, PR-review remediation):
+- Merged the local #9 review fixes. The shared hotkey assignment now includes
+  Ask after Dictate, selected-text Translate, voice Translate, and Edit;
+  unchanged legacy collisions remain savable and warn by action.
+- F1-F7 were addressed: blank instructions stop before planning; fixed-site
+  search queries strip named site aliases and fixed Japanese/English command
+  phrases; selection replacement receives cancellation and cancelled results
+  do not save History; the app's own answer panel cannot become an Ask capture
+  target; local Ask budgets respect the configured token cap; successful Ask
+  completion sets the overlay to Completed; fixed Ask errors and clarification
+  copy are localized.
+- Automated checks: 196 Rust library tests passed (4 ignored), `cargo fmt`
+  check, Clippy, TypeScript typecheck, production frontend build, and
+  `git diff --check`. Manual Windows verification remains pending.

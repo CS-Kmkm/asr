@@ -72,6 +72,24 @@ fn cancellation_copy(mode: PipelineMode) -> (&'static str, &'static str) {
     }
 }
 
+const EDIT_CLIPBOARD_UNAVAILABLE: &str =
+    "The original selection was not changed, and the clipboard is unavailable; the edit is available in this app.";
+
+/// A replacement error happens before any paste, so the original selection is
+/// unchanged and the clipboard is the fallback. `None` means the edit reached
+/// neither the target nor the clipboard.
+fn edit_insertion_outcome<E, F>(
+    replaced: Result<InsertResult, E>,
+    copy_to_clipboard: impl FnOnce() -> Result<(), F>,
+) -> Option<InsertResult> {
+    match replaced {
+        Ok(result) => Some(result),
+        Err(_) => copy_to_clipboard()
+            .ok()
+            .map(|()| InsertResult::ClipboardOnly),
+    }
+}
+
 fn persist_edit_completion(
     storage: &Storage,
     item: &NewHistoryItem<'_>,
@@ -92,6 +110,44 @@ fn persist_edit_completion(
         )
         .is_err();
     (history_status, metric_failed)
+}
+
+/// This warning follows, and visually replaces, the completion notice. Only a
+/// confirmed paste may be described as a completed edit.
+fn edit_persistence_warning(
+    insertion: InsertResult,
+    history_failed: bool,
+    metric_failed: bool,
+) -> Option<(&'static str, &'static str)> {
+    let replaced = insertion == InsertResult::ClipboardPaste;
+    let warning = match (history_failed, metric_failed, replaced) {
+        (false, false, _) => return None,
+        (true, true, true) => (
+            "history_metric_save_failed",
+            "The edit was completed, but history and usage metrics could not be saved.",
+        ),
+        (true, false, true) => (
+            "history_save_failed",
+            "The edit was completed, but history could not be saved.",
+        ),
+        (false, true, true) => (
+            "metric_save_failed",
+            "The edit was completed, but usage metrics could not be saved.",
+        ),
+        (true, true, false) => (
+            "history_metric_save_failed",
+            "The edit remains on the clipboard, but history and usage metrics could not be saved.",
+        ),
+        (true, false, false) => (
+            "history_save_failed",
+            "The edit remains on the clipboard, but history could not be saved.",
+        ),
+        (false, true, false) => (
+            "metric_save_failed",
+            "The edit remains on the clipboard, but usage metrics could not be saved.",
+        ),
+    };
+    Some(warning)
 }
 
 async fn take_published_sessions<T, U>(
@@ -818,22 +874,23 @@ pub(crate) async fn stop_recording(
             AppPhase::Injecting,
             "Replacing the original selection.",
         );
-        let insertion = match session.injector.replace_selection(
-            &session.selection,
-            &edited,
-            &session.monitor,
-            session.checkpoint,
-        ) {
-            Ok(result) => result,
-            Err(_) => {
-                session
-                    .injector
-                    .copy_to_clipboard(&edited)
-                    .map_err(command_error)?;
-                InsertResult::ClipboardOnly
-            }
-        };
+        let insertion = edit_insertion_outcome(
+            session.injector.replace_selection(
+                &session.selection,
+                &edited,
+                &session.monitor,
+                session.checkpoint,
+            ),
+            || session.injector.copy_to_clipboard(&edited),
+        );
         recording_overlay::set_phase(&app, &AppPhase::Completed);
+        let Some(insertion) = insertion else {
+            // Neither the target nor the clipboard received the edit. Keep it
+            // recoverable in this app and end the operation visibly.
+            state.publish_result(edited.clone());
+            emit_state(&app, &state, AppPhase::Error, EDIT_CLIPBOARD_UNAVAILABLE);
+            return Err(EDIT_CLIPBOARD_UNAVAILABLE.into());
+        };
         let latency_ms = started.elapsed().as_millis() as u64;
         let (history_save_status, metric_failed) = persist_edit_completion(
             &storage,
@@ -871,9 +928,16 @@ pub(crate) async fn stop_recording(
         let snapshot = state.complete(edited.clone(), completion.into());
         let _ = app.emit("app-state", snapshot);
         emit_status(&app, insertion_label, completion);
-        if let Some((kind, message)) =
+        let warning = if history_save_status == HistorySaveStatus::AudioUnavailable {
             completion_persistence_warning(history_save_status, metric_failed)
-        {
+        } else {
+            edit_persistence_warning(
+                insertion,
+                history_save_status == HistorySaveStatus::Failed,
+                metric_failed,
+            )
+        };
+        if let Some((kind, message)) = warning {
             emit_status(&app, kind, message);
         }
         report_temp_cleanup(&app, &mut artifact_cleanup);
@@ -904,6 +968,9 @@ pub(crate) async fn stop_recording(
             Some(&artifact.path),
         )
         .await;
+        if result.is_ok() {
+            recording_overlay::set_phase(&app, &AppPhase::Completed);
+        }
         if let Err(error) = &result {
             recording_overlay::set_interactive(&app, false);
             if services.lifecycle.is_cancelled(operation_id) {
@@ -925,6 +992,7 @@ pub(crate) async fn stop_recording(
     let mut llm_provider = None;
     let mut correction_failed = false;
     let mut translation_failed = false;
+    let mut correction_output_limited = false;
     let _ = app.emit("app-state", state.publish_result(transcript.text.clone()));
     // Full-recording recognition reconciles the last live hypothesis before AI correction.
     draft.monitor.wait_for_shortcut_release().await;
@@ -941,9 +1009,23 @@ pub(crate) async fn stop_recording(
     }
     let streamed_into_target = draft.pasted;
     if mode == PipelineMode::Translate {
-        let target_language = translation_target
-            .as_deref()
-            .ok_or("translation target language is unavailable")?;
+        let Some(target_language) = translation_target.as_deref() else {
+            // Startup publishes the target with the session. If it is missing,
+            // keep the speech the same way a translation failure does.
+            let copied = draft.injector.copy_to_clipboard(&transcript.text).is_ok();
+            emit_correction_preview(&app, &transcript.text, "fallback");
+            emit_state(
+                &app,
+                &state,
+                AppPhase::Error,
+                if copied {
+                    "The translation target language was unavailable; the raw transcript remains on the clipboard."
+                } else {
+                    "The translation target language was unavailable and the clipboard could not be updated; the raw transcript remains available in this app."
+                },
+            );
+            return Err("translation target language is unavailable".into());
+        };
         emit_correction_preview(&app, &transcript.text, "draft");
         emit_state(
             &app,
@@ -965,6 +1047,9 @@ pub(crate) async fn stop_recording(
             Ok(translated) => {
                 final_text = translated;
                 processed_text = Some(final_text.clone());
+                // Publish before insertion so an insertion error cannot lose
+                // the completed translation.
+                let _ = app.emit("app-state", state.publish_result(final_text.clone()));
                 emit_correction_preview(&app, &final_text, "final");
                 let _ = storage.add_metric(
                     "voice_translation",
@@ -1043,6 +1128,8 @@ pub(crate) async fn stop_recording(
             }
             Err(error) => {
                 correction_failed = true;
+                correction_output_limited =
+                    matches!(error, correction::CorrectionError::OutputLimit);
                 emit_correction_preview(&app, &transcript.text, "fallback");
                 let _ = storage.add_metric(
                     "text_correction",
@@ -1162,6 +1249,8 @@ pub(crate) async fn stop_recording(
         "The provisional text could not be safely replaced; the final result remains on the clipboard."
     } else if insertion == InsertResult::ClipboardOnly {
         "Automatic insertion failed; the result remains on the clipboard."
+    } else if correction_output_limited {
+        "AI correction stopped at the local output token limit; the original transcript was inserted. Increase the local output token limit."
     } else if correction_failed {
         "AI correction failed; the original transcript was inserted."
     } else {
@@ -1202,6 +1291,7 @@ async fn finish_ask(
     if services.lifecycle.is_cancelled(operation_id) {
         return Err("ask was cancelled".into());
     }
+    require_ask_spoken_input(spoken)?;
     let settings = storage.get_settings().map_err(command_error)?;
     emit_state(
         app,
@@ -1275,9 +1365,9 @@ async fn finish_ask(
     };
     if let AskAction::Search { site } = &action {
         // The planner may choose a fixed site, but never the external payload.
-        let query = spoken.trim();
+        let query = site.derive_search_query(spoken);
         let url = site
-            .fixed_url(query)
+            .fixed_url(spoken)
             .map_err(|_| "Ask search query was invalid".to_string())?;
         if services.lifecycle.is_cancelled(operation_id) {
             return Err("ask was cancelled".into());
@@ -1288,7 +1378,7 @@ async fn finish_ask(
             storage,
             &NewHistoryItem {
                 transcript_text: spoken,
-                processed_text: Some(query),
+                processed_text: Some(&query),
                 source_text: session.selected_source(),
                 instruction_text: Some(spoken),
                 mode: "ask",
@@ -1304,14 +1394,11 @@ async fn finish_ask(
             },
             audio_path,
         );
-        let snapshot = state.complete(
-            query.to_string(),
-            "Opening the requested fixed search.".into(),
-        );
+        let snapshot = state.complete(query.clone(), "Opening the requested fixed search.".into());
         let _ = app.emit("app-state", snapshot);
         report_history_save_warning(app, history_save_status);
         return Ok(RecordingResult {
-            text: query.into(),
+            text: query,
             insertion: "search".into(),
             duration_ms,
             latency_ms,
@@ -1349,32 +1436,39 @@ async fn finish_ask(
                 .lifecycle
                 .cancellation(operation_id)
                 .map_err(command_error)?;
-            let result = session.monitor.as_ref().zip(session.checkpoint).and_then(
-                |(monitor, checkpoint)| {
-                    session
-                        .injector
-                        .replace_selection(selection, &output, monitor, checkpoint)
-                        .ok()
-                },
-            );
+            let result =
+                session
+                    .monitor
+                    .as_ref()
+                    .zip(session.checkpoint)
+                    .map(|(monitor, checkpoint)| {
+                        session.injector.replace_selection_monitored(
+                            selection, &output, monitor, checkpoint, &cancel,
+                        )
+                    });
+            if *cancel.borrow() {
+                return Err("ask was cancelled".into());
+            }
             match result {
-                Some(InsertResult::ClipboardPaste) => insertion = "selection",
-                Some(InsertResult::ClipboardOnly) => {
+                Some(Ok(InsertResult::ClipboardPaste)) => insertion = "selection",
+                Some(Ok(InsertResult::ClipboardOnly)) => {
+                    if *cancel.borrow() {
+                        return Err("ask was cancelled".into());
+                    }
+                    insertion = "clipboard_only";
+                }
+                Some(Ok(InsertResult::PasteUnverified)) => insertion = "paste_unverified",
+                Some(Err(injection::InjectionError::Cancelled)) => {
+                    return Err("ask was cancelled".into())
+                }
+                _ if !*cancel.borrow() => {
                     session
                         .injector
                         .copy_to_clipboard(&output)
                         .map_err(command_error)?;
                     insertion = "clipboard_only";
                 }
-                Some(InsertResult::PasteUnverified) => insertion = "paste_unverified",
-                None if !*cancel.borrow() => {
-                    session
-                        .injector
-                        .copy_to_clipboard(&output)
-                        .map_err(command_error)?;
-                    insertion = "clipboard_only";
-                }
-                None => return Err("ask was cancelled".into()),
+                _ => return Err("ask was cancelled".into()),
             }
         }
         (AskAction::Draft, AskCapture::Caret(target)) => {
@@ -1396,10 +1490,9 @@ async fn finish_ask(
             match result {
                 Some(InsertResult::ClipboardPaste) => insertion = "caret",
                 Some(InsertResult::ClipboardOnly) => {
-                    session
-                        .injector
-                        .copy_to_clipboard(&output)
-                        .map_err(command_error)?;
+                    if *cancel.borrow() {
+                        return Err("ask was cancelled".into());
+                    }
                     insertion = "clipboard_only";
                 }
                 Some(InsertResult::PasteUnverified) => insertion = "paste_unverified",
@@ -1423,6 +1516,9 @@ async fn finish_ask(
                 insertion = "clipboard_only";
             }
         }
+    }
+    if services.lifecycle.is_cancelled(operation_id) {
+        return Err("ask was cancelled".into());
     }
     let latency_ms = started.elapsed().as_millis() as u64;
     let history_save_status = save_history(
@@ -1464,6 +1560,14 @@ async fn finish_ask(
         duration_ms,
         latency_ms,
     })
+}
+
+fn require_ask_spoken_input(spoken: &str) -> Result<(), String> {
+    if spoken.trim().is_empty() {
+        Err("No Ask instruction was captured.".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn action_name(action: &ask::AskAction) -> &'static str {
@@ -1600,6 +1704,33 @@ fn emit_correction_preview(app: &AppHandle, text: &str, stage: &str) {
     );
 }
 
+fn next_translation_target(languages: &[String], current: &str) -> Option<String> {
+    let current_index = languages
+        .iter()
+        .position(|language| language == current)
+        .unwrap_or(0);
+    languages
+        .get((current_index + 1) % languages.len().max(1))
+        .cloned()
+}
+
+/// Persists the target after `active` (the recording's target, falling back
+/// to the saved one). Holding the settings-write lock keeps this
+/// read-modify-write from reverting a concurrent `update_settings`.
+fn store_next_translation_target(
+    storage: &Storage,
+    active: Option<&str>,
+) -> Result<Settings, String> {
+    let _settings_writes = storage.lock_settings_writes().map_err(command_error)?;
+    let mut settings = storage.get_settings().map_err(command_error)?;
+    let current = active.unwrap_or(settings.translation_target_language.as_str());
+    settings.translation_target_language =
+        next_translation_target(&settings.translation_target_languages, current)
+            .ok_or("at least one translation target language is required")?;
+    storage.update_settings(&settings).map_err(command_error)?;
+    Ok(settings)
+}
+
 #[tauri::command]
 pub(crate) async fn cycle_voice_translation_target(
     app: AppHandle,
@@ -1607,6 +1738,9 @@ pub(crate) async fn cycle_voice_translation_target(
     storage: State<'_, Storage>,
 ) -> Result<String, String> {
     let _update_guard = services.settings_update.lock().await;
+    // An async command runs off the main thread. Settings saves can hold the
+    // settings-write lock while the global-shortcut plugin waits on that
+    // thread; waiting for the lock here must not block shortcut registration.
     let mut active = services
         .voice_translation_target
         .lock()
@@ -1616,23 +1750,8 @@ pub(crate) async fn cycle_voice_translation_target(
     {
         return Err("voice translation is not recording".into());
     }
-    let mut settings = storage.get_settings().map_err(command_error)?;
-    if settings.translation_target_languages.is_empty() {
-        return Err("at least one translation target language is required".into());
-    }
-    let current = active
-        .as_deref()
-        .unwrap_or(settings.translation_target_language.as_str());
-    let current_index = settings
-        .translation_target_languages
-        .iter()
-        .position(|language| language == current)
-        .unwrap_or(0);
-    let next = settings.translation_target_languages
-        [(current_index + 1) % settings.translation_target_languages.len()]
-    .clone();
-    settings.translation_target_language = next.clone();
-    storage.update_settings(&settings).map_err(command_error)?;
+    let settings = store_next_translation_target(&storage, active.as_deref())?;
+    let next = settings.translation_target_language.clone();
     *active = Some(next.clone());
     let _ = app.emit("settings-changed", settings);
     let _ = app.emit(
@@ -1654,18 +1773,16 @@ pub(crate) async fn cancel_recording(
         &services.lifecycle,
         &services.audio,
         &services.target,
+        &services.voice_translation_target,
         &services.live,
         &services.edit,
         &services.ask,
     )
     .await?;
-    recording_overlay::set_interactive(&app, false);
-    if let Ok(mut language) = services.voice_translation_target.lock() {
-        language.take();
-    }
     if cancelled.is_none() {
         return Ok(());
     }
+    recording_overlay::set_interactive(&app, false);
     if cancelled == Some(PipelinePhase::Recording) {
         play_stop_cue(
             storage
@@ -1697,6 +1814,7 @@ async fn cancel_pipeline_operation(
     lifecycle: &PipelineLifecycle,
     audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
     target: &Mutex<Option<TargetWindow>>,
+    translation_target: &Mutex<Option<String>>,
     live: &tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
     edit: &tokio::sync::Mutex<Option<EditSession>>,
     ask: &tokio::sync::Mutex<Option<AskSession>>,
@@ -1719,6 +1837,12 @@ async fn cancel_pipeline_operation(
     let live_task = live.lock().await.take();
     edit.lock().await.take();
     ask.lock().await.take();
+    // Startup publishes the target language before releasing `live`. Clear it
+    // while this operation still owns the lifecycle, so a later recording's
+    // target is never removed.
+    if let Ok(mut language) = translation_target.lock() {
+        language.take();
+    }
     let audio_result = {
         let mut audio = audio.lock().await;
         audio.cancel().await
@@ -1741,6 +1865,9 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
             );
         }
         correction::CorrectionError::InvalidResponse(_) => "invalid_response",
+        correction::CorrectionError::OutputLimit => {
+            return "AI correction stopped at the local output token limit; using the original transcript. Increase the local output token limit.".into();
+        }
         correction::CorrectionError::Cancelled => "cancelled",
         correction::CorrectionError::InvalidEndpoint(_) => "invalid_endpoint",
         correction::CorrectionError::UnsupportedProvider(_) => "unsupported_provider",
@@ -1752,6 +1879,17 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_ask_input_is_rejected_before_planning() {
+        for spoken in ["", "  ", "\n\t"] {
+            assert_eq!(
+                require_ask_spoken_input(spoken),
+                Err("No Ask instruction was captured.".to_string())
+            );
+        }
+        assert!(require_ask_spoken_input("search Google for Rust").is_ok());
+    }
     use crate::audio::{AudioArtifact, AudioError, AudioFuture, CaptureState, LevelMeter};
     use std::sync::atomic::AtomicUsize;
 
@@ -1921,6 +2059,60 @@ mod tests {
     }
 
     #[test]
+    fn edit_replacement_failure_falls_back_to_clipboard_or_reports_no_outcome() {
+        for result in [
+            InsertResult::ClipboardPaste,
+            InsertResult::ClipboardOnly,
+            InsertResult::PasteUnverified,
+        ] {
+            let outcome = edit_insertion_outcome(Ok::<_, ()>(result), || -> Result<(), ()> {
+                panic!("a completed replacement must not copy again")
+            });
+            assert_eq!(outcome, Some(result));
+        }
+        assert_eq!(
+            edit_insertion_outcome(Err::<InsertResult, _>("replace"), || Ok::<_, ()>(())),
+            Some(InsertResult::ClipboardOnly)
+        );
+        assert_eq!(
+            edit_insertion_outcome(Err::<InsertResult, _>("replace"), || Err("clipboard")),
+            None
+        );
+    }
+
+    #[test]
+    fn edit_persistence_warning_claims_completion_only_after_a_confirmed_paste() {
+        for insertion in [
+            InsertResult::ClipboardPaste,
+            InsertResult::ClipboardOnly,
+            InsertResult::PasteUnverified,
+        ] {
+            assert_eq!(edit_persistence_warning(insertion, false, false), None);
+            for (history_failed, metric_failed, kind) in [
+                (true, true, "history_metric_save_failed"),
+                (true, false, "history_save_failed"),
+                (false, true, "metric_save_failed"),
+            ] {
+                let (actual_kind, message) =
+                    edit_persistence_warning(insertion, history_failed, metric_failed).unwrap();
+                assert_eq!(actual_kind, kind);
+                if insertion == InsertResult::ClipboardPaste {
+                    assert!(message.starts_with("The edit was completed"), "{message}");
+                } else {
+                    assert!(!message.contains("completed"), "{message}");
+                    assert!(message.contains("remains on the clipboard"), "{message}");
+                }
+                assert_eq!(message.contains("history"), history_failed, "{message}");
+                assert_eq!(
+                    message.contains("usage metrics"),
+                    metric_failed,
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn persistence_failures_choose_one_complete_warning() {
         assert_eq!(persistence_warning(false, false), None);
         assert_eq!(
@@ -1964,6 +2156,48 @@ mod tests {
         settings.translation_target_languages = vec!["ja".into()];
         settings.translation_target_language = "en".into();
         assert!(validate_translation_targets(&settings).is_err());
+    }
+
+    #[test]
+    fn next_translation_target_wraps_and_falls_back_to_the_first_entry() {
+        let languages = vec!["en".to_string(), "ja".to_string(), "de".to_string()];
+        assert_eq!(
+            next_translation_target(&languages, "ja").as_deref(),
+            Some("de")
+        );
+        assert_eq!(
+            next_translation_target(&languages, "de").as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            next_translation_target(&languages, "xx").as_deref(),
+            Some("ja")
+        );
+        assert_eq!(next_translation_target(&[], "en"), None);
+    }
+
+    #[test]
+    fn target_cycling_waits_for_an_in_progress_settings_save() {
+        let storage = Arc::new(Storage::in_memory().unwrap());
+        let settings_save = storage.lock_settings_writes().unwrap();
+        let cycling = {
+            let storage = Arc::clone(&storage);
+            std::thread::spawn(move || store_next_translation_target(&storage, Some("en")))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!cycling.is_finished());
+
+        // The save was based on settings read before cycling started.
+        let mut saved = storage.get_settings().unwrap();
+        saved.history_retention = types::HistoryRetention::Never;
+        storage.update_settings(&saved).unwrap();
+        drop(settings_save);
+
+        let cycled = cycling.join().unwrap().unwrap();
+        assert_eq!(cycled.translation_target_language, "ja");
+        let stored = storage.get_settings().unwrap();
+        assert_eq!(stored.history_retention, types::HistoryRetention::Never);
+        assert_eq!(stored.translation_target_language, "ja");
     }
 
     struct TestAudio {
@@ -2188,8 +2422,9 @@ mod tests {
         let live = tokio::sync::Mutex::new(None);
         let edit = tokio::sync::Mutex::new(None);
         let ask = tokio::sync::Mutex::new(None);
+        let language = Mutex::new(None);
         let cancellation =
-            cancel_pipeline_operation(&lifecycle, &audio, &target, &live, &edit, &ask);
+            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit, &ask);
         tokio::pin!(cancellation);
 
         assert!(
@@ -2197,12 +2432,12 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(
-            cancel_pipeline_operation(&lifecycle, &audio, &target, &live, &edit, &ask)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(cancel_pipeline_operation(
+            &lifecycle, &audio, &target, &language, &live, &edit, &ask
+        )
+        .await
+        .unwrap()
+        .is_none());
         assert!(lifecycle.begin_start(PipelineMode::Dictate).is_err());
         drop(audio_operation);
         assert_eq!(
@@ -2226,6 +2461,7 @@ mod tests {
             &lifecycle,
             &audio,
             &target,
+            &Mutex::new(None),
             &tokio::sync::Mutex::new(None),
             &tokio::sync::Mutex::new(None),
             &tokio::sync::Mutex::new(None)
@@ -2245,6 +2481,7 @@ mod tests {
             &lifecycle,
             &test_audio(false),
             &Mutex::new(None),
+            &Mutex::new(None),
             &tokio::sync::Mutex::new(None),
             &tokio::sync::Mutex::new(None),
             &tokio::sync::Mutex::new(None),
@@ -2256,6 +2493,48 @@ mod tests {
         assert!(lifecycle.begin_start(PipelineMode::Translate).is_err());
         lifecycle.finish(id);
         assert!(lifecycle.begin_start(PipelineMode::Translate).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancel_clears_the_translation_target_only_when_it_cancels_a_recording() {
+        let lifecycle = PipelineLifecycle::default();
+        let audio = test_audio(false);
+        let target = Mutex::new(None);
+        let live = tokio::sync::Mutex::new(None);
+        let edit = tokio::sync::Mutex::new(None);
+        let ask = tokio::sync::Mutex::new(None);
+        // Nothing to cancel: a target published by a concurrent start stays.
+        let language = Mutex::new(Some("ja".to_string()));
+        assert!(cancel_pipeline_operation(
+            &lifecycle, &audio, &target, &language, &live, &edit, &ask
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(language.lock().unwrap().as_deref(), Some("ja"));
+
+        // Processing owns its published target; cancellation only signals it.
+        let id = lifecycle.begin_start(PipelineMode::Translate).unwrap();
+        lifecycle.mark_recording(id).unwrap();
+        lifecycle.begin_processing().unwrap();
+        assert_eq!(
+            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit, &ask)
+                .await
+                .unwrap(),
+            Some(PipelinePhase::Processing)
+        );
+        assert_eq!(language.lock().unwrap().as_deref(), Some("ja"));
+        lifecycle.finish(id);
+
+        let id = lifecycle.begin_start(PipelineMode::Translate).unwrap();
+        lifecycle.mark_recording(id).unwrap();
+        assert_eq!(
+            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit, &ask)
+                .await
+                .unwrap(),
+            Some(PipelinePhase::Recording)
+        );
+        assert_eq!(*language.lock().unwrap(), None);
     }
 
     #[test]
@@ -2271,6 +2550,20 @@ mod tests {
             "AI correction failed; using the original transcript. HTTP status 400."
         );
         assert!(!message.contains(marker));
+    }
+
+    #[test]
+    fn correction_failure_status_distinguishes_the_output_limit() {
+        assert_eq!(
+            correction_failure_status(&correction::CorrectionError::OutputLimit),
+            "AI correction stopped at the local output token limit; using the original transcript. Increase the local output token limit."
+        );
+        assert_eq!(
+            correction_failure_status(&correction::CorrectionError::InvalidResponse(
+                "missing output text".into()
+            )),
+            "AI correction failed; using the original transcript. Error kind: invalid_response."
+        );
     }
 }
 
@@ -2435,42 +2728,53 @@ pub(crate) async fn update_settings(
             );
         }
     }
-    let previous = storage.get_settings().map_err(command_error)?;
-    let old_routes = services
-        .shortcut_routes
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
-    let desired_routes = shortcuts::desired_routes_for_update(&previous, &settings, &old_routes)?;
-    if settings.translation_instruction.chars().count() > 500
-        || settings.translation_instruction.chars().any(|character| {
-            character.is_control() && character != '\n' && character != '\r' && character != '\t'
-        })
-    {
-        return Err("translation instruction must be at most 500 characters and contain no unsupported control characters".into());
-    }
-    if cfg!(debug_assertions) && settings.auto_start && !previous.auto_start {
-        return Err(
+    // The command is async, so waiting here never blocks the main thread
+    // needed by global-shortcut registration. Keep this guard through the
+    // single transactional settings/History persistence step.
+    let previous = {
+        let _settings_writes = storage.lock_settings_writes().map_err(command_error)?;
+        let previous = storage.get_settings().map_err(command_error)?;
+        let old_routes = services
+            .shortcut_routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let desired_routes =
+            shortcuts::desired_routes_for_update(&previous, &settings, &old_routes)?;
+        if settings.translation_instruction.chars().count() > 500
+            || settings.translation_instruction.chars().any(|character| {
+                character.is_control()
+                    && character != '\n'
+                    && character != '\r'
+                    && character != '\t'
+            })
+        {
+            return Err("translation instruction must be at most 500 characters and contain no unsupported control characters".into());
+        }
+        if cfg!(debug_assertions) && settings.auto_start && !previous.auto_start {
+            return Err(
             "autostart cannot be enabled from a development build; install and run a release build"
                 .into(),
         );
-    }
-    shortcuts::update_registrations(
-        &old_routes,
-        &desired_routes,
-        |chord| app.global_shortcut().register(chord),
-        |chord| app.global_shortcut().unregister(chord),
-        || persist_settings(&storage, &settings),
-    )?;
-    let inactive = shortcuts::inactive_descriptions(&settings, &desired_routes)?;
-    *services
-        .shortcut_routes
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = desired_routes;
-    *services
-        .inactive_shortcuts
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = inactive;
+        }
+        shortcuts::update_registrations(
+            &old_routes,
+            &desired_routes,
+            |chord| app.global_shortcut().register(chord),
+            |chord| app.global_shortcut().unregister(chord),
+            || persist_settings(&storage, &settings),
+        )?;
+        let inactive = shortcuts::inactive_descriptions(&settings, &desired_routes)?;
+        *services
+            .shortcut_routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = desired_routes;
+        *services
+            .inactive_shortcuts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = inactive;
+        previous
+    };
     if settings.auto_start != previous.auto_start {
         let result = if settings.auto_start {
             app.autolaunch().enable()

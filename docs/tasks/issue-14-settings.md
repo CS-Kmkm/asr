@@ -45,5 +45,20 @@ Status (2026-10-01, PR-review remediation before #12 propagation):
   provider, and localizes microphone, shortcut, theme, and locale errors.
 - Verified 224 Rust library tests passed (4 ignored), `cargo fmt --check`,
   Clippy, TypeScript typecheck, production frontend build, and
-  `git diff --check`. Manual Windows verification remains pending. The #12
-  propagation merge and independent audit are still required.
+  `git diff --check`. Manual Windows verification remains pending.
+
+Status (2026-10-01, #12 propagation):
+- Merged #12 into #14 with `shortcuts.rs` Routes as the final dispatcher and
+  registry. The saved-collision priority is Dictate, selected-text Translate,
+  voice Translate, Speak to edit, Ask. A legacy collision or unchanged OS-
+  unavailable chord can survive another settings edit; new collisions still
+  fail. Inactive warnings retain the action names.
+- Settings updates hold the async service update guard and settings-write lock
+  from the old-settings read through the single
+  `update_settings_and_apply_history_policy` transaction and shortcut-route
+  update. Target cycling is also async and serialized; neither path waits for
+  that lock on Tauri's main thread.
+- Verified 245 Rust library tests passed (4 ignored), `cargo fmt --check`,
+  Clippy, TypeScript typecheck, production frontend build, and
+  `git diff --check`. Independent read-only audit and manual Windows checks
+  remain pending.
