@@ -114,6 +114,10 @@ impl SelectedText {
     pub(crate) fn text(&self) -> &str {
         &self.text
     }
+
+    pub(crate) fn target(&self) -> &TargetWindow {
+        &self.target
+    }
 }
 impl SystemTextInjector {
     pub fn new(options: InjectionOptions) -> Self {
@@ -201,6 +205,26 @@ impl SystemTextInjector {
             text,
             monitor,
             checkpoint,
+        )
+    }
+
+    pub(crate) fn replace_selection_monitored(
+        &self,
+        selection: &SelectedText,
+        text: &str,
+        monitor: &InputMonitor,
+        checkpoint: u64,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<InsertResult, InjectionError> {
+        batch::replace_selection_monitored(
+            &self.backend,
+            self.options,
+            &selection.target,
+            &selection.state,
+            text,
+            monitor,
+            checkpoint,
+            cancel,
         )
     }
 

@@ -42,6 +42,7 @@ pub enum StorageError {
 pub struct Storage {
     connection: Mutex<Connection>,
     history_audio_dir: PathBuf,
+    settings_writes: Mutex<()>,
 }
 
 struct StagedHistoryAudio<'a> {
@@ -105,34 +106,48 @@ fn random_history_audio_stem() -> Result<String, StorageError> {
 impl Storage {
     pub fn open(path: &Path) -> Result<Self, StorageError> {
         let connection = Connection::open(path)?;
-        let storage = Self {
-            connection: Mutex::new(connection),
-            history_audio_dir: path
-                .parent()
+        let storage = Self::with_connection(
+            connection,
+            path.parent()
                 .unwrap_or_else(|| Path::new("."))
                 .join("history-audio"),
-        };
+        );
         storage.migrate()?;
         storage.reconcile_history_audio()?;
         Ok(storage)
     }
 
     #[cfg(test)]
-    fn in_memory() -> Result<Self, StorageError> {
-        let storage = Self {
-            connection: Mutex::new(Connection::open_in_memory()?),
-            history_audio_dir: std::env::temp_dir().join(format!(
+    pub(crate) fn in_memory() -> Result<Self, StorageError> {
+        let storage = Self::with_connection(
+            Connection::open_in_memory()?,
+            std::env::temp_dir().join(format!(
                 "local-voice-history-test-{}-{}",
                 std::process::id(),
                 AUDIO_NONCE.fetch_add(1, Ordering::Relaxed)
             )),
-        };
+        );
         storage.migrate()?;
         Ok(storage)
     }
 
+    fn with_connection(connection: Connection, history_audio_dir: PathBuf) -> Self {
+        Self {
+            connection: Mutex::new(connection),
+            history_audio_dir,
+            settings_writes: Mutex::new(()),
+        }
+    }
+
     fn connection(&self) -> Result<MutexGuard<'_, Connection>, StorageError> {
         self.connection.lock().map_err(|_| StorageError::Lock)
+    }
+
+    /// Serializes settings read-modify-write sequences. Every writer holds this
+    /// from reading the settings its change is based on until the result is
+    /// written, so concurrent writers cannot revert each other's changes.
+    pub fn lock_settings_writes(&self) -> Result<MutexGuard<'_, ()>, StorageError> {
+        self.settings_writes.lock().map_err(|_| StorageError::Lock)
     }
 
     fn migrate(&self) -> Result<(), StorageError> {
@@ -1140,11 +1155,10 @@ mod tests {
                  );",
             )
             .unwrap();
-        let storage = Storage {
-            connection: Mutex::new(connection),
-            history_audio_dir: std::env::temp_dir()
-                .join(format!("history-migration-{}", random_audio_stem())),
-        };
+        let storage = Storage::with_connection(
+            connection,
+            std::env::temp_dir().join(format!("history-migration-{}", random_audio_stem())),
+        );
 
         storage.migrate().unwrap();
         storage.migrate().unwrap();
