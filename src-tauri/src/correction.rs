@@ -216,7 +216,7 @@ async fn request_text(
         "local" => {
             let mut body = local_request(settings, transcript, instruction);
             if let Some(minimum) = minimum_output_tokens {
-                body["max_tokens"] = json!(max_output_tokens(transcript).max(minimum));
+                body["max_tokens"] = json!(local_ask_output_tokens(settings, transcript, minimum));
             }
             client
                 .post(local_chat_completions_url(
@@ -421,6 +421,12 @@ fn local_request(settings: &Settings, transcript: &str, instruction: &str) -> Va
         "max_tokens": settings.local_correction_max_tokens,
         "stream": true
     })
+}
+
+fn local_ask_output_tokens(settings: &Settings, transcript: &str, minimum: usize) -> usize {
+    max_output_tokens(transcript)
+        .max(minimum)
+        .min(settings.local_correction_max_tokens)
 }
 
 async fn collect_response(
@@ -1984,6 +1990,25 @@ mod tests {
             local_request(&configured, &large, instruction)["max_tokens"],
             32_768
         );
+    }
+
+    #[test]
+    fn local_ask_budgets_never_exceed_the_configured_cap() {
+        let transcript = "short request";
+        for (configured_cap, minimum, expected) in [
+            (128, ASK_PLAN_MIN_OUTPUT_TOKENS, 128),
+            (2048, ASK_TEXT_MIN_OUTPUT_TOKENS, 2048),
+            (8192, ASK_PLAN_MIN_OUTPUT_TOKENS, ASK_PLAN_MIN_OUTPUT_TOKENS),
+        ] {
+            let settings = Settings {
+                local_correction_max_tokens: configured_cap,
+                ..Settings::default()
+            };
+            assert_eq!(
+                local_ask_output_tokens(&settings, transcript, minimum),
+                expected
+            );
+        }
     }
 
     #[test]
