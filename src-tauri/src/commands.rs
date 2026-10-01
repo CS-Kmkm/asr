@@ -719,6 +719,9 @@ pub(crate) async fn stop_recording(
             started,
         )
         .await;
+        if result.is_ok() {
+            recording_overlay::set_phase(&app, &AppPhase::Completed);
+        }
         if let Err(error) = &result {
             recording_overlay::set_interactive(&app, false);
             if services.lifecycle.is_cancelled(operation_id) {
@@ -1031,6 +1034,7 @@ async fn finish_ask(
     if services.lifecycle.is_cancelled(operation_id) {
         return Err("ask was cancelled".into());
     }
+    require_ask_spoken_input(spoken)?;
     let settings = storage.get_settings().map_err(command_error)?;
     emit_state(
         app,
@@ -1104,9 +1108,9 @@ async fn finish_ask(
     };
     if let AskAction::Search { site } = &action {
         // The planner may choose a fixed site, but never the external payload.
-        let query = spoken.trim();
+        let query = site.derive_search_query(spoken);
         let url = site
-            .fixed_url(query)
+            .fixed_url(spoken)
             .map_err(|_| "Ask search query was invalid".to_string())?;
         if services.lifecycle.is_cancelled(operation_id) {
             return Err("ask was cancelled".into());
@@ -1116,7 +1120,7 @@ async fn finish_ask(
         if storage
             .add_history(&NewHistoryItem {
                 transcript_text: spoken,
-                processed_text: Some(query),
+                processed_text: Some(&query),
                 source_text: session.selected_source(),
                 instruction_text: Some(spoken),
                 mode: "ask",
@@ -1137,10 +1141,10 @@ async fn finish_ask(
                 "Search opened, but History could not be saved.",
             );
         }
-        let snapshot = state.complete(query.into(), "Opening the requested fixed search.".into());
+        let snapshot = state.complete(query.clone(), "Opening the requested fixed search.".into());
         let _ = app.emit("app-state", snapshot);
         return Ok(RecordingResult {
-            text: query.into(),
+            text: query,
             insertion: "search".into(),
             duration_ms,
             latency_ms,
@@ -1178,32 +1182,39 @@ async fn finish_ask(
                 .lifecycle
                 .cancellation(operation_id)
                 .map_err(command_error)?;
-            let result = session.monitor.as_ref().zip(session.checkpoint).and_then(
-                |(monitor, checkpoint)| {
-                    session
-                        .injector
-                        .replace_selection(selection, &output, monitor, checkpoint)
-                        .ok()
-                },
-            );
+            let result =
+                session
+                    .monitor
+                    .as_ref()
+                    .zip(session.checkpoint)
+                    .map(|(monitor, checkpoint)| {
+                        session.injector.replace_selection_monitored(
+                            selection, &output, monitor, checkpoint, &cancel,
+                        )
+                    });
+            if *cancel.borrow() {
+                return Err("ask was cancelled".into());
+            }
             match result {
-                Some(InsertResult::ClipboardPaste) => insertion = "selection",
-                Some(InsertResult::ClipboardOnly) => {
+                Some(Ok(InsertResult::ClipboardPaste)) => insertion = "selection",
+                Some(Ok(InsertResult::ClipboardOnly)) => {
+                    if *cancel.borrow() {
+                        return Err("ask was cancelled".into());
+                    }
+                    insertion = "clipboard_only";
+                }
+                Some(Ok(InsertResult::PasteUnverified)) => insertion = "paste_unverified",
+                Some(Err(injection::InjectionError::Cancelled)) => {
+                    return Err("ask was cancelled".into())
+                }
+                _ if !*cancel.borrow() => {
                     session
                         .injector
                         .copy_to_clipboard(&output)
                         .map_err(command_error)?;
                     insertion = "clipboard_only";
                 }
-                Some(InsertResult::PasteUnverified) => insertion = "paste_unverified",
-                None if !*cancel.borrow() => {
-                    session
-                        .injector
-                        .copy_to_clipboard(&output)
-                        .map_err(command_error)?;
-                    insertion = "clipboard_only";
-                }
-                None => return Err("ask was cancelled".into()),
+                _ => return Err("ask was cancelled".into()),
             }
         }
         (AskAction::Draft, AskCapture::Caret(target)) => {
@@ -1225,10 +1236,9 @@ async fn finish_ask(
             match result {
                 Some(InsertResult::ClipboardPaste) => insertion = "caret",
                 Some(InsertResult::ClipboardOnly) => {
-                    session
-                        .injector
-                        .copy_to_clipboard(&output)
-                        .map_err(command_error)?;
+                    if *cancel.borrow() {
+                        return Err("ask was cancelled".into());
+                    }
                     insertion = "clipboard_only";
                 }
                 Some(InsertResult::PasteUnverified) => insertion = "paste_unverified",
@@ -1252,6 +1262,9 @@ async fn finish_ask(
                 insertion = "clipboard_only";
             }
         }
+    }
+    if services.lifecycle.is_cancelled(operation_id) {
+        return Err("ask was cancelled".into());
     }
     let latency_ms = started.elapsed().as_millis() as u64;
     if storage
@@ -1296,6 +1309,14 @@ async fn finish_ask(
         duration_ms,
         latency_ms,
     })
+}
+
+fn require_ask_spoken_input(spoken: &str) -> Result<(), String> {
+    if spoken.trim().is_empty() {
+        Err("No Ask instruction was captured.".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn action_name(action: &ask::AskAction) -> &'static str {
@@ -1662,6 +1683,17 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_ask_input_is_rejected_before_planning() {
+        for spoken in ["", "  ", "\n\t"] {
+            assert_eq!(
+                require_ask_spoken_input(spoken),
+                Err("No Ask instruction was captured.".to_string())
+            );
+        }
+        assert!(require_ask_spoken_input("search Google for Rust").is_ok());
+    }
     use crate::audio::{AudioArtifact, AudioError, AudioFuture, CaptureState, LevelMeter};
 
     #[test]
