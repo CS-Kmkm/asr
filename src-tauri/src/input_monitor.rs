@@ -24,9 +24,9 @@ pub(crate) struct InputMonitor {
     sequence: std::sync::Arc<AtomicU64>,
     available: std::sync::Arc<AtomicBool>,
     shortcut_pending: std::sync::Arc<AtomicBool>,
+    recording_shortcuts: std::sync::Mutex<Vec<String>>,
     #[cfg(test)]
     async_modifier_pending: AtomicBool,
-    recording_shortcut: std::sync::Mutex<Option<String>>,
     started_by_shortcut: AtomicBool,
     cancellation: std::sync::Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
     #[cfg(all(target_os = "windows", not(test)))]
@@ -49,9 +49,9 @@ impl Default for InputMonitor {
             sequence: std::sync::Arc::new(AtomicU64::new(0)),
             available: std::sync::Arc::new(AtomicBool::new(false)),
             shortcut_pending: std::sync::Arc::new(AtomicBool::new(false)),
+            recording_shortcuts: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             async_modifier_pending: AtomicBool::new(false),
-            recording_shortcut: std::sync::Mutex::new(None),
             started_by_shortcut: AtomicBool::new(false),
             cancellation: std::sync::Mutex::new(None),
             #[cfg(all(target_os = "windows", not(test)))]
@@ -77,14 +77,21 @@ impl InputMonitor {
             .map(|slot| slot.as_ref().is_some_and(|cancel| *cancel.borrow()))
             .unwrap_or(true)
     }
-    pub(crate) fn start_for_recording(&self, shortcut: &str, from_shortcut: bool) -> bool {
-        if shortcut::ShortcutFilter::parse(shortcut).is_none() {
+    pub(crate) fn start_for_recording(
+        &self,
+        shortcut: &str,
+        alternatives: &[String],
+        from_shortcut: bool,
+    ) -> bool {
+        if shortcut::ShortcutFilters::parse(shortcut, alternatives).is_none() {
             return false;
         }
-        let Ok(mut configured) = self.recording_shortcut.lock() else {
+        let Ok(mut configured) = self.recording_shortcuts.lock() else {
             return false;
         };
-        *configured = Some(shortcut.to_owned());
+        *configured = std::iter::once(shortcut.to_owned())
+            .chain(alternatives.iter().cloned())
+            .collect();
         self.started_by_shortcut
             .store(from_shortcut, Ordering::Release);
         drop(configured);
@@ -146,9 +153,11 @@ impl InputMonitor {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .creation_flags(CREATE_NO_WINDOW);
-            if let Ok(shortcut) = self.recording_shortcut.lock() {
-                if let Some(shortcut) = shortcut.as_ref() {
-                    command.arg("--recording-shortcut").arg(shortcut);
+            if let Ok(shortcuts) = self.recording_shortcuts.lock() {
+                if !shortcuts.is_empty() {
+                    command
+                        .arg("--recording-shortcuts")
+                        .arg(serde_json::to_string(&*shortcuts).unwrap_or_default());
                     if self.started_by_shortcut.load(Ordering::Acquire) {
                         command.arg("--start-shortcut");
                     }
@@ -340,8 +349,8 @@ mod windows_worker {
 
     use crate::injection::INJECTION_MARKER;
 
-    use super::shortcut::ShortcutFilter;
-    static FILTER: OnceLock<std::sync::Mutex<ShortcutFilter>> = OnceLock::new();
+    use super::shortcut::ShortcutFilters;
+    static FILTER: OnceLock<std::sync::Mutex<ShortcutFilters>> = OnceLock::new();
     static EVENTS: OnceLock<Sender<(&'static str, u64, bool)>> = OnceLock::new();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -402,8 +411,11 @@ mod windows_worker {
 
     pub(super) fn run() {
         let mut arguments = std::env::args();
-        if arguments.any(|arg| arg == "--recording-shortcut") {
-            let Some(mut filter) = arguments.next().as_deref().and_then(ShortcutFilter::parse)
+        if arguments.any(|arg| arg == "--recording-shortcuts") {
+            let Some(mut filter) = arguments
+                .next()
+                .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+                .and_then(|chords| ShortcutFilters::parse(chords.first()?, &chords[1..]))
             else {
                 return;
             };

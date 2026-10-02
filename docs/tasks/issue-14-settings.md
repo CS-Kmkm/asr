@@ -1,0 +1,64 @@
+Goal: Complete GitHub issue #14 Settings parity for the four voice modes with safe Windows integration and preserved legacy settings.
+
+Scope / non-scope:
+- Add multiple shortcuts for Dictate, voice Translate, Ask Anything, and Speak to edit; keep selected-text translation as its existing separate shortcut. Expose microphone selection and an independent live level test in Settings, interaction start/stop sounds, Light/Dark/System theme, an extensible UI locale registry, and Dictate speech locale variants.
+- Do not control other applications' volume or send media keys. Current CPAL capture does not provide a safe, reversible per-session ducking mechanism; report mute/pause as unavailable until a supported WASAPI design is approved. Do not add a toggle that falsely promises it.
+- Do not merge, push, or change other issue branches.
+
+Constraints and fixed design:
+- Base: issue #12 commit `1f9c7a6`. Preserve its History/privacy and Retry contracts.
+- Canonical V2 shortcut settings are `shortcuts: { dictate, translate, ask, edit }`, each a nonempty array of one to four chord strings. Keep `translationHotkey` as the single selected-text translation chord. Raw JSON migration maps legacy `hotkey`, `voiceTranslateHotkey`, `askHotkey`, and `speakToEditHotkey` into V2 without discarding unrelated values. New persistence emits canonical V2. Validate parsed chords and reject duplicates across all five actions before registration or settings persistence.
+- Route each registered chord to its action using an immutable validated map. A shortcut update registers added chords, unregisters removed chords, persists settings, and swaps routing; on any failure restore the old registration and routing, reporting an explicit restart-required error if restoration fails. Chord swaps require only a routing change. Preserve the InputMonitor's actual trigger chord.
+- Independent microphone test opens the chosen CPAL input, emits bounded RMS/peak level events, and stops/cleans up on Stop, page exit, error, or recording start. It never creates History, target insertion, or retained audio. Exclusive ownership prevents microphone test and recording from capturing simultaneously.
+- Interaction sounds are local Windows start/stop cues gated by a persisted boolean; keep playback outside the capture callback and fail without breaking recording.
+- Theme is `system|light|dark` and applies to main, overlay, and answer windows via shared CSS variables and `prefers-color-scheme`. UI locale uses a typed registry with existing English/Japanese catalogs; other UI catalogs are not invented.
+- `speechLocale: string|null` is null for auto detection. Supported variants include en-US/en-GB, zh-CN/zh-TW, es-ES/es-MX, fr-FR/fr-CA, pt-BR/pt-PT. Validate against a fixed allowlist, pass the full tag to the ASR worker and AI correction context, and document when a backend only honors the base language. Keep Translate targets shared with issue #8.
+
+Acceptance criteria and checks:
+1. Legacy settings migrate idempotently; shortcut arrays persist and re-register at startup. Unit tests cover migration, collision, swap, and rollback; manual Windows shortcut smoke check remains explicit.
+2. Settings microphone selection and live level test use the selected device and release ownership after stop/error/recording start. Unit-level ownership/cleanup tests and manual device check.
+3. Interaction sound On/Off changes start/stop cues without blocking capture; lifecycle tests and manual listening check.
+4. Light/Dark/System updates all windows, with a system preference listener. Frontend build and visual manual check.
+5. English/Japanese locale registry remains complete; all new visible strings are localized. Frontend type/build checks.
+6. Regional variants persist and propagate to worker and correction prompts with fixed validation. Rust/Python tests and manual provider quality check.
+7. Rust format/check/test, Python focused tests, frontend build, `git diff --check`, and an independent code/contract audit pass. Existing History/privacy behavior remains green.
+
+Context:
+- Public issue #14 was re-read 2026-09-27; it was last updated 2026-09-21. The issue explicitly conditions audio muting on a safe Windows mechanism.
+- Existing seams: `src-tauri/src/{types,storage,commands,lib,audio,asr,correction}.rs`, `asr_worker/{worker,backends}.py`, `src/{App,types,i18n,styles.css}`, `src/pages/SettingsPage.tsx`.
+- Windows CPAL Bluetooth behavior requires test stream teardown outside idle recording; do not leave the microphone armed.
+- Windows ducking research: Microsoft documents that default ducking is triggered by a communications stream opened on the default communications device, with behavior controlled by the user's Sound settings: https://learn.microsoft.com/en-us/windows/win32/coreaudio/using-the-communication-device . The current CPAL capture path does not explicitly open a WASAPI communications stream; cross-application volume control or media-key pausing would not provide a reversible, user-controlled equivalent. Revisit only with a dedicated WASAPI design and manual Windows verification.
+
+Status (2026-09-27): Criteria 1-7 are implemented and independently audited in this branch. Legacy scalar shortcuts migrate idempotently to canonical V2; registration adds new chords before removing old ones, rolls back on failure, and routes the actual trigger chord. Settings exposes microphone selection and an independently owned live meter, interaction cues, all three theme choices, English/Japanese catalog registry, and the ten regional speech locale choices. The raw locale reaches the ASR worker and correction context; faster-whisper and OpenAI-compatible use its base language, while VibeVoice currently ignores it, as disclosed in Settings. Microsoft documents that Windows ducking follows a communications stream and user Sound settings, so other-application muting is reported unavailable with the current CPAL capture path.
+
+Verification: `cargo fmt --all -- --check`, `cargo check --all-targets --quiet`, and `cargo test --lib --quiet` passed (175 passed, 4 ignored). `uv run --extra serve -m unittest asr_worker.tests.test_worker asr_worker.tests.test_faster_whisper asr_worker.tests.test_openai_compatible` passed (53). `pnpm.cmd exec tsc --noEmit`, `pnpm.cmd run build`, and `git diff --check` passed. Two independent code audits found and closed settings-update races, draft loss, theme propagation/contrast, Escape blur persistence, locale disclosure, cancellation cue, and microphone error cleanup issues; no remaining P1/P2 findings. Manual Windows checks remain: real shortcut registration and triggering, physical microphone selection/level/teardown, audible cues, theme across windows, and provider-specific locale quality. No hardware or provider check is claimed from automated tests.
+
+Status (2026-10-01, PR-review remediation before #12 propagation):
+- Finished the preserved uncommitted PR-review work: the start cue completes
+  before microphone capture opens; legacy scalar shortcut keys mirror the
+  primary V2 chords; Ask planning and generation receive speech-locale
+  context; ASR request tests cover `language`; shortcut errors name modes.
+- Saved legacy collisions remain savable when other shortcuts change, and an
+  unchanged OS-unavailable chord remains a warning rather than blocking such
+  saves. New collisions are rejected. Frontend validation follows the same
+  rule, preserves the Translate privacy disclosure, shows the selected
+  provider, and localizes microphone, shortcut, theme, and locale errors.
+- Verified 224 Rust library tests passed (4 ignored), `cargo fmt --check`,
+  Clippy, TypeScript typecheck, production frontend build, and
+  `git diff --check`. Manual Windows verification remains pending.
+
+Status (2026-10-01, #12 propagation):
+- Merged #12 into #14 with `shortcuts.rs` Routes as the final dispatcher and
+  registry. The saved-collision priority is Dictate, selected-text Translate,
+  voice Translate, Speak to edit, Ask. A legacy collision or unchanged OS-
+  unavailable chord can survive another settings edit; new collisions still
+  fail. Inactive warnings retain the action names.
+- Settings updates hold the async service update guard and settings-write lock
+  from the old-settings read through the single
+  `update_settings_and_apply_history_policy` transaction and shortcut-route
+  update. Target cycling is also async and serialized; neither path waits for
+  that lock on Tauri's main thread.
+- Verified 245 Rust library tests passed (4 ignored), `cargo fmt --check`,
+  Clippy, TypeScript typecheck, production frontend build, and
+  `git diff --check`. Independent read-only audit and manual Windows checks
+  remain pending.

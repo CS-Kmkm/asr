@@ -413,7 +413,8 @@ class FasterWhisperBackend(ProgressReporting):
             hotwords = prompt if prompt else None
             raw_segments, _info = self.model.transcribe(
                 str(audio_path),
-                language=language,
+                # Whisper accepts an ISO 639 language, not a regional BCP 47 tag.
+                language=language.split("-", 1)[0] if language else None,
                 hotwords=hotwords,
             )
             segments = [
@@ -495,7 +496,8 @@ class OpenAICompatibleBackend(ProgressReporting):
         if prompt:
             data["prompt"] = prompt
         if language:
-            data["language"] = language
+            # The Audio Transcriptions API accepts the base language only.
+            data["language"] = language.split("-", 1)[0]
         media_type = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
         try:
             with audio_path.open("rb") as audio:

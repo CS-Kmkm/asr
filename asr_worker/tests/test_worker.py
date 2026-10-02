@@ -213,6 +213,25 @@ class WorkerTests(unittest.TestCase):
             )
         self.assertEqual(response["error"]["code"], "invalid_request")
 
+    def test_regional_locale_reaches_backend_unchanged(self) -> None:
+        class CapturingBackend(MockBackend):
+            locale = None
+
+            def transcribe(self, audio_path, prompt, language=None):  # type: ignore[no-untyped-def]
+                self.locale = language
+                return super().transcribe(audio_path, prompt, language)
+
+        backend = CapturingBackend()
+        worker = Worker(backend)
+        worker.handle({"id": 1, "command": "load"})
+        with tempfile.NamedTemporaryFile(suffix=".wav") as audio:
+            response, _ = worker.handle({
+                "id": 2, "command": "transcribe", "audio_path": audio.name,
+                "language": "en-GB",
+            })
+        self.assertTrue(response["ok"])
+        self.assertEqual(backend.locale, "en-GB")
+
 
 class _ProgressBackend(MockBackend):
     def load(self, quantization: str) -> None:

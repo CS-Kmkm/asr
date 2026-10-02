@@ -26,17 +26,18 @@ pub struct Settings {
     #[serde(default = "default_ui_language")]
     pub ui_language: String,
     pub setup_complete: bool,
-    pub hotkey: String,
+    #[serde(default)]
+    pub shortcuts: VoiceShortcuts,
     #[serde(default = "default_translation_hotkey")]
     pub translation_hotkey: String,
     #[serde(default)]
     pub translation_instruction: String,
-    #[serde(default = "default_voice_translate_hotkey")]
-    pub voice_translate_hotkey: String,
-    #[serde(default = "default_speak_to_edit_hotkey")]
-    pub speak_to_edit_hotkey: String,
-    #[serde(default = "default_ask_hotkey")]
-    pub ask_hotkey: String,
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    #[serde(default)]
+    pub interaction_sounds: bool,
+    #[serde(default)]
+    pub speech_locale: Option<String>,
     #[serde(default = "default_translation_target_languages")]
     pub translation_target_languages: Vec<String>,
     #[serde(default = "default_translation_target_language")]
@@ -105,11 +106,33 @@ pub struct CustomModel {
     pub model_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VoiceShortcuts {
+    pub dictate: Vec<String>,
+    pub translate: Vec<String>,
+    pub ask: Vec<String>,
+    pub edit: Vec<String>,
+}
+
+impl Default for VoiceShortcuts {
+    fn default() -> Self {
+        Self {
+            dictate: vec!["Ctrl+Shift+Space".into()],
+            translate: vec!["Ctrl+Shift+Y".into()],
+            ask: vec!["Ctrl+Shift+A".into()],
+            edit: vec!["Ctrl+Shift+E".into()],
+        }
+    }
+}
+
 pub const ASR_BACKENDS: [&str; 4] = ["vibevoice", "faster-whisper", "openai-compatible", "mock"];
 pub const CORRECTION_PROVIDERS: [&str; 3] = ["openai", "gemini", "local"];
 pub const OPENAI_REASONING_EFFORTS: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];
 pub const TRANSLATION_TARGET_LANGUAGES: [&str; 8] =
     ["en", "ja", "zh", "es", "fr", "pt", "de", "ko"];
+pub const SPEECH_LOCALES: [&str; 10] = [
+    "en-US", "en-GB", "zh-CN", "zh-TW", "es-ES", "es-MX", "fr-FR", "fr-CA", "pt-BR", "pt-PT",
+];
 
 fn default_asr_backend() -> String {
     "faster-whisper".into()
@@ -179,15 +202,8 @@ fn default_translation_hotkey() -> String {
     "Ctrl+Shift+T".into()
 }
 
-fn default_voice_translate_hotkey() -> String {
-    "Ctrl+Shift+Y".into()
-}
-
-fn default_speak_to_edit_hotkey() -> String {
-    "Ctrl+Shift+E".into()
-}
-fn default_ask_hotkey() -> String {
-    "Ctrl+Shift+A".into()
+fn default_theme() -> String {
+    "system".into()
 }
 
 fn default_translation_target_languages() -> Vec<String> {
@@ -215,12 +231,12 @@ impl Default for Settings {
         Self {
             ui_language: default_ui_language(),
             setup_complete: false,
-            hotkey: "Ctrl+Shift+Space".into(),
+            shortcuts: VoiceShortcuts::default(),
             translation_hotkey: default_translation_hotkey(),
             translation_instruction: String::new(),
-            voice_translate_hotkey: default_voice_translate_hotkey(),
-            speak_to_edit_hotkey: default_speak_to_edit_hotkey(),
-            ask_hotkey: default_ask_hotkey(),
+            theme: default_theme(),
+            interaction_sounds: false,
+            speech_locale: None,
             translation_target_languages: default_translation_target_languages(),
             translation_target_language: default_translation_target_language(),
             microphone_id: None,
@@ -456,8 +472,8 @@ mod tests {
         assert_eq!(settings.model_quantization, "4bit");
         assert_eq!(settings.api_base_url, "https://api.openai.com/v1");
         assert_eq!(settings.api_key_env_var, "OPENAI_API_KEY");
-        assert_eq!(settings.voice_translate_hotkey, "Ctrl+Shift+Y");
-        assert_eq!(settings.speak_to_edit_hotkey, "Ctrl+Shift+E");
+        assert_eq!(settings.shortcuts.translate, ["Ctrl+Shift+Y"]);
+        assert_eq!(settings.shortcuts.edit, ["Ctrl+Shift+E"]);
         assert_eq!(settings.translation_target_languages, ["en", "ja"]);
         assert_eq!(settings.translation_target_language, "en");
         assert!(!settings.text_correction_enabled);
@@ -480,5 +496,23 @@ mod tests {
         assert!(settings.correction_auto_format);
         assert!(settings.correction_improve_clarity);
         assert!(settings.custom_models.is_empty());
+    }
+
+    #[test]
+    fn default_settings_serialize_canonical_shortcut_arrays() {
+        let value = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(value["shortcuts"]["dictate"][0], "Ctrl+Shift+Space");
+        assert_eq!(value["shortcuts"]["translate"][0], "Ctrl+Shift+Y");
+        assert_eq!(value["theme"], "system");
+        assert_eq!(value["interactionSounds"], false);
+        assert!(value["speechLocale"].is_null());
+        for legacy in [
+            "hotkey",
+            "voiceTranslateHotkey",
+            "askHotkey",
+            "speakToEditHotkey",
+        ] {
+            assert!(value.get(legacy).is_none());
+        }
     }
 }

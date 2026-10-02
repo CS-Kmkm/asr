@@ -3,6 +3,8 @@ import type { UiLanguage } from "./types";
 
 const en = {
   "Ask Anything": "Ask Anything",
+  "Dictation": "Dictation",
+  "Selected-text translation": "Selected-text translation",
   "Ask Anything hotkey": "Ask Anything hotkey",
   "Asks or acts on a spoken instruction; the default is Ctrl+Shift+A.": "Asks or acts on a spoken instruction; the default is Ctrl+Shift+A.",
   Dismiss: "Dismiss",
@@ -161,6 +163,50 @@ const en = {
   "Automatic replacement was skipped; the edit remains on the clipboard.": "Automatic replacement was skipped; the edit remains on the clipboard.",
   "The edit paste could not be confirmed; the result remains on the clipboard.": "The edit paste could not be confirmed; the result remains on the clipboard.",
   "Speak to edit could not monitor the original selection safely.": "Speak to edit could not monitor the original selection safely.",
+  "Appearance": "Appearance",
+  "Choose the app color theme.": "Choose the app color theme.",
+  "System": "System", "Light": "Light", "Dark": "Dark",
+  "Speech language": "Speech language",
+  "Choose a speech recognition language, or use automatic detection.": "Choose a speech recognition language, or use automatic detection.",
+  "Choose a speech recognition language, or use automatic detection. The faster-whisper and OpenAI-compatible backends honor the base language only; VibeVoice currently ignores this setting.": "Choose a speech recognition language, or use automatic detection. The faster-whisper and OpenAI-compatible backends honor the base language only; VibeVoice currently ignores this setting.",
+  "Automatic detection": "Automatic detection",
+  "English (United States)": "English (United States)", "English (United Kingdom)": "English (United Kingdom)",
+  "Chinese (Simplified)": "Chinese (Simplified)", "Chinese (Traditional)": "Chinese (Traditional)",
+  "Spanish (Spain)": "Spanish (Spain)", "Spanish (Mexico)": "Spanish (Mexico)",
+  "French (France)": "French (France)", "French (Canada)": "French (Canada)",
+  "Portuguese (Brazil)": "Portuguese (Brazil)", "Portuguese (Portugal)": "Portuguese (Portugal)",
+  "Choose the input device used for recording and microphone testing.": "Choose the input device used for recording and microphone testing.",
+  "Default": "Default", "Microphone level test": "Microphone level test",
+  "Test the selected microphone. Audio is measured live and never saved.": "Test the selected microphone. Audio is measured live and never saved.",
+  "Stop test": "Stop test", "Start test": "Start test", "Microphone input level": "Microphone input level",
+  "Microphone test failed.": "Microphone test failed.",
+  "Microphone test could not start.": "Microphone test could not start.",
+  "Microphone test could not stop.": "Microphone test could not stop.",
+  "microphone test requires an idle recording pipeline": "The microphone test requires recording to be idle.",
+  "microphone test was interrupted by recording": "The microphone test was interrupted because recording started.",
+  "theme must be system, light, or dark": "Choose System, Light, or Dark for the theme.",
+  "ui language must be en or ja": "Choose English or Japanese for the app language.",
+  "speech locale is unsupported": "The selected speech language is not supported.",
+  "Provider:": "Provider:", "Interaction sounds": "Interaction sounds",
+  "Play a brief local sound when recording starts and stops.": "Play a brief local sound when recording starts and stops.",
+  "Muting or pausing other applications is unavailable because this app cannot safely control their audio.": "Muting or pausing other applications is unavailable because this app cannot safely control their audio.",
+  "Voice mode shortcuts": "Voice mode shortcuts", "Dictation shortcuts": "Dictation shortcuts",
+  "Voice Translate shortcuts": "Voice Translate shortcuts", "Ask Anything shortcuts": "Ask Anything shortcuts",
+  "Speak to edit shortcuts": "Speak to edit shortcuts",
+  "Add one to four keyboard shortcuts for each voice mode. A shortcut must be unique across all actions.": "Add one to four keyboard shortcuts for each voice mode. A shortcut must be unique across all actions.",
+  "Enter a shortcut chord such as Ctrl+Shift+Space.": "Enter a shortcut chord such as Ctrl+Shift+Space.",
+  "Remove shortcut": "Remove shortcut", "Add shortcut": "Add shortcut", "Save shortcuts": "Save shortcuts",
+  "Each voice mode needs one to four non-empty shortcuts.": "Each voice mode needs one to four non-empty shortcuts.",
+  "Shortcuts must be non-empty and unique across all actions.": "Shortcuts must be non-empty and unique across all actions.",
+  "This shortcut conflicts with": "This shortcut conflicts with",
+  "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.": "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.",
+  "shortcut cannot be empty": "Shortcut cannot be empty.",
+  "shortcuts must be unique across all actions": "Shortcuts must be unique across all actions.",
+  "each voice mode requires one to four shortcuts": "Each voice mode requires one to four shortcuts.",
+  "hotkey is invalid": "Shortcut is invalid.",
+  "shortcut registration failed:": "Shortcut registration failed:",
+  "shortcut removal failed:": "Shortcut removal failed:",
+  "shortcut restoration failed, restart required:": "Shortcut restoration failed; restart required:",
   "Dictation sends its transcript to the selected provider only when AI correction is on. Voice and selected-text Translate send text whenever used. Speak to edit sends selected source text and the transcribed spoken instruction whenever used. Ask sends only the transcribed spoken instruction to the selected provider for planning; answer generation using a selection also sends that selected source text with the instruction. Translate, Speak to edit, and Ask work even when Dictation AI correction is off. These text-processing requests do not send audio, but the selected ASR backend may.": "Dictation sends its transcript to the selected provider only when AI correction is on. Voice and selected-text Translate send text whenever used. Speak to edit sends selected source text and the transcribed spoken instruction whenever used. Ask sends only the transcribed spoken instruction to the selected provider for planning; answer generation using a selection also sends that selected source text with the instruction. Translate, Speak to edit, and Ask work even when Dictation AI correction is off. These text-processing requests do not send audio, but the selected ASR backend may.",
   "AI correction requests are disabled for Dictation. Translate, Speak to edit, and Ask still use the selected provider when invoked.": "AI correction requests are disabled for Dictation. Translate, Speak to edit, and Ask still use the selected provider when invoked.",
   "Ask sends only the transcribed spoken instruction to the selected provider for planning. Answer generation using a selection also sends the selected source text with the instruction, even when Dictation AI correction is off. The selected ASR backend may send audio.": "Ask sends only the transcribed spoken instruction to the selected provider for planning. Answer generation using a selection also sends the selected source text with the instruction, even when Dictation AI correction is off. The selected ASR backend may send audio.",
@@ -183,6 +229,7 @@ const en = {
   "Dictation (AI corrected)": "Dictation (AI corrected)",
   "Dictation (AI fallback)": "Dictation (AI fallback)",
   "Voice Translate": "Voice Translate",
+  "Speak to edit": "Speak to edit",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
@@ -352,6 +399,50 @@ const ja: Record<MessageKey, string> = {
   "Automatic replacement was skipped; the edit remains on the clipboard.": "自動置換を見送りました。編集結果はクリップボードに残っています。",
   "The edit paste could not be confirmed; the result remains on the clipboard.": "編集結果の貼り付けを確認できませんでした。結果はクリップボードに残っています。",
   "Speak to edit could not monitor the original selection safely.": "元の選択範囲を安全に監視できないため、音声編集を開始できませんでした。",
+  "Appearance": "外観",
+  "Choose the app color theme.": "アプリの配色を選択します。",
+  "System": "システム", "Light": "ライト", "Dark": "ダーク",
+  "Speech language": "音声認識の言語",
+  "Choose a speech recognition language, or use automatic detection.": "音声認識の言語を選択するか、自動検出を使用します。",
+  "Choose a speech recognition language, or use automatic detection. The faster-whisper and OpenAI-compatible backends honor the base language only; VibeVoice currently ignores this setting.": "音声認識の言語を選択するか、自動検出を使用します。faster-whisper と OpenAI 互換バックエンドは基本言語のみを使用し、VibeVoice は現在この設定を無視します。",
+  "Automatic detection": "自動検出",
+  "English (United States)": "英語（米国）", "English (United Kingdom)": "英語（英国）",
+  "Chinese (Simplified)": "中国語（簡体字）", "Chinese (Traditional)": "中国語（繁体字）",
+  "Spanish (Spain)": "スペイン語（スペイン）", "Spanish (Mexico)": "スペイン語（メキシコ）",
+  "French (France)": "フランス語（フランス）", "French (Canada)": "フランス語（カナダ）",
+  "Portuguese (Brazil)": "ポルトガル語（ブラジル）", "Portuguese (Portugal)": "ポルトガル語（ポルトガル）",
+  "Choose the input device used for recording and microphone testing.": "録音とマイクテストに使用する入力デバイスを選択します。",
+  "Default": "既定", "Microphone level test": "マイク入力テスト",
+  "Test the selected microphone. Audio is measured live and never saved.": "選択したマイクをテストします。音声はリアルタイム測定のみで保存されません。",
+  "Stop test": "テストを停止", "Start test": "テストを開始", "Microphone input level": "マイク入力レベル",
+  "Microphone test failed.": "マイクテストに失敗しました。",
+  "Microphone test could not start.": "マイクテストを開始できませんでした。",
+  "Microphone test could not stop.": "マイクテストを停止できませんでした。",
+  "microphone test requires an idle recording pipeline": "録音中はマイクテストを実行できません。",
+  "microphone test was interrupted by recording": "録音が開始されたため、マイクテストを中断しました。",
+  "theme must be system, light, or dark": "テーマはシステム、ライト、ダークから選択してください。",
+  "ui language must be en or ja": "アプリの言語は英語または日本語から選択してください。",
+  "speech locale is unsupported": "選択した音声言語はサポートされていません。",
+  "Provider:": "プロバイダー：", "Interaction sounds": "操作音",
+  "Play a brief local sound when recording starts and stops.": "録音の開始時と停止時に短い効果音を再生します。",
+  "Muting or pausing other applications is unavailable because this app cannot safely control their audio.": "他のアプリの音声を安全に制御できないため、ミュートや一時停止は利用できません。",
+  "Voice mode shortcuts": "音声モードのショートカット", "Dictation shortcuts": "音声入力のショートカット",
+  "Voice Translate shortcuts": "音声翻訳のショートカット", "Ask Anything shortcuts": "質問のショートカット",
+  "Speak to edit shortcuts": "音声編集のショートカット",
+  "Add one to four keyboard shortcuts for each voice mode. A shortcut must be unique across all actions.": "各音声モードに1～4個のショートカットを設定できます。すべての操作で重複しないようにしてください。",
+  "Enter a shortcut chord such as Ctrl+Shift+Space.": "Ctrl+Shift+Space のようなキーの組み合わせを入力します。",
+  "Remove shortcut": "ショートカットを削除", "Add shortcut": "ショートカットを追加", "Save shortcuts": "ショートカットを保存",
+  "Each voice mode needs one to four non-empty shortcuts.": "各音声モードに1～4個の空でないショートカットが必要です。",
+  "Shortcuts must be non-empty and unique across all actions.": "ショートカットは空欄にできず、すべての操作で重複できません。",
+  "This shortcut conflicts with": "このショートカットは次のモードと重複しています：",
+  "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.": "起動時に一部のショートカットを有効にできませんでした。設定で変更し、再起動して確認してください。",
+  "shortcut cannot be empty": "ショートカットは空欄にできません。",
+  "shortcuts must be unique across all actions": "すべての操作でショートカットを重複させないでください。",
+  "each voice mode requires one to four shortcuts": "各音声モードには1～4個のショートカットが必要です。",
+  "hotkey is invalid": "ショートカットが無効です。",
+  "shortcut registration failed:": "ショートカットの登録に失敗しました:",
+  "shortcut removal failed:": "ショートカットの解除に失敗しました:",
+  "shortcut restoration failed, restart required:": "ショートカットを元に戻せませんでした。再起動が必要です:",
   "Dictation sends its transcript to the selected provider only when AI correction is on. Voice and selected-text Translate send text whenever used. Speak to edit sends selected source text and the transcribed spoken instruction whenever used. Ask sends only the transcribed spoken instruction to the selected provider for planning; answer generation using a selection also sends that selected source text with the instruction. Translate, Speak to edit, and Ask work even when Dictation AI correction is off. These text-processing requests do not send audio, but the selected ASR backend may.": "音声入力はAI修正が有効なときだけ、選択したプロバイダーへ文字起こしを送信します。音声翻訳と選択テキスト翻訳は使用時にテキストを送信します。音声編集は使用時に選択元のテキストと文字起こしした音声指示を送信します。Askの計画時には、文字起こしした音声指示のみを選択済みプロバイダーへ送信します。選択テキストを用いた回答生成時には、そのテキストと音声指示も送信します。翻訳、音声編集、Askは音声入力のAI修正が無効でも動作します。これらのテキスト処理リクエストでは音声を送信しませんが、選択した音声認識バックエンドは送信する場合があります。",
   "AI correction requests are disabled for Dictation. Translate, Speak to edit, and Ask still use the selected provider when invoked.": "音声入力のAI修正リクエストは無効です。翻訳、音声編集、Askは使用時に引き続き選択したプロバイダーを使用します。",
   "Ask sends only the transcribed spoken instruction to the selected provider for planning. Answer generation using a selection also sends the selected source text with the instruction, even when Dictation AI correction is off. The selected ASR backend may send audio.": "Askの計画時には、文字起こしした音声指示のみを選択済みプロバイダーへ送信します。選択テキストを用いた回答生成時には、音声入力のAI修正が無効でも、そのテキストと音声指示を送信します。選択した音声認識バックエンドは音声を送信する場合があります。",
@@ -366,7 +457,12 @@ const ja: Record<MessageKey, string> = {
   "Dictation (AI corrected)": "音声入力（AI修正）",
   "Dictation (AI fallback)": "音声入力（AI失敗時の原文）",
   "Voice Translate": "音声翻訳",
+  "Speak to edit": "音声編集",
+  "Dictation": "音声入力",
+  "Selected-text translation": "選択テキスト翻訳",
 } satisfies Record<MessageKey, string>;
+
+const catalogs = { en, ja } satisfies Record<UiLanguage, Record<MessageKey, string>>;
 
 const appMessageKeys: ReadonlySet<MessageKey> = new Set(
   [
@@ -438,6 +534,19 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "Automatic replacement was skipped; the edit remains on the clipboard.",
       "The edit paste could not be confirmed; the result remains on the clipboard.",
       "Speak to edit could not monitor the original selection safely.",
+      "shortcut cannot be empty",
+      "shortcuts must be unique across all actions",
+      "each voice mode requires one to four shortcuts",
+      "hotkey is invalid",
+      "Microphone test failed.",
+      "Microphone test could not start.",
+      "Microphone test could not stop.",
+      "microphone test requires an idle recording pipeline",
+      "microphone test was interrupted by recording",
+      "theme must be system, light, or dark",
+      "ui language must be en or ja",
+      "speech locale is unsupported",
+      "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.",
       "Recording an Ask instruction.",
       "Ask cancelled.",
       "Choosing a safe Ask action.",
@@ -465,13 +574,36 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
 );
 
 export function translate(language: UiLanguage, key: MessageKey): string {
-  return (language === "ja" ? ja : en)[key];
+  return catalogs[language][key];
 }
 
 export function translateAppMessage(language: UiLanguage, message: string | null): string | null {
   if (message === null) return null;
   const key = message as MessageKey;
   if (appMessageKeys.has(key)) return translate(language, key);
+
+  const localizeActions = (details: string) => details
+    .replaceAll("Dictation", translate(language, "Dictation"))
+    .replaceAll("Selected-text translation", translate(language, "Selected-text translation"))
+    .replaceAll("Voice Translate", translate(language, "Voice Translate"))
+    .replaceAll("Ask Anything", translate(language, "Ask Anything"))
+    .replaceAll("Speak to edit", translate(language, "Speak to edit"));
+
+  for (const prefix of ["Microphone test failed. ", "Microphone test could not start. ", "Microphone test could not stop. "] as const) {
+    if (message.startsWith(prefix)) return `${translate(language, prefix.slice(0, -1) as MessageKey)}${message.slice(prefix.length) ? ` ${message.slice(prefix.length)}` : ""}`;
+  }
+
+  const shortcutValidation = /^(shortcut cannot be empty|shortcuts must be unique across all actions|each voice mode requires one to four shortcuts|hotkey is invalid):?\s*(.*)$/s.exec(message);
+  if (shortcutValidation) {
+    const [, prefix, details] = shortcutValidation;
+    return `${translate(language, prefix as MessageKey)}${details ? `: ${localizeActions(details)}` : ""}`;
+  }
+
+  for (const prefix of ["shortcut registration failed:", "shortcut removal failed:"] as const) {
+    if (message.startsWith(prefix)) {
+      return `${translate(language, prefix)}${localizeActions(message.slice(prefix.length).replace("shortcut restoration failed, restart required:", translate(language, "shortcut restoration failed, restart required:")))}`;
+    }
+  }
 
   const draftInsertionFailure = "Draft insertion failed; the transcript is available in this app.";
   if (message.startsWith(`${draftInsertionFailure} `)) {

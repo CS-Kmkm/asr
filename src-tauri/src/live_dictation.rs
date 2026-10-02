@@ -48,12 +48,13 @@ impl LiveDraft {
         target: TargetWindow,
         settings: &Settings,
         active_hotkey: &str,
+        mode_shortcuts: &[String],
         from_shortcut: bool,
         defer_insertion: bool,
     ) -> Self {
         let monitor = Arc::new(InputMonitor::default());
         let checkpoint = monitor
-            .start_for_recording(active_hotkey, from_shortcut)
+            .start_for_recording(active_hotkey, mode_shortcuts, from_shortcut)
             .then(|| monitor.checkpoint())
             .flatten();
         Self {
@@ -152,6 +153,7 @@ pub(crate) fn start(
     operation_id: u64,
     mut draft: LiveDraft,
     prompt: Option<String>,
+    speech_locale: Option<String>,
     cancel: watch::Receiver<bool>,
 ) -> LiveTask {
     draft.monitor.observe_cancellation(Some(cancel.clone()));
@@ -162,6 +164,7 @@ pub(crate) fn start(
             &services.audio,
             services.transcriber.as_ref(),
             prompt.as_deref(),
+            speech_locale.as_deref(),
             cancel,
             stopped,
             LIVE_INTERVAL,
@@ -198,6 +201,7 @@ async fn run(
     audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
     transcriber: &dyn Transcriber,
     prompt: Option<&str>,
+    speech_locale: Option<&str>,
     mut cancel: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
     interval: Duration,
@@ -259,7 +263,7 @@ async fn run(
         }
         let inference_started = Instant::now();
         let result = transcriber
-            .transcribe(&artifact.path, prompt, cancel.clone())
+            .transcribe_with_locale(&artifact.path, prompt, speech_locale, cancel.clone())
             .await;
         let inference_cost = inference_started.elapsed();
         cleanup.cleanup().map_err(command_error)?;
@@ -448,6 +452,7 @@ mod tests {
                 &audio,
                 &recognizer,
                 None,
+                None,
                 cancel,
                 stopped,
                 Duration::from_millis(1),
@@ -490,6 +495,7 @@ mod tests {
             let operation = run(
                 &audio,
                 &recognizer,
+                None,
                 None,
                 cancel,
                 stopped,
@@ -543,6 +549,7 @@ mod tests {
             run(
                 &audio,
                 &recognizer,
+                None,
                 None,
                 cancel,
                 stopped,

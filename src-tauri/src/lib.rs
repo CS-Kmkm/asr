@@ -9,6 +9,7 @@ mod injection;
 mod input_monitor;
 mod live_dictation;
 mod recording_overlay;
+mod shortcuts;
 mod state;
 mod storage;
 mod types;
@@ -52,6 +53,32 @@ use types::{
 
 const ASR_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const ASR_MODEL_LOAD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+
+#[derive(Default)]
+struct MicrophoneTestState {
+    generation: u64,
+    active: Option<u64>,
+}
+
+impl MicrophoneTestState {
+    fn start(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.active = Some(self.generation);
+        self.generation
+    }
+
+    fn stop(&mut self) -> bool {
+        self.active.take().is_some()
+    }
+
+    fn is_current(&self, generation: u64) -> bool {
+        self.active == Some(generation)
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+}
 
 pub(crate) fn model_identity(settings: &Settings) -> (Option<String>, String) {
     let custom_model = settings
@@ -105,137 +132,12 @@ pub(crate) struct Services {
     shutdown_started: AtomicBool,
     translation_active: AtomicBool,
     voice_translation_target: Mutex<Option<String>>,
-    // Set at startup and replaced by every successful settings save.
-    startup_hotkey_issues: Mutex<HotkeyIssues>,
-    registered_hotkeys: Mutex<Vec<Shortcut>>,
-}
-
-/// Global shortcut actions. `hotkey_bindings` lists them in collision
-/// precedence order: when saved chords collide, the older action keeps the
-/// chord and a later one is not dispatched on it until it is reassigned.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HotkeyAction {
-    Dictate,
-    SelectedTextTranslate,
-    VoiceTranslate,
-    Edit,
-    Ask,
-}
-
-impl HotkeyAction {
-    fn registration_failed_message(self) -> &'static str {
-        match self {
-            Self::Dictate => "The recording hotkey could not be registered; another app may be using it. Change it in Settings.",
-            Self::SelectedTextTranslate => "The selected-text translation hotkey could not be registered; another app may be using it. Change it in Settings.",
-            Self::VoiceTranslate => "The voice Translate hotkey could not be registered; another app may be using it. Change it in Settings.",
-            Self::Edit => "The Speak to edit hotkey could not be registered; another app may be using it. Change it in Settings.",
-            Self::Ask => "The Ask Anything hotkey could not be registered; another app may be using it. Change it in Settings.",
-        }
-    }
-
-    fn collision_message(self, owner: Self) -> &'static str {
-        match (self, owner) {
-            (Self::SelectedTextTranslate, Self::Dictate) => "The selected-text translation hotkey matches the recording hotkey, so selected-text translation is off until you change it in Settings.",
-            (Self::VoiceTranslate, Self::Dictate) => "The voice Translate hotkey matches the recording hotkey, so voice Translate is off until you change it in Settings.",
-            (Self::VoiceTranslate, Self::SelectedTextTranslate) => "The voice Translate hotkey matches the selected-text translation hotkey, so voice Translate is off until you change it in Settings.",
-            (Self::Edit, _) => "Speak to edit is disabled because its saved hotkey is already used by another action. Change the overlapping hotkeys in Settings.",
-            (Self::Ask, _) => "Ask Anything is disabled because its saved hotkey is already used by another action. Change the overlapping hotkeys in Settings.",
-            _ => "Some saved hotkeys overlap. Change them in Settings to enable each action independently.",
-        }
-    }
-}
-
-type HotkeyBinding = (HotkeyAction, Shortcut);
-
-/// The saved chords in collision precedence order.
-fn hotkey_bindings(settings: &Settings) -> Result<Vec<HotkeyBinding>, String> {
-    Ok(vec![
-        (HotkeyAction::Dictate, parse_shortcut(&settings.hotkey)?),
-        (
-            HotkeyAction::SelectedTextTranslate,
-            parse_shortcut(&settings.translation_hotkey)?,
-        ),
-        (
-            HotkeyAction::VoiceTranslate,
-            parse_shortcut(&settings.voice_translate_hotkey)?,
-        ),
-        (
-            HotkeyAction::Edit,
-            parse_shortcut(&settings.speak_to_edit_hotkey)?,
-        ),
-        (HotkeyAction::Ask, parse_shortcut(&settings.ask_hotkey)?),
-    ])
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct HotkeyAssignment {
-    /// One binding per distinct chord, owned by the first action claiming it.
-    active: Vec<HotkeyBinding>,
-    /// `(unassigned action, action that keeps the chord)` pairs.
-    collisions: Vec<(HotkeyAction, HotkeyAction)>,
-}
-
-fn assign_hotkeys(bindings: &[HotkeyBinding]) -> HotkeyAssignment {
-    let mut assignment = HotkeyAssignment::default();
-    for &(action, shortcut) in bindings {
-        match assignment
-            .active
-            .iter()
-            .find(|(_, chord)| *chord == shortcut)
-        {
-            Some(&(owner, _)) => assignment.collisions.push((action, owner)),
-            None => assignment.active.push((action, shortcut)),
-        }
-    }
-    assignment
-}
-
-/// A saved legacy collision may survive an unrelated settings edit. A new
-/// collision is one whose losing action or owner did not previously share the
-/// exact same chord.
-fn has_new_hotkey_collision(proposed: &[HotkeyBinding], previous: &[HotkeyBinding]) -> bool {
-    assign_hotkeys(proposed)
-        .collisions
-        .iter()
-        .any(|&(loser, owner)| {
-            let chord = proposed
-                .iter()
-                .find(|(action, _)| *action == loser)
-                .map(|(_, chord)| *chord)
-                .expect("colliding action has a proposed chord");
-            !previous.contains(&(loser, chord)) || !previous.contains(&(owner, chord))
-        })
-}
-
-/// The action a pressed chord runs. Only the chord's owner is dispatched, so
-/// an action that lost a collision never runs on that chord.
-fn dispatched_action(bindings: &[HotkeyBinding], pressed: Shortcut) -> Option<HotkeyAction> {
-    assign_hotkeys(bindings)
-        .active
-        .into_iter()
-        .find(|(_, chord)| *chord == pressed)
-        .map(|(action, _)| action)
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct HotkeyIssues {
-    collisions: Vec<(HotkeyAction, HotkeyAction)>,
-    unregistered: Vec<HotkeyAction>,
-}
-
-impl HotkeyIssues {
-    /// One fixed, localizable sentence per affected action.
-    fn messages(&self) -> Vec<&'static str> {
-        self.collisions
-            .iter()
-            .map(|&(action, owner)| action.collision_message(owner))
-            .chain(
-                self.unregistered
-                    .iter()
-                    .map(|action| action.registration_failed_message()),
-            )
-            .collect()
-    }
+    shortcut_routes: Mutex<shortcuts::Routes>,
+    /// Saved shortcuts not dispatched since startup, named by action and
+    /// chord: collision losers and chords the OS refused.
+    inactive_shortcuts: Mutex<Vec<String>>,
+    settings_update: tokio::sync::Mutex<()>,
+    microphone_test: tokio::sync::Mutex<MicrophoneTestState>,
 }
 
 impl Services {
@@ -266,8 +168,12 @@ impl Services {
             shutdown_started: AtomicBool::new(false),
             translation_active: AtomicBool::new(false),
             voice_translation_target: Mutex::new(None),
-            startup_hotkey_issues: Mutex::new(HotkeyIssues::default()),
-            registered_hotkeys: Mutex::new(Vec::new()),
+            shortcut_routes: Mutex::new(
+                shortcuts::Routes::parse_saved(settings).expect("validated settings"),
+            ),
+            inactive_shortcuts: Mutex::new(Vec::new()),
+            settings_update: tokio::sync::Mutex::new(()),
+            microphone_test: tokio::sync::Mutex::new(MicrophoneTestState::default()),
         }
     }
 
@@ -285,8 +191,10 @@ impl Services {
             }
         }
         {
+            self.microphone_test.lock().await.stop();
             let mut audio = self.audio.lock().await;
             let _ = audio.cancel().await;
+            let _ = audio.disarm().await;
         }
         if let Some(task) = self.live.lock().await.take() {
             let _ = task.finish().await;
@@ -312,7 +220,7 @@ pub(crate) struct EditSession {
 }
 
 impl EditSession {
-    fn new(settings: &Settings, from_shortcut: bool) -> Result<Self, String> {
+    fn new(settings: &Settings, active_hotkey: &str, from_shortcut: bool) -> Result<Self, String> {
         let injector = SystemTextInjector::new(InjectionOptions {
             restore_clipboard: settings.clipboard_restore,
         });
@@ -320,7 +228,7 @@ impl EditSession {
             .capture_selection()
             .map_err(|_| "Select text in a supported foreground edit control.".to_string())?;
         let monitor = Arc::new(InputMonitor::default());
-        if !monitor.start_for_recording(&settings.speak_to_edit_hotkey, from_shortcut) {
+        if !monitor.start_for_recording(active_hotkey, &settings.shortcuts.edit, from_shortcut) {
             return Err("Speak to edit could not monitor the original selection safely.".into());
         }
         let checkpoint = monitor
@@ -361,7 +269,7 @@ pub(crate) struct AskSession {
 }
 
 impl AskSession {
-    fn new(settings: &Settings, from_shortcut: bool) -> Self {
+    fn new(settings: &Settings, active_hotkey: &str, from_shortcut: bool) -> Self {
         let injector = SystemTextInjector::new(InjectionOptions {
             restore_clipboard: settings.clipboard_restore,
         });
@@ -385,7 +293,11 @@ impl AskSession {
         let monitor = match &capture {
             AskCapture::Selected(_) | AskCapture::Caret(_) => {
                 let monitor = Arc::new(InputMonitor::default());
-                if monitor.start_for_recording(&settings.ask_hotkey, from_shortcut) {
+                if monitor.start_for_recording(
+                    active_hotkey,
+                    &settings.shortcuts.ask,
+                    from_shortcut,
+                ) {
                     Some(monitor)
                 } else {
                     None
@@ -572,219 +484,9 @@ fn database_path(app: &AppHandle) -> Result<PathBuf, Box<dyn std::error::Error>>
     Ok(directory.join("local-voice-input.sqlite3"))
 }
 
-fn parse_shortcut(value: &str) -> Result<Shortcut, String> {
-    Shortcut::from_str(value.trim()).map_err(|_| "hotkey is invalid".to_string())
-}
-
 #[cfg(test)]
-mod shortcut_startup_tests {
+mod ask_capture_tests {
     use super::*;
-    use HotkeyAction::{Ask, Dictate, Edit, SelectedTextTranslate, VoiceTranslate};
-
-    fn bindings(
-        dictate: &str,
-        selected: &str,
-        voice: &str,
-        edit: &str,
-        ask: &str,
-    ) -> Vec<HotkeyBinding> {
-        let mut settings = Settings::default();
-        settings.hotkey = dictate.into();
-        settings.translation_hotkey = selected.into();
-        settings.voice_translate_hotkey = voice.into();
-        settings.speak_to_edit_hotkey = edit.into();
-        settings.ask_hotkey = ask.into();
-        hotkey_bindings(&settings).unwrap()
-    }
-
-    #[test]
-    fn legacy_selected_text_chord_keeps_precedence_over_voice_translate() {
-        // A legacy selected-text chord equal to the new voice Translate default.
-        let mut settings = Settings::default();
-        settings.translation_hotkey = settings.voice_translate_hotkey.clone();
-        let bindings = hotkey_bindings(&settings).unwrap();
-        let recording = parse_shortcut(&settings.hotkey).unwrap();
-        let shared = parse_shortcut(&settings.translation_hotkey).unwrap();
-
-        let assignment = assign_hotkeys(&bindings);
-        assert_eq!(
-            assignment.active,
-            vec![
-                (Dictate, recording),
-                (SelectedTextTranslate, shared),
-                (
-                    Edit,
-                    parse_shortcut(&settings.speak_to_edit_hotkey).unwrap()
-                ),
-                (Ask, parse_shortcut(&settings.ask_hotkey).unwrap())
-            ]
-        );
-        assert_eq!(
-            assignment.collisions,
-            vec![(VoiceTranslate, SelectedTextTranslate)]
-        );
-        assert_eq!(
-            dispatched_action(&bindings, shared),
-            Some(SelectedTextTranslate)
-        );
-        assert_eq!(dispatched_action(&bindings, recording), Some(Dictate));
-    }
-
-    #[test]
-    fn dictate_keeps_a_chord_shared_with_every_other_action() {
-        let bindings = bindings(
-            "Ctrl+Shift+Space",
-            "Ctrl+Shift+Space",
-            "Ctrl+Shift+Space",
-            "Ctrl+Shift+Space",
-            "Ctrl+Shift+Space",
-        );
-        let shared = parse_shortcut("Ctrl+Shift+Space").unwrap();
-        let assignment = assign_hotkeys(&bindings);
-        assert_eq!(assignment.active, vec![(Dictate, shared)]);
-        assert_eq!(
-            assignment.collisions,
-            vec![
-                (SelectedTextTranslate, Dictate),
-                (VoiceTranslate, Dictate),
-                (Edit, Dictate),
-                (Ask, Dictate)
-            ]
-        );
-        assert_eq!(dispatched_action(&bindings, shared), Some(Dictate));
-    }
-
-    #[test]
-    fn distinct_and_unassigned_chords_dispatch_their_own_action() {
-        let bindings = bindings(
-            "Ctrl+Shift+Space",
-            "Ctrl+Shift+Space",
-            "Ctrl+Shift+Y",
-            "Ctrl+Shift+E",
-            "Ctrl+Shift+A",
-        );
-        assert_eq!(
-            assign_hotkeys(&bindings).collisions,
-            vec![(SelectedTextTranslate, Dictate)]
-        );
-        assert_eq!(
-            dispatched_action(&bindings, parse_shortcut("Ctrl+Shift+Y").unwrap()),
-            Some(VoiceTranslate)
-        );
-        assert_eq!(
-            dispatched_action(&bindings, parse_shortcut("Ctrl+Shift+U").unwrap()),
-            None
-        );
-    }
-
-    #[test]
-    fn existing_collision_survives_unrelated_save_but_new_collision_is_rejected() {
-        let existing = bindings(
-            "Ctrl+Shift+Space",
-            "Ctrl+Shift+T",
-            "Ctrl+Shift+T",
-            "Ctrl+Shift+E",
-            "Ctrl+Shift+A",
-        );
-        assert!(!has_new_hotkey_collision(&existing, &existing));
-
-        let newly_colliding = bindings(
-            "Ctrl+Shift+Space",
-            "Ctrl+Shift+T",
-            "Ctrl+Shift+Space",
-            "Ctrl+Shift+E",
-            "Ctrl+Shift+A",
-        );
-        assert!(has_new_hotkey_collision(&newly_colliding, &existing));
-
-        let moved_together = bindings(
-            "Ctrl+Shift+Space",
-            "Ctrl+Shift+Y",
-            "Ctrl+Shift+Y",
-            "Ctrl+Shift+E",
-            "Ctrl+Shift+A",
-        );
-        assert!(has_new_hotkey_collision(&moved_together, &existing));
-    }
-
-    #[test]
-    fn hotkey_warnings_name_each_affected_action() {
-        assert!(HotkeyIssues::default().messages().is_empty());
-        let issues = HotkeyIssues {
-            collisions: vec![
-                (SelectedTextTranslate, Dictate),
-                (VoiceTranslate, SelectedTextTranslate),
-            ],
-            unregistered: vec![Dictate],
-        };
-        let messages = issues.messages();
-        assert_eq!(messages.len(), 3);
-        assert!(messages[0]
-            .starts_with("The selected-text translation hotkey matches the recording hotkey"));
-        assert!(messages[1].starts_with(
-            "The voice Translate hotkey matches the selected-text translation hotkey"
-        ));
-        assert!(messages[1].contains("voice Translate is off"));
-        assert!(messages[2].starts_with("The recording hotkey could not be registered"));
-    }
-
-    #[test]
-    fn speak_to_edit_yields_a_shared_chord_to_every_older_action() {
-        for owner in [Dictate, SelectedTextTranslate, VoiceTranslate] {
-            let mut settings = Settings::default();
-            let edit = settings.speak_to_edit_hotkey.clone();
-            match owner {
-                Dictate => settings.hotkey = edit,
-                SelectedTextTranslate => settings.translation_hotkey = edit,
-                VoiceTranslate => settings.voice_translate_hotkey = edit,
-                Edit | Ask => unreachable!(),
-            }
-            let bindings = hotkey_bindings(&settings).unwrap();
-            assert!(assign_hotkeys(&bindings)
-                .collisions
-                .contains(&(Edit, owner)));
-            assert_eq!(
-                dispatched_action(
-                    &bindings,
-                    parse_shortcut(&settings.speak_to_edit_hotkey).unwrap()
-                ),
-                Some(owner)
-            );
-            assert!(HotkeyIssues {
-                collisions: vec![(Edit, owner)],
-                unregistered: vec![]
-            }
-            .messages()[0]
-                .starts_with("Speak to edit is disabled"));
-        }
-    }
-
-    #[test]
-    fn ask_yields_a_shared_chord_to_every_older_action() {
-        for owner in [Dictate, SelectedTextTranslate, VoiceTranslate, Edit] {
-            let mut settings = Settings::default();
-            let ask = settings.ask_hotkey.clone();
-            match owner {
-                Dictate => settings.hotkey = ask,
-                SelectedTextTranslate => settings.translation_hotkey = ask,
-                VoiceTranslate => settings.voice_translate_hotkey = ask,
-                Edit => settings.speak_to_edit_hotkey = ask,
-                Ask => unreachable!(),
-            }
-            let bindings = hotkey_bindings(&settings).unwrap();
-            assert!(assign_hotkeys(&bindings).collisions.contains(&(Ask, owner)));
-            assert_eq!(
-                dispatched_action(&bindings, parse_shortcut(&settings.ask_hotkey).unwrap()),
-                Some(owner)
-            );
-            assert!(HotkeyIssues {
-                collisions: vec![(Ask, owner)],
-                unregistered: vec![]
-            }
-            .messages()[0]
-                .starts_with("Ask Anything is disabled"));
-        }
-    }
 
     #[test]
     fn ask_never_captures_an_answer_panel_in_its_own_process() {
@@ -801,6 +503,9 @@ mod shortcut_startup_tests {
     }
 }
 
+fn parse_shortcut(value: &str) -> Result<Shortcut, String> {
+    Shortcut::from_str(value.trim()).map_err(|_| "hotkey is invalid".to_string())
+}
 fn load_environment_file() {
     let current_dir = std::env::current_dir().ok();
     let executable = std::env::current_exe().ok();
@@ -839,6 +544,25 @@ fn environment_file_candidates(
         }
     }
     candidates
+}
+
+#[cfg(test)]
+mod microphone_test_tests {
+    use super::MicrophoneTestState;
+
+    #[test]
+    fn stop_releases_ownership_and_invalidates_old_meter_task() {
+        let mut state = MicrophoneTestState::default();
+        let first = state.start();
+        assert!(state.is_current(first));
+        assert!(state.stop());
+        assert!(!state.stop());
+        assert!(!state.is_current(first));
+        let second = state.start();
+        assert_ne!(first, second);
+        assert!(!state.is_current(first));
+        assert!(state.is_current(second));
+    }
 }
 
 #[cfg(test)]
@@ -1063,7 +787,7 @@ fn cleanup_stale_artifacts(
     Ok(removed)
 }
 
-async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode) {
+async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode, trigger_chord: String) {
     let phase = app.state::<Services>().lifecycle.phase();
     let result = match phase {
         PipelinePhase::Recording
@@ -1087,6 +811,7 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode) {
                     app.state::<AppState>(),
                     app.state::<Storage>(),
                     true,
+                    Some(trigger_chord),
                 )
                 .await
             }
@@ -1097,6 +822,7 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode) {
                     app.state::<AppState>(),
                     app.state::<Storage>(),
                     true,
+                    Some(trigger_chord),
                 )
                 .await
             }
@@ -1107,6 +833,7 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode) {
                     app.state::<AppState>(),
                     app.state::<Storage>(),
                     true,
+                    Some(trigger_chord),
                 )
                 .await
             }
@@ -1117,6 +844,7 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode) {
                     app.state::<AppState>(),
                     app.state::<Storage>(),
                     true,
+                    Some(trigger_chord),
                 )
                 .await
             }
@@ -1223,30 +951,30 @@ async fn translate_selection(app: AppHandle) {
 }
 
 fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
-    let Ok(settings) = app.state::<Storage>().get_settings() else {
+    let route = app
+        .state::<Services>()
+        .shortcut_routes
+        .lock()
+        .ok()
+        .and_then(|routes| routes.find(shortcut).cloned());
+    let Some(route) = route else {
         return;
     };
-    let Ok(bindings) = hotkey_bindings(&settings) else {
-        return;
+    match route.action {
+        shortcuts::Action::Dictate => {
+            tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Dictate, route.text))
+        }
+        shortcuts::Action::Translate => {
+            tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Translate, route.text))
+        }
+        shortcuts::Action::Edit => {
+            tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Edit, route.text))
+        }
+        shortcuts::Action::Ask => {
+            tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Ask, route.text))
+        }
+        shortcuts::Action::SelectedText => tauri::async_runtime::spawn(translate_selection(app)),
     };
-    match dispatched_action(&bindings, shortcut) {
-        Some(HotkeyAction::Dictate) => {
-            tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Dictate));
-        }
-        Some(HotkeyAction::SelectedTextTranslate) => {
-            tauri::async_runtime::spawn(translate_selection(app));
-        }
-        Some(HotkeyAction::VoiceTranslate) => {
-            tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Translate));
-        }
-        Some(HotkeyAction::Edit) => {
-            tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Edit));
-        }
-        Some(HotkeyAction::Ask) => {
-            tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Ask));
-        }
-        None => {}
-    }
 }
 
 async fn initialize_model_runtime(app: AppHandle, settings: Settings) {
@@ -1316,35 +1044,26 @@ pub fn run() {
                     );
                 }
             }
-            let bindings = hotkey_bindings(&settings)
+            let (routes, shadowed) = shortcuts::Routes::parse_saved_with_shadowed(&settings)
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
             app.manage(storage);
             app.manage(AppState::default());
             app.manage(Services::new(&settings));
             recording_overlay::create(app.handle())?;
             answer_panel::create(app.handle())?;
-            // Older settings may share a chord with a newly added action. The
-            // older action keeps it (the same owner dispatch uses); each chord
-            // is registered once, and the warning names every unassigned action.
-            let assignment = assign_hotkeys(&bindings);
-            let mut issues = HotkeyIssues {
-                collisions: assignment.collisions,
-                unregistered: Vec::new(),
-            };
-            let mut registered = Vec::new();
-            for (action, shortcut) in assignment.active {
-                if app.global_shortcut().register(shortcut).is_ok() {
-                    registered.push(shortcut);
-                } else {
-                    issues.unregistered.push(action);
-                }
+            // Collision losers stay inactive until reassigned (older action
+            // keeps the chord); the warning names them with refused chords.
+            let mut inactive: Vec<String> = shadowed.iter().map(shortcuts::Route::describe).collect();
+            let (active_routes, failures) = shortcuts::register_available(&routes, |chord| app.global_shortcut().register(chord));
+            *app.state::<Services>().shortcut_routes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = active_routes;
+            if !failures.is_empty() {
+                emit_status(app.handle(), "shortcut_registration_failed", "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.");
             }
-            if let Ok(mut active) = app.state::<Services>().registered_hotkeys.lock() {
-                *active = registered;
+            for (route, error) in failures {
+                eprintln!("Shortcut registration failed for {}: {error}", route.text);
+                inactive.push(route.describe());
             }
-            if let Ok(mut current) = app.state::<Services>().startup_hotkey_issues.lock() {
-                *current = issues;
-            }
+            *app.state::<Services>().inactive_shortcuts.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = inactive;
             if cleanup_stale_artifacts(
                 &std::env::temp_dir(),
                 settings.delete_audio_after_processing,
@@ -1387,6 +1106,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::list_audio_devices,
             commands::start_recording,
+            commands::start_microphone_test,
+            commands::stop_microphone_test,
             commands::start_voice_translation,
             commands::start_speak_to_edit,
             commands::start_ask,
@@ -1396,6 +1117,7 @@ pub fn run() {
             commands::get_app_state,
             commands::get_startup_hotkey_warning,
             commands::get_settings,
+            commands::get_shortcut_warning,
             commands::get_model_status,
             commands::load_model,
             commands::get_gpu_diagnostics,

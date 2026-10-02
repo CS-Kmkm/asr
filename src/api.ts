@@ -17,13 +17,18 @@ const inTauri = "__TAURI_INTERNALS__" in window;
 
 export const defaultSettings: Settings = {
   uiLanguage: "ja",
+  theme: "system",
+  interactionSounds: false,
+  speechLocale: null,
   setupComplete: false,
-  hotkey: "Ctrl+Shift+Space",
+  shortcuts: {
+    dictate: ["Ctrl+Shift+Space"],
+    translate: ["Ctrl+Shift+Y"],
+    ask: ["Ctrl+Shift+A"],
+    edit: ["Ctrl+Shift+E"],
+  },
   translationHotkey: "Ctrl+Shift+T",
   translationInstruction: "",
-  voiceTranslateHotkey: "Ctrl+Shift+Y",
-  speakToEditHotkey: "Ctrl+Shift+E",
-  askHotkey: "Ctrl+Shift+A",
   translationTargetLanguages: ["en", "ja"],
   translationTargetLanguage: "en",
   microphoneId: null,
@@ -70,6 +75,16 @@ export async function listAudioDevices(): Promise<AudioDevice[]> {
   return invoke("list_audio_devices");
 }
 
+export async function startMicrophoneTest(deviceId: string | null): Promise<void> {
+  if (!inTauri) return;
+  await invoke("start_microphone_test", { deviceId });
+}
+
+export async function stopMicrophoneTest(): Promise<void> {
+  if (!inTauri) return;
+  await invoke("stop_microphone_test");
+}
+
 export async function startRecording(): Promise<void> {
   if (!inTauri) return;
   return invoke("start_recording");
@@ -108,6 +123,11 @@ export async function cancelRecording(): Promise<void> {
 export async function getSettings(): Promise<Settings> {
   if (!inTauri) return defaultSettings;
   return invoke("get_settings");
+}
+
+export async function getShortcutWarning(): Promise<boolean> {
+  if (!inTauri) return false;
+  return invoke("get_shortcut_warning");
 }
 
 export async function updateSettings(settings: Settings): Promise<Settings> {

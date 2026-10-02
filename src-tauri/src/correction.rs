@@ -47,7 +47,8 @@ pub async fn correct_transcript(
     cancel: watch::Receiver<bool>,
     on_update: impl FnMut(&str),
 ) -> Result<String, CorrectionError> {
-    let instruction = build_correction_instruction(settings, dictionary_hints);
+    let mut instruction = build_correction_instruction(settings, dictionary_hints);
+    append_speech_locale(&mut instruction, settings);
     request_text(
         settings,
         transcript,
@@ -85,7 +86,8 @@ pub async fn translate_transcript(
     cancel: watch::Receiver<bool>,
     on_update: impl FnMut(&str),
 ) -> Result<String, CorrectionError> {
-    let instruction = build_voice_translation_instruction(target_language)?;
+    let mut instruction = build_voice_translation_instruction(target_language)?;
+    append_speech_locale(&mut instruction, settings);
     request_text(
         settings,
         transcript,
@@ -108,10 +110,37 @@ pub async fn edit_selected_text(
     if spoken_instruction.trim().is_empty() {
         return Err(CorrectionError::EmptyEditInstruction);
     }
-    let instruction = build_edit_instruction();
+    let mut instruction = build_edit_instruction().to_owned();
+    append_speech_locale(&mut instruction, settings);
     let input = edit_request_input(selected_text, spoken_instruction);
-    let edited = request_text(settings, &input, instruction, cancel, on_update, true, None).await?;
+    let edited = request_text(
+        settings,
+        &input,
+        &instruction,
+        cancel,
+        on_update,
+        true,
+        None,
+    )
+    .await?;
     Ok(restore_selection_whitespace(selected_text, &edited))
+}
+
+fn append_speech_locale(instruction: &mut String, settings: &Settings) {
+    if let Some(locale) = settings.speech_locale.as_deref() {
+        // The command validates this against a fixed allowlist before saving.
+        instruction.push_str("\nThe spoken transcript was recorded with speech locale ");
+        instruction.push_str(locale);
+        instruction.push_str(". Respect its regional spelling and vocabulary where appropriate.");
+    }
+}
+
+/// Ask plans and answers come from the spoken instruction, so they receive
+/// the same speech locale context as correction, Translate, and Edit.
+fn ask_instruction(instruction: &str, settings: &Settings) -> String {
+    let mut instruction = instruction.to_owned();
+    append_speech_locale(&mut instruction, settings);
+    instruction
 }
 
 /// The shared provider path trims its output, and an empty result is already
@@ -265,10 +294,11 @@ pub async fn generate_ask_text(
     instruction: &str,
     cancel: watch::Receiver<bool>,
 ) -> Result<String, CorrectionError> {
+    let instruction = ask_instruction(instruction, settings);
     request_text(
         settings,
         input,
-        instruction,
+        &instruction,
         cancel,
         |_| {},
         true,
@@ -283,10 +313,11 @@ pub async fn generate_ask_plan(
     instruction: &str,
     cancel: watch::Receiver<bool>,
 ) -> Result<String, CorrectionError> {
+    let instruction = ask_instruction(instruction, settings);
     request_text(
         settings,
         input,
-        instruction,
+        &instruction,
         cancel,
         |_| {},
         false,
@@ -807,7 +838,7 @@ fn max_output_tokens(transcript: &str) -> usize {
 }
 
 fn request_output_tokens(input: &str, instruction: &str) -> usize {
-    if instruction == build_edit_instruction() {
+    if instruction.starts_with(build_edit_instruction()) {
         // Rewrites may expand the selection substantially; retain a bounded
         // budget across all three provider request formats.
         input
@@ -2059,5 +2090,103 @@ mod tests {
             build_voice_translation_instruction("not-a-language"),
             Err(CorrectionError::InvalidResponse(_))
         ));
+    }
+
+    #[test]
+    fn speech_locale_is_available_to_correction_prompt() {
+        let settings = Settings {
+            speech_locale: Some("en-GB".into()),
+            ..Settings::default()
+        };
+        let mut instruction = build_correction_instruction(&settings, &[]);
+        append_speech_locale(&mut instruction, &settings);
+        assert!(instruction.contains("speech locale en-GB"));
+        assert!(instruction.contains("regional spelling and vocabulary"));
+    }
+
+    fn read_http_request(socket: &mut std::net::TcpStream) -> String {
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                let length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .map(|value| value.trim().parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + length {
+                    return String::from_utf8(request[end + 4..end + 4 + length].to_vec()).unwrap();
+                }
+            }
+            let count = socket.read(&mut buffer).unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&buffer[..count]);
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_requests_carry_the_speech_locale() {
+        for plan in [true, false] {
+            let server = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = server.local_addr().unwrap().port();
+            let handler = thread::spawn(move || {
+                let (mut socket, _) = server.accept().unwrap();
+                let body = read_http_request(&mut socket);
+                socket.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                body
+            });
+            let settings = Settings {
+                correction_provider: "local".into(),
+                local_correction_base_url: format!("http://127.0.0.1:{port}/v1"),
+                speech_locale: Some("pt-BR".into()),
+                ..Settings::default()
+            };
+            let (_cancel_tx, cancel) = watch::channel(false);
+            let result = if plan {
+                generate_ask_plan(&settings, "instruction", "fixed plan contract", cancel).await
+            } else {
+                generate_ask_text(&settings, "instruction", "fixed answer contract", cancel).await
+            };
+            assert!(result.is_err());
+            let body = handler.join().unwrap();
+            assert!(body.contains("speech locale pt-BR"), "plan={plan}");
+            assert!(body.contains(if plan {
+                "fixed plan contract"
+            } else {
+                "fixed answer contract"
+            }));
+        }
+    }
+
+    #[test]
+    fn ask_instruction_is_unchanged_without_a_speech_locale() {
+        let settings = Settings::default();
+        assert_eq!(
+            ask_instruction("fixed contract", &settings),
+            "fixed contract"
+        );
+        let settings = Settings {
+            speech_locale: Some("fr-CA".into()),
+            ..Settings::default()
+        };
+        let instruction = ask_instruction("fixed contract", &settings);
+        assert!(instruction.starts_with("fixed contract\n"));
+        assert!(instruction.contains("speech locale fr-CA"));
+    }
+
+    #[test]
+    fn speech_locale_does_not_reduce_edit_output_budget() {
+        let settings = Settings {
+            speech_locale: Some("en-GB".into()),
+            ..Settings::default()
+        };
+        let mut instruction = build_edit_instruction().to_owned();
+        append_speech_locale(&mut instruction, &settings);
+        let input = edit_request_input("short", "expand substantially");
+        assert_eq!(request_output_tokens(&input, &instruction), 2048);
     }
 }

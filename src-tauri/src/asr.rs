@@ -122,6 +122,16 @@ pub trait Transcriber: Send + Sync {
         prompt: Option<&str>,
         cancel: watch::Receiver<bool>,
     ) -> Result<Transcript, AsrError>;
+    async fn transcribe_with_locale(
+        &self,
+        audio_path: &Path,
+        prompt: Option<&str>,
+        locale: Option<&str>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Transcript, AsrError> {
+        let _ = locale;
+        self.transcribe(audio_path, prompt, cancel).await
+    }
     async fn shutdown(&self) -> Result<(), AsrError>;
     /// Reconfigure the worker command (for example when the ASR backend
     /// setting changes) and tear down any running worker so the next request
@@ -421,6 +431,24 @@ impl JsonlTranscriber {
     }
 }
 
+/// JSONL `transcribe` request. `language` carries the full speech locale tag
+/// (or null for automatic detection); the worker backend decides how much of
+/// it to honor.
+fn transcribe_request(
+    id: u64,
+    audio_path: &Path,
+    prompt: Option<&str>,
+    locale: Option<&str>,
+) -> Value {
+    json!({
+        "id": id,
+        "command": "transcribe",
+        "audio_path": audio_path,
+        "prompt": prompt,
+        "language": locale,
+    })
+}
+
 #[async_trait]
 impl Transcriber for JsonlTranscriber {
     async fn load(&self, quantization: &str) -> Result<(), AsrError> {
@@ -440,12 +468,23 @@ impl Transcriber for JsonlTranscriber {
         prompt: Option<&str>,
         cancel: watch::Receiver<bool>,
     ) -> Result<Transcript, AsrError> {
-        let request = json!({
-            "id": self.next_id.fetch_add(1, Ordering::Relaxed),
-            "command": "transcribe",
-            "audio_path": audio_path,
-            "prompt": prompt,
-        });
+        self.transcribe_with_locale(audio_path, prompt, None, cancel)
+            .await
+    }
+
+    async fn transcribe_with_locale(
+        &self,
+        audio_path: &Path,
+        prompt: Option<&str>,
+        locale: Option<&str>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Transcript, AsrError> {
+        let request = transcribe_request(
+            self.next_id.fetch_add(1, Ordering::Relaxed),
+            audio_path,
+            prompt,
+            locale,
+        );
         let response = self
             .request(request, Some(cancel), self.request_timeout)
             .await?;
@@ -515,6 +554,22 @@ mod tests {
         let transcript: Transcript = serde_json::from_value(value).unwrap();
         assert_eq!(transcript.text, "hello");
         assert_eq!(transcript.segments.len(), 1);
+    }
+
+    #[test]
+    fn transcribe_request_carries_the_speech_locale() {
+        let path = Path::new("recording.wav");
+        let request = transcribe_request(7, path, Some("terms"), Some("en-GB"));
+        assert_eq!(request["command"], "transcribe");
+        assert_eq!(request["language"], "en-GB");
+        assert_eq!(request["prompt"], "terms");
+        let automatic = transcribe_request(8, path, None, None);
+        assert!(automatic
+            .as_object()
+            .unwrap()
+            .get("language")
+            .unwrap()
+            .is_null());
     }
 
     #[test]
