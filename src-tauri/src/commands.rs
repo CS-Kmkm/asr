@@ -1369,10 +1369,13 @@ async fn finish_ask(
         let url = site
             .fixed_url(spoken)
             .map_err(|_| "Ask search query was invalid".to_string())?;
-        if services.lifecycle.is_cancelled(operation_id) {
-            return Err("ask was cancelled".into());
-        }
-        open_fixed_search(&url)?;
+        // Browser launch is irreversible. Cancellation either wins before
+        // launch or observes a committed search; History and completion remain
+        // owned by this operation until the outer PipelineGuard finishes it.
+        services
+            .lifecycle
+            .commit_side_effect(operation_id, || open_fixed_search(&url))
+            .map_err(|_| "ask was cancelled".to_string())??;
         let latency_ms = started.elapsed().as_millis() as u64;
         let history_save_status = save_history(
             storage,
@@ -3028,7 +3031,7 @@ pub(crate) async fn retry_history_item(
         let latency_ms = started.elapsed().as_millis() as i64;
         let history_save_status = services
             .lifecycle
-            .commit_retry(operation_id, || {
+            .commit_side_effect(operation_id, || {
                 Ok::<HistorySaveStatus, String>(save_history(
                     &storage,
                     &NewHistoryItem {
