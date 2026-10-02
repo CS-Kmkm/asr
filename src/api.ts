@@ -55,6 +55,7 @@ export const defaultSettings: Settings = {
   localCorrectionModel: "qwen3:8b",
   localCorrectionMaxTokens: 4096,
   correctionInstruction: "",
+  correctionMode: "conservative",
   correctionRemoveFillers: true,
   correctionRemoveRepetitions: true,
   correctionResolveSelfCorrections: true,

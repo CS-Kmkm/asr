@@ -238,9 +238,11 @@ const en = {
   "One alias per line": "One alias per line",
   "CSV encoding error": "Could not read the CSV encoding. Use UTF-8 or CP932.",
   "No matching dictionary entries": "No matching dictionary entries", "Change the search text or source filter.": "Change the search text or source filter.",
+  "Correction mode": "Correction mode", "Conservative": "Conservative", "Intent-aware": "Intent-aware", "Conservative keeps utterance order. Intent-aware may reorganize phrasing within this transcript; it is instructed not to add details, does not learn automatically, and uses no context beyond the current transcript and profile. Only intent-aware results are checked for changed numbers, URLs, backtick code, and uncertainty markers; a failed check inserts the original transcript. Names and other details are not checked.": "Conservative keeps utterance order. Intent-aware may reorganize phrasing within this transcript; it is instructed not to add details, does not learn automatically, and uses no context beyond the current transcript and profile. Only intent-aware results are checked for changed numbers, URLs, backtick code, and uncertainty markers; a failed check inserts the original transcript. Names and other details are not checked.",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
+  "Correction mode": "修正モード", "Conservative": "保守的", "Intent-aware": "意図認識", "Conservative keeps utterance order. Intent-aware may reorganize phrasing within this transcript; it is instructed not to add details, does not learn automatically, and uses no context beyond the current transcript and profile. Only intent-aware results are checked for changed numbers, URLs, backtick code, and uncertainty markers; a failed check inserts the original transcript. Names and other details are not checked.": "保守的モードは発話順を維持します。意図認識モードはこの文字起こし内で表現を整理できます。詳細を追加しないよう指示されており、自動学習せず、現在の文字起こしとプロファイル以外の文脈を使いません。数値・URL・バッククォートのコード・不確かさの表現の変化は意図認識モードの結果だけを検査し、検査に失敗した場合は元の文字起こしを挿入します。名前などその他の詳細は検査しません。",
   "The result completed, but History could not be saved.": "結果は完了しましたが、履歴を保存できませんでした。",
   "History text was saved, but the recording could not be retained.": "履歴のテキストは保存しましたが、録音は保存できませんでした。",
   "History text was saved, but the recording and usage metrics could not be retained.": "履歴のテキストは保存しましたが、録音と使用状況の記録は保存できませんでした。",

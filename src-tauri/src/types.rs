@@ -85,6 +85,8 @@ pub struct Settings {
     pub local_correction_max_tokens: usize,
     #[serde(default = "default_correction_instruction")]
     pub correction_instruction: String,
+    #[serde(default = "default_correction_mode")]
+    pub correction_mode: String,
     #[serde(default = "default_enabled_correction_feature")]
     pub correction_remove_fillers: bool,
     #[serde(default = "default_enabled_correction_feature")]
@@ -156,6 +158,7 @@ impl Default for VoiceShortcuts {
 
 pub const ASR_BACKENDS: [&str; 4] = ["vibevoice", "faster-whisper", "openai-compatible", "mock"];
 pub const CORRECTION_PROVIDERS: [&str; 3] = ["openai", "gemini", "local"];
+pub const CORRECTION_MODES: [&str; 2] = ["conservative", "intent_aware"];
 pub const OPENAI_REASONING_EFFORTS: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];
 pub const TRANSLATION_TARGET_LANGUAGES: [&str; 8] =
     ["en", "ja", "zh", "es", "fr", "pt", "de", "ko"];
@@ -227,6 +230,10 @@ fn default_correction_instruction() -> String {
     String::new()
 }
 
+fn default_correction_mode() -> String {
+    "conservative".into()
+}
+
 fn default_translation_hotkey() -> String {
     "Ctrl+Shift+T".into()
 }
@@ -292,6 +299,7 @@ impl Default for Settings {
             local_correction_model: default_local_correction_model(),
             local_correction_max_tokens: default_local_correction_max_tokens(),
             correction_instruction: default_correction_instruction(),
+            correction_mode: default_correction_mode(),
             correction_remove_fillers: true,
             correction_remove_repetitions: true,
             correction_resolve_self_corrections: true,
@@ -542,6 +550,7 @@ mod tests {
         assert_eq!(settings.local_correction_model, "qwen3:8b");
         assert_eq!(settings.local_correction_max_tokens, 4096);
         assert!(settings.correction_instruction.is_empty());
+        assert_eq!(settings.correction_mode, "conservative");
         assert!(settings.correction_remove_fillers);
         assert!(settings.correction_remove_repetitions);
         assert!(settings.correction_resolve_self_corrections);
