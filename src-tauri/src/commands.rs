@@ -22,22 +22,102 @@ fn cancellation_copy(mode: PipelineMode) -> (&'static str, &'static str) {
     match mode {
         PipelineMode::Dictate => ("Dictation cancelled.", "dictation was cancelled"),
         PipelineMode::Translate => ("Translation cancelled.", "translation was cancelled"),
+        PipelineMode::Edit => ("Editing cancelled.", "editing was cancelled"),
     }
 }
 
-async fn take_published_session<T>(
+const EDIT_CLIPBOARD_UNAVAILABLE: &str =
+    "The original selection was not changed, and the clipboard is unavailable; the edit is available in this app.";
+
+/// A replacement error happens before any paste, so the original selection is
+/// unchanged and the clipboard is the fallback. `None` means the edit reached
+/// neither the target nor the clipboard.
+fn edit_insertion_outcome<E, F>(
+    replaced: Result<InsertResult, E>,
+    copy_to_clipboard: impl FnOnce() -> Result<(), F>,
+) -> Option<InsertResult> {
+    match replaced {
+        Ok(result) => Some(result),
+        Err(_) => copy_to_clipboard()
+            .ok()
+            .map(|()| InsertResult::ClipboardOnly),
+    }
+}
+
+fn persist_edit_completion(
+    storage: &Storage,
+    item: &NewHistoryItem<'_>,
+    provider: &str,
+    elapsed_ms: i64,
+) -> (bool, bool) {
+    // The target may already have accepted a paste. Persistence is best effort
+    // so a database failure cannot turn that completed edit into command failure.
+    let history_failed = storage.add_history(item).is_err();
+    let metric_failed = storage
+        .add_metric(
+            "speak_to_edit",
+            Some(provider),
+            Some(elapsed_ms),
+            true,
+            None,
+        )
+        .is_err();
+    (history_failed, metric_failed)
+}
+
+/// This warning follows, and visually replaces, the completion notice. Only a
+/// confirmed paste may be described as a completed edit.
+fn edit_persistence_warning(
+    insertion: InsertResult,
+    history_failed: bool,
+    metric_failed: bool,
+) -> Option<(&'static str, &'static str)> {
+    let replaced = insertion == InsertResult::ClipboardPaste;
+    let warning = match (history_failed, metric_failed, replaced) {
+        (false, false, _) => return None,
+        (true, true, true) => (
+            "history_metric_save_failed",
+            "The edit was completed, but history and usage metrics could not be saved.",
+        ),
+        (true, false, true) => (
+            "history_save_failed",
+            "The edit was completed, but history could not be saved.",
+        ),
+        (false, true, true) => (
+            "metric_save_failed",
+            "The edit was completed, but usage metrics could not be saved.",
+        ),
+        (true, true, false) => (
+            "history_metric_save_failed",
+            "The edit remains on the clipboard, but history and usage metrics could not be saved.",
+        ),
+        (true, false, false) => (
+            "history_save_failed",
+            "The edit remains on the clipboard, but history could not be saved.",
+        ),
+        (false, true, false) => (
+            "metric_save_failed",
+            "The edit remains on the clipboard, but usage metrics could not be saved.",
+        ),
+    };
+    Some(warning)
+}
+
+async fn take_published_sessions<T, U>(
     live: &tokio::sync::Mutex<Option<T>>,
+    edit: &tokio::sync::Mutex<Option<U>>,
     translation_target: &Mutex<Option<String>>,
-) -> Result<(Option<T>, Option<String>), String> {
+) -> Result<(Option<T>, Option<U>, Option<String>), String> {
     // Startup holds `live` while it publishes both the target language and the
     // session. Waiting for this lock prevents an immediate stop from observing
     // the lifecycle's Recording phase before that publication is complete.
     let live_task = live.lock().await.take();
+    let edit_session = edit.lock().await.take();
     let target_language = translation_target
         .lock()
         .map_err(|_| "translation target service is unavailable".to_string())?
         .take();
-    Ok((live_task, target_language))
+    Ok((live_task, edit_session, target_language))
 }
 
 fn validate_translation_targets(settings: &Settings) -> Result<(), String> {
@@ -98,6 +178,16 @@ pub(crate) async fn start_voice_translation(
     start_voice_translation_with_origin(app, services, state, storage, false).await
 }
 
+#[tauri::command]
+pub(crate) async fn start_speak_to_edit(
+    app: AppHandle,
+    services: State<'_, Services>,
+    state: State<'_, AppState>,
+    storage: State<'_, Storage>,
+) -> Result<(), String> {
+    start_speak_to_edit_with_origin(app, services, state, storage, false).await
+}
+
 pub(crate) async fn start_recording_with_origin(
     app: AppHandle,
     services: State<'_, Services>,
@@ -134,6 +224,24 @@ pub(crate) async fn start_voice_translation_with_origin(
     .await
 }
 
+pub(crate) async fn start_speak_to_edit_with_origin(
+    app: AppHandle,
+    services: State<'_, Services>,
+    state: State<'_, AppState>,
+    storage: State<'_, Storage>,
+    from_shortcut: bool,
+) -> Result<(), String> {
+    start_recording_mode(
+        app,
+        services,
+        state,
+        storage,
+        from_shortcut,
+        PipelineMode::Edit,
+    )
+    .await
+}
+
 async fn start_recording_mode(
     app: AppHandle,
     services: State<'_, Services>,
@@ -155,27 +263,41 @@ async fn start_recording_mode(
         return Err("selected-text translation is already active".into());
     }
     let settings = storage.get_settings().map_err(command_error)?;
+    let mut edit_session = (mode == PipelineMode::Edit)
+        .then(|| EditSession::new(&settings, from_shortcut))
+        .transpose()?;
     ensure_model_loaded(&app, &services, &settings).await?;
     if services.lifecycle.is_cancelled(operation_id) {
         emit_state(&app, &state, AppPhase::Idle, cancel_message);
         return Err(cancel_error.into());
     }
-    let target = SystemTextInjector::default()
-        .capture_target()
-        .map_err(command_error)?;
+    let target = (mode != PipelineMode::Edit)
+        .then(|| {
+            SystemTextInjector::default()
+                .capture_target()
+                .map_err(command_error)
+        })
+        .transpose()?;
     let mut live_slot = services.live.lock().await;
+    let mut edit_slot = services.edit.lock().await;
     let active_hotkey = match mode {
         PipelineMode::Dictate => settings.hotkey.as_str(),
         PipelineMode::Translate => settings.voice_translate_hotkey.as_str(),
+        PipelineMode::Edit => settings.speak_to_edit_hotkey.as_str(),
     };
-    let draft = live_dictation::LiveDraft::new(
-        target.clone(),
-        &settings,
-        active_hotkey,
-        from_shortcut,
-        mode == PipelineMode::Translate,
-    );
+    let draft = target.as_ref().map(|target| {
+        live_dictation::LiveDraft::new(
+            target.clone(),
+            &settings,
+            active_hotkey,
+            from_shortcut,
+            mode == PipelineMode::Translate,
+        )
+    });
     let cancel = services.lifecycle.cancellation(operation_id)?;
+    if let Some(session) = edit_session.as_ref() {
+        session.monitor.observe_cancellation(Some(cancel.clone()));
+    }
     let dictionary_terms = storage.dictionary_prompt_terms().unwrap_or_default();
     let prompt = (!dictionary_terms.is_empty()).then(|| dictionary_terms.join("\n"));
     let capture_config = capture_config(&settings);
@@ -197,7 +319,7 @@ async fn start_recording_mode(
     *services
         .target
         .lock()
-        .map_err(|_| "target service is unavailable".to_string())? = Some(target);
+        .map_err(|_| "target service is unavailable".to_string())? = target;
     let target_language =
         (mode == PipelineMode::Translate).then(|| settings.translation_target_language.clone());
     *services
@@ -208,7 +330,11 @@ async fn start_recording_mode(
     let _ = app.emit(
         "voice-mode",
         serde_json::json!({
-            "mode": if mode == PipelineMode::Translate { "translate" } else { "dictate" },
+            "mode": match mode {
+                PipelineMode::Dictate => "dictate",
+                PipelineMode::Translate => "translate",
+                PipelineMode::Edit => "edit",
+            },
             "targetLanguage": target_language,
         }),
     );
@@ -217,20 +343,17 @@ async fn start_recording_mode(
         &app,
         &state,
         AppPhase::Recording,
-        if mode == PipelineMode::Translate {
-            "Recording speech to translate."
-        } else {
-            "Recording from the selected microphone."
+        match mode {
+            PipelineMode::Translate => "Recording speech to translate.",
+            PipelineMode::Edit => "Recording an edit instruction.",
+            PipelineMode::Dictate => "Recording from the selected microphone.",
         },
     );
     recording_overlay::set_interactive(&app, mode == PipelineMode::Translate);
-    *live_slot = Some(live_dictation::start(
-        app.clone(),
-        operation_id,
-        draft,
-        prompt,
-        cancel,
-    ));
+    *live_slot =
+        draft.map(|draft| live_dictation::start(app.clone(), operation_id, draft, prompt, cancel));
+    *edit_slot = edit_session.take();
+    drop(edit_slot);
     drop(live_slot);
     std::mem::forget(guard);
 
@@ -294,8 +417,12 @@ pub(crate) async fn stop_recording(
         "Stopping recording and preparing audio.",
     );
     let started = Instant::now();
-    let (live_task, translation_target) =
-        take_published_session(&services.live, &services.voice_translation_target).await?;
+    let (live_task, mut edit_session, translation_target) = take_published_sessions(
+        &services.live,
+        &services.edit,
+        &services.voice_translation_target,
+    )
+    .await?;
     let mut audio = services.audio.lock().await;
     let artifact_result = audio.stop().await;
     // `stop` closes the input stream. Do not re-arm it while transcription is
@@ -307,10 +434,11 @@ pub(crate) async fn stop_recording(
         .as_ref()
         .ok()
         .map(|artifact| TempArtifact::new(artifact.path.clone(), false));
-    let mut draft = live_task
-        .ok_or("live dictation session is unavailable")?
-        .finish()
-        .await?;
+    let mut draft = match live_task {
+        Some(task) => Some(task.finish().await?),
+        None if mode == PipelineMode::Edit => None,
+        None => return Err("live dictation session is unavailable".into()),
+    };
     let settings = storage.get_settings().map_err(command_error)?;
     let artifact = artifact_result.map_err(|error| {
         emit_state(
@@ -394,6 +522,139 @@ pub(crate) async fn stop_recording(
         .lock()
         .map_err(|_| "target service is unavailable".to_string())?
         .take();
+    if mode == PipelineMode::Edit {
+        let session = edit_session.take().ok_or("edit session is unavailable")?;
+        let instruction_text = transcript.text.clone();
+        let source_text = session.selection.text().to_owned();
+        if instruction_text.trim().is_empty() {
+            emit_state(
+                &app,
+                &state,
+                AppPhase::Error,
+                "No edit instruction was captured; the original selection was not changed.",
+            );
+            return Err("no edit instruction was captured".into());
+        }
+        emit_correction_preview(&app, &instruction_text, "draft");
+        emit_state(
+            &app,
+            &state,
+            AppPhase::Processing,
+            "Applying the spoken edit instruction.",
+        );
+        let edit_started = Instant::now();
+        let edited = match correction::edit_selected_text(
+            &settings,
+            &source_text,
+            &instruction_text,
+            correction_cancel,
+            |delta| emit_correction_preview(&app, delta, "streaming"),
+        )
+        .await
+        {
+            Ok(edited) => edited,
+            Err(correction::CorrectionError::Cancelled) => {
+                emit_state(&app, &state, AppPhase::Idle, "Editing cancelled.");
+                return Err("editing was cancelled".into());
+            }
+            Err(_error) => {
+                let _ = storage.add_metric(
+                    "speak_to_edit",
+                    Some(settings.correction_provider.as_str()),
+                    Some(edit_started.elapsed().as_millis() as i64),
+                    false,
+                    Some("edit_failed"),
+                );
+                emit_state(
+                    &app,
+                    &state,
+                    AppPhase::Error,
+                    "Editing failed; the original selection was not changed.",
+                );
+                return Err("editing failed; the original selection was not changed".into());
+            }
+        };
+        emit_correction_preview(&app, &edited, "final");
+        if services.lifecycle.is_cancelled(operation_id) {
+            emit_state(&app, &state, AppPhase::Idle, "Editing cancelled.");
+            return Err("editing was cancelled".into());
+        }
+        session.monitor.wait_for_shortcut_release().await;
+        if services.lifecycle.is_cancelled(operation_id) {
+            emit_state(&app, &state, AppPhase::Idle, "Editing cancelled.");
+            return Err("editing was cancelled".into());
+        }
+        emit_state(
+            &app,
+            &state,
+            AppPhase::Injecting,
+            "Replacing the original selection.",
+        );
+        let insertion = edit_insertion_outcome(
+            session.injector.replace_selection(
+                &session.selection,
+                &edited,
+                &session.monitor,
+                session.checkpoint,
+            ),
+            || session.injector.copy_to_clipboard(&edited),
+        );
+        recording_overlay::set_phase(&app, &AppPhase::Completed);
+        let Some(insertion) = insertion else {
+            // Neither the target nor the clipboard received the edit. Keep it
+            // recoverable in this app and end the operation visibly.
+            state.publish_result(edited.clone());
+            emit_state(&app, &state, AppPhase::Error, EDIT_CLIPBOARD_UNAVAILABLE);
+            return Err(EDIT_CLIPBOARD_UNAVAILABLE.into());
+        };
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let (history_failed, metric_failed) = persist_edit_completion(
+            &storage,
+            &NewHistoryItem {
+                transcript_text: &instruction_text,
+                processed_text: Some(&edited),
+                source_text: Some(&source_text),
+                instruction_text: Some(&instruction_text),
+                mode: "edit",
+                asr_provider: &transcript.model,
+                llm_provider: Some(settings.correction_provider.as_str()),
+                target_language: None,
+                app_category: None,
+                duration_ms: Some(duration_ms as i64),
+                latency_ms: Some(latency_ms as i64),
+            },
+            settings.correction_provider.as_str(),
+            edit_started.elapsed().as_millis() as i64,
+        );
+        let (insertion_label, completion) = match insertion {
+            InsertResult::ClipboardPaste => ("clipboard_paste", "Selected text updated."),
+            InsertResult::ClipboardOnly => (
+                "clipboard_only",
+                "Automatic replacement was skipped; the edit remains on the clipboard.",
+            ),
+            InsertResult::PasteUnverified => (
+                "paste_unverified",
+                "The edit paste could not be confirmed; the result remains on the clipboard.",
+            ),
+        };
+        let snapshot = state.complete(edited.clone(), completion.into());
+        let _ = app.emit("app-state", snapshot);
+        emit_status(&app, insertion_label, completion);
+        if let Some((kind, message)) =
+            edit_persistence_warning(insertion, history_failed, metric_failed)
+        {
+            emit_status(&app, kind, message);
+        }
+        return Ok(RecordingResult {
+            text: edited,
+            insertion: insertion_label.into(),
+            duration_ms,
+            latency_ms,
+        });
+    }
+    let mut draft = draft
+        .take()
+        .expect("non-edit recording has a live dictation session");
     let mut final_text = transcript.text.clone();
     let mut processed_text = None;
     let mut llm_provider = None;
@@ -606,6 +867,8 @@ pub(crate) async fn stop_recording(
     let history_result = storage.add_history(&NewHistoryItem {
         transcript_text: &transcript.text,
         processed_text: processed_text.as_deref(),
+        source_text: None,
+        instruction_text: None,
         mode: if mode == PipelineMode::Translate {
             "translate"
         } else if processed_text.is_some() {
@@ -882,6 +1145,7 @@ pub(crate) async fn cancel_recording(
         &services.target,
         &services.voice_translation_target,
         &services.live,
+        &services.edit,
     )
     .await?;
     // Nothing was cancelled: any published session belongs to another
@@ -897,6 +1161,8 @@ pub(crate) async fn cancel_recording(
             AppPhase::Idle,
             if mode == PipelineMode::Translate {
                 "Translation cancelled."
+            } else if mode == PipelineMode::Edit {
+                "Editing cancelled."
             } else {
                 "Dictation cancelled."
             },
@@ -911,6 +1177,7 @@ async fn cancel_pipeline_operation(
     target: &Mutex<Option<TargetWindow>>,
     translation_target: &Mutex<Option<String>>,
     live: &tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
+    edit: &tokio::sync::Mutex<Option<EditSession>>,
 ) -> Result<bool, String> {
     let Some((operation_id, phase)) = lifecycle.cancel()? else {
         return Ok(false);
@@ -928,6 +1195,7 @@ async fn cancel_pipeline_operation(
         target.take();
     }
     let live_task = live.lock().await.take();
+    edit.lock().await.take();
     // Startup publishes the target language before releasing `live`. Clear it
     // while this operation still owns the lifecycle, so a later recording's
     // target is never removed.
@@ -962,6 +1230,7 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
         correction::CorrectionError::Cancelled => "cancelled",
         correction::CorrectionError::InvalidEndpoint(_) => "invalid_endpoint",
         correction::CorrectionError::UnsupportedProvider(_) => "unsupported_provider",
+        correction::CorrectionError::EmptyEditInstruction => "empty_edit_instruction",
     };
     format!("AI correction failed; using the original transcript. Error kind: {kind}.")
 }
@@ -970,6 +1239,88 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
 mod tests {
     use super::*;
     use crate::audio::{AudioArtifact, AudioError, AudioFuture, CaptureState, LevelMeter};
+
+    #[test]
+    fn edit_persistence_failure_does_not_skip_metrics_or_propagate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit.sqlite");
+        let storage = Storage::open(&path).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute("DROP TABLE dictation_history", [])
+            .unwrap();
+        let item = NewHistoryItem {
+            transcript_text: "shorten this",
+            processed_text: Some("short"),
+            source_text: Some("long selection"),
+            instruction_text: Some("shorten this"),
+            mode: "edit",
+            asr_provider: "test",
+            llm_provider: Some("local"),
+            target_language: None,
+            app_category: None,
+            duration_ms: Some(100),
+            latency_ms: Some(200),
+        };
+        assert_eq!(
+            persist_edit_completion(&storage, &item, "local", 200),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn edit_replacement_failure_falls_back_to_clipboard_or_reports_no_outcome() {
+        for result in [
+            InsertResult::ClipboardPaste,
+            InsertResult::ClipboardOnly,
+            InsertResult::PasteUnverified,
+        ] {
+            let outcome = edit_insertion_outcome(Ok::<_, ()>(result), || -> Result<(), ()> {
+                panic!("a completed replacement must not copy again")
+            });
+            assert_eq!(outcome, Some(result));
+        }
+        assert_eq!(
+            edit_insertion_outcome(Err::<InsertResult, _>("replace"), || Ok::<_, ()>(())),
+            Some(InsertResult::ClipboardOnly)
+        );
+        assert_eq!(
+            edit_insertion_outcome(Err::<InsertResult, _>("replace"), || Err("clipboard")),
+            None
+        );
+    }
+
+    #[test]
+    fn edit_persistence_warning_claims_completion_only_after_a_confirmed_paste() {
+        for insertion in [
+            InsertResult::ClipboardPaste,
+            InsertResult::ClipboardOnly,
+            InsertResult::PasteUnverified,
+        ] {
+            assert_eq!(edit_persistence_warning(insertion, false, false), None);
+            for (history_failed, metric_failed, kind) in [
+                (true, true, "history_metric_save_failed"),
+                (true, false, "history_save_failed"),
+                (false, true, "metric_save_failed"),
+            ] {
+                let (actual_kind, message) =
+                    edit_persistence_warning(insertion, history_failed, metric_failed).unwrap();
+                assert_eq!(actual_kind, kind);
+                if insertion == InsertResult::ClipboardPaste {
+                    assert!(message.starts_with("The edit was completed"), "{message}");
+                } else {
+                    assert!(!message.contains("completed"), "{message}");
+                    assert!(message.contains("remains on the clipboard"), "{message}");
+                }
+                assert_eq!(message.contains("history"), history_failed, "{message}");
+                assert_eq!(
+                    message.contains("usage metrics"),
+                    metric_failed,
+                    "{message}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn persistence_failures_choose_one_complete_warning() {
@@ -994,14 +1345,15 @@ mod tests {
         let translate = parse_shortcut("CommandOrControl+Shift+T").unwrap();
         let selected = parse_shortcut("CommandOrControl+Shift+Y").unwrap();
         let unavailable = parse_shortcut("CommandOrControl+Shift+U").unwrap();
-        let registered = vec![dictate, selected];
-        let unchanged = vec![dictate, unavailable, selected];
+        let edit = parse_shortcut("CommandOrControl+Shift+E").unwrap();
+        let registered = vec![dictate, selected, edit];
+        let unchanged = vec![dictate, unavailable, selected, edit];
         assert_eq!(
             hotkey_changes(&registered, &unchanged),
             (vec![], vec![unavailable])
         );
 
-        let repaired = vec![dictate, translate, selected];
+        let repaired = vec![dictate, translate, selected, edit];
         assert_eq!(
             hotkey_changes(&registered, &repaired),
             (vec![], vec![translate])
@@ -1230,14 +1582,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn immediate_stop_waits_for_translation_session_publication() {
+    async fn immediate_stop_waits_for_session_publication() {
         let live = Arc::new(tokio::sync::Mutex::new(None));
+        let edit = Arc::new(tokio::sync::Mutex::new(None));
         let translation_target = Arc::new(Mutex::new(None));
         let mut startup_publication = live.lock().await;
         let live_for_stop = Arc::clone(&live);
+        let edit_for_stop = Arc::clone(&edit);
         let target_for_stop = Arc::clone(&translation_target);
         let stopping = tokio::spawn(async move {
-            take_published_session(&live_for_stop, &target_for_stop)
+            take_published_sessions(&live_for_stop, &edit_for_stop, &target_for_stop)
                 .await
                 .unwrap()
         });
@@ -1247,8 +1601,9 @@ mod tests {
         *startup_publication = Some(());
         drop(startup_publication);
 
-        let (session, target) = stopping.await.unwrap();
+        let (session, edit_session, target) = stopping.await.unwrap();
         assert_eq!(session, Some(()));
+        assert_eq!(edit_session, None::<()>);
         assert_eq!(target.as_deref(), Some("ja"));
     }
 
@@ -1261,8 +1616,10 @@ mod tests {
         let target = Mutex::new(None);
         let audio_operation = audio.lock().await;
         let live = tokio::sync::Mutex::new(None);
+        let edit = tokio::sync::Mutex::new(None);
         let language = Mutex::new(None);
-        let cancellation = cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live);
+        let cancellation =
+            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit);
         tokio::pin!(cancellation);
 
         assert!(
@@ -1271,7 +1628,7 @@ mod tests {
                 .is_err()
         );
         assert!(
-            !cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live)
+            !cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit)
                 .await
                 .unwrap()
         );
@@ -1299,6 +1656,7 @@ mod tests {
             &audio,
             &target,
             &Mutex::new(None),
+            &tokio::sync::Mutex::new(None),
             &tokio::sync::Mutex::new(None)
         )
         .await
@@ -1318,6 +1676,7 @@ mod tests {
             &Mutex::new(None),
             &Mutex::new(None),
             &tokio::sync::Mutex::new(None),
+            &tokio::sync::Mutex::new(None),
         )
         .await
         .unwrap();
@@ -1333,10 +1692,11 @@ mod tests {
         let audio = test_audio(false);
         let target = Mutex::new(None);
         let live = tokio::sync::Mutex::new(None);
+        let edit = tokio::sync::Mutex::new(None);
         // Nothing to cancel: a target published by a concurrent start stays.
         let language = Mutex::new(Some("ja".to_string()));
         assert!(
-            !cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live)
+            !cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit)
                 .await
                 .unwrap()
         );
@@ -1347,7 +1707,7 @@ mod tests {
         lifecycle.mark_recording(id).unwrap();
         lifecycle.begin_processing().unwrap();
         assert!(
-            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live)
+            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit)
                 .await
                 .unwrap()
         );
@@ -1357,7 +1717,7 @@ mod tests {
         let id = lifecycle.begin_start(PipelineMode::Translate).unwrap();
         lifecycle.mark_recording(id).unwrap();
         assert!(
-            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live)
+            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit)
                 .await
                 .unwrap()
         );
@@ -1417,6 +1777,9 @@ pub(crate) async fn update_settings(
     }
     if settings.voice_translate_hotkey.trim().is_empty() {
         return Err("voice Translate hotkey cannot be empty".into());
+    }
+    if settings.speak_to_edit_hotkey.trim().is_empty() {
+        return Err("Speak to edit hotkey cannot be empty".into());
     }
     validate_translation_targets(&settings)?;
     if !(1..=3650).contains(&settings.history_retention_days) {
@@ -1564,7 +1927,7 @@ pub(crate) async fn update_settings(
         let previous_hotkeys = hotkey_bindings(&previous).unwrap_or_default();
         if has_new_hotkey_collision(&proposed_hotkeys, &previous_hotkeys) {
             return Err(
-                "recording, selected-text translation, and voice Translate hotkeys must differ"
+                "recording, selected-text translation, voice Translate, and Speak to edit hotkeys must differ"
                     .into(),
             );
         }

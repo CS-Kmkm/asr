@@ -15,6 +15,19 @@ fn safe<B: Backend>(
             .is_ok_and(|active| policy.permits_ime(active))
 }
 
+fn safe_after_injected_paste<B: Backend>(
+    backend: &B,
+    target: &TargetWindow,
+    activity: Option<(&InputMonitor, u64)>,
+    policy: SafetyPolicy,
+) -> bool {
+    activity.is_none_or(|(monitor, checkpoint)| monitor.unchanged_since_injected_paste(checkpoint))
+        && backend.validate_target(target).is_ok()
+        && backend
+            .ime_composition_active(target)
+            .is_ok_and(|active| policy.permits_ime(active))
+}
+
 fn copy_only<B: Backend>(backend: &B, text: &str) -> Result<InsertResult, InjectionError> {
     backend.clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)?;
     Ok(InsertResult::ClipboardOnly)
@@ -93,7 +106,7 @@ fn paste<B: Backend>(
         if attempt > 0 {
             backend.wait_for_target();
         }
-        if !safe(backend, target, activity, policy) {
+        if !safe_after_injected_paste(backend, target, activity, policy) {
             break;
         }
         if backend
@@ -613,6 +626,7 @@ mod tests {
         waits: Cell<usize>,
         change_clipboard_on_paste: bool,
         change_identity_on_paste: bool,
+        on_paste: Option<Box<dyn Fn()>>,
     }
 
     impl MockBackend {
@@ -641,6 +655,7 @@ mod tests {
                 waits: Cell::new(0),
                 change_clipboard_on_paste: false,
                 change_identity_on_paste: false,
+                on_paste: None,
             }
         }
         fn apply_pending(&self) {
@@ -732,6 +747,9 @@ mod tests {
             if self.settle_after == 0 {
                 self.apply_pending();
             }
+            if let Some(on_paste) = &self.on_paste {
+                on_paste();
+            }
             if self.change_clipboard_on_paste {
                 *self.clipboard.borrow_mut() = "new user copy".into();
                 self.sequence.set(self.sequence.get() + 1);
@@ -785,6 +803,159 @@ mod tests {
             after: " suffix".into(),
         };
         assert!(state.select_recent("").is_none());
+    }
+
+    fn selected_state() -> TargetText {
+        TargetText {
+            identity: vec![1],
+            before: "prefix ".into(),
+            selected: "original".into(),
+            after: " suffix".into(),
+        }
+    }
+
+    #[test]
+    fn unchanged_captured_selection_is_replaced_once() {
+        let backend = MockBackend::new();
+        *backend.text.borrow_mut() = selected_state();
+        let before = backend.text.borrow().clone();
+        let monitor = monitor();
+        let checkpoint = monitor.checkpoint().unwrap();
+
+        assert_eq!(
+            replace_selection(
+                &backend,
+                InjectionOptions::default(),
+                &target(),
+                &before,
+                "edited",
+                &monitor,
+                checkpoint,
+            )
+            .unwrap(),
+            InsertResult::ClipboardPaste
+        );
+        assert_eq!(backend.content(), "prefix edited suffix");
+        assert_eq!(
+            backend
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == "paste")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn changed_selection_context_falls_back_to_clipboard_without_target_edits() {
+        for change in [
+            "focus",
+            "selection",
+            "input",
+            "shortcut",
+            "ime_active",
+            "ime_unknown",
+        ] {
+            let backend = MockBackend::new();
+            *backend.text.borrow_mut() = selected_state();
+            let before = backend.text.borrow().clone();
+            let monitor = monitor();
+            let checkpoint = monitor.checkpoint().unwrap();
+            match change {
+                "focus" => backend.target_valid.set(false),
+                "selection" => backend.text.borrow_mut().selected.push('!'),
+                "input" => monitor.test_record_input(),
+                "shortcut" => monitor.test_set_shortcut_pending(true),
+                "ime_active" => backend.ime.set(Some(true)),
+                "ime_unknown" => backend.ime.set(None),
+                _ => unreachable!(),
+            }
+            let expected = backend.content();
+
+            assert_eq!(
+                replace_selection(
+                    &backend,
+                    InjectionOptions::default(),
+                    &target(),
+                    &before,
+                    "edited",
+                    &monitor,
+                    checkpoint,
+                )
+                .unwrap(),
+                InsertResult::ClipboardOnly,
+                "{change}"
+            );
+            assert_eq!(backend.content(), expected, "{change}");
+            assert_eq!(&*backend.clipboard.borrow(), "edited", "{change}");
+            assert!(!backend.calls.borrow().contains(&"paste"), "{change}");
+        }
+    }
+
+    #[test]
+    fn unconfirmed_selection_paste_is_not_retried_or_restored() {
+        let mut backend = MockBackend::new();
+        *backend.text.borrow_mut() = selected_state();
+        backend.settle_after = VERIFY_ATTEMPTS + 2;
+        let before = backend.text.borrow().clone();
+        let monitor = monitor();
+        let checkpoint = monitor.checkpoint().unwrap();
+
+        assert_eq!(
+            replace_selection(
+                &backend,
+                InjectionOptions::default(),
+                &target(),
+                &before,
+                "edited",
+                &monitor,
+                checkpoint,
+            )
+            .unwrap(),
+            InsertResult::PasteUnverified
+        );
+        assert_eq!(&*backend.clipboard.borrow(), "edited");
+        assert_eq!(backend.content(), "prefix original suffix");
+        assert_eq!(
+            backend
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == "paste")
+                .count(),
+            1
+        );
+        assert!(!backend.calls.borrow().contains(&"restore"));
+    }
+
+    #[test]
+    fn injected_ctrl_during_paste_does_not_invalidate_confirmed_selection_edit() {
+        let mut backend = MockBackend::new();
+        *backend.text.borrow_mut() = selected_state();
+        let before = backend.text.borrow().clone();
+        let monitor = std::sync::Arc::new(monitor());
+        let checkpoint = monitor.checkpoint().unwrap();
+        let during_paste = std::sync::Arc::clone(&monitor);
+        backend.on_paste = Some(Box::new(move || {
+            during_paste.test_set_async_modifier_pending(true);
+        }));
+
+        assert_eq!(
+            replace_selection(
+                &backend,
+                InjectionOptions::default(),
+                &target(),
+                &before,
+                "edited",
+                &monitor,
+                checkpoint,
+            )
+            .unwrap(),
+            InsertResult::ClipboardPaste
+        );
+        assert_eq!(backend.content(), "prefix edited suffix");
+        assert!(backend.calls.borrow().contains(&"restore"));
     }
 
     #[test]

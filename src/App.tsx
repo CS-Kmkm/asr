@@ -99,7 +99,7 @@ interface CorrectionPreview {
 }
 
 interface VoiceModeEvent {
-  mode: "dictate" | "translate";
+  mode: "dictate" | "translate" | "edit";
   targetLanguage: string | null;
 }
 
@@ -131,6 +131,7 @@ const WARNING_STATUS_KINDS = new Set([
   "gpu_unavailable",
   "history_and_metric_save_failed",
   "history_save_failed",
+  "history_metric_save_failed",
   "hotkey_unavailable",
   "metric_save_failed",
   "paste_unverified",
@@ -224,7 +225,11 @@ function RecordingOverlay() {
       <div className="recording-overlay recording" role="status" aria-label={t("Recording in progress")}>
         <span className="recording-live-dot" aria-hidden="true" />
         <span className="recording-overlay-label">
-          {voiceMode.mode === "translate" ? t("Translating") : t("Listening")}
+          {voiceMode.mode === "translate"
+            ? t("Translating")
+            : voiceMode.mode === "edit"
+              ? t("Editing")
+              : t("Listening")}
         </span>
         <span className="recording-wave" aria-hidden="true">
           {waveform.map((amplitude, index) => (
@@ -254,8 +259,9 @@ function RecordingOverlay() {
   if (phase !== "processing" && phase !== "injecting") return null;
 
   const compactPreview = compactOverlayPreview(preview?.text ?? "");
-  const label =
-    phase === "injecting"
+  const label = voiceMode.mode === "edit"
+    ? t("Editing")
+    : phase === "injecting"
       ? message?.startsWith("Finalizing")
         ? t("Updating text")
         : t("Inserting")
@@ -482,7 +488,11 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     try {
       if (state.phase === "recording") {
         await stopRecording();
-        setHistory(await listHistory());
+        try {
+          setHistory(await listHistory());
+        } catch {
+          showNotice(t("Recording completed, but history could not be refreshed."), "warning");
+        }
       } else {
         await startRecording();
       }

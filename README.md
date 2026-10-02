@@ -24,6 +24,16 @@ hotkey is `Ctrl+Shift+Y`, the older action keeps the chord: recording, then
 selected-text translation, then voice Translate. The overlapped action stays off
 until it is assigned a different hotkey, and the main window names it.
 
+`Ctrl+Shift+E` starts **Speak to edit** for the text selected at that moment.
+Speak an instruction such as “make this concise” or “translate this to
+Japanese,” then press the shortcut again. The provider receives the immutable
+selected text and spoken instruction as separate untrusted fields and may only
+return replacement text. The replacement keeps the selection's leading and
+trailing spaces and line breaks. Deleting the selection is not an Edit result:
+an empty provider response is rejected and the selection is left unchanged. If
+focus, selection, user input, shortcut release, or IME safety checks fail, the
+original text is left alone and the generated edit remains on the clipboard.
+
 Audio is deleted after processing by default. Transcript history is optional and
 stored in the application SQLite database. Logs and status events must never
 contain transcript, audio, window-title, or clipboard content.

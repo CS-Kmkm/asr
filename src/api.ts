@@ -20,6 +20,7 @@ export const defaultSettings: Settings = {
   translationHotkey: "Ctrl+Shift+T",
   translationInstruction: "",
   voiceTranslateHotkey: "Ctrl+Shift+Y",
+  speakToEditHotkey: "Ctrl+Shift+E",
   translationTargetLanguages: ["en", "ja"],
   translationTargetLanguage: "en",
   microphoneId: null,

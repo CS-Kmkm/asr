@@ -55,7 +55,15 @@ export function HistoryPage({
                     : item.mode}{item.targetLanguage ? ` · ${item.targetLanguage}` : ""}
                 </span>
               </div>
-              <HistoryText text={item.transcriptText} onCopy={onCopyItem} />
+              {item.sourceText && (
+                <HistoryText text={item.sourceText} onCopy={onCopyItem} label={t("Selected text")} />
+              )}
+              {item.instructionText && (
+                <HistoryText text={item.instructionText} onCopy={onCopyItem} label={t("Spoken instruction")} />
+              )}
+              {!item.sourceText && !item.instructionText && (
+                <HistoryText text={item.transcriptText} onCopy={onCopyItem} />
+              )}
               {item.processedText && (
                 <HistoryText
                   text={item.processedText}
@@ -74,10 +82,12 @@ export function HistoryPage({
 function HistoryText({
   text,
   corrected = false,
+  label,
   onCopy,
 }: {
   text: string;
   corrected?: boolean;
+  label?: string;
   onCopy: (text: string) => void;
 }) {
   const { t } = useI18n();
@@ -92,7 +102,7 @@ function HistoryText({
         if (event.key === "Enter") onCopy(text);
       }}
     >
-      {text}
+      {label && <strong>{label}: </strong>}{text}
     </div>
   );
 }

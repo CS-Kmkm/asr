@@ -29,7 +29,9 @@ use audio::{
     AudioCapture, AudioDevice, AudioEnhancementConfig, CaptureConfig, CpalAudioCapture,
     NoiseSuppressionLevel,
 };
-use injection::{InjectionOptions, InsertResult, SystemTextInjector, TargetWindow, TextInjector};
+use injection::{
+    InjectionOptions, InsertResult, SelectedText, SystemTextInjector, TargetWindow, TextInjector,
+};
 use input_monitor::InputMonitor;
 use state::{AppState, PipelineLifecycle, PipelineMode, PipelinePhase};
 use storage::Storage;
@@ -87,6 +89,7 @@ pub(crate) fn model_identity(settings: &Settings) -> (Option<String>, String) {
 pub(crate) struct Services {
     audio: tokio::sync::Mutex<Box<dyn AudioCapture>>,
     live: tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
+    edit: tokio::sync::Mutex<Option<EditSession>>,
     target: Mutex<Option<TargetWindow>>,
     transcriber: Arc<dyn Transcriber>,
     input_monitor: Arc<InputMonitor>,
@@ -110,6 +113,7 @@ enum HotkeyAction {
     Dictate,
     SelectedTextTranslate,
     VoiceTranslate,
+    Edit,
 }
 
 impl HotkeyAction {
@@ -118,6 +122,7 @@ impl HotkeyAction {
             Self::Dictate => "The recording hotkey could not be registered; another app may be using it. Change it in Settings.",
             Self::SelectedTextTranslate => "The selected-text translation hotkey could not be registered; another app may be using it. Change it in Settings.",
             Self::VoiceTranslate => "The voice Translate hotkey could not be registered; another app may be using it. Change it in Settings.",
+            Self::Edit => "The Speak to edit hotkey could not be registered; another app may be using it. Change it in Settings.",
         }
     }
 
@@ -126,6 +131,7 @@ impl HotkeyAction {
             (Self::SelectedTextTranslate, Self::Dictate) => "The selected-text translation hotkey matches the recording hotkey, so selected-text translation is off until you change it in Settings.",
             (Self::VoiceTranslate, Self::Dictate) => "The voice Translate hotkey matches the recording hotkey, so voice Translate is off until you change it in Settings.",
             (Self::VoiceTranslate, Self::SelectedTextTranslate) => "The voice Translate hotkey matches the selected-text translation hotkey, so voice Translate is off until you change it in Settings.",
+            (Self::Edit, _) => "Speak to edit is disabled because its saved hotkey is already used by another action. Change the overlapping hotkeys in Settings.",
             _ => "Some saved hotkeys overlap. Change them in Settings to enable each action independently.",
         }
     }
@@ -144,6 +150,10 @@ fn hotkey_bindings(settings: &Settings) -> Result<Vec<HotkeyBinding>, String> {
         (
             HotkeyAction::VoiceTranslate,
             parse_shortcut(&settings.voice_translate_hotkey)?,
+        ),
+        (
+            HotkeyAction::Edit,
+            parse_shortcut(&settings.speak_to_edit_hotkey)?,
         ),
     ])
 }
@@ -225,6 +235,7 @@ impl Services {
         Self {
             audio: tokio::sync::Mutex::new(Box::new(CpalAudioCapture::new())),
             live: tokio::sync::Mutex::new(None),
+            edit: tokio::sync::Mutex::new(None),
             target: Mutex::new(None),
             transcriber: Arc::new(JsonlTranscriber::new(
                 worker_command_for_settings(settings),
@@ -269,6 +280,7 @@ impl Services {
         if let Some(task) = self.live.lock().await.take() {
             let _ = task.finish().await;
         }
+        self.edit.lock().await.take();
         if let Ok(mut target) = self.target.lock() {
             target.take();
         }
@@ -277,6 +289,43 @@ impl Services {
         }
         self.input_monitor.shutdown();
         let _ = self.transcriber.shutdown().await;
+    }
+}
+
+pub(crate) struct EditSession {
+    selection: SelectedText,
+    injector: SystemTextInjector,
+    monitor: Arc<InputMonitor>,
+    checkpoint: u64,
+}
+
+impl EditSession {
+    fn new(settings: &Settings, from_shortcut: bool) -> Result<Self, String> {
+        let injector = SystemTextInjector::new(InjectionOptions {
+            restore_clipboard: settings.clipboard_restore,
+        });
+        let selection = injector
+            .capture_selection()
+            .map_err(|_| "Select text in a supported foreground edit control.".to_string())?;
+        let monitor = Arc::new(InputMonitor::default());
+        if !monitor.start_for_recording(&settings.speak_to_edit_hotkey, from_shortcut) {
+            return Err("Speak to edit could not monitor the original selection safely.".into());
+        }
+        let checkpoint = monitor
+            .checkpoint()
+            .ok_or("Speak to edit could not monitor the original selection safely.")?;
+        Ok(Self {
+            selection,
+            injector,
+            monitor,
+            checkpoint,
+        })
+    }
+}
+
+impl Drop for EditSession {
+    fn drop(&mut self) {
+        self.monitor.shutdown();
     }
 }
 
@@ -428,13 +477,14 @@ fn parse_shortcut(value: &str) -> Result<Shortcut, String> {
 #[cfg(test)]
 mod shortcut_startup_tests {
     use super::*;
-    use HotkeyAction::{Dictate, SelectedTextTranslate, VoiceTranslate};
+    use HotkeyAction::{Dictate, Edit, SelectedTextTranslate, VoiceTranslate};
 
-    fn bindings(dictate: &str, selected: &str, voice: &str) -> Vec<HotkeyBinding> {
+    fn bindings(dictate: &str, selected: &str, voice: &str, edit: &str) -> Vec<HotkeyBinding> {
         let mut settings = Settings::default();
         settings.hotkey = dictate.into();
         settings.translation_hotkey = selected.into();
         settings.voice_translate_hotkey = voice.into();
+        settings.speak_to_edit_hotkey = edit.into();
         hotkey_bindings(&settings).unwrap()
     }
 
@@ -450,7 +500,14 @@ mod shortcut_startup_tests {
         let assignment = assign_hotkeys(&bindings);
         assert_eq!(
             assignment.active,
-            vec![(Dictate, recording), (SelectedTextTranslate, shared)]
+            vec![
+                (Dictate, recording),
+                (SelectedTextTranslate, shared),
+                (
+                    Edit,
+                    parse_shortcut(&settings.speak_to_edit_hotkey).unwrap()
+                )
+            ]
         );
         assert_eq!(
             assignment.collisions,
@@ -465,20 +522,34 @@ mod shortcut_startup_tests {
 
     #[test]
     fn dictate_keeps_a_chord_shared_with_every_other_action() {
-        let bindings = bindings("Ctrl+Shift+Space", "Ctrl+Shift+Space", "Ctrl+Shift+Space");
+        let bindings = bindings(
+            "Ctrl+Shift+Space",
+            "Ctrl+Shift+Space",
+            "Ctrl+Shift+Space",
+            "Ctrl+Shift+Space",
+        );
         let shared = parse_shortcut("Ctrl+Shift+Space").unwrap();
         let assignment = assign_hotkeys(&bindings);
         assert_eq!(assignment.active, vec![(Dictate, shared)]);
         assert_eq!(
             assignment.collisions,
-            vec![(SelectedTextTranslate, Dictate), (VoiceTranslate, Dictate)]
+            vec![
+                (SelectedTextTranslate, Dictate),
+                (VoiceTranslate, Dictate),
+                (Edit, Dictate)
+            ]
         );
         assert_eq!(dispatched_action(&bindings, shared), Some(Dictate));
     }
 
     #[test]
     fn distinct_and_unassigned_chords_dispatch_their_own_action() {
-        let bindings = bindings("Ctrl+Shift+Space", "Ctrl+Shift+Space", "Ctrl+Shift+Y");
+        let bindings = bindings(
+            "Ctrl+Shift+Space",
+            "Ctrl+Shift+Space",
+            "Ctrl+Shift+Y",
+            "Ctrl+Shift+E",
+        );
         assert_eq!(
             assign_hotkeys(&bindings).collisions,
             vec![(SelectedTextTranslate, Dictate)]
@@ -495,13 +566,28 @@ mod shortcut_startup_tests {
 
     #[test]
     fn existing_collision_survives_unrelated_save_but_new_collision_is_rejected() {
-        let existing = bindings("Ctrl+Shift+Space", "Ctrl+Shift+T", "Ctrl+Shift+T");
+        let existing = bindings(
+            "Ctrl+Shift+Space",
+            "Ctrl+Shift+T",
+            "Ctrl+Shift+T",
+            "Ctrl+Shift+E",
+        );
         assert!(!has_new_hotkey_collision(&existing, &existing));
 
-        let newly_colliding = bindings("Ctrl+Shift+Space", "Ctrl+Shift+T", "Ctrl+Shift+Space");
+        let newly_colliding = bindings(
+            "Ctrl+Shift+Space",
+            "Ctrl+Shift+T",
+            "Ctrl+Shift+Space",
+            "Ctrl+Shift+E",
+        );
         assert!(has_new_hotkey_collision(&newly_colliding, &existing));
 
-        let moved_together = bindings("Ctrl+Shift+Space", "Ctrl+Shift+Y", "Ctrl+Shift+Y");
+        let moved_together = bindings(
+            "Ctrl+Shift+Space",
+            "Ctrl+Shift+Y",
+            "Ctrl+Shift+Y",
+            "Ctrl+Shift+E",
+        );
         assert!(has_new_hotkey_collision(&moved_together, &existing));
     }
 
@@ -524,6 +610,37 @@ mod shortcut_startup_tests {
         ));
         assert!(messages[1].contains("voice Translate is off"));
         assert!(messages[2].starts_with("The recording hotkey could not be registered"));
+    }
+
+    #[test]
+    fn speak_to_edit_yields_a_shared_chord_to_every_older_action() {
+        for owner in [Dictate, SelectedTextTranslate, VoiceTranslate] {
+            let mut settings = Settings::default();
+            let edit = settings.speak_to_edit_hotkey.clone();
+            match owner {
+                Dictate => settings.hotkey = edit,
+                SelectedTextTranslate => settings.translation_hotkey = edit,
+                VoiceTranslate => settings.voice_translate_hotkey = edit,
+                Edit => unreachable!(),
+            }
+            let bindings = hotkey_bindings(&settings).unwrap();
+            assert!(assign_hotkeys(&bindings)
+                .collisions
+                .contains(&(Edit, owner)));
+            assert_eq!(
+                dispatched_action(
+                    &bindings,
+                    parse_shortcut(&settings.speak_to_edit_hotkey).unwrap()
+                ),
+                Some(owner)
+            );
+            assert!(HotkeyIssues {
+                collisions: vec![(Edit, owner)],
+                unregistered: vec![]
+            }
+            .messages()[0]
+                .starts_with("Speak to edit is disabled"));
+        }
     }
 }
 
@@ -766,6 +883,16 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode) {
                 )
                 .await
             }
+            PipelineMode::Edit => {
+                commands::start_speak_to_edit_with_origin(
+                    app.clone(),
+                    app.state::<Services>(),
+                    app.state::<AppState>(),
+                    app.state::<Storage>(),
+                    true,
+                )
+                .await
+            }
         },
         PipelinePhase::Starting | PipelinePhase::Processing => Ok(()),
     };
@@ -884,6 +1011,9 @@ fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
         }
         Some(HotkeyAction::VoiceTranslate) => {
             tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Translate));
+        }
+        Some(HotkeyAction::Edit) => {
+            tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Edit));
         }
         None => {}
     }
@@ -1027,6 +1157,7 @@ pub fn run() {
             commands::list_audio_devices,
             commands::start_recording,
             commands::start_voice_translation,
+            commands::start_speak_to_edit,
             commands::stop_recording,
             commands::cancel_recording,
             commands::cycle_voice_translation_target,
