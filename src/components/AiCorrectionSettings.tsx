@@ -55,7 +55,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         <div>
       <h2>{t("AI text correction")}</h2>
           <p className="muted">
-            {t("When enabled, the transcript is sent to the selected correction provider after local transcription. Audio is never sent by this feature.")}
+            {t("Dictation sends text to the selected correction provider only when AI correction is on. Voice and selected-text Translate send text whenever used. Correction and translation do not send audio, but the selected ASR backend may.")}
           </p>
         </div>
         <div className="ai-correction-master">
@@ -72,7 +72,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
       <p className="ai-correction-master-detail">
         {settings.textCorrectionEnabled
           ? t("AI correction is applied before text is inserted. If the API fails, the original transcript is used.")
-          : t("AI correction requests are disabled. You can configure the options below before enabling it.")}
+          : t("AI correction requests are disabled. Translate still uses the selected provider when invoked.")}
       </p>
 
       <SettingRow

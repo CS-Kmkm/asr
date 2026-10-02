@@ -81,6 +81,22 @@ button { color: inherit; }
   background: var(--accent);
   transition: height 80ms linear, opacity 80ms linear;
 }
+.translation-target-button {
+  border: 1px solid var(--accent-border);
+  border-radius: 999px;
+  padding: 3px 8px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.translation-target-button:hover { background: #dce7ff; }
+.translation-target-settings { min-width: 300px; display: grid; gap: 8px; }
+.translation-target-list { margin: 0; padding: 0; display: grid; gap: 6px; list-style: none; }
+.translation-target-list li { display: grid; grid-template-columns: 1fr auto auto auto; align-items: center; gap: 5px; }
+.translation-target-list button, .translation-target-add button { padding: 5px 8px; }
+.translation-target-add { display: grid; grid-template-columns: 1fr auto; gap: 6px; }
 .recording-overlay.processing {
   justify-content: flex-start;
   gap: 10px;
@@ -227,7 +243,8 @@ textarea { width: min(420px, 42vw); resize: vertical; line-height: 1.45; }
 .empty-icon { color: var(--accent); font-size: 24px; letter-spacing: 6px; margin-bottom: 12px; }
 .history-list { display: grid; margin-top: 10px; }
 .history-item { position: relative; padding: 27px 4px 15px; border-bottom: 1px solid var(--border); }
-.history-item time { position: absolute; top: 10px; right: 4px; color: var(--text-subtle); font-size: 10px; line-height: 1; }
+.history-meta { position: absolute; top: 10px; right: 4px; display: flex; gap: 8px; color: var(--text-subtle); font-size: 10px; line-height: 1; }
+.history-mode { color: var(--accent-strong); font-weight: 700; }
 .history-text { padding: 3px 5px; border-radius: 5px; line-height: 1.45; cursor: copy; white-space: pre-wrap; transition: background .14s ease; }
 .history-text:hover, .history-text:focus-visible { background: var(--accent-soft); }
 .history-text.api-corrected { margin-top: 6px; padding: 8px 9px; background: linear-gradient(90deg, var(--success-soft), transparent 82%); color: var(--success); }

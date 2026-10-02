@@ -7,6 +7,7 @@ use crate::types::AppPhase;
 
 const WINDOW_LABEL: &str = "recording-overlay";
 const RECORDING_WIDTH: f64 = 172.0;
+const TRANSLATION_WIDTH: f64 = 286.0;
 const RECORDING_HEIGHT: f64 = 48.0;
 const BOTTOM_MARGIN: f64 = 24.0;
 
@@ -27,8 +28,8 @@ pub(crate) fn create(app: &AppHandle) -> tauri::Result<()> {
         .visible(false)
         .build()?;
 
-    // The indicator is informational and must never intercept clicks intended
-    // for the app underneath it.
+    // Dictate mode remains click-through. Voice Translate temporarily enables
+    // pointer events for its target-language control without activating this window.
     window.set_ignore_cursor_events(true)?;
     position_on_primary_monitor(&window)
 }
@@ -52,6 +53,19 @@ pub(crate) fn set_phase(app: &AppHandle, phase: &AppPhase) {
         let _ = window.show();
     } else {
         let _ = window.hide();
+    }
+}
+
+pub(crate) fn set_interactive(app: &AppHandle, interactive: bool) {
+    if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
+        let _ = window.set_ignore_cursor_events(!interactive);
+        let width = if interactive {
+            TRANSLATION_WIDTH
+        } else {
+            RECORDING_WIDTH
+        };
+        let _ = window.set_size(LogicalSize::new(width, RECORDING_HEIGHT));
+        let _ = position_on_primary_monitor(&window);
     }
 }
 

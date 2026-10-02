@@ -31,6 +31,12 @@ pub struct Settings {
     pub translation_hotkey: String,
     #[serde(default)]
     pub translation_instruction: String,
+    #[serde(default = "default_voice_translate_hotkey")]
+    pub voice_translate_hotkey: String,
+    #[serde(default = "default_translation_target_languages")]
+    pub translation_target_languages: Vec<String>,
+    #[serde(default = "default_translation_target_language")]
+    pub translation_target_language: String,
     pub microphone_id: Option<String>,
     pub history_enabled: bool,
     pub history_retention_days: u32,
@@ -98,6 +104,8 @@ pub struct CustomModel {
 pub const ASR_BACKENDS: [&str; 4] = ["vibevoice", "faster-whisper", "openai-compatible", "mock"];
 pub const CORRECTION_PROVIDERS: [&str; 3] = ["openai", "gemini", "local"];
 pub const OPENAI_REASONING_EFFORTS: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];
+pub const TRANSLATION_TARGET_LANGUAGES: [&str; 8] =
+    ["en", "ja", "zh", "es", "fr", "pt", "de", "ko"];
 
 fn default_asr_backend() -> String {
     "faster-whisper".into()
@@ -167,6 +175,18 @@ fn default_translation_hotkey() -> String {
     "Ctrl+Shift+T".into()
 }
 
+fn default_voice_translate_hotkey() -> String {
+    "Ctrl+Shift+Y".into()
+}
+
+fn default_translation_target_languages() -> Vec<String> {
+    vec!["en".into(), "ja".into()]
+}
+
+fn default_translation_target_language() -> String {
+    "en".into()
+}
+
 fn default_enabled_correction_feature() -> bool {
     true
 }
@@ -187,6 +207,9 @@ impl Default for Settings {
             hotkey: "Ctrl+Shift+Space".into(),
             translation_hotkey: default_translation_hotkey(),
             translation_instruction: String::new(),
+            voice_translate_hotkey: default_voice_translate_hotkey(),
+            translation_target_languages: default_translation_target_languages(),
+            translation_target_language: default_translation_target_language(),
             microphone_id: None,
             history_enabled: true,
             history_retention_days: 30,
@@ -238,6 +261,7 @@ pub struct HistoryItem {
     pub mode: String,
     pub asr_provider: String,
     pub llm_provider: Option<String>,
+    pub target_language: Option<String>,
     pub app_category: Option<String>,
     pub duration_ms: Option<i64>,
     pub latency_ms: Option<i64>,
@@ -251,6 +275,7 @@ pub struct NewHistoryItem<'a> {
     pub mode: &'a str,
     pub asr_provider: &'a str,
     pub llm_provider: Option<&'a str>,
+    pub target_language: Option<&'a str>,
     pub app_category: Option<&'a str>,
     pub duration_ms: Option<i64>,
     pub latency_ms: Option<i64>,
@@ -364,6 +389,9 @@ mod tests {
         assert_eq!(settings.model_quantization, "4bit");
         assert_eq!(settings.api_base_url, "https://api.openai.com/v1");
         assert_eq!(settings.api_key_env_var, "OPENAI_API_KEY");
+        assert_eq!(settings.voice_translate_hotkey, "Ctrl+Shift+Y");
+        assert_eq!(settings.translation_target_languages, ["en", "ja"]);
+        assert_eq!(settings.translation_target_language, "en");
         assert!(!settings.text_correction_enabled);
         assert_eq!(settings.correction_provider, "openai");
         assert_eq!(settings.openai_correction_model, "gpt-5.6-luna");

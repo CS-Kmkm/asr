@@ -18,6 +18,53 @@ fn capture_config(settings: &Settings) -> CaptureConfig {
     }
 }
 
+fn cancellation_copy(mode: PipelineMode) -> (&'static str, &'static str) {
+    match mode {
+        PipelineMode::Dictate => ("Dictation cancelled.", "dictation was cancelled"),
+        PipelineMode::Translate => ("Translation cancelled.", "translation was cancelled"),
+    }
+}
+
+async fn take_published_session<T>(
+    live: &tokio::sync::Mutex<Option<T>>,
+    translation_target: &Mutex<Option<String>>,
+) -> Result<(Option<T>, Option<String>), String> {
+    // Startup holds `live` while it publishes both the target language and the
+    // session. Waiting for this lock prevents an immediate stop from observing
+    // the lifecycle's Recording phase before that publication is complete.
+    let live_task = live.lock().await.take();
+    let target_language = translation_target
+        .lock()
+        .map_err(|_| "translation target service is unavailable".to_string())?
+        .take();
+    Ok((live_task, target_language))
+}
+
+fn validate_translation_targets(settings: &Settings) -> Result<(), String> {
+    if settings.translation_target_languages.is_empty()
+        || settings.translation_target_languages.len() > types::TRANSLATION_TARGET_LANGUAGES.len()
+    {
+        return Err("one to eight translation target languages are required".into());
+    }
+    for (index, language) in settings.translation_target_languages.iter().enumerate() {
+        if !types::TRANSLATION_TARGET_LANGUAGES.contains(&language.as_str()) {
+            return Err(format!(
+                "unsupported translation target language: {language}"
+            ));
+        }
+        if settings.translation_target_languages[..index].contains(language) {
+            return Err("translation target languages must be unique".into());
+        }
+    }
+    if !settings
+        .translation_target_languages
+        .contains(&settings.translation_target_language)
+    {
+        return Err("the current translation target must be in the configured list".into());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub(crate) fn get_app_state(state: State<'_, AppState>) -> AppStateSnapshot {
     state.snapshot()
@@ -41,6 +88,16 @@ pub(crate) async fn start_recording(
     start_recording_with_origin(app, services, state, storage, false).await
 }
 
+#[tauri::command]
+pub(crate) async fn start_voice_translation(
+    app: AppHandle,
+    services: State<'_, Services>,
+    state: State<'_, AppState>,
+    storage: State<'_, Storage>,
+) -> Result<(), String> {
+    start_voice_translation_with_origin(app, services, state, storage, false).await
+}
+
 pub(crate) async fn start_recording_with_origin(
     app: AppHandle,
     services: State<'_, Services>,
@@ -48,22 +105,76 @@ pub(crate) async fn start_recording_with_origin(
     storage: State<'_, Storage>,
     from_shortcut: bool,
 ) -> Result<(), String> {
-    let operation_id = services.lifecycle.begin_start()?;
+    start_recording_mode(
+        app,
+        services,
+        state,
+        storage,
+        from_shortcut,
+        PipelineMode::Dictate,
+    )
+    .await
+}
+
+pub(crate) async fn start_voice_translation_with_origin(
+    app: AppHandle,
+    services: State<'_, Services>,
+    state: State<'_, AppState>,
+    storage: State<'_, Storage>,
+    from_shortcut: bool,
+) -> Result<(), String> {
+    start_recording_mode(
+        app,
+        services,
+        state,
+        storage,
+        from_shortcut,
+        PipelineMode::Translate,
+    )
+    .await
+}
+
+async fn start_recording_mode(
+    app: AppHandle,
+    services: State<'_, Services>,
+    state: State<'_, AppState>,
+    storage: State<'_, Storage>,
+    from_shortcut: bool,
+    mode: PipelineMode,
+) -> Result<(), String> {
+    let (cancel_message, cancel_error) = cancellation_copy(mode);
+    if services.translation_active.load(Ordering::Acquire) {
+        return Err("selected-text translation is already active".into());
+    }
+    let operation_id = services.lifecycle.begin_start(mode)?;
     let guard = PipelineGuard {
         lifecycle: &services.lifecycle,
         id: operation_id,
     };
+    if services.translation_active.load(Ordering::Acquire) {
+        return Err("selected-text translation is already active".into());
+    }
     let settings = storage.get_settings().map_err(command_error)?;
     ensure_model_loaded(&app, &services, &settings).await?;
     if services.lifecycle.is_cancelled(operation_id) {
-        emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
-        return Err("dictation was cancelled".into());
+        emit_state(&app, &state, AppPhase::Idle, cancel_message);
+        return Err(cancel_error.into());
     }
     let target = SystemTextInjector::default()
         .capture_target()
         .map_err(command_error)?;
     let mut live_slot = services.live.lock().await;
-    let draft = live_dictation::LiveDraft::new(target.clone(), &settings, from_shortcut);
+    let active_hotkey = match mode {
+        PipelineMode::Dictate => settings.hotkey.as_str(),
+        PipelineMode::Translate => settings.voice_translate_hotkey.as_str(),
+    };
+    let draft = live_dictation::LiveDraft::new(
+        target.clone(),
+        &settings,
+        active_hotkey,
+        from_shortcut,
+        mode == PipelineMode::Translate,
+    );
     let cancel = services.lifecycle.cancellation(operation_id)?;
     let dictionary_terms = storage.dictionary_prompt_terms().unwrap_or_default();
     let prompt = (!dictionary_terms.is_empty()).then(|| dictionary_terms.join("\n"));
@@ -87,13 +198,32 @@ pub(crate) async fn start_recording_with_origin(
         .target
         .lock()
         .map_err(|_| "target service is unavailable".to_string())? = Some(target);
+    let target_language =
+        (mode == PipelineMode::Translate).then(|| settings.translation_target_language.clone());
+    *services
+        .voice_translation_target
+        .lock()
+        .map_err(|_| "translation target service is unavailable".to_string())? =
+        target_language.clone();
+    let _ = app.emit(
+        "voice-mode",
+        serde_json::json!({
+            "mode": if mode == PipelineMode::Translate { "translate" } else { "dictate" },
+            "targetLanguage": target_language,
+        }),
+    );
     state.clear_result();
     emit_state(
         &app,
         &state,
         AppPhase::Recording,
-        "Recording from the selected microphone.",
+        if mode == PipelineMode::Translate {
+            "Recording speech to translate."
+        } else {
+            "Recording from the selected microphone."
+        },
     );
+    recording_overlay::set_interactive(&app, mode == PipelineMode::Translate);
     *live_slot = Some(live_dictation::start(
         app.clone(),
         operation_id,
@@ -133,7 +263,7 @@ pub(crate) async fn stop_recording(
     state: State<'_, AppState>,
     storage: State<'_, Storage>,
 ) -> Result<RecordingResult, String> {
-    let (operation_id, cancel) = match services.lifecycle.begin_processing() {
+    let (operation_id, mode, cancel) = match services.lifecycle.begin_processing() {
         Ok(operation) => operation,
         Err(error) => {
             if error == "no recording is active" {
@@ -151,6 +281,8 @@ pub(crate) async fn stop_recording(
         lifecycle: &services.lifecycle,
         id: operation_id,
     };
+    let (cancel_message, cancel_error) = cancellation_copy(mode);
+    recording_overlay::set_interactive(&app, false);
     // Publish the lifecycle transition immediately. Previously the UI stayed
     // in Recording until audio finalization completed; if finalization failed
     // (for example for a short or silent take), the lifecycle returned to Idle
@@ -162,7 +294,8 @@ pub(crate) async fn stop_recording(
         "Stopping recording and preparing audio.",
     );
     let started = Instant::now();
-    let live_task = services.live.lock().await.take();
+    let (live_task, translation_target) =
+        take_published_session(&services.live, &services.voice_translation_target).await?;
     let mut audio = services.audio.lock().await;
     let artifact_result = audio.stop().await;
     // `stop` closes the input stream. Do not re-arm it while transcription is
@@ -194,8 +327,8 @@ pub(crate) async fn stop_recording(
         .expect("successful audio has cleanup ownership");
     artifact_cleanup.retain = !settings.delete_audio_after_processing;
     if services.lifecycle.is_cancelled(operation_id) {
-        emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
-        return Err("dictation was cancelled".into());
+        emit_state(&app, &state, AppPhase::Idle, cancel_message);
+        return Err(cancel_error.into());
     }
     emit_state(&app, &state, AppPhase::Processing, "Transcribing locally.");
 
@@ -217,8 +350,8 @@ pub(crate) async fn stop_recording(
                     "Temporary audio cleanup failed.",
                 );
             }
-            emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
-            return Err("dictation was cancelled".into());
+            emit_state(&app, &state, AppPhase::Idle, cancel_message);
+            return Err(cancel_error.into());
         }
         Err(error) => {
             let _ = storage.add_metric(
@@ -252,8 +385,8 @@ pub(crate) async fn stop_recording(
         );
     }
     if services.lifecycle.is_cancelled(operation_id) {
-        emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
-        return Err("dictation was cancelled".into());
+        emit_state(&app, &state, AppPhase::Idle, cancel_message);
+        return Err(cancel_error.into());
     }
 
     services
@@ -265,13 +398,14 @@ pub(crate) async fn stop_recording(
     let mut processed_text = None;
     let mut llm_provider = None;
     let mut correction_failed = false;
+    let mut translation_failed = false;
     let mut correction_output_limited = false;
     let _ = app.emit("app-state", state.publish_result(transcript.text.clone()));
     // Full-recording recognition reconciles the last live hypothesis before AI correction.
     draft.monitor.wait_for_shortcut_release().await;
     if services.lifecycle.is_cancelled(operation_id) {
-        emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
-        return Err("dictation was cancelled".into());
+        emit_state(&app, &state, AppPhase::Idle, cancel_message);
+        return Err(cancel_error.into());
     }
     if let Err(error) = draft.update(&transcript.text) {
         emit_status(
@@ -281,7 +415,79 @@ pub(crate) async fn stop_recording(
         );
     }
     let streamed_into_target = draft.pasted;
-    if settings.text_correction_enabled {
+    if mode == PipelineMode::Translate {
+        let Some(target_language) = translation_target.as_deref() else {
+            // Startup publishes the target with the session. If it is missing,
+            // keep the speech the same way a translation failure does.
+            let copied = draft.injector.copy_to_clipboard(&transcript.text).is_ok();
+            emit_correction_preview(&app, &transcript.text, "fallback");
+            emit_state(
+                &app,
+                &state,
+                AppPhase::Error,
+                if copied {
+                    "The translation target language was unavailable; the raw transcript remains on the clipboard."
+                } else {
+                    "The translation target language was unavailable and the clipboard could not be updated; the raw transcript remains available in this app."
+                },
+            );
+            return Err("translation target language is unavailable".into());
+        };
+        emit_correction_preview(&app, &transcript.text, "draft");
+        emit_state(
+            &app,
+            &state,
+            AppPhase::Processing,
+            "Translating speech to the selected language.",
+        );
+        let translation_started = Instant::now();
+        llm_provider = Some(settings.correction_provider.clone());
+        match correction::translate_transcript(
+            &settings,
+            &transcript.text,
+            target_language,
+            correction_cancel,
+            |delta| emit_correction_preview(&app, delta, "streaming"),
+        )
+        .await
+        {
+            Ok(translated) => {
+                final_text = translated;
+                processed_text = Some(final_text.clone());
+                // Publish before insertion so an insertion error cannot lose
+                // the completed translation.
+                let _ = app.emit("app-state", state.publish_result(final_text.clone()));
+                emit_correction_preview(&app, &final_text, "final");
+                let _ = storage.add_metric(
+                    "voice_translation",
+                    Some(settings.correction_provider.as_str()),
+                    Some(translation_started.elapsed().as_millis() as i64),
+                    true,
+                    None,
+                );
+            }
+            Err(correction::CorrectionError::Cancelled) => {
+                emit_state(&app, &state, AppPhase::Idle, "Translation cancelled.");
+                return Err("translation was cancelled".into());
+            }
+            Err(_) => {
+                translation_failed = true;
+                emit_correction_preview(&app, &transcript.text, "fallback");
+                let _ = storage.add_metric(
+                    "voice_translation",
+                    Some(settings.correction_provider.as_str()),
+                    Some(translation_started.elapsed().as_millis() as i64),
+                    false,
+                    Some("translation_failed"),
+                );
+                emit_status(
+                    &app,
+                    "voice_translation_failed",
+                    "Translation failed; the raw transcript remains on the clipboard.",
+                );
+            }
+        }
+    } else if settings.text_correction_enabled {
         let correction_hints = storage
             .dictionary_correction_hints(&transcript.text)
             .unwrap_or_default();
@@ -350,8 +556,8 @@ pub(crate) async fn stop_recording(
         emit_correction_preview(&app, &transcript.text, "final");
     }
     if services.lifecycle.is_cancelled(operation_id) {
-        emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
-        return Err("dictation was cancelled".into());
+        emit_state(&app, &state, AppPhase::Idle, cancel_message);
+        return Err(cancel_error.into());
     }
 
     emit_state(
@@ -364,7 +570,14 @@ pub(crate) async fn stop_recording(
             "Inserting into the captured target."
         },
     );
-    let insertion_result = draft.finish(&final_text);
+    let insertion_result = if translation_failed {
+        draft
+            .injector
+            .copy_to_clipboard(&final_text)
+            .map(|()| InsertResult::ClipboardOnly)
+    } else {
+        draft.finish(&final_text)
+    };
     // Insertion has returned; helper shutdown and persistence are not insertion.
     // This only hides the overlay. The result below still determines success.
     recording_overlay::set_phase(&app, &AppPhase::Completed);
@@ -390,34 +603,45 @@ pub(crate) async fn stop_recording(
             InsertResult::PasteUnverified => "paste_unverified",
         }
     };
-    storage
-        .add_history(&NewHistoryItem {
-            transcript_text: &transcript.text,
-            processed_text: processed_text.as_deref(),
-            mode: if processed_text.is_some() {
-                "ai_corrected"
-            } else if correction_failed {
-                "faithful_fallback"
-            } else {
-                "faithful"
-            },
-            asr_provider: &transcript.model,
-            llm_provider: llm_provider.as_deref(),
-            app_category: None,
-            duration_ms: Some(duration_ms as i64),
-            latency_ms: Some(latency_ms as i64),
-        })
-        .map_err(command_error)?;
-    storage
-        .add_metric(
-            "dictation",
-            Some(&transcript.model),
-            Some(latency_ms as i64),
-            true,
-            None,
-        )
-        .map_err(command_error)?;
-    let completion = if insertion == InsertResult::PasteUnverified {
+    let history_result = storage.add_history(&NewHistoryItem {
+        transcript_text: &transcript.text,
+        processed_text: processed_text.as_deref(),
+        mode: if mode == PipelineMode::Translate {
+            "translate"
+        } else if processed_text.is_some() {
+            "ai_corrected"
+        } else if correction_failed {
+            "faithful_fallback"
+        } else {
+            "faithful"
+        },
+        asr_provider: &transcript.model,
+        llm_provider: llm_provider.as_deref(),
+        target_language: translation_target.as_deref(),
+        app_category: None,
+        duration_ms: Some(duration_ms as i64),
+        latency_ms: Some(latency_ms as i64),
+    });
+    let metric_result = storage.add_metric(
+        if mode == PipelineMode::Translate {
+            "voice_translate"
+        } else {
+            "dictation"
+        },
+        Some(&transcript.model),
+        Some(latency_ms as i64),
+        !translation_failed,
+        translation_failed.then_some("translation_failed"),
+    );
+    let completion = if translation_failed {
+        "Translation failed; the raw transcript remains on the clipboard."
+    } else if mode == PipelineMode::Translate && insertion == InsertResult::PasteUnverified {
+        "Translation paste could not be confirmed; the result remains available in this app."
+    } else if mode == PipelineMode::Translate && insertion == InsertResult::ClipboardOnly {
+        "The target changed; the translation remains on the clipboard."
+    } else if mode == PipelineMode::Translate {
+        "Voice translation inserted."
+    } else if insertion == InsertResult::PasteUnverified {
         "Paste completion could not be confirmed. Check the input target before pasting again; the completed result is available in this app."
     } else if insertion == InsertResult::ClipboardOnly && streamed_into_target {
         "The provisional text could not be safely replaced; the final result remains on the clipboard."
@@ -433,12 +657,153 @@ pub(crate) async fn stop_recording(
     let snapshot = state.complete(final_text.clone(), completion.into());
     let _ = app.emit("app-state", snapshot);
     emit_status(&app, insertion_label, completion);
+    if let Some((kind, message)) =
+        persistence_warning(history_result.is_err(), metric_result.is_err())
+    {
+        emit_status(&app, kind, message);
+    }
     Ok(RecordingResult {
         text: final_text,
         insertion: insertion_label.into(),
         duration_ms,
         latency_ms,
     })
+}
+
+fn persistence_warning(
+    history_failed: bool,
+    metric_failed: bool,
+) -> Option<(&'static str, &'static str)> {
+    match (history_failed, metric_failed) {
+        (true, true) => Some((
+            "history_and_metric_save_failed",
+            "Text was published, but History and usage metrics could not be saved.",
+        )),
+        (true, false) => Some((
+            "history_save_failed",
+            "Text was published, but History could not be saved.",
+        )),
+        (false, true) => Some((
+            "metric_save_failed",
+            "Text was published, but usage metrics could not be saved.",
+        )),
+        (false, false) => None,
+    }
+}
+
+fn hotkey_changes(registered: &[Shortcut], desired: &[Shortcut]) -> (Vec<Shortcut>, Vec<Shortcut>) {
+    (
+        registered
+            .iter()
+            .copied()
+            .filter(|shortcut| !desired.contains(shortcut))
+            .collect(),
+        desired
+            .iter()
+            .copied()
+            .filter(|shortcut| !registered.contains(shortcut))
+            .collect(),
+    )
+}
+
+/// The OS global-shortcut service, abstracted so the save-time registration
+/// policy can be tested without it.
+trait HotkeyRegistrar {
+    fn register(&mut self, shortcut: Shortcut) -> Result<(), String>;
+    fn unregister(&mut self, shortcut: Shortcut) -> Result<(), String>;
+}
+
+struct GlobalHotkeys<'a>(&'a AppHandle);
+
+impl HotkeyRegistrar for GlobalHotkeys<'_> {
+    fn register(&mut self, shortcut: Shortcut) -> Result<(), String> {
+        self.0
+            .global_shortcut()
+            .register(shortcut)
+            .map_err(|error| error.to_string())
+    }
+
+    fn unregister(&mut self, shortcut: Shortcut) -> Result<(), String> {
+        self.0
+            .global_shortcut()
+            .unregister(shortcut)
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct HotkeyUpdate {
+    removed: Vec<Shortcut>,
+    added: Vec<Shortcut>,
+    /// Actions saved with an unchanged chord that still cannot be registered.
+    unavailable: Vec<HotkeyAction>,
+}
+
+/// Moves `registered` to the chords in `desired`. When an action keeps the
+/// chord it already had (for example one another app held at startup) and
+/// that chord still cannot be registered, the action is reported as
+/// unavailable instead of failing an unrelated save. Any other failure rolls
+/// back this update and fails.
+fn update_hotkey_registrations(
+    registrar: &mut impl HotkeyRegistrar,
+    registered: &mut Vec<Shortcut>,
+    desired: &[HotkeyBinding],
+    previous: &[HotkeyBinding],
+) -> Result<HotkeyUpdate, String> {
+    let chords: Vec<Shortcut> = desired.iter().map(|&(_, shortcut)| shortcut).collect();
+    let (to_remove, to_add) = hotkey_changes(registered, &chords);
+    let mut update = HotkeyUpdate::default();
+    for shortcut in to_remove {
+        if let Err(error) = registrar.unregister(shortcut) {
+            rollback_hotkey_update(registrar, registered, &update);
+            return Err(format!("hotkey update failed: {error}"));
+        }
+        registered.retain(|active| *active != shortcut);
+        update.removed.push(shortcut);
+    }
+    for &(action, shortcut) in desired
+        .iter()
+        .filter(|(_, shortcut)| to_add.contains(shortcut))
+    {
+        match registrar.register(shortcut) {
+            Ok(()) => {
+                registered.push(shortcut);
+                update.added.push(shortcut);
+            }
+            Err(_) if previous.contains(&(action, shortcut)) => update.unavailable.push(action),
+            Err(error) => {
+                rollback_hotkey_update(registrar, registered, &update);
+                return Err(format!("hotkey registration failed: {error}"));
+            }
+        }
+    }
+    Ok(update)
+}
+
+fn rollback_hotkey_update(
+    registrar: &mut impl HotkeyRegistrar,
+    registered: &mut Vec<Shortcut>,
+    update: &HotkeyUpdate,
+) {
+    for shortcut in update.added.iter().rev() {
+        if registrar.unregister(*shortcut).is_ok() {
+            registered.retain(|active| active != shortcut);
+        }
+    }
+    for shortcut in &update.removed {
+        if registrar.register(*shortcut).is_ok() {
+            registered.push(*shortcut);
+        }
+    }
+}
+
+#[tauri::command]
+pub(crate) fn get_startup_hotkey_warning(services: State<'_, Services>) -> Vec<String> {
+    services
+        .startup_hotkey_issues
+        .lock()
+        .map(|issues| issues.messages().into_iter().map(str::to_owned).collect())
+        .unwrap_or_default()
 }
 
 fn emit_correction_preview(app: &AppHandle, text: &str, stage: &str) {
@@ -448,24 +813,94 @@ fn emit_correction_preview(app: &AppHandle, text: &str, stage: &str) {
     );
 }
 
+fn next_translation_target(languages: &[String], current: &str) -> Option<String> {
+    let current_index = languages
+        .iter()
+        .position(|language| language == current)
+        .unwrap_or(0);
+    languages
+        .get((current_index + 1) % languages.len().max(1))
+        .cloned()
+}
+
+/// Persists the target after `active` (the recording's target, falling back
+/// to the saved one). Holding the settings-write lock keeps this
+/// read-modify-write from reverting a concurrent `update_settings`.
+fn store_next_translation_target(
+    storage: &Storage,
+    active: Option<&str>,
+) -> Result<Settings, String> {
+    let _settings_writes = storage.lock_settings_writes().map_err(command_error)?;
+    let mut settings = storage.get_settings().map_err(command_error)?;
+    let current = active.unwrap_or(settings.translation_target_language.as_str());
+    settings.translation_target_language =
+        next_translation_target(&settings.translation_target_languages, current)
+            .ok_or("at least one translation target language is required")?;
+    storage.update_settings(&settings).map_err(command_error)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+pub(crate) async fn cycle_voice_translation_target(
+    app: AppHandle,
+    services: State<'_, Services>,
+    storage: State<'_, Storage>,
+) -> Result<String, String> {
+    // An async command runs off the main thread. Settings saves can hold the
+    // settings-write lock while the global-shortcut plugin waits on that
+    // thread; waiting for the lock here must not block shortcut registration.
+    let mut active = services
+        .voice_translation_target
+        .lock()
+        .map_err(|_| "translation target service is unavailable".to_string())?;
+    if services.lifecycle.phase() != PipelinePhase::Recording
+        || services.lifecycle.mode() != Some(PipelineMode::Translate)
+    {
+        return Err("voice translation is not recording".into());
+    }
+    let settings = store_next_translation_target(&storage, active.as_deref())?;
+    let next = settings.translation_target_language.clone();
+    *active = Some(next.clone());
+    let _ = app.emit("settings-changed", settings);
+    let _ = app.emit(
+        "voice-mode",
+        serde_json::json!({ "mode": "translate", "targetLanguage": next }),
+    );
+    Ok(next)
+}
+
 #[tauri::command]
 pub(crate) async fn cancel_recording(
     app: AppHandle,
     services: State<'_, Services>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    if !cancel_pipeline_operation(
+    let mode = services.lifecycle.mode().unwrap_or(PipelineMode::Dictate);
+    let cancelled = cancel_pipeline_operation(
         &services.lifecycle,
         &services.audio,
         &services.target,
+        &services.voice_translation_target,
         &services.live,
     )
-    .await?
-    {
+    .await?;
+    // Nothing was cancelled: any published session belongs to another
+    // operation, so leave its target language and overlay untouched.
+    if !cancelled {
         return Ok(());
     }
+    recording_overlay::set_interactive(&app, false);
     if services.lifecycle.phase() == PipelinePhase::Idle {
-        emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
+        emit_state(
+            &app,
+            &state,
+            AppPhase::Idle,
+            if mode == PipelineMode::Translate {
+                "Translation cancelled."
+            } else {
+                "Dictation cancelled."
+            },
+        );
     }
     Ok(())
 }
@@ -474,6 +909,7 @@ async fn cancel_pipeline_operation(
     lifecycle: &PipelineLifecycle,
     audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
     target: &Mutex<Option<TargetWindow>>,
+    translation_target: &Mutex<Option<String>>,
     live: &tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
 ) -> Result<bool, String> {
     let Some((operation_id, phase)) = lifecycle.cancel()? else {
@@ -492,6 +928,12 @@ async fn cancel_pipeline_operation(
         target.take();
     }
     let live_task = live.lock().await.take();
+    // Startup publishes the target language before releasing `live`. Clear it
+    // while this operation still owns the lifecycle, so a later recording's
+    // target is never removed.
+    if let Ok(mut language) = translation_target.lock() {
+        language.take();
+    }
     let audio_result = {
         let mut audio = audio.lock().await;
         audio.cancel().await
@@ -528,6 +970,211 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
 mod tests {
     use super::*;
     use crate::audio::{AudioArtifact, AudioError, AudioFuture, CaptureState, LevelMeter};
+
+    #[test]
+    fn persistence_failures_choose_one_complete_warning() {
+        assert_eq!(persistence_warning(false, false), None);
+        assert_eq!(
+            persistence_warning(true, false).unwrap().0,
+            "history_save_failed"
+        );
+        assert_eq!(
+            persistence_warning(false, true).unwrap().0,
+            "metric_save_failed"
+        );
+        assert_eq!(
+            persistence_warning(true, true).unwrap().0,
+            "history_and_metric_save_failed"
+        );
+    }
+
+    #[test]
+    fn hotkey_changes_add_only_unregistered_chords() {
+        let dictate = parse_shortcut("CommandOrControl+Shift+D").unwrap();
+        let translate = parse_shortcut("CommandOrControl+Shift+T").unwrap();
+        let selected = parse_shortcut("CommandOrControl+Shift+Y").unwrap();
+        let unavailable = parse_shortcut("CommandOrControl+Shift+U").unwrap();
+        let registered = vec![dictate, selected];
+        let unchanged = vec![dictate, unavailable, selected];
+        assert_eq!(
+            hotkey_changes(&registered, &unchanged),
+            (vec![], vec![unavailable])
+        );
+
+        let repaired = vec![dictate, translate, selected];
+        assert_eq!(
+            hotkey_changes(&registered, &repaired),
+            (vec![], vec![translate])
+        );
+    }
+
+    /// Registers every chord except those another app holds.
+    struct TestRegistrar {
+        held_elsewhere: Vec<Shortcut>,
+    }
+
+    impl HotkeyRegistrar for TestRegistrar {
+        fn register(&mut self, shortcut: Shortcut) -> Result<(), String> {
+            if self.held_elsewhere.contains(&shortcut) {
+                Err("held by another app".into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn unregister(&mut self, _shortcut: Shortcut) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn chord(value: &str) -> Shortcut {
+        parse_shortcut(value).unwrap()
+    }
+
+    #[test]
+    fn unchanged_unregistrable_hotkey_warns_without_failing_unrelated_saves() {
+        use HotkeyAction::{Dictate, SelectedTextTranslate, VoiceTranslate};
+        let (dictate, selected, voice) = (
+            chord("Ctrl+Shift+Space"),
+            chord("Ctrl+Shift+T"),
+            chord("Ctrl+Shift+Y"),
+        );
+        // Another app held voice Translate's chord at startup.
+        let previous = vec![
+            (Dictate, dictate),
+            (SelectedTextTranslate, selected),
+            (VoiceTranslate, voice),
+        ];
+        let mut registrar = TestRegistrar {
+            held_elsewhere: vec![voice],
+        };
+        let mut registered = vec![dictate, selected];
+
+        let unrelated_save =
+            update_hotkey_registrations(&mut registrar, &mut registered, &previous, &previous)
+                .unwrap();
+        assert_eq!(unrelated_save.unavailable, vec![VoiceTranslate]);
+        assert_eq!(registered, vec![dictate, selected]);
+
+        let moved_selected = chord("Ctrl+Shift+U");
+        let desired = vec![
+            (Dictate, dictate),
+            (SelectedTextTranslate, moved_selected),
+            (VoiceTranslate, voice),
+        ];
+        let update =
+            update_hotkey_registrations(&mut registrar, &mut registered, &desired, &previous)
+                .unwrap();
+        assert_eq!(update.removed, vec![selected]);
+        assert_eq!(update.added, vec![moved_selected]);
+        assert_eq!(update.unavailable, vec![VoiceTranslate]);
+        assert_eq!(registered, vec![dictate, moved_selected]);
+    }
+
+    #[test]
+    fn newly_assigned_unregistrable_hotkey_fails_and_rolls_back() {
+        use HotkeyAction::{Dictate, SelectedTextTranslate, VoiceTranslate};
+        let (dictate, selected, voice, held) = (
+            chord("Ctrl+Shift+Space"),
+            chord("Ctrl+Shift+T"),
+            chord("Ctrl+Shift+Y"),
+            chord("Ctrl+Shift+H"),
+        );
+        let previous = vec![
+            (Dictate, dictate),
+            (SelectedTextTranslate, selected),
+            (VoiceTranslate, voice),
+        ];
+        let mut registrar = TestRegistrar {
+            held_elsewhere: vec![held],
+        };
+        let mut registered = vec![dictate, selected, voice];
+        let desired = vec![
+            (Dictate, dictate),
+            (SelectedTextTranslate, chord("Ctrl+Shift+U")),
+            (VoiceTranslate, held),
+        ];
+        assert_eq!(
+            update_hotkey_registrations(&mut registrar, &mut registered, &desired, &previous),
+            Err("hotkey registration failed: held by another app".into())
+        );
+        assert_eq!(registered, vec![dictate, selected, voice]);
+
+        // A chord that only another action had before is also a new choice.
+        let mut registrar = TestRegistrar {
+            held_elsewhere: vec![voice],
+        };
+        let mut registered = vec![dictate, selected];
+        let swapped = vec![
+            (Dictate, voice),
+            (SelectedTextTranslate, selected),
+            (VoiceTranslate, dictate),
+        ];
+        assert!(
+            update_hotkey_registrations(&mut registrar, &mut registered, &swapped, &previous)
+                .is_err()
+        );
+        assert_eq!(registered, vec![dictate, selected]);
+    }
+
+    #[test]
+    fn translation_targets_require_supported_unique_current_language() {
+        let mut settings = Settings::default();
+        assert!(validate_translation_targets(&settings).is_ok());
+
+        settings.translation_target_languages = vec!["en".into(), "en".into()];
+        assert!(validate_translation_targets(&settings).is_err());
+
+        settings.translation_target_languages = vec!["xx".into()];
+        settings.translation_target_language = "xx".into();
+        assert!(validate_translation_targets(&settings).is_err());
+
+        settings.translation_target_languages = vec!["ja".into()];
+        settings.translation_target_language = "en".into();
+        assert!(validate_translation_targets(&settings).is_err());
+    }
+
+    #[test]
+    fn next_translation_target_wraps_and_falls_back_to_the_first_entry() {
+        let languages = vec!["en".to_string(), "ja".to_string(), "de".to_string()];
+        assert_eq!(
+            next_translation_target(&languages, "ja").as_deref(),
+            Some("de")
+        );
+        assert_eq!(
+            next_translation_target(&languages, "de").as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            next_translation_target(&languages, "xx").as_deref(),
+            Some("ja")
+        );
+        assert_eq!(next_translation_target(&[], "en"), None);
+    }
+
+    #[test]
+    fn target_cycling_waits_for_an_in_progress_settings_save() {
+        let storage = Arc::new(Storage::in_memory().unwrap());
+        let settings_save = storage.lock_settings_writes().unwrap();
+        let cycling = {
+            let storage = Arc::clone(&storage);
+            std::thread::spawn(move || store_next_translation_target(&storage, Some("en")))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!cycling.is_finished());
+
+        // The save was based on settings read before cycling started.
+        let mut saved = storage.get_settings().unwrap();
+        saved.history_enabled = false;
+        storage.update_settings(&saved).unwrap();
+        drop(settings_save);
+
+        let cycled = cycling.join().unwrap().unwrap();
+        assert_eq!(cycled.translation_target_language, "ja");
+        let stored = storage.get_settings().unwrap();
+        assert!(!stored.history_enabled);
+        assert_eq!(stored.translation_target_language, "ja");
+    }
 
     struct TestAudio {
         cancel_error: bool,
@@ -583,15 +1230,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn immediate_stop_waits_for_translation_session_publication() {
+        let live = Arc::new(tokio::sync::Mutex::new(None));
+        let translation_target = Arc::new(Mutex::new(None));
+        let mut startup_publication = live.lock().await;
+        let live_for_stop = Arc::clone(&live);
+        let target_for_stop = Arc::clone(&translation_target);
+        let stopping = tokio::spawn(async move {
+            take_published_session(&live_for_stop, &target_for_stop)
+                .await
+                .unwrap()
+        });
+
+        tokio::task::yield_now().await;
+        *translation_target.lock().unwrap() = Some("ja".into());
+        *startup_publication = Some(());
+        drop(startup_publication);
+
+        let (session, target) = stopping.await.unwrap();
+        assert_eq!(session, Some(()));
+        assert_eq!(target.as_deref(), Some("ja"));
+    }
+
+    #[tokio::test]
     async fn cancel_waits_for_audio_operation_then_allows_new_start() {
         let lifecycle = PipelineLifecycle::default();
-        let operation_id = lifecycle.begin_start().unwrap();
+        let operation_id = lifecycle.begin_start(PipelineMode::Dictate).unwrap();
         lifecycle.mark_recording(operation_id).unwrap();
         let audio = test_audio(false);
         let target = Mutex::new(None);
         let audio_operation = audio.lock().await;
         let live = tokio::sync::Mutex::new(None);
-        let cancellation = cancel_pipeline_operation(&lifecycle, &audio, &target, &live);
+        let language = Mutex::new(None);
+        let cancellation = cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live);
         tokio::pin!(cancellation);
 
         assert!(
@@ -600,11 +1271,11 @@ mod tests {
                 .is_err()
         );
         assert!(
-            !cancel_pipeline_operation(&lifecycle, &audio, &target, &live)
+            !cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live)
                 .await
                 .unwrap()
         );
-        assert!(lifecycle.begin_start().is_err());
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_err());
         drop(audio_operation);
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), cancellation)
@@ -612,13 +1283,13 @@ mod tests {
                 .unwrap(),
             Ok(true)
         );
-        assert!(lifecycle.begin_start().is_ok());
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_ok());
     }
 
     #[tokio::test]
     async fn failed_audio_cancel_still_allows_new_start() {
         let lifecycle = PipelineLifecycle::default();
-        let operation_id = lifecycle.begin_start().unwrap();
+        let operation_id = lifecycle.begin_start(PipelineMode::Dictate).unwrap();
         lifecycle.mark_recording(operation_id).unwrap();
         let audio = test_audio(true);
         let target = Mutex::new(None);
@@ -627,31 +1298,70 @@ mod tests {
             &lifecycle,
             &audio,
             &target,
+            &Mutex::new(None),
             &tokio::sync::Mutex::new(None)
         )
         .await
         .is_err());
-        assert!(lifecycle.begin_start().is_ok());
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_ok());
     }
 
     #[tokio::test]
     async fn processing_cancel_retains_ownership_until_processing_exits() {
         let lifecycle = PipelineLifecycle::default();
-        let id = lifecycle.begin_start().unwrap();
+        let id = lifecycle.begin_start(PipelineMode::Dictate).unwrap();
         lifecycle.mark_recording(id).unwrap();
-        let (_, cancel) = lifecycle.begin_processing().unwrap();
+        let (_, _, cancel) = lifecycle.begin_processing().unwrap();
         cancel_pipeline_operation(
             &lifecycle,
             &test_audio(false),
+            &Mutex::new(None),
             &Mutex::new(None),
             &tokio::sync::Mutex::new(None),
         )
         .await
         .unwrap();
         assert!(*cancel.borrow());
-        assert!(lifecycle.begin_start().is_err());
+        assert!(lifecycle.begin_start(PipelineMode::Translate).is_err());
         lifecycle.finish(id);
-        assert!(lifecycle.begin_start().is_ok());
+        assert!(lifecycle.begin_start(PipelineMode::Translate).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancel_clears_the_translation_target_only_when_it_cancels_a_recording() {
+        let lifecycle = PipelineLifecycle::default();
+        let audio = test_audio(false);
+        let target = Mutex::new(None);
+        let live = tokio::sync::Mutex::new(None);
+        // Nothing to cancel: a target published by a concurrent start stays.
+        let language = Mutex::new(Some("ja".to_string()));
+        assert!(
+            !cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live)
+                .await
+                .unwrap()
+        );
+        assert_eq!(language.lock().unwrap().as_deref(), Some("ja"));
+
+        // Processing owns its published target; cancellation only signals it.
+        let id = lifecycle.begin_start(PipelineMode::Translate).unwrap();
+        lifecycle.mark_recording(id).unwrap();
+        lifecycle.begin_processing().unwrap();
+        assert!(
+            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live)
+                .await
+                .unwrap()
+        );
+        assert_eq!(language.lock().unwrap().as_deref(), Some("ja"));
+        lifecycle.finish(id);
+
+        let id = lifecycle.begin_start(PipelineMode::Translate).unwrap();
+        lifecycle.mark_recording(id).unwrap();
+        assert!(
+            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live)
+                .await
+                .unwrap()
+        );
+        assert_eq!(*language.lock().unwrap(), None);
     }
 
     #[test]
@@ -705,6 +1415,10 @@ pub(crate) async fn update_settings(
     if settings.translation_hotkey.trim().is_empty() {
         return Err("translation hotkey cannot be empty".into());
     }
+    if settings.voice_translate_hotkey.trim().is_empty() {
+        return Err("voice Translate hotkey cannot be empty".into());
+    }
+    validate_translation_targets(&settings)?;
     if !(1..=3650).contains(&settings.history_retention_days) {
         return Err("history retention must be between 1 and 3650 days".into());
     }
@@ -833,14 +1547,8 @@ pub(crate) async fn update_settings(
             );
         }
     }
-    let new_shortcut = parse_shortcut(&settings.hotkey)?;
-    let new_translation_shortcut = parse_shortcut(&settings.translation_hotkey)?;
-    let previous = storage.get_settings().map_err(command_error)?;
-    let old_shortcut = parse_shortcut(&previous.hotkey)?;
-    let old_translation_shortcut = parse_shortcut(&previous.translation_hotkey)?;
-    if new_translation_shortcut == new_shortcut {
-        return Err("translation hotkey must differ from recording hotkey".into());
-    }
+    let proposed_hotkeys = hotkey_bindings(&settings)?;
+    let hotkeys = assign_hotkeys(&proposed_hotkeys);
     if settings.translation_instruction.chars().count() > 500
         || settings.translation_instruction.chars().any(|character| {
             character.is_control() && character != '\n' && character != '\r' && character != '\t'
@@ -848,61 +1556,58 @@ pub(crate) async fn update_settings(
     {
         return Err("translation instruction must be at most 500 characters and contain no unsupported control characters".into());
     }
-    if cfg!(debug_assertions) && settings.auto_start && !previous.auto_start {
-        return Err(
-            "autostart cannot be enabled from a development build; install and run a release build"
-                .into(),
-        );
-    }
-    let recording_changed = new_shortcut != old_shortcut;
-    let translation_changed = new_translation_shortcut != old_translation_shortcut;
-    let rollback_shortcuts = || {
-        if recording_changed {
-            let _ = app.global_shortcut().unregister(new_shortcut);
+    // Hold the settings-write lock from reading `previous` until the new
+    // settings are written, so overlay target cycling cannot interleave.
+    let (previous, unavailable_hotkeys) = {
+        let _settings_writes = storage.lock_settings_writes().map_err(command_error)?;
+        let previous = storage.get_settings().map_err(command_error)?;
+        let previous_hotkeys = hotkey_bindings(&previous).unwrap_or_default();
+        if has_new_hotkey_collision(&proposed_hotkeys, &previous_hotkeys) {
+            return Err(
+                "recording, selected-text translation, and voice Translate hotkeys must differ"
+                    .into(),
+            );
         }
-        if translation_changed {
-            let _ = app.global_shortcut().unregister(new_translation_shortcut);
+        if cfg!(debug_assertions) && settings.auto_start && !previous.auto_start {
+            return Err(
+                "autostart cannot be enabled from a development build; install and run a release build"
+                    .into(),
+            );
         }
-        if recording_changed {
-            let _ = app.global_shortcut().register(old_shortcut);
+        let mut registered = services
+            .registered_hotkeys
+            .lock()
+            .map_err(|_| "hotkey registration state is unavailable".to_string())?;
+        let mut registrar = GlobalHotkeys(&app);
+        let update = update_hotkey_registrations(
+            &mut registrar,
+            &mut registered,
+            &hotkeys.active,
+            &previous_hotkeys,
+        )?;
+        if let Err(error) = storage.apply_history_policy(&previous, &settings) {
+            rollback_hotkey_update(&mut registrar, &mut registered, &update);
+            return Err(command_error(error));
         }
-        if translation_changed {
-            let _ = app.global_shortcut().register(old_translation_shortcut);
+        if let Err(error) = storage.update_settings(&settings) {
+            rollback_hotkey_update(&mut registrar, &mut registered, &update);
+            return Err(command_error(error));
         }
+        (previous, update.unavailable)
     };
-    // Remove every changed registration before adding any replacement. This
-    // makes swapping the two shortcuts an atomic-looking transaction.
-    if recording_changed {
-        if let Err(error) = app.global_shortcut().unregister(old_shortcut) {
-            rollback_shortcuts();
-            return Err(format!("hotkey update failed: {error}"));
-        }
+    // Preserve warnings for saved legacy collisions and unavailable chords.
+    if let Ok(mut issues) = services.startup_hotkey_issues.lock() {
+        *issues = HotkeyIssues {
+            collisions: hotkeys.collisions,
+            unregistered: unavailable_hotkeys.clone(),
+        };
     }
-    if translation_changed {
-        if let Err(error) = app.global_shortcut().unregister(old_translation_shortcut) {
-            rollback_shortcuts();
-            return Err(format!("translation hotkey update failed: {error}"));
-        }
-    }
-    if recording_changed {
-        if let Err(error) = app.global_shortcut().register(new_shortcut) {
-            rollback_shortcuts();
-            return Err(format!("hotkey registration failed: {error}"));
-        }
-    }
-    if translation_changed {
-        if let Err(error) = app.global_shortcut().register(new_translation_shortcut) {
-            rollback_shortcuts();
-            return Err(format!("translation hotkey registration failed: {error}"));
-        }
-    }
-    if let Err(error) = storage.apply_history_policy(&previous, &settings) {
-        rollback_shortcuts();
-        return Err(command_error(error));
-    }
-    if let Err(error) = storage.update_settings(&settings) {
-        rollback_shortcuts();
-        return Err(command_error(error));
+    for action in unavailable_hotkeys {
+        emit_status(
+            &app,
+            "hotkey_unavailable",
+            action.registration_failed_message(),
+        );
     }
     if settings.auto_start != previous.auto_start {
         let result = if settings.auto_start {
