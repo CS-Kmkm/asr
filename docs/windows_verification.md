@@ -80,15 +80,16 @@ pnpm run tauri dev
 
 ### 3.1 仕組みの確認
 
-`stop_recording` コマンド（`src-tauri/src/commands.rs:125–132`）は、録音停止時に
-`storage.dictionary_prompt_terms()` を呼び出して辞書の **surface + aliases** を
-全件収集し、改行区切りで ASR ワーカーへ `prompt` パラメータとして送信する。
-（`src-tauri/src/storage.rs:270–277`）
+録音開始時に `storage.dictionary_asr_prompt_for()`（`src-tauri/src/storage.rs`）が、
+前景アプリのスコープに一致する辞書項目から ASR ヒントを作り、ASR ワーカーへ
+`prompt` パラメータとして送信する。形式はバックエンドで異なる。
 
-- **VibeVoice バックエンド**: この `prompt` が generation context として渡される。
-- **faster-whisper バックエンド**: `initial_prompt` / ホットワードとして渡される。
-
-どちらも同じ term リストを消費する。
+- **faster-whisper バックエンド**: ホットワード。全項目の surface（優先度順）→ alias →
+  手動項目の reading の順に、大文字小文字を区別せず重複を除き、カンマ区切りで
+  最大 200 文字まで入れる。
+- **その他のバックエンド（VibeVoice など）**: 1 項目 1 行の `reading => surface`
+  （alias があれば `(aliases: ...)` を付ける。自動追加項目は surface のみ）を、
+  最大 1200 文字まで改行区切りで入れる。
 
 ### 3.2 使用する固有名詞（`docs/eval_set/terms.txt` より 5 語を抜粋）
 

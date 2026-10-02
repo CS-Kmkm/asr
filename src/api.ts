@@ -7,7 +7,7 @@ import type {
   ModelStatus,
   Settings,
   RecordingResult,
-  DictionaryEntry,
+  DictionaryCandidate, DictionaryEntry,
   DictionaryEntryInput,
   HistoryFilter,
   HistoryAudioPayload,
@@ -226,9 +226,9 @@ export async function getGpuDiagnostics(): Promise<GpuDiagnostics> {
   return invoke("get_gpu_diagnostics");
 }
 
-export async function listDictionary(): Promise<DictionaryEntry[]> {
+export async function listDictionary(query?: string, source?: "manual" | "auto" | "all"): Promise<DictionaryEntry[]> {
   if (!inTauri) return [];
-  return invoke("list_dictionary");
+  return invoke("list_dictionary", { query: query || null, source: source === "all" ? null : source || null });
 }
 
 export async function addDictionaryEntry(entry: DictionaryEntryInput): Promise<DictionaryEntry> {
@@ -241,10 +241,36 @@ export async function addDictionaryEntry(entry: DictionaryEntryInput): Promise<D
       aliases: entry.aliases ?? [],
       priority: entry.priority ?? 0,
       appScope: entry.appScope ?? null,
+      source: "manual",
       createdAt: new Date().toISOString(),
     };
   }
   return invoke("add_dictionary_entry", { entry });
+}
+
+export async function updateDictionaryEntry(id: number, entry: DictionaryEntryInput): Promise<DictionaryEntry> {
+  if (!inTauri) return { ...(await addDictionaryEntry(entry)), id };
+  return invoke("update_dictionary_entry", { id, entry });
+}
+
+export async function importDictionaryCsv(csv: string): Promise<number> {
+  if (!inTauri) return 0;
+  return invoke("import_dictionary_csv", { input: { csv } });
+}
+
+export async function listDictionaryCandidates(): Promise<DictionaryCandidate[]> {
+  if (!inTauri) return [];
+  return invoke("list_dictionary_candidates");
+}
+
+export async function confirmDictionaryCandidate(id: number): Promise<DictionaryEntry> {
+  if (!inTauri) throw new Error("Dictionary candidates require the desktop application.");
+  return invoke("confirm_dictionary_candidate", { id });
+}
+
+export async function rejectDictionaryCandidate(id: number): Promise<void> {
+  if (!inTauri) return;
+  await invoke("reject_dictionary_candidate", { id });
 }
 
 export async function deleteDictionaryEntry(id: number): Promise<void> {

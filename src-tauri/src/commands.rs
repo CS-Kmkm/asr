@@ -573,10 +573,9 @@ async fn start_recording_mode(
             monitor.observe_cancellation(Some(cancel.clone()));
         }
     }
-    let dictionary_terms = storage
-        .dictionary_prompt_terms_for(app_context.as_ref())
+    let prompt = storage
+        .dictionary_asr_prompt_for(app_context.as_ref(), &settings.asr_backend)
         .unwrap_or_default();
-    let prompt = (!dictionary_terms.is_empty()).then(|| dictionary_terms.join("\n"));
     let capture_config = capture_config(&settings);
     let mut test = services.microphone_test.lock().await;
     let mut audio = services.audio.lock().await;
@@ -773,10 +772,9 @@ pub(crate) async fn stop_recording(
         .lock()
         .map_err(|_| "target service is unavailable".to_string())?
         .clone();
-    let dictionary_terms = storage
-        .dictionary_prompt_terms_for(app_context.as_ref())
+    let prompt = storage
+        .dictionary_asr_prompt_for(app_context.as_ref(), &settings.asr_backend)
         .unwrap_or_default();
-    let prompt = (!dictionary_terms.is_empty()).then(|| dictionary_terms.join("\n"));
     let correction_cancel = cancel.clone();
     let transcript_result = services
         .transcriber
@@ -1243,6 +1241,12 @@ pub(crate) async fn stop_recording(
         },
         Some(&artifact.path),
     );
+    // Only an AI correction of a Dictate transcript proposes a spelling; a
+    // translation is a different text, not a correction of the transcript.
+    if mode == PipelineMode::Dictate && processed_text.is_some() {
+        let _ =
+            storage.add_dictionary_candidate_from_correction(&transcript.text, &final_text, None);
+    }
     let metric_result = storage.add_metric(
         if mode == PipelineMode::Translate {
             "voice_translate"
@@ -3027,10 +3031,9 @@ pub(crate) async fn retry_history_item(
         // History keeps only the captured category, so Retry routes to
         // category-scoped and global dictionary entries and profiles.
         let retry_context = retry_app_context(&source);
-        let prompt_terms = storage
-            .dictionary_prompt_terms_for(retry_context.as_ref())
+        let prompt = storage
+            .dictionary_asr_prompt_for(retry_context.as_ref(), &settings.asr_backend)
             .unwrap_or_default();
-        let prompt = (!prompt_terms.is_empty()).then(|| prompt_terms.join("\n"));
         let transcript = services
             .transcriber
             .transcribe_with_locale(
@@ -3268,8 +3271,46 @@ fn stored_search_site(item: &HistoryItem) -> Result<ask::SearchSite, String> {
 }
 
 #[tauri::command]
-pub(crate) fn list_dictionary(storage: State<'_, Storage>) -> Result<Vec<DictionaryEntry>, String> {
-    storage.list_dictionary().map_err(command_error)
+pub(crate) fn list_dictionary(
+    query: Option<String>,
+    source: Option<String>,
+    storage: State<'_, Storage>,
+) -> Result<Vec<DictionaryEntry>, String> {
+    storage
+        .search_dictionary(query.as_deref(), source.as_deref())
+        .map_err(command_error)
+}
+
+#[tauri::command]
+pub(crate) fn update_dictionary_entry(
+    id: i64,
+    entry: DictionaryEntryInput,
+    storage: State<'_, Storage>,
+) -> Result<DictionaryEntry, String> {
+    personalization::validate_dictionary_scope(entry.app_scope.as_deref())
+        .map_err(str::to_owned)?;
+    if !storage
+        .update_dictionary_entry(
+            id,
+            &NewDictionaryEntry {
+                reading: &entry.reading,
+                surface: &entry.surface,
+                category: entry.category.as_deref(),
+                aliases: &entry.aliases,
+                priority: entry.priority,
+                app_scope: entry.app_scope.as_deref(),
+            },
+        )
+        .map_err(command_error)?
+    {
+        return Err("dictionary entry not found".into());
+    }
+    storage
+        .list_dictionary()
+        .map_err(command_error)?
+        .into_iter()
+        .find(|item| item.id == id)
+        .ok_or_else(|| "dictionary entry not found".into())
 }
 
 #[tauri::command]
@@ -3303,6 +3344,49 @@ pub(crate) fn delete_dictionary_entry(id: i64, storage: State<'_, Storage>) -> R
         Ok(())
     } else {
         Err("dictionary entry not found".into())
+    }
+}
+
+#[tauri::command]
+pub(crate) fn import_dictionary_csv(
+    input: DictionaryImportInput,
+    storage: State<'_, Storage>,
+) -> Result<usize, String> {
+    storage
+        .import_dictionary_csv(&input.csv)
+        .map_err(command_error)
+}
+
+#[tauri::command]
+pub(crate) fn list_dictionary_candidates(
+    storage: State<'_, Storage>,
+) -> Result<Vec<DictionaryCandidate>, String> {
+    storage.list_dictionary_candidates().map_err(command_error)
+}
+
+#[tauri::command]
+pub(crate) fn confirm_dictionary_candidate(
+    id: i64,
+    storage: State<'_, Storage>,
+) -> Result<DictionaryEntry, String> {
+    storage
+        .confirm_dictionary_candidate(id)
+        .map_err(command_error)?
+        .ok_or_else(|| "dictionary candidate not found".into())
+}
+
+#[tauri::command]
+pub(crate) fn reject_dictionary_candidate(
+    id: i64,
+    storage: State<'_, Storage>,
+) -> Result<(), String> {
+    if storage
+        .reject_dictionary_candidate(id)
+        .map_err(command_error)?
+    {
+        Ok(())
+    } else {
+        Err("dictionary candidate not found".into())
     }
 }
 

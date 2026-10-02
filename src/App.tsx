@@ -12,6 +12,10 @@ import {
   deleteAllHistory,
   getHistoryAudio,
   retryHistoryItem,
+  confirmDictionaryCandidate,
+  importDictionaryCsv,
+  listDictionaryCandidates,
+  rejectDictionaryCandidate,
   getAppState,
   getAskAnswer,
   dismissAskAnswer,
@@ -27,6 +31,7 @@ import {
   startRecording,
   stopRecording,
   updateSettings,
+  updateDictionaryEntry,
 } from "./api";
 import type {
   AppState,
@@ -35,6 +40,7 @@ import type {
   AudioLevel,
   CustomModel,
   DictionaryEntry,
+  DictionaryCandidate,
   DictionaryEntryInput,
   GpuDiagnostics,
   HistoryItem,
@@ -425,6 +431,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const [devices, setDevices] = useState<AudioDevice[]>([]);
   const [level, setLevel] = useState<AudioLevel>({ rms: 0, peak: 0 });
   const [dictionary, setDictionary] = useState<DictionaryEntry[]>([]);
+  const [dictionaryCandidates, setDictionaryCandidates] = useState<DictionaryCandidate[]>([]);
 
   useEffect(() => {
     historyFilterRef.current = historyFilter;
@@ -440,9 +447,10 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       getGpuDiagnostics(),
       listAudioDevices(),
       listDictionary(),
+      listDictionaryCandidates(),
     ])
       .then(
-        ([nextState, nextSettings, nextHistory, nextModel, nextGpu, nextDevices, nextDictionary]) => {
+        ([nextState, nextSettings, nextHistory, nextModel, nextGpu, nextDevices, nextDictionary, nextCandidates]) => {
           setState(nextState);
           setSettings(nextSettings);
           onLanguageChange(nextSettings.uiLanguage);
@@ -453,6 +461,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
           setGpu(nextGpu);
           setDevices(nextDevices);
           setDictionary(nextDictionary);
+          setDictionaryCandidates(nextCandidates);
           if (!nextSettings.setupComplete) setPage("setup");
         },
       )
@@ -600,6 +609,11 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
         } catch {
           showNotice(t("Recording completed, but history could not be refreshed."), "warning");
         }
+        try {
+          setDictionaryCandidates(await listDictionaryCandidates());
+        } catch {
+          // Candidates are reloaded with the Dictionary page; the dictation itself completed.
+        }
       } else {
         await startRecording();
       }
@@ -711,6 +725,46 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       await retryHistoryItem(id);
       await refreshHistory();
       showNotice(t("History retry completed."), "success");
+    } catch (error) { showNotice(String(error), "error"); }
+  }
+
+  async function updateDictionary(id: number, entry: DictionaryEntryInput): Promise<boolean> {
+    try {
+      await updateDictionaryEntry(id, entry);
+      setDictionary(await listDictionary());
+      showNotice(t("Dictionary entry updated."), "success");
+      return true;
+    } catch (error) {
+      showNotice(String(error), "error");
+      return false;
+    }
+  }
+
+  async function importDictionary(csv: string): Promise<boolean> {
+    try {
+      const count = await importDictionaryCsv(csv);
+      setDictionary(await listDictionary());
+      showNotice(`${t("Imported dictionary entries.")}: ${count}`, "success");
+      return true;
+    } catch (error) {
+      showNotice(String(error), "error");
+      return false;
+    }
+  }
+
+  async function confirmCandidate(id: number) {
+    try {
+      await confirmDictionaryCandidate(id);
+      const [entries, candidates] = await Promise.all([listDictionary(), listDictionaryCandidates()]);
+      setDictionary(entries); setDictionaryCandidates(candidates);
+      showNotice(t("Dictionary candidate confirmed."), "success");
+    } catch (error) { showNotice(String(error), "error"); }
+  }
+
+  async function rejectCandidate(id: number) {
+    try {
+      await rejectDictionaryCandidate(id);
+      setDictionaryCandidates(await listDictionaryCandidates());
     } catch (error) { showNotice(String(error), "error"); }
   }
 
@@ -829,8 +883,13 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
         {page === "dictionary" && (
           <DictionaryPage
             entries={dictionary}
+            candidates={dictionaryCandidates}
             onAdd={addDictionary}
+            onUpdate={updateDictionary}
             onDelete={(id) => void removeDictionary(id)}
+            onImport={importDictionary}
+            onConfirmCandidate={(id) => void confirmCandidate(id)}
+            onRejectCandidate={(id) => void rejectCandidate(id)}
           />
         )}
 

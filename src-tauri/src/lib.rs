@@ -49,8 +49,9 @@ use tauri::{
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use types::{
-    AppPhase, AppStateSnapshot, DictionaryEntry, DictionaryEntryInput, GpuDiagnostics, HistoryItem,
-    LoadModelRequest, ModelStatus, NewDictionaryEntry, NewHistoryItem, RecordingResult, Settings,
+    AppPhase, AppStateSnapshot, DictionaryCandidate, DictionaryEntry, DictionaryEntryInput,
+    DictionaryImportInput, GpuDiagnostics, HistoryItem, LoadModelRequest, ModelStatus,
+    NewDictionaryEntry, NewHistoryItem, RecordingResult, Settings,
 };
 
 const ASR_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -1133,7 +1134,12 @@ pub fn run() {
             commands::retry_history_item,
             commands::list_dictionary,
             commands::add_dictionary_entry,
+            commands::update_dictionary_entry,
             commands::delete_dictionary_entry,
+            commands::import_dictionary_csv,
+            commands::list_dictionary_candidates,
+            commands::confirm_dictionary_candidate,
+            commands::reject_dictionary_candidate,
             commands::copy_history_item,
             commands::copy_to_clipboard,
             commands::get_ask_answer,
