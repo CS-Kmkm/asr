@@ -3018,6 +3018,12 @@ pub(crate) async fn retry_history_item(
         }
         let started = Instant::now();
         let settings = storage.get_settings().map_err(command_error)?;
+        // Retry uses the current ASR settings, so it loads the selected model
+        // first, as a new recording does; a backend or model change resets it.
+        ensure_model_loaded(&app, &services, &settings).await?;
+        if services.lifecycle.is_cancelled(operation_id) {
+            return Err("history retry was cancelled".into());
+        }
         // History keeps only the captured category, so Retry routes to
         // category-scoped and global dictionary entries and profiles.
         let retry_context = retry_app_context(&source);

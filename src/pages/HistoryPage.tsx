@@ -18,6 +18,8 @@ const modeLabels = {
   ai_corrected: "Dictation (AI corrected)",
   faithful_fallback: "Dictation (AI fallback)",
   translate: "Voice Translate",
+  edit: "Edit",
+  ask: "Ask Anything",
 } as const;
 
 export function HistoryPage({ settings, history, filter, onSave, onFilter, onCopyItem, onRetry, onDelete, onDeleteAll, onLoadAudio, onAudioError, retryActive, onCancelRetry }: {
