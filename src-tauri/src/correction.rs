@@ -132,6 +132,9 @@ fn preserves_protected_spans_with_hints(
     edits: FactEdits,
     dictionary_hints: &[String],
 ) -> bool {
+    // Ordered-list markers the model adds for formatting are not facts: they
+    // may neither count as new values nor stand in for a dropped number.
+    let corrected = &strip_ordered_list_markers(corrected);
     let Some(output_for_new_values) =
         remove_prompted_dictionary_surfaces(transcript, corrected, dictionary_hints)
     else {
@@ -145,6 +148,27 @@ fn preserves_protected_spans_with_hints(
     .into_iter()
     .all(|kind| facts_preserved(transcript, corrected, &output_for_new_values, kind, edits))
         && uncertainty_preserved(transcript, corrected)
+}
+
+/// Removes a line-leading `1.` or `1)` marker (one or two ASCII digits followed
+/// by whitespace) from every line.
+fn strip_ordered_list_markers(text: &str) -> String {
+    text.split_inclusive('\n')
+        .map(|line| {
+            let body = line.trim_start_matches([' ', '\t']);
+            let indent = &line[..line.len() - body.len()];
+            let digits = body.bytes().take_while(u8::is_ascii_digit).count();
+            let rest = &body[digits..];
+            let marker = (1..=2).contains(&digits)
+                && rest.starts_with(['.', ')'])
+                && rest[1..].starts_with([' ', '\t']);
+            if marker {
+                format!("{indent}{}", &rest[1..])
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect()
 }
 
 /// Removes trusted dictionary spellings before new values are counted. Returns
@@ -1749,6 +1773,52 @@ mod tests {
             "See HTTP://Example.test/path.evil and version 142 maybes",
             true,
         ));
+    }
+
+    #[test]
+    fn ordered_list_markers_are_formatting_not_facts() {
+        for (transcript, output) in [
+            (
+                "買うものはえーと牛乳と卵とパンです",
+                "買うもの:\n1. 牛乳\n2. 卵\n3. パン",
+            ),
+            (
+                "first open the app then press save",
+                "  1) Open the app.\n  2) Press save.",
+            ),
+            ("参加者は3人と5人です", "参加者:\n1. 3人\n2. 5人"),
+        ] {
+            assert!(
+                preserves_protected_spans(transcript, output, false),
+                "rejected {transcript} => {output}"
+            );
+        }
+        let intent_aware = Settings {
+            correction_mode: "intent_aware".into(),
+            ..Settings::default()
+        };
+        assert!(validate_correction_output(
+            &intent_aware,
+            "手順はまずアプリを開いて次に保存を押します",
+            "手順:\n1. アプリを開く\n2. 保存を押す",
+        )
+        .is_ok());
+        // A marker cannot hide an invented value or stand in for a dropped one.
+        assert!(!preserves_protected_spans(
+            "牛乳と卵",
+            "1. 牛乳を3本\n2. 卵",
+            false
+        ));
+        assert!(!preserves_protected_spans(
+            "コードは2と5です",
+            "コード:\n1. 5\n2. コード",
+            false
+        ));
+        // Only a line-leading marker followed by whitespace is stripped.
+        assert_eq!(
+            strip_ordered_list_markers("1.5 hours\n2. item\n100. x\n3.item"),
+            "1.5 hours\n item\n100. x\n3.item"
+        );
     }
 
     fn accepts_with_corrections(input: &str, output: &str, merge_duplicates: bool) -> bool {
