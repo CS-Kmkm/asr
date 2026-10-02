@@ -139,8 +139,10 @@ impl SearchSite {
         for phrase in ja_phrases {
             query = query.replace(phrase, " ");
         }
+        // Whole words only, so a query such as "research" or "Pathfinder"
+        // keeps its text.
         for phrase in ["search for", "look up", "find", "search"] {
-            query = replace_ascii_phrase_case_insensitive(&query, phrase, " ");
+            query = replace_ascii_word_case_insensitive(&query, phrase, " ");
         }
         for phrase in [" on ", " using ", " please ", " for "] {
             query = replace_ascii_phrase_case_insensitive(&query, phrase, " ");
@@ -553,6 +555,22 @@ mod tests {
         assert_eq!(
             SearchSite::AmazonJapan.derive_search_query("アマゾンでコーヒー豆を検索"),
             "コーヒー豆"
+        );
+    }
+
+    #[test]
+    fn search_command_words_are_not_stripped_from_inside_query_words() {
+        assert_eq!(
+            SearchSite::Google.derive_search_query("Search Google for research papers"),
+            "research papers"
+        );
+        assert_eq!(
+            SearchSite::YouTube.derive_search_query("find Pathfinder on YouTube"),
+            "Pathfinder"
+        );
+        assert_eq!(
+            SearchSite::GitHub.derive_search_query("search GitHub for lookup tables"),
+            "lookup tables"
         );
     }
 
