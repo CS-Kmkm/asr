@@ -44,7 +44,6 @@ export function SettingsPage({
   const testRunningRef = useRef(false);
   const mountedRef = useRef(false);
   const testStartPromiseRef = useRef<Promise<void> | null>(null);
-  const suppressTranslationHotkeyBlurRef = useRef(false);
   const suppressTranslationInstructionBlurRef = useRef(false);
   const savedShortcutsJsonRef = useRef(JSON.stringify(settings.shortcuts));
 
@@ -158,13 +157,8 @@ export function SettingsPage({
     saveShortcuts({ ...shortcuts, [mode]: shortcuts[mode].filter((_, item) => item !== index) });
   }
 
-  function commitTranslationHotkey() {
-    if (translationHotkey !== settings.translationHotkey) onSave({ translationHotkey });
-  }
-
   function commitShortcuts() {
     const next = Object.fromEntries(Object.entries(shortcuts).map(([mode, chords]) => [mode, chords.map((chord) => chord.trim())])) as Settings["shortcuts"];
-    const allChords = [...Object.values(next).flat(), translationHotkey.trim()];
     if (Object.values(next).some((chords) => chords.length < 1 || chords.length > 4 || chords.some((chord) => !chord))) {
       setShortcutError(t("Each voice mode needs one to four non-empty shortcuts."));
       return;
@@ -199,7 +193,10 @@ export function SettingsPage({
       return;
     }
     setShortcutError(null);
-    if (JSON.stringify(next) !== JSON.stringify(settings.shortcuts)) onSave({ shortcuts: next });
+    const nextTranslationHotkey = translationHotkey.trim();
+    if (JSON.stringify(next) !== JSON.stringify(settings.shortcuts) || nextTranslationHotkey !== settings.translationHotkey) {
+      onSave({ shortcuts: next, translationHotkey: nextTranslationHotkey });
+    }
   }
 
   function moveTargetLanguage(index: number, direction: -1 | 1) {
@@ -284,17 +281,14 @@ export function SettingsPage({
               <button type="button" className="secondary" disabled={shortcuts[mode].length >= 4} onClick={() => addShortcut(mode)}>{t("Add shortcut")}</button>
             </div>} />
         ))}
-        <button type="button" className="primary shortcut-save" onClick={commitShortcuts}>{t("Save voice shortcuts")}</button>
         {shortcutError && <p className="settings-error" role="alert">{shortcutError}</p>}
         {startupShortcutWarning && <p className="settings-error" role="alert">{t("Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.")}</p>}
         <SettingRow title={t("Selected-text translation hotkey")} detail={t("Translates selected text; the default is Ctrl+Shift+T.")}
-          control={<input value={translationHotkey} aria-label={t("Selected-text translation hotkey")} onChange={(event) => setTranslationHotkey(event.target.value)} onBlur={() => {
-            if (suppressTranslationHotkeyBlurRef.current) { suppressTranslationHotkeyBlurRef.current = false; return; }
-            commitTranslationHotkey();
-          }} onKeyDown={(event) => {
-            if (event.key === "Enter") { event.preventDefault(); commitTranslationHotkey(); suppressTranslationHotkeyBlurRef.current = true; event.currentTarget.blur(); }
-            if (event.key === "Escape") { setTranslationHotkey(settings.translationHotkey); suppressTranslationHotkeyBlurRef.current = true; event.currentTarget.blur(); }
+          control={<input value={translationHotkey} aria-label={t("Selected-text translation hotkey")} onChange={(event) => { setTranslationHotkey(event.target.value); setShortcutError(null); }} onKeyDown={(event) => {
+            if (event.key === "Enter") { event.preventDefault(); commitShortcuts(); event.currentTarget.blur(); }
+            if (event.key === "Escape") { setTranslationHotkey(settings.translationHotkey); setShortcutError(null); event.currentTarget.blur(); }
           }} />} />
+        <button type="button" className="primary shortcut-save" onClick={commitShortcuts}>{t("Save shortcuts")}</button>
         <SettingRow title={t("Voice Translate target")} detail={`${t("The first language is the default. Reorder the list or choose the active target.")} ${t("Voice and selected-text Translate send text to the provider shown under AI text correction, even when correction is off.")} ${t("Provider:")} ${settings.correctionProvider === "openai" ? "OpenAI" : settings.correctionProvider === "gemini" ? "Google Gemini" : t("Local (OpenAI-compatible)")}.`}
           control={<div className="translation-target-settings">
             <select value={settings.translationTargetLanguage} onChange={(event) => onSave({ translationTargetLanguage: event.target.value })}>

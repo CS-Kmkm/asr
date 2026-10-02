@@ -1991,6 +1991,45 @@ mod tests {
     }
 
     #[test]
+    fn selected_text_and_voice_shortcuts_swap_in_one_persisted_update() {
+        let storage = Storage::in_memory().unwrap();
+        let previous = storage.get_settings().unwrap();
+        let old_routes = shortcuts::Routes::parse(&previous).unwrap();
+        let mut settings = previous.clone();
+        settings.translation_hotkey = previous.shortcuts.translate[0].clone();
+        assert!(shortcuts::desired_routes_for_update(&previous, &settings, &old_routes).is_err());
+        settings.shortcuts.translate[0] = previous.translation_hotkey.clone();
+        let desired =
+            shortcuts::desired_routes_for_update(&previous, &settings, &old_routes).unwrap();
+        shortcuts::update_registrations(
+            &old_routes,
+            &desired,
+            |_| -> Result<(), &str> { panic!("swapping existing chords needs no registration") },
+            |_| -> Result<(), &str> { panic!("swapping existing chords needs no removal") },
+            || persist_settings(&storage, &settings),
+        )
+        .unwrap();
+        let saved = storage.get_settings().unwrap();
+        assert_eq!(saved.translation_hotkey, previous.shortcuts.translate[0]);
+        assert_eq!(saved.shortcuts.translate[0], previous.translation_hotkey);
+        let routes = shortcuts::Routes::parse(&saved).unwrap();
+        assert_eq!(
+            routes
+                .find(crate::parse_shortcut(&saved.translation_hotkey).unwrap())
+                .unwrap()
+                .action,
+            shortcuts::Action::SelectedText
+        );
+        assert_eq!(
+            routes
+                .find(crate::parse_shortcut(&saved.shortcuts.translate[0]).unwrap())
+                .unwrap()
+                .action,
+            shortcuts::Action::Translate
+        );
+    }
+
+    #[test]
     fn failed_update_settings_write_keeps_history_and_settings() {
         let dir = tempfile::tempdir().unwrap();
         let database = dir.path().join("settings.sqlite");
