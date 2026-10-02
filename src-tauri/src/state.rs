@@ -26,6 +26,8 @@ struct PipelineOperation {
     mode: PipelineMode,
     phase: PipelinePhase,
     cancel: watch::Sender<bool>,
+    /// Successful side effects seal cancellation until the owner finishes.
+    committed: bool,
 }
 
 pub struct PipelineLifecycle {
@@ -60,6 +62,7 @@ impl PipelineLifecycle {
             mode,
             phase: PipelinePhase::Starting,
             cancel,
+            committed: false,
         });
         Ok(id)
     }
@@ -106,7 +109,7 @@ impl PipelineLifecycle {
         let Some(operation) = inner.as_ref() else {
             return Ok(None);
         };
-        if *operation.cancel.borrow() {
+        if operation.committed || *operation.cancel.borrow() {
             return Ok(None);
         }
         operation.cancel.send_replace(true);
@@ -147,6 +150,35 @@ impl PipelineLifecycle {
                     .map(|operation| *operation.cancel.borrow())
             })
             .unwrap_or(true)
+    }
+
+    /// Serialize a synchronous side effect with cancellation. On success the
+    /// operation stays owned and cannot be cancelled until completion is
+    /// published and the owner calls `finish`. On failure it stays cancellable.
+    /// The callback must not re-enter this lifecycle or wait for an async task.
+    pub fn commit_side_effect<T, E>(
+        &self,
+        id: u64,
+        commit: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Result<T, E>, &'static str> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "pipeline lifecycle is unavailable")?;
+        let operation = inner
+            .as_mut()
+            .filter(|operation| {
+                operation.id == id
+                    && operation.phase == PipelinePhase::Processing
+                    && !operation.committed
+                    && !*operation.cancel.borrow()
+            })
+            .ok_or("pipeline operation was cancelled")?;
+        let result = commit();
+        if result.is_ok() {
+            operation.committed = true;
+        }
+        Ok(result)
     }
 
     fn transition(
@@ -321,5 +353,120 @@ mod tests {
         assert!(lifecycle.mark_recording(id).is_err());
         lifecycle.finish(id);
         assert_eq!(lifecycle.phase(), PipelinePhase::Idle);
+    }
+
+    fn start_processing_search(lifecycle: &PipelineLifecycle) -> (u64, watch::Receiver<bool>) {
+        let id = lifecycle.begin_start(PipelineMode::Ask).unwrap();
+        lifecycle.mark_recording(id).unwrap();
+        let (_, _, cancel) = lifecycle.begin_processing().unwrap();
+        (id, cancel)
+    }
+
+    #[test]
+    fn search_cancel_before_launch_prevents_all_publication() {
+        let lifecycle = PipelineLifecycle::default();
+        let (id, _) = start_processing_search(&lifecycle);
+        let state = AppState::default();
+        lifecycle.cancel().unwrap();
+        let mut launched = false;
+        let result = lifecycle.commit_side_effect(id, || {
+            launched = true;
+            Ok::<(), ()>(())
+        });
+        if matches!(result, Ok(Ok(()))) {
+            state.complete("query".into(), "opened".into());
+        }
+        assert!(result.is_err());
+        assert!(!launched);
+        assert_eq!(state.snapshot().phase, AppPhase::Idle);
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_err());
+    }
+
+    #[test]
+    fn search_cancel_during_launch_observes_commit_and_completion_keeps_ownership() {
+        use std::sync::{mpsc, Arc};
+
+        let lifecycle = Arc::new(PipelineLifecycle::default());
+        let state = Arc::new(AppState::default());
+        let (id, cancel) = start_processing_search(&lifecycle);
+        let (launch_started, wait_started) = mpsc::channel();
+        let (release_launch, wait_release) = mpsc::channel();
+        let launcher = {
+            let lifecycle = lifecycle.clone();
+            let state = state.clone();
+            std::thread::spawn(move || {
+                lifecycle
+                    .commit_side_effect(id, || {
+                        launch_started.send(()).unwrap();
+                        wait_release.recv().unwrap();
+                        Ok::<(), ()>(())
+                    })
+                    .unwrap()
+                    .unwrap();
+                // Represents History and Completed publication after launch.
+                state.complete("query".into(), "opened".into());
+            })
+        };
+        wait_started.recv().unwrap();
+        let (cancel_requested, wait_cancel) = mpsc::channel();
+        let canceller = {
+            let lifecycle = lifecycle.clone();
+            std::thread::spawn(move || {
+                cancel_requested.send(()).unwrap();
+                lifecycle.cancel().unwrap()
+            })
+        };
+        wait_cancel.recv().unwrap();
+        assert!(lifecycle.inner.try_lock().is_err());
+        release_launch.send(()).unwrap();
+        launcher.join().unwrap();
+        assert_eq!(canceller.join().unwrap(), None);
+        assert!(!*cancel.borrow());
+        assert_eq!(lifecycle.cancel().unwrap(), None);
+        assert_eq!(state.snapshot().phase, AppPhase::Completed);
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_err());
+        assert!(lifecycle
+            .commit_side_effect(id, || Ok::<(), ()>(()))
+            .is_err());
+        lifecycle.finish(id);
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_ok());
+    }
+
+    #[test]
+    fn failed_search_launch_remains_cancellable() {
+        let lifecycle = PipelineLifecycle::default();
+        let (id, cancel) = start_processing_search(&lifecycle);
+        assert_eq!(
+            lifecycle
+                .commit_side_effect(id, || Err::<(), _>("launch failed"))
+                .unwrap(),
+            Err("launch failed")
+        );
+        assert_eq!(
+            lifecycle.cancel().unwrap(),
+            Some((id, PipelinePhase::Processing))
+        );
+        assert!(*cancel.borrow());
+    }
+
+    #[test]
+    fn stale_search_cannot_launch_under_a_new_operation() {
+        let lifecycle = PipelineLifecycle::default();
+        let (old_id, _) = start_processing_search(&lifecycle);
+        lifecycle.finish(old_id);
+        let (new_id, _) = start_processing_search(&lifecycle);
+        let mut launched = false;
+        assert!(lifecycle
+            .commit_side_effect(old_id, || {
+                launched = true;
+                Ok::<(), ()>(())
+            })
+            .is_err());
+        assert!(!launched);
+        assert!(!lifecycle.is_cancelled(new_id));
+        assert_eq!(
+            lifecycle.cancel().unwrap(),
+            Some((new_id, PipelinePhase::Processing))
+        );
     }
 }
