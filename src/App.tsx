@@ -8,6 +8,10 @@ import {
   cycleVoiceTranslationTarget,
   defaultSettings,
   deleteDictionaryEntry,
+  deleteHistoryItem,
+  deleteAllHistory,
+  getHistoryAudio,
+  retryHistoryItem,
   getAppState,
   getAskAnswer,
   dismissAskAnswer,
@@ -34,6 +38,7 @@ import type {
   DictionaryEntryInput,
   GpuDiagnostics,
   HistoryItem,
+  HistoryFilter,
   ModelProgress,
   ModelStatus,
   Settings,
@@ -129,11 +134,13 @@ const MODEL_PREPARATION_KINDS = ["model_loading", "model_downloading"];
 
 const WARNING_STATUS_KINDS = new Set([
   "artifact_cleanup_failed",
+  "history_audio_unavailable",
+  "history_audio_and_metric_save_failed",
+  "history_save_failed",
   "autostart_update_failed",
   "clipboard_only",
   "gpu_unavailable",
   "history_and_metric_save_failed",
-  "history_save_failed",
   "history_metric_save_failed",
   "hotkey_unavailable",
   "metric_save_failed",
@@ -371,6 +378,9 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   });
   const [settings, setSettings] = useState<Settings>(defaultSettings);
   const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [historyFilter, setHistoryFilter] = useState<HistoryFilter>("all");
+  const historyFilterRef = useRef<HistoryFilter>("all");
+  const historyRequestRef = useRef(0);
   const [model, setModel] = useState<ModelStatus | null>(null);
   const [modelLoading, setModelLoading] = useState(false);
   const [modelProgress, setModelProgress] = useState<ModelProgress | null>(null);
@@ -388,6 +398,10 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const [dictionary, setDictionary] = useState<DictionaryEntry[]>([]);
 
   useEffect(() => {
+    historyFilterRef.current = historyFilter;
+  }, [historyFilter]);
+
+  useEffect(() => {
     void getStartupHotkeyWarning().then(setStartupHotkeyWarnings).catch(() => {});
     Promise.all([
       getAppState(),
@@ -403,7 +417,9 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
           setState(nextState);
           setSettings(nextSettings);
           onLanguageChange(nextSettings.uiLanguage);
-          setHistory(nextHistory);
+          if (historyRequestRef.current === 0 && historyFilterRef.current === "all") {
+            setHistory(nextHistory);
+          }
           setModel(nextModel);
           setGpu(nextGpu);
           setDevices(nextDevices);
@@ -486,6 +502,14 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     }
   }
 
+  async function refreshHistory(filter: HistoryFilter = historyFilterRef.current) {
+    const request = ++historyRequestRef.current;
+    const items = await listHistory(filter);
+    if (request === historyRequestRef.current && filter === historyFilterRef.current) {
+      setHistory(items);
+    }
+  }
+
   async function saveSettings(patch: Partial<Settings>) {
     const previous = settings;
     const next = { ...settings, ...patch };
@@ -513,6 +537,11 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     } catch (error) {
       setSettings(previous);
       showNotice(String(error), "error");
+      return;
+    }
+    if (patch.historyRetention !== undefined || patch.deleteAudioAfterProcessing !== undefined) {
+      try { await refreshHistory(); }
+      catch (error) { showNotice(String(error), "error"); }
     }
   }
 
@@ -538,7 +567,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       if (state.phase === "recording") {
         await stopRecording();
         try {
-          setHistory(await listHistory());
+          await refreshHistory();
         } catch {
           showNotice(t("Recording completed, but history could not be refreshed."), "warning");
         }
@@ -630,6 +659,30 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     } catch (error) {
       showNotice(String(error), "error");
     }
+  }
+
+  async function removeHistory(id: number) {
+    try { await deleteHistoryItem(id); await refreshHistory(); }
+    catch (error) { showNotice(String(error), "error"); }
+  }
+
+  async function clearHistory() {
+    try { await deleteAllHistory(); historyRequestRef.current += 1; setHistory([]); showNotice(t("History deleted."), "success"); }
+    catch (error) { showNotice(String(error), "error"); }
+  }
+
+  async function reportHistoryAudioFailure() {
+    showNotice(t("The recording could not be loaded. History was refreshed."), "error");
+    try { await refreshHistory(); }
+    catch { /* The notice already reports the unavailable recording. */ }
+  }
+
+  async function retryHistory(id: number) {
+    try {
+      await retryHistoryItem(id);
+      await refreshHistory();
+      showNotice(t("History retry completed."), "success");
+    } catch (error) { showNotice(String(error), "error"); }
   }
 
   return (
@@ -724,8 +777,21 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
           <HistoryPage
             settings={settings}
             history={history}
+            filter={historyFilter}
             onSave={(patch) => void saveSettings(patch)}
             onCopyItem={(text) => void copyHistoryText(text)}
+            onFilter={(filter) => {
+              setHistoryFilter(filter);
+              historyFilterRef.current = filter;
+              void refreshHistory(filter).catch((error) => showNotice(String(error), "error"));
+            }}
+            onRetry={(id) => void retryHistory(id)}
+            onDelete={(id) => void removeHistory(id)}
+            onDeleteAll={() => void clearHistory()}
+            onLoadAudio={getHistoryAudio}
+            onAudioError={() => void reportHistoryAudioFailure()}
+            retryActive={state.phase === "processing" && state.message === "Retrying the saved recording."}
+            onCancelRetry={() => void cancelRecording()}
           />
         )}
 

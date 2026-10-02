@@ -13,18 +13,8 @@ export function PrivacyPage({
   return (
     <section className="panel">
       <SettingRow
-        title={t("Save text history")}
-        detail={t("When disabled, transcript and processed text are never inserted into dictation_history.")}
-        control={
-          <Toggle
-            checked={settings.historyEnabled}
-            onChange={(value) => onSave({ historyEnabled: value })}
-          />
-        }
-      />
-      <SettingRow
         title={t("Delete audio after processing")}
-        detail={t("Audio cleanup is enabled by default.")}
+        detail={t("On by default: new recordings are deleted after processing and are not kept for History playback, download, or Retry. Turning this on keeps recordings already saved in History until you delete them there or History retention removes them.")}
         control={
           <Toggle
             checked={settings.deleteAudioAfterProcessing}
@@ -37,12 +27,15 @@ export function PrivacyPage({
         detail={t("Text history cleanup window.")}
         control={
           <select
-            value={settings.historyRetentionDays}
-            onChange={(e) => onSave({ historyRetentionDays: Number(e.target.value) })}
+            value={settings.historyRetention}
+            onChange={(e) => onSave({ historyRetention: e.target.value as Settings["historyRetention"] })}
           >
-            <option value={7}>{t("7 days")}</option>
-            <option value={30}>{t("30 days")}</option>
-            <option value={90}>{t("90 days")}</option>
+            <option value="never">{t("Never")}</option>
+            <option value="24_hours">{t("24 hours")}</option>
+            <option value="one_week">{t("1 week")}</option>
+            <option value="one_month">{t("1 month")}</option>
+            <option value="one_year">{t("1 year")}</option>
+            <option value="forever">{t("Forever")}</option>
           </select>
         }
       />

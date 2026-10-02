@@ -355,6 +355,31 @@ pub fn validate_action(
     Ok(action)
 }
 
+/// Re-plan a retained Ask search without granting the planner authority to
+/// change its originally stored fixed site or open anything.
+pub fn validate_fixed_search_retry_plan(
+    raw: &str,
+    spoken_instruction: &str,
+    stored_site: SearchSite,
+    translation_languages: &[String],
+) -> Result<String, AskError> {
+    let action = validate_action(
+        parse_plan(raw)?,
+        AskContextKind::Caret,
+        spoken_instruction,
+        translation_languages,
+    )?;
+    let AskAction::Search { site } = action else {
+        return Err(AskError::Policy);
+    };
+    if site != stored_site {
+        return Err(AskError::Policy);
+    }
+    let query = spoken_instruction.trim();
+    site.fixed_url(query)?;
+    Ok(query.to_string())
+}
+
 pub fn planning_prompt(context: AskContextKind) -> String {
     let (context, allowed) = match context {
         AskContextKind::Selected => (
@@ -573,5 +598,27 @@ mod tests {
             source
         );
         assert!(!generation_prompt(&AskAction::Rewrite).contains(source));
+    }
+
+    #[test]
+    fn fixed_search_retry_accepts_only_the_stored_site() {
+        let plan = r#"{"version":1,"action":{"kind":"search","site":"github"}}"#;
+        assert_eq!(
+            validate_fixed_search_retry_plan(
+                plan,
+                "Search GitHub for Rust",
+                SearchSite::GitHub,
+                &languages()
+            )
+            .unwrap(),
+            "Search GitHub for Rust"
+        );
+        assert!(validate_fixed_search_retry_plan(
+            plan,
+            "Search GitHub for Rust",
+            SearchSite::Google,
+            &languages()
+        )
+        .is_err());
     }
 }

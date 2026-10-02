@@ -43,8 +43,7 @@ export interface Settings {
   translationTargetLanguages: string[];
   translationTargetLanguage: string;
   microphoneId: string | null;
-  historyEnabled: boolean;
-  historyRetentionDays: number;
+  historyRetention: HistoryRetention;
   deleteAudioAfterProcessing: boolean;
   autoStart: boolean;
   clipboardRestore: boolean;
@@ -76,6 +75,8 @@ export interface Settings {
 }
 
 export type UiLanguage = "en" | "ja";
+export type HistoryRetention = "never" | "24_hours" | "one_week" | "one_month" | "one_year" | "forever";
+export type HistoryFilter = "all" | "dictate" | "translate" | "edit" | "ask";
 
 export type AsrBackend = "vibevoice" | "faster-whisper" | "openai-compatible";
 export type ModelQuantization = "4bit" | "8bit" | "bf16";
@@ -104,6 +105,14 @@ export interface HistoryItem {
   durationMs: number | null;
   latencyMs: number | null;
   createdAt: string;
+  hasAudio: boolean;
+  retryOfId: number | null;
+}
+
+export interface HistoryAudioPayload {
+  bytes: number[];
+  filename: string;
+  mimeType: string;
 }
 
 export interface ModelStatus {

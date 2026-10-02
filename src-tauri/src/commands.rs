@@ -1,5 +1,50 @@
 use super::*;
 
+fn save_history(
+    storage: &Storage,
+    item: &NewHistoryItem<'_>,
+    audio_path: Option<&std::path::Path>,
+) -> HistorySaveStatus {
+    match storage.add_history_with_audio_report(item, audio_path) {
+        Ok((_, true)) => HistorySaveStatus::AudioUnavailable,
+        Ok((_, false)) => HistorySaveStatus::Complete,
+        Err(_) => HistorySaveStatus::Failed,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistorySaveStatus {
+    Complete,
+    AudioUnavailable,
+    Failed,
+}
+
+fn report_history_save_warning(app: &AppHandle, status: HistorySaveStatus) {
+    match status {
+        HistorySaveStatus::Complete => {}
+        HistorySaveStatus::AudioUnavailable => emit_status(
+            app,
+            "history_audio_unavailable",
+            "History text was saved, but the recording could not be retained.",
+        ),
+        HistorySaveStatus::Failed => emit_status(
+            app,
+            "history_save_failed",
+            "The result completed, but History could not be saved.",
+        ),
+    }
+}
+
+fn report_temp_cleanup(app: &AppHandle, artifact: &mut TempArtifact) {
+    if artifact.cleanup().is_err() {
+        emit_status(
+            app,
+            "artifact_cleanup_failed",
+            "Temporary audio cleanup failed.",
+        );
+    }
+}
+
 fn capture_config(settings: &Settings) -> CaptureConfig {
     let noise_suppression = match settings.noise_suppression.as_str() {
         "off" => NoiseSuppressionLevel::Off,
@@ -48,12 +93,13 @@ fn edit_insertion_outcome<E, F>(
 fn persist_edit_completion(
     storage: &Storage,
     item: &NewHistoryItem<'_>,
+    audio_path: Option<&std::path::Path>,
     provider: &str,
     elapsed_ms: i64,
-) -> (bool, bool) {
+) -> (HistorySaveStatus, bool) {
     // The target may already have accepted a paste. Persistence is best effort
     // so a database failure cannot turn that completed edit into command failure.
-    let history_failed = storage.add_history(item).is_err();
+    let history_status = save_history(storage, item, audio_path);
     let metric_failed = storage
         .add_metric(
             "speak_to_edit",
@@ -63,7 +109,7 @@ fn persist_edit_completion(
             None,
         )
         .is_err();
-    (history_failed, metric_failed)
+    (history_status, metric_failed)
 }
 
 /// This warning follows, and visually replaces, the completion notice. Only a
@@ -499,7 +545,9 @@ pub(crate) async fn stop_recording(
     let mut artifact_cleanup = artifact_cleanup
         .take()
         .expect("successful audio has cleanup ownership");
-    artifact_cleanup.retain = !settings.delete_audio_after_processing;
+    // The temporary capture remains cleanup-owned until any retained History
+    // copy has committed. History never takes ownership of this path.
+    artifact_cleanup.retain = false;
     if services.lifecycle.is_cancelled(operation_id) {
         emit_state(&app, &state, AppPhase::Idle, cancel_message);
         return Err(cancel_error.into());
@@ -513,17 +561,10 @@ pub(crate) async fn stop_recording(
         .transcriber
         .transcribe(&artifact.path, prompt.as_deref(), cancel)
         .await;
-    let cleanup_result = artifact_cleanup.cleanup();
     let transcript = match transcript_result {
         Ok(value) => value,
         Err(asr::AsrError::Cancelled) => {
-            if cleanup_result.is_err() {
-                emit_status(
-                    &app,
-                    "artifact_cleanup_failed",
-                    "Temporary audio cleanup failed.",
-                );
-            }
+            report_temp_cleanup(&app, &mut artifact_cleanup);
             emit_state(&app, &state, AppPhase::Idle, cancel_message);
             return Err(cancel_error.into());
         }
@@ -541,23 +582,10 @@ pub(crate) async fn stop_recording(
                 AppPhase::Error,
                 "Transcription failed. Check model and GPU diagnostics.",
             );
-            if cleanup_result.is_err() {
-                emit_status(
-                    &app,
-                    "artifact_cleanup_failed",
-                    "Temporary audio cleanup failed.",
-                );
-            }
+            report_temp_cleanup(&app, &mut artifact_cleanup);
             return Err(command_error(error));
         }
     };
-    if cleanup_result.is_err() {
-        emit_status(
-            &app,
-            "artifact_cleanup_failed",
-            "Temporary audio cleanup failed.",
-        );
-    }
     if services.lifecycle.is_cancelled(operation_id) {
         emit_state(&app, &state, AppPhase::Idle, cancel_message);
         return Err(cancel_error.into());
@@ -654,7 +682,7 @@ pub(crate) async fn stop_recording(
             return Err(EDIT_CLIPBOARD_UNAVAILABLE.into());
         };
         let latency_ms = started.elapsed().as_millis() as u64;
-        let (history_failed, metric_failed) = persist_edit_completion(
+        let (history_save_status, metric_failed) = persist_edit_completion(
             &storage,
             &NewHistoryItem {
                 transcript_text: &instruction_text,
@@ -670,7 +698,9 @@ pub(crate) async fn stop_recording(
                 app_category: None,
                 duration_ms: Some(duration_ms as i64),
                 latency_ms: Some(latency_ms as i64),
+                retry_of_id: None,
             },
+            Some(&artifact.path),
             settings.correction_provider.as_str(),
             edit_started.elapsed().as_millis() as i64,
         );
@@ -688,11 +718,19 @@ pub(crate) async fn stop_recording(
         let snapshot = state.complete(edited.clone(), completion.into());
         let _ = app.emit("app-state", snapshot);
         emit_status(&app, insertion_label, completion);
-        if let Some((kind, message)) =
-            edit_persistence_warning(insertion, history_failed, metric_failed)
-        {
+        let warning = if history_save_status == HistorySaveStatus::AudioUnavailable {
+            completion_persistence_warning(history_save_status, metric_failed)
+        } else {
+            edit_persistence_warning(
+                insertion,
+                history_save_status == HistorySaveStatus::Failed,
+                metric_failed,
+            )
+        };
+        if let Some((kind, message)) = warning {
             emit_status(&app, kind, message);
         }
+        report_temp_cleanup(&app, &mut artifact_cleanup);
         return Ok(RecordingResult {
             text: edited,
             insertion: insertion_label.into(),
@@ -717,6 +755,7 @@ pub(crate) async fn stop_recording(
             &transcript.model,
             duration_ms,
             started,
+            Some(&artifact.path),
         )
         .await;
         if result.is_ok() {
@@ -732,6 +771,7 @@ pub(crate) async fn stop_recording(
                 emit_state(&app, &state, AppPhase::Error, error);
             }
         }
+        report_temp_cleanup(&app, &mut artifact_cleanup);
         return result;
     }
     let mut draft = draft
@@ -946,29 +986,34 @@ pub(crate) async fn stop_recording(
             InsertResult::PasteUnverified => "paste_unverified",
         }
     };
-    let history_result = storage.add_history(&NewHistoryItem {
-        transcript_text: &transcript.text,
-        processed_text: processed_text.as_deref(),
-        source_text: None,
-        instruction_text: None,
-        action_kind: None,
-        search_site: None,
-        mode: if mode == PipelineMode::Translate {
-            "translate"
-        } else if processed_text.is_some() {
-            "ai_corrected"
-        } else if correction_failed {
-            "faithful_fallback"
-        } else {
-            "faithful"
+    let history_save_status = save_history(
+        &storage,
+        &NewHistoryItem {
+            transcript_text: &transcript.text,
+            processed_text: processed_text.as_deref(),
+            source_text: None,
+            instruction_text: None,
+            action_kind: None,
+            search_site: None,
+            mode: if mode == PipelineMode::Translate {
+                "translate"
+            } else if processed_text.is_some() {
+                "ai_corrected"
+            } else if correction_failed {
+                "faithful_fallback"
+            } else {
+                "faithful"
+            },
+            asr_provider: &transcript.model,
+            llm_provider: llm_provider.as_deref(),
+            target_language: translation_target.as_deref(),
+            app_category: None,
+            duration_ms: Some(duration_ms as i64),
+            latency_ms: Some(latency_ms as i64),
+            retry_of_id: None,
         },
-        asr_provider: &transcript.model,
-        llm_provider: llm_provider.as_deref(),
-        target_language: translation_target.as_deref(),
-        app_category: None,
-        duration_ms: Some(duration_ms as i64),
-        latency_ms: Some(latency_ms as i64),
-    });
+        Some(&artifact.path),
+    );
     let metric_result = storage.add_metric(
         if mode == PipelineMode::Translate {
             "voice_translate"
@@ -1005,10 +1050,11 @@ pub(crate) async fn stop_recording(
     let _ = app.emit("app-state", snapshot);
     emit_status(&app, insertion_label, completion);
     if let Some((kind, message)) =
-        persistence_warning(history_result.is_err(), metric_result.is_err())
+        completion_persistence_warning(history_save_status, metric_result.is_err())
     {
         emit_status(&app, kind, message);
     }
+    report_temp_cleanup(&app, &mut artifact_cleanup);
     Ok(RecordingResult {
         text: final_text,
         insertion: insertion_label.into(),
@@ -1029,6 +1075,7 @@ async fn finish_ask(
     asr_provider: &str,
     duration_ms: u64,
     started: Instant,
+    audio_path: Option<&std::path::Path>,
 ) -> Result<RecordingResult, String> {
     use ask::{AskAction, AskError};
     if services.lifecycle.is_cancelled(operation_id) {
@@ -1120,8 +1167,9 @@ async fn finish_ask(
             .commit_side_effect(operation_id, || open_fixed_search(&url))
             .map_err(|_| "ask was cancelled".to_string())??;
         let latency_ms = started.elapsed().as_millis() as u64;
-        if storage
-            .add_history(&NewHistoryItem {
+        let history_save_status = save_history(
+            storage,
+            &NewHistoryItem {
                 transcript_text: spoken,
                 processed_text: Some(&query),
                 source_text: session.selected_source(),
@@ -1135,17 +1183,13 @@ async fn finish_ask(
                 app_category: None,
                 duration_ms: Some(duration_ms as i64),
                 latency_ms: Some(latency_ms as i64),
-            })
-            .is_err()
-        {
-            emit_status(
-                app,
-                "history_save_failed",
-                "Search opened, but History could not be saved.",
-            );
-        }
+                retry_of_id: None,
+            },
+            audio_path,
+        );
         let snapshot = state.complete(query.clone(), "Opening the requested fixed search.".into());
         let _ = app.emit("app-state", snapshot);
+        report_history_save_warning(app, history_save_status);
         return Ok(RecordingResult {
             text: query,
             insertion: "search".into(),
@@ -1270,8 +1314,9 @@ async fn finish_ask(
         return Err("ask was cancelled".into());
     }
     let latency_ms = started.elapsed().as_millis() as u64;
-    if storage
-        .add_history(&NewHistoryItem {
+    let history_save_status = save_history(
+        storage,
+        &NewHistoryItem {
             transcript_text: spoken,
             processed_text: Some(&output),
             source_text: session.selected_source(),
@@ -1288,15 +1333,10 @@ async fn finish_ask(
             app_category: None,
             duration_ms: Some(duration_ms as i64),
             latency_ms: Some(latency_ms as i64),
-        })
-        .is_err()
-    {
-        emit_status(
-            app,
-            "history_save_failed",
-            "Ask completed, but History could not be saved.",
-        );
-    }
+            retry_of_id: None,
+        },
+        audio_path,
+    );
     let message = if insertion == "paste_unverified" {
         "Ask insertion could not be confirmed; the result remains on the clipboard."
     } else if insertion == "clipboard_only" {
@@ -1306,6 +1346,7 @@ async fn finish_ask(
     };
     let snapshot = state.complete(output.clone(), message.into());
     let _ = app.emit("app-state", snapshot);
+    report_history_save_warning(app, history_save_status);
     Ok(RecordingResult {
         text: output,
         insertion: insertion.into(),
@@ -1395,6 +1436,44 @@ fn persistence_warning(
         )),
         (false, false) => None,
     }
+}
+
+fn completion_persistence_warning(
+    history_status: HistorySaveStatus,
+    metric_failed: bool,
+) -> Option<(&'static str, &'static str)> {
+    if history_status == HistorySaveStatus::AudioUnavailable {
+        return if metric_failed {
+            Some((
+                "history_audio_and_metric_save_failed",
+                "History text was saved, but the recording and usage metrics could not be retained.",
+            ))
+        } else {
+            Some((
+                "history_audio_unavailable",
+                "History text was saved, but the recording could not be retained.",
+            ))
+        };
+    }
+    persistence_warning(history_status == HistorySaveStatus::Failed, metric_failed)
+}
+
+/// The single persistence step of `update_settings`. Settings and their
+/// History retention (including the History-off purge) commit in one SQLite
+/// transaction, so a failed settings write cannot erase History and an insert
+/// cannot observe the old settings after the purge. Any failure runs
+/// `rollback` so registered shortcuts match the unchanged stored settings.
+fn persist_settings_or_rollback(
+    storage: &Storage,
+    settings: &Settings,
+    rollback: impl FnOnce(),
+) -> Result<(), String> {
+    storage
+        .update_settings_and_apply_history_policy(settings)
+        .map_err(|error| {
+            rollback();
+            command_error(error)
+        })
 }
 
 fn hotkey_changes(registered: &[Shortcut], desired: &[Shortcut]) -> (Vec<Shortcut>, Vec<Shortcut>) {
@@ -1700,6 +1779,144 @@ mod tests {
     use crate::audio::{AudioArtifact, AudioError, AudioFuture, CaptureState, LevelMeter};
 
     #[test]
+    fn retry_dictate_label_tracks_correction_even_when_text_is_unchanged() {
+        assert_eq!(retry_dictate_history_mode(Some("local")), "ai_corrected");
+        assert_eq!(retry_dictate_history_mode(None), "faithful");
+    }
+
+    #[test]
+    fn history_database_failure_is_reported_without_failing_completed_output() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("history-save-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let database = dir.join("test.db");
+        let storage = Storage::open(&database).unwrap();
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute("DROP TABLE dictation_history", [])
+            .unwrap();
+        let status = save_history(
+            &storage,
+            &NewHistoryItem {
+                transcript_text: "completed output",
+                processed_text: None,
+                source_text: None,
+                instruction_text: None,
+                action_kind: None,
+                search_site: None,
+                mode: "faithful",
+                asr_provider: "test",
+                llm_provider: None,
+                target_language: None,
+                app_category: None,
+                duration_ms: None,
+                latency_ms: None,
+                retry_of_id: None,
+            },
+            None,
+        );
+        assert_eq!(status, HistorySaveStatus::Failed);
+        drop(storage);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn settings_history_item() -> NewHistoryItem<'static> {
+        NewHistoryItem {
+            transcript_text: "private transcript",
+            processed_text: None,
+            source_text: None,
+            instruction_text: None,
+            action_kind: None,
+            search_site: None,
+            mode: "faithful",
+            asr_provider: "test",
+            llm_provider: None,
+            target_language: None,
+            app_category: None,
+            duration_ms: None,
+            latency_ms: None,
+            retry_of_id: None,
+        }
+    }
+
+    fn stored_history_rows(database: &std::path::Path) -> i64 {
+        rusqlite::Connection::open(database)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM dictation_history", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn update_settings_persistence_purges_history_in_the_settings_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("settings.sqlite");
+        let storage = Storage::open(&database).unwrap();
+        assert!(
+            storage
+                .add_history_with_audio_report(&settings_history_item(), None)
+                .unwrap()
+                .0
+        );
+        let settings = Settings {
+            history_retention: types::HistoryRetention::Never,
+            ..Settings::default()
+        };
+        let mut rolled_back = false;
+
+        persist_settings_or_rollback(&storage, &settings, || rolled_back = true).unwrap();
+
+        assert!(!rolled_back);
+        assert_eq!(
+            storage.get_settings().unwrap().history_retention,
+            types::HistoryRetention::Never
+        );
+        assert_eq!(stored_history_rows(&database), 0);
+    }
+
+    #[test]
+    fn failed_update_settings_write_keeps_history_and_rolls_back_shortcuts() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("settings.sqlite");
+        let storage = Storage::open(&database).unwrap();
+        assert!(
+            storage
+                .add_history_with_audio_report(&settings_history_item(), None)
+                .unwrap()
+                .0
+        );
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_settings_insert BEFORE INSERT ON settings
+                 BEGIN SELECT RAISE(ABORT, 'settings write rejected'); END;
+                 CREATE TRIGGER reject_settings_update BEFORE UPDATE ON settings
+                 BEGIN SELECT RAISE(ABORT, 'settings write rejected'); END;",
+            )
+            .unwrap();
+        let settings = Settings {
+            history_retention: types::HistoryRetention::Never,
+            ..Settings::default()
+        };
+        let mut rolled_back = false;
+
+        assert!(persist_settings_or_rollback(&storage, &settings, || rolled_back = true).is_err());
+
+        // The purge shares the failed settings transaction, so History-off
+        // cannot erase rows while the stored settings stay unchanged.
+        assert!(rolled_back);
+        assert_eq!(stored_history_rows(&database), 1);
+        assert_eq!(
+            storage.get_settings().unwrap().history_retention,
+            Settings::default().history_retention
+        );
+    }
+
+    #[test]
     fn edit_persistence_failure_does_not_skip_metrics_or_propagate() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("edit.sqlite");
@@ -1722,10 +1939,11 @@ mod tests {
             app_category: None,
             duration_ms: Some(100),
             latency_ms: Some(200),
+            retry_of_id: None,
         };
         assert_eq!(
-            persist_edit_completion(&storage, &item, "local", 200),
-            (true, false)
+            persist_edit_completion(&storage, &item, None, "local", 200),
+            (HistorySaveStatus::Failed, false)
         );
     }
 
@@ -1797,6 +2015,18 @@ mod tests {
         assert_eq!(
             persistence_warning(true, true).unwrap().0,
             "history_and_metric_save_failed"
+        );
+        assert_eq!(
+            completion_persistence_warning(HistorySaveStatus::AudioUnavailable, true)
+                .unwrap()
+                .0,
+            "history_audio_and_metric_save_failed"
+        );
+        assert_eq!(
+            completion_persistence_warning(HistorySaveStatus::AudioUnavailable, false)
+                .unwrap()
+                .0,
+            "history_audio_unavailable"
         );
     }
 
@@ -1979,14 +2209,14 @@ mod tests {
 
         // The save was based on settings read before cycling started.
         let mut saved = storage.get_settings().unwrap();
-        saved.history_enabled = false;
+        saved.history_retention = types::HistoryRetention::Never;
         storage.update_settings(&saved).unwrap();
         drop(settings_save);
 
         let cycled = cycling.join().unwrap().unwrap();
         assert_eq!(cycled.translation_target_language, "ja");
         let stored = storage.get_settings().unwrap();
-        assert!(!stored.history_enabled);
+        assert_eq!(stored.history_retention, types::HistoryRetention::Never);
         assert_eq!(stored.translation_target_language, "ja");
     }
 
@@ -2259,9 +2489,6 @@ pub(crate) async fn update_settings(
         return Err("Ask hotkey cannot be empty".into());
     }
     validate_translation_targets(&settings)?;
-    if !(1..=3650).contains(&settings.history_retention_days) {
-        return Err("history retention must be between 1 and 3650 days".into());
-    }
     if !["off", "low", "medium", "high"].contains(&settings.noise_suppression.as_str()) {
         return Err("noise suppression must be off, low, medium, or high".into());
     }
@@ -2425,14 +2652,9 @@ pub(crate) async fn update_settings(
             &hotkeys.active,
             &previous_hotkeys,
         )?;
-        if let Err(error) = storage.apply_history_policy(&previous, &settings) {
-            rollback_hotkey_update(&mut registrar, &mut registered, &update);
-            return Err(command_error(error));
-        }
-        if let Err(error) = storage.update_settings(&settings) {
-            rollback_hotkey_update(&mut registrar, &mut registered, &update);
-            return Err(command_error(error));
-        }
+        persist_settings_or_rollback(&storage, &settings, || {
+            rollback_hotkey_update(&mut registrar, &mut registered, &update)
+        })?;
         (previous, update.unavailable)
     };
     // Preserve warnings for saved legacy collisions and unavailable chords.
@@ -2492,12 +2714,298 @@ pub(crate) async fn update_settings(
 
 #[tauri::command]
 pub(crate) fn list_history(
+    filter: Option<types::HistoryFilter>,
     limit: Option<u32>,
     storage: State<'_, Storage>,
 ) -> Result<Vec<HistoryItem>, String> {
     storage
-        .list_history(limit.unwrap_or(100))
+        .list_history(
+            filter.unwrap_or(types::HistoryFilter::All),
+            limit.unwrap_or(100),
+        )
         .map_err(command_error)
+}
+
+#[tauri::command]
+pub(crate) fn delete_history_item(id: i64, storage: State<'_, Storage>) -> Result<bool, String> {
+    storage.delete_history(id).map_err(command_error)
+}
+
+#[tauri::command]
+pub(crate) fn delete_all_history(storage: State<'_, Storage>) -> Result<u64, String> {
+    storage.delete_all_history().map_err(command_error)
+}
+
+#[tauri::command]
+pub(crate) fn get_history_audio(
+    id: i64,
+    storage: State<'_, Storage>,
+) -> Result<types::HistoryAudioPayload, String> {
+    storage
+        .history_audio(id)
+        .map_err(command_error)?
+        .ok_or_else(|| "history audio is unavailable".into())
+}
+
+#[tauri::command]
+pub(crate) async fn retry_history_item(
+    id: i64,
+    app: AppHandle,
+    services: State<'_, Services>,
+    state: State<'_, AppState>,
+    storage: State<'_, Storage>,
+) -> Result<RecordingResult, String> {
+    let source = storage
+        .history_item(id)
+        .map_err(command_error)?
+        .ok_or_else(|| "history item not found".to_string())?;
+    let mode = history_pipeline_mode(&source.mode)?;
+    let (operation_id, cancel) = services
+        .lifecycle
+        .begin_retry(mode)
+        .map_err(str::to_string)?;
+    let _guard = PipelineGuard {
+        lifecycle: &services.lifecycle,
+        id: operation_id,
+    };
+    let mut retry_cleanup = None;
+    let result = async {
+        emit_state(
+            &app,
+            &state,
+            AppPhase::Processing,
+            "Retrying the saved recording.",
+        );
+        let retry_path = storage
+            .copy_history_audio_for_retry(id)
+            .map_err(command_error)?;
+        retry_cleanup = Some(TempArtifact::new(retry_path.clone(), false));
+        if services.lifecycle.is_cancelled(operation_id) {
+            return Err("history retry was cancelled".into());
+        }
+        let started = Instant::now();
+        let settings = storage.get_settings().map_err(command_error)?;
+        let prompt_terms = storage.dictionary_prompt_terms().unwrap_or_default();
+        let prompt = (!prompt_terms.is_empty()).then(|| prompt_terms.join("\n"));
+        let transcript = services
+            .transcriber
+            .transcribe(&retry_path, prompt.as_deref(), cancel.clone())
+            .await
+            .map_err(command_error)?;
+        if services.lifecycle.is_cancelled(operation_id) {
+            return Err("history retry was cancelled".into());
+        }
+        let mut output = transcript.text.clone();
+        let mut llm_provider = None;
+        if source.mode == "translate" {
+            let target = source
+                .target_language
+                .as_deref()
+                .ok_or("saved translation target is unavailable")?;
+            output = correction::translate_transcript(
+                &settings,
+                &transcript.text,
+                target,
+                cancel.clone(),
+                |_| {},
+            )
+            .await
+            .map_err(command_error)?;
+            llm_provider = Some(settings.correction_provider.as_str());
+        } else if source.mode == "edit" {
+            let selected = source
+                .source_text
+                .as_deref()
+                .ok_or("saved edit source is unavailable")?;
+            output = correction::edit_selected_text(
+                &settings,
+                selected,
+                &transcript.text,
+                cancel.clone(),
+                |_| {},
+            )
+            .await
+            .map_err(command_error)?;
+            llm_provider = Some(settings.correction_provider.as_str());
+        } else if source.mode == "ask" {
+            if source.action_kind.as_deref() == Some("search") {
+                let stored_site = stored_search_site(&source)?;
+                let plan = correction::generate_ask_plan(
+                    &settings,
+                    &transcript.text,
+                    &ask::planning_prompt(ask::AskContextKind::Caret),
+                    cancel.clone(),
+                )
+                .await
+                .map_err(|_| "Ask search retry planning failed".to_string())?;
+                output = ask::validate_fixed_search_retry_plan(
+                    &plan,
+                    &transcript.text,
+                    stored_site,
+                    &settings.translation_target_languages,
+                )
+                .map_err(|_| "Ask search retry plan was blocked".to_string())?;
+            } else {
+                let action = stored_ask_action(&source)?;
+                let input = ask::generation_input(source.source_text.as_deref(), &transcript.text);
+                output = correction::generate_ask_text(
+                    &settings,
+                    &input,
+                    &ask::generation_prompt_with_target(&action),
+                    cancel.clone(),
+                )
+                .await
+                .map_err(command_error)?;
+            }
+            llm_provider = Some(settings.correction_provider.as_str());
+        } else if settings.text_correction_enabled {
+            let hints = storage
+                .dictionary_correction_hints(&transcript.text)
+                .unwrap_or_default();
+            output = correction::correct_transcript(
+                &settings,
+                &transcript.text,
+                &hints,
+                cancel.clone(),
+                |_| {},
+            )
+            .await
+            .map_err(command_error)?;
+            llm_provider = Some(settings.correction_provider.as_str());
+        }
+        if services.lifecycle.is_cancelled(operation_id) {
+            return Err("history retry was cancelled".into());
+        }
+        let latency_ms = started.elapsed().as_millis() as i64;
+        let history_save_status = services
+            .lifecycle
+            .commit_side_effect(operation_id, || {
+                Ok::<HistorySaveStatus, String>(save_history(
+                    &storage,
+                    &NewHistoryItem {
+                        transcript_text: &transcript.text,
+                        processed_text: (output != transcript.text).then_some(output.as_str()),
+                        source_text: source.source_text.as_deref(),
+                        instruction_text: if source.mode == "edit" || source.mode == "ask" {
+                            Some(transcript.text.as_str())
+                        } else {
+                            None
+                        },
+                        action_kind: source.action_kind.as_deref(),
+                        search_site: source.search_site.as_deref(),
+                        mode: if mode == PipelineMode::Dictate {
+                            retry_dictate_history_mode(llm_provider)
+                        } else {
+                            &source.mode
+                        },
+                        asr_provider: &transcript.model,
+                        llm_provider,
+                        target_language: source.target_language.as_deref(),
+                        app_category: source.app_category.as_deref(),
+                        duration_ms: source.duration_ms,
+                        latency_ms: Some(latency_ms),
+                        retry_of_id: Some(id),
+                    },
+                    Some(&retry_path),
+                ))
+            })
+            .map_err(str::to_string)?
+            .map_err(command_error)?;
+        // The committed Retry still owns the lifecycle. Publish its completion
+        // before releasing it, so a recording started afterwards cannot have
+        // its state overwritten by this completion.
+        recording_overlay::set_phase(&app, &AppPhase::Completed);
+        let snapshot = state.complete(
+            output.clone(),
+            "History retry completed without inserting text.".into(),
+        );
+        let _ = app.emit("app-state", snapshot);
+        services.lifecycle.finish(operation_id);
+        report_history_save_warning(&app, history_save_status);
+        Ok(RecordingResult {
+            text: output,
+            insertion: "history_only".into(),
+            duration_ms: source.duration_ms.unwrap_or_default() as u64,
+            latency_ms: latency_ms as u64,
+        })
+    }
+    .await;
+    if retry_cleanup
+        .as_mut()
+        .is_some_and(|artifact: &mut TempArtifact| artifact.cleanup().is_err())
+    {
+        emit_status(
+            &app,
+            "artifact_cleanup_failed",
+            "Temporary retry audio cleanup failed.",
+        );
+    }
+    if result.is_err() {
+        let message = if services.lifecycle.is_cancelled(operation_id) {
+            "History retry cancelled."
+        } else {
+            "History retry failed."
+        };
+        emit_state(
+            &app,
+            &state,
+            if services.lifecycle.is_cancelled(operation_id) {
+                AppPhase::Idle
+            } else {
+                AppPhase::Error
+            },
+            message,
+        );
+    }
+    result
+}
+
+fn history_pipeline_mode(mode: &str) -> Result<PipelineMode, String> {
+    match mode {
+        "translate" => Ok(PipelineMode::Translate),
+        "edit" => Ok(PipelineMode::Edit),
+        "ask" => Ok(PipelineMode::Ask),
+        "faithful" | "ai_corrected" | "faithful_fallback" => Ok(PipelineMode::Dictate),
+        _ => Err("history mode is not retryable".into()),
+    }
+}
+
+fn retry_dictate_history_mode(llm_provider: Option<&str>) -> &'static str {
+    if llm_provider.is_some() {
+        "ai_corrected"
+    } else {
+        "faithful"
+    }
+}
+
+fn stored_ask_action(item: &HistoryItem) -> Result<ask::AskAction, String> {
+    Ok(match item.action_kind.as_deref() {
+        Some("rewrite") => ask::AskAction::Rewrite,
+        Some("shorten") => ask::AskAction::Shorten,
+        Some("expand") => ask::AskAction::Expand,
+        Some("change_tone") => ask::AskAction::ChangeTone,
+        Some("summarize") => ask::AskAction::Summarize,
+        Some("explain") => ask::AskAction::Explain,
+        Some("answer") => ask::AskAction::Answer,
+        Some("draft") => ask::AskAction::Draft,
+        Some("translate") => ask::AskAction::Translate {
+            target_language: item
+                .target_language
+                .clone()
+                .ok_or("saved Ask translation target is unavailable")?,
+        },
+        _ => return Err("saved Ask action is unavailable".into()),
+    })
+}
+
+fn stored_search_site(item: &HistoryItem) -> Result<ask::SearchSite, String> {
+    match item.search_site.as_deref() {
+        Some("google") => Ok(ask::SearchSite::Google),
+        Some("youtube") => Ok(ask::SearchSite::YouTube),
+        Some("amazon_japan") => Ok(ask::SearchSite::AmazonJapan),
+        Some("github") => Ok(ask::SearchSite::GitHub),
+        _ => Err("saved Ask search site is unavailable".into()),
+    }
 }
 
 #[tauri::command]

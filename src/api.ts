@@ -9,6 +9,8 @@ import type {
   RecordingResult,
   DictionaryEntry,
   DictionaryEntryInput,
+  HistoryFilter,
+  HistoryAudioPayload,
 } from "./types";
 
 const inTauri = "__TAURI_INTERNALS__" in window;
@@ -25,8 +27,7 @@ export const defaultSettings: Settings = {
   translationTargetLanguages: ["en", "ja"],
   translationTargetLanguage: "en",
   microphoneId: null,
-  historyEnabled: true,
-  historyRetentionDays: 30,
+  historyRetention: "one_month",
   deleteAudioAfterProcessing: true,
   autoStart: false,
   clipboardRestore: true,
@@ -114,9 +115,27 @@ export async function updateSettings(settings: Settings): Promise<Settings> {
   return invoke("update_settings", { settings });
 }
 
-export async function listHistory(): Promise<HistoryItem[]> {
+export async function listHistory(filter: HistoryFilter = "all"): Promise<HistoryItem[]> {
   if (!inTauri) return [];
-  return invoke("list_history", { limit: 100 });
+  return invoke("list_history", { filter, limit: 100 });
+}
+
+export async function deleteHistoryItem(id: number): Promise<boolean> {
+  if (!inTauri) return false;
+  return invoke("delete_history_item", { id });
+}
+
+export async function deleteAllHistory(): Promise<number> {
+  if (!inTauri) return 0;
+  return invoke("delete_all_history");
+}
+
+export async function getHistoryAudio(id: number): Promise<HistoryAudioPayload> {
+  return invoke("get_history_audio", { id });
+}
+
+export async function retryHistoryItem(id: number): Promise<RecordingResult> {
+  return invoke("retry_history_item", { id });
 }
 
 export async function copyHistoryItem(id: number): Promise<void> {

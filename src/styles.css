@@ -251,6 +251,8 @@ textarea { width: min(420px, 42vw); resize: vertical; line-height: 1.45; }
 .history-text { padding: 3px 5px; border-radius: 5px; line-height: 1.45; cursor: copy; white-space: pre-wrap; transition: background .14s ease; }
 .history-text:hover, .history-text:focus-visible { background: var(--accent-soft); }
 .history-text.api-corrected { margin-top: 6px; padding: 8px 9px; background: linear-gradient(90deg, var(--success-soft), transparent 82%); color: var(--success); }
+.history-field { display: flex; align-items: flex-start; gap: 6px; }
+.history-field > .history-text { flex: 1; min-width: 0; }
 .diagnostic-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 24px 0; }
 .diagnostic-grid .info-card { padding: 17px; }
 .model-settings { margin-bottom: 20px; }

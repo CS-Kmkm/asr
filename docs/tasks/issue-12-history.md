@@ -1,0 +1,46 @@
+Goal: Implement GitHub issue #12 as a privacy-safe History manager with typed filtering, deterministic retention, DB-owned audio artifacts, and output-only retry.
+
+Scope / non-scope:
+- Add All/Dictate/Translate/Edit/Ask filters, visible copy controls, delete-one/delete-all, the required retention choices, retained-audio playback/download, and retry.
+- Reuse the existing `mode` column as the canonical operation filter. Do not add a duplicate operation-kind column.
+- Do not add feedback collection, arbitrary filesystem paths, shell/open-directory actions, target reinsertion, search launch during retry, or provider/settings/credential snapshots.
+
+Fixed design:
+- Replace the legacy boolean/day pair with one canonical retention enum: `never`, `24_hours`, `1_week`, `1_month`, `1_year`, `forever`. `never` is History-off and immediately removes text rows and associated audio. Finite options use UTC 1/7/30/365-day cutoffs; `forever` skips age cleanup.
+- Migrate raw legacy settings before normal deserialization: disabled becomes `never`; enabled day values map to the largest finite preset not exceeding the old limit, never to `forever`. Persist normalized V2 settings without discarding unrelated fields.
+- Extend history with nullable `audio_filename` and `retry_of_id`; retry links use `ON DELETE SET NULL`. Persist only random relative `.wav` filenames under the app-data `history-audio` directory, never absolute paths.
+- Retention is enforced at startup, settings changes, before filtered listing, and after inserts. Delete-one, delete-all, retention, and History-off remove owned audio. A DB-backed pending-deletion queue records locked-file failures and is retried at startup.
+- Temporary recording audio remains cleanup-owned until a history commit succeeds. Stage a copy inside `history-audio`, atomically rename it, commit the row/file association, and remove finalized files on DB rollback. Startup reconciliation deletes unreferenced files and clears missing associations without exposing paths.
+- Each retained history row owns one audio file, including retry rows. No reference counting or shared artifact ownership.
+- Playback/download accept only a history ID and return a bounded WAV payload plus a fixed sanitized filename. The frontend creates and revokes Blob URLs for `<audio>` and download; no command accepts a path.
+- Retry exclusively claims the pipeline lifecycle and uses its cancellation token. It copies the source audio to guarded temporary storage before processing so row deletion cannot race the read.
+- Retry uses current ASR/correction/dictionary/profile settings while preserving the original semantic operands: mode, selected source, target language, Ask action/site, and instruction role. It never inserts into the old target or opens a browser. Success creates a new linked row; cancellation or failure creates neither a row nor artifact.
+- A retried Ask search produces the normalized query/result for History only and never launches the site. History and audio settings at retry completion decide whether the new row/audio is retained.
+
+Acceptance checks:
+1. Idempotent schema/settings migrations cover every legacy retention value class and preserve unrelated settings/history fields.
+2. SQL filtering happens before the limit and covers all five filter values; delete-one and delete-all report missing rows safely.
+3. Retention tests cover all presets, exact cutoff boundaries, History-off, text-only retention, audio retention, and startup/settings/insert enforcement.
+4. Artifact tests cover relative-name/path-traversal rejection, commit rollback, missing/orphan reconciliation, row/audio deletion, and durable retry of locked-file deletion.
+5. Retry tests cover lifecycle exclusion/cancellation, current settings plus original semantics for Dictate/Translate/Edit/Ask, no injection/search side effects, new `retry_of_id`, and no row/artifact on failure.
+6. Playback/download tests cover ID-only access, missing/deleted audio, bounded bytes, WAV metadata, and no absolute-path exposure.
+7. History UI exposes filters, explicit Copy/Retry/Play/Download/Delete controls, confirmed Delete all, and localized English/Japanese copy.
+8. Full Rust/frontend checks and `git diff --check` pass. Manual Windows checks cover real audio playback/download, locked-file recovery, provider retry quality, and cancellation timing.
+
+Context:
+- Base is Issue #10 commit `6411024`, so History already contains typed Dictate/Translate/Edit/Ask fields.
+- Relevant seams are `src-tauri/src/{commands,lib,lifecycle,storage,types,audio}.rs`, `src/{App,api,types,i18n}.tsx`, and `src/pages/HistoryPage.tsx`.
+- `delete_audio_after_processing` remains the explicit audio-retention privacy switch; retention `never` always overrides it.
+
+Status (2026-09-29): Implemented; PR #27 review fixes F1-F6 and F8 applied on top of the 488d0ec merge. The 2026-09-27 independent audit predates that merge and these fixes; a new audit is pending. The production `update_settings` command persists through `persist_settings_or_rollback`, which calls `update_settings_and_apply_history_policy` inside the shortcut rollback handling, so the settings write and the retention/History-off purge share one SQLite transaction (restoring what 488d0ec dropped). The settings-free retention helper is private and single-argument, so the old two-step call no longer compiles; seam tests cover the purge and a rejected settings write that keeps History and rolls back shortcuts. Every audio deletion intent is recorded in the durable pending queue before rows are removed; post-commit filesystem cleanup is best-effort and cannot falsely roll settings/shortcuts back. Schema adds cryptographically random relative owned audio filenames, a non-null uniqueness invariant, and retry links; raw legacy retention settings normalize to V2 while retaining unrelated JSON fields. Staged audio uses RAII rollback until DB commit, retention collects/deletes rows under one UTC cutoff transaction, and reconciliation clears invalid references before safely removing contained orphan entries. The final History-off/audio-retention decision is serialized with the insert. Decision D3: switching `delete_audio_after_processing` from off to on keeps recordings already in History (visible, playable, downloadable, deletable) and stops retaining new ones; the Privacy setting description (en/ja) and README state this. Startup temp cleanup removes stale capture WAVs only when that setting is on, so capture WAVs kept by earlier versions under the keep-audio setting survive; stale Retry copies are always removed. Retry publishes processing before copy, claims the existing lifecycle, and on a successful History commit seals the operation (cancel becomes a no-op) and publishes Completed before releasing the lifecycle, so a newly started recording cannot be overwritten. It uses current settings plus a strict raw typed-plan fixed-site Ask-search replan without launching a browser, produces output-only linked history, and never reinjects. Retry cleanup and post-commit metric failures cannot turn completed work into false command failures. UI guards stale filter responses, cancels Retry, restores per-field copy (double-click on each field plus explicit Copy for Selected text and Spoken instruction), reports Play/Download load or playback failures with a localized notice and refreshes the list, revokes download blob URLs after a delay, and clears revoked audio blobs when their row disappears. Storage tests now also cover Forever, in-window survival for every finite preset, Never with source audio (no row, no file), and delete-audio on with a source WAV (text row, no history-audio file). Open follow-ups (not in the review fix scope): review F7 (Retry holds the storage lock through a copy of up to 50 MiB, and audio payloads travel as JSON number arrays) and the remaining review F3 test gaps (locked-file deletion retry, Retry end to end, other filter values, deleting a missing row, other legacy retention values, migration column assertions).
+
+Verification (2026-09-29, branch `feat/issue-12-history`): `cargo fmt --check`, `cargo clippy -j 4` (exit 0; 16 pre-existing warnings in audio/injection/input_monitor/answer_panel, none in files changed here), `cargo test --lib -j 4` (197 passed, 4 ignored), `pnpm exec tsc --noEmit`, `pnpm build`, and `git diff --check` passed. Manual Windows checks remain: physical playback/download (including the delayed blob revoke), locked-file recovery after restart, provider retry quality, and cancellation timing.
+
+Status (2026-10-01, PR-review propagation):
+- Merged the local #10 review fixes, retaining Ask History fields, audio
+  ownership, and the #12 `persist_settings_or_rollback` production path.
+  Settings-write serialization from #8 remains on an async command path, so
+  shortcut registration cannot deadlock with the overlay target-cycle command.
+- Verified 225 Rust library tests passed (4 ignored), `cargo fmt --check`,
+  Clippy, TypeScript typecheck, production frontend build, and
+  `git diff --check`. Manual Windows verification remains pending.
