@@ -2785,6 +2785,12 @@ pub(crate) async fn retry_history_item(
         }
         let started = Instant::now();
         let settings = storage.get_settings().map_err(command_error)?;
+        // Retry uses the current ASR settings, so it loads the selected model
+        // first, as a new recording does; a backend or model change resets it.
+        ensure_model_loaded(&app, &services, &settings).await?;
+        if services.lifecycle.is_cancelled(operation_id) {
+            return Err("history retry was cancelled".into());
+        }
         let prompt_terms = storage.dictionary_prompt_terms().unwrap_or_default();
         let prompt = (!prompt_terms.is_empty()).then(|| prompt_terms.join("\n"));
         let transcript = services
