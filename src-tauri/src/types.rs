@@ -66,6 +66,12 @@ pub struct Settings {
     pub gemini_correction_model: String,
     #[serde(default = "default_gemini_api_key_env_var")]
     pub gemini_api_key_env_var: String,
+    #[serde(default = "default_local_correction_base_url")]
+    pub local_correction_base_url: String,
+    #[serde(default = "default_local_correction_model")]
+    pub local_correction_model: String,
+    #[serde(default = "default_local_correction_max_tokens")]
+    pub local_correction_max_tokens: usize,
     #[serde(default = "default_correction_instruction")]
     pub correction_instruction: String,
     #[serde(default = "default_enabled_correction_feature")]
@@ -90,7 +96,7 @@ pub struct CustomModel {
 }
 
 pub const ASR_BACKENDS: [&str; 4] = ["vibevoice", "faster-whisper", "openai-compatible", "mock"];
-pub const CORRECTION_PROVIDERS: [&str; 2] = ["openai", "gemini"];
+pub const CORRECTION_PROVIDERS: [&str; 3] = ["openai", "gemini", "local"];
 pub const OPENAI_REASONING_EFFORTS: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];
 
 fn default_asr_backend() -> String {
@@ -139,6 +145,18 @@ fn default_gemini_correction_model() -> String {
 
 fn default_gemini_api_key_env_var() -> String {
     "GEMINI_API_KEY".into()
+}
+
+fn default_local_correction_base_url() -> String {
+    "http://127.0.0.1:11434/v1".into()
+}
+
+fn default_local_correction_model() -> String {
+    "qwen3:8b".into()
+}
+
+fn default_local_correction_max_tokens() -> usize {
+    4096
 }
 
 fn default_correction_instruction() -> String {
@@ -190,6 +208,9 @@ impl Default for Settings {
             openai_api_key_env_var: default_openai_api_key_env_var(),
             gemini_correction_model: default_gemini_correction_model(),
             gemini_api_key_env_var: default_gemini_api_key_env_var(),
+            local_correction_base_url: default_local_correction_base_url(),
+            local_correction_model: default_local_correction_model(),
+            local_correction_max_tokens: default_local_correction_max_tokens(),
             correction_instruction: default_correction_instruction(),
             correction_remove_fillers: true,
             correction_remove_repetitions: true,
@@ -350,6 +371,12 @@ mod tests {
         assert_eq!(settings.openai_api_key_env_var, "OPENAI_API_KEY");
         assert_eq!(settings.gemini_correction_model, "gemini-flash-lite-latest");
         assert_eq!(settings.gemini_api_key_env_var, "GEMINI_API_KEY");
+        assert_eq!(
+            settings.local_correction_base_url,
+            "http://127.0.0.1:11434/v1"
+        );
+        assert_eq!(settings.local_correction_model, "qwen3:8b");
+        assert_eq!(settings.local_correction_max_tokens, 4096);
         assert!(settings.correction_instruction.is_empty());
         assert!(settings.correction_remove_fillers);
         assert!(settings.correction_remove_repetitions);

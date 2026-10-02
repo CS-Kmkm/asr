@@ -383,6 +383,8 @@ mod tests {
         let mut settings = Settings::default();
         settings.hotkey = "Ctrl+Alt+V".into();
         settings.history_retention_days = 7;
+        settings.local_correction_base_url = "http://127.0.0.1:1234/v1".into();
+        settings.local_correction_model = "local-model".into();
         settings.custom_models.push(crate::types::CustomModel {
             asr_backend: "faster-whisper".into(),
             model_id: "community/whisper-custom".into(),

@@ -265,6 +265,7 @@ pub(crate) async fn stop_recording(
     let mut processed_text = None;
     let mut llm_provider = None;
     let mut correction_failed = false;
+    let mut correction_output_limited = false;
     let _ = app.emit("app-state", state.publish_result(transcript.text.clone()));
     // Full-recording recognition reconciles the last live hypothesis before AI correction.
     draft.monitor.wait_for_shortcut_release().await;
@@ -328,6 +329,8 @@ pub(crate) async fn stop_recording(
             }
             Err(error) => {
                 correction_failed = true;
+                correction_output_limited =
+                    matches!(error, correction::CorrectionError::OutputLimit);
                 emit_correction_preview(&app, &transcript.text, "fallback");
                 let _ = storage.add_metric(
                     "text_correction",
@@ -420,6 +423,8 @@ pub(crate) async fn stop_recording(
         "The provisional text could not be safely replaced; the final result remains on the clipboard."
     } else if insertion == InsertResult::ClipboardOnly {
         "Automatic insertion failed; the result remains on the clipboard."
+    } else if correction_output_limited {
+        "AI correction stopped at the local output token limit; the original transcript was inserted. Increase the local output token limit."
     } else if correction_failed {
         "AI correction failed; the original transcript was inserted."
     } else {
@@ -509,7 +514,11 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
             );
         }
         correction::CorrectionError::InvalidResponse(_) => "invalid_response",
+        correction::CorrectionError::OutputLimit => {
+            return "AI correction stopped at the local output token limit; using the original transcript. Increase the local output token limit.".into();
+        }
         correction::CorrectionError::Cancelled => "cancelled",
+        correction::CorrectionError::InvalidEndpoint(_) => "invalid_endpoint",
         correction::CorrectionError::UnsupportedProvider(_) => "unsupported_provider",
     };
     format!("AI correction failed; using the original transcript. Error kind: {kind}.")
@@ -659,6 +668,20 @@ mod tests {
         );
         assert!(!message.contains(marker));
     }
+
+    #[test]
+    fn correction_failure_status_distinguishes_the_output_limit() {
+        assert_eq!(
+            correction_failure_status(&correction::CorrectionError::OutputLimit),
+            "AI correction stopped at the local output token limit; using the original transcript. Increase the local output token limit."
+        );
+        assert_eq!(
+            correction_failure_status(&correction::CorrectionError::InvalidResponse(
+                "missing output text".into()
+            )),
+            "AI correction failed; using the original transcript. Error kind: invalid_response."
+        );
+    }
 }
 
 #[tauri::command]
@@ -697,7 +720,7 @@ pub(crate) async fn update_settings(
         );
     }
     if !types::CORRECTION_PROVIDERS.contains(&settings.correction_provider.as_str()) {
-        return Err("text correction provider must be openai or gemini".into());
+        return Err("text correction provider must be openai, gemini, or local".into());
     }
     if !types::OPENAI_REASONING_EFFORTS.contains(&settings.openai_reasoning_effort.as_str()) {
         return Err(
@@ -748,12 +771,21 @@ pub(crate) async fn update_settings(
             "Gemini correction model",
             settings.gemini_correction_model.as_str(),
         ),
+        (
+            "Local correction model",
+            settings.local_correction_model.as_str(),
+        ),
     ] {
         if model.trim().is_empty() || model.len() > 512 || model.chars().any(char::is_control) {
             return Err(format!(
                 "{label} must be non-empty, at most 512 characters, and contain no control characters"
             ));
         }
+    }
+    correction::local_chat_completions_url(&settings.local_correction_base_url)
+        .map_err(|error| error.to_string())?;
+    if !(128..=32768).contains(&settings.local_correction_max_tokens) {
+        return Err("local correction max tokens must be between 128 and 32768".into());
     }
     for (label, environment_variable) in [
         (

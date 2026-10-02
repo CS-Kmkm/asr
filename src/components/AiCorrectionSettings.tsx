@@ -1,3 +1,4 @@
+import { useEffect, useRef, useState } from "react";
 import { SettingRow, Toggle } from "./ui";
 import type { Settings } from "../types";
 import { useI18n } from "../i18n";
@@ -10,6 +11,43 @@ interface AiCorrectionSettingsProps {
 export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsProps) {
   const { t } = useI18n();
   const status = settings.textCorrectionEnabled ? t("On") : t("Off");
+  const [localBaseUrl, setLocalBaseUrl] = useState(settings.localCorrectionBaseUrl);
+  const [localModel, setLocalModel] = useState(settings.localCorrectionModel);
+  const [localMaxTokens, setLocalMaxTokens] = useState(String(settings.localCorrectionMaxTokens));
+  const cancelLocalBaseUrlBlur = useRef(false);
+  const cancelLocalModelBlur = useRef(false);
+  useEffect(() => setLocalBaseUrl(settings.localCorrectionBaseUrl), [settings.localCorrectionBaseUrl]);
+  useEffect(() => setLocalModel(settings.localCorrectionModel), [settings.localCorrectionModel]);
+  useEffect(() => setLocalMaxTokens(String(settings.localCorrectionMaxTokens)), [settings.localCorrectionMaxTokens]);
+
+  function commitLocalBaseUrl() {
+    if (cancelLocalBaseUrlBlur.current) {
+      cancelLocalBaseUrlBlur.current = false;
+      return;
+    }
+    if (localBaseUrl !== settings.localCorrectionBaseUrl) {
+      onSave({ localCorrectionBaseUrl: localBaseUrl });
+    }
+  }
+
+  function commitLocalModel() {
+    if (cancelLocalModelBlur.current) {
+      cancelLocalModelBlur.current = false;
+      return;
+    }
+    if (localModel !== settings.localCorrectionModel) {
+      onSave({ localCorrectionModel: localModel });
+    }
+  }
+
+  function commitLocalMaxTokens() {
+    const value = Number(localMaxTokens);
+    if (Number.isInteger(value) && value >= 128 && value <= 32768 && value !== settings.localCorrectionMaxTokens) {
+      onSave({ localCorrectionMaxTokens: value });
+    } else if (!Number.isInteger(value) || value < 128 || value > 32768) {
+      setLocalMaxTokens(String(settings.localCorrectionMaxTokens));
+    }
+  }
 
   return (
     <section className="panel ai-correction-panel">
@@ -17,7 +55,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         <div>
       <h2>{t("AI text correction")}</h2>
           <p className="muted">
-            {t("When enabled, the transcript is sent to the selected external provider after local transcription. Audio is never sent by this feature.")}
+            {t("When enabled, the transcript is sent to the selected correction provider after local transcription. Audio is never sent by this feature.")}
           </p>
         </div>
         <div className="ai-correction-master">
@@ -34,7 +72,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
       <p className="ai-correction-master-detail">
         {settings.textCorrectionEnabled
           ? t("AI correction is applied before text is inserted. If the API fails, the original transcript is used.")
-          : t("AI correction and external API requests are disabled. You can configure the options below before enabling it.")}
+          : t("AI correction requests are disabled. You can configure the options below before enabling it.")}
       </p>
 
       <SettingRow
@@ -51,6 +89,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
           >
             <option value="openai">OpenAI</option>
             <option value="gemini">Google Gemini</option>
+            <option value="local">{t("Local (OpenAI-compatible)")}</option>
           </select>
         }
       />
@@ -108,7 +147,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
           />
         }
       />
-      {settings.correctionProvider === "openai" ? (
+      {settings.correctionProvider === "openai" && (
         <>
           <SettingRow
             title={t("OpenAI model")}
@@ -153,7 +192,8 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
             }
           />
         </>
-      ) : (
+      )}
+      {settings.correctionProvider === "gemini" && (
         <>
           <SettingRow
             title={t("Gemini model")}
@@ -172,6 +212,75 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
               <input
                 value={settings.geminiApiKeyEnvVar}
                 onChange={(event) => onSave({ geminiApiKeyEnvVar: event.target.value })}
+              />
+            }
+          />
+        </>
+      )}
+      {settings.correctionProvider === "local" && (
+        <>
+          <SettingRow
+            title={t("Local endpoint base URL")}
+            detail={t("Use a numeric loopback URL ending in /v1. Requests bypass proxies and redirects are rejected.")}
+            control={
+              <input
+                value={localBaseUrl}
+                placeholder="http://127.0.0.1:11434/v1"
+                onChange={(event) => setLocalBaseUrl(event.target.value)}
+                onBlur={commitLocalBaseUrl}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    event.currentTarget.blur();
+                  } else if (event.key === "Escape") {
+                    cancelLocalBaseUrlBlur.current = true;
+                    setLocalBaseUrl(settings.localCorrectionBaseUrl);
+                    event.currentTarget.blur();
+                  }
+                }}
+              />
+            }
+          />
+          <SettingRow
+            title={t("Local correction model")}
+            detail={t("Model ID exposed by the local OpenAI-compatible Chat Completions server. No API key is sent.")}
+            control={
+              <input
+                value={localModel}
+                placeholder="qwen3:8b"
+                onChange={(event) => setLocalModel(event.target.value)}
+                onBlur={commitLocalModel}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    event.currentTarget.blur();
+                  } else if (event.key === "Escape") {
+                    cancelLocalModelBlur.current = true;
+                    setLocalModel(settings.localCorrectionModel);
+                    event.currentTarget.blur();
+                  }
+                }}
+              />
+            }
+          />
+          <SettingRow
+            title={t("Local output token limit")}
+            detail={t("Includes thinking tokens. Increase for reasoning models; supported range is 128 to 32768.")}
+            control={
+              <input
+                type="number"
+                min={128}
+                max={32768}
+                step={1}
+                value={localMaxTokens}
+                onChange={(event) => setLocalMaxTokens(event.target.value)}
+                onBlur={commitLocalMaxTokens}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    event.currentTarget.blur();
+                  }
+                }}
               />
             }
           />

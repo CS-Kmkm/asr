@@ -64,6 +64,8 @@ const en = {
   "The provisional text could not be safely replaced; the final result remains on the clipboard.": "The provisional text could not be safely replaced; the final result remains on the clipboard.",
   "Automatic insertion failed; the result remains on the clipboard.": "Automatic insertion failed; the result remains on the clipboard.",
   "AI correction failed; the original transcript was inserted.": "AI correction failed; the original transcript was inserted.",
+  "AI correction stopped at the local output token limit; using the original transcript. Increase the local output token limit.": "AI correction stopped at the local output token limit; using the original transcript. Increase the local output token limit.",
+  "AI correction stopped at the local output token limit; the original transcript was inserted. Increase the local output token limit.": "AI correction stopped at the local output token limit; the original transcript was inserted. Increase the local output token limit.",
   "Dictation inserted successfully.": "Dictation inserted successfully.",
   "Translation settings are unavailable.": "Translation settings are unavailable.",
   "Select text in a supported foreground edit control.": "Select text in a supported foreground edit control.",
@@ -73,6 +75,15 @@ const en = {
   "The target changed; the translation remains on the clipboard.": "The target changed; the translation remains on the clipboard.",
   "The target changed and the clipboard is unavailable.": "The target changed and the clipboard is unavailable.",
   "Translation inserted.": "Translation inserted.",
+  "When enabled, the transcript is sent to the selected correction provider after local transcription. Audio is never sent by this feature.": "When enabled, the transcript is sent to the selected correction provider after local transcription. Audio is never sent by this feature.",
+  "AI correction requests are disabled. You can configure the options below before enabling it.": "AI correction requests are disabled. You can configure the options below before enabling it.",
+  "Local (OpenAI-compatible)": "Local (OpenAI-compatible)",
+  "Local endpoint base URL": "Local endpoint base URL",
+  "Use a numeric loopback URL ending in /v1. Requests bypass proxies and redirects are rejected.": "Use a numeric loopback URL ending in /v1. Requests bypass proxies and redirects are rejected.",
+  "Local correction model": "Local correction model",
+  "Local output token limit": "Local output token limit",
+  "Includes thinking tokens. Increase for reasoning models; supported range is 128 to 32768.": "Includes thinking tokens. Increase for reasoning models; supported range is 128 to 32768.",
+  "Model ID exposed by the local OpenAI-compatible Chat Completions server. No API key is sent.": "Model ID exposed by the local OpenAI-compatible Chat Completions server. No API key is sent.",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
@@ -137,6 +148,8 @@ const ja: Record<MessageKey, string> = {
   "The provisional text could not be safely replaced; the final result remains on the clipboard.": "仮テキストを安全に置換できませんでした。最終結果はクリップボードに残っています。",
   "Automatic insertion failed; the result remains on the clipboard.": "自動挿入に失敗しました。結果はクリップボードに残っています。",
   "AI correction failed; the original transcript was inserted.": "AI修正に失敗したため、元の文字起こしを挿入しました。",
+  "AI correction stopped at the local output token limit; using the original transcript. Increase the local output token limit.": "ローカル出力トークン上限に達したためAI修正を中止し、元の文字起こしを使用します。ローカル出力トークン上限を増やしてください。",
+  "AI correction stopped at the local output token limit; the original transcript was inserted. Increase the local output token limit.": "ローカル出力トークン上限に達したためAI修正を中止し、元の文字起こしを挿入しました。ローカル出力トークン上限を増やしてください。",
   "Dictation inserted successfully.": "音声入力を挿入しました。",
   "Translation settings are unavailable.": "翻訳設定を読み込めませんでした。",
   "Select text in a supported foreground edit control.": "対応する前面の編集欄でテキストを選択してください。",
@@ -146,6 +159,15 @@ const ja: Record<MessageKey, string> = {
   "The target changed; the translation remains on the clipboard.": "入力対象が変更されたため、翻訳結果はクリップボードに残っています。",
   "The target changed and the clipboard is unavailable.": "入力対象が変更され、クリップボードも利用できません。",
   "Translation inserted.": "翻訳結果を挿入しました。",
+  "When enabled, the transcript is sent to the selected correction provider after local transcription. Audio is never sent by this feature.": "有効にすると、ローカル文字起こし後に選択した修正プロバイダーへテキストを送信します。この機能で音声を送信することはありません。",
+  "AI correction requests are disabled. You can configure the options below before enabling it.": "AI修正リクエストは無効です。有効化する前に以下の設定を変更できます。",
+  "Local (OpenAI-compatible)": "ローカル（OpenAI互換）",
+  "Local endpoint base URL": "ローカルエンドポイントのベースURL",
+  "Use a numeric loopback URL ending in /v1. Requests bypass proxies and redirects are rejected.": "末尾が /v1 の数値ループバックURLを使用します。プロキシは迂回し、リダイレクトは拒否します。",
+  "Local correction model": "ローカル修正モデル",
+  "Local output token limit": "ローカル出力トークン上限",
+  "Includes thinking tokens. Increase for reasoning models; supported range is 128 to 32768.": "思考トークンも含みます。推論モデルでは必要に応じて増やしてください。設定範囲は128～32768です。",
+  "Model ID exposed by the local OpenAI-compatible Chat Completions server. No API key is sent.": "ローカルのOpenAI互換Chat Completionsサーバーが公開するモデルID。APIキーは送信しません。",
 } satisfies Record<MessageKey, string>;
 
 const appMessageKeys: ReadonlySet<MessageKey> = new Set(
@@ -170,6 +192,8 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "The provisional text could not be safely replaced; the final result remains on the clipboard.",
       "Automatic insertion failed; the result remains on the clipboard.",
       "AI correction failed; the original transcript was inserted.",
+      "AI correction stopped at the local output token limit; using the original transcript. Increase the local output token limit.",
+      "AI correction stopped at the local output token limit; the original transcript was inserted. Increase the local output token limit.",
       "Dictation inserted successfully.",
       "Translation settings are unavailable.",
       "Select text in a supported foreground edit control.",
