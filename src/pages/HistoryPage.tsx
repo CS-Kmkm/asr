@@ -93,7 +93,8 @@ export function HistoryPage({ settings, history, filter, onSave, onFilter, onCop
           <div className="history-meta"><time dateTime={item.createdAt}>{new Date(item.createdAt).toLocaleString()}</time>
             <span className="history-mode">{item.mode in modeLabels
               ? t(modeLabels[item.mode as keyof typeof modeLabels])
-              : item.mode}{item.targetLanguage ? ` · ${item.targetLanguage}` : ""}</span></div>
+              : item.mode}{item.targetLanguage ? ` · ${item.targetLanguage}` : ""}</span>
+            {item.appCategory && <small>{t("App category")}: {item.appCategory}</small>}</div>
           {item.sourceText && <HistoryText text={item.sourceText} label={t("Selected text")} onCopy={onCopyItem} />}
           {item.instructionText && <HistoryText text={item.instructionText} label={t("Spoken instruction")} onCopy={onCopyItem} />}
           {!item.sourceText && !item.instructionText && <HistoryText text={item.transcriptText} onCopy={onCopyItem} />}

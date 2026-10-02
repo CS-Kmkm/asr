@@ -1,4 +1,5 @@
 mod answer_panel;
+mod app_context;
 mod ask;
 mod asr;
 mod audio;
@@ -8,6 +9,7 @@ mod correction_prompt;
 mod injection;
 mod input_monitor;
 mod live_dictation;
+mod personalization;
 mod recording_overlay;
 mod shortcuts;
 mod state;
@@ -123,6 +125,7 @@ pub(crate) struct Services {
     ask: tokio::sync::Mutex<Option<AskSession>>,
     answer_panel: answer_panel::AnswerPanelState,
     target: Mutex<Option<TargetWindow>>,
+    app_context: Mutex<Option<types::AppContext>>,
     transcriber: Arc<dyn Transcriber>,
     input_monitor: Arc<InputMonitor>,
     model: Mutex<ModelStatus>,
@@ -150,6 +153,7 @@ impl Services {
             ask: tokio::sync::Mutex::new(None),
             answer_panel: answer_panel::AnswerPanelState::default(),
             target: Mutex::new(None),
+            app_context: Mutex::new(None),
             transcriber: Arc::new(JsonlTranscriber::new(
                 worker_command_for_settings(settings),
                 ASR_REQUEST_TIMEOUT,

@@ -23,6 +23,17 @@ const MAX_HISTORY_AUDIO_BYTES: u64 = 50 * 1024 * 1024;
 #[cfg(test)]
 static AUDIO_NONCE: AtomicU64 = AtomicU64::new(1);
 
+fn scope_matches(scope: Option<&str>, context: Option<&crate::types::AppContext>) -> bool {
+    let Some(scope) = scope.filter(|value| !value.is_empty() && *value != "global") else {
+        return true;
+    };
+    let Some(context) = context else {
+        return false;
+    };
+    let app_scope = context.app_key.as_deref().map(|key| format!("app:{key}"));
+    app_scope.as_deref() == Some(scope) || scope == format!("category:{}", context.category)
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("database operation failed")]
@@ -1119,32 +1130,48 @@ impl Storage {
             > 0)
     }
 
-    pub fn dictionary_prompt_terms(&self) -> Result<Vec<String>, StorageError> {
+    pub fn dictionary_prompt_terms_for(
+        &self,
+        context: Option<&crate::types::AppContext>,
+    ) -> Result<Vec<String>, StorageError> {
         let mut terms = Vec::new();
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT surface, aliases
+            "SELECT surface, aliases, app_scope
              FROM dictionary_entries ORDER BY priority DESC, surface ASC",
         )?;
         let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })?;
         for row in rows {
-            let (surface, aliases) = row?;
+            let (surface, aliases, scope) = row?;
+            if !scope_matches(scope.as_deref(), context) {
+                continue;
+            }
             terms.push(surface);
             terms.extend(serde_json::from_str::<Vec<String>>(&aliases)?);
         }
         Ok(terms)
     }
 
+    pub fn dictionary_prompt_terms(&self) -> Result<Vec<String>, StorageError> {
+        self.dictionary_prompt_terms_for(None)
+    }
+
     pub fn dictionary_correction_hints(
         &self,
         transcript: &str,
+        context: Option<&crate::types::AppContext>,
     ) -> Result<Vec<String>, StorageError> {
         let transcript = transcript.to_lowercase();
         Ok(self
             .list_dictionary()?
             .into_iter()
+            .filter(|entry| scope_matches(entry.app_scope.as_deref(), context))
             .filter_map(|entry| {
                 let surface = entry.surface.trim();
                 let surface_folded = surface.to_lowercase();
@@ -1736,6 +1763,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn history_round_trips_captured_app_category() {
+        let storage = Storage::in_memory().unwrap();
+        let mut value = item();
+        value.app_category = Some("development");
+        storage.add_history(&value).unwrap();
+        assert_eq!(
+            storage.list_history(HistoryFilter::All, 10).unwrap()[0]
+                .app_category
+                .as_deref(),
+            Some("development")
+        );
+    }
+
     fn dictionary_entry<'a>(aliases: &'a [String]) -> NewDictionaryEntry<'a> {
         NewDictionaryEntry {
             reading: "おーぷんえーあい",
@@ -1795,6 +1836,113 @@ mod tests {
     }
 
     #[test]
+    fn scoped_dictionary_terms_and_hints_include_matching_context_only() {
+        let storage = Storage::in_memory().unwrap();
+        let aliases = vec!["global-alias".into()];
+        for (reading, surface, scope) in [
+            ("global-alias", "Global", None),
+            ("app-alias", "App", Some("app:code")),
+            ("category-alias", "Category", Some("category:development")),
+            ("other-alias", "Other", Some("app:other")),
+        ] {
+            storage
+                .add_dictionary_entry(&NewDictionaryEntry {
+                    reading,
+                    surface,
+                    category: None,
+                    aliases: &aliases,
+                    priority: 1,
+                    app_scope: scope,
+                })
+                .unwrap();
+        }
+        let context = crate::types::AppContext {
+            app_key: Some("code".into()),
+            category: "development".into(),
+        };
+        let terms = storage.dictionary_prompt_terms_for(Some(&context)).unwrap();
+        assert!(
+            terms.contains(&"Global".into())
+                && terms.contains(&"App".into())
+                && terms.contains(&"Category".into())
+                && !terms.contains(&"Other".into())
+        );
+        let hints = storage
+            .dictionary_correction_hints(
+                "global-alias app-alias category-alias other-alias",
+                Some(&context),
+            )
+            .unwrap();
+        assert!(hints.iter().any(|hint| hint.starts_with("Global<=")));
+        assert!(hints.iter().any(|hint| hint.starts_with("App<=")));
+        assert!(hints.iter().any(|hint| hint.starts_with("Category<=")));
+        assert!(!hints.iter().any(|hint| hint.starts_with("Other<=")));
+    }
+
+    #[test]
+    fn app_lookup_failure_uses_global_entries_and_records_no_category() {
+        let storage = Storage::in_memory().unwrap();
+        let aliases = Vec::new();
+        for (reading, surface, scope) in [
+            ("global-reading", "Global", None),
+            ("other-reading", "OtherCategory", Some("category:other")),
+            ("editor-reading", "EditorApp", Some("app:myeditor")),
+        ] {
+            storage
+                .add_dictionary_entry(&NewDictionaryEntry {
+                    reading,
+                    surface,
+                    category: None,
+                    aliases: &aliases,
+                    priority: 1,
+                    app_scope: scope,
+                })
+                .unwrap();
+        }
+
+        let failed = crate::app_context::from_executable_path(None);
+        assert_eq!(
+            storage
+                .dictionary_prompt_terms_for(failed.as_ref())
+                .unwrap(),
+            vec!["Global".to_string()]
+        );
+        let hints = storage
+            .dictionary_correction_hints(
+                "global-reading other-reading editor-reading",
+                failed.as_ref(),
+            )
+            .unwrap();
+        assert_eq!(hints, vec!["Global<=global-reading".to_string()]);
+        let mut value = item();
+        value.app_category = crate::app_context::history_category(failed.as_ref());
+        storage.add_history(&value).unwrap();
+        assert_eq!(
+            storage.list_history(HistoryFilter::All, 10).unwrap()[0].app_category,
+            None
+        );
+
+        let unclassified = crate::app_context::from_executable_path(Some(r"C:\Tools\MyEditor.exe"));
+        let terms = storage
+            .dictionary_prompt_terms_for(unclassified.as_ref())
+            .unwrap();
+        for surface in ["Global", "OtherCategory", "EditorApp"] {
+            assert!(terms.contains(&surface.to_string()), "missing {surface}");
+        }
+        let mut value = item();
+        value.app_category = crate::app_context::history_category(unclassified.as_ref());
+        storage.add_history(&value).unwrap();
+        let mut categories = storage
+            .list_history(HistoryFilter::All, 10)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.app_category)
+            .collect::<Vec<_>>();
+        categories.sort();
+        assert_eq!(categories, vec![None, Some("other".to_string())]);
+    }
+
+    #[test]
     fn dictionary_correction_hints_map_aliases_to_preferred_surface() {
         let storage = Storage::in_memory().unwrap();
         let aliases = vec!["Chat GPT".into()];
@@ -1803,12 +1951,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             storage
-                .dictionary_correction_hints("Chat GPTを使います")
+                .dictionary_correction_hints("Chat GPTを使います", None)
                 .unwrap(),
             vec!["OpenAI<=Chat GPT"]
         );
         assert!(storage
-            .dictionary_correction_hints("関係のない文章")
+            .dictionary_correction_hints("関係のない文章", None)
             .unwrap()
             .is_empty());
     }

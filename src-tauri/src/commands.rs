@@ -548,6 +548,9 @@ async fn start_recording_mode(
         emit_state(&app, &state, AppPhase::Idle, cancel_message);
         return Err(cancel_error.into());
     }
+    // Edit and Ask capture a selection instead of a target window, so they
+    // route to global dictionary entries and the global profile only.
+    let app_context = target.as_ref().and_then(app_context::from_target);
     let mut live_slot = services.live.lock().await;
     let mut edit_slot = services.edit.lock().await;
     let mut ask_slot = services.ask.lock().await;
@@ -570,7 +573,9 @@ async fn start_recording_mode(
             monitor.observe_cancellation(Some(cancel.clone()));
         }
     }
-    let dictionary_terms = storage.dictionary_prompt_terms().unwrap_or_default();
+    let dictionary_terms = storage
+        .dictionary_prompt_terms_for(app_context.as_ref())
+        .unwrap_or_default();
     let prompt = (!dictionary_terms.is_empty()).then(|| dictionary_terms.join("\n"));
     let capture_config = capture_config(&settings);
     let mut test = services.microphone_test.lock().await;
@@ -597,6 +602,10 @@ async fn start_recording_mode(
         .target
         .lock()
         .map_err(|_| "target service is unavailable".to_string())? = target;
+    *services
+        .app_context
+        .lock()
+        .map_err(|_| "target service is unavailable".to_string())? = app_context;
     let target_language =
         (mode == PipelineMode::Translate).then(|| settings.translation_target_language.clone());
     *services
@@ -759,7 +768,14 @@ pub(crate) async fn stop_recording(
     }
     emit_state(&app, &state, AppPhase::Processing, "Transcribing locally.");
 
-    let dictionary_terms = storage.dictionary_prompt_terms().unwrap_or_default();
+    let app_context = services
+        .app_context
+        .lock()
+        .map_err(|_| "target service is unavailable".to_string())?
+        .clone();
+    let dictionary_terms = storage
+        .dictionary_prompt_terms_for(app_context.as_ref())
+        .unwrap_or_default();
     let prompt = (!dictionary_terms.is_empty()).then(|| dictionary_terms.join("\n"));
     let correction_cancel = cancel.clone();
     let transcript_result = services
@@ -1082,7 +1098,7 @@ pub(crate) async fn stop_recording(
         }
     } else if settings.text_correction_enabled {
         let correction_hints = storage
-            .dictionary_correction_hints(&transcript.text)
+            .dictionary_correction_hints(&transcript.text, app_context.as_ref())
             .unwrap_or_default();
         emit_correction_preview(&app, &transcript.text, "draft");
         emit_state(
@@ -1102,6 +1118,9 @@ pub(crate) async fn stop_recording(
             &settings,
             &transcript.text,
             &correction_hints,
+            personalization::resolve_profile(&settings, app_context.as_ref())
+                .map(|profile| personalization::guidance(&profile))
+                .as_deref(),
             correction_cancel,
             |delta| {
                 emit_correction_preview(&app, delta, "streaming");
@@ -1217,7 +1236,7 @@ pub(crate) async fn stop_recording(
             asr_provider: &transcript.model,
             llm_provider: llm_provider.as_deref(),
             target_language: translation_target.as_deref(),
-            app_category: None,
+            app_category: app_context::history_category(app_context.as_ref()),
             duration_ms: Some(duration_ms as i64),
             latency_ms: Some(latency_ms as i64),
             retry_of_id: None,
@@ -1900,6 +1919,72 @@ mod tests {
     fn retry_dictate_label_tracks_correction_even_when_text_is_unchanged() {
         assert_eq!(retry_dictate_history_mode(Some("local")), "ai_corrected");
         assert_eq!(retry_dictate_history_mode(None), "faithful");
+    }
+
+    #[test]
+    fn retry_routes_personalization_by_the_saved_category_only() {
+        let item = |app_category: Option<&str>| HistoryItem {
+            id: 1,
+            transcript_text: "text".into(),
+            processed_text: None,
+            source_text: None,
+            instruction_text: None,
+            action_kind: None,
+            search_site: None,
+            mode: "faithful".into(),
+            asr_provider: "mock".into(),
+            llm_provider: None,
+            target_language: None,
+            app_category: app_category.map(str::to_owned),
+            duration_ms: None,
+            latency_ms: None,
+            created_at: String::new(),
+            has_audio: true,
+            retry_of_id: None,
+        };
+        let profile = |formality: &str| types::StyleProfile {
+            formality: formality.into(),
+            detail: "concise".into(),
+            guidance: None,
+        };
+        let settings = Settings {
+            personalization_enabled: true,
+            global_style_profile: Some(profile("formal")),
+            scoped_style_profiles: vec![
+                types::ScopedStyleProfile {
+                    scope: "category:messaging".into(),
+                    profile: profile("casual"),
+                },
+                types::ScopedStyleProfile {
+                    scope: "app:slack".into(),
+                    profile: profile("formal"),
+                },
+            ],
+            ..Settings::default()
+        };
+
+        let messaging = retry_app_context(&item(Some("messaging")));
+        assert_eq!(
+            messaging,
+            Some(types::AppContext {
+                app_key: None,
+                category: "messaging".into(),
+            })
+        );
+        assert_eq!(
+            personalization::resolve_profile(&settings, messaging.as_ref())
+                .unwrap()
+                .formality,
+            "casual"
+        );
+        let unknown = retry_app_context(&item(None));
+        assert_eq!(unknown, None);
+        assert_eq!(
+            personalization::resolve_profile(&settings, unknown.as_ref())
+                .unwrap()
+                .formality,
+            "formal"
+        );
     }
 
     #[test]
@@ -2631,6 +2716,7 @@ pub(crate) async fn update_settings(
     storage: State<'_, Storage>,
 ) -> Result<Settings, String> {
     let _update_guard = services.settings_update.lock().await;
+    personalization::validate_settings_profiles(&settings).map_err(str::to_owned)?;
     if !["en", "ja"].contains(&settings.ui_language.as_str()) {
         return Err("ui language must be en or ja".into());
     }
@@ -2932,7 +3018,12 @@ pub(crate) async fn retry_history_item(
         }
         let started = Instant::now();
         let settings = storage.get_settings().map_err(command_error)?;
-        let prompt_terms = storage.dictionary_prompt_terms().unwrap_or_default();
+        // History keeps only the captured category, so Retry routes to
+        // category-scoped and global dictionary entries and profiles.
+        let retry_context = retry_app_context(&source);
+        let prompt_terms = storage
+            .dictionary_prompt_terms_for(retry_context.as_ref())
+            .unwrap_or_default();
         let prompt = (!prompt_terms.is_empty()).then(|| prompt_terms.join("\n"));
         let transcript = services
             .transcriber
@@ -3012,12 +3103,15 @@ pub(crate) async fn retry_history_item(
             llm_provider = Some(settings.correction_provider.as_str());
         } else if settings.text_correction_enabled {
             let hints = storage
-                .dictionary_correction_hints(&transcript.text)
+                .dictionary_correction_hints(&transcript.text, retry_context.as_ref())
                 .unwrap_or_default();
             output = correction::correct_transcript(
                 &settings,
                 &transcript.text,
                 &hints,
+                personalization::resolve_profile(&settings, retry_context.as_ref())
+                    .map(|profile| personalization::guidance(&profile))
+                    .as_deref(),
                 cancel.clone(),
                 |_| {},
             )
@@ -3130,6 +3224,13 @@ fn retry_dictate_history_mode(llm_provider: Option<&str>) -> &'static str {
     }
 }
 
+fn retry_app_context(item: &HistoryItem) -> Option<types::AppContext> {
+    item.app_category.clone().map(|category| types::AppContext {
+        app_key: None,
+        category,
+    })
+}
+
 fn stored_ask_action(item: &HistoryItem) -> Result<ask::AskAction, String> {
     Ok(match item.action_kind.as_deref() {
         Some("rewrite") => ask::AskAction::Rewrite,
@@ -3170,6 +3271,8 @@ pub(crate) fn add_dictionary_entry(
     entry: DictionaryEntryInput,
     storage: State<'_, Storage>,
 ) -> Result<DictionaryEntry, String> {
+    personalization::validate_dictionary_scope(entry.app_scope.as_deref())
+        .map_err(str::to_owned)?;
     let id = storage
         .add_dictionary_entry(&NewDictionaryEntry {
             reading: &entry.reading,

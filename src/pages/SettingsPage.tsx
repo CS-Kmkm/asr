@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { SettingRow, Toggle } from "../components/ui";
 import { AiCorrectionSettings } from "../components/AiCorrectionSettings";
-import type { AudioDevice, AudioLevel, Settings, ShortcutMode } from "../types";
+import type { AudioDevice, AudioLevel, ScopedStyleProfile, Settings, ShortcutMode, StyleProfile } from "../types";
 import { speechLocaleRegistry, uiLocaleRegistry } from "../types";
 import { getShortcutWarning, startMicrophoneTest, stopMicrophoneTest } from "../api";
 import { translateAppMessage, useI18n } from "../i18n";
@@ -18,6 +18,25 @@ const shortcutModes: Array<{ mode: ShortcutMode; label: "Dictation shortcuts" | 
   { mode: "ask", label: "Ask Anything shortcuts" },
   { mode: "edit", label: "Speak to edit shortcuts" },
 ];
+
+const profileCategories = new Set(["browser", "email", "messaging", "development", "document", "other"]);
+
+function isValidProfileScope(scope: string): boolean {
+  if (Array.from(scope).length > 80 || scope.trim() !== scope) return false;
+  if (scope.startsWith("app:")) return /^app:[a-z0-9_-]+$/.test(scope);
+  if (scope.startsWith("category:")) return profileCategories.has(scope.slice("category:".length));
+  return false;
+}
+
+function sameProfiles(left: ScopedStyleProfile[], right: ScopedStyleProfile[]): boolean {
+  return left.length === right.length && left.every((item, index) => {
+    const other = right[index];
+    return item.scope === other.scope &&
+      item.profile.formality === other.profile.formality &&
+      item.profile.detail === other.profile.detail &&
+      (item.profile.guidance ?? "") === (other.profile.guidance ?? "");
+  });
+}
 
 export function SettingsPage({
   settings,
@@ -44,6 +63,8 @@ export function SettingsPage({
   const testRunningRef = useRef(false);
   const mountedRef = useRef(false);
   const testStartPromiseRef = useRef<Promise<void> | null>(null);
+  const [profiles, setProfiles] = useState(settings.scopedStyleProfiles);
+  const savedProfilesRef = useRef(settings.scopedStyleProfiles);
   const suppressTranslationInstructionBlurRef = useRef(false);
   const savedShortcutsJsonRef = useRef(JSON.stringify(settings.shortcuts));
 
@@ -64,6 +85,30 @@ export function SettingsPage({
     const firstAvailable = translationLanguages.find(([code]) => !settings.translationTargetLanguages.includes(code));
     if (firstAvailable) setLanguageToAdd(firstAvailable[0]);
   }, [languageToAdd, settings.translationTargetLanguages]);
+  useEffect(() => {
+    const previous = savedProfilesRef.current;
+    const incoming = settings.scopedStyleProfiles;
+    savedProfilesRef.current = incoming;
+    // Every settings save returns a new array. Adopt it only while the local
+    // draft has no unsaved edits, so an unrelated save cannot discard a new or
+    // invalid scoped row.
+    setProfiles((draft) => (sameProfiles(draft, previous) ? incoming : draft));
+  }, [settings.scopedStyleProfiles]);
+
+  function saveProfiles(next: ScopedStyleProfile[]) {
+    setProfiles(next);
+    if (next.every((item) => isValidProfileScope(item.scope)) &&
+        new Set(next.map((item) => item.scope)).size === next.length) {
+      onSave({ scopedStyleProfiles: next });
+    }
+  }
+
+  const profileDraftIsInvalid = profiles.some((item) => !isValidProfileScope(item.scope)) ||
+    new Set(profiles.map((item) => item.scope)).size !== profiles.length;
+
+  function saveGlobalProfile(profile: StyleProfile | null) {
+    onSave({ globalStyleProfile: profile });
+  }
 
   useEffect(() => {
     mountedRef.current = true;
@@ -328,6 +373,8 @@ export function SettingsPage({
             if (event.key === "Enter") { event.preventDefault(); if (translationInstruction !== settings.translationInstruction) onSave({ translationInstruction }); suppressTranslationInstructionBlurRef.current = true; event.currentTarget.blur(); }
             if (event.key === "Escape") { setTranslationInstruction(settings.translationInstruction); suppressTranslationInstructionBlurRef.current = true; event.currentTarget.blur(); }
           }} />} />
+        <SettingRow title={t("Personalization")} detail={t("Use manually configured abstract style profiles for the captured app category.")}
+          control={<Toggle checked={settings.personalizationEnabled} onChange={(value) => onSave({ personalizationEnabled: value })} />} />
         <SettingRow title={t("Start with Windows")} detail={t("Launches Local Voice Input automatically when you sign in to Windows.")}
           control={<Toggle checked={settings.autoStart} onChange={(value) => onSave({ autoStart: value })} />} />
         <SettingRow title={t("Restore clipboard")} detail={t("Restore previous clipboard contents after successful paste.")}
@@ -341,7 +388,63 @@ export function SettingsPage({
         <SettingRow title={t("Input gain")} detail={t("Adjusts the processed microphone level from 25% to 400%.")}
           control={<label className="range-control"><input type="range" min="25" max="400" step="5" value={settings.inputGainPercent} onChange={(event) => onSave({ inputGainPercent: Number(event.target.value) })} /><output>{settings.inputGainPercent}%</output></label>} />
       </section>
+      <PersonalizationProfiles settings={settings} profiles={profiles} profileDraftIsInvalid={profileDraftIsInvalid} onSaveGlobal={saveGlobalProfile} onSaveProfiles={saveProfiles} />
       <AiCorrectionSettings settings={settings} onSave={onSave} />
     </div>
+  );
+}
+
+function PersonalizationProfiles({
+  settings,
+  profiles,
+  profileDraftIsInvalid,
+  onSaveGlobal,
+  onSaveProfiles,
+}: {
+  settings: Settings;
+  profiles: ScopedStyleProfile[];
+  profileDraftIsInvalid: boolean;
+  onSaveGlobal: (profile: StyleProfile | null) => void;
+  onSaveProfiles: (profiles: ScopedStyleProfile[]) => void;
+}) {
+  const { t } = useI18n();
+  const global = settings.globalStyleProfile;
+  const defaultGlobal: StyleProfile = { formality: "formal", detail: "concise", guidance: "" };
+  const updateGlobal = (patch: Partial<StyleProfile>) => onSaveGlobal({ ...(global ?? defaultGlobal), ...patch });
+  return (
+    <section className="panel">
+      <h2>{t("Personalization profiles")}</h2>
+      <p>{t("Structured style settings are retained locally; no transcript examples are stored.")}</p>
+      {!settings.personalizationEnabled && <p role="status">{t("Inactive: Personalization is off, so these profiles are not used.")}</p>}
+      {!settings.textCorrectionEnabled && <p role="status">{t("Inactive: profiles are used only when AI text correction is on.")}</p>}
+      <SettingRow title={t("Global profile")} detail={t("Fallback style used when no app or category profile matches.")} control={
+        <div className="profile-controls">
+          {global ? <>
+            <select value={global.formality} onChange={(e) => updateGlobal({ formality: e.target.value as StyleProfile["formality"] })}><option value="formal">{t("Formal")}</option><option value="casual">{t("Casual")}</option></select>
+            <select value={global.detail} onChange={(e) => updateGlobal({ detail: e.target.value as StyleProfile["detail"] })}><option value="concise">{t("Concise")}</option><option value="detailed">{t("Detailed")}</option></select>
+            <input maxLength={300} placeholder={t("Optional guidance")} value={global.guidance ?? ""} onChange={(e) => updateGlobal({ guidance: e.target.value })} />
+            <button className="secondary" onClick={() => onSaveGlobal(null)}>{t("Clear")}</button>
+          </> : <>
+            <span>{t("Not configured")}</span>
+            <button className="secondary" onClick={() => onSaveGlobal(defaultGlobal)}>{t("Configure global profile")}</button>
+          </>}
+        </div>
+      } />
+      <div className="profile-list">
+        <strong>{t("Scoped profiles")}</strong>
+        <p>{t("Precedence is fixed: exact app > category > global. List order has no effect.")}</p>
+        {profileDraftIsInvalid && <p role="alert">{t("Profile scopes must be valid and unique before changes are saved.")}</p>}
+        {profiles.map((item, index) => (
+          <div className="setting-row" key={index}>
+            <input value={item.scope} maxLength={80} placeholder={t("app:code or category:development")} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, scope: e.target.value }; onSaveProfiles(next); }} />
+            <select value={item.profile.formality} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, formality: e.target.value as StyleProfile["formality"] } }; onSaveProfiles(next); }}><option value="formal">{t("Formal")}</option><option value="casual">{t("Casual")}</option></select>
+            <select value={item.profile.detail} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, detail: e.target.value as StyleProfile["detail"] } }; onSaveProfiles(next); }}><option value="concise">{t("Concise")}</option><option value="detailed">{t("Detailed")}</option></select>
+            <input maxLength={300} placeholder={t("Optional guidance")} value={item.profile.guidance ?? ""} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, guidance: e.target.value } }; onSaveProfiles(next); }} />
+            <button className="secondary" onClick={() => onSaveProfiles(profiles.filter((_, i) => i !== index))}>{t("Remove")}</button>
+          </div>
+        ))}
+        <button className="primary" onClick={() => onSaveProfiles([...profiles, { scope: "", profile: { formality: "formal", detail: "concise", guidance: "" } }])}>{t("Add scoped profile")}</button>
+      </div>
+    </section>
   );
 }

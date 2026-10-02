@@ -9,6 +9,7 @@ const EMPTY_FORM = {
   category: "",
   aliases: "",
   priority: "0",
+  appScope: "",
 };
 
 export function DictionaryPage({
@@ -36,6 +37,7 @@ export function DictionaryPage({
       category: form.category.trim() || null,
       aliases,
       priority: Number.isFinite(priority) ? priority : 0,
+      appScope: form.appScope.trim() || null,
     };
     const ok = await onAdd(input);
     if (ok) setForm(EMPTY_FORM);
@@ -88,6 +90,13 @@ export function DictionaryPage({
         </div>
         <div className="setting-row">
           <div>
+          <strong>{t("Scope")}</strong>
+          <p>{t("Optional global, app:key, or category:name scope.")}</p>
+          </div>
+          <input value={form.appScope} onChange={(e) => setForm({ ...form, appScope: e.target.value })} />
+        </div>
+        <div className="setting-row">
+          <div>
           <strong>{t("Priority")}</strong>
             <p>{t("Higher values win when readings collide.")}</p>
           </div>
@@ -119,6 +128,7 @@ export function DictionaryPage({
                   {entry.aliases.length > 0 ? ` · ${t("aliases:")} ${entry.aliases.join(", ")}` : ""}
                   {` · ${t("priority")} ${entry.priority}`}
                 </p>
+                {entry.appScope && <small>{t("scope:")} {entry.appScope}</small>}
               </div>
               <button
                 className="secondary"
