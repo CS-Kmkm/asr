@@ -1,3 +1,5 @@
+mod answer_panel;
+mod ask;
 mod asr;
 mod audio;
 mod commands;
@@ -24,6 +26,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use ask::AskContextKind;
 use asr::{JsonlTranscriber, Transcriber, WorkerCommand};
 use audio::{
     AudioCapture, AudioDevice, AudioEnhancementConfig, CaptureConfig, CpalAudioCapture,
@@ -90,6 +93,8 @@ pub(crate) struct Services {
     audio: tokio::sync::Mutex<Box<dyn AudioCapture>>,
     live: tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
     edit: tokio::sync::Mutex<Option<EditSession>>,
+    ask: tokio::sync::Mutex<Option<AskSession>>,
+    answer_panel: answer_panel::AnswerPanelState,
     target: Mutex<Option<TargetWindow>>,
     transcriber: Arc<dyn Transcriber>,
     input_monitor: Arc<InputMonitor>,
@@ -114,6 +119,7 @@ enum HotkeyAction {
     SelectedTextTranslate,
     VoiceTranslate,
     Edit,
+    Ask,
 }
 
 impl HotkeyAction {
@@ -123,6 +129,7 @@ impl HotkeyAction {
             Self::SelectedTextTranslate => "The selected-text translation hotkey could not be registered; another app may be using it. Change it in Settings.",
             Self::VoiceTranslate => "The voice Translate hotkey could not be registered; another app may be using it. Change it in Settings.",
             Self::Edit => "The Speak to edit hotkey could not be registered; another app may be using it. Change it in Settings.",
+            Self::Ask => "The Ask Anything hotkey could not be registered; another app may be using it. Change it in Settings.",
         }
     }
 
@@ -132,6 +139,7 @@ impl HotkeyAction {
             (Self::VoiceTranslate, Self::Dictate) => "The voice Translate hotkey matches the recording hotkey, so voice Translate is off until you change it in Settings.",
             (Self::VoiceTranslate, Self::SelectedTextTranslate) => "The voice Translate hotkey matches the selected-text translation hotkey, so voice Translate is off until you change it in Settings.",
             (Self::Edit, _) => "Speak to edit is disabled because its saved hotkey is already used by another action. Change the overlapping hotkeys in Settings.",
+            (Self::Ask, _) => "Ask Anything is disabled because its saved hotkey is already used by another action. Change the overlapping hotkeys in Settings.",
             _ => "Some saved hotkeys overlap. Change them in Settings to enable each action independently.",
         }
     }
@@ -155,6 +163,7 @@ fn hotkey_bindings(settings: &Settings) -> Result<Vec<HotkeyBinding>, String> {
             HotkeyAction::Edit,
             parse_shortcut(&settings.speak_to_edit_hotkey)?,
         ),
+        (HotkeyAction::Ask, parse_shortcut(&settings.ask_hotkey)?),
     ])
 }
 
@@ -236,6 +245,8 @@ impl Services {
             audio: tokio::sync::Mutex::new(Box::new(CpalAudioCapture::new())),
             live: tokio::sync::Mutex::new(None),
             edit: tokio::sync::Mutex::new(None),
+            ask: tokio::sync::Mutex::new(None),
+            answer_panel: answer_panel::AnswerPanelState::default(),
             target: Mutex::new(None),
             transcriber: Arc::new(JsonlTranscriber::new(
                 worker_command_for_settings(settings),
@@ -281,6 +292,7 @@ impl Services {
             let _ = task.finish().await;
         }
         self.edit.lock().await.take();
+        self.ask.lock().await.take();
         if let Ok(mut target) = self.target.lock() {
             target.take();
         }
@@ -326,6 +338,96 @@ impl EditSession {
 impl Drop for EditSession {
     fn drop(&mut self) {
         self.monitor.shutdown();
+    }
+}
+
+pub(crate) enum AskCapture {
+    Selected(SelectedText),
+    Caret(TargetWindow),
+    Unavailable,
+}
+
+// The answer panel and all other app windows share our process. Never use
+// their focused text as a fresh Ask source or insertion target.
+fn is_external_ask_target(target: &TargetWindow) -> bool {
+    target.process_id != std::process::id()
+}
+
+pub(crate) struct AskSession {
+    pub(crate) capture: AskCapture,
+    pub(crate) injector: SystemTextInjector,
+    pub(crate) monitor: Option<Arc<InputMonitor>>,
+    pub(crate) checkpoint: Option<u64>,
+}
+
+impl AskSession {
+    fn new(settings: &Settings, from_shortcut: bool) -> Self {
+        let injector = SystemTextInjector::new(InjectionOptions {
+            restore_clipboard: settings.clipboard_restore,
+        });
+        // Only the known "no selection" result may become a caret capture.
+        // Any inaccessible/changed selection becomes panel-only, never an
+        // insertion target.
+        let capture = match injector.capture_selection() {
+            Ok(selection) if is_external_ask_target(selection.target()) => {
+                AskCapture::Selected(selection)
+            }
+            Ok(_) => AskCapture::Unavailable,
+            Err(injection::InjectionError::BackendFailure("no text is selected")) => {
+                match injector.capture_target() {
+                    Ok(target) if is_external_ask_target(&target) => AskCapture::Caret(target),
+                    Ok(_) => AskCapture::Unavailable,
+                    Err(_) => AskCapture::Unavailable,
+                }
+            }
+            Err(_) => AskCapture::Unavailable,
+        };
+        let monitor = match &capture {
+            AskCapture::Selected(_) | AskCapture::Caret(_) => {
+                let monitor = Arc::new(InputMonitor::default());
+                if monitor.start_for_recording(&settings.ask_hotkey, from_shortcut) {
+                    Some(monitor)
+                } else {
+                    None
+                }
+            }
+            AskCapture::Unavailable => None,
+        };
+        let checkpoint = monitor.as_ref().and_then(|monitor| monitor.checkpoint());
+        let capture = if matches!(&capture, AskCapture::Caret(_)) && checkpoint.is_none() {
+            AskCapture::Unavailable
+        } else {
+            capture
+        };
+        Self {
+            capture,
+            injector,
+            monitor,
+            checkpoint,
+        }
+    }
+
+    pub(crate) fn kind(&self) -> AskContextKind {
+        match self.capture {
+            AskCapture::Selected(_) => AskContextKind::Selected,
+            AskCapture::Caret(_) => AskContextKind::Caret,
+            AskCapture::Unavailable => AskContextKind::Unavailable,
+        }
+    }
+
+    pub(crate) fn selected_source(&self) -> Option<&str> {
+        match &self.capture {
+            AskCapture::Selected(selection) => Some(selection.text()),
+            _ => None,
+        }
+    }
+}
+
+impl Drop for AskSession {
+    fn drop(&mut self) {
+        if let Some(monitor) = &self.monitor {
+            monitor.shutdown();
+        }
     }
 }
 
@@ -477,14 +579,21 @@ fn parse_shortcut(value: &str) -> Result<Shortcut, String> {
 #[cfg(test)]
 mod shortcut_startup_tests {
     use super::*;
-    use HotkeyAction::{Dictate, Edit, SelectedTextTranslate, VoiceTranslate};
+    use HotkeyAction::{Ask, Dictate, Edit, SelectedTextTranslate, VoiceTranslate};
 
-    fn bindings(dictate: &str, selected: &str, voice: &str, edit: &str) -> Vec<HotkeyBinding> {
+    fn bindings(
+        dictate: &str,
+        selected: &str,
+        voice: &str,
+        edit: &str,
+        ask: &str,
+    ) -> Vec<HotkeyBinding> {
         let mut settings = Settings::default();
         settings.hotkey = dictate.into();
         settings.translation_hotkey = selected.into();
         settings.voice_translate_hotkey = voice.into();
         settings.speak_to_edit_hotkey = edit.into();
+        settings.ask_hotkey = ask.into();
         hotkey_bindings(&settings).unwrap()
     }
 
@@ -506,7 +615,8 @@ mod shortcut_startup_tests {
                 (
                     Edit,
                     parse_shortcut(&settings.speak_to_edit_hotkey).unwrap()
-                )
+                ),
+                (Ask, parse_shortcut(&settings.ask_hotkey).unwrap())
             ]
         );
         assert_eq!(
@@ -527,6 +637,7 @@ mod shortcut_startup_tests {
             "Ctrl+Shift+Space",
             "Ctrl+Shift+Space",
             "Ctrl+Shift+Space",
+            "Ctrl+Shift+Space",
         );
         let shared = parse_shortcut("Ctrl+Shift+Space").unwrap();
         let assignment = assign_hotkeys(&bindings);
@@ -536,7 +647,8 @@ mod shortcut_startup_tests {
             vec![
                 (SelectedTextTranslate, Dictate),
                 (VoiceTranslate, Dictate),
-                (Edit, Dictate)
+                (Edit, Dictate),
+                (Ask, Dictate)
             ]
         );
         assert_eq!(dispatched_action(&bindings, shared), Some(Dictate));
@@ -549,6 +661,7 @@ mod shortcut_startup_tests {
             "Ctrl+Shift+Space",
             "Ctrl+Shift+Y",
             "Ctrl+Shift+E",
+            "Ctrl+Shift+A",
         );
         assert_eq!(
             assign_hotkeys(&bindings).collisions,
@@ -571,6 +684,7 @@ mod shortcut_startup_tests {
             "Ctrl+Shift+T",
             "Ctrl+Shift+T",
             "Ctrl+Shift+E",
+            "Ctrl+Shift+A",
         );
         assert!(!has_new_hotkey_collision(&existing, &existing));
 
@@ -579,6 +693,7 @@ mod shortcut_startup_tests {
             "Ctrl+Shift+T",
             "Ctrl+Shift+Space",
             "Ctrl+Shift+E",
+            "Ctrl+Shift+A",
         );
         assert!(has_new_hotkey_collision(&newly_colliding, &existing));
 
@@ -587,6 +702,7 @@ mod shortcut_startup_tests {
             "Ctrl+Shift+Y",
             "Ctrl+Shift+Y",
             "Ctrl+Shift+E",
+            "Ctrl+Shift+A",
         );
         assert!(has_new_hotkey_collision(&moved_together, &existing));
     }
@@ -621,7 +737,7 @@ mod shortcut_startup_tests {
                 Dictate => settings.hotkey = edit,
                 SelectedTextTranslate => settings.translation_hotkey = edit,
                 VoiceTranslate => settings.voice_translate_hotkey = edit,
-                Edit => unreachable!(),
+                Edit | Ask => unreachable!(),
             }
             let bindings = hotkey_bindings(&settings).unwrap();
             assert!(assign_hotkeys(&bindings)
@@ -641,6 +757,47 @@ mod shortcut_startup_tests {
             .messages()[0]
                 .starts_with("Speak to edit is disabled"));
         }
+    }
+
+    #[test]
+    fn ask_yields_a_shared_chord_to_every_older_action() {
+        for owner in [Dictate, SelectedTextTranslate, VoiceTranslate, Edit] {
+            let mut settings = Settings::default();
+            let ask = settings.ask_hotkey.clone();
+            match owner {
+                Dictate => settings.hotkey = ask,
+                SelectedTextTranslate => settings.translation_hotkey = ask,
+                VoiceTranslate => settings.voice_translate_hotkey = ask,
+                Edit => settings.speak_to_edit_hotkey = ask,
+                Ask => unreachable!(),
+            }
+            let bindings = hotkey_bindings(&settings).unwrap();
+            assert!(assign_hotkeys(&bindings).collisions.contains(&(Ask, owner)));
+            assert_eq!(
+                dispatched_action(&bindings, parse_shortcut(&settings.ask_hotkey).unwrap()),
+                Some(owner)
+            );
+            assert!(HotkeyIssues {
+                collisions: vec![(Ask, owner)],
+                unregistered: vec![]
+            }
+            .messages()[0]
+                .starts_with("Ask Anything is disabled"));
+        }
+    }
+
+    #[test]
+    fn ask_never_captures_an_answer_panel_in_its_own_process() {
+        let mut target = TargetWindow {
+            window_handle: 1,
+            control_handle: 1,
+            process_id: std::process::id(),
+            thread_id: 1,
+            is_secure: false,
+        };
+        assert!(!is_external_ask_target(&target));
+        target.process_id = target.process_id.saturating_add(1);
+        assert!(is_external_ask_target(&target));
     }
 }
 
@@ -893,6 +1050,16 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode) {
                 )
                 .await
             }
+            PipelineMode::Ask => {
+                commands::start_ask_with_origin(
+                    app.clone(),
+                    app.state::<Services>(),
+                    app.state::<AppState>(),
+                    app.state::<Storage>(),
+                    true,
+                )
+                .await
+            }
         },
         PipelinePhase::Starting | PipelinePhase::Processing => Ok(()),
     };
@@ -1015,6 +1182,9 @@ fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
         Some(HotkeyAction::Edit) => {
             tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Edit));
         }
+        Some(HotkeyAction::Ask) => {
+            tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Ask));
+        }
         None => {}
     }
 }
@@ -1092,6 +1262,7 @@ pub fn run() {
             app.manage(AppState::default());
             app.manage(Services::new(&settings));
             recording_overlay::create(app.handle())?;
+            answer_panel::create(app.handle())?;
             // Older settings may share a chord with a newly added action. The
             // older action keeps it (the same owner dispatch uses); each chord
             // is registered once, and the warning names every unassigned action.
@@ -1158,6 +1329,7 @@ pub fn run() {
             commands::start_recording,
             commands::start_voice_translation,
             commands::start_speak_to_edit,
+            commands::start_ask,
             commands::stop_recording,
             commands::cancel_recording,
             commands::cycle_voice_translation_target,
@@ -1174,9 +1346,17 @@ pub fn run() {
             commands::delete_dictionary_entry,
             commands::copy_history_item,
             commands::copy_to_clipboard,
+            commands::get_ask_answer,
+            commands::dismiss_ask_answer,
             commands::update_settings
         ])
         .on_window_event(|window, event| {
+            if window.label() == answer_panel::WINDOW_LABEL {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
             if window.label() == "main" && matches!(event, WindowEvent::CloseRequested { .. }) {
                 // A tray icon keeps a Tauri process alive after its last window
                 // is closed. Treat the main window's close button as an actual

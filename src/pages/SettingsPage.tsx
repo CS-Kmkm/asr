@@ -27,6 +27,7 @@ export function SettingsPage({
   const [translationHotkey, setTranslationHotkey] = useState(settings.translationHotkey);
   const [voiceTranslateHotkey, setVoiceTranslateHotkey] = useState(settings.voiceTranslateHotkey);
   const [speakToEditHotkey, setSpeakToEditHotkey] = useState(settings.speakToEditHotkey);
+  const [askHotkey, setAskHotkey] = useState(settings.askHotkey);
   const [translationInstruction, setTranslationInstruction] = useState(settings.translationInstruction);
   const [languageToAdd, setLanguageToAdd] = useState("zh");
   const cancelHotkeyBlurRef = useRef(false);
@@ -37,6 +38,8 @@ export function SettingsPage({
   const suppressVoiceTranslateBlurRef = useRef(false);
   const cancelSpeakToEditBlurRef = useRef(false);
   const suppressSpeakToEditBlurRef = useRef(false);
+  const cancelAskBlurRef = useRef(false);
+  const suppressAskBlurRef = useRef(false);
   const cancelTranslationInstructionBlurRef = useRef(false);
   const suppressTranslationInstructionBlurRef = useRef(false);
 
@@ -44,6 +47,7 @@ export function SettingsPage({
   useEffect(() => setTranslationHotkey(settings.translationHotkey), [settings.translationHotkey]);
   useEffect(() => setVoiceTranslateHotkey(settings.voiceTranslateHotkey), [settings.voiceTranslateHotkey]);
   useEffect(() => setSpeakToEditHotkey(settings.speakToEditHotkey), [settings.speakToEditHotkey]);
+  useEffect(() => setAskHotkey(settings.askHotkey), [settings.askHotkey]);
   useEffect(() => setTranslationInstruction(settings.translationInstruction), [settings.translationInstruction]);
   useEffect(() => {
     if (!settings.translationTargetLanguages.includes(languageToAdd)) return;
@@ -102,6 +106,15 @@ export function SettingsPage({
     if (speakToEditHotkey !== settings.speakToEditHotkey) {
       onSave({ speakToEditHotkey });
     }
+  }
+
+  function commitAskHotkey() {
+    if (cancelAskBlurRef.current || suppressAskBlurRef.current) {
+      cancelAskBlurRef.current = false;
+      suppressAskBlurRef.current = false;
+      return;
+    }
+    if (askHotkey !== settings.askHotkey) onSave({ askHotkey });
   }
 
   function moveTargetLanguage(index: number, direction: -1 | 1) {
@@ -273,6 +286,29 @@ export function SettingsPage({
                 } else if (event.key === "Escape") {
                   setSpeakToEditHotkey(settings.speakToEditHotkey);
                   cancelSpeakToEditBlurRef.current = true;
+                  event.currentTarget.blur();
+                }
+              }}
+            />
+          }
+        />
+        <SettingRow
+          title={t("Ask Anything hotkey")}
+          detail={`${t("Asks or acts on a spoken instruction; the default is Ctrl+Shift+A.")} ${t("Ask sends only the transcribed spoken instruction to the selected provider for planning. Answer generation using a selection also sends the selected source text with the instruction, even when Dictation AI correction is off. The selected ASR backend may send audio.")}`}
+          control={
+            <input
+              value={askHotkey}
+              onChange={(event) => setAskHotkey(event.target.value)}
+              onBlur={commitAskHotkey}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  commitAskHotkey();
+                  suppressAskBlurRef.current = true;
+                  event.currentTarget.blur();
+                } else if (event.key === "Escape") {
+                  setAskHotkey(settings.askHotkey);
+                  cancelAskBlurRef.current = true;
                   event.currentTarget.blur();
                 }
               }}

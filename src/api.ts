@@ -21,6 +21,7 @@ export const defaultSettings: Settings = {
   translationInstruction: "",
   voiceTranslateHotkey: "Ctrl+Shift+Y",
   speakToEditHotkey: "Ctrl+Shift+E",
+  askHotkey: "Ctrl+Shift+A",
   translationTargetLanguages: ["en", "ja"],
   translationTargetLanguage: "en",
   microphoneId: null,
@@ -83,6 +84,11 @@ export async function startVoiceTranslation(): Promise<void> {
   return invoke("start_voice_translation");
 }
 
+export async function startAsk(): Promise<void> {
+  if (!inTauri) return;
+  return invoke("start_ask");
+}
+
 export async function cycleVoiceTranslationTarget(): Promise<string> {
   if (!inTauri) return defaultSettings.translationTargetLanguage;
   return invoke("cycle_voice_translation_target");
@@ -124,6 +130,18 @@ export async function copyToClipboard(text: string): Promise<void> {
     return;
   }
   await navigator.clipboard.writeText(text);
+}
+
+export type AskAnswer = { operationId: number; payload: string };
+
+export async function getAskAnswer(): Promise<AskAnswer | null> {
+  if (!inTauri) return null;
+  return invoke<AskAnswer | null>("get_ask_answer");
+}
+
+export async function dismissAskAnswer(operationId: number): Promise<boolean> {
+  if (!inTauri) return false;
+  return invoke<boolean>("dismiss_ask_answer", { operationId });
 }
 
 export async function getModelStatus(): Promise<ModelStatus> {

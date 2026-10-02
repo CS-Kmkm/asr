@@ -15,6 +15,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_READ_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_ERROR_BODY_CHARS: usize = 500;
+const ASK_PLAN_MIN_OUTPUT_TOKENS: usize = 512;
+const ASK_TEXT_MIN_OUTPUT_TOKENS: usize = 4096;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CorrectionError {
@@ -46,7 +48,16 @@ pub async fn correct_transcript(
     on_update: impl FnMut(&str),
 ) -> Result<String, CorrectionError> {
     let instruction = build_correction_instruction(settings, dictionary_hints);
-    request_text(settings, transcript, &instruction, cancel, on_update).await
+    request_text(
+        settings,
+        transcript,
+        &instruction,
+        cancel,
+        on_update,
+        true,
+        None,
+    )
+    .await
 }
 
 pub async fn translate_text(
@@ -55,7 +66,16 @@ pub async fn translate_text(
     cancel: watch::Receiver<bool>,
 ) -> Result<String, CorrectionError> {
     let instruction = build_translation_instruction(settings);
-    request_text(settings, transcript, &instruction, cancel, |_| {}).await
+    request_text(
+        settings,
+        transcript,
+        &instruction,
+        cancel,
+        |_| {},
+        true,
+        None,
+    )
+    .await
 }
 
 pub async fn translate_transcript(
@@ -66,7 +86,16 @@ pub async fn translate_transcript(
     on_update: impl FnMut(&str),
 ) -> Result<String, CorrectionError> {
     let instruction = build_voice_translation_instruction(target_language)?;
-    request_text(settings, transcript, &instruction, cancel, on_update).await
+    request_text(
+        settings,
+        transcript,
+        &instruction,
+        cancel,
+        on_update,
+        true,
+        None,
+    )
+    .await
 }
 
 pub async fn edit_selected_text(
@@ -81,7 +110,7 @@ pub async fn edit_selected_text(
     }
     let instruction = build_edit_instruction();
     let input = edit_request_input(selected_text, spoken_instruction);
-    let edited = request_text(settings, &input, instruction, cancel, on_update).await?;
+    let edited = request_text(settings, &input, instruction, cancel, on_update, true, None).await?;
     Ok(restore_selection_whitespace(selected_text, &edited))
 }
 
@@ -147,6 +176,8 @@ async fn request_text(
     instruction: &str,
     mut cancel: watch::Receiver<bool>,
     mut on_update: impl FnMut(&str),
+    trim_output: bool,
+    minimum_output_tokens: Option<usize>,
 ) -> Result<String, CorrectionError> {
     if *cancel.borrow() {
         return Err(CorrectionError::Cancelled);
@@ -161,23 +192,38 @@ async fn request_text(
     let request = match settings.correction_provider.as_str() {
         "openai" => {
             let key = api_key(&settings.openai_api_key_env_var)?;
+            let mut body = openai_request(settings, transcript, instruction);
+            if let Some(minimum) = minimum_output_tokens {
+                body["max_output_tokens"] = json!(max_output_tokens(transcript).max(minimum));
+            }
             client
                 .post(OPENAI_RESPONSES_URL)
                 .bearer_auth(key)
-                .json(&openai_request(settings, transcript, instruction))
+                .json(&body)
         }
         "gemini" => {
             let key = api_key(&settings.gemini_api_key_env_var)?;
+            let mut body = gemini_request(settings, transcript, instruction);
+            if let Some(minimum) = minimum_output_tokens {
+                body["generation_config"]["max_output_tokens"] =
+                    json!(max_output_tokens(transcript).max(minimum));
+            }
             client
                 .post(GEMINI_INTERACTIONS_URL)
                 .header("x-goog-api-key", key)
-                .json(&gemini_request(settings, transcript, instruction))
+                .json(&body)
         }
-        "local" => client
-            .post(local_chat_completions_url(
-                &settings.local_correction_base_url,
-            )?)
-            .json(&local_request(settings, transcript, instruction)),
+        "local" => {
+            let mut body = local_request(settings, transcript, instruction);
+            if let Some(minimum) = minimum_output_tokens {
+                body["max_tokens"] = json!(local_ask_output_tokens(settings, transcript, minimum));
+            }
+            client
+                .post(local_chat_completions_url(
+                    &settings.local_correction_base_url,
+                )?)
+                .json(&body)
+        }
         provider => return Err(CorrectionError::UnsupportedProvider(provider.into())),
     };
 
@@ -197,13 +243,56 @@ async fn request_text(
         &mut on_update,
     )
     .await?;
-    let corrected = corrected.trim();
+    let corrected = if trim_output {
+        corrected.trim()
+    } else {
+        &corrected
+    };
     if corrected.is_empty() {
         return Err(CorrectionError::InvalidResponse(
             "the model returned empty text".into(),
         ));
     }
     Ok(corrected.to_owned())
+}
+
+/// A deliberately narrow text-only provider seam for the second Ask stage.
+/// The caller owns the action policy; this function neither parses plans nor
+/// performs side effects.
+pub async fn generate_ask_text(
+    settings: &Settings,
+    input: &str,
+    instruction: &str,
+    cancel: watch::Receiver<bool>,
+) -> Result<String, CorrectionError> {
+    request_text(
+        settings,
+        input,
+        instruction,
+        cancel,
+        |_| {},
+        true,
+        Some(ASK_TEXT_MIN_OUTPUT_TOKENS),
+    )
+    .await
+}
+
+pub async fn generate_ask_plan(
+    settings: &Settings,
+    input: &str,
+    instruction: &str,
+    cancel: watch::Receiver<bool>,
+) -> Result<String, CorrectionError> {
+    request_text(
+        settings,
+        input,
+        instruction,
+        cancel,
+        |_| {},
+        false,
+        Some(ASK_PLAN_MIN_OUTPUT_TOKENS),
+    )
+    .await
 }
 
 fn local_client() -> Result<Client, reqwest::Error> {
@@ -332,6 +421,12 @@ fn local_request(settings: &Settings, transcript: &str, instruction: &str) -> Va
         "max_tokens": settings.local_correction_max_tokens,
         "stream": true
     })
+}
+
+fn local_ask_output_tokens(settings: &Settings, transcript: &str, minimum: usize) -> usize {
+    max_output_tokens(transcript)
+        .max(minimum)
+        .min(settings.local_correction_max_tokens)
 }
 
 async fn collect_response(
@@ -1895,6 +1990,25 @@ mod tests {
             local_request(&configured, &large, instruction)["max_tokens"],
             32_768
         );
+    }
+
+    #[test]
+    fn local_ask_budgets_never_exceed_the_configured_cap() {
+        let transcript = "short request";
+        for (configured_cap, minimum, expected) in [
+            (128, ASK_PLAN_MIN_OUTPUT_TOKENS, 128),
+            (2048, ASK_TEXT_MIN_OUTPUT_TOKENS, 2048),
+            (8192, ASK_PLAN_MIN_OUTPUT_TOKENS, ASK_PLAN_MIN_OUTPUT_TOKENS),
+        ] {
+            let settings = Settings {
+                local_correction_max_tokens: configured_cap,
+                ..Settings::default()
+            };
+            assert_eq!(
+                local_ask_output_tokens(&settings, transcript, minimum),
+                expected
+            );
+        }
     }
 
     #[test]

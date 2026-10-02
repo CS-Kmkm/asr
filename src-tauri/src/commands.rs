@@ -23,6 +23,7 @@ fn cancellation_copy(mode: PipelineMode) -> (&'static str, &'static str) {
         PipelineMode::Dictate => ("Dictation cancelled.", "dictation was cancelled"),
         PipelineMode::Translate => ("Translation cancelled.", "translation was cancelled"),
         PipelineMode::Edit => ("Editing cancelled.", "editing was cancelled"),
+        PipelineMode::Ask => ("Ask cancelled.", "ask was cancelled"),
     }
 }
 
@@ -106,18 +107,20 @@ fn edit_persistence_warning(
 async fn take_published_sessions<T, U>(
     live: &tokio::sync::Mutex<Option<T>>,
     edit: &tokio::sync::Mutex<Option<U>>,
+    ask: &tokio::sync::Mutex<Option<AskSession>>,
     translation_target: &Mutex<Option<String>>,
-) -> Result<(Option<T>, Option<U>, Option<String>), String> {
+) -> Result<(Option<T>, Option<U>, Option<AskSession>, Option<String>), String> {
     // Startup holds `live` while it publishes both the target language and the
     // session. Waiting for this lock prevents an immediate stop from observing
     // the lifecycle's Recording phase before that publication is complete.
     let live_task = live.lock().await.take();
     let edit_session = edit.lock().await.take();
+    let ask_session = ask.lock().await.take();
     let target_language = translation_target
         .lock()
         .map_err(|_| "translation target service is unavailable".to_string())?
         .take();
-    Ok((live_task, edit_session, target_language))
+    Ok((live_task, edit_session, ask_session, target_language))
 }
 
 fn validate_translation_targets(settings: &Settings) -> Result<(), String> {
@@ -188,6 +191,16 @@ pub(crate) async fn start_speak_to_edit(
     start_speak_to_edit_with_origin(app, services, state, storage, false).await
 }
 
+#[tauri::command]
+pub(crate) async fn start_ask(
+    app: AppHandle,
+    services: State<'_, Services>,
+    state: State<'_, AppState>,
+    storage: State<'_, Storage>,
+) -> Result<(), String> {
+    start_ask_with_origin(app, services, state, storage, false).await
+}
+
 pub(crate) async fn start_recording_with_origin(
     app: AppHandle,
     services: State<'_, Services>,
@@ -242,6 +255,24 @@ pub(crate) async fn start_speak_to_edit_with_origin(
     .await
 }
 
+pub(crate) async fn start_ask_with_origin(
+    app: AppHandle,
+    services: State<'_, Services>,
+    state: State<'_, AppState>,
+    storage: State<'_, Storage>,
+    from_shortcut: bool,
+) -> Result<(), String> {
+    start_recording_mode(
+        app,
+        services,
+        state,
+        storage,
+        from_shortcut,
+        PipelineMode::Ask,
+    )
+    .await
+}
+
 async fn start_recording_mode(
     app: AppHandle,
     services: State<'_, Services>,
@@ -266,12 +297,14 @@ async fn start_recording_mode(
     let mut edit_session = (mode == PipelineMode::Edit)
         .then(|| EditSession::new(&settings, from_shortcut))
         .transpose()?;
+    let mut ask_session =
+        (mode == PipelineMode::Ask).then(|| AskSession::new(&settings, from_shortcut));
     ensure_model_loaded(&app, &services, &settings).await?;
     if services.lifecycle.is_cancelled(operation_id) {
         emit_state(&app, &state, AppPhase::Idle, cancel_message);
         return Err(cancel_error.into());
     }
-    let target = (mode != PipelineMode::Edit)
+    let target = (mode != PipelineMode::Edit && mode != PipelineMode::Ask)
         .then(|| {
             SystemTextInjector::default()
                 .capture_target()
@@ -280,10 +313,12 @@ async fn start_recording_mode(
         .transpose()?;
     let mut live_slot = services.live.lock().await;
     let mut edit_slot = services.edit.lock().await;
+    let mut ask_slot = services.ask.lock().await;
     let active_hotkey = match mode {
         PipelineMode::Dictate => settings.hotkey.as_str(),
         PipelineMode::Translate => settings.voice_translate_hotkey.as_str(),
         PipelineMode::Edit => settings.speak_to_edit_hotkey.as_str(),
+        PipelineMode::Ask => settings.ask_hotkey.as_str(),
     };
     let draft = target.as_ref().map(|target| {
         live_dictation::LiveDraft::new(
@@ -291,12 +326,17 @@ async fn start_recording_mode(
             &settings,
             active_hotkey,
             from_shortcut,
-            mode == PipelineMode::Translate,
+            mode == PipelineMode::Translate || mode == PipelineMode::Ask,
         )
     });
     let cancel = services.lifecycle.cancellation(operation_id)?;
     if let Some(session) = edit_session.as_ref() {
         session.monitor.observe_cancellation(Some(cancel.clone()));
+    }
+    if let Some(session) = ask_session.as_ref() {
+        if let Some(monitor) = &session.monitor {
+            monitor.observe_cancellation(Some(cancel.clone()));
+        }
     }
     let dictionary_terms = storage.dictionary_prompt_terms().unwrap_or_default();
     let prompt = (!dictionary_terms.is_empty()).then(|| dictionary_terms.join("\n"));
@@ -334,6 +374,7 @@ async fn start_recording_mode(
                 PipelineMode::Dictate => "dictate",
                 PipelineMode::Translate => "translate",
                 PipelineMode::Edit => "edit",
+                PipelineMode::Ask => "ask",
             },
             "targetLanguage": target_language,
         }),
@@ -346,6 +387,7 @@ async fn start_recording_mode(
         match mode {
             PipelineMode::Translate => "Recording speech to translate.",
             PipelineMode::Edit => "Recording an edit instruction.",
+            PipelineMode::Ask => "Recording an Ask instruction.",
             PipelineMode::Dictate => "Recording from the selected microphone.",
         },
     );
@@ -353,6 +395,8 @@ async fn start_recording_mode(
     *live_slot =
         draft.map(|draft| live_dictation::start(app.clone(), operation_id, draft, prompt, cancel));
     *edit_slot = edit_session.take();
+    *ask_slot = ask_session.take();
+    drop(ask_slot);
     drop(edit_slot);
     drop(live_slot);
     std::mem::forget(guard);
@@ -417,12 +461,14 @@ pub(crate) async fn stop_recording(
         "Stopping recording and preparing audio.",
     );
     let started = Instant::now();
-    let (live_task, mut edit_session, translation_target) = take_published_sessions(
-        &services.live,
-        &services.edit,
-        &services.voice_translation_target,
-    )
-    .await?;
+    let (live_task, mut edit_session, mut ask_session, translation_target) =
+        take_published_sessions(
+            &services.live,
+            &services.edit,
+            &services.ask,
+            &services.voice_translation_target,
+        )
+        .await?;
     let mut audio = services.audio.lock().await;
     let artifact_result = audio.stop().await;
     // `stop` closes the input stream. Do not re-arm it while transcription is
@@ -436,7 +482,7 @@ pub(crate) async fn stop_recording(
         .map(|artifact| TempArtifact::new(artifact.path.clone(), false));
     let mut draft = match live_task {
         Some(task) => Some(task.finish().await?),
-        None if mode == PipelineMode::Edit => None,
+        None if mode == PipelineMode::Edit || mode == PipelineMode::Ask => None,
         None => return Err("live dictation session is unavailable".into()),
     };
     let settings = storage.get_settings().map_err(command_error)?;
@@ -615,6 +661,8 @@ pub(crate) async fn stop_recording(
                 processed_text: Some(&edited),
                 source_text: Some(&source_text),
                 instruction_text: Some(&instruction_text),
+                action_kind: None,
+                search_site: None,
                 mode: "edit",
                 asr_provider: &transcript.model,
                 llm_provider: Some(settings.correction_provider.as_str()),
@@ -651,6 +699,40 @@ pub(crate) async fn stop_recording(
             duration_ms,
             latency_ms,
         });
+    }
+    if mode == PipelineMode::Ask {
+        let Some(session) = ask_session.take() else {
+            recording_overlay::set_phase(&app, &AppPhase::Error);
+            emit_state(&app, &state, AppPhase::Error, "Ask session is unavailable.");
+            return Err("Ask session is unavailable".into());
+        };
+        let result = finish_ask(
+            &app,
+            &services,
+            &state,
+            &storage,
+            operation_id,
+            &session,
+            &transcript.text,
+            &transcript.model,
+            duration_ms,
+            started,
+        )
+        .await;
+        if result.is_ok() {
+            recording_overlay::set_phase(&app, &AppPhase::Completed);
+        }
+        if let Err(error) = &result {
+            recording_overlay::set_interactive(&app, false);
+            if services.lifecycle.is_cancelled(operation_id) {
+                recording_overlay::set_phase(&app, &AppPhase::Idle);
+                emit_state(&app, &state, AppPhase::Idle, cancel_message);
+            } else {
+                recording_overlay::set_phase(&app, &AppPhase::Error);
+                emit_state(&app, &state, AppPhase::Error, error);
+            }
+        }
+        return result;
     }
     let mut draft = draft
         .take()
@@ -869,6 +951,8 @@ pub(crate) async fn stop_recording(
         processed_text: processed_text.as_deref(),
         source_text: None,
         instruction_text: None,
+        action_kind: None,
+        search_site: None,
         mode: if mode == PipelineMode::Translate {
             "translate"
         } else if processed_text.is_some() {
@@ -931,6 +1015,365 @@ pub(crate) async fn stop_recording(
         duration_ms,
         latency_ms,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_ask(
+    app: &AppHandle,
+    services: &Services,
+    state: &AppState,
+    storage: &Storage,
+    operation_id: u64,
+    session: &AskSession,
+    spoken: &str,
+    asr_provider: &str,
+    duration_ms: u64,
+    started: Instant,
+) -> Result<RecordingResult, String> {
+    use ask::{AskAction, AskError};
+    if services.lifecycle.is_cancelled(operation_id) {
+        return Err("ask was cancelled".into());
+    }
+    require_ask_spoken_input(spoken)?;
+    let settings = storage.get_settings().map_err(command_error)?;
+    emit_state(
+        app,
+        state,
+        AppPhase::Processing,
+        "Choosing a safe Ask action.",
+    );
+    // Planning receives spoken text and context only. It never receives source.
+    let plan = correction::generate_ask_plan(
+        &settings,
+        spoken,
+        &ask::planning_prompt(session.kind()),
+        services
+            .lifecycle
+            .cancellation(operation_id)
+            .map_err(command_error)?,
+    )
+    .await
+    .map_err(|_| "Ask planning failed without taking an action".to_string())?;
+    if services.lifecycle.is_cancelled(operation_id) {
+        return Err("ask was cancelled".into());
+    }
+    let parsed =
+        ask::parse_plan(&plan).map_err(|_| "Ask planner returned an invalid action".to_string())?;
+    let action = match ask::validate_action(
+        parsed,
+        session.kind(),
+        spoken,
+        &settings.translation_target_languages,
+    ) {
+        Ok(action) => action,
+        Err(AskError::Clarification(_)) => {
+            let clarification =
+                "Please name the target language, for example: translate to English.";
+            if services.lifecycle.is_cancelled(operation_id) {
+                return Err("ask was cancelled".into());
+            }
+            let published = services
+                .answer_panel
+                .publish(operation_id, clarification.into());
+            if !published || !answer_panel::show(app, operation_id, clarification) {
+                session
+                    .injector
+                    .copy_to_clipboard(clarification)
+                    .map_err(command_error)?;
+                let snapshot = state.complete(
+                    clarification.into(),
+                    "Ask needs clarification; the prompt is on the clipboard.".into(),
+                );
+                let _ = app.emit("app-state", snapshot);
+                return Ok(RecordingResult {
+                    text: clarification.into(),
+                    insertion: "clipboard_only".into(),
+                    duration_ms,
+                    latency_ms: started.elapsed().as_millis() as u64,
+                });
+            }
+            let snapshot = state.complete(clarification.into(), "Ask needs clarification.".into());
+            let _ = app.emit("app-state", snapshot);
+            return Ok(RecordingResult {
+                text: clarification.into(),
+                insertion: "panel".into(),
+                duration_ms,
+                latency_ms: started.elapsed().as_millis() as u64,
+            });
+        }
+        Err(AskError::Policy) => {
+            return Err("Ask action was blocked by context policy".into());
+        }
+        Err(_) => return Err("Ask planner returned an invalid action".into()),
+    };
+    if let AskAction::Search { site } = &action {
+        // The planner may choose a fixed site, but never the external payload.
+        let query = site.derive_search_query(spoken);
+        let url = site
+            .fixed_url(spoken)
+            .map_err(|_| "Ask search query was invalid".to_string())?;
+        // Browser launch is irreversible. Cancellation either wins before
+        // launch or observes a committed search; History and completion remain
+        // owned by this operation until the outer PipelineGuard finishes it.
+        services
+            .lifecycle
+            .commit_side_effect(operation_id, || open_fixed_search(&url))
+            .map_err(|_| "ask was cancelled".to_string())??;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        if storage
+            .add_history(&NewHistoryItem {
+                transcript_text: spoken,
+                processed_text: Some(&query),
+                source_text: session.selected_source(),
+                instruction_text: Some(spoken),
+                mode: "ask",
+                asr_provider,
+                llm_provider: Some(settings.correction_provider.as_str()),
+                target_language: None,
+                action_kind: Some("search"),
+                search_site: Some(search_site_name(*site)),
+                app_category: None,
+                duration_ms: Some(duration_ms as i64),
+                latency_ms: Some(latency_ms as i64),
+            })
+            .is_err()
+        {
+            emit_status(
+                app,
+                "history_save_failed",
+                "Search opened, but History could not be saved.",
+            );
+        }
+        let snapshot = state.complete(query.clone(), "Opening the requested fixed search.".into());
+        let _ = app.emit("app-state", snapshot);
+        return Ok(RecordingResult {
+            text: query,
+            insertion: "search".into(),
+            duration_ms,
+            latency_ms,
+        });
+    }
+    let input = ask::generation_input(session.selected_source(), spoken);
+    let output = correction::generate_ask_text(
+        &settings,
+        &input,
+        &ask::generation_prompt_with_target(&action),
+        services
+            .lifecycle
+            .cancellation(operation_id)
+            .map_err(command_error)?,
+    )
+    .await
+    .map_err(|_| "Ask generation failed without taking an action".to_string())?;
+    if services.lifecycle.is_cancelled(operation_id) {
+        return Err("ask was cancelled".into());
+    }
+    let mut insertion = "panel";
+    if services.lifecycle.is_cancelled(operation_id) {
+        return Err("ask was cancelled".into());
+    }
+    match (&action, &session.capture) {
+        (
+            AskAction::Rewrite
+            | AskAction::Shorten
+            | AskAction::Expand
+            | AskAction::ChangeTone
+            | AskAction::Translate { .. },
+            AskCapture::Selected(selection),
+        ) => {
+            let cancel = services
+                .lifecycle
+                .cancellation(operation_id)
+                .map_err(command_error)?;
+            let result =
+                session
+                    .monitor
+                    .as_ref()
+                    .zip(session.checkpoint)
+                    .map(|(monitor, checkpoint)| {
+                        session.injector.replace_selection_monitored(
+                            selection, &output, monitor, checkpoint, &cancel,
+                        )
+                    });
+            if *cancel.borrow() {
+                return Err("ask was cancelled".into());
+            }
+            match result {
+                Some(Ok(InsertResult::ClipboardPaste)) => insertion = "selection",
+                Some(Ok(InsertResult::ClipboardOnly)) => {
+                    if *cancel.borrow() {
+                        return Err("ask was cancelled".into());
+                    }
+                    insertion = "clipboard_only";
+                }
+                Some(Ok(InsertResult::PasteUnverified)) => insertion = "paste_unverified",
+                Some(Err(injection::InjectionError::Cancelled)) => {
+                    return Err("ask was cancelled".into())
+                }
+                _ if !*cancel.borrow() => {
+                    session
+                        .injector
+                        .copy_to_clipboard(&output)
+                        .map_err(command_error)?;
+                    insertion = "clipboard_only";
+                }
+                _ => return Err("ask was cancelled".into()),
+            }
+        }
+        (AskAction::Draft, AskCapture::Caret(target)) => {
+            let cancel = services
+                .lifecycle
+                .cancellation(operation_id)
+                .map_err(command_error)?;
+            let result = session
+                .monitor
+                .as_ref()
+                .zip(session.checkpoint)
+                .filter(|(monitor, checkpoint)| monitor.unchanged_since(*checkpoint))
+                .and_then(|(monitor, checkpoint)| {
+                    session
+                        .injector
+                        .insert_monitored(&output, target, monitor, checkpoint, &cancel)
+                        .ok()
+                });
+            match result {
+                Some(InsertResult::ClipboardPaste) => insertion = "caret",
+                Some(InsertResult::ClipboardOnly) => {
+                    if *cancel.borrow() {
+                        return Err("ask was cancelled".into());
+                    }
+                    insertion = "clipboard_only";
+                }
+                Some(InsertResult::PasteUnverified) => insertion = "paste_unverified",
+                None if !*cancel.borrow() => {
+                    session
+                        .injector
+                        .copy_to_clipboard(&output)
+                        .map_err(command_error)?;
+                    insertion = "clipboard_only";
+                }
+                None => return Err("ask was cancelled".into()),
+            }
+        }
+        _ => {
+            if services.lifecycle.is_cancelled(operation_id) {
+                return Err("ask was cancelled".into());
+            }
+            let published = services.answer_panel.publish(operation_id, output.clone());
+            if !published || !answer_panel::show(app, operation_id, &output) {
+                let _ = session.injector.copy_to_clipboard(&output);
+                insertion = "clipboard_only";
+            }
+        }
+    }
+    if services.lifecycle.is_cancelled(operation_id) {
+        return Err("ask was cancelled".into());
+    }
+    let latency_ms = started.elapsed().as_millis() as u64;
+    if storage
+        .add_history(&NewHistoryItem {
+            transcript_text: spoken,
+            processed_text: Some(&output),
+            source_text: session.selected_source(),
+            instruction_text: Some(spoken),
+            mode: "ask",
+            asr_provider,
+            llm_provider: Some(settings.correction_provider.as_str()),
+            target_language: match &action {
+                AskAction::Translate { target_language } => Some(target_language.as_str()),
+                _ => None,
+            },
+            action_kind: Some(action_name(&action)),
+            search_site: None,
+            app_category: None,
+            duration_ms: Some(duration_ms as i64),
+            latency_ms: Some(latency_ms as i64),
+        })
+        .is_err()
+    {
+        emit_status(
+            app,
+            "history_save_failed",
+            "Ask completed, but History could not be saved.",
+        );
+    }
+    let message = if insertion == "paste_unverified" {
+        "Ask insertion could not be confirmed; the result remains on the clipboard."
+    } else if insertion == "clipboard_only" {
+        "Ask result is on the clipboard."
+    } else {
+        "Ask completed."
+    };
+    let snapshot = state.complete(output.clone(), message.into());
+    let _ = app.emit("app-state", snapshot);
+    Ok(RecordingResult {
+        text: output,
+        insertion: insertion.into(),
+        duration_ms,
+        latency_ms,
+    })
+}
+
+fn require_ask_spoken_input(spoken: &str) -> Result<(), String> {
+    if spoken.trim().is_empty() {
+        Err("No Ask instruction was captured.".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn action_name(action: &ask::AskAction) -> &'static str {
+    match action {
+        ask::AskAction::Rewrite => "rewrite",
+        ask::AskAction::Shorten => "shorten",
+        ask::AskAction::Expand => "expand",
+        ask::AskAction::ChangeTone => "change_tone",
+        ask::AskAction::Summarize => "summarize",
+        ask::AskAction::Explain => "explain",
+        ask::AskAction::Translate { .. } => "translate",
+        ask::AskAction::Answer => "answer",
+        ask::AskAction::Draft => "draft",
+        ask::AskAction::Search { .. } => "search",
+    }
+}
+fn search_site_name(site: ask::SearchSite) -> &'static str {
+    match site {
+        ask::SearchSite::Google => "google",
+        ask::SearchSite::YouTube => "youtube",
+        ask::SearchSite::AmazonJapan => "amazon_japan",
+        ask::SearchSite::GitHub => "github",
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_fixed_search(url: &str) -> Result<(), String> {
+    use windows::{
+        core::{HSTRING, PCWSTR},
+        Win32::{
+            Foundation::HWND,
+            UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+        },
+    };
+    let url = HSTRING::from(url);
+    let result = unsafe {
+        ShellExecuteW(
+            HWND::default(),
+            None,
+            PCWSTR(url.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize <= 32 {
+        Err("The fixed search could not be opened.".into())
+    } else {
+        Ok(())
+    }
+}
+#[cfg(not(target_os = "windows"))]
+fn open_fixed_search(_: &str) -> Result<(), String> {
+    Err("Search launch is only supported on Windows.".into())
 }
 
 fn persistence_warning(
@@ -1146,6 +1589,7 @@ pub(crate) async fn cancel_recording(
         &services.voice_translation_target,
         &services.live,
         &services.edit,
+        &services.ask,
     )
     .await?;
     // Nothing was cancelled: any published session belongs to another
@@ -1163,6 +1607,8 @@ pub(crate) async fn cancel_recording(
                 "Translation cancelled."
             } else if mode == PipelineMode::Edit {
                 "Editing cancelled."
+            } else if mode == PipelineMode::Ask {
+                "Ask cancelled."
             } else {
                 "Dictation cancelled."
             },
@@ -1178,6 +1624,7 @@ async fn cancel_pipeline_operation(
     translation_target: &Mutex<Option<String>>,
     live: &tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
     edit: &tokio::sync::Mutex<Option<EditSession>>,
+    ask: &tokio::sync::Mutex<Option<AskSession>>,
 ) -> Result<bool, String> {
     let Some((operation_id, phase)) = lifecycle.cancel()? else {
         return Ok(false);
@@ -1196,6 +1643,7 @@ async fn cancel_pipeline_operation(
     }
     let live_task = live.lock().await.take();
     edit.lock().await.take();
+    ask.lock().await.take();
     // Startup publishes the target language before releasing `live`. Clear it
     // while this operation still owns the lifecycle, so a later recording's
     // target is never removed.
@@ -1238,6 +1686,17 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blank_ask_input_is_rejected_before_planning() {
+        for spoken in ["", "  ", "\n\t"] {
+            assert_eq!(
+                require_ask_spoken_input(spoken),
+                Err("No Ask instruction was captured.".to_string())
+            );
+        }
+        assert!(require_ask_spoken_input("search Google for Rust").is_ok());
+    }
     use crate::audio::{AudioArtifact, AudioError, AudioFuture, CaptureState, LevelMeter};
 
     #[test]
@@ -1254,6 +1713,8 @@ mod tests {
             processed_text: Some("short"),
             source_text: Some("long selection"),
             instruction_text: Some("shorten this"),
+            action_kind: None,
+            search_site: None,
             mode: "edit",
             asr_provider: "test",
             llm_provider: Some("local"),
@@ -1346,14 +1807,15 @@ mod tests {
         let selected = parse_shortcut("CommandOrControl+Shift+Y").unwrap();
         let unavailable = parse_shortcut("CommandOrControl+Shift+U").unwrap();
         let edit = parse_shortcut("CommandOrControl+Shift+E").unwrap();
-        let registered = vec![dictate, selected, edit];
-        let unchanged = vec![dictate, unavailable, selected, edit];
+        let ask = parse_shortcut("CommandOrControl+Shift+A").unwrap();
+        let registered = vec![dictate, selected, edit, ask];
+        let unchanged = vec![dictate, unavailable, selected, edit, ask];
         assert_eq!(
             hotkey_changes(&registered, &unchanged),
             (vec![], vec![unavailable])
         );
 
-        let repaired = vec![dictate, translate, selected, edit];
+        let repaired = vec![dictate, translate, selected, edit, ask];
         assert_eq!(
             hotkey_changes(&registered, &repaired),
             (vec![], vec![translate])
@@ -1585,15 +2047,22 @@ mod tests {
     async fn immediate_stop_waits_for_session_publication() {
         let live = Arc::new(tokio::sync::Mutex::new(None));
         let edit = Arc::new(tokio::sync::Mutex::new(None));
+        let ask = Arc::new(tokio::sync::Mutex::new(None));
         let translation_target = Arc::new(Mutex::new(None));
         let mut startup_publication = live.lock().await;
         let live_for_stop = Arc::clone(&live);
         let edit_for_stop = Arc::clone(&edit);
+        let ask_for_stop = Arc::clone(&ask);
         let target_for_stop = Arc::clone(&translation_target);
         let stopping = tokio::spawn(async move {
-            take_published_sessions(&live_for_stop, &edit_for_stop, &target_for_stop)
-                .await
-                .unwrap()
+            take_published_sessions(
+                &live_for_stop,
+                &edit_for_stop,
+                &ask_for_stop,
+                &target_for_stop,
+            )
+            .await
+            .unwrap()
         });
 
         tokio::task::yield_now().await;
@@ -1601,9 +2070,10 @@ mod tests {
         *startup_publication = Some(());
         drop(startup_publication);
 
-        let (session, edit_session, target) = stopping.await.unwrap();
+        let (session, edit_session, ask_session, target) = stopping.await.unwrap();
         assert_eq!(session, Some(()));
         assert_eq!(edit_session, None::<()>);
+        assert!(ask_session.is_none());
         assert_eq!(target.as_deref(), Some("ja"));
     }
 
@@ -1617,9 +2087,10 @@ mod tests {
         let audio_operation = audio.lock().await;
         let live = tokio::sync::Mutex::new(None);
         let edit = tokio::sync::Mutex::new(None);
+        let ask = tokio::sync::Mutex::new(None);
         let language = Mutex::new(None);
         let cancellation =
-            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit);
+            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit, &ask);
         tokio::pin!(cancellation);
 
         assert!(
@@ -1627,11 +2098,11 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(
-            !cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit)
-                .await
-                .unwrap()
-        );
+        assert!(!cancel_pipeline_operation(
+            &lifecycle, &audio, &target, &language, &live, &edit, &ask
+        )
+        .await
+        .unwrap());
         assert!(lifecycle.begin_start(PipelineMode::Dictate).is_err());
         drop(audio_operation);
         assert_eq!(
@@ -1657,6 +2128,7 @@ mod tests {
             &target,
             &Mutex::new(None),
             &tokio::sync::Mutex::new(None),
+            &tokio::sync::Mutex::new(None),
             &tokio::sync::Mutex::new(None)
         )
         .await
@@ -1677,6 +2149,7 @@ mod tests {
             &Mutex::new(None),
             &tokio::sync::Mutex::new(None),
             &tokio::sync::Mutex::new(None),
+            &tokio::sync::Mutex::new(None),
         )
         .await
         .unwrap();
@@ -1693,34 +2166,35 @@ mod tests {
         let target = Mutex::new(None);
         let live = tokio::sync::Mutex::new(None);
         let edit = tokio::sync::Mutex::new(None);
+        let ask = tokio::sync::Mutex::new(None);
         // Nothing to cancel: a target published by a concurrent start stays.
         let language = Mutex::new(Some("ja".to_string()));
-        assert!(
-            !cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit)
-                .await
-                .unwrap()
-        );
+        assert!(!cancel_pipeline_operation(
+            &lifecycle, &audio, &target, &language, &live, &edit, &ask
+        )
+        .await
+        .unwrap());
         assert_eq!(language.lock().unwrap().as_deref(), Some("ja"));
 
         // Processing owns its published target; cancellation only signals it.
         let id = lifecycle.begin_start(PipelineMode::Translate).unwrap();
         lifecycle.mark_recording(id).unwrap();
         lifecycle.begin_processing().unwrap();
-        assert!(
-            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit)
-                .await
-                .unwrap()
-        );
+        assert!(cancel_pipeline_operation(
+            &lifecycle, &audio, &target, &language, &live, &edit, &ask
+        )
+        .await
+        .unwrap());
         assert_eq!(language.lock().unwrap().as_deref(), Some("ja"));
         lifecycle.finish(id);
 
         let id = lifecycle.begin_start(PipelineMode::Translate).unwrap();
         lifecycle.mark_recording(id).unwrap();
-        assert!(
-            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit)
-                .await
-                .unwrap()
-        );
+        assert!(cancel_pipeline_operation(
+            &lifecycle, &audio, &target, &language, &live, &edit, &ask
+        )
+        .await
+        .unwrap());
         assert_eq!(*language.lock().unwrap(), None);
     }
 
@@ -1780,6 +2254,9 @@ pub(crate) async fn update_settings(
     }
     if settings.speak_to_edit_hotkey.trim().is_empty() {
         return Err("Speak to edit hotkey cannot be empty".into());
+    }
+    if settings.ask_hotkey.trim().is_empty() {
+        return Err("Ask hotkey cannot be empty".into());
     }
     validate_translation_targets(&settings)?;
     if !(1..=3650).contains(&settings.history_retention_days) {
@@ -1927,7 +2404,7 @@ pub(crate) async fn update_settings(
         let previous_hotkeys = hotkey_bindings(&previous).unwrap_or_default();
         if has_new_hotkey_collision(&proposed_hotkeys, &previous_hotkeys) {
             return Err(
-                "recording, selected-text translation, voice Translate, and Speak to edit hotkeys must differ"
+                "recording, selected-text translation, voice Translate, Speak to edit, and Ask hotkeys must differ"
                     .into(),
             );
         }
@@ -2090,6 +2567,25 @@ pub(crate) fn copy_to_clipboard(text: String) -> Result<(), String> {
     }
     #[allow(unreachable_code)]
     Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn get_ask_answer(
+    services: State<'_, Services>,
+) -> Result<Option<answer_panel::AnswerPayload>, String> {
+    Ok(services.answer_panel.current())
+}
+
+#[tauri::command]
+pub(crate) fn dismiss_ask_answer(
+    operation_id: u64,
+    app: AppHandle,
+    services: State<'_, Services>,
+) -> Result<bool, String> {
+    Ok(services.answer_panel.dismiss_with(operation_id, || {
+        app.get_webview_window(answer_panel::WINDOW_LABEL)
+            .is_some_and(|window| window.hide().is_ok())
+    }))
 }
 
 #[tauri::command]

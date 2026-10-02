@@ -3,6 +3,7 @@
 
 use crate::input_monitor::InputMonitor;
 use std::fmt;
+use tokio::sync::watch;
 
 #[cfg(all(test, target_os = "windows"))]
 mod native_tests;
@@ -61,6 +62,7 @@ pub enum InjectionError {
     PrivilegeMismatch,
     ImeCompositionActive,
     ClipboardUnavailable,
+    Cancelled,
     BackendFailure(&'static str),
 }
 
@@ -74,6 +76,7 @@ impl fmt::Display for InjectionError {
             Self::PrivilegeMismatch => "the target cannot be accessed at this privilege level",
             Self::ImeCompositionActive => "an IME composition is in progress",
             Self::ClipboardUnavailable => "the clipboard is unavailable",
+            Self::Cancelled => "text insertion was cancelled",
             Self::BackendFailure(message) => message,
         })
     }
@@ -110,6 +113,10 @@ pub(crate) struct SelectedText {
 impl SelectedText {
     pub(crate) fn text(&self) -> &str {
         &self.text
+    }
+
+    pub(crate) fn target(&self) -> &TargetWindow {
+        &self.target
     }
 }
 impl SystemTextInjector {
@@ -201,10 +208,49 @@ impl SystemTextInjector {
         )
     }
 
+    pub(crate) fn replace_selection_monitored(
+        &self,
+        selection: &SelectedText,
+        text: &str,
+        monitor: &InputMonitor,
+        checkpoint: u64,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<InsertResult, InjectionError> {
+        batch::replace_selection_monitored(
+            &self.backend,
+            self.options,
+            &selection.target,
+            &selection.state,
+            text,
+            monitor,
+            checkpoint,
+            cancel,
+        )
+    }
+
     pub(crate) fn copy_to_clipboard(&self, text: &str) -> Result<(), InjectionError> {
         self.backend
             .clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)
             .map(|_| ())
+    }
+
+    pub(crate) fn insert_monitored(
+        &self,
+        text: &str,
+        target: &TargetWindow,
+        monitor: &InputMonitor,
+        checkpoint: u64,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<InsertResult, InjectionError> {
+        batch::insert_monitored(
+            &self.backend,
+            self.options,
+            text,
+            target,
+            monitor,
+            checkpoint,
+            cancel,
+        )
     }
 }
 impl Default for SystemTextInjector {

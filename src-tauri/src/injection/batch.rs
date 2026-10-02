@@ -1,4 +1,5 @@
 use super::*;
+use tokio::sync::watch;
 
 const VERIFY_ATTEMPTS: usize = 50;
 
@@ -69,6 +70,7 @@ fn select_verified<B: Backend>(
 
 /// Once any paste input is queued, its clipboard payload must remain intact
 /// until the target confirms the edit. Never substitute a retry or fallback.
+#[allow(clippy::too_many_arguments)]
 fn paste<B: Backend>(
     backend: &B,
     options: InjectionOptions,
@@ -77,25 +79,41 @@ fn paste<B: Backend>(
     before: &TargetText,
     activity: Option<(&InputMonitor, u64)>,
     policy: SafetyPolicy,
+    cancel: Option<&watch::Receiver<bool>>,
 ) -> Result<InsertResult, InjectionError> {
+    if cancel.is_some_and(|receiver| *receiver.borrow()) {
+        return Err(InjectionError::Cancelled);
+    }
     let previous = if options.restore_clipboard {
         Some(backend.clipboard_snapshot()?)
     } else {
         None
     };
+    if cancel.is_some_and(|receiver| *receiver.borrow()) {
+        return Err(InjectionError::Cancelled);
+    }
     if !safe(backend, target, activity, policy)
         || !backend
             .target_text(target)
             .is_ok_and(|actual| actual.same_content(before))
     {
+        if cancel.is_some_and(|receiver| *receiver.borrow()) {
+            return Err(InjectionError::Cancelled);
+        }
         return copy_only(backend, text);
     }
     let sequence = backend.clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)?;
+    if cancel.is_some_and(|receiver| *receiver.borrow()) {
+        return Err(InjectionError::Cancelled);
+    }
     if !safe(backend, target, activity, policy)
         || !backend
             .target_text(target)
             .is_ok_and(|actual| actual.same_content(before))
     {
+        if cancel.is_some_and(|receiver| *receiver.borrow()) {
+            return Err(InjectionError::Cancelled);
+        }
         return copy_only(backend, text);
     }
     if !backend.paste(target, policy).unwrap_or(false) {
@@ -106,7 +124,9 @@ fn paste<B: Backend>(
         if attempt > 0 {
             backend.wait_for_target();
         }
-        if !safe_after_injected_paste(backend, target, activity, policy) {
+        if cancel.is_some_and(|receiver| *receiver.borrow())
+            || !safe_after_injected_paste(backend, target, activity, policy)
+        {
             break;
         }
         if backend
@@ -160,6 +180,42 @@ pub(super) fn insert<B: Backend>(
         &before,
         None,
         SafetyPolicy::Additive,
+        None,
+    )
+}
+
+pub(super) fn insert_monitored<B: Backend>(
+    backend: &B,
+    options: InjectionOptions,
+    text: &str,
+    target: &TargetWindow,
+    monitor: &InputMonitor,
+    checkpoint: u64,
+    cancel: &watch::Receiver<bool>,
+) -> Result<InsertResult, InjectionError> {
+    if *cancel.borrow() {
+        return Err(InjectionError::Cancelled);
+    }
+    if !safe(
+        backend,
+        target,
+        Some((monitor, checkpoint)),
+        SafetyPolicy::Additive,
+    ) {
+        return copy_only(backend, text);
+    }
+    let Ok(before) = backend.target_text(target) else {
+        return copy_only(backend, text);
+    };
+    paste(
+        backend,
+        options,
+        text,
+        target,
+        &before,
+        Some((monitor, checkpoint)),
+        SafetyPolicy::Additive,
+        Some(cancel),
     )
 }
 
@@ -180,6 +236,29 @@ pub(super) fn replace_selection<B: Backend>(
         before,
         Some((monitor, checkpoint)),
         SafetyPolicy::Destructive,
+        None,
+    )
+}
+
+pub(super) fn replace_selection_monitored<B: Backend>(
+    backend: &B,
+    options: InjectionOptions,
+    target: &TargetWindow,
+    before: &TargetText,
+    text: &str,
+    monitor: &InputMonitor,
+    checkpoint: u64,
+    cancel: &watch::Receiver<bool>,
+) -> Result<InsertResult, InjectionError> {
+    paste(
+        backend,
+        options,
+        text,
+        target,
+        before,
+        Some((monitor, checkpoint)),
+        SafetyPolicy::Destructive,
+        Some(cancel),
     )
 }
 
@@ -249,6 +328,7 @@ fn begin_with_checkpoint<B: Backend>(
             &before,
             Some((monitor, checkpoint)),
             SafetyPolicy::Destructive,
+            None,
         )?;
         let range = (result != InsertResult::ClipboardOnly).then(|| ReplacementRange {
             after: before.replaced_with(draft),
@@ -352,6 +432,7 @@ pub(super) fn update<B: Backend>(
         &selected,
         activity,
         SafetyPolicy::Destructive,
+        None,
     )?;
     if session.result != InsertResult::ClipboardOnly {
         session.displayed = final_text.to_owned();
@@ -795,6 +876,25 @@ mod tests {
     }
 
     #[test]
+    fn monitored_insert_cancellation_does_not_copy_or_overwrite_clipboard() {
+        let backend = MockBackend::new();
+        let monitor = monitor();
+        let (_sender, cancel) = watch::channel(true);
+        let result = insert_monitored(
+            &backend,
+            InjectionOptions::default(),
+            "cancelled",
+            &target(),
+            &monitor,
+            monitor.checkpoint().unwrap(),
+            &cancel,
+        );
+        assert_eq!(result, Err(InjectionError::Cancelled));
+        assert_eq!(&*backend.clipboard.borrow(), "original rich clipboard");
+        assert!(!backend.calls.borrow().contains(&"write"));
+    }
+
+    #[test]
     fn selection_verification_rejects_empty_source() {
         let state = TargetText {
             identity: vec![1],
@@ -845,6 +945,30 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn cancelled_ask_selection_never_copies_or_pastes() {
+        let backend = MockBackend::new();
+        *backend.text.borrow_mut() = selected_state();
+        let before = backend.text.borrow().clone();
+        let monitor = monitor();
+        let (_sender, cancel) = watch::channel(true);
+        let result = replace_selection_monitored(
+            &backend,
+            InjectionOptions::default(),
+            &target(),
+            &before,
+            "answer",
+            &monitor,
+            monitor.checkpoint().unwrap(),
+            &cancel,
+        );
+        assert_eq!(result, Err(InjectionError::Cancelled));
+        assert_eq!(backend.content(), "prefix original suffix");
+        assert_eq!(&*backend.clipboard.borrow(), "original rich clipboard");
+        assert!(!backend.calls.borrow().contains(&"write"));
+        assert!(!backend.calls.borrow().contains(&"paste"));
     }
 
     #[test]

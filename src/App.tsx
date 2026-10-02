@@ -9,6 +9,8 @@ import {
   defaultSettings,
   deleteDictionaryEntry,
   getAppState,
+  getAskAnswer,
+  dismissAskAnswer,
   getGpuDiagnostics,
   getModelStatus,
   getSettings,
@@ -90,6 +92,7 @@ const phaseMessageKeys: Record<AppState["phase"], MessageKey> = {
 };
 
 const isRecordingOverlay = getCurrentWebviewWindow().label === "recording-overlay";
+const isAskAnswer = getCurrentWebviewWindow().label === "ask-answer";
 const OVERLAY_WAVE_BAR_COUNT = 9;
 const OVERLAY_PREVIEW_CHARS = 140;
 
@@ -99,7 +102,7 @@ interface CorrectionPreview {
 }
 
 interface VoiceModeEvent {
-  mode: "dictate" | "translate" | "edit";
+  mode: "dictate" | "translate" | "edit" | "ask";
   targetLanguage: string | null;
 }
 
@@ -163,6 +166,46 @@ function compactOverlayPreview(text: string): string {
 
 if (isRecordingOverlay) {
   document.body.classList.add("recording-overlay-body");
+}
+
+function AskAnswerPanel() {
+  const { language, t } = useI18n();
+  const [answer, setAnswer] = useState("");
+  const [operationId, setOperationId] = useState(0);
+  const operationRef = useRef(0);
+  useEffect(() => {
+    let active = true;
+    const setup = async () => {
+      const unlisten = await listen<{ operationId: number; payload: string }>("ask-answer", ({ payload }) => {
+        if (!active || payload.operationId < operationRef.current) return;
+        operationRef.current = payload.operationId;
+        setOperationId(payload.operationId);
+        setAnswer(payload.payload);
+      });
+      if (!active) {
+        unlisten();
+        return;
+      }
+      const current = await getAskAnswer();
+      if (active && current && current.operationId >= operationRef.current) {
+        operationRef.current = current.operationId;
+        setOperationId(current.operationId);
+        setAnswer(current.payload);
+      }
+      return unlisten;
+    };
+    let unlisten: (() => void) | undefined;
+    void setup().then((cleanup) => { unlisten = cleanup; if (!active) cleanup?.(); });
+    return () => { active = false; unlisten?.(); };
+  }, []);
+  const dismiss = async () => {
+    await dismissAskAnswer(operationId);
+  };
+  const displayedAnswer = translateAppMessage(language, answer) ?? answer;
+  return <main className="ask-answer-panel" aria-live="polite">
+    <p className="eyebrow">{t("Ask Anything")}</p><div className="ask-answer-text">{displayedAnswer}</div>
+    <div className="ask-answer-actions"><button className="secondary" type="button" disabled={!answer} onClick={() => void copyToClipboard(displayedAnswer)}>{t("Copy")}</button><button className="secondary" type="button" disabled={!answer} onClick={() => void dismiss()}>{t("Dismiss")}</button></div>
+  </main>;
 }
 
 function RecordingOverlay() {
@@ -229,6 +272,8 @@ function RecordingOverlay() {
             ? t("Translating")
             : voiceMode.mode === "edit"
               ? t("Editing")
+              : voiceMode.mode === "ask"
+                ? t("Ask Anything")
               : t("Listening")}
         </span>
         <span className="recording-wave" aria-hidden="true">
@@ -259,7 +304,9 @@ function RecordingOverlay() {
   if (phase !== "processing" && phase !== "injecting") return null;
 
   const compactPreview = compactOverlayPreview(preview?.text ?? "");
-  const label = voiceMode.mode === "edit"
+  const label = voiceMode.mode === "ask"
+    ? t("Ask Anything")
+    : voiceMode.mode === "edit"
     ? t("Editing")
     : phase === "injecting"
       ? message?.startsWith("Finalizing")
@@ -304,6 +351,8 @@ export default function App() {
     <I18nProvider language={language}>
       {isRecordingOverlay ? (
         <RecordingOverlay />
+      ) : isAskAnswer ? (
+        <AskAnswerPanel />
       ) : (
         <MainAppContent onLanguageChange={setLanguage} />
       )}

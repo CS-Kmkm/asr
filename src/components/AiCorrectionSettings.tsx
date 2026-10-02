@@ -55,7 +55,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         <div>
       <h2>{t("AI text correction")}</h2>
           <p className="muted">
-            {t("Dictation sends its transcript to the selected provider only when AI correction is on. Voice and selected-text Translate send text whenever used. Speak to edit sends selected source text and the transcribed spoken instruction whenever used, even when AI correction is off. These text-processing features do not send audio, but the selected ASR backend may.")}
+            {t("Dictation sends its transcript to the selected provider only when AI correction is on. Voice and selected-text Translate send text whenever used. Speak to edit sends selected source text and the transcribed spoken instruction whenever used. Ask sends only the transcribed spoken instruction to the selected provider for planning; answer generation using a selection also sends that selected source text with the instruction. Translate, Speak to edit, and Ask work even when Dictation AI correction is off. These text-processing requests do not send audio, but the selected ASR backend may.")}
           </p>
         </div>
         <div className="ai-correction-master">
@@ -72,7 +72,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
       <p className="ai-correction-master-detail">
         {settings.textCorrectionEnabled
           ? t("AI correction is applied before text is inserted. If the API fails, the original transcript is used.")
-          : t("AI correction requests are disabled for Dictation. Translate and Speak to edit still use the selected provider when invoked.")}
+          : t("AI correction requests are disabled for Dictation. Translate, Speak to edit, and Ask still use the selected provider when invoked.")}
       </p>
 
       <SettingRow
