@@ -1,0 +1,24 @@
+Goal: Fix the two 2026-10-02 review findings: Ask search cancellation and atomic shortcut swapping.
+
+Scope: Apply the search fix to the existing #10, #12 and #14 worktrees; fix shortcut drafts in #14. The follow-up request authorizes issue-scoped commits and ordinary dependency merges. Preserve existing work and published history. Pushes, PR edits and merging implementation into main are outside this follow-up.
+
+Constraints: A cancelled search must not launch or save History/Completed. Once a browser launch succeeds, cancellation is a no-op until the owner publishes completion and releases the lifecycle. Launch failure must remain cancellable. All shortcut fields must be validated and submitted together, without intermediate blur saves. Preserve legacy collision and registration rollback behavior.
+
+Reuse / creation plan: Extend PipelineLifecycle's existing commit mechanism and SettingsPage's shortcut validation. Add regression coverage at the lifecycle and registration seams. Do not introduce a frontend test framework.
+
+Acceptance criteria:
+1. Search launch and cancellation are serialized in #10/#12/#14; regression tests cover cancellation before launch, during launch, launch failure, stale operation ownership, and completion ownership.
+2. #14 submits voice shortcuts and translationHotkey in one patch; blur does not persist intermediate drafts; both voice-only and selected-text-only changes can be saved. Verify frontend interactions and backend swap/rollback tests.
+3. Each affected tree passes cargo fmt --check, cargo clippy -j 4, cargo test --lib -j 4 and git diff --check. #14 passes pnpm exec tsc --noEmit and pnpm build.
+4. One independent read-only audit covers behavior, adjacent callers, cancellation ordering and settings persistence. Hardware/provider timing limitations remain explicit.
+
+Context: GitHub issue comments 5952622407 (#10) and 5952626937 (#14); existing feature worktrees and docs/tasks/current-implementation-review.md. Current heads: #10 c17989c, #12 8f01bf4, #14 1549f46.
+
+Status: All four acceptance criteria are complete for the local changes.
+- Criterion 1: All three search paths use commit_side_effect. Cancellation before launch rejects the callback; a successful launch seals cancellation while keeping ownership through History and Completed publication. Failed launch remains cancellable. Each worktree includes four deterministic lifecycle regression tests. #12 and #14 lifecycle files match exactly; each of the three search paths has one commit point. Retry reuses the generalized mechanism and its existing tests pass.
+- Criterion 2: #14 validates and submits shortcuts plus translationHotkey in one patch. Selected-text translation no longer saves on blur; Enter uses the combined transaction and Escape restores its draft. Backend persistence/readback and routing swap regression passes. Five Node component event-contract tests pass, covering swaps, blur, single-field edits, Enter, invalid drafts, Escape and no-op saves; the frontend CI job now runs them without new dependencies.
+- Criterion 3: cargo fmt --check, cargo clippy -j 4 and cargo test --lib -j 4 pass in every affected worktree: #10 200 passed / 4 ignored; #12 229 passed / 4 ignored; #14 250 passed / 4 ignored. #14 pnpm exec tsc --noEmit and pnpm build pass. git diff --check passes for all three trees. Clippy retains warnings. The Vite build was retried successfully outside the sandbox after a parent-directory ACL error.
+- Criterion 4: An independent native GPT-6 Sol reviewer found no confirmed defects across the exact diffs, adjacent cancellation/shutdown/shortcut callers, Retry, settings persistence/rollback, component tests and CI. The prescribed Claude route was unavailable: installed CLI 2.1.229 is below the documented Opus 5.5 minimum 2.1.280.
+- Limits: CUA browser inventory was empty, so no actual browser UI test was completed. Component tests use isolated hooks and IPC stubs; native hotkey registration and real Windows search launch/cancellation timing remain unverified. Shell activation may wait while holding the lifecycle lock; the audit found no synchronous main-thread re-entry or proven lock cycle.
+- Delivery: #10 search fix is committed as 0f6f2eb; #12 incorporates it with merge c113f24 and adapts Retry to the shared API. #14 shortcut saving and its tests/CI are committed separately as 1ac75f9; merge 337d9f5 incorporates #12. All final implementation contents match the previously tested and independently audited snapshots; those checks are reused without rerunning unchanged code. The #10 -> #12 -> #14 ancestry is preserved. No push, remote PR update or implementation merge into main was performed.
+- Records: The prior implementation-review report and this remediation/verification contract are recorded as separate documentation commits on main. The review report describes the pre-fix snapshot; this contract records the subsequent fixes.
