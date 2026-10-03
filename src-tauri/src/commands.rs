@@ -548,8 +548,8 @@ async fn start_recording_mode(
         emit_state(&app, &state, AppPhase::Idle, cancel_message);
         return Err(cancel_error.into());
     }
-    // Edit and Ask capture a selection instead of a target window, so they
-    // route to global dictionary entries and the global profile only.
+    // Edit and Ask capture a selection instead of a target window, so their
+    // ASR hints use global dictionary entries only; they apply no style profile.
     let app_context = target.as_ref().and_then(app_context::from_target);
     let mut live_slot = services.live.lock().await;
     let mut edit_slot = services.edit.lock().await;
