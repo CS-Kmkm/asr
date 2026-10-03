@@ -1350,9 +1350,12 @@ impl Storage {
     }
 
     pub fn list_dictionary_candidates(&self) -> Result<Vec<DictionaryCandidate>, StorageError> {
-        if self.get_settings()?.history_retention == HistoryRetention::Never {
+        let settings = self.get_settings()?;
+        if settings.history_retention == HistoryRetention::Never {
             return Ok(Vec::new());
         }
+        // Like History, expired candidate text is purged before it is read.
+        self.apply_history_policy(&settings)?;
         let connection = self.connection()?;
         let mut statement = connection.prepare("SELECT id, original_span, preferred_span, confidence, history_id, created_at FROM dictionary_candidates ORDER BY created_at DESC")?;
         let rows = statement.query_map([], |row| {
@@ -4191,5 +4194,38 @@ mod tests {
         drop(connection);
         storage.enforce_current_history_policy().unwrap();
         assert_eq!(storage.list_dictionary_candidates().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn listing_candidates_purges_text_past_the_retention_window() {
+        let storage = Storage::in_memory().unwrap();
+        let settings = Settings {
+            history_retention: HistoryRetention::OneMonth,
+            ..Settings::default()
+        };
+        storage
+            .update_settings_and_apply_history_policy(&settings)
+            .unwrap();
+        let expired = storage
+            .add_dictionary_candidate_from_correction("open ai", "OpenAI", None)
+            .unwrap()
+            .unwrap();
+        let current = storage
+            .add_dictionary_candidate_from_correction("use Github", "use GitHub", None)
+            .unwrap()
+            .unwrap();
+        let connection = storage.connection().unwrap();
+        connection
+            .execute(
+                "UPDATE dictionary_candidates SET created_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+                [expired],
+            )
+            .unwrap();
+        drop(connection);
+        let listed = storage.list_dictionary_candidates().unwrap();
+        assert_eq!(
+            listed.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![current]
+        );
     }
 }
