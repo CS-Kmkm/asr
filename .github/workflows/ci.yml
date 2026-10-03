@@ -18,7 +18,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec tsc --noEmit
-      - run: node --test scripts/test-shortcut-settings.mjs
+      - run: node --test scripts/test-shortcut-settings.mjs scripts/test-retained-data.mjs
 
   rust:
     runs-on: windows-latest

@@ -432,6 +432,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const [level, setLevel] = useState<AudioLevel>({ rms: 0, peak: 0 });
   const [dictionary, setDictionary] = useState<DictionaryEntry[]>([]);
   const [dictionaryCandidates, setDictionaryCandidates] = useState<DictionaryCandidate[]>([]);
+  const dictionaryRequestRef = useRef(0);
 
   useEffect(() => {
     historyFilterRef.current = historyFilter;
@@ -447,10 +448,9 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       getGpuDiagnostics(),
       listAudioDevices(),
       listDictionary(),
-      listDictionaryCandidates(),
     ])
       .then(
-        ([nextState, nextSettings, nextHistory, nextModel, nextGpu, nextDevices, nextDictionary, nextCandidates]) => {
+        ([nextState, nextSettings, nextHistory, nextModel, nextGpu, nextDevices, nextDictionary]) => {
           setState(nextState);
           setSettings(nextSettings);
           onLanguageChange(nextSettings.uiLanguage);
@@ -461,7 +461,6 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
           setGpu(nextGpu);
           setDevices(nextDevices);
           setDictionary(nextDictionary);
-          setDictionaryCandidates(nextCandidates);
           if (!nextSettings.setupComplete) setPage("setup");
         },
       )
@@ -548,6 +547,34 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     }
   }
 
+  async function refreshDictionary() {
+    const request = ++dictionaryRequestRef.current;
+    const [entries, candidates] = await Promise.all([listDictionary(), listDictionaryCandidates()]);
+    if (request === dictionaryRequestRef.current) {
+      setDictionary(entries);
+      setDictionaryCandidates(candidates);
+    }
+  }
+
+  useEffect(() => {
+    // Shortcut-driven recordings finish through app-state events, without the
+    // Dashboard stop handler. Read the retained data when either page opens
+    // and after lifecycle or retention changes while it is visible.
+    let active = true;
+    if (page === "history") {
+      void refreshHistory().catch((error) => { if (active) showNotice(String(error), "error"); });
+    }
+    if (page === "dictionary") {
+      setDictionaryCandidates([]);
+      void refreshDictionary().catch((error) => { if (active) showNotice(String(error), "error"); });
+    }
+    return () => {
+      active = false;
+      historyRequestRef.current += 1;
+      dictionaryRequestRef.current += 1;
+    };
+  }, [page, state.phase, settings.historyRetention]);
+
   async function saveSettings(patch: Partial<Settings>) {
     const previous = settings;
     const next = { ...settings, ...patch };
@@ -578,7 +605,13 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       return;
     }
     if (patch.historyRetention !== undefined || patch.deleteAudioAfterProcessing !== undefined) {
-      try { await refreshHistory(); }
+      // The optimistic render can read before the settings transaction has
+      // purged old rows. Refresh again after its acknowledgement so that read
+      // cannot restore candidates removed by a shorter retention window.
+      try {
+        setDictionaryCandidates([]);
+        await Promise.all([refreshHistory(), refreshDictionary()]);
+      }
       catch (error) { showNotice(String(error), "error"); }
     }
   }
@@ -608,11 +641,6 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
           await refreshHistory();
         } catch {
           showNotice(t("Recording completed, but history could not be refreshed."), "warning");
-        }
-        try {
-          setDictionaryCandidates(await listDictionaryCandidates());
-        } catch {
-          // Candidates are reloaded with the Dictionary page; the dictation itself completed.
         }
       } else {
         await startRecording();
@@ -755,8 +783,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   async function confirmCandidate(id: number) {
     try {
       await confirmDictionaryCandidate(id);
-      const [entries, candidates] = await Promise.all([listDictionary(), listDictionaryCandidates()]);
-      setDictionary(entries); setDictionaryCandidates(candidates);
+      await refreshDictionary();
       showNotice(t("Dictionary candidate confirmed."), "success");
     } catch (error) { showNotice(String(error), "error"); }
   }
@@ -764,7 +791,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   async function rejectCandidate(id: number) {
     try {
       await rejectDictionaryCandidate(id);
-      setDictionaryCandidates(await listDictionaryCandidates());
+      await refreshDictionary();
     } catch (error) { showNotice(String(error), "error"); }
   }
 
@@ -883,7 +910,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
         {page === "dictionary" && (
           <DictionaryPage
             entries={dictionary}
-            candidates={dictionaryCandidates}
+            candidates={settings.historyRetention === "never" ? [] : dictionaryCandidates}
             onAdd={addDictionary}
             onUpdate={updateDictionary}
             onDelete={(id) => void removeDictionary(id)}
