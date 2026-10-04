@@ -121,11 +121,20 @@ impl SearchSite {
 
         // Japanese commands end the instruction: 「…を検索して」, optionally
         // preceded by the site: 「…をユーチューブで検索して」.
-        if let Some(rest) = strip_suffix_any(query, JA_SEARCH_COMMANDS) {
-            query = trim_query_edges(rest);
-            query = strip_suffix_any(query, &["を", "で"]).unwrap_or(query);
+        let mut japanese_command = false;
+        if let Some(command) = JA_SEARCH_COMMANDS
+            .iter()
+            .find(|command| query.ends_with(**command))
+        {
+            japanese_command = true;
+            query = trim_query_edges(&query[..query.len() - command.len()]);
+            // Only a bare command (「…を 検索して」) leaves its particle behind;
+            // a second particle belongs to the query (「ふでを検索」).
+            if !command.starts_with(['を', 'で']) {
+                query = strip_suffix_any(query, &["を", "で"]).unwrap_or(query);
+            }
             if let Some(rest) = strip_alias_suffix(query, aliases) {
-                query = strip_suffix_any(rest, &["を", "で", "の"]).unwrap_or(rest);
+                query = strip_suffix_any(rest, &["を", "で"]).unwrap_or(rest);
             }
             query = trim_query_edges(query);
         }
@@ -139,7 +148,7 @@ impl SearchSite {
         let mut command = strip_command_prefix(&mut query);
         let mut site = false;
         if command != Some(true) {
-            if let Some(rest) = strip_site_prefix(query, aliases) {
+            if let Some(rest) = strip_site_prefix(query, aliases, japanese_command) {
                 query = rest;
                 site = true;
             }
@@ -260,8 +269,14 @@ fn strip_command_prefix<'a>(query: &mut &'a str) -> Option<bool> {
 }
 
 /// A leading site phrase: "Google", "on YouTube", 「グーグルで」, 「Googleで」.
-/// A site name directly followed by more text (「グーグルマップ」) is kept.
-fn strip_site_prefix<'a>(text: &'a str, aliases: &[&str]) -> Option<&'a str> {
+/// A site name directly followed by more text (「グーグルマップ」,
+/// 「グーグルの使い方」) is kept. In a Japanese instruction only 「<site>で」
+/// names the site, so 「Google Pixel reviewを検索」 keeps "Google".
+fn strip_site_prefix<'a>(
+    text: &'a str,
+    aliases: &[&str],
+    require_particle: bool,
+) -> Option<&'a str> {
     let without_connector =
         strip_ascii_prefix_any(text, &["on", "in", "using", "with", "via"]).unwrap_or(text);
     let rest = aliases.iter().find_map(|alias| {
@@ -278,10 +293,11 @@ fn strip_site_prefix<'a>(text: &'a str, aliases: &[&str]) -> Option<&'a str> {
             without_connector.strip_prefix(alias)
         }
     })?;
-    if let Some(after) = strip_prefix_any(rest, &["で", "の"]) {
+    if let Some(after) = rest.strip_prefix('で') {
         return Some(trim_query_start(after));
     }
-    (rest.is_empty() || rest.starts_with(is_query_separator)).then(|| trim_query_start(rest))
+    (!require_particle && (rest.is_empty() || rest.starts_with(is_query_separator)))
+        .then(|| trim_query_start(rest))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -698,6 +714,19 @@ mod tests {
                 "グーグルマップの使い方を検索",
                 "グーグルマップの使い方",
             ),
+            (
+                SearchSite::Google,
+                "グーグルの使い方を検索",
+                "グーグルの使い方",
+            ),
+            (
+                SearchSite::Google,
+                "Google Pixel reviewを検索して",
+                "Google Pixel review",
+            ),
+            (SearchSite::Google, "ふでを検索", "ふで"),
+            (SearchSite::Google, "ふでをグーグルで検索", "ふで"),
+            (SearchSite::Google, "猫を 検索して", "猫"),
             (
                 SearchSite::Google,
                 "Search Google for tools for kids",
