@@ -170,13 +170,7 @@ fn preserves_protected_spans_with_hints(
     .into_iter()
     .all(|kind| facts_preserved(transcript, corrected, &output_for_new_values, kind, edits))
         && uncertainty_preserved(transcript, corrected)
-        && proper_nouns_preserved(
-            transcript,
-            corrected,
-            &output_for_new_values,
-            edits,
-            dictionary_hints,
-        )
+        && proper_nouns_preserved(transcript, corrected, edits, dictionary_hints)
 }
 
 /// Names must survive intent-aware editing: every kept source name stays,
@@ -191,7 +185,6 @@ fn preserves_protected_spans_with_hints(
 fn proper_nouns_preserved(
     source: &str,
     output: &str,
-    output_for_new_values: &str,
     edits: FactEdits,
     dictionary_hints: &[String],
 ) -> bool {
@@ -205,8 +198,7 @@ fn proper_nouns_preserved(
             .map_or_else(
                 || contains_name(output, &key.value),
                 |(surface, readings)| {
-                    std::iter::once(surface)
-                        .chain(readings)
+                    term_spellings(surface, readings)
                         .any(|spelling| contains_name(output, &spelling.to_lowercase()))
                 },
             )
@@ -219,11 +211,34 @@ fn proper_nouns_preserved(
             OccurrenceRole::Superseded => true,
             OccurrenceRole::Replaceable(final_key) => present(key) || present(final_key),
         });
-    // Dictionary surfaces were removed from `output_for_new_values`, so only
-    // names outside the prompted terms are checked against the source.
-    kept && latin_name_occurrences(output_for_new_values)
+    // Prompted dictionary spellings are trusted; any other name must have
+    // been spoken. Whole tokens are skipped, so a surface such as "Git" never
+    // turns "GitHub" into an unknown "Hub".
+    let term_ranges = name_occurrences(output, &terms)
+        .into_iter()
+        .filter(|(_, key)| {
+            terms
+                .iter()
+                .any(|(surface, _)| surface.to_lowercase() == key.value)
+        })
+        .map(|(range, _)| range)
+        .collect::<Vec<_>>();
+    kept && latin_name_occurrences(output)
         .iter()
+        .filter(|(range, _)| !term_ranges.iter().any(|term| ranges_overlap(term, range)))
         .all(|(_, name)| contains_name(source, &name.to_lowercase()))
+}
+
+/// The spellings that identify a prompted term. Readings in scripts without
+/// word separators must be at least three characters, since a short reading
+/// such as あい also occurs inside unrelated words (ぐあい).
+fn term_spellings<'a>(surface: &'a str, readings: &'a [String]) -> impl Iterator<Item = &'a str> {
+    std::iter::once(surface).chain(
+        readings
+            .iter()
+            .map(String::as_str)
+            .filter(|reading| reading.is_ascii() || reading.chars().count() >= 3),
+    )
 }
 
 /// Prompted dictionary terms as `(surface, spoken readings)`.
@@ -252,7 +267,7 @@ fn dictionary_terms(dictionary_hints: &[String]) -> Vec<(String, Vec<String>)> {
 /// whichever spelling was spoken.
 fn name_occurrences(text: &str, terms: &[(String, Vec<String>)]) -> Vec<FactOccurrence> {
     let lower = text.to_lowercase();
-    let mut occurrences: Vec<FactOccurrence> = Vec::new();
+    let mut candidates: Vec<FactOccurrence> = Vec::new();
     // Lowercasing keeps byte offsets only when case mapping keeps lengths;
     // otherwise prompted terms cannot be located in the source safely.
     if lower.len() == text.len() {
@@ -261,19 +276,27 @@ fn name_occurrences(text: &str, terms: &[(String, Vec<String>)]) -> Vec<FactOccu
                 value: surface.to_lowercase(),
                 unit: None,
             };
-            for spelling in std::iter::once(surface).chain(readings) {
+            for spelling in term_spellings(surface, readings) {
                 let spelling = spelling.to_lowercase();
                 for (at, _) in lower.match_indices(&spelling) {
                     let range = at..at + spelling.len();
-                    if name_boundaries(text, &range)
-                        && !occurrences
-                            .iter()
-                            .any(|(existing, _)| ranges_overlap(existing, &range))
-                    {
-                        occurrences.push((range, key.clone()));
+                    if name_boundaries(text, &range) {
+                        candidates.push((range, key.clone()));
                     }
                 }
             }
+        }
+    }
+    // The longest spelling wins where terms overlap: "git hub" is GitHub,
+    // not Git followed by "hub".
+    candidates.sort_by_key(|(range, _)| (std::cmp::Reverse(range.len()), range.start));
+    let mut occurrences: Vec<FactOccurrence> = Vec::new();
+    for (range, key) in candidates {
+        if !occurrences
+            .iter()
+            .any(|(existing, _)| ranges_overlap(existing, &range))
+        {
+            occurrences.push((range, key));
         }
     }
     for (range, name) in latin_name_occurrences(text) {
@@ -355,6 +378,11 @@ fn latin_name_occurrences(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
             end += 1;
         }
         index = end;
+        // A possessive belongs to the sentence, not the name: Tanaka's.
+        let token = &bytes[start..end];
+        if token.len() > 2 && (token.ends_with(b"'s") || token.ends_with(b"'S")) {
+            end -= 2;
+        }
         let range = start..end;
         if excluded.iter().any(|other| ranges_overlap(other, &range)) {
             continue;
@@ -3406,6 +3434,38 @@ mod tests {
                 "accepted {input} => {output}"
             );
         }
+    }
+
+    #[test]
+    fn name_check_tolerates_possessives_and_dictionary_tokens() {
+        let edits = FactEdits {
+            corrections: true,
+            merge_duplicates: true,
+        };
+        assert!(accepts_with_corrections(
+            "the draft from Tanaka",
+            "Tanaka's draft",
+            true
+        ));
+        assert!(accepts_with_corrections(
+            "Tanaka's draft",
+            "the draft from Tanaka",
+            true
+        ));
+        // A prompted surface inside a longer name does not split it.
+        assert!(preserves_protected_spans_with_hints(
+            "push to git hub",
+            "Push to GitHub.",
+            edits,
+            &["Git<=git".to_owned(), "GitHub<=git hub".to_owned()],
+        ));
+        // A two-character reading inside another word is not that term.
+        assert!(preserves_protected_spans_with_hints(
+            "ぐあいが悪い",
+            "具合が悪い。",
+            edits,
+            &["AI<=あい".to_owned()],
+        ));
     }
 
     #[test]
