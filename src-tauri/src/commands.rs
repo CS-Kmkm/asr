@@ -855,7 +855,7 @@ pub(crate) async fn stop_recording(
                 emit_state(&app, &state, AppPhase::Idle, "Editing cancelled.");
                 return Err("editing was cancelled".into());
             }
-            Err(_error) => {
+            Err(error) => {
                 let _ = storage.add_metric(
                     "speak_to_edit",
                     Some(settings.correction_provider.as_str()),
@@ -863,12 +863,7 @@ pub(crate) async fn stop_recording(
                     false,
                     Some("edit_failed"),
                 );
-                emit_state(
-                    &app,
-                    &state,
-                    AppPhase::Error,
-                    "Editing failed; the original selection was not changed.",
-                );
+                emit_state(&app, &state, AppPhase::Error, edit_failure_message(&error));
                 return Err("editing failed; the original selection was not changed".into());
             }
         };
@@ -1903,6 +1898,45 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
     format!("AI correction failed; using the original transcript. Error kind: {kind}.")
 }
 
+/// Names why Speak to edit failed, so the user can fix the cause. Every
+/// message is a fixed, localized string; error details are never shown.
+fn edit_failure_message(error: &correction::CorrectionError) -> &'static str {
+    use correction::CorrectionError;
+    match error {
+        CorrectionError::MissingApiKey(_) => {
+            "Editing failed because the AI provider API key is not set. The original selection was not changed."
+        }
+        CorrectionError::Api { status, .. } if matches!(status.as_u16(), 401 | 403) => {
+            "Editing failed because the AI provider rejected the API key. The original selection was not changed."
+        }
+        CorrectionError::Api { status, .. } if status.as_u16() == 429 => {
+            "Editing failed because the AI provider rate limit was reached. Try again later. The original selection was not changed."
+        }
+        CorrectionError::Api { .. } => {
+            "Editing failed because the AI provider returned an error. The original selection was not changed."
+        }
+        CorrectionError::Request(_) => {
+            "Editing failed because the AI provider could not be reached. The original selection was not changed."
+        }
+        CorrectionError::InvalidEndpoint(_) => {
+            "Editing failed because the local AI endpoint URL is invalid. The original selection was not changed."
+        }
+        CorrectionError::OutputLimit => {
+            "Editing stopped at the local output token limit. The original selection was not changed. Increase the local output token limit."
+        }
+        CorrectionError::InvalidResponse(_) | CorrectionError::ProtectedContentChanged => {
+            "Editing failed because the AI provider returned an unusable response. The original selection was not changed."
+        }
+        CorrectionError::UnsupportedProvider(_) => {
+            "Editing failed because the selected AI provider is not supported. The original selection was not changed."
+        }
+        CorrectionError::EmptyEditInstruction => {
+            "No edit instruction was captured; the original selection was not changed."
+        }
+        CorrectionError::Cancelled => "Editing cancelled.",
+    }
+}
+
 /// Metric code for a failed correction; validator rejects stay countable.
 fn correction_failure_metric_code(error: &correction::CorrectionError) -> &'static str {
     match error {
@@ -1936,6 +1970,35 @@ mod tests {
         );
         assert_eq!(retry_dictate_history_mode(None, false), "faithful");
         assert_eq!(retry_dictate_history_mode(None, true), "faithful_fallback");
+    }
+
+    #[test]
+    fn edit_failures_name_their_cause() {
+        use correction::CorrectionError;
+        use reqwest::StatusCode;
+        let api = |status| CorrectionError::Api {
+            status,
+            message: "details".into(),
+        };
+        let messages = [
+            edit_failure_message(&CorrectionError::MissingApiKey("OPENAI_API_KEY".into())),
+            edit_failure_message(&api(StatusCode::UNAUTHORIZED)),
+            edit_failure_message(&api(StatusCode::TOO_MANY_REQUESTS)),
+            edit_failure_message(&api(StatusCode::INTERNAL_SERVER_ERROR)),
+            edit_failure_message(&CorrectionError::InvalidEndpoint("ftp://".into())),
+            edit_failure_message(&CorrectionError::OutputLimit),
+            edit_failure_message(&CorrectionError::InvalidResponse("empty".into())),
+            edit_failure_message(&CorrectionError::UnsupportedProvider("other".into())),
+            edit_failure_message(&CorrectionError::EmptyEditInstruction),
+        ];
+        let distinct = messages.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(distinct.len(), messages.len());
+        assert_eq!(
+            edit_failure_message(&api(StatusCode::FORBIDDEN)),
+            edit_failure_message(&api(StatusCode::UNAUTHORIZED))
+        );
+        // Provider details may echo request content, so they are never shown.
+        assert!(messages.iter().all(|message| !message.contains("details")));
     }
 
     #[test]
