@@ -340,14 +340,16 @@ Full usage and Phase 0 gate criteria are documented in
   or pointer input occurred since the operation began (recording start for
   voice modes). Otherwise the result stays on the clipboard.
 - Elevated applications, password controls, and secure controls are not forced.
-- Model downloads use the Hugging Face cache. An interrupted download resumes
-  from its partial files on the next load, and the progress notice says so.
-  Newly downloaded files are checked against the Hub's SHA-256/git checksums;
-  a mismatched file is downloaded again once, and a persistent mismatch fails
-  the load. If the Hub cannot be reached for that check, the files stay
-  unverified and are checked on the next load. Models cached before this check
-  existed load offline without it. faster-whisper reports byte progress;
-  VibeVoice (downloaded by Transformers) is verified after its first load.
+- Model downloads use the Hugging Face cache. An interrupted download (partial
+  files, or a snapshot folder still missing model files) is continued on the
+  next load, and the progress notice says when it resumes. Newly downloaded
+  files are checked against the Hub's SHA-256/git checksums; a mismatched file
+  is downloaded again once, and a persistent mismatch fails the load. Until a
+  download passes this check it stays pending: a load fails while the Hub
+  cannot be reached and checks again next time. Complete models cached before
+  this check existed load offline without it. faster-whisper reports byte
+  progress; VibeVoice (downloaded by Transformers) is verified after the load
+  that downloaded it, or before loading files left unverified earlier.
 - The default shortcut is registered at startup, and persisted custom shortcuts
   are re-registered on launch. If another app holds a saved hotkey, the app
   names the action that stays unavailable; saving other settings still works,

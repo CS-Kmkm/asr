@@ -568,6 +568,8 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "Replacing the original selection.",
       "Editing cancelled.",
       "Editing failed; the original selection was not changed.",
+      "Resuming the interrupted speech model download.",
+      "Verifying the downloaded speech model files.",
       "Editing failed because the AI provider API key is not set. The original selection was not changed.",
       "Editing failed because the AI provider rejected the API key. The original selection was not changed.",
       "Editing failed because the AI provider rate limit was reached. Try again later. The original selection was not changed.",

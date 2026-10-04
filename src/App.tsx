@@ -136,7 +136,7 @@ interface Notice {
 }
 
 // Notices that only describe model preparation and are cleared once it ends.
-const MODEL_PREPARATION_KINDS = ["model_loading", "model_downloading"];
+const MODEL_PREPARATION_KINDS = ["model_loading", "model_downloading", "model_verifying"];
 
 const WARNING_STATUS_KINDS = new Set([
   "artifact_cleanup_failed",

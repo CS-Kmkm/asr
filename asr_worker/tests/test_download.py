@@ -125,6 +125,23 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "model_verification_failed")
         self.assertTrue(download.verification_pending("org/repo"))
 
+    def test_snapshot_completeness_requires_files_and_every_weight_shard(self) -> None:
+        snapshot = Path(self.snapshot)
+        snapshot.mkdir(parents=True)
+        self.assertFalse(download.snapshot_has_files(self.snapshot, ["config.json", "model.bin"]))
+        self.assertFalse(download.snapshot_has_weights(self.snapshot))
+        (snapshot / "config.json").write_text("{}", encoding="utf-8")
+        (snapshot / "model.bin").write_bytes(b"x")
+        self.assertTrue(download.snapshot_has_files(self.snapshot, ["config.json", "model.bin"]))
+        (snapshot / "model.safetensors.index.json").write_text(
+            '{"weight_map": {"a": "model-1.safetensors", "b": "model-2.safetensors"}}',
+            encoding="utf-8",
+        )
+        (snapshot / "model-1.safetensors").write_bytes(b"x")
+        self.assertFalse(download.snapshot_has_weights(self.snapshot))
+        (snapshot / "model-2.safetensors").write_bytes(b"x")
+        self.assertTrue(download.snapshot_has_weights(self.snapshot))
+
     def test_local_directories_are_not_hub_snapshots(self) -> None:
         self.assertFalse(download.verify_snapshot("org/repo", "C:/models/custom", FakeHubApi()))
 
@@ -154,7 +171,9 @@ def _fake_vibevoice_modules(loads: list[str]) -> dict[str, types.ModuleType]:
 
 
 class VibeVoiceVerificationTests(unittest.TestCase):
-    def load(self, *, cached: list[str | None], pending: bool, repaired: bool) -> tuple[list[str], list[dict], list]:
+    def load(
+        self, *, cached: list[str | None], pending: bool, repaired: bool, complete: bool = True
+    ) -> tuple[list[str], list[dict], list]:
         loads: list[str] = []
         events: list[dict] = []
         backend = VibeVoiceBackend()
@@ -165,6 +184,8 @@ class VibeVoiceVerificationTests(unittest.TestCase):
         ), patch("asr_worker.backends.verification_pending", return_value=pending), patch(
             "asr_worker.backends.partial_download_bytes", return_value=0
         ), patch("asr_worker.backends.mark_verification_pending"), patch(
+            "asr_worker.backends.snapshot_has_weights", return_value=complete
+        ), patch(
             "asr_worker.backends.verify_snapshot", return_value=repaired
         ) as verify:
             backend.load("bf16")
@@ -173,6 +194,14 @@ class VibeVoiceVerificationTests(unittest.TestCase):
     def test_fresh_download_is_verified_and_reloaded_after_a_repair(self) -> None:
         loads, events, verified = self.load(cached=[None, "/snap"], pending=False, repaired=True)
         self.assertEqual(len(loads), 4)  # processor and model, twice
+        self.assertEqual([event["stage"] for event in events], ["download", "verify"])
+        self.assertEqual(len(verified), 1)
+
+    def test_incomplete_cached_snapshot_is_downloaded_and_verified_after_loading(self) -> None:
+        loads, events, verified = self.load(
+            cached=["/snap", "/snap"], pending=True, repaired=False, complete=False
+        )
+        self.assertEqual(len(loads), 2)
         self.assertEqual([event["stage"] for event in events], ["download", "verify"])
         self.assertEqual(len(verified), 1)
 

@@ -11,11 +11,14 @@ from urllib.parse import urlparse
 
 from .download import (
     FASTER_WHISPER_ALLOW_PATTERNS,
+    FASTER_WHISPER_REQUIRED_FILES,
     ProgressCallback,
     cached_snapshot_path,
     download_snapshot,
     mark_verification_pending,
     partial_download_bytes,
+    snapshot_has_files,
+    snapshot_has_weights,
     verification_pending,
     verify_snapshot,
 )
@@ -62,9 +65,8 @@ class ProgressReporting:
         if callback is not None:
             callback({"stage": stage, **fields})
 
-    def begin_download(self, repo_id: str) -> None:
+    def begin_download(self, repo_id: str, resumed: int) -> None:
         """Mark files for verification and report a new or resumed download."""
-        resumed = partial_download_bytes(repo_id)
         mark_verification_pending(repo_id)
         if resumed:
             self.report_progress("download", model=repo_id, resumed_bytes=resumed)
@@ -316,12 +318,18 @@ class VibeVoiceBackend(ProgressReporting):
         if Path(self.model_id).is_dir():
             return False
         cached = cached_snapshot_path(self.model_id)
-        if cached is None:
-            self.begin_download(self.model_id)
-            return True
-        if verification_pending(self.model_id):
+        resumed = partial_download_bytes(self.model_id)
+        complete = cached is not None and resumed == 0 and snapshot_has_weights(cached)
+        if complete and not verification_pending(self.model_id):
+            return False
+        if complete:
+            # Every file of an earlier download is present but unverified.
+            # Repair corrupt files before transformers reads them.
             self.verify_download(self.model_id, cached)
-        return False
+            return False
+        # Missing or partial files: transformers fetches and resumes them.
+        self.begin_download(self.model_id, resumed)
+        return True
 
     def unload(self) -> None:
         self.model = None
@@ -427,12 +435,18 @@ class FasterWhisperBackend(ProgressReporting):
         if repo_id is None:
             return self.model_id
         cached = cached_snapshot_path(repo_id, FASTER_WHISPER_ALLOW_PATTERNS)
-        if cached is not None:
-            # A download interrupted before verification is checked now.
-            if verification_pending(repo_id):
-                self.verify_download(repo_id, cached)
+        resumed = partial_download_bytes(repo_id)
+        if (
+            cached is not None
+            and resumed == 0
+            and not verification_pending(repo_id)
+            and snapshot_has_files(cached, FASTER_WHISPER_REQUIRED_FILES)
+        ):
             return cached
-        self.begin_download(repo_id)
+        # Nothing cached, an interrupted download (partial files, a snapshot
+        # folder without its files) or files left unverified: download again.
+        # huggingface_hub skips complete files and resumes partial ones.
+        self.begin_download(repo_id, resumed)
         snapshot = download_snapshot(
             repo_id,
             FASTER_WHISPER_ALLOW_PATTERNS,

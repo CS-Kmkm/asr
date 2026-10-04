@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 import time
 from pathlib import Path
@@ -15,6 +16,11 @@ FASTER_WHISPER_ALLOW_PATTERNS = [
     "tokenizer.json",
     "vocabulary.*",
 ]
+
+# Files without which a cached faster-whisper snapshot cannot load. huggingface_hub
+# creates the snapshot folder before fetching files, so an interrupted download
+# leaves a folder that looks cached but lacks them.
+FASTER_WHISPER_REQUIRED_FILES = ["config.json", "model.bin"]
 
 # Progress travels over the JSONL protocol, so report often enough for a smooth
 # progress bar without flooding stdout.
@@ -93,6 +99,26 @@ def partial_download_bytes(repo_id: str) -> int:
         return sum(path.stat().st_size for path in blobs.glob("*.incomplete"))
     except (ImportError, OSError):
         return 0
+
+
+def snapshot_has_files(snapshot_path: str, required: list[str]) -> bool:
+    """Whether a cached snapshot holds every required file."""
+    return all((Path(snapshot_path) / name).is_file() for name in required)
+
+
+def snapshot_has_weights(snapshot_path: str) -> bool:
+    """Whether a Transformers snapshot holds its config and every weight shard."""
+    snapshot = Path(snapshot_path)
+    if not (snapshot / "config.json").is_file():
+        return False
+    index = snapshot / "model.safetensors.index.json"
+    if not index.is_file():
+        return (snapshot / "model.safetensors").is_file()
+    try:
+        shards = set(json.loads(index.read_text(encoding="utf-8"))["weight_map"].values())
+    except (OSError, ValueError, KeyError, AttributeError):
+        return False
+    return bool(shards) and all((snapshot / shard).is_file() for shard in shards)
 
 
 def mark_verification_pending(repo_id: str) -> None:
