@@ -333,6 +333,12 @@ Full usage and Phase 0 gate criteria are documented in
   Direct UI Automation insertion is available where supported, but some controls
   may still fall back to clipboard paste, Unicode input, or clipboard-only
   behavior.
+- Native Win32 Edit controls (including Windows Forms text boxes) that expose
+  no UI Automation text range are read and selected with window messages.
+  Their IME composition cannot be observed from another process, so their
+  text is replaced or deleted only when the IME is closed, or when no keyboard
+  or pointer input occurred since the operation began (recording start for
+  voice modes). Otherwise the result stays on the clipboard.
 - Elevated applications, password controls, and secure controls are not forced.
 - Model downloads use the Hugging Face cache. An interrupted download resumes
   from its partial files on the next load, and the progress notice says so.
