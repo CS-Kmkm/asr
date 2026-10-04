@@ -1,23 +1,25 @@
 //! Win32 Edit controls that expose no UI Automation text range.
 //!
-//! The control's text and selection are read with window messages, which the
-//! system marshals across processes for standard controls. Positions are
-//! UTF-16 units of the raw text, whose CRLF line breaks `normalize_text`
-//! turns into LF. Target text is inspected transiently and never logged.
+//! The control's text and selection are read and edited with window messages,
+//! which the system marshals across processes for standard controls. Edits use
+//! WM_PASTE and WM_CLEAR rather than keystrokes, so they never pass through an
+//! IME composition the control's thread may hold. Positions are UTF-16 units of
+//! the raw text, whose CRLF line breaks `normalize_text` turns into LF. Target
+//! text is inspected transiently and never logged.
 
 use super::{normalize_text, InjectionError, TargetText, TargetWindow};
 use std::ffi::c_void;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::UI::Input::Ime::ImmGetDefaultIMEWnd;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClassNameW, SendMessageTimeoutW, SEND_MESSAGE_TIMEOUT_FLAGS, SMTO_ABORTIFHUNG, SMTO_BLOCK,
-    WM_GETTEXT, WM_GETTEXTLENGTH, WM_IME_CONTROL,
+    WM_CLEAR, WM_GETTEXT, WM_GETTEXTLENGTH, WM_PASTE,
 };
 
 const EM_GETSEL: u32 = 0x00B0;
 const EM_SETSEL: u32 = 0x00B1;
-const IMC_GETOPENSTATUS: usize = 0x0005;
 const MESSAGE_TIMEOUT_MS: u32 = 200;
+/// Pasting runs the control's own paste handling, which may take longer.
+const EDIT_TIMEOUT_MS: u32 = 2000;
 /// EM_GETSEL packs both positions into 16-bit words, so longer text cannot be
 /// addressed safely and is treated as unreadable.
 const MAX_UNITS: usize = 0xFFFF;
@@ -48,6 +50,16 @@ pub(super) fn is_native_edit(target: &TargetWindow) -> bool {
 }
 
 fn send(window: HWND, message: u32, wparam: usize, lparam: isize) -> Option<usize> {
+    send_with_timeout(window, message, wparam, lparam, MESSAGE_TIMEOUT_MS)
+}
+
+fn send_with_timeout(
+    window: HWND,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+    timeout_ms: u32,
+) -> Option<usize> {
     let mut result = 0usize;
     let sent = unsafe {
         SendMessageTimeoutW(
@@ -56,7 +68,7 @@ fn send(window: HWND, message: u32, wparam: usize, lparam: isize) -> Option<usiz
             WPARAM(wparam),
             LPARAM(lparam),
             SEND_MESSAGE_TIMEOUT_FLAGS(SMTO_ABORTIFHUNG.0 | SMTO_BLOCK.0),
-            MESSAGE_TIMEOUT_MS,
+            timeout_ms,
             Some(&mut result),
         )
     };
@@ -129,15 +141,17 @@ pub(super) fn select_recent(
     Ok(true)
 }
 
-/// Whether the IME of the control's thread is open. A closed IME (direct
-/// input) cannot hold a composition; an open one may, and its composition is
-/// not observable from another process.
-pub(super) fn ime_open(target: &TargetWindow) -> Option<bool> {
-    let ime_window = unsafe { ImmGetDefaultIMEWnd(control(target)) };
-    if ime_window.0.is_null() {
-        return None;
-    }
-    send(ime_window, WM_IME_CONTROL, IMC_GETOPENSTATUS, 0).map(|open| open != 0)
+/// Pastes the clipboard over the selection. A timed-out message may still be
+/// processed later, so the paste always counts as possibly queued and is
+/// confirmed by reading the control, never retried.
+pub(super) fn paste(target: &TargetWindow) -> bool {
+    let _ = send_with_timeout(control(target), WM_PASTE, 0, 0, EDIT_TIMEOUT_MS);
+    true
+}
+
+/// Deletes the selection.
+pub(super) fn clear_selection(target: &TargetWindow) -> bool {
+    send_with_timeout(control(target), WM_CLEAR, 0, 0, EDIT_TIMEOUT_MS).is_some()
 }
 
 fn is_high_surrogate(unit: u16) -> bool {

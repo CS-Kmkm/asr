@@ -322,7 +322,10 @@ enum SafetyPolicy {
     /// observed (a native Win32 Edit control). Allowed only while the input
     /// monitor shows no keyboard or pointer input since the operation began
     /// (recording start for voice modes), because a composition cannot start
-    /// without input. The batch layer chooses it and checks the monitor.
+    /// without input. Such controls are edited with window messages instead of
+    /// keystrokes, so a composition left open before the operation is not
+    /// driven by injected keys. The batch layer chooses it and checks the
+    /// monitor.
     DestructiveAfterQuietInput,
 }
 
@@ -673,17 +676,8 @@ mod windows_backend {
             &self,
             target: &TargetWindow,
         ) -> Result<Option<bool>, InjectionError> {
-            let active = uia_ime_composition_active(target.process_id)
-                .map_err(|_| InjectionError::BackendFailure("failed to query IME composition"))?;
-            // Native Edit controls expose no composition through UI
-            // Automation, but a closed IME (direct input) cannot compose.
-            if active.is_none()
-                && native_edit::is_native_edit(target)
-                && native_edit::ime_open(target) == Some(false)
-            {
-                return Ok(Some(false));
-            }
-            Ok(active)
+            uia_ime_composition_active(target.process_id)
+                .map_err(|_| InjectionError::BackendFailure("failed to query IME composition"))
         }
         fn target_text(&self, target: &TargetWindow) -> Result<TargetText, InjectionError> {
             self.validate_target(target)?;
@@ -744,6 +738,9 @@ mod windows_backend {
             if !policy.permits_ime(self.ime_composition_active(target)?) || !modifiers_released() {
                 return Ok(false);
             }
+            if native_edit::is_native_edit(target) {
+                return Ok(native_edit::paste(target));
+            }
             let inputs = [
                 keyboard_input(VK_CONTROL, 0),
                 keyboard_input(VK_V, 0),
@@ -769,6 +766,9 @@ mod windows_backend {
                 || !modifiers_released()
             {
                 return Ok(false);
+            }
+            if native_edit::is_native_edit(target) {
+                return Ok(native_edit::clear_selection(target));
             }
             let inputs = [
                 keyboard_input(VK_BACK, 0),

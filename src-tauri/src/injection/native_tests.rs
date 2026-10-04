@@ -154,8 +154,14 @@ fn native_edit_messages_read_and_select_the_recent_draft() {
         assert_eq!(selected.after, " suffix");
         // A stale expectation never moves the selection.
         assert!(!native_edit::select_recent(&target, &state, draft).unwrap());
-        // The IME query answers or reports that it cannot; it never fails.
-        let _ = native_edit::ime_open(&target);
+        // Deleting goes through WM_CLEAR, not a keystroke.
+        assert!(native_edit::clear_selection(&target));
+        let cleared = native_edit::read(&target).unwrap();
+        assert_eq!(
+            (cleared.before.as_str(), cleared.selected.as_str()),
+            ("prefix ", "")
+        );
+        assert_eq!(cleared.after, " suffix");
     }
 }
 
@@ -178,8 +184,8 @@ fn edit_text(window: windows::Win32::Foundation::HWND) -> String {
 
 /// Drives the real Windows backend against a top-level Win32 Edit window owned
 /// by another thread. Whichever path reads its text (UI Automation or window
-/// messages), its IME state is either known closed or unobservable, so the
-/// quiet-input policy must allow replacing the verified draft.
+/// messages), its IME state is unobservable, so the quiet-input policy must
+/// allow replacing the verified draft through WM_PASTE.
 fn native_edit_round_trip(draft: &str, corrected: &str) {
     let probe = EditProbe::new("prefix  suffix", 7, true);
     let window = probe.window;

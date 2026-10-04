@@ -333,12 +333,15 @@ Full usage and Phase 0 gate criteria are documented in
   Direct UI Automation insertion is available where supported, but some controls
   may still fall back to clipboard paste, Unicode input, or clipboard-only
   behavior.
-- Native Win32 Edit controls (including Windows Forms text boxes) that expose
-  no UI Automation text range are read and selected with window messages.
-  Their IME composition cannot be observed from another process, so their
-  text is replaced or deleted only when the IME is closed, or when no keyboard
-  or pointer input occurred since the operation began (recording start for
-  voice modes). Otherwise the result stays on the clipboard.
+- Native Win32 Edit controls (including Windows Forms text boxes) are read,
+  selected and edited with window messages (WM_PASTE/WM_CLEAR, not
+  keystrokes), also when they expose no UI Automation text range. Their IME
+  composition cannot be observed from another process, so their text is
+  replaced or deleted only while no keyboard or pointer input has occurred
+  since the operation began (recording start for voice modes); otherwise the
+  result stays on the clipboard. A composition left unconverted before the
+  operation is not touched and is committed at the caret when the user
+  converts it.
 - Elevated applications, password controls, and secure controls are not forced.
 - Model downloads use the Hugging Face cache. An interrupted download (partial
   files, or a snapshot folder still missing model files) is continued on the
