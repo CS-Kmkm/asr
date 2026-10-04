@@ -343,9 +343,9 @@ Full usage and Phase 0 gate criteria are documented in
   operation is not touched and is committed at the caret when the user
   converts it.
 - Elevated applications, password controls, and secure controls are not forced.
-- Model downloads use the Hugging Face cache. An interrupted download (partial
-  files, or a snapshot folder still missing model files) is continued on the
-  next load, and the progress notice says when it resumes. Newly downloaded
+- Model downloads use the Hugging Face cache. An interrupted download (a
+  snapshot still missing model files) is continued on the next load, and the
+  progress notice says when it resumes partial files. Newly downloaded
   files are checked against the Hub's SHA-256/git checksums; a mismatched file
   is downloaded again once, and a persistent mismatch fails the load. Until a
   download passes this check it stays pending: a load fails while the Hub

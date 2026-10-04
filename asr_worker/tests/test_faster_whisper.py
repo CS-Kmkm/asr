@@ -202,6 +202,18 @@ class ResolveModelFilesTests(unittest.TestCase):
         events, _ = self.resolve_incomplete(pending=False, partial=0, has_files=False)
         self.assertEqual(events[0], {"stage": "download", "model": "org/repo"})
 
+    def test_stale_partial_files_do_not_block_an_offline_complete_model(self) -> None:
+        backend = FasterWhisperBackend()
+        with patch("asr_worker.backends.faster_whisper_repo_id", return_value="org/repo"), patch(
+            "asr_worker.backends.cached_snapshot_path", return_value="/cache/repo"
+        ), patch("asr_worker.backends.verification_pending", return_value=False), patch(
+            "asr_worker.backends.partial_download_bytes", return_value=4096
+        ), patch("asr_worker.backends.snapshot_has_files", return_value=True), patch(
+            "asr_worker.backends.download_snapshot"
+        ) as download:
+            self.assertEqual(backend._resolve_model_files(), "/cache/repo")
+        download.assert_not_called()
+
     def test_partial_files_resume_even_when_the_snapshot_folder_exists(self) -> None:
         events, _ = self.resolve_incomplete(pending=True, partial=4096, has_files=False)
         self.assertEqual(

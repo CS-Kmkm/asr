@@ -318,8 +318,9 @@ class VibeVoiceBackend(ProgressReporting):
         if Path(self.model_id).is_dir():
             return False
         cached = cached_snapshot_path(self.model_id)
-        resumed = partial_download_bytes(self.model_id)
-        complete = cached is not None and resumed == 0 and snapshot_has_weights(cached)
+        # Completeness depends on the files the model needs, not on leftover
+        # partial files, which a changed remote file may never finish.
+        complete = cached is not None and snapshot_has_weights(cached)
         if complete and not verification_pending(self.model_id):
             return False
         if complete:
@@ -328,7 +329,7 @@ class VibeVoiceBackend(ProgressReporting):
             self.verify_download(self.model_id, cached)
             return False
         # Missing or partial files: transformers fetches and resumes them.
-        self.begin_download(self.model_id, resumed)
+        self.begin_download(self.model_id, partial_download_bytes(self.model_id))
         return True
 
     def unload(self) -> None:
@@ -435,18 +436,18 @@ class FasterWhisperBackend(ProgressReporting):
         if repo_id is None:
             return self.model_id
         cached = cached_snapshot_path(repo_id, FASTER_WHISPER_ALLOW_PATTERNS)
-        resumed = partial_download_bytes(repo_id)
+        # Completeness depends on the files the model needs, not on leftover
+        # partial files, which a changed remote file may never finish.
         if (
             cached is not None
-            and resumed == 0
             and not verification_pending(repo_id)
             and snapshot_has_files(cached, FASTER_WHISPER_REQUIRED_FILES)
         ):
             return cached
-        # Nothing cached, an interrupted download (partial files, a snapshot
-        # folder without its files) or files left unverified: download again.
-        # huggingface_hub skips complete files and resumes partial ones.
-        self.begin_download(repo_id, resumed)
+        # Nothing cached, an interrupted download (a snapshot folder without
+        # its files) or files left unverified: download again. huggingface_hub
+        # skips complete files and resumes partial ones.
+        self.begin_download(repo_id, partial_download_bytes(repo_id))
         snapshot = download_snapshot(
             repo_id,
             FASTER_WHISPER_ALLOW_PATTERNS,
