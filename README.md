@@ -273,8 +273,20 @@ with open("sample.wav", "rb") as audio:
 print(result.text)
 ```
 
-The local server currently provides non-streaming transcription and does not
-provide diarization or token log probabilities.
+With `stream=true` (and the `json` or `text` response format) the server sends
+OpenAI-style server-sent events: one `transcript.text.delta` per decoded
+segment, then `transcript.text.done` with the whole text. faster-whisper
+streams segments as they are decoded; the other backends send their transcript
+as a single delta.
+
+```python
+stream = client.audio.transcriptions.create(model="local-asr", file=audio, stream=True)
+for event in stream:
+    if event.type == "transcript.text.delta":
+        print(event.delta, end="", flush=True)
+```
+
+The local server does not provide diarization or token log probabilities.
 
 ## Checks
 

@@ -6,7 +6,7 @@ import mimetypes
 import os
 import wave
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 from urllib.parse import urlparse
 
 from .download import (
@@ -409,6 +409,17 @@ class FasterWhisperBackend(ProgressReporting):
         prompt: str | None,
         language: str | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
+        segments = list(self.transcribe_segments(audio_path, prompt, language))
+        text = "".join(segment["text"] for segment in segments).strip()
+        return text, segments
+
+    def transcribe_segments(
+        self,
+        audio_path: Path,
+        prompt: str | None,
+        language: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield segments as faster-whisper decodes them, for streaming."""
         try:
             hotwords = prompt if prompt else None
             raw_segments, _info = self.model.transcribe(
@@ -417,17 +428,16 @@ class FasterWhisperBackend(ProgressReporting):
                 language=language.split("-", 1)[0] if language else None,
                 hotwords=hotwords,
             )
-            segments = [
-                {
+            for segment in raw_segments:
+                yield {
                     "start": float(segment.start),
                     "end": float(segment.end),
                     "speaker": None,
                     "text": str(segment.text),
                 }
-                for segment in raw_segments
-            ]
-            text = "".join(segment["text"] for segment in segments).strip()
-            return text, segments
+        except GeneratorExit:
+            # A consumer stopped reading; that is not a transcription failure.
+            raise
         except BaseException as exc:
             raise map_backend_exception(exc, "transcribe", "faster-whisper") from exc
 
