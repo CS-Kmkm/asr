@@ -194,6 +194,28 @@ class ApiServerTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertFalse(seen[0].exists())
 
+    def test_streaming_failure_after_text_ends_with_an_error_event(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from asr_worker.api import create_app
+
+        class FailsMidway(MockBackend):
+            def transcribe_segments(self, audio_path, prompt, language=None):
+                yield {"start": 0.0, "end": 1.0, "speaker": None, "text": " Hello"}
+                raise BackendError("gpu_oom", "GPU out of memory while operating the ASR model")
+
+        client = TestClient(create_app(FailsMidway(), served_model="local-asr"))
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={"model": "local-asr", "stream": "true"},
+            files={"file": ("sample.wav", b"RIFF-test", "audio/wav")},
+        )
+        # The status was already sent with the first delta.
+        self.assertEqual(response.status_code, 200)
+        events = self.stream_events(response)
+        self.assertEqual([event["type"] for event in events], ["transcript.text.delta", "error"])
+        self.assertEqual(events[1]["error"]["code"], "gpu_oom")
+
     def test_streaming_whole_transcript_backends_send_a_single_delta(self) -> None:
         from fastapi.testclient import TestClient
 
