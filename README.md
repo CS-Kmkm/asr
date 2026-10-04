@@ -334,8 +334,14 @@ Full usage and Phase 0 gate criteria are documented in
   may still fall back to clipboard paste, Unicode input, or clipboard-only
   behavior.
 - Elevated applications, password controls, and secure controls are not forced.
-- Model download progress/resume UI and checksum verification remain future model
-  management work; Transformers manages the current cache download.
+- Model downloads use the Hugging Face cache. An interrupted download resumes
+  from its partial files on the next load, and the progress notice says so.
+  Newly downloaded files are checked against the Hub's SHA-256/git checksums;
+  a mismatched file is downloaded again once, and a persistent mismatch fails
+  the load. If the Hub cannot be reached for that check, the files stay
+  unverified and are checked on the next load. Models cached before this check
+  existed load offline without it. faster-whisper reports byte progress;
+  VibeVoice (downloaded by Transformers) is verified after its first load.
 - The default shortcut is registered at startup, and persisted custom shortcuts
   are re-registered on launch. If another app holds a saved hotkey, the app
   names the action that stays unavailable; saving other settings still works,

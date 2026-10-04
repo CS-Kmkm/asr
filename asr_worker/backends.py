@@ -14,6 +14,10 @@ from .download import (
     ProgressCallback,
     cached_snapshot_path,
     download_snapshot,
+    mark_verification_pending,
+    partial_download_bytes,
+    verification_pending,
+    verify_snapshot,
 )
 
 MODEL_ID = "microsoft/VibeVoice-ASR-HF"
@@ -57,6 +61,20 @@ class ProgressReporting:
         callback = self.progress
         if callback is not None:
             callback({"stage": stage, **fields})
+
+    def begin_download(self, repo_id: str) -> None:
+        """Mark files for verification and report a new or resumed download."""
+        resumed = partial_download_bytes(repo_id)
+        mark_verification_pending(repo_id)
+        if resumed:
+            self.report_progress("download", model=repo_id, resumed_bytes=resumed)
+        else:
+            self.report_progress("download", model=repo_id)
+
+    def verify_download(self, repo_id: str, snapshot_path: str) -> bool:
+        """Verify downloaded files; returns whether any had to be replaced."""
+        self.report_progress("verify", model=repo_id)
+        return verify_snapshot(repo_id, snapshot_path)
 
 
 def faster_whisper_repo_id(model_id: str) -> str | None:
@@ -257,9 +275,21 @@ class VibeVoiceBackend(ProgressReporting):
             else:
                 kwargs["torch_dtype"] = torch.bfloat16
 
-            self._report_pending_download()
+            downloading = self._report_pending_download()
             self.processor = AutoProcessor.from_pretrained(self.model_id)
             self.model = VibeVoiceAsrForConditionalGeneration.from_pretrained(self.model_id, **kwargs)
+            if downloading:
+                # transformers fetched the files while loading; check them now
+                # and load again if a corrupted file had to be replaced.
+                snapshot = cached_snapshot_path(self.model_id)
+                if snapshot is not None and self.verify_download(self.model_id, snapshot):
+                    self.processor = None
+                    self.model = None
+                    gc.collect()
+                    self.processor = AutoProcessor.from_pretrained(self.model_id)
+                    self.model = VibeVoiceAsrForConditionalGeneration.from_pretrained(
+                        self.model_id, **kwargs
+                    )
             device = str(next(self.model.parameters()).device)
             if not device.startswith("cuda"):
                 self.processor = None
@@ -275,16 +305,23 @@ class VibeVoiceBackend(ProgressReporting):
         except BaseException as exc:
             raise map_backend_exception(exc, "load") from exc
 
-    def _report_pending_download(self) -> None:
-        """Report that model files are still missing before transformers loads.
+    def _report_pending_download(self) -> bool:
+        """Prepare model files before transformers loads them.
 
         transformers downloads inside ``from_pretrained`` without a progress
-        hook, so only the stage is reported for this backend.
+        hook, so only the stage is reported for this backend. Returns whether
+        files will be downloaded and must be verified after loading. Files
+        left unverified by an earlier load are verified here, before use.
         """
         if Path(self.model_id).is_dir():
-            return
-        if cached_snapshot_path(self.model_id) is None:
-            self.report_progress("download", model=self.model_id)
+            return False
+        cached = cached_snapshot_path(self.model_id)
+        if cached is None:
+            self.begin_download(self.model_id)
+            return True
+        if verification_pending(self.model_id):
+            self.verify_download(self.model_id, cached)
+        return False
 
     def unload(self) -> None:
         self.model = None
@@ -391,13 +428,18 @@ class FasterWhisperBackend(ProgressReporting):
             return self.model_id
         cached = cached_snapshot_path(repo_id, FASTER_WHISPER_ALLOW_PATTERNS)
         if cached is not None:
+            # A download interrupted before verification is checked now.
+            if verification_pending(repo_id):
+                self.verify_download(repo_id, cached)
             return cached
-        self.report_progress("download", model=repo_id)
-        return download_snapshot(
+        self.begin_download(repo_id)
+        snapshot = download_snapshot(
             repo_id,
             FASTER_WHISPER_ALLOW_PATTERNS,
             lambda update: self.report_progress("download", model=repo_id, **update),
         )
+        self.verify_download(repo_id, snapshot)
+        return snapshot
 
     def unload(self) -> None:
         self.model = None

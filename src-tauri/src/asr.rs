@@ -70,9 +70,11 @@ pub struct Transcript {
 
 /// Progress the worker reports while a `load` request is still running.
 ///
-/// `stage` is `download` while model files are being fetched on first use and
+/// `stage` is `download` while model files are being fetched on first use,
+/// `verify` while downloaded files are checked against their checksums, and
 /// `load` once cached files are read into memory. Byte counts are absent until
 /// the download size is known, and for backends that cannot measure it.
+/// `resumed_bytes` is present when an interrupted download is continued.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all(serialize = "camelCase"))]
 pub struct LoadProgress {
@@ -83,6 +85,8 @@ pub struct LoadProgress {
     pub completed_bytes: Option<u64>,
     #[serde(default)]
     pub total_bytes: Option<u64>,
+    #[serde(default)]
+    pub resumed_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -666,6 +670,26 @@ mod tests {
         ] {
             assert!(JsonlTranscriber::parse_progress(line, &json!(1)).is_some());
         }
+    }
+
+    #[test]
+    fn resumed_and_verify_progress_is_read() {
+        let resumed = JsonlTranscriber::parse_progress(
+            br#"{"id":1,"event":"progress","stage":"download","model":"repo","resumed_bytes":512}"#,
+            &json!(1),
+        )
+        .unwrap();
+        assert_eq!(resumed.resumed_bytes, Some(512));
+        let verify = JsonlTranscriber::parse_progress(
+            br#"{"id":1,"event":"progress","stage":"verify","model":"repo"}"#,
+            &json!(1),
+        )
+        .unwrap();
+        assert_eq!(verify.stage, "verify");
+        assert_eq!(
+            serde_json::to_value(&resumed).unwrap()["resumedBytes"],
+            json!(512)
+        );
     }
 
     #[test]
