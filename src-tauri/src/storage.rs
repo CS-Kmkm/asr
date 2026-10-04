@@ -853,6 +853,9 @@ impl Storage {
             )?;
         }
         let changed = transaction.execute("DELETE FROM dictation_history", [])? as u64;
+        // Candidate spans and decisions are transcript text, so removing all
+        // History removes them too. Confirmed dictionary entries are kept.
+        purge_dictionary_candidates_before(&transaction, None)?;
         transaction.commit()?;
         drop(connection);
         let _ = self.retry_pending_audio_deletions();
@@ -4136,6 +4139,43 @@ mod tests {
             .add_dictionary_candidate_from_correction("open ai", "OpenAI", None)
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn deleting_all_history_removes_candidate_text_but_keeps_entries() {
+        let storage = Storage::in_memory().unwrap();
+        let confirmed = storage
+            .add_dictionary_candidate_from_correction("open ai", "OpenAI", None)
+            .unwrap()
+            .unwrap();
+        storage.confirm_dictionary_candidate(confirmed).unwrap();
+        let rejected = storage
+            .add_dictionary_candidate_from_correction("chat gpt", "ChatGPT", None)
+            .unwrap()
+            .unwrap();
+        assert!(storage.reject_dictionary_candidate(rejected).unwrap());
+        storage
+            .add_dictionary_candidate_from_correction("use Github", "use GitHub", None)
+            .unwrap()
+            .unwrap();
+        storage.delete_all_history().unwrap();
+
+        assert!(storage.list_dictionary_candidates().unwrap().is_empty());
+        let decisions: i64 = storage
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM dictionary_candidate_decisions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(decisions, 0);
+        assert!(storage
+            .list_dictionary()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.surface == "OpenAI"));
     }
 
     #[test]
