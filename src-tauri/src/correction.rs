@@ -170,6 +170,230 @@ fn preserves_protected_spans_with_hints(
     .into_iter()
     .all(|kind| facts_preserved(transcript, corrected, &output_for_new_values, kind, edits))
         && uncertainty_preserved(transcript, corrected)
+        && proper_nouns_preserved(
+            transcript,
+            corrected,
+            &output_for_new_values,
+            edits,
+            dictionary_hints,
+        )
+}
+
+/// Names must survive intent-aware editing: every kept source name stays,
+/// an explicitly repaired name may be replaced by its repair, and the output
+/// may not introduce a name the speaker never said. Comparison ignores case,
+/// so capitalization fixes such as Github -> GitHub are accepted, and a name
+/// may be mentioned more or fewer times while it still appears.
+///
+/// Names are Latin-script tokens that look like proper nouns (see
+/// [`is_latin_proper_noun`]) and prompted dictionary terms, the only way a
+/// Japanese name is known to be a name.
+fn proper_nouns_preserved(
+    source: &str,
+    output: &str,
+    output_for_new_values: &str,
+    edits: FactEdits,
+    dictionary_hints: &[String],
+) -> bool {
+    let terms = dictionary_terms(dictionary_hints);
+    let occurrences = name_occurrences(source, &terms);
+    let roles = occurrence_roles(source, &occurrences, edits.corrections);
+    let present = |key: &FactKey| {
+        terms
+            .iter()
+            .find(|(surface, _)| surface.to_lowercase() == key.value)
+            .map_or_else(
+                || contains_name(output, &key.value),
+                |(surface, readings)| {
+                    std::iter::once(surface)
+                        .chain(readings)
+                        .any(|spelling| contains_name(output, &spelling.to_lowercase()))
+                },
+            )
+    };
+    let kept = occurrences
+        .iter()
+        .zip(&roles)
+        .all(|((_, key), role)| match role {
+            OccurrenceRole::Kept => present(key),
+            OccurrenceRole::Superseded => true,
+            OccurrenceRole::Replaceable(final_key) => present(key) || present(final_key),
+        });
+    // Dictionary surfaces were removed from `output_for_new_values`, so only
+    // names outside the prompted terms are checked against the source.
+    kept && latin_name_occurrences(output_for_new_values)
+        .iter()
+        .all(|(_, name)| contains_name(source, &name.to_lowercase()))
+}
+
+/// Prompted dictionary terms as `(surface, spoken readings)`.
+fn dictionary_terms(dictionary_hints: &[String]) -> Vec<(String, Vec<String>)> {
+    dictionary_hints
+        .iter()
+        .filter_map(|hint| {
+            let (surface, readings) = hint.split_once("<=")?;
+            let surface = surface.trim();
+            (!surface.is_empty()).then(|| {
+                (
+                    surface.to_owned(),
+                    readings
+                        .split('|')
+                        .map(str::trim)
+                        .filter(|reading| !reading.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                )
+            })
+        })
+        .collect()
+}
+
+/// Name occurrences in source order. A prompted term is keyed by its surface,
+/// whichever spelling was spoken.
+fn name_occurrences(text: &str, terms: &[(String, Vec<String>)]) -> Vec<FactOccurrence> {
+    let lower = text.to_lowercase();
+    let mut occurrences: Vec<FactOccurrence> = Vec::new();
+    // Lowercasing keeps byte offsets only when case mapping keeps lengths;
+    // otherwise prompted terms cannot be located in the source safely.
+    if lower.len() == text.len() {
+        for (surface, readings) in terms {
+            let key = FactKey {
+                value: surface.to_lowercase(),
+                unit: None,
+            };
+            for spelling in std::iter::once(surface).chain(readings) {
+                let spelling = spelling.to_lowercase();
+                for (at, _) in lower.match_indices(&spelling) {
+                    let range = at..at + spelling.len();
+                    if name_boundaries(text, &range)
+                        && !occurrences
+                            .iter()
+                            .any(|(existing, _)| ranges_overlap(existing, &range))
+                    {
+                        occurrences.push((range, key.clone()));
+                    }
+                }
+            }
+        }
+    }
+    for (range, name) in latin_name_occurrences(text) {
+        if !occurrences
+            .iter()
+            .any(|(existing, _)| ranges_overlap(existing, &range))
+        {
+            occurrences.push((
+                range,
+                FactKey {
+                    value: name.to_lowercase(),
+                    unit: None,
+                },
+            ));
+        }
+    }
+    occurrences.sort_by_key(|(range, _)| range.start);
+    occurrences
+}
+
+fn ranges_overlap(left: &std::ops::Range<usize>, right: &std::ops::Range<usize>) -> bool {
+    left.start < right.end && right.start < left.end
+}
+
+/// ASCII names need word boundaries; other scripts have no word separators.
+fn name_boundaries(text: &str, range: &std::ops::Range<usize>) -> bool {
+    if !text[range.clone()].is_ascii() {
+        return true;
+    }
+    let before = text[..range.start].chars().next_back();
+    let after = text[range.end..].chars().next();
+    !before.is_some_and(|character| character.is_ascii_alphanumeric())
+        && !after.is_some_and(|character| character.is_ascii_alphanumeric())
+}
+
+/// Whether `text` mentions `name` (lowercase), as a whole word when ASCII.
+fn contains_name(text: &str, name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    if lower.len() != text.len() {
+        return lower.contains(name);
+    }
+    lower
+        .match_indices(name)
+        .any(|(at, _)| name_boundaries(text, &(at..at + name.len())))
+}
+
+/// Latin-script tokens that look like proper nouns, outside URLs and code.
+fn latin_name_occurrences(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
+    let excluded = url_occurrences(text)
+        .into_iter()
+        .chain(code_span_occurrences(text))
+        .map(|(range, _)| range)
+        .collect::<Vec<_>>();
+    let bytes = text.as_bytes();
+    let mut names = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_alphanumeric() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut end = index;
+        while end < bytes.len() {
+            if bytes[end].is_ascii_alphanumeric() {
+                end += 1;
+            } else if matches!(bytes[end], b'.' | b'-' | b'_' | b'\'')
+                && bytes.get(end + 1).is_some_and(u8::is_ascii_alphanumeric)
+            {
+                end += 2;
+            } else {
+                break;
+            }
+        }
+        while end < bytes.len() && matches!(bytes[end], b'+' | b'#') {
+            end += 1;
+        }
+        index = end;
+        let range = start..end;
+        if excluded.iter().any(|other| ranges_overlap(other, &range)) {
+            continue;
+        }
+        let token = &text[range.clone()];
+        if is_latin_proper_noun(token, sentence_initial(text, start)) {
+            names.push((range, token.to_owned()));
+        }
+    }
+    names
+}
+
+/// A token is a name when it has an inner capital (GitHub, iPhone, NASA) or
+/// is capitalized away from a sentence start (Tanaka, Zoom). A capitalized
+/// sentence start is ambiguous and ignored. Single letters, "I" contractions
+/// and "OK" are ordinary words.
+fn is_latin_proper_noun(token: &str, sentence_initial: bool) -> bool {
+    let letters = token.chars().filter(char::is_ascii_alphabetic).count();
+    if letters < 2 || token.eq_ignore_ascii_case("ok") || token.starts_with("I'") {
+        return false;
+    }
+    let mut characters = token.chars();
+    let first = characters.next().unwrap_or_default();
+    let inner_capital = characters.any(|character| character.is_ascii_uppercase());
+    inner_capital || first.is_ascii_uppercase() && !sentence_initial
+}
+
+fn sentence_initial(text: &str, start: usize) -> bool {
+    let before = text[..start].trim_end_matches(|character: char| {
+        character.is_whitespace() || matches!(character, '"' | '\'' | '(' | '「' | '『' | '（')
+    });
+    match before.char_indices().next_back() {
+        None => true,
+        Some((index, character)) => {
+            character == '\n'
+                || matches!(character, ':' | '：' | '-' | '*' | '・')
+                || is_sentence_break_at(before, index, character)
+        }
+    }
 }
 
 /// Removes a line-leading `1.` or `1)` marker (one or two ASCII digits followed
@@ -3134,6 +3358,98 @@ mod tests {
             extract_numbers("温度は- 3度、誤差は+ 3です。"),
             ["-3", "+3"]
         );
+    }
+
+    #[test]
+    fn intent_aware_keeps_names_and_never_invents_them() {
+        let accepted = [
+            ("we use Github for this", "We use GitHub for this."),
+            ("Send it to Tanaka, actually Suzuki.", "Send it to Suzuki."),
+            (
+                "I asked Tanaka and then I asked Tanaka again.",
+                "I asked Tanaka twice.",
+            ),
+            (
+                "the meeting is with Tanaka tomorrow",
+                "Tomorrow's meeting is with Tanaka.",
+            ),
+            (
+                "please email Zoom support",
+                "Zoom support should be emailed.",
+            ),
+            ("会議はZoomで行います", "会議はZoomで行います。"),
+            (
+                "Deploy the API to AWS today.",
+                "Today, deploy the API to AWS.",
+            ),
+            ("- Buy milk\n- call mom", "- Buy milk\n- Call mom"),
+        ];
+        for (input, output) in accepted {
+            assert!(
+                accepts_with_corrections(input, output, true),
+                "rejected {input} => {output}"
+            );
+        }
+        let rejected = [
+            (
+                "Schedule the call on Zoom with Tanaka.",
+                "Schedule the call with Tanaka.",
+            ),
+            ("Send it to the team.", "Send it to the Marketing team."),
+            ("Send it to Tanaka.", "Send it to Suzuki."),
+            ("Deploy the API today.", "Deploy it today."),
+            ("会議はZoomで行います", "会議はオンラインで行います。"),
+        ];
+        for (input, output) in rejected {
+            assert!(
+                !accepts_with_corrections(input, output, true),
+                "accepted {input} => {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn prompted_dictionary_terms_are_protected_names() {
+        let edits = FactEdits {
+            corrections: true,
+            merge_duplicates: true,
+        };
+        let hints = ["田中<=たなか".to_owned()];
+        let accepts =
+            |input, output| preserves_protected_spans_with_hints(input, output, edits, &hints);
+        assert!(accepts("たなかさんに送って", "田中さんに送ってください。"));
+        assert!(accepts(
+            "たなかさんに送って",
+            "たなかさんに送ってください。"
+        ));
+        assert!(!accepts("たなかさんに送って", "担当者に送ってください。"));
+        // An explicit repair may drop the term.
+        assert!(preserves_protected_spans_with_hints(
+            "たなかさん、いや、すずきさんに送って",
+            "鈴木さんに送ってください。",
+            edits,
+            &["田中<=たなか".to_owned(), "鈴木<=すずき".to_owned()],
+        ));
+    }
+
+    #[test]
+    fn latin_name_detection_skips_ordinary_words() {
+        let names = |text| {
+            latin_name_occurrences(text)
+                .into_iter()
+                .map(|(_, name)| name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names("Today I'm OK. A plan for Tanaka"), ["Tanaka"]);
+        assert_eq!(
+            names("use iPhone, NASA and C++ with Node.js"),
+            ["iPhone", "NASA", "Node.js"]
+        );
+        assert_eq!(
+            names("see https://Example.test/GitHub and `GitHub` then Zoom"),
+            ["Zoom"]
+        );
+        assert_eq!(names("（Tanaka said）"), Vec::<String>::new());
     }
 
     #[test]
