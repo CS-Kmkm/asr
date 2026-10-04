@@ -1930,8 +1930,35 @@ mod tests {
 
     #[test]
     fn retry_dictate_label_tracks_correction_even_when_text_is_unchanged() {
-        assert_eq!(retry_dictate_history_mode(Some("local")), "ai_corrected");
-        assert_eq!(retry_dictate_history_mode(None), "faithful");
+        assert_eq!(
+            retry_dictate_history_mode(Some("local"), false),
+            "ai_corrected"
+        );
+        assert_eq!(retry_dictate_history_mode(None, false), "faithful");
+        assert_eq!(retry_dictate_history_mode(None, true), "faithful_fallback");
+    }
+
+    #[test]
+    fn retry_keeps_the_transcript_when_correction_fails_or_is_rejected() {
+        assert!(matches!(
+            classify_retry_correction(Ok("corrected".into())),
+            RetryCorrection::Corrected(text) if text == "corrected"
+        ));
+        assert!(matches!(
+            classify_retry_correction(Err(correction::CorrectionError::Cancelled)),
+            RetryCorrection::Cancelled
+        ));
+        for error in [
+            correction::CorrectionError::ProtectedContentChanged,
+            correction::CorrectionError::OutputLimit,
+            correction::CorrectionError::MissingApiKey("OPENAI_API_KEY".into()),
+            correction::CorrectionError::InvalidResponse("empty".into()),
+        ] {
+            assert!(matches!(
+                classify_retry_correction(Err(error)),
+                RetryCorrection::Fallback(_)
+            ));
+        }
     }
 
     #[test]
@@ -3081,6 +3108,7 @@ pub(crate) async fn retry_history_item(
         }
         let mut output = transcript.text.clone();
         let mut llm_provider = None;
+        let mut correction_failed = false;
         if source.mode == "translate" {
             let target = source
                 .target_language
@@ -3146,7 +3174,8 @@ pub(crate) async fn retry_history_item(
             let hints = storage
                 .dictionary_correction_hints(&transcript.text, retry_context.as_ref())
                 .unwrap_or_default();
-            output = correction::correct_transcript(
+            let correction_started = Instant::now();
+            let result = correction::correct_transcript(
                 &settings,
                 &transcript.text,
                 &hints,
@@ -3156,9 +3185,31 @@ pub(crate) async fn retry_history_item(
                 cancel.clone(),
                 |_| {},
             )
-            .await
-            .map_err(command_error)?;
-            llm_provider = Some(settings.correction_provider.as_str());
+            .await;
+            match classify_retry_correction(result) {
+                RetryCorrection::Corrected(corrected) => {
+                    output = corrected;
+                    llm_provider = Some(settings.correction_provider.as_str());
+                }
+                RetryCorrection::Cancelled => return Err("history retry was cancelled".into()),
+                RetryCorrection::Fallback(error) => {
+                    // Like a new recording, a failed correction keeps the new
+                    // transcript instead of failing the whole Retry.
+                    correction_failed = true;
+                    emit_status(
+                        &app,
+                        "text_correction_failed",
+                        &correction_failure_status(&error),
+                    );
+                    let _ = storage.add_metric(
+                        "text_correction",
+                        Some(settings.correction_provider.as_str()),
+                        Some(correction_started.elapsed().as_millis() as i64),
+                        false,
+                        Some(correction_failure_metric_code(&error)),
+                    );
+                }
+            }
         }
         if services.lifecycle.is_cancelled(operation_id) {
             return Err("history retry was cancelled".into());
@@ -3181,7 +3232,7 @@ pub(crate) async fn retry_history_item(
                         action_kind: source.action_kind.as_deref(),
                         search_site: source.search_site.as_deref(),
                         mode: if mode == PipelineMode::Dictate {
-                            retry_dictate_history_mode(llm_provider)
+                            retry_dictate_history_mode(llm_provider, correction_failed)
                         } else {
                             &source.mode
                         },
@@ -3257,11 +3308,32 @@ fn history_pipeline_mode(mode: &str) -> Result<PipelineMode, String> {
     }
 }
 
-fn retry_dictate_history_mode(llm_provider: Option<&str>) -> &'static str {
+fn retry_dictate_history_mode(llm_provider: Option<&str>, correction_failed: bool) -> &'static str {
     if llm_provider.is_some() {
         "ai_corrected"
+    } else if correction_failed {
+        "faithful_fallback"
     } else {
         "faithful"
+    }
+}
+
+/// How a Retry continues after its AI correction finishes.
+#[derive(Debug)]
+enum RetryCorrection {
+    Corrected(String),
+    /// The correction failed or was rejected; the new transcript is kept.
+    Fallback(correction::CorrectionError),
+    Cancelled,
+}
+
+fn classify_retry_correction(
+    result: Result<String, correction::CorrectionError>,
+) -> RetryCorrection {
+    match result {
+        Ok(corrected) => RetryCorrection::Corrected(corrected),
+        Err(correction::CorrectionError::Cancelled) => RetryCorrection::Cancelled,
+        Err(error) => RetryCorrection::Fallback(error),
     }
 }
 
