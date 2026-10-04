@@ -106,80 +106,182 @@ impl SearchSite {
 
     /// Derive the query from the user's spoken instruction. The planner's
     /// output is intentionally absent from this function's inputs.
+    ///
+    /// Command words, the site name and connectors are removed only at the
+    /// edges of the instruction, so the same words inside a query survive
+    /// (for example 検索エンジン最適化, "tools for kids" or "Google Pixel").
     pub fn derive_search_query(self, spoken: &str) -> String {
-        let mut query = spoken.trim().to_owned();
-        let site_aliases: &[&str] = match self {
+        let aliases: &[&str] = match self {
             Self::Google => &["google", "グーグル"],
             Self::YouTube => &["youtube", "ユーチューブ"],
             Self::AmazonJapan => &["amazon", "アマゾン"],
             Self::GitHub => &["github", "ギットハブ"],
         };
-        for alias in site_aliases {
-            query = if alias.is_ascii() {
-                replace_ascii_word_case_insensitive(&query, alias, " ")
-            } else {
-                query.replace(alias, " ")
-            };
+        let mut query = trim_query_edges(spoken);
+
+        // Japanese commands end the instruction: 「…を検索して」, optionally
+        // preceded by the site: 「…をユーチューブで検索して」.
+        if let Some(rest) = strip_suffix_any(query, JA_SEARCH_COMMANDS) {
+            query = trim_query_edges(rest);
+            query = strip_suffix_any(query, &["を", "で"]).unwrap_or(query);
+            if let Some(rest) = strip_alias_suffix(query, aliases) {
+                query = strip_suffix_any(rest, &["を", "で", "の"]).unwrap_or(rest);
+            }
+            query = trim_query_edges(query);
         }
 
-        // Fixed command phrases only; words that may be part of a query are
-        // not interpreted as arbitrary stop words.
-        let ja_phrases = [
-            "で検索してください",
-            "で検索して",
-            "で検索",
-            "を検索してください",
-            "を検索して",
-            "を検索",
-            "検索してください",
-            "検索して",
-            "検索する",
-            "検索",
-        ];
-        for phrase in ja_phrases {
-            query = query.replace(phrase, " ");
+        // Commands begin the instruction: "please search Google for …" or
+        // 「グーグルで 検索 …」. After "search for" the query itself follows, so
+        // a site name there belongs to the query ("search for Google Pixel").
+        while let Some(rest) = strip_ascii_prefix_any(query, &["please", "can you", "could you"]) {
+            query = rest;
         }
-        // Whole words only, so a query such as "research" or "Pathfinder"
-        // keeps its text.
-        for phrase in ["search for", "look up", "find", "search"] {
-            query = replace_ascii_word_case_insensitive(&query, phrase, " ");
+        let mut command = strip_command_prefix(&mut query);
+        let mut site = false;
+        if command != Some(true) {
+            if let Some(rest) = strip_site_prefix(query, aliases) {
+                query = rest;
+                site = true;
+            }
         }
-        for phrase in [" on ", " using ", " please ", " for "] {
-            query = replace_ascii_phrase_case_insensitive(&query, phrase, " ");
+        if command.is_none() {
+            command = strip_command_prefix(&mut query);
         }
-        query = query.trim().trim_start_matches('で').trim().to_owned();
-        query.split_whitespace().collect::<Vec<_>>().join(" ")
+        // One connector may follow the command or site ("… Google for X"), but
+        // never a second one: "search for for loops" keeps "for loops".
+        if (site || command.is_some()) && command != Some(true) {
+            query = strip_ascii_prefix_any(query, &["for"]).unwrap_or(query);
+        }
+        if let Some(rest) = strip_prefix_any(query, &["検索して", "検索"]) {
+            if rest.starts_with(is_query_separator) {
+                query = trim_query_start(rest);
+            }
+        }
+
+        // A trailing English site phrase: "… on YouTube please".
+        query = strip_ascii_suffix_any(query, &["please"]).unwrap_or(query);
+        if let Some(rest) = strip_alias_suffix(query, aliases) {
+            if let Some(rest) =
+                strip_ascii_suffix_any(rest, &["on", "in", "using", "with", "via", "at"])
+            {
+                query = rest;
+            }
+        }
+        query = strip_ascii_suffix_any(query, &["please"]).unwrap_or(query);
+        trim_query_edges(query)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
-fn replace_ascii_word_case_insensitive(input: &str, needle: &str, replacement: &str) -> String {
-    let lower = input.to_ascii_lowercase();
-    let mut result = String::with_capacity(input.len());
-    let mut start = 0;
-    for (index, _) in lower.match_indices(needle) {
-        let end = index + needle.len();
-        let before_ok = index == 0 || !lower.as_bytes()[index - 1].is_ascii_alphanumeric();
-        let after_ok = end == lower.len() || !lower.as_bytes()[end].is_ascii_alphanumeric();
-        if before_ok && after_ok && index >= start {
-            result.push_str(&input[start..index]);
-            result.push_str(replacement);
-            start = end;
-        }
-    }
-    result.push_str(&input[start..]);
-    result
+const JA_SEARCH_COMMANDS: &[&str] = &[
+    "で検索してください",
+    "で検索して",
+    "で検索する",
+    "で検索",
+    "を検索してください",
+    "を検索して",
+    "を検索する",
+    "を検索",
+    "検索してください",
+    "検索して",
+    "検索する",
+    "検索",
+];
+
+const EN_SEARCH_COMMANDS: &[&str] = &["search for", "search", "look up", "look for", "find"];
+
+fn is_query_separator(character: char) -> bool {
+    character.is_whitespace() || ",、。.!！?？:：".contains(character)
 }
 
-fn replace_ascii_phrase_case_insensitive(input: &str, phrase: &str, replacement: &str) -> String {
-    let mut result = input.to_owned();
-    loop {
-        let lower = result.to_ascii_lowercase();
-        let Some(index) = lower.find(phrase) else {
-            break;
-        };
-        result.replace_range(index..index + phrase.len(), replacement);
+fn trim_query_start(text: &str) -> &str {
+    text.trim_start_matches(is_query_separator)
+}
+
+fn trim_query_edges(text: &str) -> &str {
+    trim_query_start(text).trim_end_matches(is_query_separator)
+}
+
+fn strip_prefix_any<'a>(text: &'a str, prefixes: &[&str]) -> Option<&'a str> {
+    prefixes.iter().find_map(|prefix| text.strip_prefix(prefix))
+}
+
+fn strip_suffix_any<'a>(text: &'a str, suffixes: &[&str]) -> Option<&'a str> {
+    suffixes.iter().find_map(|suffix| text.strip_suffix(suffix))
+}
+
+/// Strips a leading ASCII phrase, case-insensitively and as whole words.
+fn strip_ascii_prefix_any<'a>(text: &'a str, phrases: &[&str]) -> Option<&'a str> {
+    phrases.iter().find_map(|phrase| {
+        let head = text.get(..phrase.len())?;
+        let boundary = !text[phrase.len()..]
+            .chars()
+            .next()
+            .is_some_and(|next| next.is_ascii_alphanumeric());
+        (head.eq_ignore_ascii_case(phrase) && boundary)
+            .then(|| trim_query_start(&text[phrase.len()..]))
+    })
+}
+
+/// Strips a trailing ASCII phrase, case-insensitively and as whole words.
+fn strip_ascii_suffix_any<'a>(text: &'a str, phrases: &[&str]) -> Option<&'a str> {
+    phrases.iter().find_map(|phrase| {
+        let start = text.len().checked_sub(phrase.len())?;
+        let tail = text.get(start..)?;
+        let boundary = !text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|previous| previous.is_ascii_alphanumeric());
+        (tail.eq_ignore_ascii_case(phrase) && boundary)
+            .then(|| text[..start].trim_end_matches(is_query_separator))
+    })
+}
+
+fn strip_alias_suffix<'a>(text: &'a str, aliases: &[&str]) -> Option<&'a str> {
+    aliases.iter().find_map(|alias| {
+        if alias.is_ascii() {
+            strip_ascii_suffix_any(text, &[alias])
+        } else {
+            text.strip_suffix(alias)
+        }
+    })
+}
+
+/// Strips a leading search command and reports whether it ended in "for".
+fn strip_command_prefix<'a>(query: &mut &'a str) -> Option<bool> {
+    let text: &'a str = query;
+    let rest = strip_ascii_prefix_any(text, EN_SEARCH_COMMANDS)?;
+    let consumed = &text[..text.len() - rest.len()];
+    let ends_with_for = consumed.trim_end().to_ascii_lowercase().ends_with(" for");
+    *query = rest;
+    Some(ends_with_for)
+}
+
+/// A leading site phrase: "Google", "on YouTube", 「グーグルで」, 「Googleで」.
+/// A site name directly followed by more text (「グーグルマップ」) is kept.
+fn strip_site_prefix<'a>(text: &'a str, aliases: &[&str]) -> Option<&'a str> {
+    let without_connector =
+        strip_ascii_prefix_any(text, &["on", "in", "using", "with", "via"]).unwrap_or(text);
+    let rest = aliases.iter().find_map(|alias| {
+        if alias.is_ascii() {
+            let head = without_connector.get(..alias.len())?;
+            let rest = &without_connector[alias.len()..];
+            (head.eq_ignore_ascii_case(alias)
+                && !rest
+                    .chars()
+                    .next()
+                    .is_some_and(|next| next.is_ascii_alphanumeric()))
+            .then_some(rest)
+        } else {
+            without_connector.strip_prefix(alias)
+        }
+    })?;
+    if let Some(after) = strip_prefix_any(rest, &["で", "の"]) {
+        return Some(trim_query_start(after));
     }
-    result
+    (rest.is_empty() || rest.starts_with(is_query_separator)).then(|| trim_query_start(rest))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -548,9 +650,10 @@ mod tests {
             SearchSite::YouTube.derive_search_query("ユーチューブで猫動画を検索して"),
             "猫動画"
         );
+        // Connectors inside the query are part of it.
         assert_eq!(
             SearchSite::GitHub.derive_search_query("find GitHub projects for rust"),
-            "projects rust"
+            "projects for rust"
         );
         assert_eq!(
             SearchSite::AmazonJapan.derive_search_query("アマゾンでコーヒー豆を検索"),
@@ -572,6 +675,79 @@ mod tests {
             SearchSite::GitHub.derive_search_query("search GitHub for lookup tables"),
             "lookup tables"
         );
+    }
+
+    #[test]
+    fn search_command_words_are_stripped_only_at_the_instruction_edges() {
+        let cases = [
+            (
+                SearchSite::Google,
+                "グーグルで検索エンジン最適化を検索",
+                "検索エンジン最適化",
+            ),
+            (
+                SearchSite::Google,
+                "検索エンジン最適化をグーグルで検索して",
+                "検索エンジン最適化",
+            ),
+            (SearchSite::Google, "Googleで猫を検索", "猫"),
+            (SearchSite::Google, "猫をGoogleで検索してください。", "猫"),
+            (SearchSite::Google, "グーグルで検索 猫", "猫"),
+            (
+                SearchSite::Google,
+                "グーグルマップの使い方を検索",
+                "グーグルマップの使い方",
+            ),
+            (
+                SearchSite::Google,
+                "Search Google for tools for kids",
+                "tools for kids",
+            ),
+            (
+                SearchSite::Google,
+                "Search Google for books on history",
+                "books on history",
+            ),
+            (
+                SearchSite::Google,
+                "Search Google for Google Pixel",
+                "Google Pixel",
+            ),
+            (
+                SearchSite::Google,
+                "search for Google Pixel",
+                "Google Pixel",
+            ),
+            (SearchSite::Google, "Search for for loops", "for loops"),
+            (
+                SearchSite::Google,
+                "Search Google for for loops",
+                "for loops",
+            ),
+            (
+                SearchSite::YouTube,
+                "Please search for cats on YouTube please.",
+                "cats",
+            ),
+            (
+                SearchSite::YouTube,
+                "YouTube search lo-fi music",
+                "lo-fi music",
+            ),
+            (
+                SearchSite::AmazonJapan,
+                "look up USB-C cables on Amazon",
+                "USB-C cables",
+            ),
+            (
+                SearchSite::GitHub,
+                "find the search engine repo on GitHub",
+                "the search engine repo",
+            ),
+        ];
+        for (site, spoken, expected) in cases {
+            assert_eq!(site.derive_search_query(spoken), expected, "{spoken}");
+        }
     }
 
     #[test]
