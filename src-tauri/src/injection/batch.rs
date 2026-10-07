@@ -1034,10 +1034,15 @@ mod tests {
         fn quiet_input_rules_out_composition(&self, _: &TargetWindow) -> bool {
             self.native_edit.get()
         }
-        fn paste(&self, _: &TargetWindow, policy: SafetyPolicy) -> Result<bool, InjectionError> {
+        fn paste(
+            &self,
+            target: &TargetWindow,
+            policy: SafetyPolicy,
+        ) -> Result<bool, InjectionError> {
             self.calls.borrow_mut().push("paste");
             self.policies.borrow_mut().push(policy);
-            if !policy.permits_ime(self.ime.get()) {
+            // Mirrors the platform paste boundary.
+            if !policy.permits_ime(self.ime.get()) || !policy.permits_selection(self, target) {
                 return Ok(false);
             }
             if !self.paste_accepted.get() {
@@ -2716,6 +2721,63 @@ mod tests {
             );
             assert_eq!(backend.content(), expected);
         }
+    }
+
+    #[test]
+    fn native_edit_final_paste_follows_the_after_input_rule() {
+        // Untouched since recording started: the unknown IME state is accepted.
+        let backend = native_edit_backend(None);
+        assert_eq!(
+            final_paste(&backend, FinalGuard::Untouched),
+            InsertResult::ClipboardPaste
+        );
+        assert_eq!(backend.content(), "prefix new suffix");
+        // After input a composition may be open, and a native Edit cannot
+        // report one, so the result stays on the clipboard.
+        let backend = native_edit_backend(None);
+        assert_eq!(
+            final_paste(&backend, FinalGuard::AfterInput),
+            InsertResult::ClipboardOnly
+        );
+        assert_eq!(pastes(&backend), 0);
+        let monitor = monitor();
+        assert_eq!(
+            diagnose(
+                &backend,
+                &target(),
+                &monitor,
+                monitor.checkpoint(),
+                false,
+                FinalGuard::AfterInput
+            ),
+            InsertionDetail::ImeUnknown
+        );
+    }
+
+    #[test]
+    fn native_edit_replacement_is_never_confirmed_by_a_loose_occurrence() {
+        let backend = native_edit_backend(None);
+        *backend.text.borrow_mut() = selected_state();
+        let before = backend.text.borrow().clone();
+        // The readback shows the new text at the caret but not the exact
+        // replaced document, which only an additive paste may accept.
+        *backend.readback_after_paste.borrow_mut() = Some(proxy_text("fix edited", " suf"));
+        let monitor = monitor();
+        let checkpoint = monitor.checkpoint().unwrap();
+        assert_eq!(
+            replace_selection(
+                &backend,
+                InjectionOptions::default(),
+                &target(),
+                &before,
+                "edited",
+                &monitor,
+                checkpoint,
+            )
+            .unwrap(),
+            InsertResult::PasteUnverified
+        );
+        assert!(!backend.calls.borrow().contains(&"restore"));
     }
 
     #[test]
