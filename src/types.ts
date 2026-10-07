@@ -47,6 +47,7 @@ export interface Settings {
   deleteAudioAfterProcessing: boolean;
   autoStart: boolean;
   clipboardRestore: boolean;
+  liveTargetInsertion: boolean;
   noiseSuppression: NoiseSuppression;
   inputGainPercent: number;
   automaticGain: boolean;
@@ -133,6 +134,8 @@ export interface HistoryItem {
   createdAt: string;
   hasAudio: boolean;
   retryOfId: number | null;
+  insertionResult: string | null;
+  insertionDetail: string | null;
 }
 
 export interface HistoryAudioPayload {

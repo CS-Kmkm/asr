@@ -60,6 +60,8 @@ import { PrivacyPage } from "./pages/PrivacyPage";
 import { DiagnosticsPage } from "./pages/DiagnosticsPage";
 import {
   I18nProvider,
+  insertionDetailLabels,
+  insertionOutcomeNotices,
   translate,
   translateAppMessage,
   useI18n,
@@ -117,6 +119,15 @@ interface VoiceModeEvent {
   targetLanguage: string | null;
 }
 
+// Fixed outcome and reason codes for a non-confirmed insertion.
+interface InsertionNoticeEvent {
+  outcome: string;
+  detail: string | null;
+}
+
+// Matches the backend timer that hides the overlay window.
+const INSERTION_NOTICE_MS = 5_000;
+
 const translationLanguageKeys: Record<string, MessageKey> = {
   en: "English",
   ja: "Japanese",
@@ -150,7 +161,6 @@ const WARNING_STATUS_KINDS = new Set([
   "history_metric_save_failed",
   "hotkey_unavailable",
   "metric_save_failed",
-  "paste_unverified",
   "streaming_insertion_unavailable",
   "text_correction_failed",
   "voice_translation_failed",
@@ -234,9 +244,16 @@ function RecordingOverlay() {
     mode: "dictate",
     targetLanguage: null,
   });
+  const [notice, setNotice] = useState<InsertionNoticeEvent | null>(null);
+  const noticeTimer = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     const listeners = Promise.all([
+      listen<InsertionNoticeEvent>("insertion-notice", ({ payload }) => {
+        window.clearTimeout(noticeTimer.current);
+        setNotice(payload);
+        noticeTimer.current = window.setTimeout(() => setNotice(null), INSERTION_NOTICE_MS);
+      }),
       listen<AudioLevel>("audio-level", ({ payload }) => {
         const rms = Number.isFinite(payload.rms) ? payload.rms : 0;
         const peak = Number.isFinite(payload.peak) ? payload.peak : 0;
@@ -252,6 +269,8 @@ function RecordingOverlay() {
         if (recordingStarted) {
           setWaveform(Array(OVERLAY_WAVE_BAR_COUNT).fill(0));
           setPreview(null);
+          window.clearTimeout(noticeTimer.current);
+          setNotice(null);
         } else if (
           payload.phase === "processing" &&
           (payload.message?.startsWith("Stopping") || payload.message?.startsWith("Transcribing"))
@@ -272,9 +291,27 @@ function RecordingOverlay() {
     ]);
 
     return () => {
+      window.clearTimeout(noticeTimer.current);
       void listeners.then((unlisten) => unlisten.forEach((fn) => fn()));
     };
   }, []);
+
+  if (phase !== "recording" && phase !== "processing" && phase !== "injecting" && notice) {
+    const failed = notice.outcome === "insertion_failed";
+    // The paste was sent; only its confirmation is unavailable in this field.
+    const sent = notice.outcome === "paste_unverified";
+    const outcomeKey = insertionOutcomeNotices[notice.outcome];
+    const detailKey = notice.detail ? insertionDetailLabels[notice.detail] : undefined;
+    return (
+      <div className={`recording-overlay notice${failed ? " failed" : sent ? " sent" : ""}`} role="status" aria-live="polite">
+        <span className="notice-mark" aria-hidden="true" />
+        <div className="processing-copy">
+          <span className="recording-overlay-label">{outcomeKey ? t(outcomeKey) : notice.outcome}</span>
+          {notice.detail && <span className="notice-detail">{detailKey ? t(detailKey) : notice.detail}</span>}
+        </div>
+      </div>
+    );
+  }
 
   if (phase === "recording") {
     return (
@@ -304,7 +341,7 @@ function RecordingOverlay() {
           <button
             className="translation-target-button"
             type="button"
-            title={t("Cycle target language; this recording will use clipboard fallback.")}
+            title={t("Cycle the target language for this recording.")}
             onClick={() => void cycleVoiceTranslationTarget().catch(() => undefined)}
           >
             {t(translationLanguageKeys[voiceMode.targetLanguage] ?? "Language")} ↻

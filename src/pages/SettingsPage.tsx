@@ -379,6 +379,8 @@ export function SettingsPage({
           control={<Toggle checked={settings.autoStart} onChange={(value) => onSave({ autoStart: value })} />} />
         <SettingRow title={t("Restore clipboard")} detail={t("Restore previous clipboard contents after successful paste.")}
           control={<Toggle checked={settings.clipboardRestore} onChange={(value) => onSave({ clipboardRestore: value })} />} />
+        <SettingRow title={t("Live text insertion (experimental)")} detail={t("Off by default: Dictate inserts only the final text once. When on, partial text is typed into the target while you speak; some editors and browser fields may keep only the first part.")}
+          control={<Toggle checked={settings.liveTargetInsertion} onChange={(value) => onSave({ liveTargetInsertion: value })} />} />
         <SettingRow title={t("Noise suppression")} detail={t("Reduces steady fan and room noise after recording, without adding work to the live microphone callback.")}
           control={<select value={settings.noiseSuppression} onChange={(event) => onSave({ noiseSuppression: event.target.value as Settings["noiseSuppression"] })}>
             <option value="off">{t("Off")}</option><option value="low">{t("Low")}</option><option value="medium">{t("Medium")}</option><option value="high">{t("High")}</option>

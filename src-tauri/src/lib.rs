@@ -36,7 +36,8 @@ use audio::{
     NoiseSuppressionLevel,
 };
 use injection::{
-    InjectionOptions, InsertResult, SelectedText, SystemTextInjector, TargetWindow, TextInjector,
+    InjectionOptions, InsertResult, InsertionDetail, SelectedText, SystemTextInjector,
+    TargetWindow, TextInjector,
 };
 use input_monitor::InputMonitor;
 use state::{AppState, PipelineLifecycle, PipelineMode, PipelinePhase};

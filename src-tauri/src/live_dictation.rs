@@ -9,6 +9,74 @@ use segmentation::{append_utterance, Decision, Segmentation};
 
 const LIVE_INTERVAL: Duration = Duration::from_millis(150);
 
+/// Default Dictate pastes only the final text once. Live provisional target
+/// insertion is an explicit opt-in because editors whose content cannot be
+/// read back keep the first unverified fragment. Other modes always defer.
+pub(crate) fn defers_target_insertion(mode: PipelineMode, settings: &Settings) -> bool {
+    mode != PipelineMode::Dictate || !settings.live_target_insertion
+}
+
+#[derive(Clone, Copy)]
+struct SettleTiming {
+    quiet: Duration,
+    limit: Duration,
+    poll: Duration,
+}
+
+/// Clicking, scrolling or typing during recording and recognition is normal.
+/// A deferred final paste waits for a short quiet moment instead.
+const SETTLE_TIMING: SettleTiming = SettleTiming {
+    quiet: Duration::from_millis(350),
+    limit: Duration::from_secs(5),
+    poll: Duration::from_millis(50),
+};
+
+/// Returns a checkpoint taken once input has been quiet for `timing.quiet`,
+/// preferring a moment when `ready` also holds. At the limit, a quiet but
+/// unready target still yields a checkpoint so the outcome names the target
+/// as the reason. `None` means input never settled, the monitor stopped, or
+/// the operation was cancelled; the caller keeps its earlier checkpoint.
+async fn settled_checkpoint(
+    monitor: &InputMonitor,
+    cancel: &watch::Receiver<bool>,
+    timing: SettleTiming,
+    ready: impl Fn() -> bool,
+) -> Option<u64> {
+    let started = Instant::now();
+    let mut last = monitor.checkpoint()?;
+    let mut quiet_since = Instant::now();
+    loop {
+        if *cancel.borrow() {
+            return None;
+        }
+        let current = monitor.checkpoint()?;
+        if current != last || monitor.shortcut_pending() {
+            last = current;
+            quiet_since = Instant::now();
+        }
+        if quiet_since.elapsed() >= timing.quiet && ready() {
+            // Input during the readiness check would make this checkpoint stale.
+            let after = monitor.checkpoint()?;
+            if after == current {
+                return Some(current);
+            }
+            last = after;
+            quiet_since = Instant::now();
+        }
+        if started.elapsed() >= timing.limit {
+            return (quiet_since.elapsed() >= timing.quiet).then_some(last);
+        }
+        tokio::time::sleep(timing.poll).await;
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Finalization {
+    InsertOnce,
+    FinishSession,
+    CopyOnly,
+}
+
 pub(crate) struct LiveTask {
     stop: watch::Sender<bool>,
     task: tauri::async_runtime::JoinHandle<LiveDraft>,
@@ -31,6 +99,13 @@ pub(crate) struct LiveDraft {
     target: TargetWindow,
     session: Option<ProvisionalInsertion>,
     checkpoint: Option<u64>,
+    /// The element focused when recording started, if UI Automation could
+    /// identify it. `None` falls back to the window-level target guard.
+    focus_identity: Option<Vec<i32>>,
+    /// Input arrived after recording started and the checkpoint was renewed.
+    /// Only then does the final paste require an empty selection and an
+    /// explicitly inactive IME; without input the recording-start state holds.
+    after_input: bool,
     attempted: bool,
     defer_insertion: bool,
     pub(crate) pasted: bool,
@@ -42,6 +117,15 @@ impl LiveDraft {
             && self
                 .checkpoint
                 .is_some_and(|checkpoint| self.monitor.unchanged_since(checkpoint))
+    }
+
+    /// The field focused at recording start is focused again. In single-window
+    /// apps a click can move focus to another field (another chat, a terminal)
+    /// without changing the window, so the window guard alone cannot tell.
+    fn focus_unchanged(&self) -> bool {
+        self.focus_identity.as_ref().is_none_or(|identity| {
+            self.injector.focus_identity(&self.target).as_ref() == Some(identity)
+        })
     }
 
     pub(crate) fn new(
@@ -57,14 +141,18 @@ impl LiveDraft {
             .start_for_recording(active_hotkey, mode_shortcuts, from_shortcut)
             .then(|| monitor.checkpoint())
             .flatten();
+        let injector = SystemTextInjector::new(InjectionOptions {
+            restore_clipboard: settings.clipboard_restore,
+        });
+        let focus_identity = injector.focus_identity(&target);
         Self {
-            injector: SystemTextInjector::new(InjectionOptions {
-                restore_clipboard: settings.clipboard_restore,
-            }),
+            injector,
             monitor,
             target,
             session: None,
             checkpoint,
+            focus_identity,
+            after_input: false,
             attempted: false,
             defer_insertion,
             pasted: false,
@@ -100,6 +188,11 @@ impl LiveDraft {
             }
             self.pasted |= self.session.as_ref().is_some_and(|s| s.paste_was_queued());
             if !self.pasted {
+                // Live text requires a readable range; a final additive paste
+                // is still allowed if no input was queued and guards hold.
+                self.session.take();
+            }
+            if !self.pasted {
                 return Err(injection::InjectionError::BackendFailure(
                     "live insertion could not be verified",
                 ));
@@ -109,30 +202,107 @@ impl LiveDraft {
         Ok(())
     }
 
-    pub(crate) fn finish(&mut self, text: &str) -> Result<InsertResult, injection::InjectionError> {
-        if self.defer_insertion && self.session.is_none() && !self.attempted {
-            self.attempted = true;
-            if self.can_insert_final(text) {
-                self.session = self.injector.begin_live_provisional(
+    /// Input during recording and recognition does not block a deferred final
+    /// paste: once input is quiet and the target is ready, the checkpoint is
+    /// renewed, so only input during the paste itself stops it. Live sessions
+    /// keep the recording-start checkpoint their replacement ranges rely on.
+    pub(crate) async fn settle_before_final(&mut self, cancel: &watch::Receiver<bool>) {
+        if !self.defer_insertion || self.pasted || self.session.is_some() {
+            return;
+        }
+        let ready =
+            |draft: &Self| draft.injector.target_ready(&draft.target) && draft.focus_unchanged();
+        if self
+            .checkpoint
+            .is_some_and(|checkpoint| self.monitor.unchanged_since(checkpoint))
+            && ready(self)
+        {
+            return;
+        }
+        let draft = &*self;
+        let settled =
+            settled_checkpoint(&draft.monitor, cancel, SETTLE_TIMING, || ready(draft)).await;
+        if let Some(checkpoint) = settled {
+            self.renew_checkpoint(checkpoint);
+        }
+    }
+
+    fn renew_checkpoint(&mut self, checkpoint: u64) {
+        // A changed input sequence means the user acted after recording began.
+        self.after_input = self.checkpoint != Some(checkpoint);
+        self.checkpoint = Some(checkpoint);
+    }
+
+    /// A live session finishes its own range. Without one, the final text is
+    /// pasted at most once, never after a live paste was already queued, and
+    /// only into the field that was focused when recording started.
+    fn finalization(&self, text: &str) -> Finalization {
+        if self.session.is_some() {
+            Finalization::FinishSession
+        } else if !self.pasted && self.can_insert_final(text) && self.focus_unchanged() {
+            Finalization::InsertOnce
+        } else {
+            Finalization::CopyOnly
+        }
+    }
+
+    pub(crate) fn finish(
+        &mut self,
+        text: &str,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<InsertResult, injection::InjectionError> {
+        match self.finalization(text) {
+            Finalization::InsertOnce => {
+                self.attempted = true;
+                let result = self.injector.insert_final(
                     text,
                     &self.target,
                     &self.monitor,
                     self.checkpoint.expect("checkpoint was verified"),
+                    cancel,
+                    self.after_input,
                 )?;
-                self.pasted |= self
-                    .session
-                    .as_ref()
-                    .is_some_and(|session| session.paste_was_queued());
+                self.pasted |= result != InsertResult::ClipboardOnly;
+                Ok(result)
+            }
+            Finalization::FinishSession => {
+                // On cancel, dropping the draft removes its unedited range.
+                if *cancel.borrow() {
+                    return Err(injection::InjectionError::Cancelled);
+                }
+                let session = self.session.as_mut().expect("session was checked");
+                self.injector
+                    .finish_provisional(session, text, &self.monitor)
+            }
+            Finalization::CopyOnly => {
+                // A cancelled monitor also fails `can_insert_final`; that is a
+                // cancellation, not a reason to overwrite the clipboard.
+                if *cancel.borrow() {
+                    return Err(injection::InjectionError::Cancelled);
+                }
+                self.injector
+                    .copy_to_clipboard(text)
+                    .map(|()| InsertResult::ClipboardOnly)
             }
         }
-        if let Some(session) = self.session.as_mut() {
-            self.injector
-                .finish_provisional(session, text, &self.monitor)
-        } else {
-            self.injector
-                .copy_to_clipboard(text)
-                .map(|()| InsertResult::ClipboardOnly)
+    }
+
+    /// Reason for a non-confirmed outcome. Call before dropping the draft,
+    /// which stops the input monitor.
+    pub(crate) fn diagnose(&self, result: InsertResult) -> Option<InsertionDetail> {
+        // A paste that was never sent because focus moved to another field.
+        if result == InsertResult::ClipboardOnly && !self.focus_unchanged() {
+            return Some(InsertionDetail::TargetChanged);
         }
+        (result != InsertResult::ClipboardPaste).then(|| {
+            self.injector.diagnose_insertion(
+                &self.target,
+                &self.monitor,
+                self.checkpoint,
+                result == InsertResult::PasteUnverified,
+                self.after_input,
+            )
+        })
     }
 }
 
@@ -309,10 +479,185 @@ mod tests {
             },
             session: None,
             checkpoint: Some(0),
+            focus_identity: None,
+            after_input: false,
             attempted: false,
             defer_insertion: true,
             pasted: false,
         }
+    }
+
+    #[test]
+    fn dictate_defers_target_input_unless_live_insertion_is_enabled() {
+        let mut settings = Settings::default();
+        assert!(defers_target_insertion(PipelineMode::Dictate, &settings));
+        assert!(defers_target_insertion(PipelineMode::Translate, &settings));
+        settings.live_target_insertion = true;
+        assert!(!defers_target_insertion(PipelineMode::Dictate, &settings));
+        for mode in [
+            PipelineMode::Translate,
+            PipelineMode::Edit,
+            PipelineMode::Ask,
+        ] {
+            assert!(defers_target_insertion(mode, &settings));
+        }
+    }
+
+    // Windows timers can round short sleeps up to ~16 ms; the quiet window
+    // stays several input periods long so these tests are not timing-flaky.
+    const FAST: SettleTiming = SettleTiming {
+        quiet: Duration::from_millis(80),
+        limit: Duration::from_millis(300),
+        poll: Duration::from_millis(5),
+    };
+
+    fn available_monitor() -> Arc<InputMonitor> {
+        let monitor = Arc::new(InputMonitor::default());
+        monitor.test_set_available(true);
+        monitor
+    }
+
+    #[tokio::test]
+    async fn clicks_during_recording_settle_to_a_fresh_checkpoint() {
+        let mut draft = deferred_test_draft();
+        draft.monitor.test_record_input();
+        assert!(!draft.can_insert_final("final"));
+        let (_cancel, cancelled) = watch::channel(false);
+        let checkpoint = settled_checkpoint(&draft.monitor, &cancelled, FAST, || true)
+            .await
+            .unwrap();
+        draft.checkpoint = Some(checkpoint);
+        assert!(draft.can_insert_final("final"));
+        // Input during the paste itself still stops it.
+        draft.monitor.test_record_input();
+        assert!(!draft.can_insert_final("final"));
+    }
+
+    #[tokio::test]
+    async fn continuous_input_never_settles() {
+        let monitor = available_monitor();
+        let busy = Arc::clone(&monitor);
+        let done = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&done);
+        // Always runnable, so it records input between any two polls on this
+        // single-threaded runtime, independent of timer resolution or stalls.
+        let typing = tokio::spawn(async move {
+            while !stop.load(Ordering::Acquire) {
+                busy.test_record_input();
+                tokio::task::yield_now().await;
+            }
+        });
+        let (_cancel, cancelled) = watch::channel(false);
+        let result = settled_checkpoint(&monitor, &cancelled, FAST, || true).await;
+        done.store(true, Ordering::Release);
+        typing.await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn settling_leaves_live_sessions_and_queued_pastes_alone() {
+        let (_cancel, cancelled) = watch::channel(false);
+        for case in ["live", "pasted"] {
+            let mut draft = deferred_test_draft();
+            draft.monitor.test_record_input();
+            match case {
+                "live" => draft.defer_insertion = false,
+                "pasted" => draft.pasted = true,
+                _ => unreachable!(),
+            }
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                draft.settle_before_final(&cancelled),
+            )
+            .await
+            .unwrap();
+            // The recording-start checkpoint is kept, so input still blocks.
+            assert_eq!(draft.checkpoint, Some(0), "{case}");
+            assert!(!draft.can_insert_final("final"), "{case}");
+        }
+    }
+
+    #[test]
+    fn only_a_changed_input_sequence_makes_the_final_paste_strict() {
+        let mut draft = deferred_test_draft();
+        // Waited for focus or IME without any input: recording-start rules.
+        draft.renew_checkpoint(0);
+        assert!(!draft.after_input);
+        // Clicked or scrolled while waiting: strict selection and IME rules.
+        draft.renew_checkpoint(3);
+        assert!(draft.after_input);
+        assert_eq!(draft.checkpoint, Some(3));
+    }
+
+    #[test]
+    fn a_different_focused_field_is_never_pasted_into() {
+        let mut draft = deferred_test_draft();
+        assert_eq!(draft.finalization("final"), Finalization::InsertOnce);
+        // The test target belongs to no process, so the element focused now
+        // can never match the identity recorded at recording start.
+        draft.focus_identity = Some(vec![42, 7]);
+        assert!(!draft.focus_unchanged());
+        assert_eq!(draft.finalization("final"), Finalization::CopyOnly);
+        assert_eq!(
+            draft.diagnose(InsertResult::ClipboardOnly),
+            Some(InsertionDetail::TargetChanged)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quiet_but_unready_target_yields_a_checkpoint_at_the_limit() {
+        let monitor = available_monitor();
+        monitor.test_record_input();
+        let (_cancel, cancelled) = watch::channel(false);
+        let started = Instant::now();
+        let checkpoint = settled_checkpoint(&monitor, &cancelled, FAST, || false).await;
+        assert_eq!(checkpoint, monitor.checkpoint());
+        assert!(started.elapsed() >= FAST.limit);
+    }
+
+    #[tokio::test]
+    async fn cancellation_or_a_stopped_monitor_ends_the_wait_without_a_checkpoint() {
+        let monitor = available_monitor();
+        let (cancel, cancelled) = watch::channel(false);
+        cancel.send_replace(true);
+        assert_eq!(
+            settled_checkpoint(&monitor, &cancelled, FAST, || true).await,
+            None
+        );
+        let (_cancel, cancelled) = watch::channel(false);
+        monitor.test_set_available(false);
+        assert_eq!(
+            settled_checkpoint(&monitor, &cancelled, FAST, || true).await,
+            None
+        );
+    }
+
+    #[test]
+    fn final_text_is_pasted_at_most_once_and_never_after_a_queued_live_paste() {
+        let mut draft = deferred_test_draft();
+        assert_eq!(draft.finalization("final"), Finalization::InsertOnce);
+        assert_eq!(draft.finalization(""), Finalization::CopyOnly);
+        // A queued live paste (its session already taken or finished) must
+        // never be followed by a second additive paste of the final text.
+        draft.pasted = true;
+        assert_eq!(draft.finalization("final"), Finalization::CopyOnly);
+        let draft = deferred_test_draft();
+        draft.monitor.test_record_input();
+        assert_eq!(draft.finalization("final"), Finalization::CopyOnly);
+    }
+
+    #[test]
+    fn cancelled_finalization_neither_inserts_nor_copies() {
+        let mut draft = deferred_test_draft();
+        let (cancel, cancelled) = watch::channel(false);
+        draft.monitor.observe_cancellation(Some(cancelled.clone()));
+        cancel.send_replace(true);
+        assert_eq!(draft.finalization("final"), Finalization::CopyOnly);
+        assert_eq!(
+            draft.finish("final", &cancelled),
+            Err(injection::InjectionError::Cancelled)
+        );
+        assert!(!draft.pasted);
     }
 
     #[test]

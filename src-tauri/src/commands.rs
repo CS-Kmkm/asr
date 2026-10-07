@@ -75,6 +75,8 @@ fn cancellation_copy(mode: PipelineMode) -> (&'static str, &'static str) {
 const EDIT_CLIPBOARD_UNAVAILABLE: &str =
     "The original selection was not changed, and the clipboard is unavailable; the edit is available in this app.";
 
+const INSERTION_FAILED: &str = "Insertion failed; the result is available in this app.";
+
 /// A replacement error happens before any paste, so the original selection is
 /// unchanged and the clipboard is the fallback. `None` means the edit reached
 /// neither the target nor the clipboard.
@@ -100,13 +102,14 @@ fn persist_edit_completion(
     // The target may already have accepted a paste. Persistence is best effort
     // so a database failure cannot turn that completed edit into command failure.
     let history_status = save_history(storage, item, audio_path);
+    let insertion_failed = item.insertion_result == Some("insertion_failed");
     let metric_failed = storage
         .add_metric(
             "speak_to_edit",
             Some(provider),
             Some(elapsed_ms),
-            true,
-            None,
+            !insertion_failed,
+            insertion_failed.then_some("insertion_failed"),
         )
         .is_err();
     (history_status, metric_failed)
@@ -561,7 +564,7 @@ async fn start_recording_mode(
             active_hotkey,
             mode_shortcuts,
             from_shortcut,
-            mode == PipelineMode::Translate || mode == PipelineMode::Ask,
+            live_dictation::defers_target_insertion(mode, &settings),
         )
     });
     let cancel = services.lifecycle.cancellation(operation_id)?;
@@ -898,12 +901,17 @@ pub(crate) async fn stop_recording(
             || session.injector.copy_to_clipboard(&edited),
         );
         recording_overlay::set_phase(&app, &AppPhase::Completed);
-        let Some(insertion) = insertion else {
-            // Neither the target nor the clipboard received the edit. Keep it
-            // recoverable in this app and end the operation visibly.
-            state.publish_result(edited.clone());
-            emit_state(&app, &state, AppPhase::Error, EDIT_CLIPBOARD_UNAVAILABLE);
-            return Err(EDIT_CLIPBOARD_UNAVAILABLE.into());
+        let (insertion_label, completion) = match insertion {
+            Some(InsertResult::ClipboardPaste) => ("clipboard_paste", "Selected text updated."),
+            Some(InsertResult::ClipboardOnly) => (
+                "clipboard_only",
+                "Automatic replacement was skipped; the edit remains on the clipboard.",
+            ),
+            Some(InsertResult::PasteUnverified) => (
+                "paste_unverified",
+                "The edit paste could not be confirmed; the result remains on the clipboard.",
+            ),
+            None => ("insertion_failed", EDIT_CLIPBOARD_UNAVAILABLE),
         };
         let latency_ms = started.elapsed().as_millis() as u64;
         let (history_save_status, metric_failed) = persist_edit_completion(
@@ -923,25 +931,39 @@ pub(crate) async fn stop_recording(
                 duration_ms: Some(duration_ms as i64),
                 latency_ms: Some(latency_ms as i64),
                 retry_of_id: None,
+                insertion_result: Some(insertion_label),
+                insertion_detail: insertion
+                    .is_none()
+                    .then_some(InsertionDetail::ClipboardUnavailable.code()),
             },
             Some(&artifact.path),
             settings.correction_provider.as_str(),
             edit_started.elapsed().as_millis() as i64,
         );
-        let (insertion_label, completion) = match insertion {
-            InsertResult::ClipboardPaste => ("clipboard_paste", "Selected text updated."),
-            InsertResult::ClipboardOnly => (
-                "clipboard_only",
-                "Automatic replacement was skipped; the edit remains on the clipboard.",
-            ),
-            InsertResult::PasteUnverified => (
-                "paste_unverified",
-                "The edit paste could not be confirmed; the result remains on the clipboard.",
-            ),
+        let Some(insertion) = insertion else {
+            // Persist before returning: neither the target nor the clipboard
+            // received the edit, and closing the app must not lose the result.
+            state.publish_result(edited.clone());
+            emit_state(&app, &state, AppPhase::Error, EDIT_CLIPBOARD_UNAVAILABLE);
+            if let Some((kind, message)) =
+                completion_persistence_warning(history_save_status, metric_failed)
+            {
+                emit_status(&app, kind, message);
+            }
+            recording_overlay::show_insertion_notice(
+                &app,
+                insertion_label,
+                Some(InsertionDetail::ClipboardUnavailable.code()),
+            );
+            report_temp_cleanup(&app, &mut artifact_cleanup);
+            return Err(EDIT_CLIPBOARD_UNAVAILABLE.into());
         };
         let snapshot = state.complete(edited.clone(), completion.into());
         let _ = app.emit("app-state", snapshot);
         emit_status(&app, insertion_label, completion);
+        if insertion != InsertResult::ClipboardPaste {
+            recording_overlay::show_insertion_notice(&app, insertion_label, None);
+        }
         let warning = if history_save_status == HistorySaveStatus::AudioUnavailable {
             completion_persistence_warning(history_save_status, metric_failed)
         } else {
@@ -1099,12 +1121,14 @@ pub(crate) async fn stop_recording(
             .dictionary_correction_hints(&transcript.text, app_context.as_ref())
             .unwrap_or_default();
         emit_correction_preview(&app, &transcript.text, "draft");
-        emit_state(
-            &app,
-            &state,
-            AppPhase::Injecting,
-            "Inserting the provisional transcript into the captured target.",
-        );
+        if streamed_into_target {
+            emit_state(
+                &app,
+                &state,
+                AppPhase::Injecting,
+                "Inserting the provisional transcript into the captured target.",
+            );
+        }
         emit_state(
             &app,
             &state,
@@ -1186,7 +1210,15 @@ pub(crate) async fn stop_recording(
             .copy_to_clipboard(&final_text)
             .map(|()| InsertResult::ClipboardOnly)
     } else {
-        draft.finish(&final_text)
+        let cancel = services.lifecycle.cancellation(operation_id)?;
+        draft.settle_before_final(&cancel).await;
+        draft.finish(&final_text, &cancel)
+    };
+    // Diagnose before the draft stops its input monitor. Fixed codes only.
+    let insertion_detail = match &insertion_result {
+        Ok(_) if translation_failed => Some("translation_failed"),
+        Ok(result) => draft.diagnose(*result).map(InsertionDetail::code),
+        Err(error) => InsertionDetail::from_error(error).map(InsertionDetail::code),
     };
     // Insertion has returned; helper shutdown and persistence are not insertion.
     // This only hides the overlay. The result below still determines success.
@@ -1194,25 +1226,19 @@ pub(crate) async fn stop_recording(
     // The helper observes input only while a provisional replacement session
     // can still mutate the target. Stop it before persisting the result.
     drop(draft);
-    let insertion = insertion_result.map_err(|error| {
-        emit_state(
-            &app,
-            &state,
-            AppPhase::Error,
-            "Insertion was blocked for safety.",
-        );
-        command_error(error)
-    })?;
+    if insertion_result == Err(injection::InjectionError::Cancelled) {
+        emit_state(&app, &state, AppPhase::Idle, cancel_message);
+        return Err(cancel_error.into());
+    }
     let latency_ms = started.elapsed().as_millis() as u64;
-    let insertion_label = if streamed_into_target && insertion == InsertResult::ClipboardPaste {
-        "provisional_replace"
-    } else {
-        match insertion {
-            InsertResult::ClipboardPaste => "clipboard_paste",
-            InsertResult::ClipboardOnly => "clipboard_only",
-            InsertResult::PasteUnverified => "paste_unverified",
-        }
+    let insertion_label = match insertion_result {
+        Err(_) => "insertion_failed",
+        Ok(InsertResult::ClipboardPaste) if streamed_into_target => "provisional_replace",
+        Ok(InsertResult::ClipboardPaste) => "clipboard_paste",
+        Ok(InsertResult::ClipboardOnly) => "clipboard_only",
+        Ok(InsertResult::PasteUnverified) => "paste_unverified",
     };
+    let inserted = insertion_result == Ok(InsertResult::ClipboardPaste);
     let history_save_status = save_history(
         &storage,
         &NewHistoryItem {
@@ -1238,6 +1264,8 @@ pub(crate) async fn stop_recording(
             duration_ms: Some(duration_ms as i64),
             latency_ms: Some(latency_ms as i64),
             retry_of_id: None,
+            insertion_result: Some(insertion_label),
+            insertion_detail,
         },
         Some(&artifact.path),
     );
@@ -1247,27 +1275,62 @@ pub(crate) async fn stop_recording(
         let _ =
             storage.add_dictionary_candidate_from_correction(&transcript.text, &final_text, None);
     }
+    let mode_metric = if mode == PipelineMode::Translate {
+        "voice_translate"
+    } else {
+        "dictation"
+    };
     let metric_result = storage.add_metric(
-        if mode == PipelineMode::Translate {
-            "voice_translate"
-        } else {
-            "dictation"
-        },
+        mode_metric,
         Some(&transcript.model),
         Some(latency_ms as i64),
         !translation_failed,
         translation_failed.then_some("translation_failed"),
     );
+    // The pipeline metric above records recognition; this one records whether
+    // the text reached the target, as `outcome` or `outcome:reason` codes.
+    let insertion_code = insertion_detail.map_or_else(
+        || insertion_label.to_owned(),
+        |detail| format!("{insertion_label}:{detail}"),
+    );
+    let insertion_metric = storage.add_metric(
+        "insertion",
+        Some(mode_metric),
+        Some(latency_ms as i64),
+        inserted,
+        (!inserted).then_some(insertion_code.as_str()),
+    );
+    let metric_failed = metric_result.is_err() || insertion_metric.is_err();
+    let insertion = match insertion_result {
+        Ok(insertion) => insertion,
+        Err(error) => {
+            // The clipboard is not overwritten after an insertion error (it
+            // may hold data that could not be preserved); keep the text here.
+            let _ = app.emit("app-state", state.publish_result(final_text.clone()));
+            emit_state(&app, &state, AppPhase::Error, INSERTION_FAILED);
+            if let Some((kind, message)) =
+                completion_persistence_warning(history_save_status, metric_failed)
+            {
+                emit_status(&app, kind, message);
+            }
+            recording_overlay::show_insertion_notice(&app, insertion_label, insertion_detail);
+            report_temp_cleanup(&app, &mut artifact_cleanup);
+            return Err(command_error(error));
+        }
+    };
     let completion = if translation_failed {
         "Translation failed; the raw transcript remains on the clipboard."
     } else if mode == PipelineMode::Translate && insertion == InsertResult::PasteUnverified {
-        "Translation paste could not be confirmed; the result remains available in this app."
+        "Translation pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard)."
     } else if mode == PipelineMode::Translate && insertion == InsertResult::ClipboardOnly {
         "The target changed; the translation remains on the clipboard."
     } else if mode == PipelineMode::Translate {
         "Voice translation inserted."
+    } else if insertion == InsertResult::PasteUnverified && streamed_into_target {
+        // The clipboard may still hold the first live fragment, not the result.
+        "The live draft could not be confirmed, so it was not replaced; the final result is available in this app."
     } else if insertion == InsertResult::PasteUnverified {
-        "Paste completion could not be confirmed. Check the input target before pasting again; the completed result is available in this app."
+        "Pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard)."
     } else if insertion == InsertResult::ClipboardOnly && streamed_into_target {
         "The provisional text could not be safely replaced; the final result remains on the clipboard."
     } else if insertion == InsertResult::ClipboardOnly {
@@ -1283,9 +1346,18 @@ pub(crate) async fn stop_recording(
     let _ = app.emit("app-state", snapshot);
     emit_status(&app, insertion_label, completion);
     if let Some((kind, message)) =
-        completion_persistence_warning(history_save_status, metric_result.is_err())
+        completion_persistence_warning(history_save_status, metric_failed)
     {
         emit_status(&app, kind, message);
+    }
+    if !inserted {
+        // With opt-in live insertion the raw draft may already be in the field.
+        let notice = match insertion {
+            InsertResult::ClipboardOnly if streamed_into_target => "draft_kept",
+            InsertResult::PasteUnverified if streamed_into_target => "draft_unverified",
+            _ => insertion_label,
+        };
+        recording_overlay::show_insertion_notice(&app, notice, insertion_detail);
     }
     report_temp_cleanup(&app, &mut artifact_cleanup);
     Ok(RecordingResult {
@@ -1417,6 +1489,8 @@ async fn finish_ask(
                 duration_ms: Some(duration_ms as i64),
                 latency_ms: Some(latency_ms as i64),
                 retry_of_id: None,
+                insertion_result: None,
+                insertion_detail: None,
             },
             audio_path,
         );
@@ -1567,6 +1641,8 @@ async fn finish_ask(
             duration_ms: Some(duration_ms as i64),
             latency_ms: Some(latency_ms as i64),
             retry_of_id: None,
+            insertion_result: None,
+            insertion_detail: None,
         },
         audio_path,
     );
@@ -1954,6 +2030,8 @@ mod tests {
             created_at: String::new(),
             has_audio: true,
             retry_of_id: None,
+            insertion_result: None,
+            insertion_detail: None,
         };
         let profile = |formality: &str| types::StyleProfile {
             formality: formality.into(),
@@ -2031,6 +2109,8 @@ mod tests {
                 duration_ms: None,
                 latency_ms: None,
                 retry_of_id: None,
+                insertion_result: None,
+                insertion_detail: None,
             },
             None,
         );
@@ -2055,6 +2135,8 @@ mod tests {
             duration_ms: None,
             latency_ms: None,
             retry_of_id: None,
+            insertion_result: None,
+            insertion_detail: None,
         }
     }
 
@@ -2191,6 +2273,8 @@ mod tests {
             duration_ms: Some(100),
             latency_ms: Some(200),
             retry_of_id: None,
+            insertion_result: None,
+            insertion_detail: None,
         };
         assert_eq!(
             persist_edit_completion(&storage, &item, None, "local", 200),
@@ -2218,6 +2302,56 @@ mod tests {
             edit_insertion_outcome(Err::<InsertResult, _>("replace"), || Err("clipboard")),
             None
         );
+    }
+
+    #[test]
+    fn edit_insertion_failure_retains_generated_text_and_failure_metric() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit-insertion-failure.sqlite");
+        let storage = Storage::open(&path).unwrap();
+        let item = NewHistoryItem {
+            transcript_text: "shorten this",
+            processed_text: Some("short"),
+            source_text: Some("long selection"),
+            instruction_text: Some("shorten this"),
+            action_kind: None,
+            search_site: None,
+            mode: "edit",
+            asr_provider: "test",
+            llm_provider: Some("local"),
+            target_language: None,
+            app_category: None,
+            duration_ms: Some(100),
+            latency_ms: Some(200),
+            retry_of_id: None,
+            insertion_result: Some("insertion_failed"),
+            insertion_detail: Some("clipboard_unavailable"),
+        };
+        assert_eq!(
+            persist_edit_completion(&storage, &item, None, "local", 200),
+            (HistorySaveStatus::Complete, false)
+        );
+        let rows = storage.list_history(types::HistoryFilter::All, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].processed_text.as_deref(), Some("short"));
+        assert_eq!(rows[0].source_text.as_deref(), Some("long selection"));
+        assert_eq!(
+            rows[0].insertion_result.as_deref(),
+            Some("insertion_failed")
+        );
+        assert_eq!(
+            rows[0].insertion_detail.as_deref(),
+            Some("clipboard_unavailable")
+        );
+        let metric: (bool, String) = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT success, error_code FROM metrics WHERE event_type = 'speak_to_edit'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(metric, (false, "insertion_failed".into()));
     }
 
     #[test]
@@ -3192,6 +3326,8 @@ pub(crate) async fn retry_history_item(
                         duration_ms: source.duration_ms,
                         latency_ms: Some(latency_ms),
                         retry_of_id: Some(id),
+                        insertion_result: None,
+                        insertion_detail: None,
                     },
                     Some(&retry_path),
                 ))

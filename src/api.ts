@@ -36,6 +36,7 @@ export const defaultSettings: Settings = {
   deleteAudioAfterProcessing: true,
   autoStart: false,
   clipboardRestore: true,
+  liveTargetInsertion: false,
   noiseSuppression: "medium",
   inputGainPercent: 100,
   automaticGain: true,

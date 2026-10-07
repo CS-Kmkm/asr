@@ -34,6 +34,61 @@ pub enum InsertResult {
     PasteUnverified,
 }
 
+/// Fixed reason for an insertion that was not confirmed. The code is stored
+/// in History and shown to the user; it never contains target or text content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertionDetail {
+    InputMonitorUnavailable,
+    UserActivity,
+    TargetChanged,
+    TargetProtected,
+    ImeActive,
+    ImeUnknown,
+    SelectionActive,
+    SelectionUnknown,
+    TargetUnreadable,
+    NotConfirmed,
+    ClipboardUnavailable,
+    BackendFailure,
+}
+
+impl InsertionDetail {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::InputMonitorUnavailable => "input_monitor_unavailable",
+            Self::UserActivity => "user_activity",
+            Self::TargetChanged => "target_changed",
+            Self::TargetProtected => "target_protected",
+            Self::ImeActive => "ime_active",
+            Self::ImeUnknown => "ime_unknown",
+            Self::SelectionActive => "selection_active",
+            Self::SelectionUnknown => "selection_unknown",
+            Self::TargetUnreadable => "target_unreadable",
+            Self::NotConfirmed => "not_confirmed",
+            Self::ClipboardUnavailable => "clipboard_unavailable",
+            Self::BackendFailure => "backend_failure",
+        }
+    }
+
+    /// Cancellation is not an insertion outcome and has no detail.
+    pub(crate) fn from_error(error: &InjectionError) -> Option<Self> {
+        match error {
+            InjectionError::Cancelled => None,
+            InjectionError::NoForegroundWindow | InjectionError::TargetChanged => {
+                Some(Self::TargetChanged)
+            }
+            InjectionError::SecureTarget | InjectionError::PrivilegeMismatch => {
+                Some(Self::TargetProtected)
+            }
+            InjectionError::ImeCompositionActive => Some(Self::ImeActive),
+            InjectionError::ClipboardUnavailable => Some(Self::ClipboardUnavailable),
+            InjectionError::UnsupportedPlatform | InjectionError::BackendFailure(_) => {
+                Some(Self::BackendFailure)
+            }
+        }
+    }
+}
+
 pub(crate) struct ProvisionalInsertion {
     target: TargetWindow,
     displayed: String,
@@ -234,6 +289,53 @@ impl SystemTextInjector {
             .map(|_| ())
     }
 
+    pub(crate) fn insert_final(
+        &self,
+        text: &str,
+        target: &TargetWindow,
+        monitor: &InputMonitor,
+        checkpoint: u64,
+        cancel: &watch::Receiver<bool>,
+        after_input: bool,
+    ) -> Result<InsertResult, InjectionError> {
+        batch::insert_final(
+            &self.backend,
+            self.options,
+            text,
+            target,
+            monitor,
+            checkpoint,
+            cancel,
+            final_guard(after_input),
+        )
+    }
+
+    pub(crate) fn target_ready(&self, target: &TargetWindow) -> bool {
+        batch::ready(&self.backend, target)
+    }
+
+    pub(crate) fn focus_identity(&self, target: &TargetWindow) -> Option<Vec<i32>> {
+        self.backend.focus_identity(target).ok()
+    }
+
+    pub(crate) fn diagnose_insertion(
+        &self,
+        target: &TargetWindow,
+        monitor: &InputMonitor,
+        checkpoint: Option<u64>,
+        after_paste: bool,
+        after_input: bool,
+    ) -> InsertionDetail {
+        batch::diagnose(
+            &self.backend,
+            target,
+            monitor,
+            checkpoint,
+            after_paste,
+            final_guard(after_input),
+        )
+    }
+
     pub(crate) fn insert_monitored(
         &self,
         text: &str,
@@ -282,6 +384,16 @@ impl TargetText {
         self.before == other.before && self.selected == other.selected && self.after == other.after
     }
 
+    /// Occurrences of `text` anywhere in the readable content.
+    fn occurrences(&self, text: &str) -> usize {
+        [&self.before, &self.selected, &self.after]
+            .into_iter()
+            .map(String::as_str)
+            .collect::<String>()
+            .matches(text)
+            .count()
+    }
+
     fn replaced_with(&self, text: &str) -> Self {
         Self {
             identity: self.identity.clone(),
@@ -311,15 +423,30 @@ enum ClipboardExclusion {
     AllowHistory,
 }
 
+/// A deferred final paste is strict only after input since recording started.
+fn final_guard(after_input: bool) -> batch::FinalGuard {
+    if after_input {
+        batch::FinalGuard::AfterInput
+    } else {
+        batch::FinalGuard::Untouched
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SafetyPolicy {
     Additive,
+    /// Deferred pastes renew their checkpoint and must inspect IME and selection.
+    FinalAdditive,
     Destructive,
 }
 
 impl SafetyPolicy {
     fn permits_ime(self, active: Option<bool>) -> bool {
         active == Some(false) || self == Self::Additive && active.is_none()
+    }
+
+    fn permits_selection<B: Backend>(self, backend: &B, target: &TargetWindow) -> bool {
+        self != Self::FinalAdditive || backend.selection_is_empty(target).is_ok_and(|empty| empty)
     }
 }
 
@@ -330,6 +457,14 @@ trait Backend {
     fn ime_composition_active(&self, target: &TargetWindow)
         -> Result<Option<bool>, InjectionError>;
     fn target_text(&self, target: &TargetWindow) -> Result<TargetText, InjectionError>;
+    /// Inspect the selection independently of reading the full document.
+    fn selection_is_empty(&self, target: &TargetWindow) -> Result<bool, InjectionError> {
+        self.target_text(target)
+            .map(|text| text.selected.is_empty())
+    }
+    /// UI Automation runtime id of the element focused in the target process.
+    /// It identifies the field, never its content.
+    fn focus_identity(&self, target: &TargetWindow) -> Result<Vec<i32>, InjectionError>;
     /// Returns true when selection was requested. The target may apply it later;
     /// callers must confirm the selected text before replacing or deleting it.
     fn select_recent(
@@ -376,6 +511,9 @@ impl Backend for PlatformBackend {
         Err(InjectionError::UnsupportedPlatform)
     }
     fn target_text(&self, _: &TargetWindow) -> Result<TargetText, InjectionError> {
+        Err(InjectionError::UnsupportedPlatform)
+    }
+    fn focus_identity(&self, _: &TargetWindow) -> Result<Vec<i32>, InjectionError> {
         Err(InjectionError::UnsupportedPlatform)
     }
     fn select_recent(
@@ -652,6 +790,14 @@ mod windows_backend {
             self.validate_target(target)?;
             accessibility::read(target)
         }
+        fn selection_is_empty(&self, target: &TargetWindow) -> Result<bool, InjectionError> {
+            self.validate_target(target)?;
+            accessibility::selection_is_empty(target)
+        }
+        fn focus_identity(&self, target: &TargetWindow) -> Result<Vec<i32>, InjectionError> {
+            self.validate_target(target)?;
+            accessibility::focused_identity(target)
+        }
         fn select_recent(
             &self,
             target: &TargetWindow,
@@ -688,6 +834,9 @@ mod windows_backend {
         ) -> Result<bool, InjectionError> {
             self.validate_target(target)?;
             if !policy.permits_ime(self.ime_composition_active(target)?) || !modifiers_released() {
+                return Ok(false);
+            }
+            if !policy.permits_selection(self, target) {
                 return Ok(false);
             }
             let inputs = [

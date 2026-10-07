@@ -1,5 +1,9 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use serde::Serialize;
 use tauri::{
-    AppHandle, LogicalSize, Manager, PhysicalPosition, WebviewUrl, WebviewWindow,
+    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder,
 };
 
@@ -9,7 +13,14 @@ const WINDOW_LABEL: &str = "recording-overlay";
 const RECORDING_WIDTH: f64 = 172.0;
 const TRANSLATION_WIDTH: f64 = 286.0;
 const RECORDING_HEIGHT: f64 = 48.0;
+const NOTICE_WIDTH: f64 = 380.0;
+const NOTICE_HEIGHT: f64 = 64.0;
+const NOTICE_DURATION: Duration = Duration::from_secs(5);
 const BOTTOM_MARGIN: f64 = 24.0;
+
+/// Advanced by every phase change and notice. A notice timer hides the window
+/// only if nothing replaced its notice, so it never hides a later recording.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn create(app: &AppHandle) -> tauri::Result<()> {
     let window = WebviewWindowBuilder::new(app, WINDOW_LABEL, WebviewUrl::App("index.html".into()))
@@ -35,6 +46,7 @@ pub(crate) fn create(app: &AppHandle) -> tauri::Result<()> {
 }
 
 pub(crate) fn set_phase(app: &AppHandle, phase: &AppPhase) {
+    GENERATION.fetch_add(1, Ordering::AcqRel);
     let Some(window) = app.get_webview_window(WINDOW_LABEL) else {
         return;
     };
@@ -54,6 +66,47 @@ pub(crate) fn set_phase(app: &AppHandle, phase: &AppPhase) {
     } else {
         let _ = window.hide();
     }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InsertionNotice<'a> {
+    outcome: &'a str,
+    detail: Option<&'a str>,
+}
+
+/// Shows a non-confirmed insertion outcome for a few seconds. The overlay is
+/// click-through and never focusable, so the notice cannot take the target's
+/// focus. Payloads are fixed codes; the overlay localizes them.
+pub(crate) fn show_insertion_notice(app: &AppHandle, outcome: &str, detail: Option<&str>) {
+    let Some(window) = app.get_webview_window(WINDOW_LABEL) else {
+        return;
+    };
+    let generation = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    let _ = app.emit_to(
+        WINDOW_LABEL,
+        "insertion-notice",
+        InsertionNotice { outcome, detail },
+    );
+    let _ = window.set_ignore_cursor_events(true);
+    let _ = window.set_size(LogicalSize::new(NOTICE_WIDTH, NOTICE_HEIGHT));
+    let _ = position_on_primary_monitor(&window);
+    let _ = window.show();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(NOTICE_DURATION).await;
+        let handle = app.clone();
+        // Window commands run in order on the main thread. Checking there
+        // means a phase change either precedes this check (no hide) or its
+        // show is queued after this hide.
+        let _ = app.run_on_main_thread(move || {
+            if GENERATION.load(Ordering::Acquire) == generation {
+                if let Some(window) = handle.get_webview_window(WINDOW_LABEL) {
+                    let _ = window.hide();
+                }
+            }
+        });
+    });
 }
 
 pub(crate) fn set_interactive(app: &AppHandle, interactive: bool) {
