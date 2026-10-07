@@ -48,6 +48,10 @@ pub struct Settings {
     pub delete_audio_after_processing: bool,
     pub auto_start: bool,
     pub clipboard_restore: bool,
+    /// Off by default: Dictate pastes only the final text once. On restores
+    /// live provisional insertion and replacement in the captured target.
+    #[serde(default)]
+    pub live_target_insertion: bool,
     #[serde(default = "default_noise_suppression")]
     pub noise_suppression: String,
     #[serde(default = "default_input_gain_percent")]
@@ -280,6 +284,7 @@ impl Default for Settings {
             delete_audio_after_processing: true,
             auto_start: false,
             clipboard_restore: true,
+            live_target_insertion: false,
             noise_suppression: default_noise_suppression(),
             input_gain_percent: default_input_gain_percent(),
             automatic_gain: default_automatic_gain(),
@@ -340,6 +345,12 @@ pub struct HistoryItem {
     pub created_at: String,
     pub has_audio: bool,
     pub retry_of_id: Option<i64>,
+    /// Fixed outcome code such as `clipboard_paste` or `clipboard_only`.
+    #[serde(default)]
+    pub insertion_result: Option<String>,
+    /// Fixed reason code for a non-confirmed outcome, never text content.
+    #[serde(default)]
+    pub insertion_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -402,6 +413,8 @@ pub struct NewHistoryItem<'a> {
     pub duration_ms: Option<i64>,
     pub latency_ms: Option<i64>,
     pub retry_of_id: Option<i64>,
+    pub insertion_result: Option<&'a str>,
+    pub insertion_detail: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -557,6 +570,7 @@ mod tests {
         assert!(settings.correction_auto_format);
         assert!(settings.correction_improve_clarity);
         assert!(settings.custom_models.is_empty());
+        assert!(!settings.live_target_insertion);
     }
 
     #[test]

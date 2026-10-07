@@ -36,6 +36,7 @@ export const defaultSettings: Settings = {
   deleteAudioAfterProcessing: true,
   autoStart: false,
   clipboardRestore: true,
+  liveTargetInsertion: false,
   noiseSuppression: "medium",
   inputGainPercent: 100,
   automaticGain: true,
@@ -96,7 +97,8 @@ export async function startRecording(): Promise<void> {
 
 export async function getStartupHotkeyWarning(): Promise<string[]> {
   if (!inTauri) return [];
-  return invoke("get_startup_hotkey_warning");
+  const warning = await invoke<string | null>("get_startup_hotkey_warning");
+  return warning === null ? [] : [warning];
 }
 
 export async function startVoiceTranslation(): Promise<void> {

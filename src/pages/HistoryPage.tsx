@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Empty } from "../components/ui";
 import type { HistoryAudioPayload, HistoryFilter, HistoryItem, Settings } from "../types";
-import { useI18n } from "../i18n";
+import { insertionDetailLabels, insertionOutcomeLabels, useI18n } from "../i18n";
 
 const filters = [
   { value: "all", label: "All" }, { value: "dictate", label: "Dictate" },
@@ -96,7 +96,8 @@ export function HistoryPage({ settings, history, filter, onSave, onFilter, onCop
             <span className="history-mode">{item.mode in modeLabels
               ? t(modeLabels[item.mode as keyof typeof modeLabels])
               : item.mode}{item.targetLanguage ? ` · ${item.targetLanguage}` : ""}</span>
-            {item.appCategory && <small>{t("App category")}: {item.appCategory}</small>}</div>
+            {item.appCategory && <small>{t("App category")}: {item.appCategory}</small>}
+            {item.insertionResult && <InsertionBadge result={item.insertionResult} detail={item.insertionDetail} />}</div>
           {item.sourceText && <HistoryText text={item.sourceText} label={t("Selected text")} onCopy={onCopyItem} />}
           {item.instructionText && <HistoryText text={item.instructionText} label={t("Spoken instruction")} onCopy={onCopyItem} />}
           {!item.sourceText && !item.instructionText && <HistoryText text={item.transcriptText} onCopy={onCopyItem} />}
@@ -110,6 +111,18 @@ export function HistoryPage({ settings, history, filter, onSave, onFilter, onCop
           </div>
         </article>)}</div>}
   </section>;
+}
+
+function InsertionBadge({ result, detail }: { result: string; detail: string | null }) {
+  const { t } = useI18n();
+  const resultKey = insertionOutcomeLabels[result];
+  const detailKey = detail ? insertionDetailLabels[detail] : undefined;
+  const inserted = result === "clipboard_paste" || result === "provisional_replace";
+  const state = inserted ? "inserted" : result === "paste_unverified" ? "sent" : "not-inserted";
+  const detailText = detail ? (detailKey ? t(detailKey) : detail) : undefined;
+  return <small className={`history-insertion ${state}`} title={detailText}>
+    {resultKey ? t(resultKey) : result}{detailText ? ` · ${detailText}` : ""}
+  </small>;
 }
 
 function HistoryText({ text, corrected = false, label, onCopy }: {

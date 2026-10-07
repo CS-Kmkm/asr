@@ -7,17 +7,37 @@ Python ASR worker (VibeVoice, faster-whisper, or an OpenAI-compatible API).
 
 `Ctrl+Shift+Space` captures the foreground target and starts recording. Press it
 again to stop. The Windows capture backend converts input to a temporary 24 kHz
-mono PCM WAV, sends it to the persistent JSONL worker, and inserts the transcript
-using clipboard paste, Unicode input, or the available UI Automation path. If
-automatic insertion fails after the clipboard is populated, the transcript
-remains on the clipboard.
+mono PCM WAV, and sends it to the persistent JSONL worker. While you speak,
+partial text appears only in the recording overlay. After transcription and any
+AI correction, the final text is pasted once into the captured target with the
+clipboard and Ctrl+V. When the target's text can be read through UI Automation,
+the paste is verified and (with **Restore clipboard** on) the previous
+clipboard is restored; otherwise one
+guarded paste is sent unverified. Clicking, scrolling, or typing while you
+speak or while the text is being recognized does not prevent insertion: before
+pasting, the app waits until input has been quiet for a moment (up to five
+seconds) and the field that was focused when recording started is focused
+again, then pastes at its current caret. In browsers and apps such as VS Code,
+where every field shares one window, the field is identified through UI
+Automation, so a click on another chat, panel, or the terminal never receives
+the text. If you clicked, scrolled, or typed after recording started, the paste
+also requires an empty selection and an IME confirmed to be inactive, so text
+you selected or an unfinished IME conversion is never overwritten; fields that
+cannot report either state get the clipboard instead. Without such input the
+field is as you left it when recording started, so text selected beforehand is
+replaced by the dictation as before. If a guard still fails (input does not
+settle, the original field is not focused again, an IME conversion, or a
+protected field), the text is copied to the clipboard instead. When History is
+on, it stores the outcome of each Dictate, Translate, and Edit insertion, with
+a fixed reason code for Dictate and Translate outcomes that were not confirmed.
+The recording overlay shows non-confirmed outcomes for a few seconds. Typing partial text into the target
+while speaking is an experimental opt-in (**Settings → Live text insertion**).
 
 `Ctrl+Shift+Y` starts the independent voice **Translate** mode. Press it again
 to stop, transcribe, translate into the configured target language, and insert
 only the translated result. Settings stores an ordered target-language list
 and the current target. The recording overlay shows that target and can cycle
-the list; clicking the overlay counts as user activity, so that recording uses
-the clipboard fallback instead of modifying a target after interaction.
+the list for the current recording.
 `Ctrl+Shift+T` remains the separate selected-text translation action.
 If saved hotkeys overlap, for example when an older selected-text translation
 hotkey is `Ctrl+Shift+Y`, the older action keeps the chord: recording, then
@@ -206,17 +226,18 @@ and sets an output-token limit based on the transcript length.
 
 Correction responses are consumed as server-sent events from the OpenAI
 Responses API, Gemini Interactions API, and compatible local Chat Completions
-servers; non-streaming local responses are also accepted. In Dictate mode, as
-soon as ASR finishes, the raw transcript is inserted into the captured target
-as provisional text. The first correction delta replaces that draft and later deltas are appended while
-the API is still generating; the always-on-top status overlay mirrors the same
-progress. A short-lived helper process observes keyboard and pointer activity
-during this replacement session. It reports only activity counters (never key
-values or typed text), ignores this application's tagged input, and never
-suppresses an event. If the user types, clicks, changes focus, starts IME
-composition, or the monitor becomes unavailable, live replacement stops and
-the completed result is left on the clipboard instead of modifying the target
-again.
+servers; non-streaming local responses are also accepted. Correction deltas
+stream into the always-on-top recording overlay, and the corrected text is
+inserted once when correction completes. With the experimental **Live text
+insertion** setting on, the raw transcript is first inserted as provisional
+text and the corrected result replaces it. A short-lived helper process observes
+keyboard and pointer activity from the start of recording until insertion. It
+reports only activity counters (never key values or typed text), ignores this
+application's tagged input, and never suppresses an event. The default final
+paste only waits for that activity to settle. With live text insertion on, any
+typing, click, focus change, or IME composition after recording starts, or an
+unavailable monitor, leaves the result on the clipboard instead of modifying
+the target.
 
 All fixed prompt text and prompt-size limits are centralized in
 `src-tauri/src/correction_prompt.rs` under the `Prompt tuning` block. Edit that
@@ -318,9 +339,10 @@ Full usage and Phase 0 gate criteria are documented in
   History retention remove them.
 - The captured target must still be foreground and non-secure at insertion time.
 - UI Automation security inspection exists and is used to avoid secure targets.
-  Direct UI Automation insertion is available where supported, but some controls
-  may still fall back to clipboard paste, Unicode input, or clipboard-only
-  behavior.
+  Text is entered by clipboard paste only; UI Automation reads the target to
+  verify the paste. Controls that cannot be read back (for example some browser
+  and code-editor fields) receive one unverified paste, and live text insertion
+  in them may keep only the first fragment.
 - Elevated applications, password controls, and secure controls are not forced.
 - Model download progress/resume UI and checksum verification remain future model
   management work; Transformers manages the current cache download.

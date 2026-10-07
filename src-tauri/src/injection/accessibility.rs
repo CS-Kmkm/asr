@@ -147,6 +147,39 @@ pub(super) fn read(target: &TargetWindow) -> Result<TargetText, InjectionError> 
     TextControl::focused(target)?.state()
 }
 
+pub(super) fn selection_is_empty(target: &TargetWindow) -> Result<bool, InjectionError> {
+    let control = TextControl::focused(target)?;
+    let selection = control.selection()?;
+    // Compare endpoints instead of GetText: an empty embedded object can be
+    // selected without returning characters. A final paste must be additive.
+    unsafe {
+        selection.CompareEndpoints(
+            TextPatternRangeEndpoint_Start,
+            &selection,
+            TextPatternRangeEndpoint_End,
+        )
+    }
+    .map(|distance| distance == 0)
+    .map_err(|_| unavailable())
+}
+
+/// Runtime id of the focused element, whether or not it exposes text. Single
+/// window apps (browsers, Electron, WPF) keep one focus window for every
+/// field, so only this id tells their fields apart.
+pub(super) fn focused_identity(target: &TargetWindow) -> Result<Vec<i32>, InjectionError> {
+    // Declared first so COM references below are released before teardown.
+    let _apartment = Apartment(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok());
+    let automation: IUIAutomation =
+        unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
+            .map_err(|_| unavailable())?;
+    let element = unsafe { automation.GetFocusedElement() }.map_err(|_| unavailable())?;
+    if unsafe { element.CurrentProcessId() }.map_err(|_| unavailable())? != target.process_id as i32
+    {
+        return Err(InjectionError::TargetChanged);
+    }
+    runtime_id(&element)
+}
+
 pub(super) fn select_recent(
     target: &TargetWindow,
     expected: &TargetText,

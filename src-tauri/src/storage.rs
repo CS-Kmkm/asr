@@ -313,6 +313,8 @@ impl Storage {
             "instruction_text",
             "action_kind",
             "search_site",
+            "insertion_result",
+            "insertion_detail",
         ] {
             let exists: bool = connection.query_row(
                 "SELECT EXISTS(
@@ -671,9 +673,11 @@ impl Storage {
             "INSERT INTO dictation_history(
                transcript_text, processed_text, source_text, instruction_text, action_kind, search_site, mode,
                asr_provider, llm_provider, target_language, app_category, duration_ms,
-               latency_ms, created_at, audio_filename, retry_of_id
+               latency_ms, created_at, audio_filename, retry_of_id, insertion_result,
+               insertion_detail
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                      CASE WHEN EXISTS (SELECT 1 FROM dictation_history WHERE id = ?16) THEN ?16 ELSE NULL END)",
+                      CASE WHEN EXISTS (SELECT 1 FROM dictation_history WHERE id = ?16) THEN ?16 ELSE NULL END,
+                      ?17, ?18)",
             params![
                 item.transcript_text,
                 item.processed_text,
@@ -691,6 +695,8 @@ impl Storage {
                 Utc::now().to_rfc3339(),
                 audio_filename,
                 item.retry_of_id,
+                item.insertion_result,
+                item.insertion_detail,
             ],
         );
         if let Err(error) = insert {
@@ -726,7 +732,7 @@ impl Storage {
             "SELECT id, transcript_text, processed_text, mode, asr_provider, llm_provider,
                     target_language, app_category, duration_ms, latency_ms, created_at,
                     source_text, instruction_text, action_kind, search_site,
-                    audio_filename IS NOT NULL, retry_of_id
+                    audio_filename IS NOT NULL, retry_of_id, insertion_result, insertion_detail
              FROM dictation_history
              WHERE ?1 = 'all' OR
                (?1 = 'dictate' AND mode IN ('faithful', 'ai_corrected', 'faithful_fallback')) OR
@@ -761,6 +767,8 @@ impl Storage {
                 created_at: row.get(10)?,
                 has_audio: row.get(15)?,
                 retry_of_id: row.get(16)?,
+                insertion_result: row.get(17)?,
+                insertion_detail: row.get(18)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -780,7 +788,7 @@ impl Storage {
                 "SELECT id, transcript_text, processed_text, mode, asr_provider, llm_provider,
                     target_language, app_category, duration_ms, latency_ms, created_at,
                     source_text, instruction_text, action_kind, search_site,
-                    audio_filename IS NOT NULL, retry_of_id
+                    audio_filename IS NOT NULL, retry_of_id, insertion_result, insertion_detail
              FROM dictation_history WHERE id = ?1",
                 [id],
                 |row| {
@@ -802,6 +810,8 @@ impl Storage {
                         search_site: row.get(14)?,
                         has_audio: row.get(15)?,
                         retry_of_id: row.get(16)?,
+                        insertion_result: row.get(17)?,
+                        insertion_detail: row.get(18)?,
                     })
                 },
             )
@@ -2001,6 +2011,8 @@ mod tests {
             duration_ms: Some(1000),
             latency_ms: Some(200),
             retry_of_id: None,
+            insertion_result: None,
+            insertion_detail: None,
         }
     }
 
@@ -2070,6 +2082,8 @@ mod tests {
             "instruction_text",
             "action_kind",
             "search_site",
+            "insertion_result",
+            "insertion_detail",
         ] {
             let exists: bool = storage
                 .connection()
@@ -2101,6 +2115,37 @@ mod tests {
             .remove(0);
         assert_eq!(stored.mode, "translate");
         assert_eq!(stored.target_language.as_deref(), Some("ja"));
+    }
+
+    #[test]
+    fn history_round_trips_insertion_outcome_codes() {
+        let storage = Storage::in_memory().unwrap();
+        storage.add_history(&item()).unwrap();
+        let mut copied = item();
+        copied.insertion_result = Some("clipboard_only");
+        copied.insertion_detail = Some("user_activity");
+        storage.add_history(&copied).unwrap();
+
+        let rows = storage.list_history(HistoryFilter::All, 2).unwrap();
+        let outcomes: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.insertion_result.as_deref(),
+                    row.insertion_detail.as_deref(),
+                )
+            })
+            .collect();
+        assert!(outcomes.contains(&(None, None)));
+        assert!(outcomes.contains(&(Some("clipboard_only"), Some("user_activity"))));
+        let id = rows
+            .iter()
+            .find(|row| row.insertion_result.is_some())
+            .unwrap()
+            .id;
+        let stored = storage.history_item(id).unwrap().unwrap();
+        assert_eq!(stored.insertion_result.as_deref(), Some("clipboard_only"));
+        assert_eq!(stored.insertion_detail.as_deref(), Some("user_activity"));
     }
 
     #[test]
