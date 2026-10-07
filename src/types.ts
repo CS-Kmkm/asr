@@ -151,17 +151,14 @@ export interface ModelStatus {
   detail: string;
 }
 
-// Progress reported while the ASR worker prepares the model: downloading,
-// verifying downloaded files against their checksums, then loading. Byte counts
-// are absent until the download size is known, and for backends that cannot
+// Progress reported while the ASR worker prepares the model. Byte counts are
+// absent until the download size is known, and for backends that cannot
 // measure it.
 export interface ModelProgress {
-  stage: "download" | "verify" | "load";
+  stage: "download" | "load";
   model: string | null;
   completedBytes: number | null;
   totalBytes: number | null;
-  // Bytes kept from an interrupted download that is being resumed.
-  resumedBytes: number | null;
 }
 
 export interface GpuDiagnostics {

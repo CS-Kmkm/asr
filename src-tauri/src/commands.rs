@@ -2049,30 +2049,6 @@ mod tests {
     }
 
     #[test]
-    fn load_stages_announce_download_resume_and_verification() {
-        let progress = |stage: &str, resumed_bytes| asr::LoadProgress {
-            stage: stage.into(),
-            model: Some("repo".into()),
-            completed_bytes: None,
-            total_bytes: None,
-            resumed_bytes,
-        };
-        assert_eq!(
-            load_stage_notice(&progress("download", Some(4096))).map(|(_, message)| message),
-            Some("Resuming the interrupted speech model download.")
-        );
-        assert_eq!(
-            load_stage_notice(&progress("download", None)).map(|(kind, _)| kind),
-            Some("model_downloading")
-        );
-        assert_eq!(
-            load_stage_notice(&progress("verify", None)).map(|(kind, _)| kind),
-            Some("model_verifying")
-        );
-        assert_eq!(load_stage_notice(&progress("load", None)), None);
-    }
-
-    #[test]
     fn edit_failures_name_their_cause() {
         use correction::CorrectionError;
         use reqwest::StatusCode;
@@ -3876,8 +3852,8 @@ pub(crate) async fn ensure_model_loaded(
 
 /// Relay worker load progress to the window until the load finishes.
 ///
-/// The first report of each stage also replaces the loading message, so a model
-/// that is already cached never claims that files are being downloaded.
+/// The first download report also replaces the loading message, so a model that
+/// is already cached never claims that files are being downloaded.
 fn spawn_load_progress_forwarder(
     app: &AppHandle,
     services: &Services,
@@ -3885,15 +3861,17 @@ fn spawn_load_progress_forwarder(
     let mut receiver = services.transcriber.load_progress()?;
     let app = app.clone();
     Some(tauri::async_runtime::spawn(async move {
-        let mut announced_stage = None;
+        let mut download_announced = false;
         loop {
             match receiver.recv().await {
                 Ok(progress) => {
-                    if announced_stage.as_deref() != Some(progress.stage.as_str()) {
-                        if let Some((kind, message)) = load_stage_notice(&progress) {
-                            announced_stage = Some(progress.stage.clone());
-                            emit_status(&app, kind, message);
-                        }
+                    if progress.stage == "download" && !download_announced {
+                        download_announced = true;
+                        emit_status(
+                            &app,
+                            "model_downloading",
+                            "Downloading the speech model files. This runs once; later starts use the local cache.",
+                        );
                     }
                     let _ = app.emit("model-progress", progress);
                 }
@@ -3903,27 +3881,6 @@ fn spawn_load_progress_forwarder(
             }
         }
     }))
-}
-
-/// The notice for the first progress report of a download or verify stage.
-/// Only the first download report carries resumed bytes, so it decides
-/// whether the download is announced as resumed.
-fn load_stage_notice(progress: &asr::LoadProgress) -> Option<(&'static str, &'static str)> {
-    match progress.stage.as_str() {
-        "download" if progress.resumed_bytes.is_some_and(|bytes| bytes > 0) => Some((
-            "model_downloading",
-            "Resuming the interrupted speech model download.",
-        )),
-        "download" => Some((
-            "model_downloading",
-            "Downloading the speech model files. This runs once; later starts use the local cache.",
-        )),
-        "verify" => Some((
-            "model_verifying",
-            "Verifying the downloaded speech model files.",
-        )),
-        _ => None,
-    }
 }
 
 pub(crate) fn probe_gpu_diagnostics() -> GpuDiagnostics {

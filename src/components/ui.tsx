@@ -19,13 +19,9 @@ export function ModelProgressBar({ progress }: { progress: ModelProgress }) {
   const label =
     progress.stage === "load"
       ? t("Loading into memory")
-      : progress.stage === "verify"
-        ? t("Checking file checksums")
-        : ratio !== null && completedBytes !== null && totalBytes !== null
-          ? `${Math.round(ratio * 100)}% (${formatBytes(completedBytes)} / ${formatBytes(totalBytes)})`
-          : progress.resumedBytes
-            ? `${t("Resuming download")} (${formatBytes(progress.resumedBytes)})`
-            : t("Starting download");
+      : ratio !== null && completedBytes !== null && totalBytes !== null
+        ? `${Math.round(ratio * 100)}% (${formatBytes(completedBytes)} / ${formatBytes(totalBytes)})`
+        : t("Starting download");
   return (
     <div
       className="model-progress"

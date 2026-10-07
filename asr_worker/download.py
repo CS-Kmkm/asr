@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
-import re
 import time
-from pathlib import Path
 from typing import Any, Callable
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -16,11 +13,6 @@ FASTER_WHISPER_ALLOW_PATTERNS = [
     "tokenizer.json",
     "vocabulary.*",
 ]
-
-# Files without which a cached faster-whisper snapshot cannot load. huggingface_hub
-# creates the snapshot folder before fetching files, so an interrupted download
-# leaves a folder that looks cached but lacks them.
-FASTER_WHISPER_REQUIRED_FILES = ["config.json", "model.bin"]
 
 # Progress travels over the JSONL protocol, so report often enough for a smooth
 # progress bar without flooding stdout.
@@ -63,137 +55,6 @@ def download_snapshot(
         allow_patterns=allow_patterns,
         tqdm_class=byte_progress_tqdm(progress) if progress is not None else None,
     )
-
-
-_COMMIT_HASH = re.compile(r"^[0-9a-f]{40}$")
-
-
-def _hub_constants() -> Any:
-    from huggingface_hub import constants
-
-    return constants
-
-
-def _repo_cache_folder(repo_id: str) -> Path:
-    return Path(_hub_constants().HF_HUB_CACHE) / ("models--" + repo_id.replace("/", "--"))
-
-
-def _pending_marker(repo_id: str) -> Path:
-    # Kept beside, not inside, the hub cache so cache tools never see it.
-    return (
-        Path(_hub_constants().HF_HOME)
-        / "local-voice-input"
-        / "pending-verification"
-        / repo_id.replace("/", "--")
-    )
-
-
-def partial_download_bytes(repo_id: str) -> int:
-    """Bytes already fetched by an interrupted download that will be resumed.
-
-    huggingface_hub keeps unfinished files as ``blobs/*.incomplete`` and
-    continues them on the next download.
-    """
-    try:
-        blobs = _repo_cache_folder(repo_id) / "blobs"
-        return sum(path.stat().st_size for path in blobs.glob("*.incomplete"))
-    except (ImportError, OSError):
-        return 0
-
-
-def snapshot_has_files(snapshot_path: str, required: list[str]) -> bool:
-    """Whether a cached snapshot holds every required file."""
-    return all((Path(snapshot_path) / name).is_file() for name in required)
-
-
-def snapshot_has_weights(snapshot_path: str) -> bool:
-    """Whether a Transformers snapshot holds its config and every weight shard."""
-    snapshot = Path(snapshot_path)
-    if not (snapshot / "config.json").is_file():
-        return False
-    index = snapshot / "model.safetensors.index.json"
-    if not index.is_file():
-        return (snapshot / "model.safetensors").is_file()
-    try:
-        shards = set(json.loads(index.read_text(encoding="utf-8"))["weight_map"].values())
-    except (OSError, ValueError, KeyError, AttributeError):
-        return False
-    return bool(shards) and all((snapshot / shard).is_file() for shard in shards)
-
-
-def mark_verification_pending(repo_id: str) -> None:
-    """Remember that downloaded files must be verified before they are trusted.
-
-    The mark survives an interrupted download or an unreachable Hub, so the
-    next load verifies the files. Models cached before this mark existed load
-    without network access.
-    """
-    try:
-        marker = _pending_marker(repo_id)
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.touch()
-    except (ImportError, OSError):
-        # Verification still runs right after this download.
-        pass
-
-
-def verification_pending(repo_id: str) -> bool:
-    try:
-        return _pending_marker(repo_id).is_file()
-    except (ImportError, OSError):
-        return False
-
-
-def clear_verification_pending(repo_id: str) -> None:
-    try:
-        _pending_marker(repo_id).unlink(missing_ok=True)
-    except (ImportError, OSError):
-        pass
-
-
-def _mismatched_paths(api: Any, repo_id: str, revision: str) -> list[str]:
-    result = api.verify_repo_checksums(repo_id, revision=revision)
-    return sorted(mismatch["path"] for mismatch in result.mismatches)
-
-
-def verify_snapshot(repo_id: str, snapshot_path: str, api: Any = None) -> bool:
-    """Check downloaded files against the Hub's SHA-256 / git checksums.
-
-    Files that do not match are downloaded again once. Returns whether files
-    were replaced, so a backend that already loaded them can reload.
-    """
-    from .backends import BackendError
-
-    revision = Path(snapshot_path).name
-    if not _COMMIT_HASH.fullmatch(revision):
-        # Not a hub cache snapshot, so there is nothing to compare against.
-        return False
-    try:
-        import huggingface_hub
-
-        api = api if api is not None else huggingface_hub.HfApi()
-        mismatched = _mismatched_paths(api, repo_id, revision)
-        repaired = bool(mismatched)
-        for path in mismatched:
-            huggingface_hub.hf_hub_download(
-                repo_id, path, revision=revision, force_download=True
-            )
-        if repaired:
-            mismatched = _mismatched_paths(api, repo_id, revision)
-    except Exception as exc:
-        raise BackendError(
-            "model_verification_failed",
-            "The downloaded model files could not be verified. "
-            "Check the network connection and load the model again.",
-        ) from exc
-    if mismatched:
-        raise BackendError(
-            "model_checksum_mismatch",
-            "Model files failed checksum verification after downloading them again: "
-            + ", ".join(mismatched),
-        )
-    clear_verification_pending(repo_id)
-    return repaired
 
 
 def byte_progress_tqdm(progress: ProgressCallback) -> type:

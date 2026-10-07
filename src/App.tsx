@@ -147,7 +147,7 @@ interface Notice {
 }
 
 // Notices that only describe model preparation and are cleared once it ends.
-const MODEL_PREPARATION_KINDS = ["model_loading", "model_downloading", "model_verifying"];
+const MODEL_PREPARATION_KINDS = ["model_loading", "model_downloading"];
 
 const WARNING_STATUS_KINDS = new Set([
   "artifact_cleanup_failed",
@@ -516,15 +516,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
           );
         }
       }),
-      listen<ModelProgress>("model-progress", (event) =>
-        // Only the first event of a resumed download names the resumed bytes;
-        // keep showing that it resumed until the download stage ends.
-        setModelProgress((current) =>
-          event.payload.stage === "download" && event.payload.resumedBytes === null && current?.stage === "download"
-            ? { ...event.payload, resumedBytes: current.resumedBytes }
-            : event.payload,
-        ),
-      ),
+      listen<ModelProgress>("model-progress", (event) => setModelProgress(event.payload)),
       listen<GpuDiagnostics>("gpu-diagnostics", (event) => setGpu(event.payload)),
       listen<Settings>("settings-changed", (event) => {
         setSettings(event.payload);
@@ -993,12 +985,8 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             >
               {translateAppMessage(language, shownNotice?.message ?? null) ??
                 (shownProgress?.stage === "download"
-                  ? shownProgress.resumedBytes
-                    ? t("Resuming the interrupted speech model download.")
-                    : t("Downloading the speech model files.")
-                  : shownProgress?.stage === "verify"
-                    ? t("Verifying the downloaded speech model files.")
-                    : t("Loading the speech model."))}
+                  ? t("Downloading the speech model files.")
+                  : t("Loading the speech model."))}
             </button>
             {shownProgress && <ModelProgressBar progress={shownProgress} />}
           </div>
