@@ -158,14 +158,69 @@ class ResolveModelFilesTests(unittest.TestCase):
         backend.progress = events.append
         with patch("asr_worker.backends.faster_whisper_repo_id", return_value="org/repo"), patch(
             "asr_worker.backends.cached_snapshot_path", return_value="/cache/repo"
-        ), patch("asr_worker.backends.download_snapshot") as download:
+        ), patch("asr_worker.backends.download_snapshot") as download, patch(
+            "asr_worker.backends.verification_pending", return_value=False
+        ), patch("asr_worker.backends.partial_download_bytes", return_value=0), patch(
+            "asr_worker.backends.snapshot_has_files", return_value=True
+        ), patch("asr_worker.backends.verify_snapshot") as verify:
             source = backend._resolve_model_files()
 
         self.assertEqual(source, "/cache/repo")
         download.assert_not_called()
+        # A model cached before verification existed loads without network.
+        verify.assert_not_called()
         self.assertEqual(events, [])
 
-    def test_missing_model_is_downloaded_with_progress(self) -> None:
+    def resolve_incomplete(self, *, pending: bool, partial: int, has_files: bool) -> tuple[list[dict], object]:
+        backend = FasterWhisperBackend()
+        events: list[dict] = []
+        backend.progress = events.append
+        with patch("asr_worker.backends.faster_whisper_repo_id", return_value="org/repo"), patch(
+            "asr_worker.backends.cached_snapshot_path", return_value="/cache/repo"
+        ), patch("asr_worker.backends.verification_pending", return_value=pending), patch(
+            "asr_worker.backends.partial_download_bytes", return_value=partial
+        ), patch("asr_worker.backends.snapshot_has_files", return_value=has_files), patch(
+            "asr_worker.backends.mark_verification_pending"
+        ), patch(
+            "asr_worker.backends.download_snapshot", return_value="/cache/repo"
+        ) as download, patch("asr_worker.backends.verify_snapshot", return_value=False) as verify:
+            self.assertEqual(backend._resolve_model_files(), "/cache/repo")
+        download.assert_called_once()
+        verify.assert_called_once_with("org/repo", "/cache/repo")
+        return events, download
+
+    def test_unverified_cached_model_is_completed_and_verified(self) -> None:
+        events, _ = self.resolve_incomplete(pending=True, partial=0, has_files=True)
+        self.assertEqual(
+            events,
+            [{"stage": "download", "model": "org/repo"}, {"stage": "verify", "model": "org/repo"}],
+        )
+
+    def test_interrupted_snapshot_folder_is_not_treated_as_cached(self) -> None:
+        # huggingface_hub creates the snapshot folder before its files, so an
+        # interrupted first download leaves a folder without model.bin.
+        events, _ = self.resolve_incomplete(pending=False, partial=0, has_files=False)
+        self.assertEqual(events[0], {"stage": "download", "model": "org/repo"})
+
+    def test_stale_partial_files_do_not_block_an_offline_complete_model(self) -> None:
+        backend = FasterWhisperBackend()
+        with patch("asr_worker.backends.faster_whisper_repo_id", return_value="org/repo"), patch(
+            "asr_worker.backends.cached_snapshot_path", return_value="/cache/repo"
+        ), patch("asr_worker.backends.verification_pending", return_value=False), patch(
+            "asr_worker.backends.partial_download_bytes", return_value=4096
+        ), patch("asr_worker.backends.snapshot_has_files", return_value=True), patch(
+            "asr_worker.backends.download_snapshot"
+        ) as download:
+            self.assertEqual(backend._resolve_model_files(), "/cache/repo")
+        download.assert_not_called()
+
+    def test_partial_files_resume_even_when_the_snapshot_folder_exists(self) -> None:
+        events, _ = self.resolve_incomplete(pending=True, partial=4096, has_files=False)
+        self.assertEqual(
+            events[0], {"stage": "download", "model": "org/repo", "resumed_bytes": 4096}
+        )
+
+    def test_missing_model_is_downloaded_with_progress_and_verified(self) -> None:
         backend = FasterWhisperBackend()
         events: list[dict] = []
         backend.progress = events.append
@@ -176,10 +231,16 @@ class ResolveModelFilesTests(unittest.TestCase):
 
         with patch("asr_worker.backends.faster_whisper_repo_id", return_value="org/repo"), patch(
             "asr_worker.backends.cached_snapshot_path", return_value=None
-        ), patch("asr_worker.backends.download_snapshot", fake_download):
+        ), patch("asr_worker.backends.download_snapshot", fake_download), patch(
+            "asr_worker.backends.partial_download_bytes", return_value=0
+        ), patch("asr_worker.backends.mark_verification_pending") as mark, patch(
+            "asr_worker.backends.verify_snapshot", return_value=False
+        ) as verify:
             source = backend._resolve_model_files()
 
         self.assertEqual(source, "/cache/repo")
+        mark.assert_called_once_with("org/repo")
+        verify.assert_called_once_with("org/repo", "/cache/repo")
         self.assertEqual(
             events,
             [
@@ -190,7 +251,25 @@ class ResolveModelFilesTests(unittest.TestCase):
                     "completed_bytes": 5,
                     "total_bytes": 10,
                 },
+                {"stage": "verify", "model": "org/repo"},
             ],
+        )
+
+    def test_interrupted_download_reports_resumed_bytes(self) -> None:
+        backend = FasterWhisperBackend()
+        events: list[dict] = []
+        backend.progress = events.append
+        with patch("asr_worker.backends.faster_whisper_repo_id", return_value="org/repo"), patch(
+            "asr_worker.backends.cached_snapshot_path", return_value=None
+        ), patch("asr_worker.backends.download_snapshot", return_value="/cache/repo"), patch(
+            "asr_worker.backends.partial_download_bytes", return_value=1234
+        ), patch("asr_worker.backends.mark_verification_pending"), patch(
+            "asr_worker.backends.verify_snapshot", return_value=False
+        ):
+            backend._resolve_model_files()
+
+        self.assertEqual(
+            events[0], {"stage": "download", "model": "org/repo", "resumed_bytes": 1234}
         )
 
     def test_unresolvable_model_is_left_to_faster_whisper(self) -> None:

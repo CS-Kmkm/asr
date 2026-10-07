@@ -294,8 +294,20 @@ with open("sample.wav", "rb") as audio:
 print(result.text)
 ```
 
-The local server currently provides non-streaming transcription and does not
-provide diarization or token log probabilities.
+With `stream=true` (and the `json` or `text` response format) the server sends
+OpenAI-style server-sent events: one `transcript.text.delta` per decoded
+segment, then `transcript.text.done` with the whole text. faster-whisper
+streams segments as they are decoded; the other backends send their transcript
+as a single delta.
+
+```python
+stream = client.audio.transcriptions.create(model="local-asr", file=audio, stream=True)
+for event in stream:
+    if event.type == "transcript.text.delta":
+        print(event.delta, end="", flush=True)
+```
+
+The local server does not provide diarization or token log probabilities.
 
 ## Checks
 
@@ -339,13 +351,31 @@ Full usage and Phase 0 gate criteria are documented in
   History retention remove them.
 - The captured target must still be foreground and non-secure at insertion time.
 - UI Automation security inspection exists and is used to avoid secure targets.
-  Text is entered by clipboard paste only; UI Automation reads the target to
-  verify the paste. Controls that cannot be read back (for example some browser
-  and code-editor fields) receive one unverified paste, and live text insertion
-  in them may keep only the first fragment.
+  Text is entered by clipboard paste only (Ctrl+V, or window messages for
+  native Win32 Edit controls); UI Automation reads the target to verify the
+  paste. Controls that cannot be read back (for example some browser and
+  code-editor fields) receive one unverified paste, and live text insertion in
+  them may keep only the first fragment.
+- Native Win32 Edit controls (including Windows Forms text boxes) are read,
+  selected and edited with window messages (WM_PASTE/WM_CLEAR, not
+  keystrokes), also when they expose no UI Automation text range. Their IME
+  composition cannot be observed from another process, so their text is
+  inserted, replaced or deleted only while no keyboard or pointer input has
+  occurred since the operation began (recording start for voice modes);
+  otherwise, including after clicks or scrolling during recognition, the result
+  stays on the clipboard. A composition left unconverted before the operation
+  is not touched and is committed at the caret when the user converts it.
 - Elevated applications, password controls, and secure controls are not forced.
-- Model download progress/resume UI and checksum verification remain future model
-  management work; Transformers manages the current cache download.
+- Model downloads use the Hugging Face cache. An interrupted download (a
+  snapshot still missing model files) is continued on the next load, and the
+  progress notice says when it resumes partial files. Newly downloaded
+  files are checked against the Hub's SHA-256/git checksums; a mismatched file
+  is downloaded again once, and a persistent mismatch fails the load. Until a
+  download passes this check it stays pending: a load fails while the Hub
+  cannot be reached and checks again next time. Complete models cached before
+  this check existed load offline without it. faster-whisper reports byte
+  progress; VibeVoice (downloaded by Transformers) is verified after the load
+  that downloaded it, or before loading files left unverified earlier.
 - The default shortcut is registered at startup, and persisted custom shortcuts
   are re-registered on launch. If another app holds a saved hotkey, the app
   names the action that stays unavailable; saving other settings still works,

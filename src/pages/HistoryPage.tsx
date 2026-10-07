@@ -85,7 +85,7 @@ export function HistoryPage({ settings, history, filter, onSave, onFilter, onCop
         <option value="one_week">{t("1 week")}</option><option value="one_month">{t("1 month")}</option>
         <option value="one_year">{t("1 year")}</option><option value="forever">{t("Forever")}</option>
       </select>
-      <button className="danger-button" onClick={() => { if (window.confirm(t("Delete all history?"))) onDeleteAll(); }}>{t("Delete all")}</button>
+      <button className="danger-button" onClick={() => { if (window.confirm(t("Delete all history and suggested spellings?"))) onDeleteAll(); }}>{t("Delete all")}</button>
       {retryActive && <button onClick={onCancelRetry}>{t("Cancel")}</button>}
     </div>
     {audioUrl && <audio className="history-player" src={audioUrl} controls autoPlay onError={onAudioError} />}

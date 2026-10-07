@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -149,6 +150,112 @@ class ApiServerTests(unittest.TestCase):
         self.assertEqual(models.json()["data"][0]["id"], "local-asr")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["task"], "transcribe")
+
+    @staticmethod
+    def stream_events(response: httpx.Response) -> list[dict]:
+        return [
+            json.loads(line[len("data: "):])
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+
+    def test_streaming_sends_one_delta_per_segment_then_done(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from asr_worker.api import create_app
+
+        seen: list[Path] = []
+
+        class SegmentedBackend(MockBackend):
+            def transcribe_segments(self, audio_path, prompt, language=None):
+                seen.append(Path(audio_path))
+                yield {"start": 0.0, "end": 1.0, "speaker": None, "text": " Hello"}
+                yield {"start": 1.0, "end": 2.0, "speaker": None, "text": " world."}
+
+        client = TestClient(create_app(SegmentedBackend(), served_model="local-asr"))
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={"model": "local-asr", "stream": "true"},
+            files={"file": ("sample.wav", b"RIFF-test", "audio/wav")},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers["content-type"].startswith("text/event-stream"))
+        events = self.stream_events(response)
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["transcript.text.delta", "transcript.text.delta", "transcript.text.done"],
+        )
+        self.assertEqual([event["delta"] for event in events[:2]], ["Hello", " world."])
+        self.assertEqual(events[-1]["text"], "Hello world.")
+        # The producer deletes the upload once decoding finishes.
+        for _ in range(100):
+            if not seen[0].exists():
+                break
+            time.sleep(0.01)
+        self.assertFalse(seen[0].exists())
+
+    def test_streaming_failure_after_text_ends_with_an_error_event(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from asr_worker.api import create_app
+
+        class FailsMidway(MockBackend):
+            def transcribe_segments(self, audio_path, prompt, language=None):
+                yield {"start": 0.0, "end": 1.0, "speaker": None, "text": " Hello"}
+                raise BackendError("gpu_oom", "GPU out of memory while operating the ASR model")
+
+        client = TestClient(create_app(FailsMidway(), served_model="local-asr"))
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={"model": "local-asr", "stream": "true"},
+            files={"file": ("sample.wav", b"RIFF-test", "audio/wav")},
+        )
+        # The status was already sent with the first delta.
+        self.assertEqual(response.status_code, 200)
+        events = self.stream_events(response)
+        self.assertEqual([event["type"] for event in events], ["transcript.text.delta", "error"])
+        self.assertEqual(events[1]["error"]["code"], "gpu_oom")
+
+    def test_streaming_whole_transcript_backends_send_a_single_delta(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from asr_worker.api import create_app
+
+        with patch.dict(os.environ, {"ASR_WORKER_MOCK_TEXT": "served locally"}):
+            client = TestClient(create_app(MockBackend(), served_model="local-asr"))
+            response = client.post(
+                "/v1/audio/transcriptions",
+                data={"model": "local-asr", "stream": "true", "response_format": "text"},
+                files={"file": ("sample.wav", b"RIFF-test", "audio/wav")},
+            )
+        events = self.stream_events(response)
+        self.assertEqual(events[0], {"type": "transcript.text.delta", "delta": "served locally", "logprobs": []})
+        self.assertEqual(events[1]["text"], "served locally")
+
+    def test_streaming_rejects_segment_formats_and_reports_early_failures(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from asr_worker.api import create_app
+
+        class FailingBackend(MockBackend):
+            def transcribe_segments(self, audio_path, prompt, language=None):
+                raise BackendError("gpu_oom", "GPU out of memory while operating the ASR model")
+                yield  # pragma: no cover - makes this a generator
+
+        client = TestClient(create_app(FailingBackend(), served_model="local-asr"))
+        unsupported = client.post(
+            "/v1/audio/transcriptions",
+            data={"model": "local-asr", "stream": "true", "response_format": "srt"},
+            files={"file": ("sample.wav", b"RIFF-test", "audio/wav")},
+        )
+        failed = client.post(
+            "/v1/audio/transcriptions",
+            data={"model": "local-asr", "stream": "true"},
+            files={"file": ("sample.wav", b"RIFF-test", "audio/wav")},
+        )
+        self.assertEqual(unsupported.status_code, 400)
+        self.assertEqual(failed.status_code, 500)
+        self.assertEqual(failed.json()["error"]["code"], "gpu_oom")
 
     def test_invalid_and_oversized_requests_use_openai_error_shape(self) -> None:
         from fastapi.testclient import TestClient

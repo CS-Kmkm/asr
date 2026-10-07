@@ -6,14 +6,21 @@ import mimetypes
 import os
 import wave
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 from urllib.parse import urlparse
 
 from .download import (
     FASTER_WHISPER_ALLOW_PATTERNS,
+    FASTER_WHISPER_REQUIRED_FILES,
     ProgressCallback,
     cached_snapshot_path,
     download_snapshot,
+    mark_verification_pending,
+    partial_download_bytes,
+    snapshot_has_files,
+    snapshot_has_weights,
+    verification_pending,
+    verify_snapshot,
 )
 
 MODEL_ID = "microsoft/VibeVoice-ASR-HF"
@@ -57,6 +64,19 @@ class ProgressReporting:
         callback = self.progress
         if callback is not None:
             callback({"stage": stage, **fields})
+
+    def begin_download(self, repo_id: str, resumed: int) -> None:
+        """Mark files for verification and report a new or resumed download."""
+        mark_verification_pending(repo_id)
+        if resumed:
+            self.report_progress("download", model=repo_id, resumed_bytes=resumed)
+        else:
+            self.report_progress("download", model=repo_id)
+
+    def verify_download(self, repo_id: str, snapshot_path: str) -> bool:
+        """Verify downloaded files; returns whether any had to be replaced."""
+        self.report_progress("verify", model=repo_id)
+        return verify_snapshot(repo_id, snapshot_path)
 
 
 def faster_whisper_repo_id(model_id: str) -> str | None:
@@ -257,9 +277,21 @@ class VibeVoiceBackend(ProgressReporting):
             else:
                 kwargs["torch_dtype"] = torch.bfloat16
 
-            self._report_pending_download()
+            downloading = self._report_pending_download()
             self.processor = AutoProcessor.from_pretrained(self.model_id)
             self.model = VibeVoiceAsrForConditionalGeneration.from_pretrained(self.model_id, **kwargs)
+            if downloading:
+                # transformers fetched the files while loading; check them now
+                # and load again if a corrupted file had to be replaced.
+                snapshot = cached_snapshot_path(self.model_id)
+                if snapshot is not None and self.verify_download(self.model_id, snapshot):
+                    self.processor = None
+                    self.model = None
+                    gc.collect()
+                    self.processor = AutoProcessor.from_pretrained(self.model_id)
+                    self.model = VibeVoiceAsrForConditionalGeneration.from_pretrained(
+                        self.model_id, **kwargs
+                    )
             device = str(next(self.model.parameters()).device)
             if not device.startswith("cuda"):
                 self.processor = None
@@ -275,16 +307,30 @@ class VibeVoiceBackend(ProgressReporting):
         except BaseException as exc:
             raise map_backend_exception(exc, "load") from exc
 
-    def _report_pending_download(self) -> None:
-        """Report that model files are still missing before transformers loads.
+    def _report_pending_download(self) -> bool:
+        """Prepare model files before transformers loads them.
 
         transformers downloads inside ``from_pretrained`` without a progress
-        hook, so only the stage is reported for this backend.
+        hook, so only the stage is reported for this backend. Returns whether
+        files will be downloaded and must be verified after loading. Files
+        left unverified by an earlier load are verified here, before use.
         """
         if Path(self.model_id).is_dir():
-            return
-        if cached_snapshot_path(self.model_id) is None:
-            self.report_progress("download", model=self.model_id)
+            return False
+        cached = cached_snapshot_path(self.model_id)
+        # Completeness depends on the files the model needs, not on leftover
+        # partial files, which a changed remote file may never finish.
+        complete = cached is not None and snapshot_has_weights(cached)
+        if complete and not verification_pending(self.model_id):
+            return False
+        if complete:
+            # Every file of an earlier download is present but unverified.
+            # Repair corrupt files before transformers reads them.
+            self.verify_download(self.model_id, cached)
+            return False
+        # Missing or partial files: transformers fetches and resumes them.
+        self.begin_download(self.model_id, partial_download_bytes(self.model_id))
+        return True
 
     def unload(self) -> None:
         self.model = None
@@ -390,14 +436,25 @@ class FasterWhisperBackend(ProgressReporting):
         if repo_id is None:
             return self.model_id
         cached = cached_snapshot_path(repo_id, FASTER_WHISPER_ALLOW_PATTERNS)
-        if cached is not None:
+        # Completeness depends on the files the model needs, not on leftover
+        # partial files, which a changed remote file may never finish.
+        if (
+            cached is not None
+            and not verification_pending(repo_id)
+            and snapshot_has_files(cached, FASTER_WHISPER_REQUIRED_FILES)
+        ):
             return cached
-        self.report_progress("download", model=repo_id)
-        return download_snapshot(
+        # Nothing cached, an interrupted download (a snapshot folder without
+        # its files) or files left unverified: download again. huggingface_hub
+        # skips complete files and resumes partial ones.
+        self.begin_download(repo_id, partial_download_bytes(repo_id))
+        snapshot = download_snapshot(
             repo_id,
             FASTER_WHISPER_ALLOW_PATTERNS,
             lambda update: self.report_progress("download", model=repo_id, **update),
         )
+        self.verify_download(repo_id, snapshot)
+        return snapshot
 
     def unload(self) -> None:
         self.model = None
@@ -409,6 +466,17 @@ class FasterWhisperBackend(ProgressReporting):
         prompt: str | None,
         language: str | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
+        segments = list(self.transcribe_segments(audio_path, prompt, language))
+        text = "".join(segment["text"] for segment in segments).strip()
+        return text, segments
+
+    def transcribe_segments(
+        self,
+        audio_path: Path,
+        prompt: str | None,
+        language: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield segments as faster-whisper decodes them, for streaming."""
         try:
             hotwords = prompt if prompt else None
             raw_segments, _info = self.model.transcribe(
@@ -417,17 +485,16 @@ class FasterWhisperBackend(ProgressReporting):
                 language=language.split("-", 1)[0] if language else None,
                 hotwords=hotwords,
             )
-            segments = [
-                {
+            for segment in raw_segments:
+                yield {
                     "start": float(segment.start),
                     "end": float(segment.end),
                     "speaker": None,
                     "text": str(segment.text),
                 }
-                for segment in raw_segments
-            ]
-            text = "".join(segment["text"] for segment in segments).strip()
-            return text, segments
+        except GeneratorExit:
+            # A consumer stopped reading; that is not a transcription failure.
+            raise
         except BaseException as exc:
             raise map_backend_exception(exc, "transcribe", "faster-whisper") from exc
 

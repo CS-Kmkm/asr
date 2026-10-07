@@ -858,7 +858,7 @@ pub(crate) async fn stop_recording(
                 emit_state(&app, &state, AppPhase::Idle, "Editing cancelled.");
                 return Err("editing was cancelled".into());
             }
-            Err(_error) => {
+            Err(error) => {
                 let _ = storage.add_metric(
                     "speak_to_edit",
                     Some(settings.correction_provider.as_str()),
@@ -866,12 +866,7 @@ pub(crate) async fn stop_recording(
                     false,
                     Some("edit_failed"),
                 );
-                emit_state(
-                    &app,
-                    &state,
-                    AppPhase::Error,
-                    "Editing failed; the original selection was not changed.",
-                );
+                emit_state(&app, &state, AppPhase::Error, edit_failure_message(&error));
                 return Err("editing failed; the original selection was not changed".into());
             }
         };
@@ -1979,6 +1974,45 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
     format!("AI correction failed; using the original transcript. Error kind: {kind}.")
 }
 
+/// Names why Speak to edit failed, so the user can fix the cause. Every
+/// message is a fixed, localized string; error details are never shown.
+fn edit_failure_message(error: &correction::CorrectionError) -> &'static str {
+    use correction::CorrectionError;
+    match error {
+        CorrectionError::MissingApiKey(_) => {
+            "Editing failed because the AI provider API key is not set. The original selection was not changed."
+        }
+        CorrectionError::Api { status, .. } if matches!(status.as_u16(), 401 | 403) => {
+            "Editing failed because the AI provider rejected the API key. The original selection was not changed."
+        }
+        CorrectionError::Api { status, .. } if status.as_u16() == 429 => {
+            "Editing failed because the AI provider rate limit was reached. Try again later. The original selection was not changed."
+        }
+        CorrectionError::Api { .. } => {
+            "Editing failed because the AI provider returned an error. The original selection was not changed."
+        }
+        CorrectionError::Request(_) => {
+            "Editing failed because the AI provider could not be reached. The original selection was not changed."
+        }
+        CorrectionError::InvalidEndpoint(_) => {
+            "Editing failed because the local AI endpoint URL is invalid. The original selection was not changed."
+        }
+        CorrectionError::OutputLimit => {
+            "Editing stopped at the local output token limit. The original selection was not changed. Increase the local output token limit."
+        }
+        CorrectionError::InvalidResponse(_) | CorrectionError::ProtectedContentChanged => {
+            "Editing failed because the AI provider returned an unusable response. The original selection was not changed."
+        }
+        CorrectionError::UnsupportedProvider(_) => {
+            "Editing failed because the selected AI provider is not supported. The original selection was not changed."
+        }
+        CorrectionError::EmptyEditInstruction => {
+            "No edit instruction was captured; the original selection was not changed."
+        }
+        CorrectionError::Cancelled => "Editing cancelled.",
+    }
+}
+
 /// Metric code for a failed correction; validator rejects stay countable.
 fn correction_failure_metric_code(error: &correction::CorrectionError) -> &'static str {
     match error {
@@ -2006,8 +2040,88 @@ mod tests {
 
     #[test]
     fn retry_dictate_label_tracks_correction_even_when_text_is_unchanged() {
-        assert_eq!(retry_dictate_history_mode(Some("local")), "ai_corrected");
-        assert_eq!(retry_dictate_history_mode(None), "faithful");
+        assert_eq!(
+            retry_dictate_history_mode(Some("local"), false),
+            "ai_corrected"
+        );
+        assert_eq!(retry_dictate_history_mode(None, false), "faithful");
+        assert_eq!(retry_dictate_history_mode(None, true), "faithful_fallback");
+    }
+
+    #[test]
+    fn load_stages_announce_download_resume_and_verification() {
+        let progress = |stage: &str, resumed_bytes| asr::LoadProgress {
+            stage: stage.into(),
+            model: Some("repo".into()),
+            completed_bytes: None,
+            total_bytes: None,
+            resumed_bytes,
+        };
+        assert_eq!(
+            load_stage_notice(&progress("download", Some(4096))).map(|(_, message)| message),
+            Some("Resuming the interrupted speech model download.")
+        );
+        assert_eq!(
+            load_stage_notice(&progress("download", None)).map(|(kind, _)| kind),
+            Some("model_downloading")
+        );
+        assert_eq!(
+            load_stage_notice(&progress("verify", None)).map(|(kind, _)| kind),
+            Some("model_verifying")
+        );
+        assert_eq!(load_stage_notice(&progress("load", None)), None);
+    }
+
+    #[test]
+    fn edit_failures_name_their_cause() {
+        use correction::CorrectionError;
+        use reqwest::StatusCode;
+        let api = |status| CorrectionError::Api {
+            status,
+            message: "details".into(),
+        };
+        let messages = [
+            edit_failure_message(&CorrectionError::MissingApiKey("OPENAI_API_KEY".into())),
+            edit_failure_message(&api(StatusCode::UNAUTHORIZED)),
+            edit_failure_message(&api(StatusCode::TOO_MANY_REQUESTS)),
+            edit_failure_message(&api(StatusCode::INTERNAL_SERVER_ERROR)),
+            edit_failure_message(&CorrectionError::InvalidEndpoint("ftp://".into())),
+            edit_failure_message(&CorrectionError::OutputLimit),
+            edit_failure_message(&CorrectionError::InvalidResponse("empty".into())),
+            edit_failure_message(&CorrectionError::UnsupportedProvider("other".into())),
+            edit_failure_message(&CorrectionError::EmptyEditInstruction),
+        ];
+        let distinct = messages.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(distinct.len(), messages.len());
+        assert_eq!(
+            edit_failure_message(&api(StatusCode::FORBIDDEN)),
+            edit_failure_message(&api(StatusCode::UNAUTHORIZED))
+        );
+        // Provider details may echo request content, so they are never shown.
+        assert!(messages.iter().all(|message| !message.contains("details")));
+    }
+
+    #[test]
+    fn retry_keeps_the_transcript_when_correction_fails_or_is_rejected() {
+        assert!(matches!(
+            classify_retry_correction(Ok("corrected".into())),
+            RetryCorrection::Corrected(text) if text == "corrected"
+        ));
+        assert!(matches!(
+            classify_retry_correction(Err(correction::CorrectionError::Cancelled)),
+            RetryCorrection::Cancelled
+        ));
+        for error in [
+            correction::CorrectionError::ProtectedContentChanged,
+            correction::CorrectionError::OutputLimit,
+            correction::CorrectionError::MissingApiKey("OPENAI_API_KEY".into()),
+            correction::CorrectionError::InvalidResponse("empty".into()),
+        ] {
+            assert!(matches!(
+                classify_retry_correction(Err(error)),
+                RetryCorrection::Fallback(_)
+            ));
+        }
     }
 
     #[test]
@@ -3215,6 +3329,7 @@ pub(crate) async fn retry_history_item(
         }
         let mut output = transcript.text.clone();
         let mut llm_provider = None;
+        let mut correction_failed = false;
         if source.mode == "translate" {
             let target = source
                 .target_language
@@ -3280,7 +3395,8 @@ pub(crate) async fn retry_history_item(
             let hints = storage
                 .dictionary_correction_hints(&transcript.text, retry_context.as_ref())
                 .unwrap_or_default();
-            output = correction::correct_transcript(
+            let correction_started = Instant::now();
+            let result = correction::correct_transcript(
                 &settings,
                 &transcript.text,
                 &hints,
@@ -3290,9 +3406,31 @@ pub(crate) async fn retry_history_item(
                 cancel.clone(),
                 |_| {},
             )
-            .await
-            .map_err(command_error)?;
-            llm_provider = Some(settings.correction_provider.as_str());
+            .await;
+            match classify_retry_correction(result) {
+                RetryCorrection::Corrected(corrected) => {
+                    output = corrected;
+                    llm_provider = Some(settings.correction_provider.as_str());
+                }
+                RetryCorrection::Cancelled => return Err("history retry was cancelled".into()),
+                RetryCorrection::Fallback(error) => {
+                    // Like a new recording, a failed correction keeps the new
+                    // transcript instead of failing the whole Retry.
+                    correction_failed = true;
+                    emit_status(
+                        &app,
+                        "text_correction_failed",
+                        &correction_failure_status(&error),
+                    );
+                    let _ = storage.add_metric(
+                        "text_correction",
+                        Some(settings.correction_provider.as_str()),
+                        Some(correction_started.elapsed().as_millis() as i64),
+                        false,
+                        Some(correction_failure_metric_code(&error)),
+                    );
+                }
+            }
         }
         if services.lifecycle.is_cancelled(operation_id) {
             return Err("history retry was cancelled".into());
@@ -3315,7 +3453,7 @@ pub(crate) async fn retry_history_item(
                         action_kind: source.action_kind.as_deref(),
                         search_site: source.search_site.as_deref(),
                         mode: if mode == PipelineMode::Dictate {
-                            retry_dictate_history_mode(llm_provider)
+                            retry_dictate_history_mode(llm_provider, correction_failed)
                         } else {
                             &source.mode
                         },
@@ -3393,11 +3531,32 @@ fn history_pipeline_mode(mode: &str) -> Result<PipelineMode, String> {
     }
 }
 
-fn retry_dictate_history_mode(llm_provider: Option<&str>) -> &'static str {
+fn retry_dictate_history_mode(llm_provider: Option<&str>, correction_failed: bool) -> &'static str {
     if llm_provider.is_some() {
         "ai_corrected"
+    } else if correction_failed {
+        "faithful_fallback"
     } else {
         "faithful"
+    }
+}
+
+/// How a Retry continues after its AI correction finishes.
+#[derive(Debug)]
+enum RetryCorrection {
+    Corrected(String),
+    /// The correction failed or was rejected; the new transcript is kept.
+    Fallback(correction::CorrectionError),
+    Cancelled,
+}
+
+fn classify_retry_correction(
+    result: Result<String, correction::CorrectionError>,
+) -> RetryCorrection {
+    match result {
+        Ok(corrected) => RetryCorrection::Corrected(corrected),
+        Err(correction::CorrectionError::Cancelled) => RetryCorrection::Cancelled,
+        Err(error) => RetryCorrection::Fallback(error),
     }
 }
 
@@ -3717,8 +3876,8 @@ pub(crate) async fn ensure_model_loaded(
 
 /// Relay worker load progress to the window until the load finishes.
 ///
-/// The first download report also replaces the loading message, so a model that
-/// is already cached never claims that files are being downloaded.
+/// The first report of each stage also replaces the loading message, so a model
+/// that is already cached never claims that files are being downloaded.
 fn spawn_load_progress_forwarder(
     app: &AppHandle,
     services: &Services,
@@ -3726,17 +3885,15 @@ fn spawn_load_progress_forwarder(
     let mut receiver = services.transcriber.load_progress()?;
     let app = app.clone();
     Some(tauri::async_runtime::spawn(async move {
-        let mut download_announced = false;
+        let mut announced_stage = None;
         loop {
             match receiver.recv().await {
                 Ok(progress) => {
-                    if progress.stage == "download" && !download_announced {
-                        download_announced = true;
-                        emit_status(
-                            &app,
-                            "model_downloading",
-                            "Downloading the speech model files. This runs once; later starts use the local cache.",
-                        );
+                    if announced_stage.as_deref() != Some(progress.stage.as_str()) {
+                        if let Some((kind, message)) = load_stage_notice(&progress) {
+                            announced_stage = Some(progress.stage.clone());
+                            emit_status(&app, kind, message);
+                        }
                     }
                     let _ = app.emit("model-progress", progress);
                 }
@@ -3746,6 +3903,27 @@ fn spawn_load_progress_forwarder(
             }
         }
     }))
+}
+
+/// The notice for the first progress report of a download or verify stage.
+/// Only the first download report carries resumed bytes, so it decides
+/// whether the download is announced as resumed.
+fn load_stage_notice(progress: &asr::LoadProgress) -> Option<(&'static str, &'static str)> {
+    match progress.stage.as_str() {
+        "download" if progress.resumed_bytes.is_some_and(|bytes| bytes > 0) => Some((
+            "model_downloading",
+            "Resuming the interrupted speech model download.",
+        )),
+        "download" => Some((
+            "model_downloading",
+            "Downloading the speech model files. This runs once; later starts use the local cache.",
+        )),
+        "verify" => Some((
+            "model_verifying",
+            "Verifying the downloaded speech model files.",
+        )),
+        _ => None,
+    }
 }
 
 pub(crate) fn probe_gpu_diagnostics() -> GpuDiagnostics {

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
+import queue
 import secrets
 import tempfile
 import threading
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +14,8 @@ from .backends import Backend, BackendError
 
 
 RESPONSE_FORMATS = {"json", "text", "verbose_json", "srt", "vtt"}
+# Like OpenAI, streamed transcripts are plain text deltas without segments.
+STREAM_RESPONSE_FORMATS = {"json", "text"}
 SUPPORTED_AUDIO_SUFFIXES = {".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga", ".ogg", ".wav", ".webm"}
 DEFAULT_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
@@ -174,12 +179,15 @@ def create_app(
             raise HTTPException(status_code=400, detail="temperature must be between 0 and 1")
         if language is not None and len(language) > 32:
             raise HTTPException(status_code=400, detail="language is too long")
-        if stream:
-            raise HTTPException(status_code=400, detail="Streaming transcription is not supported")
         if response_format not in RESPONSE_FORMATS:
             raise HTTPException(
                 status_code=400,
                 detail=f"response_format must be one of: {', '.join(sorted(RESPONSE_FORMATS))}",
+            )
+        if stream and response_format not in STREAM_RESPONSE_FORMATS:
+            raise HTTPException(
+                status_code=400,
+                detail="Streaming supports only the json and text response formats",
             )
         suffix = Path(file.filename or "audio.wav").suffix.lower()
         if suffix not in SUPPORTED_AUDIO_SUFFIXES:
@@ -194,6 +202,13 @@ def create_app(
                     if uploaded > max_upload_bytes:
                         raise HTTPException(status_code=413, detail="Audio file is too large")
                     temporary.write(chunk)
+
+            if stream:
+                # The producer thread now owns the upload and deletes it.
+                audio_path, temporary_path = temporary_path, None
+                return await _stream_transcription(
+                    backend, inference_lock, audio_path, prompt, language
+                )
 
             def infer() -> tuple[str, list[dict[str, Any]]]:
                 with inference_lock:
@@ -216,6 +231,101 @@ def create_app(
         return {"text": text}
 
     return app
+
+
+def _text_deltas(
+    backend: Backend,
+    audio_path: Path,
+    prompt: str | None,
+    language: str | None,
+) -> Iterator[str]:
+    """Yield transcript pieces whose concatenation is the transcript text.
+
+    Backends that decode incrementally yield one piece per segment; others
+    yield their whole transcript at once.
+    """
+    segments = getattr(backend, "transcribe_segments", None)
+    if segments is None:
+        text, _segments = backend.transcribe(audio_path, prompt, language)
+        if text:
+            yield text
+        return
+    started = False
+    for segment in segments(audio_path, prompt, language):
+        piece = segment["text"] if started else segment["text"].lstrip()
+        if piece:
+            started = True
+            yield piece
+
+
+def _sse(event: dict[str, Any]) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+async def _stream_transcription(
+    backend: Backend,
+    inference_lock: threading.Lock,
+    audio_path: Path,
+    prompt: str | None,
+    language: str | None,
+):
+    """Stream OpenAI-style ``transcript.text.delta``/``done`` server-sent events.
+
+    Inference runs on its own thread so a client that disconnects early still
+    releases the model lock and the uploaded file once decoding finishes.
+    """
+    from fastapi.concurrency import run_in_threadpool
+    from fastapi.responses import StreamingResponse
+
+    events: queue.Queue[tuple[str, Any]] = queue.Queue()
+
+    def produce() -> None:
+        try:
+            with inference_lock:
+                for piece in _text_deltas(backend, audio_path, prompt, language):
+                    events.put(("delta", piece))
+            events.put(("done", None))
+        except BackendError as exc:
+            events.put(("error", exc))
+        except BaseException:  # noqa: BLE001 - reported to the client below
+            events.put(("error", BackendError("transcription_failed", "Transcription failed")))
+        finally:
+            audio_path.unlink(missing_ok=True)
+
+    threading.Thread(target=produce, name="asr-api-stream", daemon=True).start()
+    # A failure before any text keeps its HTTP error status.
+    first = await run_in_threadpool(events.get)
+    if first[0] == "error":
+        raise first[1]
+
+    async def body() -> AsyncIterator[str]:
+        event = first
+        pieces: list[str] = []
+        while True:
+            kind, value = event
+            if kind == "delta":
+                pieces.append(value)
+                yield _sse({"type": "transcript.text.delta", "delta": value, "logprobs": []})
+            elif kind == "done":
+                text = "".join(pieces).rstrip()
+                yield _sse({"type": "transcript.text.done", "text": text, "logprobs": []})
+                return
+            else:
+                yield _sse(
+                    {
+                        "type": "error",
+                        "error": {
+                            "message": value.message,
+                            "type": "server_error",
+                            "param": None,
+                            "code": value.code,
+                        },
+                    }
+                )
+                return
+            event = await run_in_threadpool(events.get)
+
+    return StreamingResponse(body(), media_type="text/event-stream")
 
 
 def run_api_server(
