@@ -11,8 +11,8 @@ use super::{normalize_text, InjectionError, TargetText, TargetWindow};
 use std::ffi::c_void;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, SendMessageTimeoutW, SEND_MESSAGE_TIMEOUT_FLAGS, SMTO_ABORTIFHUNG, SMTO_BLOCK,
-    WM_CLEAR, WM_GETTEXT, WM_GETTEXTLENGTH, WM_PASTE,
+    GetClassNameW, IsWindowUnicode, SendMessageTimeoutW, SEND_MESSAGE_TIMEOUT_FLAGS,
+    SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_CLEAR, WM_GETTEXT, WM_GETTEXTLENGTH, WM_PASTE,
 };
 
 const EM_GETSEL: u32 = 0x00B0;
@@ -36,7 +36,13 @@ fn control(target: &TargetWindow) -> HWND {
 
 /// Standard Win32 Edit controls, including Windows Forms text boxes, which
 /// superclass them. RichEdit counts positions differently and is excluded.
+/// So are ANSI windows: WM_GETTEXT is converted to UTF-16 for us, but their
+/// EM_GETSEL/EM_SETSEL positions may count bytes of a multibyte code page,
+/// which would select a different range than the one read.
 pub(super) fn is_native_edit(target: &TargetWindow) -> bool {
+    if !unsafe { IsWindowUnicode(control(target)) }.as_bool() {
+        return false;
+    }
     let mut class_name = [0u16; 128];
     let length = unsafe { GetClassNameW(control(target), &mut class_name) };
     if length <= 0 {
