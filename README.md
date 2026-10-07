@@ -10,9 +10,8 @@ again to stop. The Windows capture backend converts input to a temporary 24 kHz
 mono PCM WAV, and sends it to the persistent JSONL worker. While you speak,
 partial text appears only in the recording overlay. After transcription and any
 AI correction, the final text is pasted once into the captured target with the
-clipboard and Ctrl+V. When the target's text can be read (through UI
-Automation, or window messages for native Win32 Edit controls), the paste is
-verified and (with **Restore clipboard** on) the previous
+clipboard and Ctrl+V. When the target's text can be read through UI Automation,
+the paste is verified and (with **Restore clipboard** on) the previous
 clipboard is restored; otherwise one
 guarded paste is sent unverified. Clicking, scrolling, or typing while you
 speak or while the text is being recognized does not prevent insertion: before
@@ -352,22 +351,10 @@ Full usage and Phase 0 gate criteria are documented in
   History retention remove them.
 - The captured target must still be foreground and non-secure at insertion time.
 - UI Automation security inspection exists and is used to avoid secure targets.
-  Text is entered by clipboard paste only (Ctrl+V, or window messages for
-  native Win32 Edit controls); UI Automation reads the target to verify the
-  paste. Controls that cannot be read back (for example some browser and
-  code-editor fields) receive one unverified paste, and live text insertion in
-  them may keep only the first fragment.
-- Native Win32 Edit controls (including Windows Forms text boxes) in Unicode
-  windows are read, selected and edited with window messages (WM_PASTE/WM_CLEAR,
-  not keystrokes), also when they expose no UI Automation text range. Edit
-  controls in ANSI windows, whose positions may count bytes, use the regular
-  path instead. Their IME
-  composition cannot be observed from another process, so their text is
-  inserted, replaced or deleted only while no keyboard or pointer input has
-  occurred since the operation began (recording start for voice modes);
-  otherwise, including after clicks or scrolling during recognition, the result
-  stays on the clipboard. A composition left unconverted before the operation
-  is not touched and is committed at the caret when the user converts it.
+  Text is entered by clipboard paste only; UI Automation reads the target to
+  verify the paste. Controls that cannot be read back (for example some browser
+  and code-editor fields) receive one unverified paste, and live text insertion
+  in them may keep only the first fragment.
 - Elevated applications, password controls, and secure controls are not forced.
 - Model downloads use the Hugging Face cache. An interrupted download (a
   snapshot still missing model files) is continued on the next load, and the

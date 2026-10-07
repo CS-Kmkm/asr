@@ -3,29 +3,13 @@ use tokio::sync::watch;
 
 const VERIFY_ATTEMPTS: usize = 50;
 
-/// The destructive policy for `target`. A control whose IME composition state
-/// cannot be observed may be edited only under a monitored checkpoint, whose
-/// quiet input is then required by every safety check.
-fn destructive<B: Backend>(
-    backend: &B,
-    target: &TargetWindow,
-    activity: Option<(&InputMonitor, u64)>,
-) -> SafetyPolicy {
-    if activity.is_some() && backend.quiet_input_rules_out_composition(target) {
-        SafetyPolicy::DestructiveAfterQuietInput
-    } else {
-        SafetyPolicy::Destructive
-    }
-}
-
 fn safe<B: Backend>(
     backend: &B,
     target: &TargetWindow,
     activity: Option<(&InputMonitor, u64)>,
     policy: SafetyPolicy,
 ) -> bool {
-    (policy != SafetyPolicy::DestructiveAfterQuietInput || activity.is_some())
-        && activity.is_none_or(|(monitor, checkpoint)| monitor.unchanged_since(checkpoint))
+    activity.is_none_or(|(monitor, checkpoint)| monitor.unchanged_since(checkpoint))
         && backend.validate_target(target).is_ok()
         && backend
             .ime_composition_active(target)
@@ -76,9 +60,7 @@ fn safe_after_injected_paste<B: Backend>(
     activity: Option<(&InputMonitor, u64)>,
     policy: SafetyPolicy,
 ) -> bool {
-    (policy != SafetyPolicy::DestructiveAfterQuietInput || activity.is_some())
-        && activity
-            .is_none_or(|(monitor, checkpoint)| monitor.unchanged_since_injected_paste(checkpoint))
+    activity.is_none_or(|(monitor, checkpoint)| monitor.unchanged_since_injected_paste(checkpoint))
         && backend.validate_target(target).is_ok()
         && backend
             .ime_composition_active(target)
@@ -98,10 +80,9 @@ fn select_verified<B: Backend>(
     activity: Option<(&InputMonitor, u64)>,
 ) -> Option<TargetText> {
     let selected = before.select_recent(text)?;
-    let policy = destructive(backend, target, activity);
-    if !safe(backend, target, activity, policy)
+    if !safe(backend, target, activity, SafetyPolicy::Destructive)
         || !backend.target_text(target).ok()?.same_content(before)
-        || !backend.select_recent(target, before, text, policy).ok()?
+        || !backend.select_recent(target, before, text).ok()?
     {
         return None;
     }
@@ -109,7 +90,7 @@ fn select_verified<B: Backend>(
         if attempt > 0 {
             backend.wait_for_target();
         }
-        if !safe(backend, target, activity, policy) {
+        if !safe(backend, target, activity, SafetyPolicy::Destructive) {
             return None;
         }
         let actual = backend.target_text(target).ok()?;
@@ -203,7 +184,8 @@ fn paste<B: Backend>(
         }
         if backend.target_text(target).is_ok_and(|actual| {
             actual.same_content(&expected)
-                || (!policy.is_destructive() && shows_inserted_text(before, &actual, text))
+                || (policy != SafetyPolicy::Destructive
+                    && shows_inserted_text(before, &actual, text))
         }) {
             if let Some(previous) = previous {
                 // Restoration failure cannot undo a confirmed edit and must
@@ -401,15 +383,14 @@ pub(super) fn replace_selection<B: Backend>(
     monitor: &InputMonitor,
     checkpoint: u64,
 ) -> Result<InsertResult, InjectionError> {
-    let activity = Some((monitor, checkpoint));
     paste(
         backend,
         options,
         text,
         target,
         before,
-        activity,
-        destructive(backend, target, activity),
+        Some((monitor, checkpoint)),
+        SafetyPolicy::Destructive,
         None,
     )
 }
@@ -424,15 +405,14 @@ pub(super) fn replace_selection_monitored<B: Backend>(
     checkpoint: u64,
     cancel: &watch::Receiver<bool>,
 ) -> Result<InsertResult, InjectionError> {
-    let activity = Some((monitor, checkpoint));
     paste(
         backend,
         options,
         text,
         target,
         before,
-        activity,
-        destructive(backend, target, activity),
+        Some((monitor, checkpoint)),
+        SafetyPolicy::Destructive,
         Some(cancel),
     )
 }
@@ -481,12 +461,11 @@ fn begin_with_checkpoint<B: Backend>(
     }
     let replacement = checkpoint
         .filter(|checkpoint| {
-            let activity = Some((monitor, *checkpoint));
             safe(
                 backend,
                 target,
-                activity,
-                destructive(backend, target, activity),
+                Some((monitor, *checkpoint)),
+                SafetyPolicy::Destructive,
             )
         })
         .and_then(|checkpoint| {
@@ -496,15 +475,14 @@ fn begin_with_checkpoint<B: Backend>(
                 .map(|before| (checkpoint, before))
         });
     let (result, replacement) = if let Some((checkpoint, before)) = replacement {
-        let activity = Some((monitor, checkpoint));
         let result = paste(
             backend,
             options,
             draft,
             target,
             &before,
-            activity,
-            destructive(backend, target, activity),
+            Some((monitor, checkpoint)),
+            SafetyPolicy::Destructive,
             None,
         )?;
         let range = (result != InsertResult::ClipboardOnly).then(|| ReplacementRange {
@@ -566,12 +544,11 @@ pub(super) fn update<B: Backend>(
     if session.result == InsertResult::PasteUnverified {
         // The target may have processed the draft while correction was running.
         // Confirm the complete edit before touching a possibly pending payload.
-        let activity = Some((monitor, range.checkpoint));
         if !safe(
             backend,
             &session.target,
-            activity,
-            destructive(backend, &session.target, activity),
+            Some((monitor, range.checkpoint)),
+            SafetyPolicy::Destructive,
         ) || !backend
             .target_text(&session.target)
             .is_ok_and(|actual| actual.same_content(&range.after))
@@ -609,7 +586,7 @@ pub(super) fn update<B: Backend>(
         &session.target,
         &selected,
         activity,
-        destructive(backend, &session.target, activity),
+        SafetyPolicy::Destructive,
         None,
     )?;
     if session.result != InsertResult::ClipboardOnly {
@@ -644,13 +621,16 @@ pub(super) fn cancel<B: Backend>(
     ) else {
         return;
     };
-    let policy = destructive(backend, &session.target, activity);
-    if safe(backend, &session.target, activity, policy)
-        && backend
-            .target_text(&session.target)
-            .is_ok_and(|actual| actual.same_content(&selected))
+    if safe(
+        backend,
+        &session.target,
+        activity,
+        SafetyPolicy::Destructive,
+    ) && backend
+        .target_text(&session.target)
+        .is_ok_and(|actual| actual.same_content(&selected))
     {
-        let _ = backend.delete_selection(&session.target, policy);
+        let _ = backend.delete_selection(&session.target);
     }
 }
 
@@ -870,9 +850,6 @@ mod tests {
         sequence: Cell<u32>,
         target_valid: Cell<bool>,
         ime: Cell<Option<bool>>,
-        /// Simulates a native Edit control whose IME state is unobservable.
-        native_edit: Cell<bool>,
-        policies: RefCell<Vec<SafetyPolicy>>,
         text_readable: Cell<bool>,
         selection_readable: Cell<bool>,
         paste_accepted: Cell<bool>,
@@ -908,8 +885,6 @@ mod tests {
                 sequence: Cell::new(0),
                 target_valid: Cell::new(true),
                 ime: Cell::new(Some(false)),
-                native_edit: Cell::new(false),
-                policies: RefCell::new(Vec::new()),
                 text_readable: Cell::new(true),
                 selection_readable: Cell::new(true),
                 paste_accepted: Cell::new(true),
@@ -984,14 +959,8 @@ mod tests {
             _: &TargetWindow,
             state: &TargetText,
             text: &str,
-            policy: SafetyPolicy,
         ) -> Result<bool, InjectionError> {
             self.calls.borrow_mut().push("select");
-            self.policies.borrow_mut().push(policy);
-            // Mirrors the Windows backend's own IME gate.
-            if !policy.is_destructive() || !policy.permits_ime(self.ime.get()) {
-                return Ok(false);
-            }
             let Some(selected) = state.select_recent(text) else {
                 return Ok(false);
             };
@@ -1031,20 +1000,8 @@ mod tests {
             *self.clipboard.borrow_mut() = snapshot;
             Ok(true)
         }
-        fn quiet_input_rules_out_composition(&self, _: &TargetWindow) -> bool {
-            self.native_edit.get()
-        }
-        fn paste(
-            &self,
-            target: &TargetWindow,
-            policy: SafetyPolicy,
-        ) -> Result<bool, InjectionError> {
+        fn paste(&self, _: &TargetWindow, _: SafetyPolicy) -> Result<bool, InjectionError> {
             self.calls.borrow_mut().push("paste");
-            self.policies.borrow_mut().push(policy);
-            // Mirrors the platform paste boundary.
-            if !policy.permits_ime(self.ime.get()) || !policy.permits_selection(self, target) {
-                return Ok(false);
-            }
             if !self.paste_accepted.get() {
                 return Ok(false);
             }
@@ -1064,14 +1021,7 @@ mod tests {
             }
             Ok(true)
         }
-        fn delete_selection(
-            &self,
-            _: &TargetWindow,
-            policy: SafetyPolicy,
-        ) -> Result<bool, InjectionError> {
-            if !policy.is_destructive() || !policy.permits_ime(self.ime.get()) {
-                return Ok(false);
-            }
+        fn delete_selection(&self, _: &TargetWindow) -> Result<bool, InjectionError> {
             self.text.borrow_mut().selected.clear();
             self.calls.borrow_mut().push("delete");
             Ok(true)
@@ -2587,219 +2537,5 @@ mod tests {
                 .count(),
             1
         );
-    }
-
-    fn native_edit_backend(ime: Option<bool>) -> MockBackend {
-        let backend = MockBackend::new();
-        backend.ime.set(ime);
-        backend.native_edit.set(true);
-        backend
-    }
-
-    fn begin_native_draft(backend: &MockBackend, monitor: &InputMonitor) -> ProvisionalInsertion {
-        let checkpoint = monitor.checkpoint().unwrap();
-        begin_live(
-            backend,
-            InjectionOptions::default(),
-            "draft",
-            &target(),
-            monitor,
-            checkpoint,
-        )
-        .unwrap()
-        .unwrap()
-    }
-
-    #[test]
-    fn native_edit_with_unknown_ime_is_replaced_only_while_input_stays_quiet() {
-        let backend = native_edit_backend(None);
-        let monitor = monitor();
-        let mut session = begin_native_draft(&backend, &monitor);
-        assert!(session.replacement.is_some());
-        assert_eq!(backend.content(), "prefix draft suffix");
-        assert_eq!(
-            finish(
-                &backend,
-                InjectionOptions::default(),
-                &mut session,
-                "final",
-                &monitor
-            )
-            .unwrap(),
-            InsertResult::ClipboardPaste
-        );
-        assert_eq!(backend.content(), "prefix final suffix");
-        assert!(backend
-            .policies
-            .borrow()
-            .iter()
-            .all(|policy| *policy == SafetyPolicy::DestructiveAfterQuietInput));
-
-        // Any input after the checkpoint could have started a composition.
-        let backend = native_edit_backend(None);
-        let monitor = self::monitor();
-        let mut session = begin_native_draft(&backend, &monitor);
-        monitor.test_record_input();
-        assert_eq!(
-            finish(
-                &backend,
-                InjectionOptions::default(),
-                &mut session,
-                "final",
-                &monitor
-            )
-            .unwrap(),
-            InsertResult::ClipboardOnly
-        );
-        assert_eq!(backend.content(), "prefix draft suffix");
-        assert_eq!(&*backend.clipboard.borrow(), "final");
-        assert!(!backend.calls.borrow().contains(&"select"));
-    }
-
-    #[test]
-    fn native_edit_cancellation_removes_the_draft_only_while_input_stays_quiet() {
-        let backend = native_edit_backend(None);
-        let monitor = monitor();
-        let mut session = begin_native_draft(&backend, &monitor);
-        cancel(&backend, &mut session, &monitor);
-        assert_eq!(backend.content(), "prefix  suffix");
-
-        let backend = native_edit_backend(None);
-        let monitor = self::monitor();
-        let mut session = begin_native_draft(&backend, &monitor);
-        monitor.test_record_input();
-        cancel(&backend, &mut session, &monitor);
-        assert_eq!(backend.content(), "prefix draft suffix");
-    }
-
-    #[test]
-    fn unknown_ime_elsewhere_or_active_ime_is_never_replaced() {
-        for backend in [
-            {
-                // A control that is not a native Edit keeps the strict rule.
-                let backend = MockBackend::new();
-                backend.ime.set(None);
-                backend
-            },
-            native_edit_backend(Some(true)),
-        ] {
-            let monitor = monitor();
-            let session = begin_native_draft(&backend, &monitor);
-            assert!(session.replacement.is_none());
-            assert_eq!(session.result, InsertResult::ClipboardOnly);
-            assert_eq!(backend.content(), "prefix  suffix");
-            assert!(!backend.calls.borrow().contains(&"paste"));
-        }
-    }
-
-    #[test]
-    fn native_edit_selection_is_replaced_only_while_input_stays_quiet() {
-        for (input, expected, result) in [
-            (false, "prefix edited suffix", InsertResult::ClipboardPaste),
-            (true, "prefix original suffix", InsertResult::ClipboardOnly),
-        ] {
-            let backend = native_edit_backend(None);
-            *backend.text.borrow_mut() = selected_state();
-            let before = backend.text.borrow().clone();
-            let monitor = monitor();
-            let checkpoint = monitor.checkpoint().unwrap();
-            if input {
-                monitor.test_record_input();
-            }
-            assert_eq!(
-                replace_selection(
-                    &backend,
-                    InjectionOptions::default(),
-                    &target(),
-                    &before,
-                    "edited",
-                    &monitor,
-                    checkpoint,
-                )
-                .unwrap(),
-                result
-            );
-            assert_eq!(backend.content(), expected);
-        }
-    }
-
-    #[test]
-    fn native_edit_final_paste_follows_the_after_input_rule() {
-        // Untouched since recording started: the unknown IME state is accepted.
-        let backend = native_edit_backend(None);
-        assert_eq!(
-            final_paste(&backend, FinalGuard::Untouched),
-            InsertResult::ClipboardPaste
-        );
-        assert_eq!(backend.content(), "prefix new suffix");
-        // After input a composition may be open, and a native Edit cannot
-        // report one, so the result stays on the clipboard.
-        let backend = native_edit_backend(None);
-        assert_eq!(
-            final_paste(&backend, FinalGuard::AfterInput),
-            InsertResult::ClipboardOnly
-        );
-        assert_eq!(pastes(&backend), 0);
-        let monitor = monitor();
-        assert_eq!(
-            diagnose(
-                &backend,
-                &target(),
-                &monitor,
-                monitor.checkpoint(),
-                false,
-                FinalGuard::AfterInput
-            ),
-            InsertionDetail::ImeUnknown
-        );
-    }
-
-    #[test]
-    fn native_edit_replacement_is_never_confirmed_by_a_loose_occurrence() {
-        let backend = native_edit_backend(None);
-        *backend.text.borrow_mut() = selected_state();
-        let before = backend.text.borrow().clone();
-        // The readback shows the new text at the caret but not the exact
-        // replaced document, which only an additive paste may accept.
-        *backend.readback_after_paste.borrow_mut() = Some(proxy_text("fix edited", " suf"));
-        let monitor = monitor();
-        let checkpoint = monitor.checkpoint().unwrap();
-        assert_eq!(
-            replace_selection(
-                &backend,
-                InjectionOptions::default(),
-                &target(),
-                &before,
-                "edited",
-                &monitor,
-                checkpoint,
-            )
-            .unwrap(),
-            InsertResult::PasteUnverified
-        );
-        assert!(!backend.calls.borrow().contains(&"restore"));
-    }
-
-    #[test]
-    fn quiet_input_policy_requires_a_monitored_checkpoint() {
-        let backend = native_edit_backend(None);
-        let monitor = monitor();
-        let checkpoint = monitor.checkpoint().unwrap();
-        assert_eq!(
-            destructive(&backend, &target(), None),
-            SafetyPolicy::Destructive
-        );
-        assert_eq!(
-            destructive(&backend, &target(), Some((&monitor, checkpoint))),
-            SafetyPolicy::DestructiveAfterQuietInput
-        );
-        assert!(!safe(
-            &backend,
-            &target(),
-            None,
-            SafetyPolicy::DestructiveAfterQuietInput
-        ));
-        assert!(!SafetyPolicy::DestructiveAfterQuietInput.permits_ime(Some(true)));
-        assert!(!SafetyPolicy::Destructive.permits_ime(None));
     }
 }

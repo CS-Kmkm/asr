@@ -13,8 +13,6 @@ mod accessibility;
 mod batch;
 #[cfg(target_os = "windows")]
 mod clipboard;
-#[cfg(target_os = "windows")]
-mod native_edit;
 
 pub(crate) const INJECTION_MARKER: usize = 0x4C56_494A;
 
@@ -434,36 +432,17 @@ fn final_guard(after_input: bool) -> batch::FinalGuard {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SafetyPolicy {
     Additive,
     /// Deferred pastes renew their checkpoint and must inspect IME and selection.
     FinalAdditive,
-    /// Replaces or deletes target text; requires a known-inactive IME.
     Destructive,
-    /// A destructive edit of a control whose IME composition state cannot be
-    /// observed (a native Win32 Edit control). Allowed only while the input
-    /// monitor shows no keyboard or pointer input since the operation began
-    /// (recording start for voice modes), because a composition cannot start
-    /// without input. Such controls are edited with window messages instead of
-    /// keystrokes, so a composition left open before the operation is not
-    /// driven by injected keys. The batch layer chooses it and checks the
-    /// monitor.
-    DestructiveAfterQuietInput,
 }
 
 impl SafetyPolicy {
     fn permits_ime(self, active: Option<bool>) -> bool {
-        match self {
-            // A paste after input may meet a composition left open while the
-            // user waited, so it also needs a known-inactive IME.
-            Self::Destructive | Self::FinalAdditive => active == Some(false),
-            Self::Additive | Self::DestructiveAfterQuietInput => active != Some(true),
-        }
-    }
-
-    fn is_destructive(self) -> bool {
-        matches!(self, Self::Destructive | Self::DestructiveAfterQuietInput)
+        active == Some(false) || self == Self::Additive && active.is_none()
     }
 
     fn permits_selection<B: Backend>(self, backend: &B, target: &TargetWindow) -> bool {
@@ -493,14 +472,7 @@ trait Backend {
         target: &TargetWindow,
         expected: &TargetText,
         text: &str,
-        policy: SafetyPolicy,
     ) -> Result<bool, InjectionError>;
-    /// Whether the target's IME composition state is unobservable but no
-    /// composition can exist without input after the operation began (a native
-    /// Win32 Edit control); see [`SafetyPolicy::DestructiveAfterQuietInput`].
-    fn quiet_input_rules_out_composition(&self, _target: &TargetWindow) -> bool {
-        false
-    }
     fn clipboard_snapshot(&self) -> Result<Self::Clipboard, InjectionError>;
     fn clipboard_write(
         &self,
@@ -514,11 +486,7 @@ trait Backend {
     ) -> Result<bool, InjectionError>;
     /// Returns true if any input was queued, including a partial SendInput.
     fn paste(&self, target: &TargetWindow, policy: SafetyPolicy) -> Result<bool, InjectionError>;
-    fn delete_selection(
-        &self,
-        target: &TargetWindow,
-        policy: SafetyPolicy,
-    ) -> Result<bool, InjectionError>;
+    fn delete_selection(&self, target: &TargetWindow) -> Result<bool, InjectionError>;
     fn wait_for_target(&self);
 }
 
@@ -553,7 +521,6 @@ impl Backend for PlatformBackend {
         _: &TargetWindow,
         _: &TargetText,
         _: &str,
-        _: SafetyPolicy,
     ) -> Result<bool, InjectionError> {
         Err(InjectionError::UnsupportedPlatform)
     }
@@ -569,7 +536,7 @@ impl Backend for PlatformBackend {
     fn paste(&self, _: &TargetWindow, _: SafetyPolicy) -> Result<bool, InjectionError> {
         Err(InjectionError::UnsupportedPlatform)
     }
-    fn delete_selection(&self, _: &TargetWindow, _: SafetyPolicy) -> Result<bool, InjectionError> {
+    fn delete_selection(&self, _: &TargetWindow) -> Result<bool, InjectionError> {
         Err(InjectionError::UnsupportedPlatform)
     }
     fn wait_for_target(&self) {}
@@ -581,8 +548,8 @@ use windows_backend::PlatformBackend;
 #[cfg(target_os = "windows")]
 mod windows_backend {
     use super::{
-        accessibility, clipboard, native_edit, Backend, ClipboardExclusion, InjectionError,
-        SafetyPolicy, TargetText, TargetWindow, INJECTION_MARKER,
+        accessibility, clipboard, Backend, ClipboardExclusion, InjectionError, SafetyPolicy,
+        TargetText, TargetWindow, INJECTION_MARKER,
     };
     use std::mem::{size_of, zeroed};
     use std::thread;
@@ -821,12 +788,7 @@ mod windows_backend {
         }
         fn target_text(&self, target: &TargetWindow) -> Result<TargetText, InjectionError> {
             self.validate_target(target)?;
-            match accessibility::read(target) {
-                Err(InjectionError::BackendFailure(_)) if native_edit::is_native_edit(target) => {
-                    native_edit::read(target)
-                }
-                result => result,
-            }
+            accessibility::read(target)
         }
         fn selection_is_empty(&self, target: &TargetWindow) -> Result<bool, InjectionError> {
             self.validate_target(target)?;
@@ -841,24 +803,12 @@ mod windows_backend {
             target: &TargetWindow,
             expected: &TargetText,
             text: &str,
-            policy: SafetyPolicy,
         ) -> Result<bool, InjectionError> {
             self.validate_target(target)?;
-            if !policy.is_destructive()
-                || !policy.permits_ime(self.ime_composition_active(target)?)
-                || !modifiers_released()
-            {
+            if self.ime_composition_active(target)? != Some(false) || !modifiers_released() {
                 return Ok(false);
             }
-            match accessibility::select_recent(target, expected, text) {
-                Err(InjectionError::BackendFailure(_)) if native_edit::is_native_edit(target) => {
-                    native_edit::select_recent(target, expected, text)
-                }
-                result => result,
-            }
-        }
-        fn quiet_input_rules_out_composition(&self, target: &TargetWindow) -> bool {
-            native_edit::is_native_edit(target)
+            accessibility::select_recent(target, expected, text)
         }
         fn clipboard_snapshot(&self) -> Result<Self::Clipboard, InjectionError> {
             clipboard::snapshot()
@@ -889,9 +839,6 @@ mod windows_backend {
             if !policy.permits_selection(self, target) {
                 return Ok(false);
             }
-            if native_edit::is_native_edit(target) {
-                return Ok(native_edit::paste(target));
-            }
             let inputs = [
                 keyboard_input(VK_CONTROL, 0),
                 keyboard_input(VK_V, 0),
@@ -906,20 +853,10 @@ mod windows_backend {
             }
             Ok(sent > 0)
         }
-        fn delete_selection(
-            &self,
-            target: &TargetWindow,
-            policy: SafetyPolicy,
-        ) -> Result<bool, InjectionError> {
+        fn delete_selection(&self, target: &TargetWindow) -> Result<bool, InjectionError> {
             self.validate_target(target)?;
-            if !policy.is_destructive()
-                || !policy.permits_ime(self.ime_composition_active(target)?)
-                || !modifiers_released()
-            {
+            if self.ime_composition_active(target)? != Some(false) || !modifiers_released() {
                 return Ok(false);
-            }
-            if native_edit::is_native_edit(target) {
-                return Ok(native_edit::clear_selection(target));
             }
             let inputs = [
                 keyboard_input(VK_BACK, 0),
