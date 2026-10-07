@@ -194,12 +194,12 @@ fn proper_nouns_preserved(
     let present = |key: &FactKey| {
         terms
             .iter()
-            .find(|(surface, _)| surface.to_lowercase() == key.value)
+            .find(|(surface, _)| fold(surface) == key.value)
             .map_or_else(
                 || contains_name(output, &key.value),
                 |(surface, readings)| {
                     term_spellings(surface, readings)
-                        .any(|spelling| contains_name(output, &spelling.to_lowercase()))
+                        .any(|spelling| contains_name(output, &fold(spelling)))
                 },
             )
     };
@@ -216,17 +216,13 @@ fn proper_nouns_preserved(
     // turns "GitHub" into an unknown "Hub".
     let term_ranges = name_occurrences(output, &terms)
         .into_iter()
-        .filter(|(_, key)| {
-            terms
-                .iter()
-                .any(|(surface, _)| surface.to_lowercase() == key.value)
-        })
+        .filter(|(_, key)| terms.iter().any(|(surface, _)| fold(surface) == key.value))
         .map(|(range, _)| range)
         .collect::<Vec<_>>();
     kept && latin_name_occurrences(output)
         .iter()
         .filter(|(range, _)| !term_ranges.iter().any(|term| ranges_overlap(term, range)))
-        .all(|(_, name)| contains_name(source, &name.to_lowercase()))
+        .all(|(_, name)| contains_name(source, &fold(name)))
 }
 
 /// The spellings that identify a prompted term. Readings in scripts without
@@ -267,25 +263,16 @@ fn dictionary_terms(dictionary_hints: &[String]) -> Vec<(String, Vec<String>)> {
 /// whichever spelling was spoken.
 fn name_occurrences(text: &str, terms: &[(String, Vec<String>)]) -> Vec<FactOccurrence> {
     let mut candidates: Vec<FactOccurrence> = Vec::new();
-    // Without offset-preserving case mapping, prompted terms cannot be located
-    // in the source safely.
-    if let Some(lower) = offset_preserving_lowercase(text) {
-        for (surface, readings) in terms {
-            let key = FactKey {
-                value: surface.to_lowercase(),
-                unit: None,
-            };
-            for spelling in term_spellings(surface, readings) {
-                // Lowercased like the source, character by character.
-                let spelling = spelling
-                    .chars()
-                    .flat_map(char::to_lowercase)
-                    .collect::<String>();
-                for (at, _) in lower.match_indices(&spelling) {
-                    let range = at..at + spelling.len();
-                    if name_boundaries(text, &range) {
-                        candidates.push((range, key.clone()));
-                    }
+    let folded = Folded::new(text);
+    for (surface, readings) in terms {
+        let key = FactKey {
+            value: fold(surface),
+            unit: None,
+        };
+        for spelling in term_spellings(surface, readings) {
+            for range in folded.matches(&fold(spelling)) {
+                if name_boundaries(text, &range) {
+                    candidates.push((range, key.clone()));
                 }
             }
         }
@@ -310,7 +297,7 @@ fn name_occurrences(text: &str, terms: &[(String, Vec<String>)]) -> Vec<FactOccu
             occurrences.push((
                 range,
                 FactKey {
-                    value: name.to_lowercase(),
+                    value: fold(&name),
                     unit: None,
                 },
             ));
@@ -335,33 +322,50 @@ fn name_boundaries(text: &str, range: &std::ops::Range<usize>) -> bool {
         && !after.is_some_and(|character| character.is_ascii_alphanumeric())
 }
 
-/// Lowercases `text` only when every character keeps its UTF-8 length, so a
-/// byte offset found in the result is a valid offset in `text`. Equal total
-/// lengths are not enough: one character can shrink (Kelvin sign to "k")
-/// while another grows (dotted capital I), shifting every later offset.
-fn offset_preserving_lowercase(text: &str) -> Option<String> {
-    let mut lower = String::with_capacity(text.len());
-    for character in text.chars() {
-        let start = lower.len();
-        lower.extend(character.to_lowercase());
-        if lower.len() - start != character.len_utf8() {
-            return None;
-        }
-    }
-    Some(lower)
+/// Case folding for name comparison: every character lowercased on its own,
+/// so a name folds the same way wherever it occurs (no final-sigma context).
+fn fold(text: &str) -> String {
+    text.chars().flat_map(char::to_lowercase).collect()
 }
 
-/// Whether `text` mentions `name` (lowercase), as a whole word when ASCII.
-fn contains_name(text: &str, name: &str) -> bool {
-    if name.is_empty() {
-        return false;
+/// `text` folded, with each folded byte offset that begins a source
+/// character's folding mapped back to that character's offset in `text`.
+/// Case mapping can change lengths (the Kelvin sign shrinks, a dotted capital
+/// I grows), so folded offsets are never reused directly on `text`.
+struct Folded {
+    folded: String,
+    to_source: Vec<Option<usize>>,
+}
+
+impl Folded {
+    fn new(text: &str) -> Self {
+        let mut folded = String::with_capacity(text.len());
+        let mut to_source = Vec::with_capacity(text.len() + 1);
+        for (at, character) in text.char_indices() {
+            to_source.push(Some(at));
+            folded.extend(character.to_lowercase());
+            to_source.resize(folded.len(), None);
+        }
+        to_source.push(Some(text.len()));
+        Self { folded, to_source }
     }
-    let Some(lower) = offset_preserving_lowercase(text) else {
-        return text.to_lowercase().contains(name);
-    };
-    lower
-        .match_indices(name)
-        .any(|(at, _)| name_boundaries(text, &(at..at + name.len())))
+
+    /// Source ranges of `name` (already folded). A match that starts or ends
+    /// inside one character's folding is not a match of that character.
+    fn matches<'a>(&'a self, name: &'a str) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
+        self.folded
+            .match_indices(name)
+            .filter(|_| !name.is_empty())
+            .filter_map(|(at, _)| Some(self.to_source[at]?..self.to_source[at + name.len()]?))
+    }
+}
+
+/// Whether `text` mentions `name` (folded), as a whole word when ASCII.
+fn contains_name(text: &str, name: &str) -> bool {
+    !name.is_empty()
+        && Folded::new(text)
+            .matches(name)
+            .any(|range| name_boundaries(text, &range))
 }
 
 /// Latin-script tokens that look like proper nouns, outside URLs and code.
@@ -3454,24 +3458,45 @@ mod tests {
         }
     }
 
+    fn name_edits() -> FactEdits {
+        FactEdits {
+            corrections: true,
+            merge_duplicates: true,
+        }
+    }
+
     #[test]
     fn length_changing_case_mapping_never_misaligns_name_offsets() {
         // The Kelvin sign shrinks and each dotted capital I grows when
         // lowercased, so the total length is unchanged while offsets shift.
         let text = "\u{212A} GitHub \u{130}\u{130}";
         assert_eq!(text.to_lowercase().len(), text.len());
-        assert_eq!(offset_preserving_lowercase(text), None);
         assert!(contains_name(text, "github"));
-        let edits = FactEdits {
-            corrections: true,
-            merge_duplicates: true,
-        };
-        let hints = vec!["GitHub".to_owned()];
-        assert!(proper_nouns_preserved(text, text, edits, &hints));
-        assert_eq!(
-            offset_preserving_lowercase("GitHub と Zoom").as_deref(),
-            Some("github と zoom")
-        );
+        let hints = vec!["GitHub<=ぎっとはぶ".to_owned()];
+        assert!(proper_nouns_preserved(text, text, name_edits(), &hints));
+        // A match inside one character's folding is not that character.
+        assert!(!contains_name("\u{130}", "i"));
+    }
+
+    #[test]
+    fn prompted_names_stay_protected_next_to_length_changing_characters() {
+        let source = "\u{212A}\u{130}\u{130} 東京";
+        let hints = vec!["東京<=東京".to_owned()];
+        assert!(!proper_nouns_preserved(
+            source,
+            "\u{212A}\u{130}\u{130}",
+            name_edits(),
+            &hints
+        ));
+        assert!(proper_nouns_preserved(source, source, name_edits(), &hints));
+    }
+
+    #[test]
+    fn names_fold_the_same_way_wherever_they_occur() {
+        // Contextual lowercasing would turn a final capital sigma into ς in
+        // the key but σ in the text, rejecting unchanged output.
+        let hints = vec!["ΟΣ<=ΟΣ".to_owned()];
+        assert!(proper_nouns_preserved("ΟΣ", "ΟΣ", name_edits(), &hints));
     }
 
     #[test]
