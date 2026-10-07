@@ -266,18 +266,21 @@ fn dictionary_terms(dictionary_hints: &[String]) -> Vec<(String, Vec<String>)> {
 /// Name occurrences in source order. A prompted term is keyed by its surface,
 /// whichever spelling was spoken.
 fn name_occurrences(text: &str, terms: &[(String, Vec<String>)]) -> Vec<FactOccurrence> {
-    let lower = text.to_lowercase();
     let mut candidates: Vec<FactOccurrence> = Vec::new();
-    // Lowercasing keeps byte offsets only when case mapping keeps lengths;
-    // otherwise prompted terms cannot be located in the source safely.
-    if lower.len() == text.len() {
+    // Without offset-preserving case mapping, prompted terms cannot be located
+    // in the source safely.
+    if let Some(lower) = offset_preserving_lowercase(text) {
         for (surface, readings) in terms {
             let key = FactKey {
                 value: surface.to_lowercase(),
                 unit: None,
             };
             for spelling in term_spellings(surface, readings) {
-                let spelling = spelling.to_lowercase();
+                // Lowercased like the source, character by character.
+                let spelling = spelling
+                    .chars()
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>();
                 for (at, _) in lower.match_indices(&spelling) {
                     let range = at..at + spelling.len();
                     if name_boundaries(text, &range) {
@@ -332,15 +335,30 @@ fn name_boundaries(text: &str, range: &std::ops::Range<usize>) -> bool {
         && !after.is_some_and(|character| character.is_ascii_alphanumeric())
 }
 
+/// Lowercases `text` only when every character keeps its UTF-8 length, so a
+/// byte offset found in the result is a valid offset in `text`. Equal total
+/// lengths are not enough: one character can shrink (Kelvin sign to "k")
+/// while another grows (dotted capital I), shifting every later offset.
+fn offset_preserving_lowercase(text: &str) -> Option<String> {
+    let mut lower = String::with_capacity(text.len());
+    for character in text.chars() {
+        let start = lower.len();
+        lower.extend(character.to_lowercase());
+        if lower.len() - start != character.len_utf8() {
+            return None;
+        }
+    }
+    Some(lower)
+}
+
 /// Whether `text` mentions `name` (lowercase), as a whole word when ASCII.
 fn contains_name(text: &str, name: &str) -> bool {
     if name.is_empty() {
         return false;
     }
-    let lower = text.to_lowercase();
-    if lower.len() != text.len() {
-        return lower.contains(name);
-    }
+    let Some(lower) = offset_preserving_lowercase(text) else {
+        return text.to_lowercase().contains(name);
+    };
     lower
         .match_indices(name)
         .any(|(at, _)| name_boundaries(text, &(at..at + name.len())))
@@ -3434,6 +3452,26 @@ mod tests {
                 "accepted {input} => {output}"
             );
         }
+    }
+
+    #[test]
+    fn length_changing_case_mapping_never_misaligns_name_offsets() {
+        // The Kelvin sign shrinks and each dotted capital I grows when
+        // lowercased, so the total length is unchanged while offsets shift.
+        let text = "\u{212A} GitHub \u{130}\u{130}";
+        assert_eq!(text.to_lowercase().len(), text.len());
+        assert_eq!(offset_preserving_lowercase(text), None);
+        assert!(contains_name(text, "github"));
+        let edits = FactEdits {
+            corrections: true,
+            merge_duplicates: true,
+        };
+        let hints = vec!["GitHub".to_owned()];
+        assert!(proper_nouns_preserved(text, text, edits, &hints));
+        assert_eq!(
+            offset_preserving_lowercase("GitHub と Zoom").as_deref(),
+            Some("github と zoom")
+        );
     }
 
     #[test]
