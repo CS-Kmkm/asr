@@ -1994,13 +1994,15 @@ fn openai_reasoning_allowance(model: &str, effort: &str) -> usize {
 }
 
 /// Thinking tokens reserved for Gemini. `thinking_level=minimal` is sent to
-/// models that accept it and keeps thinking negligible; any other model runs
-/// its default (dynamic) thinking, which counts against `max_output_tokens`.
+/// models that accept it and keeps thinking negligible. Gemini 2.5 models run
+/// their default (dynamic) thinking, which counts against
+/// `max_output_tokens`. Other models are not known to think, and some (such
+/// as gemini-2.0-flash) cap output at 8192 tokens, so they get no allowance.
 fn gemini_thinking_allowance(model: &str) -> usize {
-    if supports_gemini_minimal_thinking(model) {
-        0
-    } else {
+    if !supports_gemini_minimal_thinking(model) && model.starts_with("gemini-2.5") {
         8_192
+    } else {
+        0
     }
 }
 
@@ -3817,6 +3819,10 @@ mod tests {
         assert_eq!(gemini_thinking_allowance("gemini-flash-lite-latest"), 0);
         assert_eq!(gemini_thinking_allowance("gemini-3-flash-preview"), 0);
         assert_eq!(gemini_thinking_allowance("gemini-2.5-flash"), 8_192);
+        assert_eq!(gemini_thinking_allowance("gemini-2.5-pro"), 8_192);
+        for model in ["gemini-2.0-flash", "gemini-1.5-pro", "gemma-3-27b-it"] {
+            assert_eq!(gemini_thinking_allowance(model), 0, "{model}");
+        }
     }
 
     #[test]
@@ -3861,6 +3867,15 @@ mod tests {
         assert_eq!(
             gemini_request(&edit, "short", "correct it")["generation_config"]["max_output_tokens"],
             128 + 8_192
+        );
+        let non_thinking = Settings {
+            gemini_correction_model: "gemini-2.0-flash".into(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            gemini_request(&non_thinking, "short", "correct it")["generation_config"]
+                ["max_output_tokens"],
+            128
         );
 
         // Ask raises the visible budget to its minimum; the allowance still
