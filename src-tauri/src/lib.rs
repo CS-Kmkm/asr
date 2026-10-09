@@ -1199,15 +1199,15 @@ pub fn run() {
                     let _ = window.hide();
                 }
             }
-            if window.label() == "main" && matches!(event, WindowEvent::CloseRequested { .. }) {
-                // A tray icon keeps a Tauri process alive after its last window
-                // is closed. Treat the main window's close button as an actual
-                // application exit, but keep the window alive until RunEvent's
-                // asynchronous shutdown has stopped capture and the ASR worker.
+            if window.label() == "main" {
+                // The app stays resident in the tray: closing the main window
+                // only hides it, so dictation and the loaded model survive.
+                // Tray > Quit exits through RunEvent::ExitRequested, whose
+                // asynchronous shutdown stops capture and the ASR worker.
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
+                    let _ = window.hide();
                 }
-                window.app_handle().exit(0);
             }
         })
         .build(tauri::generate_context!())
