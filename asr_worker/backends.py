@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 from .download import (
     FASTER_WHISPER_ALLOW_PATTERNS,
+    FASTER_WHISPER_REQUIRED_FILES,
     ProgressCallback,
     cached_snapshot_path,
     download_snapshot,
@@ -389,7 +390,9 @@ class FasterWhisperBackend(ProgressReporting):
         repo_id = faster_whisper_repo_id(self.model_id)
         if repo_id is None:
             return self.model_id
-        cached = cached_snapshot_path(repo_id, FASTER_WHISPER_ALLOW_PATTERNS)
+        cached = cached_snapshot_path(
+            repo_id, FASTER_WHISPER_ALLOW_PATTERNS, FASTER_WHISPER_REQUIRED_FILES
+        )
         if cached is not None:
             return cached
         self.report_progress("download", model=repo_id)

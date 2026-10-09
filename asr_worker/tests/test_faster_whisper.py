@@ -17,6 +17,7 @@ from asr_worker.backends import (
     faster_whisper_compute_type,
     wav_duration_seconds,
 )
+from asr_worker.download import FASTER_WHISPER_ALLOW_PATTERNS
 
 
 class CreateBackendTests(unittest.TestCase):
@@ -192,6 +193,49 @@ class ResolveModelFilesTests(unittest.TestCase):
                 },
             ],
         )
+
+    def resolve_with_cached_files(self, files: list[str]) -> tuple[str, list[dict], list[dict]]:
+        """Resolve against a fake hub cache whose snapshot folder holds ``files``."""
+        backend = FasterWhisperBackend()
+        events: list[dict] = []
+        backend.progress = events.append
+        downloads: list[dict] = []
+
+        def fake_download(repo_id, allow_patterns, progress):  # noqa: ANN001
+            downloads.append({"repo_id": repo_id, "allow_patterns": allow_patterns})
+            return "/downloaded/repo"
+
+        with TemporaryDirectory() as tmp:
+            snapshot = Path(tmp)
+            for name in files:
+                (snapshot / name).write_bytes(b"x")
+            hub = types.ModuleType("huggingface_hub")
+            hub.snapshot_download = lambda repo_id, **kwargs: str(snapshot)  # type: ignore[attr-defined]
+            with patch.dict(sys.modules, {"huggingface_hub": hub}), patch(
+                "asr_worker.backends.faster_whisper_repo_id", return_value="org/repo"
+            ), patch("asr_worker.backends.download_snapshot", fake_download):
+                source = backend._resolve_model_files()
+                if source == str(snapshot):
+                    source = "<cached snapshot>"
+        return source, events, downloads
+
+    def test_interrupted_first_download_is_downloaded_again(self) -> None:
+        source, events, downloads = self.resolve_with_cached_files(
+            ["config.json", "tokenizer.json", "vocabulary.json"]
+        )
+
+        self.assertEqual(source, "/downloaded/repo")
+        self.assertEqual(downloads, [{"repo_id": "org/repo", "allow_patterns": FASTER_WHISPER_ALLOW_PATTERNS}])
+        self.assertEqual(events, [{"stage": "download", "model": "org/repo"}])
+
+    def test_complete_cached_snapshot_is_loaded_without_downloading(self) -> None:
+        source, events, downloads = self.resolve_with_cached_files(
+            ["config.json", "model.bin", "tokenizer.json", "vocabulary.json", "preprocessor_config.json"]
+        )
+
+        self.assertEqual(source, "<cached snapshot>")
+        self.assertEqual(downloads, [])
+        self.assertEqual(events, [])
 
     def test_unresolvable_model_is_left_to_faster_whisper(self) -> None:
         backend = FasterWhisperBackend()
