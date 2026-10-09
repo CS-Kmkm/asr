@@ -28,7 +28,7 @@ pub enum CorrectionError {
     Api { status: StatusCode, message: String },
     #[error("text correction API returned an invalid response: {0}")]
     InvalidResponse(String),
-    #[error("the local model reached its output token limit")]
+    #[error("the model reached its output token limit")]
     OutputLimit,
     /// The intent-aware fact check rejected an otherwise complete result.
     #[error("intent-aware correction changed protected transcript content")]
@@ -1319,7 +1319,10 @@ async fn request_text(
             let key = api_key(&settings.openai_api_key_env_var)?;
             let mut body = openai_request(settings, transcript, instruction);
             if let Some(minimum) = minimum_output_tokens {
-                body["max_output_tokens"] = json!(max_output_tokens(transcript).max(minimum));
+                body["max_output_tokens"] = json!(openai_output_budget(
+                    settings,
+                    max_output_tokens(transcript).max(minimum)
+                ));
             }
             client
                 .post(OPENAI_RESPONSES_URL)
@@ -1330,8 +1333,10 @@ async fn request_text(
             let key = api_key(&settings.gemini_api_key_env_var)?;
             let mut body = gemini_request(settings, transcript, instruction);
             if let Some(minimum) = minimum_output_tokens {
-                body["generation_config"]["max_output_tokens"] =
-                    json!(max_output_tokens(transcript).max(minimum));
+                body["generation_config"]["max_output_tokens"] = json!(gemini_output_budget(
+                    settings,
+                    max_output_tokens(transcript).max(minimum)
+                ));
             }
             client
                 .post(GEMINI_INTERACTIONS_URL)
@@ -1508,7 +1513,10 @@ fn openai_request(settings: &Settings, transcript: &str, instruction: &str) -> V
         "model": model,
         "instructions": instruction,
         "input": transcript,
-        "max_output_tokens": request_output_tokens(transcript, instruction),
+        "max_output_tokens": openai_output_budget(
+            settings,
+            request_output_tokens(transcript, instruction)
+        ),
         "store": false,
         "stream": true
     });
@@ -1527,7 +1535,10 @@ fn gemini_request(settings: &Settings, transcript: &str, instruction: &str) -> V
         "system_instruction": instruction,
         "input": transcript,
         "generation_config": {
-            "max_output_tokens": request_output_tokens(transcript, instruction)
+            "max_output_tokens": gemini_output_budget(
+                settings,
+                request_output_tokens(transcript, instruction)
+            )
         },
         "store": false,
         "stream": true
@@ -1822,7 +1833,8 @@ fn apply_stream_event(
             )))
         }
         ("gemini", Some("interaction.completed")) => Ok(true),
-        ("openai", Some("response.incomplete")) => Err(CorrectionError::InvalidResponse(
+        ("openai", Some("response.incomplete")) => Err(openai_incomplete_error(
+            value.pointer("/response/incomplete_details/reason"),
             incomplete_stream_message(provider, &value),
         )),
         ("gemini", Some("interaction.status_update"))
@@ -1837,6 +1849,15 @@ fn apply_stream_event(
             CorrectionError::InvalidResponse(stream_error_message(&value)),
         ),
         _ => Ok(false),
+    }
+}
+
+/// An OpenAI response cut off by `max_output_tokens` (visible text plus
+/// reasoning) is an output-limit failure, not a malformed response.
+fn openai_incomplete_error(reason: Option<&Value>, message: String) -> CorrectionError {
+    match reason.and_then(Value::as_str) {
+        Some("max_output_tokens") => CorrectionError::OutputLimit,
+        _ => CorrectionError::InvalidResponse(message),
     }
 }
 
@@ -1948,6 +1969,50 @@ fn request_output_tokens(input: &str, instruction: &str) -> usize {
     }
 }
 
+/// Output tokens reserved for hidden reasoning on top of the visible-text
+/// budget. OpenAI counts reasoning tokens against `max_output_tokens`, so a
+/// short utterance (visible budget 128) would otherwise be starved by any
+/// reasoning and end as an incomplete response. The values are deliberately
+/// generous ceilings, not expected usage: the cap only bounds the worst case,
+/// and correction prompts are short, so they stay below OpenAI's general
+/// "reserve about 25k tokens" advice except at the highest efforts.
+fn openai_reasoning_allowance(model: &str, effort: &str) -> usize {
+    match effort {
+        "none" if supports_openai_none_reasoning(model) => 0,
+        // The reasoning field is omitted for models that are not known to
+        // accept "none", so a reasoning model runs its default effort
+        // (medium for the GPT-5 and o-series families).
+        "none" | "medium" => 8_192,
+        "low" => 4_096,
+        "high" => 16_384,
+        _ => 32_768,
+    }
+}
+
+/// Thinking tokens reserved for Gemini. `thinking_level=minimal` is sent to
+/// models that accept it and keeps thinking negligible; any other model runs
+/// its default (dynamic) thinking, which counts against `max_output_tokens`.
+fn gemini_thinking_allowance(model: &str) -> usize {
+    if supports_gemini_minimal_thinking(model) {
+        0
+    } else {
+        8_192
+    }
+}
+
+fn openai_output_budget(settings: &Settings, visible_tokens: usize) -> usize {
+    visible_tokens.saturating_add(openai_reasoning_allowance(
+        settings.openai_correction_model.trim(),
+        settings.openai_reasoning_effort.as_str(),
+    ))
+}
+
+fn gemini_output_budget(settings: &Settings, visible_tokens: usize) -> usize {
+    visible_tokens.saturating_add(gemini_thinking_allowance(
+        settings.gemini_correction_model.trim(),
+    ))
+}
+
 fn supports_openai_none_reasoning(model: &str) -> bool {
     ["gpt-5.4", "gpt-5.5", "gpt-5.6"]
         .iter()
@@ -1959,6 +2024,12 @@ fn supports_gemini_minimal_thinking(model: &str) -> bool {
 }
 
 fn parse_openai_response(value: &Value) -> Result<String, CorrectionError> {
+    if value.get("status").and_then(Value::as_str) == Some("incomplete") {
+        return Err(openai_incomplete_error(
+            value.pointer("/incomplete_details/reason"),
+            "the response was incomplete".into(),
+        ));
+    }
     let text = value
         .get("output")
         .and_then(Value::as_array)
@@ -2803,7 +2874,15 @@ mod tests {
             &mut text,
             &mut preview,
         );
-        assert!(matches!(openai, Err(CorrectionError::InvalidResponse(_))));
+        assert!(matches!(openai, Err(CorrectionError::OutputLimit)));
+
+        let filtered = apply_stream_event(
+            "openai",
+            r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}}"#,
+            &mut text,
+            &mut preview,
+        );
+        assert!(matches!(filtered, Err(CorrectionError::InvalidResponse(_))));
 
         let gemini = apply_stream_event(
             "gemini",
@@ -3708,6 +3787,117 @@ mod tests {
         assert_eq!(max_output_tokens("short"), 128);
         assert_eq!(max_output_tokens(&"x".repeat(1_000)), 2_064);
         assert_eq!(max_output_tokens(&"x".repeat(20_000)), 32_768);
+    }
+
+    #[test]
+    fn reasoning_allowance_scales_with_effort_and_model_support() {
+        for (effort, allowance) in [
+            ("none", 0),
+            ("low", 4_096),
+            ("medium", 8_192),
+            ("high", 16_384),
+            ("xhigh", 32_768),
+            ("max", 32_768),
+        ] {
+            assert_eq!(
+                openai_reasoning_allowance("gpt-5.6-luna", effort),
+                allowance,
+                "{effort}"
+            );
+        }
+        // "none" is omitted for models not known to accept it, so their
+        // default (medium) reasoning still needs room.
+        assert_eq!(openai_reasoning_allowance("gpt-5-mini", "none"), 8_192);
+        assert_eq!(openai_reasoning_allowance("gpt-5-mini", "low"), 4_096);
+
+        assert_eq!(gemini_thinking_allowance("gemini-flash-lite-latest"), 0);
+        assert_eq!(gemini_thinking_allowance("gemini-3-flash-preview"), 0);
+        assert_eq!(gemini_thinking_allowance("gemini-2.5-flash"), 8_192);
+    }
+
+    #[test]
+    fn provider_requests_reserve_reasoning_tokens_beyond_the_visible_budget() {
+        for (model, effort, budget, sends_reasoning) in [
+            ("gpt-5.6-luna", "none", 128, true),
+            ("gpt-5.6-luna", "low", 128 + 4_096, true),
+            ("gpt-5.6-luna", "high", 128 + 16_384, true),
+            ("gpt-5.6-luna", "max", 128 + 32_768, true),
+            ("gpt-5-mini", "none", 128 + 8_192, false),
+            ("gpt-5-mini", "medium", 128 + 8_192, true),
+        ] {
+            let settings = Settings {
+                openai_correction_model: model.into(),
+                openai_reasoning_effort: effort.into(),
+                ..Settings::default()
+            };
+            let request = openai_request(&settings, "はい、了解です", "correct it");
+            assert_eq!(request["max_output_tokens"], budget, "{model} {effort}");
+            if sends_reasoning {
+                assert_eq!(request["reasoning"]["effort"], effort, "{model} {effort}");
+            } else {
+                assert!(request.get("reasoning").is_none(), "{model} {effort}");
+            }
+        }
+
+        let edit = Settings {
+            openai_reasoning_effort: "high".into(),
+            gemini_correction_model: "gemini-2.5-flash".into(),
+            ..Settings::default()
+        };
+        let instruction = build_edit_instruction();
+        let input = edit_request_input("short", "expand substantially");
+        assert_eq!(
+            openai_request(&edit, &input, instruction)["max_output_tokens"],
+            2_048 + 16_384
+        );
+        assert_eq!(
+            gemini_request(&edit, &input, instruction)["generation_config"]["max_output_tokens"],
+            2_048 + 8_192
+        );
+        assert_eq!(
+            gemini_request(&edit, "short", "correct it")["generation_config"]["max_output_tokens"],
+            128 + 8_192
+        );
+
+        // Ask raises the visible budget to its minimum; the allowance still
+        // applies on top of it.
+        assert_eq!(
+            openai_output_budget(
+                &edit,
+                max_output_tokens("short").max(ASK_PLAN_MIN_OUTPUT_TOKENS)
+            ),
+            512 + 16_384
+        );
+        assert_eq!(
+            openai_output_budget(&Settings::default(), ASK_TEXT_MIN_OUTPUT_TOKENS),
+            4_096
+        );
+        assert_eq!(
+            gemini_output_budget(&Settings::default(), ASK_PLAN_MIN_OUTPUT_TOKENS),
+            512
+        );
+    }
+
+    #[test]
+    fn incomplete_openai_responses_map_output_limit_separately() {
+        let limited = json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "partial"}]}]
+        });
+        assert!(matches!(
+            parse_openai_response(&limited),
+            Err(CorrectionError::OutputLimit)
+        ));
+        let filtered = json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "partial"}]}]
+        });
+        assert!(matches!(
+            parse_openai_response(&filtered),
+            Err(CorrectionError::InvalidResponse(_))
+        ));
     }
 
     #[test]
