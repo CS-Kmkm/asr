@@ -779,22 +779,37 @@ pub(crate) async fn stop_recording(
         .dictionary_asr_prompt_for(app_context.as_ref(), &settings.asr_backend)
         .unwrap_or_default();
     let correction_cancel = cancel.clone();
-    let transcript_result = services
-        .transcriber
-        .transcribe_with_locale(
-            &artifact.path,
-            prompt.as_deref(),
-            settings.speech_locale.as_deref(),
-            cancel,
-        )
-        .await;
+    // The model may have been reset since the recording started (for example
+    // after a worker crash), so load it as a new recording would.
+    let model_ready = ensure_model_loaded(&app, &services, &settings).await;
+    if services.lifecycle.is_cancelled(operation_id) {
+        report_temp_cleanup(&app, &mut artifact_cleanup);
+        emit_state(&app, &state, AppPhase::Idle, cancel_message);
+        return Err(cancel_error.into());
+    }
+    let transcript_result = match model_ready {
+        Err(error) => Err(error),
+        Ok(_) => match services
+            .transcriber
+            .transcribe_with_locale(
+                &artifact.path,
+                prompt.as_deref(),
+                settings.speech_locale.as_deref(),
+                cancel,
+            )
+            .await
+        {
+            Ok(value) => Ok(value),
+            Err(asr::AsrError::Cancelled) => {
+                report_temp_cleanup(&app, &mut artifact_cleanup);
+                emit_state(&app, &state, AppPhase::Idle, cancel_message);
+                return Err(cancel_error.into());
+            }
+            Err(error) => Err(command_error(error)),
+        },
+    };
     let transcript = match transcript_result {
         Ok(value) => value,
-        Err(asr::AsrError::Cancelled) => {
-            report_temp_cleanup(&app, &mut artifact_cleanup);
-            emit_state(&app, &state, AppPhase::Idle, cancel_message);
-            return Err(cancel_error.into());
-        }
         Err(error) => {
             let _ = storage.add_metric(
                 "asr",
@@ -810,7 +825,7 @@ pub(crate) async fn stop_recording(
                 "Transcription failed. Check model and GPU diagnostics.",
             );
             report_temp_cleanup(&app, &mut artifact_cleanup);
-            return Err(command_error(error));
+            return Err(error);
         }
     };
     if services.lifecycle.is_cancelled(operation_id) {
@@ -2949,6 +2964,51 @@ mod tests {
             "correction_failed"
         );
     }
+
+    #[test]
+    fn model_changes_wait_for_an_idle_pipeline() {
+        let previous = Settings::default();
+        let mut backend = previous.clone();
+        backend.asr_backend = if previous.asr_backend == "mock" {
+            "faster-whisper"
+        } else {
+            "mock"
+        }
+        .into();
+        let mut model = previous.clone();
+        model.model_id = Some("custom/model".into());
+        let mut quantization = previous.clone();
+        quantization.model_quantization = if previous.model_quantization == "4bit" {
+            "8bit"
+        } else {
+            "4bit"
+        }
+        .into();
+        let mut endpoint = previous.clone();
+        endpoint.api_base_url = "https://asr.example.invalid/v1".into();
+        let mut unrelated = previous.clone();
+        unrelated.interaction_sounds = !previous.interaction_sounds;
+        for busy in [
+            PipelinePhase::Starting,
+            PipelinePhase::Recording,
+            PipelinePhase::Processing,
+        ] {
+            for next in [&backend, &model, &quantization, &endpoint] {
+                assert_eq!(
+                    reject_model_change_while_busy(&previous, next, busy),
+                    Err(MODEL_CHANGE_WHILE_BUSY.to_string())
+                );
+                assert_eq!(
+                    reject_model_change_while_busy(&previous, next, PipelinePhase::Idle),
+                    Ok(())
+                );
+            }
+            assert_eq!(
+                reject_model_change_while_busy(&previous, &unrelated, busy),
+                Ok(())
+            );
+        }
+    }
 }
 
 #[tauri::command]
@@ -3122,6 +3182,7 @@ pub(crate) async fn update_settings(
     let previous = {
         let _settings_writes = storage.lock_settings_writes().map_err(command_error)?;
         let previous = storage.get_settings().map_err(command_error)?;
+        reject_model_change_while_busy(&previous, &settings, services.lifecycle.phase())?;
         let old_routes = services
             .shortcut_routes
             .lock()
@@ -3177,10 +3238,7 @@ pub(crate) async fn update_settings(
             );
         }
     }
-    let model_configuration_changed = settings.asr_backend != previous.asr_backend
-        || settings.model_id != previous.model_id
-        || settings.api_base_url != previous.api_base_url
-        || settings.api_key_env_var != previous.api_key_env_var;
+    let model_configuration_changed = worker_configuration_changed(&previous, &settings);
     if model_configuration_changed {
         services
             .transcriber
@@ -3203,6 +3261,33 @@ pub(crate) async fn update_settings(
     }
     let _ = app.emit("settings-changed", &settings);
     Ok(settings)
+}
+
+/// Settings that require a new worker command (`reconfigure` kills the worker).
+fn worker_configuration_changed(previous: &Settings, next: &Settings) -> bool {
+    next.asr_backend != previous.asr_backend
+        || next.model_id != previous.model_id
+        || next.api_base_url != previous.api_base_url
+        || next.api_key_env_var != previous.api_key_env_var
+}
+
+const MODEL_CHANGE_WHILE_BUSY: &str =
+    "Finish the current recording or processing before changing the speech model.";
+
+/// A recording or its processing owns the loaded speech model until it
+/// finishes. Reconfiguring or reloading it underneath would fail the final
+/// transcription, so such changes wait until the pipeline is idle.
+fn reject_model_change_while_busy(
+    previous: &Settings,
+    next: &Settings,
+    phase: PipelinePhase,
+) -> Result<(), String> {
+    let model_changed = worker_configuration_changed(previous, next)
+        || next.model_quantization != previous.model_quantization;
+    if model_changed && phase != PipelinePhase::Idle {
+        return Err(MODEL_CHANGE_WHILE_BUSY.into());
+    }
+    Ok(())
 }
 
 #[tauri::command]
