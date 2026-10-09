@@ -425,8 +425,15 @@ async fn run(
         let decoded_duration = prepared.duration();
         let artifact = tokio::task::spawn_blocking(move || prepared.into_artifact())
             .await
-            .map_err(|_| "live audio writing failed")?
-            .map_err(command_error)?;
+            .map_err(|_| "live audio writing failed")?;
+        let Some(artifact) = window_artifact(artifact)? else {
+            // Advance past the window; re-planning it would decode it forever.
+            segmentation.recognized(decoded_duration, voiced_until, Duration::ZERO, endpoint);
+            if endpoint {
+                cursor += decoded_duration;
+            }
+            continue;
+        };
         let mut cleanup = TempArtifact::new(artifact.path.clone(), false);
         if *cancel.borrow() || *stopped.borrow() {
             return Ok(());
@@ -440,21 +447,41 @@ async fn run(
         if *cancel.borrow() || *stopped.borrow() {
             return Ok(());
         }
-        let transcript = result.map_err(command_error)?;
-        if transcript.text.trim().is_empty() {
-            return Err("live recognition returned no text for voiced audio".into());
-        }
-        let text = append_utterance(&completed, &transcript.text);
-        if text != displayed {
-            on_update(&text);
-            displayed = text.clone();
+        if let Some(utterance) = window_text(result)? {
+            let text = append_utterance(&completed, &utterance);
+            if text != displayed {
+                on_update(&text);
+                displayed = text.clone();
+            }
+            if endpoint {
+                completed = text;
+            }
         }
         segmentation.recognized(decoded_duration, voiced_until, inference_cost, endpoint);
         if endpoint {
-            completed = text;
             cursor += decoded_duration;
         }
     }
+}
+
+/// A window with nothing recognizable in it, such as a cough or breath that
+/// passed the segmentation energy gate, is skipped (`None`) so live
+/// recognition keeps running. Only real audio failures end live mode.
+fn window_artifact(
+    result: Result<audio::AudioArtifact, AudioError>,
+) -> Result<Option<audio::AudioArtifact>, String> {
+    match result {
+        Ok(artifact) => Ok(Some(artifact)),
+        Err(AudioError::TooShort { .. } | AudioError::NoVoiceDetected) => Ok(None),
+        Err(error) => Err(command_error(error)),
+    }
+}
+
+/// An empty recognition result skips the window (`None`); worker and
+/// transport errors still end live mode.
+fn window_text(result: Result<asr::Transcript, asr::AsrError>) -> Result<Option<String>, String> {
+    let transcript = result.map_err(command_error)?;
+    Ok((!transcript.text.trim().is_empty()).then_some(transcript.text))
 }
 
 #[cfg(test)]
@@ -911,6 +938,142 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(updates, ["途中", "途中途中の文章"]);
+        assert_eq!(recognizer.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    fn transcript(text: &str) -> asr::Transcript {
+        asr::Transcript {
+            text: text.into(),
+            segments: vec![],
+            model: "test".into(),
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn unrecognizable_windows_are_skipped_but_real_failures_end_live_mode() {
+        for empty in ["", "  \n"] {
+            assert_eq!(window_text(Ok(transcript(empty))), Ok(None));
+        }
+        assert_eq!(
+            window_text(Ok(transcript(" 途中 "))),
+            Ok(Some(" 途中 ".into()))
+        );
+        for error in [asr::AsrError::Crashed, asr::AsrError::Timeout] {
+            assert!(window_text(Err(error)).is_err());
+        }
+
+        assert!(matches!(
+            window_artifact(Err(AudioError::NoVoiceDetected)),
+            Ok(None)
+        ));
+        assert!(matches!(
+            window_artifact(Err(AudioError::TooShort {
+                actual: Duration::from_millis(10),
+                minimum: Duration::from_millis(100),
+            })),
+            Ok(None)
+        ));
+        assert!(window_artifact(Err(AudioError::NotCapturing)).is_err());
+    }
+
+    /// Returns the scripted results in order, then repeats the last one.
+    struct ScriptedRecognizer {
+        calls: AtomicUsize,
+        script: Vec<Option<&'static str>>,
+    }
+    #[async_trait::async_trait]
+    impl Transcriber for ScriptedRecognizer {
+        async fn load(&self, _: &str) -> Result<(), asr::AsrError> {
+            Ok(())
+        }
+        async fn transcribe(
+            &self,
+            _: &Path,
+            _: Option<&str>,
+            _: watch::Receiver<bool>,
+        ) -> Result<asr::Transcript, asr::AsrError> {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.script[index.min(self.script.len() - 1)]
+                .map(transcript)
+                .ok_or(asr::AsrError::Crashed)
+        }
+        async fn shutdown(&self) -> Result<(), asr::AsrError> {
+            Ok(())
+        }
+        async fn reconfigure(&self, _: WorkerCommand) {}
+    }
+
+    fn voiced_capture(directory: &Path) -> tokio::sync::Mutex<Box<dyn AudioCapture>> {
+        tokio::sync::Mutex::new(Box::new(Capture {
+            directory: directory.to_owned(),
+            snapshots: AtomicUsize::new(0),
+            source: None,
+        }))
+    }
+
+    #[tokio::test]
+    async fn an_empty_partial_result_does_not_end_live_recognition() {
+        let directory = tempfile::tempdir().unwrap();
+        let audio = voiced_capture(directory.path());
+        let recognizer = ScriptedRecognizer {
+            calls: AtomicUsize::new(0),
+            script: vec![Some(""), Some("途中")],
+        };
+        let (_cancel, cancel) = watch::channel(false);
+        let (stop, stopped) = watch::channel(false);
+        let mut updates = vec![];
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run(
+                &audio,
+                &recognizer,
+                None,
+                None,
+                cancel,
+                stopped,
+                Duration::from_millis(1),
+                |text| {
+                    updates.push(text.to_owned());
+                    stop.send_replace(true);
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(updates, ["途中"]);
+        assert_eq!(recognizer.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_worker_failure_still_ends_live_recognition() {
+        let directory = tempfile::tempdir().unwrap();
+        let audio = voiced_capture(directory.path());
+        let recognizer = ScriptedRecognizer {
+            calls: AtomicUsize::new(0),
+            script: vec![Some(""), None],
+        };
+        let (_cancel, cancel) = watch::channel(false);
+        let (_stop, stopped) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run(
+                &audio,
+                &recognizer,
+                None,
+                None,
+                cancel,
+                stopped,
+                Duration::from_millis(1),
+                |_| panic!("no text was recognized"),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
         assert_eq!(recognizer.calls.load(Ordering::SeqCst), 2);
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
     }
