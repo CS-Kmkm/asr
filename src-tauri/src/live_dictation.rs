@@ -447,8 +447,8 @@ async fn run(
         if *cancel.borrow() || *stopped.borrow() {
             return Ok(());
         }
-        if let Some(utterance) = window_text(result)? {
-            let text = append_utterance(&completed, &utterance);
+        let utterance = window_text(result)?;
+        if let Some(text) = window_display(&completed, utterance.as_deref(), endpoint) {
             if text != displayed {
                 on_update(&text);
                 displayed = text.clone();
@@ -474,6 +474,17 @@ fn window_artifact(
         Ok(artifact) => Ok(Some(artifact)),
         Err(AudioError::TooShort { .. } | AudioError::NoVoiceDetected) => Ok(None),
         Err(error) => Err(command_error(error)),
+    }
+}
+
+/// The live text after one recognized window, or `None` to keep the current
+/// display. An empty result at an utterance endpoint withdraws the partial
+/// shown earlier for that utterance, since it will never be committed.
+fn window_display(completed: &str, utterance: Option<&str>, endpoint: bool) -> Option<String> {
+    match utterance {
+        Some(utterance) => Some(append_utterance(completed, utterance)),
+        None if endpoint => Some(completed.to_owned()),
+        None => None,
     }
 }
 
@@ -976,6 +987,19 @@ mod tests {
             Ok(None)
         ));
         assert!(window_artifact(Err(AudioError::NotCapturing)).is_err());
+    }
+
+    #[test]
+    fn an_empty_endpoint_withdraws_the_uncommitted_partial() {
+        assert_eq!(
+            window_display("前文", Some("途中"), false),
+            Some("前文途中".into())
+        );
+        // An empty partial keeps whatever is displayed.
+        assert_eq!(window_display("前文", None, false), None);
+        // An empty endpoint reverts to the committed text.
+        assert_eq!(window_display("前文", None, true), Some("前文".into()));
+        assert_eq!(window_display("", None, true), Some(String::new()));
     }
 
     /// Returns the scripted results in order, then repeats the last one.
