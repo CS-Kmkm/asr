@@ -42,8 +42,10 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import wave
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +53,10 @@ from typing import Any
 # large LLM-style ASR model can take a while, and a 60s utterance transcription
 # is itself non-trivial. Override with --timeout.
 DEFAULT_TIMEOUT_S = 300.0
+
+# Worker stderr lines kept for failure reports. The rest is read and dropped so
+# the worker never blocks on a full stderr pipe.
+STDERR_TAIL_LINES = 200
 
 # Synthetic audio parameters for --smoke.
 SMOKE_SAMPLE_RATE = 24_000
@@ -126,6 +132,8 @@ class WorkerSession:
         self.env = env
         self.proc: subprocess.Popen[str] | None = None
         self._next_id = 0
+        self._stderr_lines: deque[str] = deque(maxlen=STDERR_TAIL_LINES)
+        self._stderr_thread: threading.Thread | None = None
 
     def __enter__(self) -> "WorkerSession":
         try:
@@ -141,6 +149,11 @@ class WorkerSession:
             )
         except (OSError, ValueError) as exc:
             raise BenchError(f"failed to start worker {self.cmd!r}: {exc}") from exc
+        # Model libraries write warnings and progress bars to stderr. Unread,
+        # they fill the pipe buffer and block the worker, which then looks like
+        # a model hang ("worker timed out").
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -150,13 +163,27 @@ class WorkerSession:
         self._next_id += 1
         return self._next_id
 
-    def _stderr_tail(self) -> str:
-        """Best-effort read of any stderr the worker emitted, for diagnostics."""
-        if self.proc is None or self.proc.stderr is None:
-            return ""
+    def _drain_stderr(self) -> None:
+        """Keep reading worker stderr, remembering only the most recent lines."""
+        stream = self.proc.stderr if self.proc is not None else None
+        if stream is None:
+            return
         with contextlib.suppress(Exception):
-            return self.proc.stderr.read() or ""
-        return ""
+            for line in stream:
+                self._stderr_lines.append(line)
+
+    def _stderr_tail(self) -> str:
+        """The most recent stderr lines the worker emitted, for diagnostics."""
+        thread = self._stderr_thread
+        if thread is not None and self.proc is not None:
+            # Failure reports often come from a worker that is still exiting.
+            # Once it has exited, the drain thread reaches end of file, so its
+            # last lines are included.
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                self.proc.wait(timeout=1)
+            if self._poll() is not None:
+                thread.join(timeout=2)
+        return "".join(list(self._stderr_lines))
 
     def request(self, payload: dict[str, Any]) -> tuple[dict[str, Any], float]:
         """Send one JSONL request, return (response, wall_ms).
@@ -217,8 +244,6 @@ class WorkerSession:
         portable to Windows, and the real runs happen on Windows.
         """
         assert self.proc is not None and self.proc.stdout is not None
-        import threading
-
         result: dict[str, str | None] = {"line": None}
 
         def _reader() -> None:
@@ -255,6 +280,9 @@ class WorkerSession:
                 self.proc.wait(timeout=5)
         if self.proc.poll() is None:
             self._kill()
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=2)
+            self._stderr_thread = None
         # Drain pipes so the OS can reclaim the fds.
         for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
             with contextlib.suppress(Exception):
