@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import contextlib
+import json
+import os
 import sys
 import types
 import unittest
@@ -8,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-from asr_worker.backends import VibeVoiceBackend, join_segment_texts
+from asr_worker.backends import BackendError, VibeVoiceBackend, join_segment_texts
 
 
 class _FakeIds:
@@ -23,10 +25,9 @@ class _FakeIds:
 
     def __getitem__(self, key: Any) -> Any:
         rows, columns = key
-        selected = [row[columns] for row in self.rows[rows]]
-        if isinstance(columns, int):
-            return selected[0] if isinstance(rows, int) else selected
-        return _FakeIds(selected)
+        if isinstance(rows, int):
+            return self.rows[rows][columns]
+        return _FakeIds([row[columns] for row in self.rows[rows]])
 
 
 class _FakeInputs(dict):
@@ -48,13 +49,23 @@ class _FakeProcessor:
         return [self.parsed]
 
 
+class _CutOffProcessor(_FakeProcessor):
+    """Fails like the real parser on a transcript that never closed its JSON array."""
+
+    def decode(self, generated_ids: _FakeIds, return_format: str) -> list[list[dict[str, Any]]]:
+        self.decoded.append(generated_ids)
+        return [json.loads('[{"Start": 0.0, "Content": "cut')]
+
+
 class _FakeModel:
     device = "cuda:0"
     dtype = "bfloat16"
 
-    def __init__(self, generated: list[int]) -> None:
+    def __init__(self, generated: list[int], eos_token_id: Any = None) -> None:
         self.generated = generated
         self.max_new_tokens: int | None = None
+        if eos_token_id is not None:
+            self.generation_config = types.SimpleNamespace(eos_token_id=eos_token_id)
 
     def generate(self, input_ids: _FakeIds, max_new_tokens: int) -> _FakeIds:
         self.max_new_tokens = max_new_tokens
@@ -120,6 +131,51 @@ class VibeVoiceTranscribeTests(unittest.TestCase):
         text, _ = _transcribe(processor, _FakeModel([7, 8, 2]))
 
         self.assertEqual(text, "Hello there. See you tomorrow.")
+
+
+
+class VibeVoiceTruncationTests(unittest.TestCase):
+    def transcribe_with_limit(self, processor: _FakeProcessor, model: _FakeModel) -> tuple[str, list[dict[str, Any]]]:
+        with patch.dict(os.environ, {"ASR_MAX_NEW_TOKENS": "4"}):
+            return _transcribe(processor, model)
+
+    def test_output_cut_off_at_the_token_limit_is_a_clear_error(self) -> None:
+        processor = _CutOffProcessor([])
+        model = _FakeModel([7, 8, 9, 10, 11, 12], eos_token_id=2)
+
+        with self.assertRaises(BackendError) as raised:
+            self.transcribe_with_limit(processor, model)
+
+        self.assertEqual(raised.exception.code, "transcript_truncated")
+        self.assertIn("4-token output limit", raised.exception.message)
+        self.assertIn("ASR_MAX_NEW_TOKENS", raised.exception.message)
+        self.assertEqual(model.max_new_tokens, 4)
+        self.assertEqual(processor.decoded, [])
+
+    def test_limit_is_detected_without_a_known_end_token(self) -> None:
+        with self.assertRaises(BackendError) as raised:
+            self.transcribe_with_limit(_CutOffProcessor([]), _FakeModel([7, 8, 9, 10]))
+
+        self.assertEqual(raised.exception.code, "transcript_truncated")
+
+    def test_transcript_ending_exactly_at_the_limit_is_complete(self) -> None:
+        processor = _FakeProcessor(_segments("Hello"))
+        text, _ = self.transcribe_with_limit(processor, _FakeModel([7, 8, 9, 2], eos_token_id=[2, 3]))
+
+        self.assertEqual(text, "Hello")
+
+    def test_transcript_below_the_limit_is_decoded(self) -> None:
+        processor = _FakeProcessor(_segments("Hello"))
+        text, _ = self.transcribe_with_limit(processor, _FakeModel([7, 8, 2], eos_token_id=2))
+
+        self.assertEqual(text, "Hello")
+        self.assertEqual(processor.decoded[0].rows, [[7, 8, 2]])
+
+    def test_other_parse_failures_stay_transcription_failed(self) -> None:
+        with self.assertRaises(BackendError) as raised:
+            self.transcribe_with_limit(_CutOffProcessor([]), _FakeModel([7, 2], eos_token_id=2))
+
+        self.assertEqual(raised.exception.code, "transcription_failed")
 
 
 if __name__ == "__main__":

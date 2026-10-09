@@ -294,6 +294,7 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 | `hf_download_failed` | backends.py(例外マッピング) | Hugging Faceへの接続、名前解決、またはダウンロードが失敗した。 |
 | `model_load_failed` | backends.py(例外マッピング) | `load` 中の予期しない例外(OOM以外)。 |
 | `transcription_failed` | backends.py(例外マッピング) | `transcribe` 中の予期しない例外(OOM以外)。 |
+| `transcript_truncated` | backends.py (`VibeVoiceBackend.transcribe`) | 生成が `max_new_tokens`(音声長からの推定、上限4096、`ASR_MAX_NEW_TOKENS` で上書き可)に達し、終端トークンなしで打ち切られた。途中までの出力は返さない(長尺録音の分割または `ASR_MAX_NEW_TOKENS` の引き上げが必要)。 |
 | `internal_error` | worker.py | 上記のいずれにも該当しない予期しない例外を `handle` が捕捉した場合の包括フォールバック。 |
 
 補足:
@@ -302,7 +303,8 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
   終了コード2で即時終了する。これはプロトコル上のレスポンスではなく、起動時の失敗である。
 - `BackendError` として送出されたコード(`unsupported_quantization`, `backend_unavailable`,
   `gpu_oom`, `gpu_unsupported`, `hf_auth_required`, `hf_repository_unavailable`,
-  `hf_rate_limited`, `hf_download_failed`, `model_load_failed`, `transcription_failed`)は
+  `hf_rate_limited`, `hf_download_failed`, `model_load_failed`, `transcription_failed`,
+  `transcript_truncated`)は
   `handle` 内で捕捉され、そのコードのままレスポンスに反映される。
 - それ以外の想定外例外はすべて `internal_error` に丸められ、詳細はstderrにのみ出力される
   (`message` には例外の内部詳細を含めない)。

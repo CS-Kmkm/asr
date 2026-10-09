@@ -142,6 +142,33 @@ def join_segment_texts(texts: list[str]) -> str:
     return joined
 
 
+def generation_reached_limit(
+    generated_ids: Any,
+    max_new_tokens: int,
+    eos_token_ids: set[int],
+) -> bool:
+    """Whether generation stopped at ``max_new_tokens`` instead of finishing.
+
+    A sequence whose end-of-sequence token is exactly the last allowed token is
+    complete, so only a full-length sequence without one counts as cut off.
+    """
+    if generated_ids.shape[1] < max_new_tokens:
+        return False
+    return int(generated_ids[0, -1]) not in eos_token_ids
+
+
+def _eos_token_ids(model: Any) -> set[int]:
+    eos = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+    if eos is None:
+        return set()
+    if isinstance(eos, int):
+        return {eos}
+    try:
+        return {int(token) for token in eos}
+    except (TypeError, ValueError):
+        return set()
+
+
 def wav_duration_seconds(audio_path: Path) -> float | None:
     try:
         with contextlib.closing(wave.open(str(audio_path), "rb")) as handle:
@@ -367,6 +394,15 @@ class VibeVoiceBackend(ProgressReporting):
                 output_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
                 generated_ids = output_ids[:, input_length:]
                 del inputs
+                # A cut-off transcript is an unterminated JSON array, which the
+                # parser reports only as an opaque JSONDecodeError.
+                if generation_reached_limit(generated_ids, max_new_tokens, _eos_token_ids(self.model)):
+                    del generated_ids, output_ids
+                    raise BackendError(
+                        "transcript_truncated",
+                        f"VibeVoice reached its {max_new_tokens}-token output limit before the "
+                        "transcript ended. Record a shorter clip or raise ASR_MAX_NEW_TOKENS.",
+                    )
                 parsed = self.processor.decode(generated_ids, return_format="parsed")[0]
                 del generated_ids, output_ids
             segments = [
@@ -380,6 +416,8 @@ class VibeVoiceBackend(ProgressReporting):
             ]
             text = join_segment_texts([segment["text"] for segment in segments])
             return text, segments
+        except BackendError:
+            raise
         except BaseException as exc:
             raise map_backend_exception(exc, "transcribe") from exc
 
