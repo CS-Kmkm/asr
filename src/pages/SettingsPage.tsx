@@ -19,6 +19,9 @@ const shortcutModes: Array<{ mode: ShortcutMode; label: "Dictation shortcuts" | 
   { mode: "edit", label: "Speak to edit shortcuts" },
 ];
 
+// Inactive shortcuts arrive as "Action (chord)" with the English action label.
+const shortcutActionLabels = ["Dictation", "Selected-text translation", "Voice Translate", "Speak to edit", "Ask Anything"] as const;
+
 const profileCategories = new Set(["browser", "email", "messaging", "development", "document", "other"]);
 
 function isValidProfileScope(scope: string): boolean {
@@ -58,7 +61,7 @@ export function SettingsPage({
   const [testStopping, setTestStopping] = useState(false);
   const [testError, setTestError] = useState<string | null>(null);
   const [shortcutError, setShortcutError] = useState<string | null>(null);
-  const [startupShortcutWarning, setStartupShortcutWarning] = useState(false);
+  const [inactiveStartupShortcuts, setInactiveStartupShortcuts] = useState<string[]>([]);
   const [level, setLevel] = useState<AudioLevel>({ rms: 0, peak: 0 });
   const testRunningRef = useRef(false);
   const mountedRef = useRef(false);
@@ -78,7 +81,7 @@ export function SettingsPage({
 
   useEffect(() => setTranslationInstruction(settings.translationInstruction), [settings.translationInstruction]);
   useEffect(() => {
-    void getShortcutWarning().then(setStartupShortcutWarning).catch(() => {});
+    void getShortcutWarning().then(setInactiveStartupShortcuts).catch(() => {});
   }, [settings.shortcuts, settings.translationHotkey]);
   useEffect(() => {
     if (!settings.translationTargetLanguages.includes(languageToAdd)) return;
@@ -327,7 +330,10 @@ export function SettingsPage({
             </div>} />
         ))}
         {shortcutError && <p className="settings-error" role="alert">{shortcutError}</p>}
-        {startupShortcutWarning && <p className="settings-error" role="alert">{t("Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.")}</p>}
+        {inactiveStartupShortcuts.length > 0 && <p className="settings-error" role="alert">{t("Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.")} {t("Inactive shortcuts:")} {inactiveStartupShortcuts.map((entry) => {
+          const action = shortcutActionLabels.find((label) => entry.startsWith(`${label} (`));
+          return action ? `${t(action)}${entry.slice(action.length)}` : entry;
+        }).join(", ")}</p>}
         <SettingRow title={t("Selected-text translation hotkey")} detail={t("Translates selected text; the default is Ctrl+Shift+T.")}
           control={<input value={translationHotkey} aria-label={t("Selected-text translation hotkey")} onChange={(event) => { setTranslationHotkey(event.target.value); setShortcutError(null); }} onKeyDown={(event) => {
             if (event.key === "Enter") { event.preventDefault(); commitShortcuts(); event.currentTarget.blur(); }
