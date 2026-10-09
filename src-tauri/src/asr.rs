@@ -194,6 +194,13 @@ impl JsonlTranscriber {
                 Stdio::inherit()
             })
             .kill_on_drop(true);
+        // The release app has no console for the Python worker to share, so
+        // it would otherwise open a console window of its own.
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
         let mut child = command.spawn()?;
         if let Some(stderr) = child.stderr.take() {
             crate::worker_log::mark_worker_start();

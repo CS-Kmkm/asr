@@ -3884,12 +3884,20 @@ fn spawn_load_progress_forwarder(
 }
 
 pub(crate) fn probe_gpu_diagnostics() -> GpuDiagnostics {
-    let output = Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=name,driver_version,memory.total",
-            "--format=csv,noheader,nounits",
-        ])
-        .output();
+    let mut command = Command::new("nvidia-smi");
+    command.args([
+        "--query-gpu=name,driver_version,memory.total",
+        "--format=csv,noheader,nounits",
+    ]);
+    // The release app has no console for this console tool to share, so it
+    // would otherwise open a window of its own.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command.output();
     if let Ok(output) = output {
         if output.status.success() {
             let line = String::from_utf8_lossy(&output.stdout);
