@@ -28,8 +28,12 @@ pub enum CorrectionError {
     Api { status: StatusCode, message: String },
     #[error("text correction API returned an invalid response: {0}")]
     InvalidResponse(String),
-    #[error("the model reached its output token limit")]
+    #[error("the local model reached its output token limit")]
     OutputLimit,
+    /// A cloud provider stopped at `max_output_tokens`, which also counts its
+    /// hidden reasoning tokens.
+    #[error("the AI provider reached its output token limit")]
+    ProviderOutputLimit,
     /// The intent-aware fact check rejected an otherwise complete result.
     #[error("intent-aware correction changed protected transcript content")]
     ProtectedContentChanged,
@@ -1856,7 +1860,7 @@ fn apply_stream_event(
 /// reasoning) is an output-limit failure, not a malformed response.
 fn openai_incomplete_error(reason: Option<&Value>, message: String) -> CorrectionError {
     match reason.and_then(Value::as_str) {
-        Some("max_output_tokens") => CorrectionError::OutputLimit,
+        Some("max_output_tokens") => CorrectionError::ProviderOutputLimit,
         _ => CorrectionError::InvalidResponse(message),
     }
 }
@@ -2874,7 +2878,7 @@ mod tests {
             &mut text,
             &mut preview,
         );
-        assert!(matches!(openai, Err(CorrectionError::OutputLimit)));
+        assert!(matches!(openai, Err(CorrectionError::ProviderOutputLimit)));
 
         let filtered = apply_stream_event(
             "openai",
@@ -3887,7 +3891,7 @@ mod tests {
         });
         assert!(matches!(
             parse_openai_response(&limited),
-            Err(CorrectionError::OutputLimit)
+            Err(CorrectionError::ProviderOutputLimit)
         ));
         let filtered = json!({
             "status": "incomplete",
