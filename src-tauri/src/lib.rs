@@ -55,6 +55,8 @@ use types::{
     NewDictionaryEntry, NewHistoryItem, RecordingResult, Settings,
 };
 
+/// Minimum response timeout for an ASR request. Transcription of a long
+/// recording scales beyond it with the audio length (`asr::transcription_timeout`).
 const ASR_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const ASR_MODEL_LOAD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
 
