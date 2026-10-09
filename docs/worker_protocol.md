@@ -177,6 +177,7 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 | `command` | `"transcribe"` | 必須 | 操作名(`op` でも可)。 |
 | `audio_path` | 文字列(非空) | 必須 | 音声ファイルのパス。非空文字列でなければ `invalid_audio_path`、ファイルが存在しなければ `audio_not_found`。 |
 | `prompt` | 文字列 / 文字列リスト / `null` / 省略 | 任意 | 認識ヒント(辞書語など)。詳細は下記。 |
+| `language` | 文字列(32文字以下) / `null` / 省略 | 任意 | 音声の言語(例 `ja`、`en-GB`)。それ以外の型や長すぎる値は `invalid_request`。faster-whisper と openai-compatible は地域部分を除いたベース言語として渡す。VibeVoice は transformers の `apply_transcription_request` が言語引数を持たないため無視する。 |
 
 **`prompt` の扱い:**
 
@@ -212,9 +213,10 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 | `speaker` | 任意 / `null` | 話者識別子。VibeVoiceは話者番号等を返しうる。faster-whisperおよびエラーフォールバックでは `null`。Rust側では `Option<Value>` として保持され、型を限定しない。 |
 | `text` | 文字列 | セグメントのテキスト。 |
 
-`text` 全文の組み立て規則はバックエンドにより異なる(VibeVoiceは各セグメントを半角空白で連結、
-faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレスポンスでは確定済みの
-`text` フィールドとして返る。
+`text` 全文の組み立て規則はバックエンドにより異なる(VibeVoiceは各セグメントを `strip()` して
+連結し、境界の片側が漢字・かな・全角記号などの空白を置かない文字なら区切りなし、それ以外は
+半角空白1つを挟む。faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレスポンスでは
+確定済みの `text` フィールドとして返る。
 
 **JSON例:**
 

@@ -102,6 +102,46 @@ def compute_max_new_tokens(
     return max(floor, min(ceiling, estimate))
 
 
+# Scripts written without spaces between words, plus the full-width forms used
+# with them. Hangul is excluded on purpose: Korean separates words with spaces.
+_UNSPACED_SCRIPT_RANGES = (
+    (0x2E80, 0x2FDF),  # CJK radicals and Kangxi radicals
+    (0x3000, 0x303F),  # CJK symbols and punctuation (、。「」)
+    (0x3040, 0x30FF),  # Hiragana and Katakana (including ー)
+    (0x3100, 0x312F),  # Bopomofo
+    (0x31F0, 0x31FF),  # Katakana phonetic extensions
+    (0x3200, 0x33FF),  # Enclosed CJK letters and CJK compatibility
+    (0x3400, 0x4DBF),  # CJK unified ideographs extension A
+    (0x4E00, 0x9FFF),  # CJK unified ideographs
+    (0xF900, 0xFAFF),  # CJK compatibility ideographs
+    (0xFE30, 0xFE4F),  # CJK compatibility forms
+    (0xFF00, 0xFF9F),  # Full-width forms, half-width CJK punctuation and Katakana
+    (0x20000, 0x3134F),  # CJK unified ideographs extensions B and later
+)
+
+
+def _is_unspaced_script(char: str) -> bool:
+    code = ord(char)
+    return any(start <= code <= end for start, end in _UNSPACED_SCRIPT_RANGES)
+
+
+def join_segment_texts(texts: list[str]) -> str:
+    """Join segment texts with one space, except next to CJK, kana or full-width text.
+
+    Japanese and Chinese are written without spaces between words, so a space
+    at a segment boundary would be inserted into the user's text verbatim.
+    """
+    joined = ""
+    for text in texts:
+        text = text.strip()
+        if not text:
+            continue
+        if joined and not (_is_unspaced_script(joined[-1]) or _is_unspaced_script(text[0])):
+            joined += " "
+        joined += text
+    return joined
+
+
 def wav_duration_seconds(audio_path: Path) -> float | None:
     try:
         with contextlib.closing(wave.open(str(audio_path), "rb")) as handle:
@@ -338,7 +378,7 @@ class VibeVoiceBackend(ProgressReporting):
                 }
                 for item in parsed
             ]
-            text = " ".join(segment["text"] for segment in segments).strip()
+            text = join_segment_texts([segment["text"] for segment in segments])
             return text, segments
         except BaseException as exc:
             raise map_backend_exception(exc, "transcribe") from exc
