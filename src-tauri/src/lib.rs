@@ -1011,10 +1011,25 @@ async fn initialize_model_runtime(app: AppHandle, settings: Settings) {
     }
 }
 
+/// Bring the main window to the front, restoring it from the tray or taskbar.
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     load_environment_file();
     tauri::Builder::default()
+        // Must stay the first plugin: a second launch hands over to the running
+        // instance and exits inside this plugin's initialization, before the
+        // database, hotkeys, tray, or ASR worker of the new process start.
+        .plugin(tauri_plugin_single_instance::init(|app, _arguments, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -1097,12 +1112,7 @@ pub fn run() {
                 .menu(&menu)
                 .tooltip("Local Voice Input")
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
+                    "show" => show_main_window(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })
