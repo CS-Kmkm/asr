@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Empty } from "../components/ui";
 import type { DictionaryCandidate, DictionaryEntry, DictionaryEntryInput } from "../types";
 import { useI18n } from "../i18n";
@@ -6,12 +6,21 @@ import { useI18n } from "../i18n";
 const emptyForm = { reading: "", surface: "", category: "", aliases: "", priority: "0", appScope: "" };
 type Form = typeof emptyForm;
 
-function toInput(form: Form): DictionaryEntryInput {
-  const priority = Number(form.priority);
+// The backend stores priority as i64; anything other than a whole number in
+// this range would otherwise fail deserialization with an untranslated error.
+export const PRIORITY_MIN = -1_000_000;
+export const PRIORITY_MAX = 1_000_000;
+export function parsePriority(value: string): number | null {
+  if (!value.trim()) return null;
+  const priority = Number(value);
+  return Number.isSafeInteger(priority) && priority >= PRIORITY_MIN && priority <= PRIORITY_MAX ? priority : null;
+}
+
+function toInput(form: Form, priority: number): DictionaryEntryInput {
   return {
     reading: form.reading.trim(), surface: form.surface.trim(), category: form.category.trim() || null,
     aliases: form.aliases.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
-    priority: Number.isFinite(priority) ? priority : 0, appScope: form.appScope.trim() || null,
+    priority, appScope: form.appScope.trim() || null,
   };
 }
 
@@ -29,6 +38,12 @@ export function DictionaryPage({ entries, candidates, onAdd, onUpdate, onDelete,
   const [source, setSource] = useState<"all" | "manual" | "auto">("all");
   const [importError, setImportError] = useState(false);
   const importInput = useRef<HTMLInputElement>(null);
+  const priorityInput = useRef<HTMLInputElement>(null);
+  const priorityInvalid = parsePriority(form.priority) === null;
+  const priorityMessage = t("Priority must be a whole number from -1000000 to 1000000.");
+  // Native step/min/max checks block submission before onSubmit runs, so a
+  // custom validity message keeps that native prompt translated too.
+  useEffect(() => priorityInput.current?.setCustomValidity(priorityInvalid ? priorityMessage : ""), [priorityInvalid, priorityMessage]);
   const visible = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase();
     return entries.filter((entry) => (source === "all" || entry.source === source) && (!needle || [entry.reading, entry.surface, entry.category ?? "", entry.aliases.join(" "), entry.appScope ?? ""].some((value) => value.toLocaleLowerCase().includes(needle))));
@@ -36,7 +51,9 @@ export function DictionaryPage({ entries, candidates, onAdd, onUpdate, onDelete,
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    const ok = editing === null ? await onAdd(toInput(form)) : await onUpdate(editing, toInput(form));
+    const priority = parsePriority(form.priority);
+    if (priority === null) return;
+    const ok = editing === null ? await onAdd(toInput(form, priority)) : await onUpdate(editing, toInput(form, priority));
     if (ok) { setForm(emptyForm); setEditing(null); }
   }
   function edit(entry: DictionaryEntry) {
@@ -67,7 +84,8 @@ export function DictionaryPage({ entries, candidates, onAdd, onUpdate, onDelete,
     {importError && <p role="alert">{t("CSV encoding error")}</p>}
     <form className="steps dictionary-form" onSubmit={(event) => void submit(event)}>
       {([ ["Reading", "reading", true], ["Surface", "surface", true], ["Category", "category", false], ["Aliases", "aliases", false], ["Scope", "appScope", false] ] as const).map(([label, key, required]) => <div className="setting-row" key={key}><div><strong>{t(label)}</strong>{key === "aliases" && <p>{t("One alias per line")}</p>}</div>{key === "aliases" ? <textarea value={form.aliases} onChange={(event) => setForm({ ...form, aliases: event.target.value })} /> : <input value={form[key]} required={required} onChange={(event) => setForm({ ...form, [key]: event.target.value })} />}</div>)}
-      <div className="setting-row"><div><strong>{t("Priority")}</strong></div><input type="number" value={form.priority} onChange={(event) => setForm({ ...form, priority: event.target.value })} /></div>
+      <div className="setting-row"><div><strong>{t("Priority")}</strong></div><input ref={priorityInput} type="number" step={1} min={PRIORITY_MIN} max={PRIORITY_MAX} aria-label={t("Priority")} aria-invalid={priorityInvalid} value={form.priority} onChange={(event) => setForm({ ...form, priority: event.target.value })} /></div>
+      {priorityInvalid && <p className="settings-error" role="alert">{priorityMessage}</p>}
       <div><button className="primary" type="submit">{editing === null ? t("Add entry") : t("Save entry")}</button>{editing !== null && <button className="secondary" type="button" onClick={() => { setEditing(null); setForm(emptyForm); }}>{t("Cancel")}</button>}</div>
     </form>
 
