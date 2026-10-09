@@ -15,6 +15,7 @@ mod shortcuts;
 mod state;
 mod storage;
 mod types;
+mod worker_log;
 
 use std::{
     ffi::OsString,
@@ -1028,6 +1029,11 @@ pub fn run() {
                 .build(),
         )
         .setup(move |app| {
+            // Must precede the first worker spawn (initialize_model_runtime).
+            // A missing log directory only loses diagnostics, never startup.
+            if let Ok(directory) = app.path().app_log_dir() {
+                let _ = worker_log::install(&directory);
+            }
             let storage = Storage::open(&database_path(app.handle())?)?;
             storage.enforce_current_history_policy()?;
             let settings = storage.get_settings()?;

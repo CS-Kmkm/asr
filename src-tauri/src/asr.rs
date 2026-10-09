@@ -179,15 +179,26 @@ impl JsonlTranscriber {
     }
 
     async fn spawn(&self, command_spec: &WorkerCommand) -> Result<RunningWorker, AsrError> {
+        // stderr carries the worker's internal_error details; persist it to the
+        // rotating worker log when the app installed one.
+        let log_stderr = crate::worker_log::is_installed();
         let mut command = Command::new(&command_spec.program);
         command
             .args(&command_spec.args)
             .envs(command_spec.env.iter().cloned())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(if log_stderr {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            })
             .kill_on_drop(true);
         let mut child = command.spawn()?;
+        if let Some(stderr) = child.stderr.take() {
+            crate::worker_log::mark_worker_start();
+            tokio::spawn(crate::worker_log::pump(stderr));
+        }
         let stdin = child
             .stdin
             .take()
