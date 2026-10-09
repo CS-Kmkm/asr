@@ -1011,6 +1011,25 @@ async fn initialize_model_runtime(app: AppHandle, settings: Settings) {
     }
 }
 
+/// Argument the sign-in Run entry passes so the app starts in the tray only.
+const AUTOSTART_ARGUMENT: &str = "--autostart";
+
+/// Whether a command line, program path first, came from the sign-in entry.
+///
+/// The autostart plugin writes the executable path unquoted, so a path with
+/// spaces may arrive split across several leading arguments; only an exact
+/// argument after the first one counts.
+fn launched_by_autostart<I>(arguments: I) -> bool
+where
+    I: IntoIterator,
+    I::Item: AsRef<std::ffi::OsStr>,
+{
+    arguments
+        .into_iter()
+        .skip(1)
+        .any(|argument| argument.as_ref() == AUTOSTART_ARGUMENT)
+}
+
 /// Bring the main window to the front, restoring it from the tray or taskbar.
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -1027,12 +1046,15 @@ pub fn run() {
         // Must stay the first plugin: a second launch hands over to the running
         // instance and exits inside this plugin's initialization, before the
         // database, hotkeys, tray, or ASR worker of the new process start.
-        .plugin(tauri_plugin_single_instance::init(|app, _arguments, _cwd| {
-            show_main_window(app);
+        .plugin(tauri_plugin_single_instance::init(|app, arguments, _cwd| {
+            // A sign-in launch while already running must not pop the window.
+            if !launched_by_autostart(&arguments) {
+                show_main_window(app);
+            }
         }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
+            Some(vec![AUTOSTART_ARGUMENT]),
         ))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -1056,6 +1078,8 @@ pub fn run() {
             // A development executable depends on Vite's dev server and cannot
             // run on its own at Windows sign-in, so it must never replace the
             // registration created by an installed/release build.
+            // enable() rewrites the Run entry on every start, which also adds
+            // --autostart to entries registered before the argument existed.
             #[cfg(not(debug_assertions))]
             {
                 let autostart_result = if settings.auto_start {
@@ -1117,6 +1141,11 @@ pub fn run() {
                     _ => {}
                 })
                 .build(app)?;
+            // The main window is configured hidden so a sign-in launch stays in
+            // the tray; every other launch shows it.
+            if !launched_by_autostart(std::env::args_os()) {
+                show_main_window(app.handle());
+            }
             let app_handle = app.handle().clone();
             let initialization =
                 tauri::async_runtime::spawn(initialize_model_runtime(app_handle, settings));
@@ -1196,4 +1225,59 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod autostart_launch_tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_launch_is_not_an_autostart_launch() {
+        assert!(!launched_by_autostart(["local-voice-input.exe"]));
+        assert!(!launched_by_autostart(Vec::<String>::new()));
+    }
+
+    #[test]
+    fn the_sign_in_argument_marks_an_autostart_launch() {
+        assert!(launched_by_autostart([
+            "local-voice-input.exe",
+            "--autostart"
+        ]));
+    }
+
+    #[test]
+    fn an_unquoted_program_path_with_spaces_still_counts() {
+        assert!(launched_by_autostart([
+            r"C:\Users\me\AppData\Local\Local",
+            "Voice",
+            r"Input\local-voice-input.exe",
+            "--autostart",
+        ]));
+    }
+
+    #[test]
+    fn only_the_exact_argument_after_the_program_counts() {
+        assert!(!launched_by_autostart(["--autostart"]));
+        assert!(!launched_by_autostart([
+            "local-voice-input.exe",
+            "--autostart=1"
+        ]));
+        assert!(!launched_by_autostart([
+            "local-voice-input.exe",
+            "--AUTOSTART"
+        ]));
+        assert!(!launched_by_autostart([
+            "local-voice-input.exe",
+            "--input-monitor"
+        ]));
+    }
+
+    #[test]
+    fn os_string_arguments_are_accepted() {
+        let arguments = vec![
+            OsString::from("local-voice-input.exe"),
+            OsString::from("--autostart"),
+        ];
+        assert!(launched_by_autostart(arguments));
+    }
 }
