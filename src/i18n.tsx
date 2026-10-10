@@ -85,6 +85,8 @@ const en = {
   "Transcribing locally.": "Transcribing locally.",
   "Dictation cancelled.": "Dictation cancelled.",
   "Transcription failed. Check model and GPU diagnostics.": "Transcription failed. Check model and GPU diagnostics.",
+  "Transcription failed. The recording was saved to History, where you can retry it.": "Transcription failed. The recording was saved to History, where you can retry it.",
+  "Transcription failed": "Transcription failed",
   "Finish the current recording or processing before changing the speech model.": "Finish the current recording or processing before changing the speech model.",
   "Temporary audio cleanup failed.": "Temporary audio cleanup failed.",
   "History text was saved, but the recording could not be retained.": "History text was saved, but the recording could not be retained.",
@@ -373,6 +375,8 @@ const ja: Record<MessageKey, string> = {
   "Transcribing locally.": "ローカルで文字起こししています。",
   "Dictation cancelled.": "音声入力をキャンセルしました。",
   "Transcription failed. Check model and GPU diagnostics.": "文字起こしに失敗しました。モデルとGPU診断を確認してください。",
+  "Transcription failed. The recording was saved to History, where you can retry it.": "文字起こしに失敗しました。録音は履歴に保存したので、履歴から再試行できます。",
+  "Transcription failed": "文字起こし失敗",
   "Finish the current recording or processing before changing the speech model.": "音声認識モデルを変更する前に、現在の録音または処理を終えてください。",
   "Temporary audio cleanup failed.": "一時音声の削除に失敗しました。",
   "Correcting the transcript with the configured AI provider.": "設定されたAIプロバイダーで文字起こしを修正しています。",
@@ -572,6 +576,7 @@ export const insertionOutcomeLabels: Record<string, MessageKey> = {
   clipboard_only: "Clipboard only",
   paste_unverified: "Paste not confirmed",
   insertion_failed: "Not inserted",
+  transcription_failed: "Transcription failed",
 };
 
 export const insertionDetailLabels: Record<string, MessageKey> = {
@@ -604,6 +609,7 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "Transcribing locally.",
       "Dictation cancelled.",
       "Transcription failed. Check model and GPU diagnostics.",
+      "Transcription failed. The recording was saved to History, where you can retry it.",
       "Finish the current recording or processing before changing the speech model.",
       "Temporary audio cleanup failed.",
       "History text was saved, but the recording could not be retained.",

@@ -45,6 +45,75 @@ fn report_temp_cleanup(app: &AppHandle, artifact: &mut TempArtifact) {
     }
 }
 
+const TRANSCRIPTION_FAILED_SAVED_TO_HISTORY: &str =
+    "Transcription failed. The recording was saved to History, where you can retry it.";
+
+/// `insertion_result` of a History row whose final transcription failed. The
+/// row carries no text, only the audio that Retry transcribes again.
+const TRANSCRIPTION_FAILED_OUTCOME: &str = "transcription_failed";
+
+/// A failed take is kept only where the user already keeps History with its
+/// audio; otherwise its temporary audio is deleted as before.
+fn preserves_failed_takes(settings: &Settings) -> bool {
+    settings.history_retention != types::HistoryRetention::Never
+        && !settings.delete_audio_after_processing
+}
+
+/// The History row that lets Retry re-run a take whose transcription failed,
+/// or `None` when Retry could not reproduce the request. Ask chooses its
+/// action from the transcript, so a take without one has nothing to retry.
+fn failed_take_history_item<'a>(
+    mode: PipelineMode,
+    asr_provider: &'a str,
+    edit_source: Option<&'a str>,
+    target_language: Option<&'a str>,
+    app_category: Option<&'a str>,
+    duration_ms: u64,
+) -> Option<NewHistoryItem<'a>> {
+    let (history_mode, source_text, target_language) = match mode {
+        PipelineMode::Dictate => ("faithful", None, None),
+        PipelineMode::Translate => ("translate", None, Some(target_language?)),
+        PipelineMode::Edit => ("edit", Some(edit_source?), None),
+        PipelineMode::Ask => return None,
+    };
+    Some(NewHistoryItem {
+        transcript_text: "",
+        processed_text: None,
+        source_text,
+        instruction_text: None,
+        action_kind: None,
+        search_site: None,
+        mode: history_mode,
+        asr_provider,
+        llm_provider: None,
+        target_language,
+        app_category,
+        duration_ms: Some(duration_ms as i64),
+        latency_ms: None,
+        retry_of_id: None,
+        insertion_result: Some(TRANSCRIPTION_FAILED_OUTCOME),
+        insertion_detail: None,
+    })
+}
+
+/// Saves a take whose transcription failed, with its audio, to History so
+/// Retry can transcribe it again. Returns whether the audio was retained.
+fn preserve_failed_take(
+    storage: &Storage,
+    settings: &Settings,
+    item: Option<NewHistoryItem<'_>>,
+    audio_path: &std::path::Path,
+) -> bool {
+    let Some(item) = item else {
+        return false;
+    };
+    preserves_failed_takes(settings)
+        && matches!(
+            storage.add_history_with_audio_report(&item, Some(audio_path)),
+            Ok((true, false))
+        )
+}
+
 fn capture_config(settings: &Settings) -> CaptureConfig {
     let noise_suppression = match settings.noise_suppression.as_str() {
         "off" => NoiseSuppressionLevel::Off,
@@ -818,12 +887,35 @@ pub(crate) async fn stop_recording(
                 false,
                 Some("asr_failed"),
             );
+            let asr_provider = model_identity(&settings)
+                .0
+                .unwrap_or_else(|| settings.asr_backend.clone());
+            let preserved = preserve_failed_take(
+                &storage,
+                &settings,
+                failed_take_history_item(
+                    mode,
+                    &asr_provider,
+                    edit_session
+                        .as_ref()
+                        .map(|session| session.selection.text()),
+                    translation_target.as_deref(),
+                    app_context::history_category(app_context.as_ref()),
+                    duration_ms,
+                ),
+                &artifact.path,
+            );
             emit_state(
                 &app,
                 &state,
                 AppPhase::Error,
-                "Transcription failed. Check model and GPU diagnostics.",
+                if preserved {
+                    TRANSCRIPTION_FAILED_SAVED_TO_HISTORY
+                } else {
+                    "Transcription failed. Check model and GPU diagnostics."
+                },
             );
+            // History keeps its own copy, so the temporary capture is always removed.
             report_temp_cleanup(&app, &mut artifact_cleanup);
             return Err(error);
         }
@@ -3008,6 +3100,113 @@ mod tests {
                 Ok(())
             );
         }
+    }
+
+    fn failed_take_storage(keep_audio: bool) -> (Storage, tempfile::TempDir, PathBuf) {
+        let storage = Storage::in_memory().unwrap();
+        let settings = Settings {
+            history_retention: types::HistoryRetention::OneMonth,
+            delete_audio_after_processing: !keep_audio,
+            ..Settings::default()
+        };
+        storage.update_settings(&settings).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let take = directory.path().join("failed-take.wav");
+        std::fs::write(&take, b"RIFF failed take").unwrap();
+        (storage, directory, take)
+    }
+
+    #[test]
+    fn a_failed_transcription_is_kept_in_history_for_retry() {
+        let (storage, _directory, take) = failed_take_storage(true);
+        let settings = storage.get_settings().unwrap();
+        let item = failed_take_history_item(
+            PipelineMode::Dictate,
+            "faster-whisper:large-v3-turbo",
+            None,
+            None,
+            Some("messaging"),
+            90_000,
+        );
+        assert!(preserve_failed_take(&storage, &settings, item, &take));
+
+        let rows = storage.list_history(types::HistoryFilter::All, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert!(row.has_audio);
+        assert_eq!(row.transcript_text, "");
+        assert_eq!(
+            row.insertion_result.as_deref(),
+            Some(TRANSCRIPTION_FAILED_OUTCOME)
+        );
+        assert_eq!(row.duration_ms, Some(90_000));
+        assert_eq!(history_pipeline_mode(&row.mode), Ok(PipelineMode::Dictate));
+        let retry_copy = storage.copy_history_audio_for_retry(row.id).unwrap();
+        assert_eq!(std::fs::read(&retry_copy).unwrap(), b"RIFF failed take");
+        std::fs::remove_file(retry_copy).unwrap();
+        // History keeps its own copy; the caller still removes its temporary take.
+        assert!(take.is_file());
+        storage.delete_all_history().unwrap();
+    }
+
+    #[test]
+    fn a_failed_transcription_is_deleted_unless_history_keeps_audio() {
+        let (storage, _directory, take) = failed_take_storage(false);
+        let settings = storage.get_settings().unwrap();
+        let item = failed_take_history_item(PipelineMode::Dictate, "mock", None, None, None, 1);
+        assert!(!preserve_failed_take(&storage, &settings, item, &take));
+        assert!(storage
+            .list_history(types::HistoryFilter::All, 10)
+            .unwrap()
+            .is_empty());
+
+        let disabled = Settings {
+            history_retention: types::HistoryRetention::Never,
+            delete_audio_after_processing: false,
+            ..Settings::default()
+        };
+        assert!(!preserves_failed_takes(&disabled));
+        assert!(!preserves_failed_takes(&Settings::default()));
+    }
+
+    #[test]
+    fn failed_takes_keep_what_retry_needs_for_each_mode() {
+        let translate = failed_take_history_item(
+            PipelineMode::Translate,
+            "mock",
+            None,
+            Some("English"),
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(translate.mode, "translate");
+        assert_eq!(translate.target_language, Some("English"));
+        let edit =
+            failed_take_history_item(PipelineMode::Edit, "mock", Some("selected"), None, None, 1)
+                .unwrap();
+        assert_eq!(edit.mode, "edit");
+        assert_eq!(edit.source_text, Some("selected"));
+        for mode in ["faithful", "translate", "edit"] {
+            assert!(history_pipeline_mode(mode).is_ok());
+        }
+        // Retry could not reproduce these takes, so they are not kept.
+        assert!(
+            failed_take_history_item(PipelineMode::Translate, "mock", None, None, None, 1)
+                .is_none()
+        );
+        assert!(
+            failed_take_history_item(PipelineMode::Edit, "mock", None, None, None, 1).is_none()
+        );
+        assert!(failed_take_history_item(
+            PipelineMode::Ask,
+            "mock",
+            Some("selected"),
+            None,
+            None,
+            1
+        )
+        .is_none());
     }
 }
 
