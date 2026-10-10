@@ -138,7 +138,7 @@ pub(crate) fn set_phase(app: &AppHandle, phase: &AppPhase) {
     LIVE.store(live, Ordering::Release);
     if live {
         let (width, height) = live_size(TRANSLATION_CONTROL.load(Ordering::Acquire));
-        let _ = window.set_ignore_cursor_events(false);
+        let _ = window.set_ignore_cursor_events(click_through(phase));
         let _ = window.set_size(LogicalSize::new(width, height));
         // Recalculate whenever shown in case display layout, DPI, or the
         // recording/processing window size changed.
@@ -147,6 +147,13 @@ pub(crate) fn set_phase(app: &AppHandle, phase: &AppPhase) {
     } else {
         let _ = window.hide();
     }
+}
+
+/// Whether the overlay lets clicks through to the window below. Only views
+/// with a control (the cancel button while recording or processing, and
+/// Voice Translate's language control) take pointer events.
+pub(crate) fn click_through(phase: &AppPhase) -> bool {
+    !matches!(phase, AppPhase::Recording | AppPhase::Processing)
 }
 
 /// The live view's logical size.
@@ -430,6 +437,15 @@ mod tests {
             None
         );
         assert_eq!(select_monitor(&[], window(0, 0, 10, 10)), None);
+    }
+
+    #[test]
+    fn only_views_with_a_control_take_clicks() {
+        assert!(!click_through(&AppPhase::Recording));
+        assert!(!click_through(&AppPhase::Processing));
+        // Injecting has no cancel button: clicks reach the target.
+        assert!(click_through(&AppPhase::Injecting));
+        assert!(click_through(&AppPhase::Error));
     }
 
     #[test]
