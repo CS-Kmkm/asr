@@ -1,3 +1,5 @@
+import { useRef } from "react";
+import { previewHistoryRetentionPurge, type HistoryPurgePreview } from "../api";
 import type { HistoryRetention } from "../types";
 import { useI18n, type MessageKey } from "../i18n";
 
@@ -25,20 +27,48 @@ export function HistoryRetentionSelect({ value, disabled = false, onChange }: {
   onChange: (value: HistoryRetention) => void;
 }) {
   const { t } = useI18n();
-  return <select value={value} disabled={disabled} aria-label={t("History retention")} onChange={(event) => {
-    const next = event.target.value as HistoryRetention;
-    if (shortensHistoryRetention(value, next)) {
+  const current = useRef(value);
+  current.current = value;
+  const confirming = useRef(false);
+
+  async function confirmShortening(next: HistoryRetention) {
+    // Ignore further changes (for example repeated arrow keys) while one
+    // confirmation is being prepared or shown.
+    if (confirming.current) return;
+    confirming.current = true;
+    try {
+      let preview: HistoryPurgePreview | null = null;
+      try {
+        preview = await previewHistoryRetentionPurge(next);
+      } catch {
+        // Without counts the generic warning below still asks for consent.
+      }
+      // The stored retention changed while counting (for example from another
+      // window); drop this change rather than confirm against a stale value.
+      if (current.current !== value) return;
       const message = [
         `${t("History retention")}: ${t(label(value))} → ${t(label(next))}`,
+        ...(preview ? [[
+          `${t("History entries to delete")}: ${preview.historyItems}`,
+          `${t("Saved recordings to delete")}: ${preview.recordings}`,
+        ].join("\n")] : []),
         t(next === "never"
           ? "All History entries, saved recordings, and suggested spellings will be deleted immediately. This cannot be undone. Continue?"
           : "History entries, saved recordings, and suggested spellings older than the new period will be deleted immediately. This cannot be undone. Continue?"),
       ].join("\n\n");
-      // A declined change is not saved, so the controlled select keeps showing
-      // the stored value.
-      if (!window.confirm(message)) return;
+      // Confirm even when both counts are 0: suggested spellings are purged
+      // too, and the purge computes its own cutoff a moment later. A declined
+      // change is not saved, so the controlled select keeps the stored value.
+      if (window.confirm(message)) onChange(next);
+    } finally {
+      confirming.current = false;
     }
-    onChange(next);
+  }
+
+  return <select value={value} disabled={disabled} aria-label={t("History retention")} onChange={(event) => {
+    const next = event.target.value as HistoryRetention;
+    if (shortensHistoryRetention(value, next)) void confirmShortening(next);
+    else onChange(next);
   }}>
     {historyRetentionOptions.map((option) => <option key={option.value} value={option.value}>{t(option.label)}</option>)}
   </select>;

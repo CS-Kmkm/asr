@@ -11,6 +11,7 @@ import type {
   DictionaryEntryInput,
   HistoryFilter,
   HistoryAudioPayload,
+  HistoryRetention,
 } from "./types";
 
 const inTauri = "__TAURI_INTERNALS__" in window;
@@ -154,6 +155,18 @@ export async function deleteHistoryItem(id: number): Promise<boolean> {
 export async function deleteAllHistory(): Promise<number> {
   if (!inTauri) return 0;
   return invoke("delete_all_history");
+}
+
+/** What saving a retention would delete now: History rows and retained recordings. */
+export interface HistoryPurgePreview {
+  historyItems: number;
+  recordings: number;
+}
+
+export async function previewHistoryRetentionPurge(retention: HistoryRetention): Promise<HistoryPurgePreview> {
+  // The browser preview keeps no History, so nothing would be deleted.
+  if (!inTauri) return { historyItems: 0, recordings: 0 };
+  return invoke("preview_history_retention_purge", { retention });
 }
 
 export async function getHistoryAudio(id: number): Promise<HistoryAudioPayload> {
