@@ -1,12 +1,15 @@
 import { SettingRow, Toggle } from "../components/ui";
+import { HistoryRetentionSelect } from "../components/HistoryRetentionSelect";
 import type { Settings } from "../types";
 import { useI18n } from "../i18n";
 
 export function PrivacyPage({
   settings,
+  settingsLoaded,
   onSave,
 }: {
   settings: Settings;
+  settingsLoaded: boolean;
   onSave: (patch: Partial<Settings>) => void;
 }) {
   const { t } = useI18n();
@@ -24,19 +27,13 @@ export function PrivacyPage({
       />
       <SettingRow
         title={t("History retention")}
-        detail={t("Text history cleanup window.")}
+        detail={t("How long History and its saved recordings are kept. Shortening it deletes older entries immediately.")}
         control={
-          <select
+          <HistoryRetentionSelect
             value={settings.historyRetention}
-            onChange={(e) => onSave({ historyRetention: e.target.value as Settings["historyRetention"] })}
-          >
-            <option value="never">{t("Never")}</option>
-            <option value="24_hours">{t("24 hours")}</option>
-            <option value="one_week">{t("1 week")}</option>
-            <option value="one_month">{t("1 month")}</option>
-            <option value="one_year">{t("1 year")}</option>
-            <option value="forever">{t("Forever")}</option>
-          </select>
+            disabled={!settingsLoaded}
+            onChange={(historyRetention) => onSave({ historyRetention })}
+          />
         }
       />
     </section>

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Empty } from "../components/ui";
+import { HistoryRetentionSelect } from "../components/HistoryRetentionSelect";
 import type { HistoryAudioPayload, HistoryFilter, HistoryItem, Settings } from "../types";
 import { insertionDetailLabels, insertionOutcomeLabels, useI18n } from "../i18n";
 
@@ -22,8 +23,9 @@ const modeLabels = {
   ask: "Ask Anything",
 } as const;
 
-export function HistoryPage({ settings, history, filter, onSave, onFilter, onCopyItem, onRetry, onDelete, onDeleteAll, onLoadAudio, onAudioError, retryActive, onCancelRetry }: {
+export function HistoryPage({ settings, settingsLoaded, history, filter, onSave, onFilter, onCopyItem, onRetry, onDelete, onDeleteAll, onLoadAudio, onAudioError, retryActive, onCancelRetry }: {
   settings: Settings;
+  settingsLoaded: boolean;
   history: HistoryItem[];
   filter: HistoryFilter;
   onSave: (patch: Partial<Settings>) => void;
@@ -80,11 +82,7 @@ export function HistoryPage({ settings, history, filter, onSave, onFilter, onCop
       }}>
         {filters.map(({ value, label }) => <option key={value} value={value}>{t(label)}</option>)}
       </select>
-      <select value={settings.historyRetention} onChange={(event) => onSave({ historyRetention: event.target.value as Settings["historyRetention"] })}>
-        <option value="never">{t("Never")}</option><option value="24_hours">{t("24 hours")}</option>
-        <option value="one_week">{t("1 week")}</option><option value="one_month">{t("1 month")}</option>
-        <option value="one_year">{t("1 year")}</option><option value="forever">{t("Forever")}</option>
-      </select>
+      <HistoryRetentionSelect value={settings.historyRetention} disabled={!settingsLoaded} onChange={(historyRetention) => onSave({ historyRetention })} />
       <button className="danger-button" onClick={() => { if (window.confirm(t("Delete all history and suggested spellings?"))) onDeleteAll(); }}>{t("Delete all")}</button>
       {retryActive && <button onClick={onCancelRetry}>{t("Cancel")}</button>}
     </div>
