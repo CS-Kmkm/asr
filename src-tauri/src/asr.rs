@@ -190,8 +190,13 @@ impl JsonlTranscriber {
             .stdout(Stdio::piped())
             .stderr(if log_stderr {
                 Stdio::piped()
-            } else {
+            } else if cfg!(debug_assertions) {
                 Stdio::inherit()
+            } else {
+                // A GUI-subsystem parent has no stderr to inherit; Python would
+                // then see sys.stderr as None, and diagnostics written to it
+                // could end up on stdout and corrupt the JSONL protocol.
+                Stdio::null()
             })
             .kill_on_drop(true);
         // The release app has no console for the Python worker to share, so

@@ -125,8 +125,9 @@ impl RotatingLog {
 
 /// Route future worker stderr output into `directory/asr-worker.log`.
 ///
-/// Only the first call takes effect. Without a sink (unit tests, benchmarks),
-/// workers keep inheriting the parent's stderr.
+/// Only the first call takes effect. Without a sink, debug builds (unit tests,
+/// benchmarks) keep inheriting the parent's stderr and release builds discard
+/// it.
 pub(crate) fn install(directory: &Path) -> io::Result<()> {
     fs::create_dir_all(directory)?;
     let _ = SINK.set(Mutex::new(RotatingLog::new(
