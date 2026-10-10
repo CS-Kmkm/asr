@@ -1984,18 +1984,20 @@ fn request_output_tokens(input: &str, instruction: &str) -> usize {
 /// and correction prompts are short, so they stay below OpenAI's general
 /// "reserve about 25k tokens" advice except at the highest efforts. Known
 /// non-reasoning models get no allowance whatever the effort setting, since
-/// it would only push them past their output limit. For unknown models the
-/// user's effort choice is trusted: a non-"none" effort is sent and reserved.
+/// it would only push them past their output limit. Unknown models are
+/// treated as possibly reasoning: the user's effort is reserved, and at
+/// "none" (which is not sent) the default-effort allowance keeps a future
+/// reasoning model from starving at the 128-token visible budget.
 fn openai_reasoning_allowance(model: &str, effort: &str) -> usize {
     match (openai_model_kind(model), effort) {
-        (OpenAiModelKind::NonReasoning, _) | (OpenAiModelKind::Unknown, "none") => 0,
+        (OpenAiModelKind::NonReasoning, _) => 0,
         (OpenAiModelKind::Reasoning, "none") if supports_openai_none_reasoning(model) => 0,
         // o1-mini and o1-preview reason but accept no effort, so they always
         // run their default effort.
         (OpenAiModelKind::Reasoning, _) if !accepts_openai_reasoning_effort(model) => 8_192,
-        // The reasoning field is omitted for reasoning models that are not
-        // known to accept "none", so they run their default effort (medium
-        // for the GPT-5 and o-series families).
+        // The reasoning field is omitted for models that are not known to
+        // accept "none", so they run their default effort (medium for the
+        // GPT-5 and o-series families).
         (_, "none" | "medium") => 8_192,
         (_, "low") => 4_096,
         (_, "high") => 16_384,
@@ -2040,13 +2042,13 @@ fn openai_base_model(model: &str) -> String {
 
 /// Reasoning: GPT-5 (except the `-chat` variants such as
 /// gpt-5-chat-latest), the o1/o3/o4 series and codex-mini. Non-reasoning:
-/// gpt-4o, chatgpt-4o, gpt-4.1 and the GPT-5 `-chat` variants. Anything
-/// else is unknown.
+/// the GPT-4 family (gpt-4, gpt-4-turbo, gpt-4o, gpt-4.1), chatgpt-4o,
+/// gpt-3.5 and the GPT-5 `-chat` variants. Anything else is unknown.
 fn openai_model_kind(model: &str) -> OpenAiModelKind {
     let base = openai_base_model(model);
     let gpt5 = base.starts_with("gpt-5");
     if (gpt5 && base.contains("-chat"))
-        || ["gpt-4o", "chatgpt-4o", "gpt-4.1"]
+        || ["gpt-4", "chatgpt-4o", "gpt-3.5"]
             .iter()
             .any(|prefix| base.starts_with(prefix))
     {
@@ -2096,6 +2098,10 @@ const OPENAI_OUTPUT_CEILINGS: &[(&str, usize)] = &[
     ("chatgpt-4o", 16_384),
     // gpt-4.1, gpt-4.1-mini, gpt-4.1-nano: 32,768.
     ("gpt-4.1", 32_768),
+    // gpt-4-turbo and gpt-3.5-turbo: 4,096.
+    // Plain gpt-4 snapshots are left unclamped.
+    ("gpt-4-turbo", 4_096),
+    ("gpt-3.5-turbo", 4_096),
     // o1-preview: 32,768; o1-mini: 65,536; o1, o1-pro, o3, o3-mini, o3-pro,
     // o4-mini: 100,000. codex-mini-latest (based on o4-mini): 100,000.
     ("o1-preview", 32_768),
@@ -4213,8 +4219,10 @@ mod tests {
             ("gpt-4.1-nano", NonReasoning),
             ("gpt-5-chat-latest", NonReasoning),
             ("ft:gpt-4.1-mini:org:custom:abc123", NonReasoning),
+            ("gpt-4", NonReasoning),
+            ("gpt-4-turbo-2024-04-09", NonReasoning),
+            ("gpt-3.5-turbo", NonReasoning),
             ("some-future-model", Unknown),
-            ("gpt-3.5-turbo", Unknown),
         ] {
             assert_eq!(openai_model_kind(model), kind, "{model}");
         }
@@ -4245,9 +4253,10 @@ mod tests {
         }
 
         // Unknown models follow the user's choice: a non-"none" effort is
-        // sent with its allowance and no ceiling; "none" is omitted.
+        // sent with its allowance and no ceiling; "none" is omitted but still
+        // reserves the default-effort allowance.
         for (effort, budget) in [
-            ("none", 128),
+            ("none", 128 + 8_192),
             ("low", 128 + 4_096),
             ("high", 128 + 16_384),
             ("max", 128 + 32_768),
@@ -4395,6 +4404,8 @@ mod tests {
             ("gpt-4.1", 32_768),
             ("gpt-4.1-mini", 32_768),
             ("gpt-5-chat-latest", 16_384),
+            ("gpt-4-turbo", 4_096),
+            ("gpt-3.5-turbo", 4_096),
         ] {
             let settings = Settings {
                 openai_correction_model: model.into(),
