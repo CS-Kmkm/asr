@@ -365,6 +365,15 @@ Full usage and Phase 0 gate criteria are documented in
   for playback, download, and Retry. Turning it on stops keeping new recordings
   but does not delete recordings already in History; delete them there or let
   History retention remove them.
+- "Keep failed recordings for 24 hours" (Privacy, on by default) is the one
+  exception to these settings. When transcription fails (Dictate, Translate,
+  or Edit), the recording is kept with its audio as a History item for Retry,
+  even if History is set to Never or "Delete audio after processing" is on.
+  Unless History with audio would keep it anyway, it is deleted with its audio
+  24 hours after the failure (checked at startup and whenever History is
+  listed or written), or as soon as a Retry succeeds; the Retry result follows
+  the normal History and audio settings. Turning the setting off deletes such
+  recordings; failed recordings are then kept only when History keeps audio.
 - The captured target must still be foreground and non-secure at insertion time.
 - UI Automation security inspection exists and is used to avoid secure targets.
   Text is entered by clipboard paste only; UI Automation reads the target to

@@ -46,6 +46,11 @@ pub struct Settings {
     #[serde(default)]
     pub history_retention: HistoryRetention,
     pub delete_audio_after_processing: bool,
+    /// On by default: a take whose transcription failed is kept with its
+    /// audio for 24 hours so it can be retried, even where the History and
+    /// audio settings above would not keep it.
+    #[serde(default = "default_keep_failed_takes")]
+    pub keep_failed_takes: bool,
     pub auto_start: bool,
     pub clipboard_restore: bool,
     /// Off by default: Dictate pastes only the final text once. On restores
@@ -258,6 +263,10 @@ fn default_enabled_correction_feature() -> bool {
     true
 }
 
+fn default_keep_failed_takes() -> bool {
+    true
+}
+
 fn default_input_gain_percent() -> u16 {
     100
 }
@@ -282,6 +291,7 @@ impl Default for Settings {
             microphone_id: None,
             history_retention: HistoryRetention::OneMonth,
             delete_audio_after_processing: true,
+            keep_failed_takes: default_keep_failed_takes(),
             auto_start: false,
             clipboard_restore: true,
             live_target_insertion: false,
@@ -351,6 +361,10 @@ pub struct HistoryItem {
     /// Fixed reason code for a non-confirmed outcome, never text content.
     #[serde(default)]
     pub insertion_detail: Option<String>,
+    /// Set only on a failed take kept for Retry outside the History and
+    /// audio settings: when it and its audio are deleted (RFC 3339, UTC).
+    #[serde(default)]
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]

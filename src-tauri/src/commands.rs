@@ -48,16 +48,12 @@ fn report_temp_cleanup(app: &AppHandle, artifact: &mut TempArtifact) {
 const TRANSCRIPTION_FAILED_SAVED_TO_HISTORY: &str =
     "Transcription failed. The recording was saved to History, where you can retry it.";
 
+const TRANSCRIPTION_FAILED_KEPT_FOR_RETRY: &str =
+    "Transcription failed. The recording is kept in History for 24 hours, where you can retry it.";
+
 /// `insertion_result` of a History row whose final transcription failed. The
 /// row carries no text, only the audio that Retry transcribes again.
 const TRANSCRIPTION_FAILED_OUTCOME: &str = "transcription_failed";
-
-/// A failed take is kept only where the user already keeps History with its
-/// audio; otherwise its temporary audio is deleted as before.
-fn preserves_failed_takes(settings: &Settings) -> bool {
-    settings.history_retention != types::HistoryRetention::Never
-        && !settings.delete_audio_after_processing
-}
 
 /// The History row that lets Retry re-run a take whose transcription failed,
 /// or `None` when Retry could not reproduce the request. Ask chooses its
@@ -99,23 +95,44 @@ fn failed_take_history_item<'a>(
 }
 
 /// Saves a take whose transcription failed, with its audio, to History so
-/// Retry can transcribe it again. Returns whether the audio was retained.
+/// Retry can transcribe it again. A take is kept where History keeps
+/// recordings, or else for 24 hours when keeping failed takes is on. Returns
+/// how it was kept, or `None` when it was not.
 fn preserve_failed_take(
     storage: &Storage,
     settings: &Settings,
     item: Option<NewHistoryItem<'_>>,
     audio_path: &std::path::Path,
-) -> bool {
-    let Some(item) = item else {
-        return false;
-    };
+) -> Option<storage::FailedTakeRetention> {
+    let item = item?;
+    storage::FailedTakeRetention::for_settings(settings)?;
     // Storage re-checks the current settings and writes the row only with
     // its audio: a text-less row without audio would offer nothing to retry.
-    preserves_failed_takes(settings)
-        && matches!(
-            storage.add_history_requiring_audio(&item, audio_path),
-            Ok(true)
-        )
+    storage.add_failed_take(&item, audio_path).ok().flatten()
+}
+
+/// Saves a successful Retry of History row `source_id`. A failed take kept
+/// only for Retry then follows the History and audio settings; if that
+/// cleanup fails, the take still expires with the 24-hour purge.
+fn save_retry_result(
+    storage: &Storage,
+    item: &NewHistoryItem<'_>,
+    audio_path: &std::path::Path,
+    source_id: i64,
+) -> HistorySaveStatus {
+    let status = save_history(storage, item, Some(audio_path));
+    if status != HistorySaveStatus::Failed {
+        let _ = storage.settle_retried_failed_take(source_id);
+    }
+    status
+}
+
+fn failed_take_message(kept: Option<storage::FailedTakeRetention>) -> &'static str {
+    match kept {
+        Some(storage::FailedTakeRetention::Normal) => TRANSCRIPTION_FAILED_SAVED_TO_HISTORY,
+        Some(storage::FailedTakeRetention::Temporary) => TRANSCRIPTION_FAILED_KEPT_FOR_RETRY,
+        None => "Transcription failed. Check model and GPU diagnostics.",
+    }
 }
 
 fn capture_config(settings: &Settings) -> CaptureConfig {
@@ -1025,11 +1042,7 @@ pub(crate) async fn stop_recording_for(
                 &app,
                 &state,
                 AppPhase::Error,
-                if preserved {
-                    TRANSCRIPTION_FAILED_SAVED_TO_HISTORY
-                } else {
-                    "Transcription failed. Check model and GPU diagnostics."
-                },
+                failed_take_message(preserved),
             );
             // History keeps its own copy, so the temporary capture is always removed.
             report_temp_cleanup(&app, &mut artifact_cleanup);
@@ -2345,6 +2358,7 @@ mod tests {
             retry_of_id: None,
             insertion_result: None,
             insertion_detail: None,
+            expires_at: None,
         };
         let profile = |formality: &str| types::StyleProfile {
             formality: formality.into(),
@@ -3406,13 +3420,8 @@ mod tests {
         }
     }
 
-    fn failed_take_storage(keep_audio: bool) -> (Storage, tempfile::TempDir, PathBuf) {
+    fn failed_take_storage(settings: Settings) -> (Storage, tempfile::TempDir, PathBuf) {
         let storage = Storage::in_memory().unwrap();
-        let settings = Settings {
-            history_retention: types::HistoryRetention::OneMonth,
-            delete_audio_after_processing: !keep_audio,
-            ..Settings::default()
-        };
         storage.update_settings(&settings).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let take = directory.path().join("failed-take.wav");
@@ -3420,9 +3429,41 @@ mod tests {
         (storage, directory, take)
     }
 
+    /// History and its audio are kept, so a failed take is a normal row.
+    fn keeping_audio() -> Settings {
+        Settings {
+            history_retention: types::HistoryRetention::OneMonth,
+            delete_audio_after_processing: false,
+            ..Settings::default()
+        }
+    }
+
+    /// The most private settings: no History and no audio.
+    fn keeping_nothing(keep_failed_takes: bool) -> Settings {
+        Settings {
+            history_retention: types::HistoryRetention::Never,
+            delete_audio_after_processing: true,
+            keep_failed_takes,
+            ..Settings::default()
+        }
+    }
+
+    fn dictate_failure() -> Option<NewHistoryItem<'static>> {
+        failed_take_history_item(PipelineMode::Dictate, "mock", None, None, None, 1)
+    }
+
+    fn history_audio_count(storage: &Storage) -> usize {
+        storage
+            .list_history(types::HistoryFilter::All, 10)
+            .unwrap()
+            .iter()
+            .filter(|row| row.has_audio)
+            .count()
+    }
+
     #[test]
     fn a_failed_transcription_is_kept_in_history_for_retry() {
-        let (storage, _directory, take) = failed_take_storage(true);
+        let (storage, _directory, take) = failed_take_storage(keeping_audio());
         let settings = storage.get_settings().unwrap();
         let item = failed_take_history_item(
             PipelineMode::Dictate,
@@ -3432,12 +3473,18 @@ mod tests {
             Some("messaging"),
             90_000,
         );
-        assert!(preserve_failed_take(&storage, &settings, item, &take));
+        let kept = preserve_failed_take(&storage, &settings, item, &take);
+        assert_eq!(kept, Some(storage::FailedTakeRetention::Normal));
+        assert_eq!(
+            failed_take_message(kept),
+            TRANSCRIPTION_FAILED_SAVED_TO_HISTORY
+        );
 
         let rows = storage.list_history(types::HistoryFilter::All, 10).unwrap();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert!(row.has_audio);
+        assert_eq!(row.expires_at, None, "normal History retention applies");
         assert_eq!(row.transcript_text, "");
         assert_eq!(
             row.insertion_result.as_deref(),
@@ -3454,50 +3501,184 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_transcription_is_deleted_unless_history_keeps_audio() {
-        let (storage, _directory, take) = failed_take_storage(false);
-        let settings = storage.get_settings().unwrap();
-        let item = failed_take_history_item(PipelineMode::Dictate, "mock", None, None, None, 1);
-        assert!(!preserve_failed_take(&storage, &settings, item, &take));
-        assert!(storage
-            .list_history(types::HistoryFilter::All, 10)
-            .unwrap()
-            .is_empty());
+    fn a_failed_take_is_kept_for_retry_even_when_history_and_audio_are_off() {
+        for settings in [
+            keeping_nothing(true),
+            Settings {
+                delete_audio_after_processing: false,
+                ..keeping_nothing(true)
+            },
+            Settings {
+                history_retention: types::HistoryRetention::OneMonth,
+                ..keeping_nothing(true)
+            },
+        ] {
+            let (storage, _directory, take) = failed_take_storage(settings.clone());
+            let kept = preserve_failed_take(&storage, &settings, dictate_failure(), &take);
+            assert_eq!(kept, Some(storage::FailedTakeRetention::Temporary));
+            assert_eq!(
+                failed_take_message(kept),
+                TRANSCRIPTION_FAILED_KEPT_FOR_RETRY
+            );
 
-        let disabled = Settings {
-            history_retention: types::HistoryRetention::Never,
-            delete_audio_after_processing: false,
-            ..Settings::default()
+            let rows = storage.list_history(types::HistoryFilter::All, 10).unwrap();
+            assert_eq!(rows.len(), 1, "{settings:?}");
+            let row = &rows[0];
+            assert!(row.has_audio);
+            assert!(row.expires_at.is_some());
+            let retry_copy = storage.copy_history_audio_for_retry(row.id).unwrap();
+            assert_eq!(std::fs::read(&retry_copy).unwrap(), b"RIFF failed take");
+            std::fs::remove_file(retry_copy).unwrap();
+            storage.delete_all_history().unwrap();
+        }
+    }
+
+    #[test]
+    fn without_keeping_failed_takes_only_history_with_audio_keeps_them() {
+        for settings in [
+            keeping_nothing(false),
+            Settings {
+                delete_audio_after_processing: false,
+                ..keeping_nothing(false)
+            },
+            Settings {
+                history_retention: types::HistoryRetention::OneMonth,
+                ..keeping_nothing(false)
+            },
+        ] {
+            let (storage, _directory, take) = failed_take_storage(settings.clone());
+            let kept = preserve_failed_take(&storage, &settings, dictate_failure(), &take);
+            assert_eq!(kept, None, "{settings:?}");
+            assert_eq!(
+                failed_take_message(kept),
+                "Transcription failed. Check model and GPU diagnostics."
+            );
+            assert!(storage
+                .list_history(types::HistoryFilter::All, 10)
+                .unwrap()
+                .is_empty());
+        }
+
+        let settings = Settings {
+            keep_failed_takes: false,
+            ..keeping_audio()
         };
-        assert!(!preserves_failed_takes(&disabled));
-        assert!(!preserves_failed_takes(&Settings::default()));
+        let (storage, _directory, take) = failed_take_storage(settings.clone());
+        assert_eq!(
+            preserve_failed_take(&storage, &settings, dictate_failure(), &take),
+            Some(storage::FailedTakeRetention::Normal)
+        );
+        storage.delete_all_history().unwrap();
     }
 
     #[test]
     fn a_failed_take_is_never_saved_without_its_audio() {
-        // Audio retention was turned off while the take was being transcribed.
-        let (storage, _directory, take) = failed_take_storage(false);
-        let snapshot = Settings {
-            delete_audio_after_processing: false,
-            ..storage.get_settings().unwrap()
-        };
-        let item = failed_take_history_item(PipelineMode::Dictate, "mock", None, None, None, 1);
-        assert!(!preserve_failed_take(&storage, &snapshot, item, &take));
+        // Audio retention and keeping failed takes were turned off while the
+        // take was being transcribed.
+        let (storage, _directory, take) = failed_take_storage(Settings {
+            history_retention: types::HistoryRetention::OneMonth,
+            ..keeping_nothing(false)
+        });
+        let snapshot = keeping_audio();
+        assert_eq!(
+            preserve_failed_take(&storage, &snapshot, dictate_failure(), &take),
+            None
+        );
         assert!(storage
             .list_history(types::HistoryFilter::All, 10)
             .unwrap()
             .is_empty());
 
         // The audio copy fails (here: the take no longer exists).
-        let (storage, directory, _take) = failed_take_storage(true);
+        for settings in [keeping_audio(), keeping_nothing(true)] {
+            let (storage, directory, _take) = failed_take_storage(settings.clone());
+            let missing = directory.path().join("missing.wav");
+            assert_eq!(
+                preserve_failed_take(&storage, &settings, dictate_failure(), &missing),
+                None
+            );
+            assert!(storage
+                .list_history(types::HistoryFilter::All, 10)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    fn retry_result(source_id: i64) -> NewHistoryItem<'static> {
+        NewHistoryItem {
+            transcript_text: "retried",
+            processed_text: None,
+            source_text: None,
+            instruction_text: None,
+            action_kind: None,
+            search_site: None,
+            mode: "faithful",
+            asr_provider: "mock",
+            llm_provider: None,
+            target_language: None,
+            app_category: None,
+            duration_ms: Some(1),
+            latency_ms: Some(1),
+            retry_of_id: Some(source_id),
+            insertion_result: None,
+            insertion_detail: None,
+        }
+    }
+
+    #[test]
+    fn a_successful_retry_applies_the_normal_settings_to_a_failed_take() {
+        // History off: neither the failed take nor the Retry result remains.
+        let (storage, directory, take) = failed_take_storage(keeping_nothing(true));
         let settings = storage.get_settings().unwrap();
-        let item = failed_take_history_item(PipelineMode::Dictate, "mock", None, None, None, 1);
-        let missing = directory.path().join("missing.wav");
-        assert!(!preserve_failed_take(&storage, &settings, item, &missing));
+        preserve_failed_take(&storage, &settings, dictate_failure(), &take).unwrap();
+        let source = storage.list_history(types::HistoryFilter::All, 1).unwrap()[0].id;
+        let retry_audio = storage.copy_history_audio_for_retry(source).unwrap();
+        assert_eq!(
+            save_retry_result(&storage, &retry_result(source), &retry_audio, source),
+            HistorySaveStatus::Complete
+        );
+        std::fs::remove_file(retry_audio).unwrap();
+        assert!(storage.history_item(source).unwrap().is_none());
         assert!(storage
             .list_history(types::HistoryFilter::All, 10)
             .unwrap()
             .is_empty());
+        drop(directory);
+
+        // History on, audio deleted: the Retry text is kept without audio.
+        let (storage, _directory, take) = failed_take_storage(Settings {
+            history_retention: types::HistoryRetention::OneMonth,
+            ..keeping_nothing(true)
+        });
+        let settings = storage.get_settings().unwrap();
+        preserve_failed_take(&storage, &settings, dictate_failure(), &take).unwrap();
+        let source = storage.list_history(types::HistoryFilter::All, 1).unwrap()[0].id;
+        let retry_audio = storage.copy_history_audio_for_retry(source).unwrap();
+        save_retry_result(&storage, &retry_result(source), &retry_audio, source);
+        std::fs::remove_file(retry_audio).unwrap();
+        assert!(storage.history_item(source).unwrap().is_none());
+        let rows = storage.list_history(types::HistoryFilter::All, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].transcript_text, "retried");
+        assert_eq!(history_audio_count(&storage), 0);
+
+        // History with audio enabled since the failure: the take stays as a
+        // normal row instead of expiring.
+        let (storage, _directory, take) = failed_take_storage(keeping_nothing(true));
+        let settings = storage.get_settings().unwrap();
+        preserve_failed_take(&storage, &settings, dictate_failure(), &take).unwrap();
+        let source = storage.list_history(types::HistoryFilter::All, 1).unwrap()[0].id;
+        storage
+            .update_settings_and_apply_history_policy(&keeping_audio())
+            .unwrap();
+        let retry_audio = storage.copy_history_audio_for_retry(source).unwrap();
+        save_retry_result(&storage, &retry_result(source), &retry_audio, source);
+        std::fs::remove_file(retry_audio).unwrap();
+        let kept = storage.history_item(source).unwrap().unwrap();
+        assert!(kept.has_audio);
+        assert_eq!(kept.expires_at, None);
+        assert_eq!(history_audio_count(&storage), 2);
+        storage.delete_all_history().unwrap();
     }
 
     #[test]
@@ -4117,7 +4298,7 @@ pub(crate) async fn retry_history_item(
         let history_save_status = services
             .lifecycle
             .commit_side_effect(operation_id, || {
-                Ok::<HistorySaveStatus, String>(save_history(
+                Ok::<HistorySaveStatus, String>(save_retry_result(
                     &storage,
                     &NewHistoryItem {
                         transcript_text: &transcript.text,
@@ -4145,7 +4326,8 @@ pub(crate) async fn retry_history_item(
                         insertion_result: None,
                         insertion_detail: None,
                     },
-                    Some(&retry_path),
+                    &retry_path,
+                    id,
                 ))
             })
             .map_err(str::to_string)?
