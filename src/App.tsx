@@ -128,6 +128,9 @@ interface InsertionNoticeEvent {
 // Matches the backend timer that hides the overlay window.
 const INSERTION_NOTICE_MS = 5_000;
 
+// The Processing message of a hotkey start that waits for the speech model.
+const PREPARING_SPEECH_MODEL = "Preparing the speech model. Recording starts when it is ready.";
+
 // A failure or warning sentence from the backend, shown while the main
 // window may be hidden. The backend chooses how long it stays up.
 interface OverlayMessageEvent {
@@ -292,7 +295,9 @@ function RecordingOverlay() {
           setNotice(null);
         } else if (
           payload.phase === "processing" &&
-          (payload.message?.startsWith("Stopping") || payload.message?.startsWith("Transcribing"))
+          (payload.message === PREPARING_SPEECH_MODEL ||
+            payload.message?.startsWith("Stopping") ||
+            payload.message?.startsWith("Transcribing"))
         ) {
           setPreview(null);
         }
@@ -386,7 +391,11 @@ function RecordingOverlay() {
   if (phase !== "processing" && phase !== "injecting") return null;
 
   const compactPreview = compactOverlayPreview(preview?.text ?? "");
-  const label = voiceMode.mode === "ask"
+  // A start waiting for the model has not published its voice mode yet.
+  const preparing = message === PREPARING_SPEECH_MODEL;
+  const label = preparing
+    ? t("Preparing speech model")
+    : voiceMode.mode === "ask"
     ? t("Ask Anything")
     : voiceMode.mode === "edit"
     ? t("Editing")
@@ -411,8 +420,10 @@ function RecordingOverlay() {
       <span className="processing-spinner" aria-hidden="true" />
       <div className="processing-copy">
         <span className="recording-overlay-label">{label}</span>
-        <span className={`correction-preview${compactPreview ? "" : " pending"}`}>
-          {compactPreview || translateAppMessage(language, message) || t("Preparing text…")}
+        <span className={`correction-preview${compactPreview && !preparing ? "" : " pending"}`}>
+          {preparing
+            ? t("Starts when ready")
+            : compactPreview || translateAppMessage(language, message) || t("Preparing text…")}
         </span>
       </div>
     </div>

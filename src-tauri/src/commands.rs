@@ -767,11 +767,8 @@ async fn start_owned_recording(
         .transpose()?;
     let mut ask_session = (mode == PipelineMode::Ask)
         .then(|| AskSession::new(&settings, active_hotkey, from_shortcut));
-    ensure_model_loaded(&app, &services, &settings).await?;
-    if services.lifecycle.is_cancelled(operation_id) {
-        emit_state(&app, &state, AppPhase::Idle, cancel_message);
-        return Err(cancel_error.into());
-    }
+    // Capture the target at the press: a model load may take minutes, and
+    // the foreground window by then is not necessarily the one meant.
     let target = (mode != PipelineMode::Edit && mode != PipelineMode::Ask)
         .then(|| {
             SystemTextInjector::default()
@@ -779,6 +776,24 @@ async fn start_owned_recording(
                 .map_err(command_error)
         })
         .transpose()?;
+    let preparing = services
+        .model
+        .lock()
+        .map(|status| needs_model_preparation(&status, &model_identity(&settings).0))
+        .unwrap_or(true);
+    if preparing {
+        emit_state(&app, &state, AppPhase::Processing, PREPARING_SPEECH_MODEL);
+    }
+    let cancelled = wait_for_speech_model(
+        &app,
+        &settings,
+        services.lifecycle.cancellation(operation_id)?,
+    )
+    .await?;
+    if cancelled || services.lifecycle.is_cancelled(operation_id) {
+        emit_state(&app, &state, AppPhase::Idle, cancel_message);
+        return Err(cancel_error.into());
+    }
     // The start cue finishes before the microphone opens (`arm` below), so it
     // is neither recorded nor detected as speech by the live draft.
     play_start_cue_before_capture(settings.interaction_sounds, play_start_cue_to_completion).await;
@@ -929,6 +944,51 @@ async fn start_owned_recording(
         }
     });
     Ok(())
+}
+
+/// Shown on the overlay while a start waits for the speech model.
+const PREPARING_SPEECH_MODEL: &str =
+    "Preparing the speech model. Recording starts when it is ready.";
+
+/// Whether a start must wait for a model load, and therefore shows the
+/// preparing state instead of appearing to ignore the hotkey.
+fn needs_model_preparation(status: &ModelStatus, model_id: &Option<String>) -> bool {
+    !(status.state == "ready" && &status.model_id == model_id)
+}
+
+/// Waits until the speech model is ready or the start is cancelled, and
+/// returns whether it was cancelled first. The load runs as its own task: a
+/// worker request cannot be abandoned midway, so a cancelled start stops
+/// waiting (and never opens the microphone later), while the load finishes
+/// for the next start.
+async fn wait_for_speech_model(
+    app: &AppHandle,
+    settings: &Settings,
+    cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<bool, String> {
+    let load = {
+        let app = app.clone();
+        let settings = settings.clone();
+        tauri::async_runtime::spawn(async move {
+            let services = app.state::<Services>();
+            ensure_model_loaded(&app, &services, &settings)
+                .await
+                .map(|_| ())
+        })
+    };
+    load_unless_cancelled(async move { load.await.map_err(command_error)? }, cancel).await
+}
+
+/// Returns `Ok(true)` as soon as `cancel` is set, without waiting for `load`.
+async fn load_unless_cancelled(
+    load: impl std::future::Future<Output = Result<(), String>>,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<bool, String> {
+    tokio::select! {
+        loaded = load => loaded.map(|()| false),
+        // A closed channel means the operation is gone, which is a cancel too.
+        _ = cancel.wait_for(|cancelled| *cancelled) => Ok(true),
+    }
 }
 
 /// Recordings stop automatically at this length and are transcribed as usual.
@@ -3564,6 +3624,82 @@ mod tests {
         assert_eq!(
             start_failure(true, false, Some(&AppPhase::Completed)),
             StartFailure::Keep
+        );
+    }
+
+    #[test]
+    fn only_a_start_that_must_load_the_model_shows_the_preparing_state() {
+        let status = |state: &str, model: &str| ModelStatus {
+            model_id: Some(model.into()),
+            installed: true,
+            state: state.into(),
+            detail: String::new(),
+        };
+        let current = Some("faster-whisper:large-v3-turbo".to_string());
+        let ready = status("ready", "faster-whisper:large-v3-turbo");
+        assert!(!needs_model_preparation(&ready, &current));
+        for state in ["loading", "not_loaded", "error"] {
+            assert!(needs_model_preparation(
+                &status(state, "faster-whisper:large-v3-turbo"),
+                &current
+            ));
+        }
+        // A ready model that is not the configured one is reloaded first.
+        assert!(needs_model_preparation(
+            &status("ready", "faster-whisper:small"),
+            &current
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelling_while_the_model_loads_never_starts_the_recording() {
+        let lifecycle = PipelineLifecycle::default();
+        let id = lifecycle.begin_start(PipelineMode::Dictate).unwrap();
+        let cancel = lifecycle.cancellation(id).unwrap();
+        let (finish_load, load_finished) = tokio::sync::oneshot::channel::<()>();
+        let waiting = load_unless_cancelled(
+            async move {
+                let _ = load_finished.await;
+                Ok(())
+            },
+            cancel,
+        );
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), waiting.as_mut())
+                .await
+                .is_err()
+        );
+        // A second press cancels the Starting operation mid-load.
+        assert_eq!(
+            lifecycle.cancel().unwrap(),
+            Some((id, PipelinePhase::Starting))
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .unwrap(),
+            Ok(true)
+        );
+        // The load finishing later cannot open the microphone.
+        let _ = finish_load.send(());
+        assert!(lifecycle.mark_recording(id).is_err());
+        lifecycle.finish(id);
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_ready_model_starts_without_waiting_for_cancellation() {
+        let lifecycle = PipelineLifecycle::default();
+        let id = lifecycle.begin_start(PipelineMode::Dictate).unwrap();
+        let cancel = lifecycle.cancellation(id).unwrap();
+        assert_eq!(
+            load_unless_cancelled(async { Ok(()) }, cancel.clone()).await,
+            Ok(false)
+        );
+        assert_eq!(
+            load_unless_cancelled(async { Err("load failed".into()) }, cancel).await,
+            Err("load failed".to_string())
         );
     }
 

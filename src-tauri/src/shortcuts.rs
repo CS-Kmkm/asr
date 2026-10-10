@@ -1,5 +1,37 @@
-use crate::{parse_shortcut, types::Settings};
+use crate::{
+    parse_shortcut,
+    state::{PipelineMode, PipelinePhase},
+    types::Settings,
+};
 use tauri_plugin_global_shortcut::Shortcut;
+
+/// What a voice-mode hotkey press does in the current lifecycle phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Press {
+    Start,
+    Stop,
+    /// A second press while a start waits (for example for the speech
+    /// model) cancels it, so the microphone never opens unexpectedly later.
+    CancelStart,
+    /// Another mode is recording; the press is reported and changes nothing.
+    Busy(&'static str),
+    /// Processing is already visible on the overlay and finishes by itself.
+    Ignore,
+}
+
+pub(crate) fn press(
+    phase: PipelinePhase,
+    active: Option<PipelineMode>,
+    requested: PipelineMode,
+) -> Press {
+    match phase {
+        PipelinePhase::Idle => Press::Start,
+        PipelinePhase::Recording if active == Some(requested) => Press::Stop,
+        PipelinePhase::Recording => Press::Busy("another voice mode is already recording"),
+        PipelinePhase::Starting => Press::CancelStart,
+        PipelinePhase::Processing => Press::Ignore,
+    }
+}
 
 /// Routed actions in collision precedence order: when saved chords collide,
 /// the older action keeps the chord (Dictate, selected-text Translate, voice
@@ -299,6 +331,34 @@ pub(crate) fn update_registrations<E: std::fmt::Display>(
 mod tests {
     use super::*;
     use std::{cell::RefCell, collections::HashSet};
+
+    #[test]
+    fn a_second_press_while_starting_cancels_instead_of_being_ignored() {
+        use PipelineMode::{Dictate, Translate};
+        assert_eq!(press(PipelinePhase::Idle, None, Dictate), Press::Start);
+        assert_eq!(
+            press(PipelinePhase::Starting, Some(Dictate), Dictate),
+            Press::CancelStart
+        );
+        // Any voice hotkey cancels a pending start: nothing should begin
+        // recording minutes later because a model was still loading.
+        assert_eq!(
+            press(PipelinePhase::Starting, Some(Dictate), Translate),
+            Press::CancelStart
+        );
+        assert_eq!(
+            press(PipelinePhase::Recording, Some(Dictate), Dictate),
+            Press::Stop
+        );
+        assert_eq!(
+            press(PipelinePhase::Recording, Some(Dictate), Translate),
+            Press::Busy("another voice mode is already recording")
+        );
+        assert_eq!(
+            press(PipelinePhase::Processing, Some(Dictate), Dictate),
+            Press::Ignore
+        );
+    }
 
     #[test]
     fn detects_cross_action_collisions_and_chord_swaps() {

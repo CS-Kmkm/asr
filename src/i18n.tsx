@@ -303,6 +303,9 @@ const en = {
   "Not completed": "Not completed",
   "Completed with a warning": "Completed with a warning",
   "selected-text translation is already active": "selected-text translation is already active",
+  "Preparing speech model": "Preparing speech model",
+  "Preparing the speech model. Recording starts when it is ready.": "Preparing the speech model. Recording starts when it is ready.",
+  "Starts when ready": "Starts when ready",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
@@ -607,6 +610,9 @@ const ja: Record<MessageKey, string> = {
   "Not completed": "完了しませんでした",
   "Completed with a warning": "完了しました（注意あり）",
   "selected-text translation is already active": "選択テキストの翻訳を実行中です。",
+  "Preparing speech model": "音声認識モデルを準備中",
+  "Preparing the speech model. Recording starts when it is ready.": "音声認識モデルを準備しています。準備ができたら録音を開始します。",
+  "Starts when ready": "準備ができたら開始します",
 } satisfies Record<MessageKey, string>;
 
 const catalogs = { en, ja } satisfies Record<UiLanguage, Record<MessageKey, string>>;
@@ -779,6 +785,7 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "Speak to edit is disabled because its saved hotkey is already used by another action. Change the overlapping hotkeys in Settings.",
       "Speak to edit is disabled because its saved hotkey is already used by another action, and a saved hotkey could not be registered. Change them in Settings.",
       "selected-text translation is already active",
+      "Preparing the speech model. Recording starts when it is ready.",
   ] satisfies MessageKey[],
 );
 
