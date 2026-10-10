@@ -118,7 +118,9 @@ impl InsertionDetail {
                 Some(Self::TargetProtected)
             }
             InjectionError::ImeCompositionActive => Some(Self::ImeActive),
-            InjectionError::ClipboardUnavailable => Some(Self::ClipboardUnavailable),
+            InjectionError::ClipboardUnavailable | InjectionError::ClipboardUnpreservable => {
+                Some(Self::ClipboardUnavailable)
+            }
             InjectionError::UnsupportedPlatform
             | InjectionError::NoSelection
             | InjectionError::BackendFailure(_) => Some(Self::BackendFailure),
@@ -153,7 +155,12 @@ pub enum InjectionError {
     SecureTarget,
     PrivilegeMismatch,
     ImeCompositionActive,
+    /// The clipboard is locked by another process.
     ClipboardUnavailable,
+    /// The clipboard could be opened, but holds data that cannot be copied
+    /// (too many or too large formats, private or owner-drawn formats, or a
+    /// delay-rendering owner that fails to render).
+    ClipboardUnpreservable,
     Cancelled,
     /// The focused field is readable but nothing is selected in it.
     NoSelection,
@@ -170,6 +177,7 @@ impl fmt::Display for InjectionError {
             Self::PrivilegeMismatch => "the target cannot be accessed at this privilege level",
             Self::ImeCompositionActive => "an IME composition is in progress",
             Self::ClipboardUnavailable => "the clipboard is unavailable",
+            Self::ClipboardUnpreservable => "the clipboard holds data that cannot be preserved",
             Self::Cancelled => "text insertion was cancelled",
             Self::NoSelection => "no text is selected",
             Self::BackendFailure(message) => message,

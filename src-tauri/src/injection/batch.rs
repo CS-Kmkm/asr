@@ -153,15 +153,21 @@ fn paste<B: Backend>(
     if cancel.is_some_and(|receiver| *receiver.borrow()) {
         return Err(InjectionError::Cancelled);
     }
-    // A clipboard that cannot be preserved (oversized, private, owner-drawn
-    // or delay-rendered formats) must not block insertion: the copy-only and
-    // unreadable-target paths overwrite it as well. The paste proceeds and
-    // the caller reports that the clipboard was not restored.
     let mut unrestored = false;
     let previous = if options.restore_clipboard {
-        let snapshot = backend.clipboard_snapshot().ok();
-        unrestored = snapshot.is_none();
-        snapshot
+        match backend.clipboard_snapshot() {
+            Ok(snapshot) => Some(snapshot),
+            // Data that cannot be preserved must not block insertion: the
+            // copy-only and unreadable-target paths overwrite it as well. The
+            // paste proceeds and the caller reports the unrestored clipboard.
+            Err(InjectionError::ClipboardUnpreservable) => {
+                unrestored = true;
+                None
+            }
+            // A clipboard still locked after retries could have been
+            // preserved later. Never paste over it.
+            Err(error) => return Err(error),
+        }
     } else {
         None
     };
@@ -1196,7 +1202,7 @@ pub(super) mod tests {
         target_valid: Cell<bool>,
         pub(crate) ime: Cell<Option<bool>>,
         ime_query_fails: Cell<bool>,
-        snapshot_fails: Cell<bool>,
+        snapshot_error: RefCell<Option<InjectionError>>,
         not_restored: Cell<usize>,
         text_readable: Cell<bool>,
         selection_readable: Cell<bool>,
@@ -1235,7 +1241,7 @@ pub(super) mod tests {
                 target_valid: Cell::new(true),
                 ime: Cell::new(Some(false)),
                 ime_query_fails: Cell::new(false),
-                snapshot_fails: Cell::new(false),
+                snapshot_error: RefCell::new(None),
                 not_restored: Cell::new(0),
                 text_readable: Cell::new(true),
                 selection_readable: Cell::new(true),
@@ -1333,8 +1339,8 @@ pub(super) mod tests {
             if let Some(on_snapshot) = &self.on_snapshot {
                 on_snapshot(self);
             }
-            if self.snapshot_fails.get() {
-                return Err(InjectionError::ClipboardUnavailable);
+            if let Some(error) = self.snapshot_error.borrow().clone() {
+                return Err(error);
             }
             Ok(self.clipboard.borrow().clone())
         }
@@ -1712,7 +1718,7 @@ pub(super) mod tests {
     fn an_unpreservable_clipboard_does_not_block_a_readable_paste() {
         // Additive final paste and a destructive selection replacement.
         let backend = MockBackend::new();
-        backend.snapshot_fails.set(true);
+        *backend.snapshot_error.borrow_mut() = Some(InjectionError::ClipboardUnpreservable);
         assert_eq!(
             final_paste(&backend, FinalGuard::Untouched),
             InsertResult::ClipboardPaste
@@ -1723,7 +1729,7 @@ pub(super) mod tests {
         assert_eq!(backend.not_restored.get(), 1);
 
         let backend = MockBackend::new();
-        backend.snapshot_fails.set(true);
+        *backend.snapshot_error.borrow_mut() = Some(InjectionError::ClipboardUnpreservable);
         *backend.text.borrow_mut() = selected_state();
         let monitor = monitor();
         assert_eq!(
@@ -1743,7 +1749,7 @@ pub(super) mod tests {
 
         // Nothing to report when restoring is off or the snapshot succeeds.
         let backend = MockBackend::new();
-        backend.snapshot_fails.set(true);
+        *backend.snapshot_error.borrow_mut() = Some(InjectionError::ClipboardUnpreservable);
         let (_sender, cancel) = watch::channel(false);
         insert_final(
             &backend,
@@ -1890,6 +1896,31 @@ pub(super) mod tests {
                 "{case}"
             );
         }
+    }
+
+    #[test]
+    fn a_clipboard_that_stays_locked_aborts_before_any_target_input() {
+        let backend = MockBackend::new();
+        *backend.snapshot_error.borrow_mut() = Some(InjectionError::ClipboardUnavailable);
+        let monitor = monitor();
+        let (_sender, cancel) = watch::channel(false);
+        assert_eq!(
+            insert_final(
+                &backend,
+                InjectionOptions::default(),
+                "new",
+                &target(),
+                &monitor,
+                monitor.checkpoint().unwrap(),
+                &cancel,
+                FinalGuard::Untouched,
+            ),
+            Err(InjectionError::ClipboardUnavailable)
+        );
+        assert!(backend.calls.borrow().is_empty());
+        assert_eq!(*backend.clipboard.borrow(), "original rich clipboard");
+        assert_eq!(backend.content(), "prefix  suffix");
+        assert_eq!(backend.not_restored.get(), 0);
     }
 
     #[test]
