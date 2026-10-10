@@ -222,6 +222,11 @@ struct RunningWorker {
     /// next read continues the same line, so giving up on a response never
     /// desynchronizes the stream.
     partial_line: Vec<u8>,
+    /// A request was sent and its response not yet read. Still set when the
+    /// waiting future was dropped (for example an aborted startup load): the
+    /// worker is busy and its stream holds a stale response, so it is killed
+    /// rather than reused or asked to shut down.
+    in_flight: bool,
 }
 
 impl RunningWorker {
@@ -229,6 +234,7 @@ impl RunningWorker {
         let mut encoded =
             serde_json::to_vec(message).map_err(|error| AsrError::Protocol(error.to_string()))?;
         encoded.push(b'\n');
+        self.in_flight = true;
         self.stdin.write_all(&encoded).await?;
         self.stdin.flush().await?;
         Ok(())
@@ -297,6 +303,13 @@ impl State {
             worker.kill().await;
         }
         self.mark_not_resident();
+    }
+
+    /// Kill a worker whose last response was abandoned without a drain.
+    async fn discard_abandoned_worker(&mut self) {
+        if self.running.as_ref().is_some_and(|worker| worker.in_flight) {
+            self.reset().await;
+        }
     }
 }
 
@@ -383,6 +396,7 @@ async fn drain_cancelled(
             ));
         }
     }
+    worker.in_flight = false;
     Ok(())
 }
 
@@ -495,6 +509,7 @@ impl JsonlTranscriber {
             stdin,
             stdout: BufReader::new(stdout),
             partial_line: Vec::new(),
+            in_flight: false,
         })
     }
 
@@ -514,7 +529,10 @@ impl JsonlTranscriber {
                 Some(progress) => {
                     let _ = self.progress.send(progress);
                 }
-                None => return Self::validate_response(&line, expected_id),
+                None => {
+                    worker.in_flight = false;
+                    return Self::validate_response(&line, expected_id);
+                }
             }
         }
     }
@@ -649,9 +667,11 @@ impl JsonlTranscriber {
         let state = until_cancelled(self.state.clone().lock_owned(), cancel, interrupt)
             .await
             .map_err(|_| AsrError::Cancelled)?;
+        let mut state = state;
         if interrupt.has_changed().unwrap_or(true) || cancel_requested(cancel) {
             return Err(AsrError::Cancelled);
         }
+        state.discard_abandoned_worker().await;
         Ok(state)
     }
 
@@ -894,6 +914,7 @@ impl Transcriber for JsonlTranscriber {
     async fn shutdown(&self) -> Result<(), AsrError> {
         self.interrupt_running_request();
         let mut state = self.state.lock().await;
+        state.discard_abandoned_worker().await;
         state.mark_not_resident();
         let Some(mut worker) = state.running.take() else {
             return Ok(());
@@ -1432,11 +1453,11 @@ mod tests {
             let cancel_once_running = async {
                 mock.wait_for_event("transcribe", 1).await;
                 cancel_tx.send_replace(true);
+                Instant::now()
             };
-            let started = Instant::now();
-            let (result, ()) = tokio::join!(request, cancel_once_running);
+            let (result, cancelled_at) = tokio::join!(request, cancel_once_running);
             assert!(matches!(result, Err(AsrError::Cancelled)), "{result:?}");
-            assert!(started.elapsed() < BOUNDED);
+            assert!(cancelled_at.elapsed() < BOUNDED);
 
             // The held backend stops only because the worker relayed the cancel.
             mock.wait_for_event("cancelled", 1).await;
@@ -1557,11 +1578,11 @@ mod tests {
             let cancel_once_loading = async {
                 mock.wait_for_event("load 4bit", 1).await;
                 cancel_tx.send_replace(true);
+                Instant::now()
             };
-            let started = Instant::now();
-            let (result, ()) = tokio::join!(load, cancel_once_loading);
+            let (result, cancelled_at) = tokio::join!(load, cancel_once_loading);
             assert!(matches!(result, Err(AsrError::Cancelled)), "{result:?}");
-            assert!(started.elapsed() < BOUNDED);
+            assert!(cancelled_at.elapsed() < BOUNDED);
             assert_eq!(resident(&transcriber), None);
 
             mock.release();
@@ -1621,6 +1642,107 @@ mod tests {
                 "reconfigured"
             );
             assert_eq!(mock.processes(), 2);
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn shutdown_kills_a_worker_whose_load_was_abandoned() {
+            // Quit aborts the startup load task, dropping its future while
+            // the worker is still loading; shutdown must not wait for it.
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = Arc::new(
+                mock.transcriber()
+                    .with_grace_periods(Duration::from_secs(5), Duration::from_secs(30)),
+            );
+            mock.hold();
+            let load = tokio::spawn({
+                let transcriber = transcriber.clone();
+                async move { transcriber.load("4bit").await }
+            });
+            mock.wait_for_event("load 4bit", 1).await;
+            load.abort();
+            assert!(load.await.unwrap_err().is_cancelled());
+
+            let started = Instant::now();
+            transcriber.shutdown().await.unwrap();
+            assert!(started.elapsed() < BOUNDED);
+            assert!(transcriber.state.lock().await.running.is_none());
+            mock.release();
+        }
+
+        #[tokio::test]
+        async fn a_request_after_an_abandoned_load_uses_a_new_worker() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = Arc::new(mock.transcriber());
+            mock.hold();
+            let load = tokio::spawn({
+                let transcriber = transcriber.clone();
+                async move { transcriber.load("4bit").await }
+            });
+            mock.wait_for_event("load 4bit", 1).await;
+            load.abort();
+            let _ = load.await;
+            mock.release();
+
+            // The stale load response is never read as this load's reply.
+            transcriber.load("8bit").await.unwrap();
+            mock.transcribe(&transcriber).await.unwrap();
+            assert_eq!(mock.processes(), 2);
+            transcriber.shutdown().await.unwrap();
+        }
+
+        /// A worker from before `cancel` existed: it handles one request at a
+        /// time and rejects `cancel` as unknown after the transcription.
+        const LEGACY_WORKER: &str = r#"
+import json, sys
+from asr_worker.backends import MockBackend
+from asr_worker.worker import Worker, error_response
+worker = Worker(MockBackend())
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("command") == "cancel":
+        response = error_response(request["id"], "unsupported_operation", "v1")
+    else:
+        response, _ = worker.handle(request)
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#;
+
+        #[tokio::test]
+        async fn a_legacy_worker_answering_cancel_last_is_drained_and_kept() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let mut command = mock.command.clone();
+            command.args = vec!["-c".into(), LEGACY_WORKER.into()];
+            let transcriber =
+                JsonlTranscriber::new(command, Duration::from_secs(20), Duration::from_secs(20))
+                    .with_grace_periods(Duration::from_secs(5), Duration::from_secs(2));
+            transcriber.load("4bit").await.unwrap();
+            mock.hold();
+
+            let (cancel_tx, cancel) = watch::channel(false);
+            let request = transcriber.transcribe(&mock.audio, None, cancel);
+            let cancel_once_running = async {
+                mock.wait_for_event("transcribe", 1).await;
+                cancel_tx.send_replace(true);
+            };
+            let (result, ()) = tokio::join!(request, cancel_once_running);
+            assert!(matches!(result, Err(AsrError::Cancelled)), "{result:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            mock.release();
+
+            mock.transcribe(&transcriber).await.unwrap();
+            assert!(resident(&transcriber).is_some());
+            assert_eq!(
+                mock.event_names(),
+                ["load 4bit", "transcribe", "transcribe"]
+            );
+            assert_eq!(mock.processes(), 1);
             transcriber.shutdown().await.unwrap();
         }
 
