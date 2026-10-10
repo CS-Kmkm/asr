@@ -435,25 +435,27 @@ pub(crate) fn worker_command_for_settings(settings: &Settings) -> WorkerCommand 
     command
 }
 
-fn worker_runtime() -> (OsString, Option<PathBuf>) {
-    let roots = [
+/// The checkout that holds the Python worker: the first ancestor of the
+/// working directory, then of the executable's directory, with `asr_worker`.
+fn project_root() -> Option<PathBuf> {
+    [
         std::env::current_dir().ok(),
         std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(Path::to_path_buf)),
-    ];
-    let mut project_root = None;
-    for root in roots.into_iter().flatten() {
-        for candidate in root.ancestors() {
-            if candidate.join("asr_worker").join("__main__.py").is_file() {
-                project_root = Some(candidate.to_path_buf());
-                break;
-            }
-        }
-        if project_root.is_some() {
-            break;
-        }
-    }
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|start| {
+        start
+            .ancestors()
+            .find(|candidate| candidate.join("asr_worker").join("__main__.py").is_file())
+            .map(Path::to_path_buf)
+    })
+}
+
+fn worker_runtime() -> (OsString, Option<PathBuf>) {
+    let project_root = project_root();
 
     if let Some(python) = std::env::var_os("ASR_PYTHON") {
         return (python, project_root);
@@ -515,7 +517,12 @@ fn parse_shortcut(value: &str) -> Result<Shortcut, String> {
 fn load_environment_file() {
     let current_dir = std::env::current_dir().ok();
     let executable = std::env::current_exe().ok();
-    let candidates = environment_file_candidates(current_dir.as_deref(), executable.as_deref());
+    let project_root = project_root();
+    let candidates = environment_file_candidates(
+        current_dir.as_deref(),
+        executable.as_deref(),
+        project_root.as_deref(),
+    );
 
     if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
         if let Err(error) = dotenvy::from_path(&path) {
@@ -527,9 +534,13 @@ fn load_environment_file() {
     }
 }
 
+/// `.env` locations in priority order. Windows autostart runs the release
+/// executable from `C:\Windows\System32`, so the checkout that holds the
+/// worker (and its `.env`) is searched last as well.
 fn environment_file_candidates(
     current_dir: Option<&Path>,
     executable: Option<&Path>,
+    project_root: Option<&Path>,
 ) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(current_dir) = current_dir {
@@ -543,8 +554,13 @@ fn environment_file_candidates(
             }
         }
     }
-    if let Some(parent) = executable.and_then(Path::parent) {
-        let path = parent.join(".env");
+    let later = [
+        executable
+            .and_then(Path::parent)
+            .map(|parent| parent.join(".env")),
+        project_root.map(|root| root.join(".env")),
+    ];
+    for path in later.into_iter().flatten() {
         if !candidates.contains(&path) {
             candidates.push(path);
         }
@@ -581,9 +597,29 @@ mod model_configuration_tests {
         let current_dir = workspace.join("src-tauri");
         let executable = current_dir.join("target/debug/local-voice-input.exe");
 
-        let candidates = environment_file_candidates(Some(&current_dir), Some(&executable));
+        let candidates = environment_file_candidates(Some(&current_dir), Some(&executable), None);
 
         assert!(candidates.contains(&workspace.join(".env")));
+    }
+
+    #[test]
+    fn autostart_launch_finds_the_checkout_environment_file_last() {
+        // Windows autostart starts the release build from System32.
+        let workspace = Path::new("workspace");
+        let current_dir = Path::new("windows").join("system32");
+        let executable = workspace.join("src-tauri/target/release/local-voice-input.exe");
+
+        let candidates =
+            environment_file_candidates(Some(&current_dir), Some(&executable), Some(workspace));
+
+        assert_eq!(
+            candidates,
+            [
+                current_dir.join(".env"),
+                workspace.join("src-tauri/target/release/.env"),
+                workspace.join(".env"),
+            ]
+        );
     }
 
     #[test]
