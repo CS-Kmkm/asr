@@ -579,10 +579,7 @@ async fn start_recording_mode(
     if services.translation_active.load(Ordering::Acquire) {
         return Err("selected-text translation is already active".into());
     }
-    let operation_id = begin_pipeline(&services.settings_update, || {
-        services.lifecycle.begin_start(mode)
-    })
-    .await?;
+    let operation_id = MODEL_CHANGE_GATE.begin_pipeline(|| services.lifecycle.begin_start(mode))?;
     let guard = PipelineGuard {
         lifecycle: &services.lifecycle,
         id: operation_id,
@@ -3259,44 +3256,82 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_recording_cannot_start_between_the_model_check_and_reconfigure() {
-        let settings_update = Arc::new(tokio::sync::Mutex::new(()));
-        let lifecycle = Arc::new(PipelineLifecycle::default());
-        let reconfigured = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    fn model_change() -> (Settings, Settings) {
         let previous = Settings::default();
         let mut next = previous.clone();
         next.model_id = Some("custom/model".into());
+        (previous, next)
+    }
 
-        // update_settings: Idle check, then reconfigure under the same guard.
-        let update_guard = settings_update.lock().await;
+    #[test]
+    fn a_recording_cannot_start_between_the_model_check_and_reconfigure() {
+        let gate = ModelChangeGate::new();
+        let lifecycle = PipelineLifecycle::default();
+        let (previous, next) = model_change();
+
+        // update_settings: the Idle check and the mark happen in one step.
+        let change = gate
+            .begin_change(&previous, &next, || lifecycle.phase())
+            .unwrap();
+        assert!(change.is_some());
         assert_eq!(
-            reject_model_change_while_busy(&previous, &next, lifecycle.phase()),
-            Ok(())
+            gate.begin_pipeline(|| lifecycle.begin_start(PipelineMode::Dictate)),
+            Err(MODEL_CHANGE_IN_PROGRESS)
         );
-        let start = tokio::spawn({
-            let settings_update = Arc::clone(&settings_update);
-            let lifecycle = Arc::clone(&lifecycle);
-            let reconfigured = Arc::clone(&reconfigured);
-            async move {
-                begin_pipeline(&settings_update, || {
-                    // The start observes the finished reconfiguration.
-                    assert!(reconfigured.load(std::sync::atomic::Ordering::SeqCst));
-                    lifecycle.begin_start(PipelineMode::Dictate)
-                })
-                .await
+        assert_eq!(lifecycle.phase(), PipelinePhase::Idle);
+
+        // After the reconfiguration the start proceeds, and a later model
+        // change observes the claimed pipeline and is refused.
+        drop(change);
+        assert!(gate
+            .begin_pipeline(|| lifecycle.begin_start(PipelineMode::Dictate))
+            .is_ok());
+        assert_eq!(
+            gate.begin_change(&previous, &next, || lifecycle.phase())
+                .err(),
+            Some(MODEL_CHANGE_WHILE_BUSY.to_string())
+        );
+        // Unrelated settings never take the mark, even while recording.
+        assert!(gate
+            .begin_change(&previous, &previous, || lifecycle.phase())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_start_during_a_model_change_fails_fast_instead_of_waiting() {
+        let gate = Arc::new(ModelChangeGate::new());
+        let lifecycle = PipelineLifecycle::default();
+        let (previous, next) = model_change();
+        let (marked, wait_marked) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+        // A reconfiguration that is still running (for example behind a
+        // model download that holds the transcriber).
+        let updater = std::thread::spawn({
+            let gate = Arc::clone(&gate);
+            move || {
+                let _change = gate
+                    .begin_change(&previous, &next, || PipelinePhase::Idle)
+                    .unwrap();
+                marked.send(()).unwrap();
+                wait_release.recv().unwrap();
             }
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_marked.recv().unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            gate.begin_pipeline(|| lifecycle.begin_retry(PipelineMode::Dictate))
+                .map(|(id, _)| id),
+            Err(MODEL_CHANGE_IN_PROGRESS)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(lifecycle.phase(), PipelinePhase::Idle);
-        reconfigured.store(true, std::sync::atomic::Ordering::SeqCst);
-        drop(update_guard);
-        assert!(start.await.unwrap().is_ok());
-        assert_eq!(lifecycle.phase(), PipelinePhase::Starting);
-
-        // A later update observes the claimed pipeline and is refused.
-        let _update_guard = settings_update.lock().await;
-        assert!(reject_model_change_while_busy(&previous, &next, lifecycle.phase()).is_err());
+        release.send(()).unwrap();
+        updater.join().unwrap();
+        // The guard cleared the mark when the update finished.
+        assert!(gate
+            .begin_pipeline(|| lifecycle.begin_retry(PipelineMode::Dictate))
+            .is_ok());
     }
 
     #[test]
@@ -3654,10 +3689,13 @@ pub(crate) async fn update_settings(
     // The command is async, so waiting here never blocks the main thread
     // needed by global-shortcut registration. Keep this guard through the
     // single transactional settings/History persistence step.
-    let previous = {
+    let (previous, _model_change) = {
         let _settings_writes = storage.lock_settings_writes().map_err(command_error)?;
         let previous = storage.get_settings().map_err(command_error)?;
-        reject_model_change_while_busy(&previous, &settings, services.lifecycle.phase())?;
+        // Held until the transcriber is reconfigured and its status reset;
+        // recording starts and Retry fail fast meanwhile instead of waiting.
+        let model_change =
+            MODEL_CHANGE_GATE.begin_change(&previous, &settings, || services.lifecycle.phase())?;
         let old_routes = services
             .shortcut_routes
             .lock()
@@ -3697,7 +3735,7 @@ pub(crate) async fn update_settings(
             .inactive_shortcuts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = inactive;
-        previous
+        (previous, model_change)
     };
     if settings.auto_start != previous.auto_start {
         let result = if settings.auto_start {
@@ -3746,21 +3784,82 @@ fn worker_configuration_changed(previous: &Settings, next: &Settings) -> bool {
         || next.api_key_env_var != previous.api_key_env_var
 }
 
-/// Claims the pipeline only while no settings update is in progress.
-/// `update_settings` holds `settings_update` from its Idle check through the
-/// transcriber reconfiguration, so a recording or Retry either claims the
-/// pipeline first (and the model change is refused) or starts after the
-/// reconfiguration (and loads the new model).
-async fn begin_pipeline<T>(
-    settings_update: &tokio::sync::Mutex<()>,
-    begin: impl FnOnce() -> T,
-) -> T {
-    let _settings_update = settings_update.lock().await;
-    begin()
-}
-
 const MODEL_CHANGE_WHILE_BUSY: &str =
     "Finish the current recording or processing before changing the speech model.";
+const MODEL_CHANGE_IN_PROGRESS: &str = "The speech model is being changed. Try again in a moment.";
+
+/// Makes a speech-model change atomic with respect to pipeline starts.
+///
+/// `update_settings` checks that the pipeline is idle and marks a change in
+/// progress in one step under this short-lived lock, then reconfigures the
+/// transcriber without it. Recording start and Retry claim the lifecycle
+/// under the same lock and fail fast while the mark is set. A start can
+/// therefore neither slip between the check and the reconfiguration nor wait
+/// behind a model load that holds the transcriber.
+struct ModelChangeGate {
+    changing: Mutex<bool>,
+}
+
+static MODEL_CHANGE_GATE: ModelChangeGate = ModelChangeGate::new();
+
+impl ModelChangeGate {
+    const fn new() -> Self {
+        Self {
+            changing: Mutex::new(false),
+        }
+    }
+
+    fn changing(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.changing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Returns a guard that keeps starts out until it drops, or `None` when
+    /// `next` does not change the speech model.
+    fn begin_change(
+        &self,
+        previous: &Settings,
+        next: &Settings,
+        phase: impl FnOnce() -> PipelinePhase,
+    ) -> Result<Option<ModelChangeGuard<'_>>, String> {
+        let mut changing = self.changing();
+        if !speech_model_changed(previous, next) {
+            return Ok(None);
+        }
+        reject_model_change_while_busy(previous, next, phase())?;
+        *changing = true;
+        Ok(Some(ModelChangeGuard { gate: self }))
+    }
+
+    /// Claims the pipeline with `begin` unless a model change is in progress.
+    fn begin_pipeline<T>(
+        &self,
+        begin: impl FnOnce() -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        let changing = self.changing();
+        if *changing {
+            return Err(MODEL_CHANGE_IN_PROGRESS);
+        }
+        begin()
+    }
+}
+
+/// Clears the model-change mark on every exit path of `update_settings`.
+struct ModelChangeGuard<'a> {
+    gate: &'a ModelChangeGate,
+}
+
+impl Drop for ModelChangeGuard<'_> {
+    fn drop(&mut self) {
+        *self.gate.changing() = false;
+    }
+}
+
+fn speech_model_changed(previous: &Settings, next: &Settings) -> bool {
+    worker_configuration_changed(previous, next)
+        || next.model_quantization != previous.model_quantization
+}
 
 /// A recording or its processing owns the loaded speech model until it
 /// finishes. Reconfiguring or reloading it underneath would fail the final
@@ -3770,9 +3869,7 @@ fn reject_model_change_while_busy(
     next: &Settings,
     phase: PipelinePhase,
 ) -> Result<(), String> {
-    let model_changed = worker_configuration_changed(previous, next)
-        || next.model_quantization != previous.model_quantization;
-    if model_changed && phase != PipelinePhase::Idle {
+    if speech_model_changed(previous, next) && phase != PipelinePhase::Idle {
         return Err(MODEL_CHANGE_WHILE_BUSY.into());
     }
     Ok(())
@@ -3826,11 +3923,9 @@ pub(crate) async fn retry_history_item(
         .map_err(command_error)?
         .ok_or_else(|| "history item not found".to_string())?;
     let mode = history_pipeline_mode(&source.mode)?;
-    let (operation_id, cancel) = begin_pipeline(&services.settings_update, || {
-        services.lifecycle.begin_retry(mode)
-    })
-    .await
-    .map_err(str::to_string)?;
+    let (operation_id, cancel) = MODEL_CHANGE_GATE
+        .begin_pipeline(|| services.lifecycle.begin_retry(mode))
+        .map_err(str::to_string)?;
     let _guard = PipelineGuard {
         lifecycle: &services.lifecycle,
         id: operation_id,
