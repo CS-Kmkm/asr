@@ -156,9 +156,14 @@ impl Default for InjectionOptions {
 }
 
 pub struct SystemTextInjector {
-    backend: PlatformBackend,
+    backend: InjectorBackend,
     options: InjectionOptions,
 }
+
+#[cfg(not(test))]
+type InjectorBackend = PlatformBackend;
+#[cfg(test)]
+type InjectorBackend = test_backend::Switchable;
 
 pub(crate) struct SelectedText {
     target: TargetWindow,
@@ -177,7 +182,22 @@ impl SelectedText {
 impl SystemTextInjector {
     pub fn new(options: InjectionOptions) -> Self {
         Self {
-            backend: PlatformBackend::new(),
+            backend: InjectorBackend::new(),
+            options,
+        }
+    }
+    /// Drives the batch mock target, so callers such as `LiveDraft` can be
+    /// tested over the same injection paths as production.
+    #[cfg(test)]
+    pub(crate) fn with_mock(
+        mock: std::sync::Arc<std::sync::Mutex<test_backend::MockBackend>>,
+        options: InjectionOptions,
+    ) -> Self {
+        Self {
+            backend: test_backend::Switchable {
+                platform: PlatformBackend::new(),
+                mock: Some(mock),
+            },
             options,
         }
     }
@@ -223,6 +243,14 @@ impl SystemTextInjector {
         monitor: &InputMonitor,
     ) -> Result<InsertResult, InjectionError> {
         batch::update(&self.backend, self.options, session, text, monitor, false)
+    }
+    /// Removes the whole provisional draft; never edits text outside it.
+    pub(crate) fn retract_provisional(
+        &self,
+        session: &mut ProvisionalInsertion,
+        monitor: &InputMonitor,
+    ) -> Result<InsertResult, InjectionError> {
+        batch::retract(&self.backend, session, monitor)
     }
     pub(crate) fn cancel_provisional(
         &self,
@@ -488,6 +516,127 @@ trait Backend {
     fn paste(&self, target: &TargetWindow, policy: SafetyPolicy) -> Result<bool, InjectionError>;
     fn delete_selection(&self, target: &TargetWindow) -> Result<bool, InjectionError>;
     fn wait_for_target(&self);
+}
+
+/// Test builds can swap the platform backend for the batch mock target.
+#[cfg(test)]
+pub(crate) mod test_backend {
+    pub(crate) use super::batch::tests::{calls, target, MockBackend};
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    pub(super) struct Switchable {
+        pub(super) platform: PlatformBackend,
+        pub(super) mock: Option<Arc<Mutex<MockBackend>>>,
+    }
+
+    impl Switchable {
+        pub(super) fn new() -> Self {
+            Self {
+                platform: PlatformBackend::new(),
+                mock: None,
+            }
+        }
+    }
+
+    pub(super) enum Clipboard {
+        Platform(<PlatformBackend as Backend>::Clipboard),
+        Mock(String),
+    }
+
+    macro_rules! delegate {
+        ($self:ident, |$backend:ident| $call:expr) => {
+            match &$self.mock {
+                Some(mock) => {
+                    let $backend = &*mock.lock().expect("mock backend lock");
+                    $call
+                }
+                None => {
+                    let $backend = &$self.platform;
+                    $call
+                }
+            }
+        };
+    }
+
+    impl Backend for Switchable {
+        type Clipboard = Clipboard;
+        fn capture_target(&self) -> Result<TargetWindow, InjectionError> {
+            delegate!(self, |b| b.capture_target())
+        }
+        fn validate_target(&self, target: &TargetWindow) -> Result<(), InjectionError> {
+            delegate!(self, |b| b.validate_target(target))
+        }
+        fn ime_composition_active(
+            &self,
+            target: &TargetWindow,
+        ) -> Result<Option<bool>, InjectionError> {
+            delegate!(self, |b| b.ime_composition_active(target))
+        }
+        fn target_text(&self, target: &TargetWindow) -> Result<TargetText, InjectionError> {
+            delegate!(self, |b| b.target_text(target))
+        }
+        fn selection_is_empty(&self, target: &TargetWindow) -> Result<bool, InjectionError> {
+            delegate!(self, |b| b.selection_is_empty(target))
+        }
+        fn focus_identity(&self, target: &TargetWindow) -> Result<Vec<i32>, InjectionError> {
+            delegate!(self, |b| b.focus_identity(target))
+        }
+        fn select_recent(
+            &self,
+            target: &TargetWindow,
+            expected: &TargetText,
+            text: &str,
+        ) -> Result<bool, InjectionError> {
+            delegate!(self, |b| b.select_recent(target, expected, text))
+        }
+        fn clipboard_snapshot(&self) -> Result<Self::Clipboard, InjectionError> {
+            match &self.mock {
+                Some(mock) => mock
+                    .lock()
+                    .expect("mock backend lock")
+                    .clipboard_snapshot()
+                    .map(Clipboard::Mock),
+                None => self.platform.clipboard_snapshot().map(Clipboard::Platform),
+            }
+        }
+        fn clipboard_write(
+            &self,
+            text: &str,
+            exclusion: ClipboardExclusion,
+        ) -> Result<u32, InjectionError> {
+            delegate!(self, |b| b.clipboard_write(text, exclusion))
+        }
+        fn clipboard_restore(
+            &self,
+            snapshot: Self::Clipboard,
+            expected_sequence: u32,
+        ) -> Result<bool, InjectionError> {
+            match (&self.mock, snapshot) {
+                (Some(mock), Clipboard::Mock(snapshot)) => mock
+                    .lock()
+                    .expect("mock backend lock")
+                    .clipboard_restore(snapshot, expected_sequence),
+                (None, Clipboard::Platform(snapshot)) => {
+                    self.platform.clipboard_restore(snapshot, expected_sequence)
+                }
+                _ => unreachable!("a snapshot is restored by the backend that took it"),
+            }
+        }
+        fn paste(
+            &self,
+            target: &TargetWindow,
+            policy: SafetyPolicy,
+        ) -> Result<bool, InjectionError> {
+            delegate!(self, |b| b.paste(target, policy))
+        }
+        fn delete_selection(&self, target: &TargetWindow) -> Result<bool, InjectionError> {
+            delegate!(self, |b| b.delete_selection(target))
+        }
+        fn wait_for_target(&self) {
+            delegate!(self, |b| b.wait_for_target())
+        }
+    }
 }
 
 #[cfg(not(target_os = "windows"))]

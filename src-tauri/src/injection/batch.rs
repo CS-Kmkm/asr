@@ -531,7 +531,7 @@ pub(super) fn update<B: Backend>(
     if session.finished {
         return Ok(session.result);
     }
-    let Some(range) = session.replacement.as_ref() else {
+    if session.replacement.is_none() {
         if finalizing
             && session.result != InsertResult::PasteUnverified
             && (session.result == InsertResult::ClipboardOnly
@@ -540,31 +540,19 @@ pub(super) fn update<B: Backend>(
             session.result = copy_only(backend, final_text)?;
         }
         return Ok(session.result);
-    };
-    if session.result == InsertResult::PasteUnverified {
-        // The target may have processed the draft while correction was running.
-        // Confirm the complete edit before touching a possibly pending payload.
-        if !safe(
-            backend,
-            &session.target,
-            Some((monitor, range.checkpoint)),
-            SafetyPolicy::Destructive,
-        ) || !backend
-            .target_text(&session.target)
-            .is_ok_and(|actual| actual.same_content(&range.after))
-        {
-            return Ok(session.result);
-        }
-        session.result = InsertResult::ClipboardPaste;
+    }
+    if !confirm_queued_draft(backend, session, monitor) {
+        return Ok(session.result);
     }
     if normalize_text(&session.displayed) == normalize_text(final_text) {
         return Ok(session.result);
     }
+    let range = session.replacement.as_ref().expect("range was checked");
     let activity = Some((monitor, range.checkpoint));
-    let Some(selected) = select_verified(
+    let Some(selected) = revision_range(
         backend,
         &session.target,
-        &range.after,
+        range,
         &session.displayed,
         activity,
     ) else {
@@ -595,6 +583,129 @@ pub(super) fn update<B: Backend>(
             after: selected.replaced_with(final_text),
             checkpoint,
         });
+    }
+    Ok(session.result)
+}
+
+/// A draft whose paste was queued but not yet confirmed may have been
+/// processed since. Confirm the complete edit before touching a possibly
+/// pending payload; `false` leaves the session untouched.
+fn confirm_queued_draft<B: Backend>(
+    backend: &B,
+    session: &mut ProvisionalInsertion,
+    monitor: &InputMonitor,
+) -> bool {
+    let Some(range) = session.replacement.as_ref() else {
+        return false;
+    };
+    if session.result != InsertResult::PasteUnverified {
+        return true;
+    }
+    if !safe(
+        backend,
+        &session.target,
+        Some((monitor, range.checkpoint)),
+        SafetyPolicy::Destructive,
+    ) || !backend
+        .target_text(&session.target)
+        .is_ok_and(|actual| actual.same_content(&range.after))
+    {
+        return false;
+    }
+    session.result = InsertResult::ClipboardPaste;
+    true
+}
+
+/// The target state a revision replaces: the verified selection of the
+/// current draft or, after the draft was retracted, the unchanged empty caret
+/// where it began. Either way the target must still show exactly the state
+/// this session left, so nothing outside the draft is ever replaced.
+fn revision_range<B: Backend>(
+    backend: &B,
+    target: &TargetWindow,
+    range: &ReplacementRange,
+    displayed: &str,
+    activity: Option<(&InputMonitor, u64)>,
+) -> Option<TargetText> {
+    if !displayed.is_empty() {
+        return select_verified(backend, target, &range.after, displayed, activity);
+    }
+    (safe(backend, target, activity, SafetyPolicy::Destructive)
+        && backend
+            .target_text(target)
+            .is_ok_and(|actual| actual.same_content(&range.after)))
+    .then(|| range.after.clone())
+}
+
+/// Withdraws the whole live draft from the target, for an utterance that
+/// ended without text. The draft is selected and deleted under the same
+/// guards as a replacement; a later revision is pasted at the caret it left.
+/// Any failed guard freezes the session as a failed replacement does: the
+/// target is never edited again and finalization only copies the text.
+pub(super) fn retract<B: Backend>(
+    backend: &B,
+    session: &mut ProvisionalInsertion,
+    monitor: &InputMonitor,
+) -> Result<InsertResult, InjectionError> {
+    if session.finished || !confirm_queued_draft(backend, session, monitor) {
+        return Ok(session.result);
+    }
+    if session.displayed.is_empty() {
+        return Ok(session.result);
+    }
+    let range = session.replacement.as_ref().expect("range was confirmed");
+    let checkpoint = range.checkpoint;
+    let activity = Some((monitor, checkpoint));
+    let selected = select_verified(
+        backend,
+        &session.target,
+        &range.after,
+        &session.displayed,
+        activity,
+    );
+    // A failure after selecting must not authorize another target edit.
+    session.replacement = None;
+    session.result = InsertResult::ClipboardOnly;
+    let Some(selected) = selected else {
+        return Ok(session.result);
+    };
+    if !safe(
+        backend,
+        &session.target,
+        activity,
+        SafetyPolicy::Destructive,
+    ) || !backend
+        .target_text(&session.target)
+        .is_ok_and(|actual| actual.same_content(&selected))
+        || !backend.delete_selection(&session.target).unwrap_or(false)
+    {
+        return Ok(session.result);
+    }
+    let expected = selected.replaced_with("");
+    for attempt in 0..=VERIFY_ATTEMPTS {
+        if attempt > 0 {
+            backend.wait_for_target();
+        }
+        if !safe(
+            backend,
+            &session.target,
+            activity,
+            SafetyPolicy::Destructive,
+        ) {
+            break;
+        }
+        if backend
+            .target_text(&session.target)
+            .is_ok_and(|actual| actual.same_content(&expected))
+        {
+            session.displayed.clear();
+            session.replacement = Some(ReplacementRange {
+                after: expected,
+                checkpoint,
+            });
+            session.result = InsertResult::ClipboardPaste;
+            break;
+        }
     }
     Ok(session.result)
 }
@@ -635,7 +746,7 @@ pub(super) fn cancel<B: Backend>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
 
@@ -843,13 +954,182 @@ mod tests {
         assert_eq!(&*backend.clipboard.borrow(), "draft");
     }
 
-    struct MockBackend {
+    fn live_draft(
+        backend: &MockBackend,
+        monitor: &InputMonitor,
+        text: &str,
+    ) -> ProvisionalInsertion {
+        let session = begin_live(
+            backend,
+            InjectionOptions::default(),
+            text,
+            &target(),
+            monitor,
+            monitor.checkpoint().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(backend.content(), format!("prefix {text} suffix"));
+        session
+    }
+
+    pub(crate) fn calls(backend: &MockBackend, name: &str) -> usize {
+        backend
+            .calls
+            .borrow()
+            .iter()
+            .filter(|c| **c == name)
+            .count()
+    }
+
+    #[test]
+    fn retraction_removes_the_whole_live_draft_and_a_revision_resumes_at_its_caret() {
+        let backend = MockBackend::new();
+        let monitor = monitor();
+        let mut session = live_draft(&backend, &monitor, "途中");
+        assert_eq!(
+            retract(&backend, &mut session, &monitor).unwrap(),
+            InsertResult::ClipboardPaste
+        );
+        assert_eq!(backend.content(), "prefix  suffix");
+        assert_eq!(calls(&backend, "delete"), 1);
+        // Nothing is left to retract, and dropping an empty draft deletes nothing.
+        retract(&backend, &mut session, &monitor).unwrap();
+        assert_eq!(calls(&backend, "delete"), 1);
+        // The next utterance is pasted exactly where the draft began.
+        assert_eq!(
+            update(
+                &backend,
+                InjectionOptions::default(),
+                &mut session,
+                "次の文",
+                &monitor,
+                false
+            )
+            .unwrap(),
+            InsertResult::ClipboardPaste
+        );
+        assert_eq!(backend.content(), "prefix 次の文 suffix");
+        finish(
+            &backend,
+            InjectionOptions::default(),
+            &mut session,
+            "次の文。",
+            &monitor,
+        )
+        .unwrap();
+        assert_eq!(backend.content(), "prefix 次の文。 suffix");
+    }
+
+    #[test]
+    fn a_retracted_draft_finishes_empty_and_cancels_without_deleting() {
+        let backend = MockBackend::new();
+        let monitor = monitor();
+        let mut session = live_draft(&backend, &monitor, "draft");
+        retract(&backend, &mut session, &monitor).unwrap();
+        assert_eq!(
+            finish(
+                &backend,
+                InjectionOptions::default(),
+                &mut session,
+                "",
+                &monitor
+            )
+            .unwrap(),
+            InsertResult::ClipboardPaste
+        );
+        let mut session = live_draft(&backend, &monitor, "draft");
+        retract(&backend, &mut session, &monitor).unwrap();
+        cancel(&backend, &mut session, &monitor);
+        assert_eq!(backend.content(), "prefix  suffix");
+        assert_eq!(calls(&backend, "delete"), 2);
+        assert_eq!(calls(&backend, "paste"), 2);
+    }
+
+    #[test]
+    fn retraction_never_deletes_once_a_guard_fails_and_then_freezes_the_target() {
+        for reason in ["input", "ime", "edited", "target"] {
+            let backend = MockBackend::new();
+            let monitor = monitor();
+            let mut session = live_draft(&backend, &monitor, "draft");
+            match reason {
+                "input" => monitor.test_record_input(),
+                "ime" => backend.ime.set(None),
+                "edited" => backend.text.borrow_mut().after = " suffix typed".into(),
+                "target" => backend.target_valid.set(false),
+                _ => unreachable!(),
+            }
+            let content = backend.content();
+            assert_eq!(
+                retract(&backend, &mut session, &monitor).unwrap(),
+                InsertResult::ClipboardOnly,
+                "{reason}"
+            );
+            assert_eq!(backend.content(), content, "{reason}");
+            assert_eq!(calls(&backend, "delete"), 0, "{reason}");
+            // Even once the guard holds again, the target is never edited.
+            backend.ime.set(Some(false));
+            backend.target_valid.set(true);
+            update(
+                &backend,
+                InjectionOptions::default(),
+                &mut session,
+                "later",
+                &monitor,
+                false,
+            )
+            .unwrap();
+            assert_eq!(backend.content(), content, "{reason}");
+            finish(
+                &backend,
+                InjectionOptions::default(),
+                &mut session,
+                "final",
+                &monitor,
+            )
+            .unwrap();
+            assert_eq!(backend.content(), content, "{reason}");
+            assert_eq!(calls(&backend, "paste"), 1, "{reason}");
+            assert_eq!(&*backend.clipboard.borrow(), "final", "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_moved_caret_after_retraction_blocks_the_next_revision() {
+        let backend = MockBackend::new();
+        let monitor = monitor();
+        let mut session = live_draft(&backend, &monitor, "draft");
+        retract(&backend, &mut session, &monitor).unwrap();
+        // The caret moved (for example by an untracked edit) after the draft
+        // was withdrawn, so its position no longer marks the draft's range.
+        backend.text.borrow_mut().before = "pre".into();
+        let clipboard = backend.clipboard.borrow().clone();
+        assert_eq!(
+            update(
+                &backend,
+                InjectionOptions::default(),
+                &mut session,
+                "next",
+                &monitor,
+                false
+            )
+            .unwrap(),
+            InsertResult::ClipboardOnly
+        );
+        assert_eq!(backend.content(), "pre suffix");
+        assert_eq!(calls(&backend, "paste"), 1);
+        // A partial hypothesis never replaces the user's clipboard.
+        assert_eq!(*backend.clipboard.borrow(), clipboard);
+    }
+
+    /// Shared with `live_dictation` tests through `SystemTextInjector::with_mock`.
+    pub(crate) struct MockBackend {
         text: RefCell<TargetText>,
         clipboard: RefCell<String>,
         calls: RefCell<Vec<&'static str>>,
         sequence: Cell<u32>,
         target_valid: Cell<bool>,
-        ime: Cell<Option<bool>>,
+        pub(crate) ime: Cell<Option<bool>>,
         text_readable: Cell<bool>,
         selection_readable: Cell<bool>,
         paste_accepted: Cell<bool>,
@@ -857,22 +1137,22 @@ mod tests {
         pending_selection: RefCell<Option<TargetText>>,
         selection_settle_after: usize,
         selection_waits: Cell<usize>,
-        on_selection_wait: Option<Box<dyn Fn(&MockBackend)>>,
+        on_selection_wait: Option<Box<dyn Fn(&MockBackend) + Send>>,
         exclusions: RefCell<Vec<ClipboardExclusion>>,
         settle_after: usize,
         waits: Cell<usize>,
         change_clipboard_on_paste: bool,
         change_identity_on_paste: bool,
-        on_paste: Option<Box<dyn Fn()>>,
-        on_validate: Option<Box<dyn Fn()>>,
-        on_clipboard_write: Option<Box<dyn Fn(&MockBackend)>>,
+        on_paste: Option<Box<dyn Fn() + Send>>,
+        on_validate: Option<Box<dyn Fn() + Send>>,
+        on_clipboard_write: Option<Box<dyn Fn(&MockBackend) + Send>>,
         /// What the target exposes after processing a paste, for editors
         /// whose readable text is a proxy or a window of the document.
         readback_after_paste: RefCell<Option<TargetText>>,
     }
 
     impl MockBackend {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 text: RefCell::new(TargetText {
                     identity: vec![1],
@@ -913,7 +1193,7 @@ mod tests {
                 }
             }
         }
-        fn content(&self) -> String {
+        pub(crate) fn content(&self) -> String {
             let text = self.text.borrow();
             format!("{}{}{}", text.before, text.selected, text.after)
         }
@@ -1044,7 +1324,7 @@ mod tests {
             }
         }
     }
-    fn target() -> TargetWindow {
+    pub(crate) fn target() -> TargetWindow {
         TargetWindow {
             window_handle: 1,
             control_handle: 2,
