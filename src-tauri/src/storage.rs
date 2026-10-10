@@ -59,7 +59,7 @@ pub enum StorageError {
     #[error("CSV parsing failed")]
     Csv(#[from] csv::Error),
     #[error(
-        "database schema version {version} requires a reader of version          {min_reader_version}; this build supports {supported}"
+        "database schema version {version} requires a reader of version {min_reader_version}; this build supports {supported}"
     )]
     IncompatibleSchema {
         version: i64,
@@ -406,7 +406,7 @@ fn run_migrations(
                 });
             }
             eprintln!(
-                "Database schema version {version} is newer than this build's {supported};                  opening it because it remains compatible with version {min_reader_version}."
+                "Database schema version {version} is newer than this build's {supported}; opening it because it remains compatible with version {min_reader_version}."
             );
             return Ok(());
         };
@@ -3040,6 +3040,19 @@ mod tests {
         assert_eq!(
             stored_min_reader_version(&connection).unwrap(),
             supported + 1
+        );
+    }
+
+    #[test]
+    fn incompatible_schema_error_reads_as_one_sentence() {
+        let error = StorageError::IncompatibleSchema {
+            version: 4,
+            min_reader_version: 3,
+            supported: 2,
+        };
+        assert_eq!(
+            error.to_string(),
+            "database schema version 4 requires a reader of version 3; this build supports 2"
         );
     }
 
