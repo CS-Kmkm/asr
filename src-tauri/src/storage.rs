@@ -122,12 +122,6 @@ fn mirror_legacy_shortcut_keys(
     Ok(changed)
 }
 
-fn serialized_settings(settings: &Settings) -> Result<String, StorageError> {
-    let mut value = serde_json::to_value(settings)?;
-    mirror_legacy_shortcut_keys(&mut value, &settings.shortcuts)?;
-    Ok(serde_json::to_string(&value)?)
-}
-
 /// How long a failed take is kept for Retry when the History and audio
 /// settings would not keep it.
 const FAILED_TAKE_RETENTION_HOURS: i64 = 24;
@@ -270,14 +264,7 @@ fn purge_history(
 /// like `get_settings`, so a value from a newer build cannot make the write
 /// fail.
 fn stored_settings(connection: &Connection) -> Result<Settings, StorageError> {
-    let raw: Option<String> = connection
-        .query_row(
-            "SELECT value FROM settings WHERE key = 'app_settings'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(raw
+    Ok(stored_settings_row(connection)?
         .as_deref()
         .map(|raw| load_settings(raw).settings)
         .unwrap_or_default())
@@ -636,25 +623,60 @@ fn default_chords(mode: ShortcutMode) -> Vec<String> {
     std::mem::take(mode(&mut VoiceShortcuts::default()))
 }
 
-/// Settings decoded from a stored row, with the JSON to persist.
+/// Settings decoded from a stored row.
 struct LoadedSettings {
     settings: Settings,
-    /// The stored object after migration and repair, including keys this
-    /// build does not know.
-    value: serde_json::Value,
-    /// Content-free names of what changed; empty when the row is current.
-    repairs: Vec<String>,
+    /// The stored row after the legacy-layout migrations, when one changed
+    /// it. Only these migrations are ever persisted.
+    migrated: Option<serde_json::Value>,
+    /// Content-free names of the legacy migrations in `migrated`.
+    migrations: Vec<&'static str>,
+    /// Content-free names of the fields replaced in memory only.
+    repairs: SettingsRepairs,
 }
 
-/// Decodes a stored settings row without failing. Legacy layouts are
-/// migrated; each field this build cannot read falls back to its default
-/// on its own, so one bad value never discards the other settings.
+/// Fields of the stored settings this build could not read and replaced in
+/// memory for this run. The stored row keeps the original values, so a newer
+/// build that wrote them still finds them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettingsRepairs(Vec<String>);
+
+impl SettingsRepairs {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether the field with this JSON key (or the whole row) was replaced.
+    pub fn contains(&self, key: &str) -> bool {
+        self.0
+            .iter()
+            .any(|repaired| repaired == key || repaired == UNREADABLE_ROW)
+    }
+
+    fn push(&mut self, key: impl Into<String>) {
+        self.0.push(key.into());
+    }
+}
+
+/// Repair marker for a row that is not a JSON object at all.
+const UNREADABLE_ROW: &str = "unreadable";
+
+/// Decodes a stored settings row without failing.
+///
+/// Legacy layouts (pre-retention History switches, scalar shortcut keys, and
+/// the scalar mirrors) are migrated and may be persisted as before. Any
+/// field this build cannot read is replaced only in memory, each on its own,
+/// so one bad value never discards the other settings and a value written by
+/// a newer build is never overwritten by an older one.
 fn load_settings(raw: &str) -> LoadedSettings {
-    let mut repairs = Vec::new();
-    let mut object = match serde_json::from_str::<serde_json::Value>(raw) {
+    let mut repairs = SettingsRepairs::default();
+    let mut migrations = Vec::new();
+    let parsed = serde_json::from_str::<serde_json::Value>(raw);
+    let readable = matches!(parsed, Ok(serde_json::Value::Object(_)));
+    let mut object = match parsed {
         Ok(serde_json::Value::Object(object)) => object,
         _ => {
-            repairs.push("unreadable".to_owned());
+            repairs.push(UNREADABLE_ROW);
             serde_json::Map::new()
         }
     };
@@ -676,7 +698,7 @@ fn load_settings(raw: &str) -> LoadedSettings {
             (_, Some(_)) => "one_year",
         };
         object.insert("historyRetention".into(), retention.into());
-        repairs.push("legacy_history".to_owned());
+        migrations.push("legacy_history");
     }
     if !object.contains_key("shortcuts") {
         let scalar = |name: &str, fallback: &str| {
@@ -693,35 +715,33 @@ fn load_settings(raw: &str) -> LoadedSettings {
             "edit": [scalar("speakToEditHotkey", "Ctrl+Shift+E")],
         });
         object.insert("shortcuts".into(), shortcuts);
-        repairs.push("legacy_shortcuts".to_owned());
+        migrations.push("legacy_shortcuts");
     }
+    let mut migrated = serde_json::Value::Object(object.clone());
     repair_shortcut_lists(&mut object, &mut repairs);
-    let mut settings = match serde_json::from_value(serde_json::Value::Object(object.clone())) {
-        Ok(settings) => settings,
-        Err(_) => {
-            let (settings, readable) = decode_fields_leniently(&object, &mut repairs);
-            object.extend(readable);
-            settings
-        }
-    };
-    let mut value = serde_json::Value::Object(object);
-    repair_shortcut_routes(&mut settings, &mut value, &mut repairs);
+    let mut settings = serde_json::from_value(serde_json::Value::Object(object.clone()))
+        .unwrap_or_else(|_| decode_fields_leniently(&object, &mut repairs));
+    repair_shortcut_routes(&mut settings, &mut repairs);
     // V2 `shortcuts` is canonical; the scalar keys only mirror primaries.
-    if mirror_legacy_shortcut_keys(&mut value, &settings.shortcuts).unwrap_or(false) {
-        repairs.push("legacy_shortcut_mirror".to_owned());
+    // Mirror only chords that are exactly what is stored.
+    if repairs.is_empty()
+        && mirror_legacy_shortcut_keys(&mut migrated, &settings.shortcuts).unwrap_or(false)
+    {
+        migrations.push("legacy_shortcut_mirror");
     }
     LoadedSettings {
         settings,
-        value,
+        migrated: (readable && !migrations.is_empty()).then_some(migrated),
+        migrations,
         repairs,
     }
 }
 
 /// Replaces each mode's chord list that is not a list of strings with that
-/// mode's default, keeping the other modes and unknown nested keys.
+/// mode's default, keeping the other modes.
 fn repair_shortcut_lists(
     object: &mut serde_json::Map<String, serde_json::Value>,
-    repairs: &mut Vec<String>,
+    repairs: &mut SettingsRepairs,
 ) {
     let Some(serde_json::Value::Object(shortcuts)) = object.get_mut("shortcuts") else {
         return;
@@ -738,85 +758,84 @@ fn repair_shortcut_lists(
     }
 }
 
-/// Values used in place of stored fields this build cannot read.
+/// Values used in memory in place of stored fields this build cannot read.
 ///
-/// Rule: a fallback must never destroy or drop user data, because it is
-/// applied to an existing installation (the startup retention purge and
-/// stale-audio cleanup run right after loading). Fields whose fresh-install
-/// default deletes data therefore fall back to the value that keeps it:
+/// Rule: a fallback must never destroy user data or undo a choice the user
+/// already made, because it applies to an existing installation and runs
+/// right before the startup retention purge. So, unlike `Settings::default`
+/// (still used for fresh installs):
 /// - `historyRetention` -> `forever` (no History or candidate purge; the
 ///   default `one_month` would delete everything older than 30 days);
-/// - `deleteAudioAfterProcessing` -> `false` (keeps retained recordings,
-///   failed takes, and older builds' capture WAVs that may be the only copy).
+/// - `setupComplete` -> `true` (a stored row means setup already ran).
 ///
-/// Every other default only changes behavior from now on. The unreadable
-/// raw value itself stays in `settings_backups`. `Settings::default` is
-/// unchanged and still applies to fresh installs.
+/// `deleteAudioAfterProcessing` keeps its privacy default `true`; the only
+/// data that value would destroy, older builds' stale capture WAVs, is
+/// protected by skipping that startup cleanup when the field was replaced
+/// (see [`SettingsRepairs`]). Likewise the autostart registration is left
+/// alone when `autoStart` was replaced. Every other default only changes
+/// behavior for this run, and the stored row is never rewritten with it.
 fn fallback_settings() -> Settings {
     Settings {
         history_retention: HistoryRetention::Forever,
-        delete_audio_after_processing: false,
+        setup_complete: true,
         ..Settings::default()
     }
 }
 
 /// Decodes `object` one top-level field at a time: a field is kept when the
-/// fallbacks with only that field replaced decode, and otherwise takes its
-/// [`fallback_settings`] value. Returns the settings and the JSON of every
-/// known field.
+/// fallbacks with only that field replaced decode, and otherwise (unreadable,
+/// or missing without a serde default) takes its [`fallback_settings`] value.
 fn decode_fields_leniently(
     object: &serde_json::Map<String, serde_json::Value>,
-    repairs: &mut Vec<String>,
-) -> (Settings, serde_json::Map<String, serde_json::Value>) {
-    let Ok(serde_json::Value::Object(defaults)) = serde_json::to_value(fallback_settings()) else {
-        return (fallback_settings(), serde_json::Map::new());
+    repairs: &mut SettingsRepairs,
+) -> Settings {
+    let Ok(serde_json::Value::Object(fallbacks)) = serde_json::to_value(fallback_settings()) else {
+        return fallback_settings();
     };
-    let mut merged = defaults.clone();
-    for key in defaults.keys() {
-        let Some(saved) = object.get(key) else {
-            continue;
-        };
-        let mut probe = defaults.clone();
-        probe.insert(key.clone(), saved.clone());
-        if serde_json::from_value::<Settings>(serde_json::Value::Object(probe)).is_ok() {
-            merged.insert(key.clone(), saved.clone());
-        } else {
-            repairs.push(key.clone());
+    let decodes = |candidate: serde_json::Map<String, serde_json::Value>| {
+        serde_json::from_value::<Settings>(serde_json::Value::Object(candidate)).is_ok()
+    };
+    let mut merged = fallbacks.clone();
+    for key in fallbacks.keys() {
+        let mut probe = fallbacks.clone();
+        match object.get(key) {
+            Some(saved) => {
+                probe.insert(key.clone(), saved.clone());
+                if decodes(probe) {
+                    merged.insert(key.clone(), saved.clone());
+                } else {
+                    repairs.push(key.clone());
+                }
+            }
+            None => {
+                // A missing field with a serde default decodes as before.
+                probe.remove(key);
+                if decodes(probe) {
+                    merged.remove(key);
+                } else {
+                    repairs.push(key.clone());
+                }
+            }
         }
     }
     // Fields decode independently, so the accepted values decode together.
-    match serde_json::from_value(serde_json::Value::Object(merged.clone())) {
-        Ok(settings) => {
-            repairs.push("defaulted_fields".to_owned());
-            (settings, merged)
-        }
-        Err(_) => {
-            repairs.push("all_fields".to_owned());
-            (fallback_settings(), defaults)
-        }
-    }
+    serde_json::from_value(serde_json::Value::Object(merged)).unwrap_or_else(|_| {
+        repairs.push("all_fields");
+        fallback_settings()
+    })
 }
 
-/// Resets each action whose saved chords cannot be routed (a wrong count or
-/// an unparseable chord) to its default, keeping the other actions.
-/// Collisions stay allowed, as for any saved settings.
-fn repair_shortcut_routes(
-    settings: &mut Settings,
-    value: &mut serde_json::Value,
-    repairs: &mut Vec<String>,
-) {
+/// Resets, in memory, each action whose saved chords cannot be routed (a
+/// wrong count or an unparseable chord) to its default, keeping the other
+/// actions. Collisions stay allowed, as for any saved settings.
+fn repair_shortcut_routes(settings: &mut Settings, repairs: &mut SettingsRepairs) {
     let defaults = Settings::default();
     let routable = |candidate: &Settings| crate::shortcuts::Routes::parse_saved(candidate).is_ok();
-    if !value["shortcuts"].is_object() {
-        value["shortcuts"] = serde_json::json!({});
-    }
     for (key, mode) in SHORTCUT_MODES {
         let mut candidate = defaults.clone();
         *mode(&mut candidate.shortcuts) = mode(&mut settings.shortcuts).clone();
         if !routable(&candidate) {
-            let fallback = default_chords(mode);
-            value["shortcuts"][key] = fallback.clone().into();
-            *mode(&mut settings.shortcuts) = fallback;
+            *mode(&mut settings.shortcuts) = default_chords(mode);
             repairs.push(format!("shortcuts.{key}"));
         }
     }
@@ -826,19 +845,30 @@ fn repair_shortcut_routes(
     };
     if !routable(&candidate) {
         settings.translation_hotkey = defaults.translation_hotkey.clone();
-        value["translationHotkey"] = defaults.translation_hotkey.clone().into();
-        repairs.push("translationHotkey".to_owned());
+        repairs.push("translationHotkey");
     }
     if !routable(settings) {
         // Unreachable while collisions are allowed; keeps startup safe anyway.
-        settings.shortcuts = defaults.shortcuts.clone();
-        settings.translation_hotkey = defaults.translation_hotkey.clone();
-        for (key, mode) in SHORTCUT_MODES {
-            value["shortcuts"][key] = default_chords(mode).into();
-        }
-        value["translationHotkey"] = defaults.translation_hotkey.into();
-        repairs.push("shortcuts".to_owned());
+        settings.shortcuts = defaults.shortcuts;
+        settings.translation_hotkey = defaults.translation_hotkey;
+        repairs.push("shortcuts");
     }
+}
+
+fn serialized_settings(settings: &Settings) -> Result<String, StorageError> {
+    let mut value = serde_json::to_value(settings)?;
+    mirror_legacy_shortcut_keys(&mut value, &settings.shortcuts)?;
+    Ok(serde_json::to_string(&value)?)
+}
+
+fn stored_settings_row(connection: &Connection) -> Result<Option<String>, StorageError> {
+    Ok(connection
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'app_settings'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 /// Whether stored settings turn History off. Reads like `get_settings`, so an
@@ -933,6 +963,19 @@ impl Storage {
         Ok(storage)
     }
 
+    /// Stores `raw` as the settings row as is, as another build might.
+    #[cfg(test)]
+    pub(crate) fn store_raw_settings_for_test(&self, raw: &str) {
+        self.connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, 'now')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [raw],
+            )
+            .unwrap();
+    }
+
     fn with_connection(connection: Connection, history_audio_dir: PathBuf) -> Self {
         Self {
             connection: Mutex::new(connection),
@@ -963,42 +1006,38 @@ impl Storage {
         run_migrations(&mut connection, MIGRATIONS)
     }
 
-    /// Reads the stored settings without ever failing on their content. A row
-    /// this build cannot fully read (corrupt, or written by a newer build)
-    /// falls back per field to defaults, keeps every readable field and every
-    /// unknown key, and is backed up in `settings_backups` before it is
-    /// rewritten.
+    /// Reads the stored settings without ever failing on their content.
+    /// Fields this build cannot read are replaced in memory only (see
+    /// `load_settings`); only legacy-layout migrations are persisted, after
+    /// the raw row is copied to `settings_backups`.
     pub fn get_settings(&self) -> Result<Settings, StorageError> {
-        let stored: Option<String> = self
-            .connection()?
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'app_settings'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(raw) = stored else {
-            return Ok(Settings::default());
-        };
-        let loaded = load_settings(&raw);
-        if !loaded.repairs.is_empty() {
-            // Best effort: the repaired values are used for this run even if
-            // they cannot be persisted, and the next read repairs again.
-            let _ = self.rewrite_settings(&raw, &loaded.value, &loaded.repairs.join(","));
-        }
-        Ok(loaded.settings)
+        Ok(self.get_settings_with_repairs()?.0)
     }
 
-    /// Replaces the stored row `raw` with `repaired`, keeping `raw` in
+    /// Like `get_settings`, also naming the fields replaced in memory.
+    pub fn get_settings_with_repairs(&self) -> Result<(Settings, SettingsRepairs), StorageError> {
+        let Some(raw) = stored_settings_row(&*self.connection()?)? else {
+            return Ok((Settings::default(), SettingsRepairs::default()));
+        };
+        let loaded = load_settings(&raw);
+        if let Some(migrated) = &loaded.migrated {
+            // Best effort: the migrated values are used for this run even if
+            // they cannot be persisted, and the next read migrates again.
+            let _ = self.rewrite_settings(&raw, migrated, &loaded.migrations.join(","));
+        }
+        Ok((loaded.settings, loaded.repairs))
+    }
+
+    /// Replaces the stored row `raw` with `migrated`, keeping `raw` in
     /// `settings_backups` within the same transaction. A row changed by a
     /// concurrent writer since it was read is left untouched.
     fn rewrite_settings(
         &self,
         raw: &str,
-        repaired: &serde_json::Value,
+        migrated: &serde_json::Value,
         reason: &str,
     ) -> Result<(), StorageError> {
-        let repaired = serde_json::to_string(repaired)?;
+        let migrated = serde_json::to_string(migrated)?;
         let now = Utc::now().to_rfc3339();
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
@@ -1010,7 +1049,7 @@ impl Storage {
         let updated = transaction.execute(
             "UPDATE settings SET value = ?1, updated_at = ?2
              WHERE key = 'app_settings' AND value = ?3",
-            params![repaired, now, raw],
+            params![migrated, now, raw],
         )?;
         if updated == 0 {
             return Ok(());
@@ -1042,10 +1081,10 @@ impl Storage {
         &self,
         settings: &Settings,
     ) -> Result<(), StorageError> {
-        let value = serialized_settings(settings)?;
         let now = Utc::now();
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
+        let value = serialized_settings(settings)?;
         transaction.execute(
             "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
@@ -3338,94 +3377,12 @@ mod tests {
         assert_eq!(upgraded.shortcuts.edit, ["Ctrl+Alt+E"]);
     }
 
-    #[test]
-    fn empty_persisted_dictation_shortcuts_recover_before_primary_lookup() {
-        let storage = Storage::in_memory().unwrap();
-        let mut value = serde_json::to_value(Settings::default()).unwrap();
-        value["shortcuts"]["dictate"] = serde_json::json!([]);
-        value["futureSetting"] = serde_json::json!({"keep": true});
-        storage
-            .connection()
-            .unwrap()
-            .execute(
-                "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, 'now')",
-                [value.to_string()],
-            )
-            .unwrap();
-        let recovered = storage.get_settings().unwrap();
-        assert_eq!(recovered.shortcuts.dictate, ["Ctrl+Shift+Space"]);
-        let raw: String = storage
-            .connection()
-            .unwrap()
-            .query_row(
-                "SELECT value FROM settings WHERE key='app_settings'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let saved: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(saved["hotkey"], "Ctrl+Shift+Space");
-        assert_eq!(saved["shortcuts"]["dictate"][0], "Ctrl+Shift+Space");
-        assert_eq!(saved["futureSetting"]["keep"], true);
-    }
-
-    #[test]
-    fn empty_shortcut_recovery_preserves_unknown_nested_chords() {
-        let storage = Storage::in_memory().unwrap();
-        let mut value = serde_json::to_value(Settings::default()).unwrap();
-        value["shortcuts"]["dictate"] = serde_json::json!([]);
-        value["shortcuts"]["ask"] = serde_json::json!([]);
-        value["shortcuts"]["futureMode"] = serde_json::json!(["Ctrl+Alt+F"]);
-        storage
-            .connection()
-            .unwrap()
-            .execute(
-                "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, 'now')",
-                [value.to_string()],
-            )
-            .unwrap();
-
-        let recovered = storage.get_settings().unwrap();
-        assert_eq!(recovered.shortcuts.dictate, ["Ctrl+Shift+Space"]);
-        assert_eq!(recovered.shortcuts.ask, ["Ctrl+Shift+A"]);
-        let raw: String = storage
-            .connection()
-            .unwrap()
-            .query_row(
-                "SELECT value FROM settings WHERE key='app_settings'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let saved: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(
-            saved["shortcuts"]["futureMode"],
-            serde_json::json!(["Ctrl+Alt+F"])
-        );
-        assert_eq!(
-            saved["shortcuts"]["dictate"],
-            serde_json::json!(["Ctrl+Shift+Space"])
-        );
-        assert_eq!(
-            saved["shortcuts"]["ask"],
-            serde_json::json!(["Ctrl+Shift+A"])
-        );
-    }
-
     fn store_raw_settings(storage: &Storage, raw: &str) {
-        storage
-            .connection()
-            .unwrap()
-            .execute(
-                "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, 'now')
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                [raw],
-            )
-            .unwrap();
+        storage.store_raw_settings_for_test(raw);
     }
 
-    fn stored_settings_value(storage: &Storage) -> serde_json::Value {
-        let raw: String = storage
+    fn stored_settings_raw(storage: &Storage) -> String {
+        storage
             .connection()
             .unwrap()
             .query_row(
@@ -3433,8 +3390,11 @@ mod tests {
                 [],
                 |row| row.get(0),
             )
-            .unwrap();
-        serde_json::from_str(&raw).unwrap()
+            .unwrap()
+    }
+
+    fn stored_settings_value(storage: &Storage) -> serde_json::Value {
+        serde_json::from_str(&stored_settings_raw(storage)).unwrap()
     }
 
     /// `(value, reason)` of each settings backup, oldest first.
@@ -3450,7 +3410,29 @@ mod tests {
     }
 
     #[test]
-    fn values_from_a_newer_build_fall_back_per_field_and_keep_a_backup() {
+    fn empty_shortcut_lists_are_recovered_in_memory_only() {
+        let storage = Storage::in_memory().unwrap();
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value["shortcuts"]["dictate"] = serde_json::json!([]);
+        value["shortcuts"]["ask"] = serde_json::json!([]);
+        value["shortcuts"]["futureMode"] = serde_json::json!(["Ctrl+Alt+F"]);
+        value["futureSetting"] = serde_json::json!({"keep": true});
+        let raw = value.to_string();
+        store_raw_settings(&storage, &raw);
+
+        let (recovered, repairs) = storage.get_settings_with_repairs().unwrap();
+
+        assert_eq!(recovered.shortcuts.dictate, ["Ctrl+Shift+Space"]);
+        assert_eq!(recovered.shortcuts.ask, ["Ctrl+Shift+A"]);
+        assert!(repairs.contains("shortcuts.dictate"));
+        assert!(repairs.contains("shortcuts.ask"));
+        assert!(!repairs.contains("shortcuts.edit"));
+        assert_eq!(stored_settings_raw(&storage), raw);
+        assert!(settings_backups(&storage).is_empty());
+    }
+
+    #[test]
+    fn values_from_a_newer_build_are_replaced_in_memory_and_kept_in_the_row() {
         let storage = Storage::in_memory().unwrap();
         let mut value = serde_json::to_value(Settings::default()).unwrap();
         value["setupComplete"] = true.into();
@@ -3475,7 +3457,7 @@ mod tests {
         store_raw_settings(&storage, &raw);
         assert!(!stored_history_is_off(&raw));
 
-        let settings = storage.get_settings().unwrap();
+        let (settings, repairs) = storage.get_settings_with_repairs().unwrap();
 
         let defaults = Settings::default();
         assert!(settings.setup_complete);
@@ -3490,10 +3472,6 @@ mod tests {
         assert_eq!(settings.shortcuts.edit, defaults.shortcuts.edit);
         assert_eq!(settings.translation_hotkey, defaults.translation_hotkey);
         crate::shortcuts::Routes::parse_saved(&settings).unwrap();
-
-        let backups = settings_backups(&storage);
-        assert_eq!(backups.len(), 1);
-        assert_eq!(backups[0].0, raw);
         for repaired in [
             "historyRetention",
             "theme",
@@ -3503,27 +3481,20 @@ mod tests {
             "shortcuts.edit",
             "translationHotkey",
         ] {
-            assert!(
-                backups[0].1.split(',').any(|reason| reason == repaired),
-                "{repaired} missing from {}",
-                backups[0].1
-            );
+            assert!(repairs.contains(repaired), "{repaired} in {repairs:?}");
         }
-        let stored = stored_settings_value(&storage);
-        assert_eq!(stored["futureSetting"]["keep"], true);
-        assert_eq!(stored["shortcuts"]["futureMode"][0], "Ctrl+Alt+F");
-        assert_eq!(stored["historyRetention"], "forever");
-        assert_eq!(stored["setupComplete"], true);
-        assert_eq!(stored["hotkey"], "Ctrl+Alt+V");
+        assert!(!repairs.contains("setupComplete"));
+        assert!(!repairs.contains("shortcuts.dictate"));
 
-        // The repaired row reads cleanly: no further rewrite or backup.
+        // The newer build's values stay stored, so it still finds them.
+        assert_eq!(stored_settings_raw(&storage), raw);
+        assert!(settings_backups(&storage).is_empty());
         assert_eq!(storage.get_settings().unwrap(), settings);
-        assert_eq!(settings_backups(&storage).len(), 1);
-        assert_eq!(stored_settings_value(&storage), stored);
+        assert_eq!(stored_settings_raw(&storage), raw);
     }
 
     #[test]
-    fn unreadable_settings_rows_fall_back_to_defaults_and_keep_a_backup() {
+    fn unreadable_settings_rows_use_fallbacks_and_stay_stored() {
         for raw in [
             "not json",
             "[1, 2]",
@@ -3533,59 +3504,51 @@ mod tests {
         ] {
             let storage = Storage::in_memory().unwrap();
             store_raw_settings(&storage, raw);
-            assert_eq!(
-                storage.get_settings().unwrap(),
-                fallback_settings(),
-                "{raw}"
-            );
-            let backups = settings_backups(&storage);
-            assert_eq!(backups.len(), 1, "{raw}");
-            assert_eq!(backups[0].0, raw);
-            assert!(backups[0].1.starts_with("unreadable"), "{}", backups[0].1);
-            assert_eq!(
-                serde_json::from_value::<Settings>(stored_settings_value(&storage)).unwrap(),
-                fallback_settings()
-            );
+            let (settings, repairs) = storage.get_settings_with_repairs().unwrap();
+            assert_eq!(settings, fallback_settings(), "{raw}");
+            assert!(settings.setup_complete);
+            assert!(settings.delete_audio_after_processing);
+            assert!(repairs.contains("autoStart"));
+            assert!(repairs.contains("deleteAudioAfterProcessing"));
+            assert_eq!(stored_settings_raw(&storage), raw);
+            assert!(settings_backups(&storage).is_empty());
         }
     }
 
     #[test]
-    fn a_missing_required_field_defaults_without_losing_the_rest() {
+    fn missing_required_fields_use_fallbacks_without_losing_the_rest() {
         let storage = Storage::in_memory().unwrap();
         let mut value = serde_json::to_value(Settings {
-            setup_complete: true,
             auto_start: true,
             history_retention: HistoryRetention::OneYear,
+            clipboard_restore: false,
             ..Settings::default()
         })
         .unwrap();
         let object = value.as_object_mut().unwrap();
         object.remove("setupComplete");
-        object.remove("clipboardRestore");
+        object.remove("deleteAudioAfterProcessing");
         object.insert("futureSetting".into(), 7.into());
         let raw = value.to_string();
         store_raw_settings(&storage, &raw);
 
-        let settings = storage.get_settings().unwrap();
+        let (settings, repairs) = storage.get_settings_with_repairs().unwrap();
 
-        assert!(!settings.setup_complete);
-        assert!(settings.clipboard_restore);
+        // A stored row means setup already ran.
+        assert!(settings.setup_complete);
+        assert!(settings.delete_audio_after_processing);
         assert!(settings.auto_start);
+        assert!(!settings.clipboard_restore);
         assert_eq!(settings.history_retention, HistoryRetention::OneYear);
-        let backups = settings_backups(&storage);
-        assert_eq!(backups.len(), 1);
-        assert_eq!(backups[0].0, raw);
-        assert!(backups[0]
-            .1
-            .split(',')
-            .any(|reason| reason == "defaulted_fields"));
-        let stored = stored_settings_value(&storage);
-        assert_eq!(stored["setupComplete"], false);
-        assert_eq!(stored["futureSetting"], 7);
+        assert!(repairs.contains("setupComplete"));
+        assert!(repairs.contains("deleteAudioAfterProcessing"));
+        assert!(!repairs.contains("autoStart"));
+        assert!(!repairs.contains("theme"));
+        assert_eq!(stored_settings_raw(&storage), raw);
     }
 
     #[test]
-    fn unreadable_retention_and_audio_settings_never_delete_data() {
+    fn unreadable_retention_never_purges_history() {
         let storage = Storage::in_memory().unwrap();
         insert_history_at(&storage, "old", Utc::now() - chrono::Duration::days(400));
         insert_history_at(&storage, "recent", Utc::now());
@@ -3600,11 +3563,24 @@ mod tests {
 
         storage.enforce_current_history_policy().unwrap();
 
-        let settings = storage.get_settings().unwrap();
+        let (settings, repairs) = storage.get_settings_with_repairs().unwrap();
         assert_eq!(settings.history_retention, HistoryRetention::Forever);
-        assert!(!settings.delete_audio_after_processing);
-        assert!(settings.setup_complete);
+        // The privacy default stays; startup skips only the cleanup it
+        // would trigger (see `repairs`).
+        assert!(settings.delete_audio_after_processing);
+        assert!(repairs.contains("deleteAudioAfterProcessing"));
         assert_eq!(history_texts(&storage).len(), 2);
+    }
+
+    #[test]
+    fn history_inserts_succeed_while_the_row_holds_newer_values() {
+        let storage = Storage::in_memory().unwrap();
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value["historyRetention"] = "three_months".into();
+        store_raw_settings(&storage, &value.to_string());
+
+        assert!(storage.add_history(&item()).unwrap());
+        assert_eq!(history_texts(&storage).len(), 1);
     }
 
     #[test]
@@ -3642,25 +3618,40 @@ mod tests {
     #[test]
     fn fresh_installs_keep_the_normal_defaults() {
         let storage = Storage::in_memory().unwrap();
-        let settings = storage.get_settings().unwrap();
+        let (settings, repairs) = storage.get_settings_with_repairs().unwrap();
         assert_eq!(settings, Settings::default());
         assert_eq!(settings.history_retention, HistoryRetention::OneMonth);
         assert!(settings.delete_audio_after_processing);
+        assert!(!settings.setup_complete);
+        assert!(repairs.is_empty());
         assert!(settings_backups(&storage).is_empty());
     }
 
     #[test]
-    fn settings_backups_keep_only_the_newest_rows() {
+    fn legacy_migrations_are_persisted_after_a_capped_backup() {
         let storage = Storage::in_memory().unwrap();
         let total = MAX_SETTINGS_BACKUPS + 3;
         for index in 0..total {
-            store_raw_settings(&storage, &format!("corrupt {index}"));
-            storage.get_settings().unwrap();
+            let mut value = serde_json::to_value(Settings::default()).unwrap();
+            let object = value.as_object_mut().unwrap();
+            object.remove("historyRetention");
+            object.insert("historyEnabled".into(), true.into());
+            object.insert("historyRetentionDays".into(), 7.into());
+            object.insert("futureSetting".into(), index.into());
+            store_raw_settings(&storage, &value.to_string());
+            let (settings, repairs) = storage.get_settings_with_repairs().unwrap();
+            assert_eq!(settings.history_retention, HistoryRetention::OneWeek);
+            assert!(repairs.is_empty());
+            let stored = stored_settings_value(&storage);
+            assert_eq!(stored["historyRetention"], "one_week");
+            assert_eq!(stored["futureSetting"], index);
         }
         let backups = settings_backups(&storage);
         assert_eq!(backups.len() as i64, MAX_SETTINGS_BACKUPS);
-        assert_eq!(backups[0].0, "corrupt 3");
-        assert_eq!(backups.last().unwrap().0, format!("corrupt {}", total - 1));
+        assert!(backups[0].0.contains("\"futureSetting\":3"));
+        assert!(backups
+            .iter()
+            .all(|(_, reason)| reason.split(',').any(|name| name == "legacy_history")));
     }
 
     #[test]

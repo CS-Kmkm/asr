@@ -43,7 +43,7 @@ use injection::{
 };
 use input_monitor::InputMonitor;
 use state::{AppState, PipelineLifecycle, PipelineMode, PipelinePhase};
-use storage::Storage;
+use storage::{SettingsRepairs, Storage};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
@@ -1032,6 +1032,28 @@ mod model_configuration_tests {
     }
 
     #[test]
+    fn startup_cleanup_keeps_captures_when_the_audio_setting_was_unreadable() {
+        let storage = Storage::in_memory().unwrap();
+        let settings = Settings::default();
+        let (_, clean) = storage.get_settings_with_repairs().unwrap();
+        assert!(startup_cleanup_removes_captures(&settings, &clean));
+        assert!(!startup_cleanup_removes_captures(
+            &Settings {
+                delete_audio_after_processing: false,
+                ..Settings::default()
+            },
+            &clean
+        ));
+
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value["deleteAudioAfterProcessing"] = "yes".into();
+        storage.store_raw_settings_for_test(&value.to_string());
+        let (repaired, repairs) = storage.get_settings_with_repairs().unwrap();
+        assert!(repaired.delete_audio_after_processing);
+        assert!(!startup_cleanup_removes_captures(&repaired, &repairs));
+    }
+
+    #[test]
     fn stale_artifact_removal_decision_respects_legacy_keep_audio_setting() {
         assert!(removes_stale_artifact(StaleArtifactKind::Capture, true));
         assert!(!removes_stale_artifact(StaleArtifactKind::Capture, false));
@@ -1067,6 +1089,14 @@ enum StaleArtifactKind {
     Capture,
     /// A guarded History Retry copy. It is always cleanup-owned.
     RetryCopy,
+}
+
+/// Whether the startup cleanup may delete stale capture WAVs. Older builds
+/// kept them when "Delete audio after processing" was off, so a stored value
+/// this build could not read (and replaced with the privacy default) must not
+/// delete what may be the only copy of a recording.
+fn startup_cleanup_removes_captures(settings: &Settings, repairs: &SettingsRepairs) -> bool {
+    settings.delete_audio_after_processing && !repairs.contains("deleteAudioAfterProcessing")
 }
 
 fn removes_stale_artifact(kind: StaleArtifactKind, delete_audio_after_processing: bool) -> bool {
@@ -1411,15 +1441,16 @@ fn setup_app(
     }
     let storage = Storage::open(&database_path(app.handle())?)?;
     storage.enforce_current_history_policy()?;
-    let settings = storage.get_settings()?;
+    let (settings, repairs) = storage.get_settings_with_repairs()?;
     // The autostart plugin registers the currently running executable.
     // A development executable depends on Vite's dev server and cannot
     // run on its own at Windows sign-in, so it must never replace the
     // registration created by an installed/release build.
     // enable() rewrites the Run entry on every start, which also adds
     // --autostart to entries registered before the argument existed.
+    // A stored value this build could not read leaves the entry as it is.
     #[cfg(not(debug_assertions))]
-    {
+    if !repairs.contains("autoStart") {
         let autostart_result = if settings.auto_start {
             app.autolaunch().enable()
         } else {
@@ -1462,7 +1493,7 @@ fn setup_app(
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = inactive;
     if cleanup_stale_artifacts(
         &std::env::temp_dir(),
-        settings.delete_audio_after_processing,
+        startup_cleanup_removes_captures(&settings, &repairs),
     )
     .is_err()
     {
