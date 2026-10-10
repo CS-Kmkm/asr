@@ -4536,18 +4536,29 @@ pub(crate) async fn update_settings(
                 .into(),
         );
         }
-        shortcuts::update_registrations(
+        // Held until the new routes are published, so the Esc cancel chord
+        // follower cannot re-register Esc from the old routes in between.
+        let mut cancel_chord = services
+            .cancel_chord_registered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let phase = services.lifecycle.phase();
+        let registration = shortcuts::update_registrations_with_cancel_chord(
+            &mut cancel_chord,
+            phase,
             &old_routes,
             &desired_routes,
             |chord| app.global_shortcut().register(chord),
             |chord| app.global_shortcut().unregister(chord),
             || persist_settings(&storage, &settings),
-        )?;
+        );
+        registration?;
         let inactive = shortcuts::inactive_descriptions(&settings, &desired_routes)?;
         *services
             .shortcut_routes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = desired_routes;
+        drop(cancel_chord);
         *services
             .inactive_shortcuts
             .lock()

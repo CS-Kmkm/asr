@@ -146,6 +146,9 @@ pub(crate) struct Services {
     inactive_shortcuts: Mutex<Vec<String>>,
     settings_update: tokio::sync::Mutex<()>,
     microphone_test: tokio::sync::Mutex<MicrophoneTestState>,
+    /// Whether this app holds the Esc cancel chord. Locked before
+    /// `shortcut_routes` whenever both are needed.
+    cancel_chord_registered: Mutex<bool>,
 }
 
 impl Services {
@@ -183,6 +186,7 @@ impl Services {
             inactive_shortcuts: Mutex::new(Vec::new()),
             settings_update: tokio::sync::Mutex::new(()),
             microphone_test: tokio::sync::Mutex::new(MicrophoneTestState::default()),
+            cancel_chord_registered: Mutex::new(false),
         }
     }
 
@@ -1346,11 +1350,16 @@ async fn cancel_voice_session(app: AppHandle) {
 /// processing.
 async fn follow_cancel_chord(app: AppHandle) {
     let mut phases = app.state::<Services>().lifecycle.subscribe_phase();
-    let mut registered = false;
     while phases.changed().await.is_ok() {
         let phase = *phases.borrow_and_update();
-        let wanted = app
-            .state::<Services>()
+        let services = app.state::<Services>();
+        // Settings saves update routes under the same lock (see
+        // `shortcuts::update_registrations_with_cancel_chord`).
+        let mut registered = services
+            .cancel_chord_registered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let wanted = services
             .shortcut_routes
             .lock()
             .map(|routes| shortcuts::wants_cancel_chord(phase, &routes))

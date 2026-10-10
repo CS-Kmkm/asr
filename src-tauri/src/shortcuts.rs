@@ -68,6 +68,38 @@ pub(crate) fn sync_cancel_chord<E: std::fmt::Display>(
     }
 }
 
+/// `update_registrations` for a settings save, keeping the Esc cancel chord
+/// consistent with the routes. Esc is released first when the new routes
+/// take it (a route registration would otherwise fail on our own hold), and
+/// afterwards follows the routes in effect: the new ones, or the old ones
+/// after a rollback. A route that gave Esc up during a session hands it back
+/// to the cancel chord.
+pub(crate) fn update_registrations_with_cancel_chord<E: std::fmt::Display>(
+    cancel_chord: &mut bool,
+    phase: PipelinePhase,
+    old: &Routes,
+    new: &Routes,
+    mut register: impl FnMut(Shortcut) -> Result<(), E>,
+    mut unregister: impl FnMut(Shortcut) -> Result<(), E>,
+    persist: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    sync_cancel_chord(
+        cancel_chord,
+        wants_cancel_chord(phase, old) && wants_cancel_chord(phase, new),
+        &mut register,
+        &mut unregister,
+    );
+    let result = update_registrations(old, new, &mut register, &mut unregister, persist);
+    let routes = if result.is_ok() { new } else { old };
+    sync_cancel_chord(
+        cancel_chord,
+        wants_cancel_chord(phase, routes),
+        &mut register,
+        &mut unregister,
+    );
+    result
+}
+
 /// Routed actions in collision precedence order: when saved chords collide,
 /// the older action keeps the chord (Dictate, selected-text Translate, voice
 /// Translate, Speak to edit, then Ask).
@@ -416,6 +448,144 @@ mod tests {
         sync_cancel_chord(&mut registered, false, register(Ok(())), unregister);
         assert!(!registered);
         assert_eq!(*calls.borrow(), vec!["register", "register", "unregister"]);
+    }
+
+    /// A registry that, like the OS, refuses a chord registered twice.
+    struct Registry(RefCell<HashSet<Shortcut>>);
+
+    impl Registry {
+        fn register(&self, chord: Shortcut) -> Result<(), &'static str> {
+            self.0
+                .borrow_mut()
+                .insert(chord)
+                .then_some(())
+                .ok_or("already registered")
+        }
+
+        fn unregister(&self, chord: Shortcut) -> Result<(), &'static str> {
+            self.0
+                .borrow_mut()
+                .remove(&chord)
+                .then_some(())
+                .ok_or("not registered")
+        }
+
+        fn holds(&self, chord: Shortcut) -> bool {
+            self.0.borrow().contains(&chord)
+        }
+    }
+
+    fn with_esc_on_ask() -> Settings {
+        let mut settings = Settings::default();
+        settings.shortcuts.ask[0] = "Escape".into();
+        settings
+    }
+
+    fn save(
+        registry: &Registry,
+        cancel_chord: &mut bool,
+        phase: PipelinePhase,
+        old: &Routes,
+        new: &Routes,
+        persisted: Result<(), String>,
+    ) -> Result<(), String> {
+        let mut persisted = Some(persisted);
+        update_registrations_with_cancel_chord(
+            cancel_chord,
+            phase,
+            old,
+            new,
+            |chord| registry.register(chord),
+            |chord| registry.unregister(chord),
+            || persisted.take().unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_route_can_take_esc_from_the_cancel_chord_mid_session() {
+        let old = Routes::parse(&Settings::default()).unwrap();
+        let new = Routes::parse(&with_esc_on_ask()).unwrap();
+        let registry = Registry(RefCell::new(old.chords().into_iter().collect()));
+        registry.register(cancel_chord()).unwrap();
+        let mut cancel = true;
+        save(
+            &registry,
+            &mut cancel,
+            PipelinePhase::Recording,
+            &old,
+            &new,
+            Ok(()),
+        )
+        .unwrap();
+        // Esc is now the Ask route's; the cancel chord let go of it.
+        assert!(!cancel);
+        assert!(registry.holds(cancel_chord()));
+        assert_eq!(
+            new.find(cancel_chord()).map(|route| route.action),
+            Some(Action::Ask)
+        );
+    }
+
+    #[test]
+    fn removing_an_esc_route_mid_session_hands_esc_back_to_cancel() {
+        let old = Routes::parse(&with_esc_on_ask()).unwrap();
+        let new = Routes::parse(&Settings::default()).unwrap();
+        let registry = Registry(RefCell::new(old.chords().into_iter().collect()));
+        let mut cancel = false;
+        save(
+            &registry,
+            &mut cancel,
+            PipelinePhase::Processing,
+            &old,
+            &new,
+            Ok(()),
+        )
+        .unwrap();
+        assert!(cancel);
+        assert!(registry.holds(cancel_chord()));
+        // While idle the removed route simply frees Esc.
+        let registry = Registry(RefCell::new(old.chords().into_iter().collect()));
+        let mut cancel = false;
+        save(
+            &registry,
+            &mut cancel,
+            PipelinePhase::Idle,
+            &old,
+            &new,
+            Ok(()),
+        )
+        .unwrap();
+        assert!(!cancel);
+        assert!(!registry.holds(cancel_chord()));
+    }
+
+    #[test]
+    fn a_failed_save_restores_the_cancel_chord_with_the_old_routes() {
+        let old = Routes::parse(&Settings::default()).unwrap();
+        let new = Routes::parse(&with_esc_on_ask()).unwrap();
+        let registry = Registry(RefCell::new(old.chords().into_iter().collect()));
+        registry.register(cancel_chord()).unwrap();
+        let mut cancel = true;
+        assert_eq!(
+            save(
+                &registry,
+                &mut cancel,
+                PipelinePhase::Recording,
+                &old,
+                &new,
+                Err("write failed".into()),
+            ),
+            Err("write failed".into())
+        );
+        assert!(cancel);
+        assert!(registry.holds(cancel_chord()));
+        assert_eq!(
+            *registry.0.borrow(),
+            old.chords()
+                .into_iter()
+                .chain([cancel_chord()])
+                .collect::<HashSet<_>>()
+        );
     }
 
     #[test]
