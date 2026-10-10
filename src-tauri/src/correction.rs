@@ -1996,10 +1996,14 @@ fn openai_reasoning_allowance(model: &str, effort: &str) -> usize {
 /// Thinking tokens reserved for Gemini. `thinking_level=minimal` is sent to
 /// models that accept it and keeps thinking negligible. Gemini 2.5 models run
 /// their default (dynamic) thinking, which counts against
-/// `max_output_tokens`. Other models are not known to think, and some (such
-/// as gemini-2.0-flash) cap output at 8192 tokens, so they get no allowance.
+/// `max_output_tokens`, and so may the other `-latest` aliases (such as
+/// gemini-flash-latest), which can resolve to a thinking model. Other models
+/// are not known to think, and some (such as gemini-2.0-flash) cap output at
+/// 8192 tokens, so they get no allowance.
 fn gemini_thinking_allowance(model: &str) -> usize {
-    if !supports_gemini_minimal_thinking(model) && model.starts_with("gemini-2.5") {
+    let may_think = model.starts_with("gemini-2.5")
+        || (model.starts_with("gemini-") && model.ends_with("-latest"));
+    if may_think && !supports_gemini_minimal_thinking(model) {
         8_192
     } else {
         0
@@ -3820,6 +3824,9 @@ mod tests {
         assert_eq!(gemini_thinking_allowance("gemini-3-flash-preview"), 0);
         assert_eq!(gemini_thinking_allowance("gemini-2.5-flash"), 8_192);
         assert_eq!(gemini_thinking_allowance("gemini-2.5-pro"), 8_192);
+        for alias in ["gemini-flash-latest", "gemini-pro-latest"] {
+            assert_eq!(gemini_thinking_allowance(alias), 8_192, "{alias}");
+        }
         for model in ["gemini-2.0-flash", "gemini-1.5-pro", "gemma-3-27b-it"] {
             assert_eq!(gemini_thinking_allowance(model), 0, "{model}");
         }
