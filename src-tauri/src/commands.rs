@@ -3261,6 +3261,18 @@ pub(crate) fn delete_all_history(storage: State<'_, Storage>) -> Result<u64, Str
     storage.delete_all_history().map_err(command_error)
 }
 
+/// Read-only count shown in the confirmation before a shorter retention is
+/// saved; saving it purges through the same cutoff and row selection.
+#[tauri::command]
+pub(crate) fn preview_history_retention_purge(
+    retention: types::HistoryRetention,
+    storage: State<'_, Storage>,
+) -> Result<storage::HistoryPurgePreview, String> {
+    storage
+        .history_purge_preview(retention)
+        .map_err(command_error)
+}
+
 #[tauri::command]
 pub(crate) fn get_history_audio(
     id: i64,

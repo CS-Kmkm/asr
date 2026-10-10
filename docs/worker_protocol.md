@@ -156,7 +156,9 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 バックエンドごとの挙動:
 
 - faster-whisper: モデルIDをHugging Faceリポジトリへ解決し、キャッシュ済みなら `download` を
-  通知せず `load` のみを通知する。未キャッシュなら `download` を通知し、
+  通知せず `load` のみを通知する。snapshotフォルダがあっても `config.json`・`model.bin`・
+  `vocabulary.*`(faster-whisper組み込みのモデル名に対応するリポジトリではさらに `tokenizer.json`)の
+  いずれかが欠けていれば(初回ダウンロードの中断)未キャッシュとみなし、欠けたファイルを取得する。未キャッシュなら `download` を通知し、
   `huggingface_hub.snapshot_download` の集約プログレスバーからバイト進捗を送出する
   (`completed_bytes` は転送方式により総量をわずかに超えうるため、表示側で丸める)。
 - VibeVoice: transformers の `from_pretrained` に進捗フックがないため、未キャッシュ時に

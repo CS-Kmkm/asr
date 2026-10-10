@@ -23,6 +23,9 @@ pub struct WorkerCommand {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Working directory for the worker. `python -m` puts it first on
+    /// `sys.path`, so it must not be the inherited working directory.
+    pub current_dir: Option<PathBuf>,
 }
 
 impl WorkerCommand {
@@ -42,12 +45,18 @@ impl WorkerCommand {
                 // Notifications are sent only to a client that asks for them.
                 ("ASR_WORKER_PROGRESS".into(), "1".into()),
             ],
+            current_dir: None,
         }
     }
 
     pub fn with_backend(mut self, backend: &str) -> Self {
         self.args.push("--backend".into());
         self.args.push(backend.to_owned());
+        self
+    }
+
+    pub fn with_current_dir(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.current_dir = Some(directory.into());
         self
     }
 }
@@ -187,6 +196,9 @@ impl JsonlTranscriber {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        if let Some(directory) = &command_spec.current_dir {
+            command.current_dir(directory);
+        }
         let mut child = command.spawn()?;
         let stdin = child
             .stdin
@@ -591,6 +603,11 @@ mod tests {
                 ("PYTHONIOENCODING".to_string(), "utf-8".to_string()),
                 ("ASR_WORKER_PROGRESS".to_string(), "1".to_string()),
             ]
+        );
+        assert_eq!(command.current_dir, None);
+        assert_eq!(
+            command.with_current_dir("checkout").current_dir,
+            Some(PathBuf::from("checkout"))
         );
     }
 
