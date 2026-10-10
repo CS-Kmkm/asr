@@ -177,12 +177,20 @@ impl FailedTakeRetention {
 /// Removes the History rows that `settings` no longer keep at `now` and
 /// queues their audio for deletion. A failed take kept only for Retry is
 /// removed when it expires, when keeping failed takes is turned off, or when
-/// the History window removes it first; History off does not remove it.
+/// the History window removes it first; History off does not remove it. Once
+/// History keeps audio, an unexpired one becomes a normal row instead.
 fn purge_history(
     connection: &Connection,
     settings: &Settings,
     now: DateTime<Utc>,
 ) -> Result<(), StorageError> {
+    if FailedTakeRetention::for_settings(settings) == Some(FailedTakeRetention::Normal) {
+        connection.execute(
+            "UPDATE dictation_history SET expires_at = NULL
+             WHERE expires_at IS NOT NULL AND expires_at > ?1",
+            [now.to_rfc3339()],
+        )?;
+    }
     let cutoff = HistoryCutoff::at(settings.history_retention, now);
     let (remove_all, before) = match &cutoff {
         HistoryCutoff::KeepAll => (false, None),
@@ -3501,6 +3509,40 @@ mod tests {
             .unwrap();
         assert_eq!(stored_row_count(&storage), 0);
         assert!(history_audio_files(&storage).is_empty());
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
+    }
+
+    #[test]
+    fn a_kept_failed_take_follows_normal_retention_once_history_keeps_audio() {
+        let storage = Storage::in_memory().unwrap();
+        storage.update_settings(&keeping_nothing(true)).unwrap();
+        let source = source_wav();
+        storage.add_failed_take(&item(), &source).unwrap().unwrap();
+        let _ = fs::remove_file(&source);
+
+        // Turning History on alone still deletes audio: the take still expires.
+        let history_only = Settings {
+            history_retention: HistoryRetention::OneMonth,
+            ..keeping_nothing(true)
+        };
+        storage
+            .update_settings_and_apply_history_policy(&history_only)
+            .unwrap();
+        assert!(storage.list_history(HistoryFilter::All, 1).unwrap()[0]
+            .expires_at
+            .is_some());
+
+        storage
+            .update_settings_and_apply_history_policy(&keeping_audio())
+            .unwrap();
+        let row = &storage.list_history(HistoryFilter::All, 1).unwrap()[0];
+        assert_eq!(row.expires_at, None);
+        storage
+            .apply_history_policy_at(&keeping_audio(), Utc::now() + chrono::Duration::hours(25))
+            .unwrap();
+        assert_eq!(stored_row_count(&storage), 1);
+        assert_eq!(history_audio_files(&storage).len(), 1);
+        storage.delete_all_history().unwrap();
         let _ = fs::remove_dir_all(&storage.history_audio_dir);
     }
 
