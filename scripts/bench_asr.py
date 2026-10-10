@@ -144,6 +144,10 @@ class WorkerSession:
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
+                # The protocol on stdout is UTF-8, but stderr is whatever the
+                # worker's libraries write, often in the console code page.
+                # Undecodable bytes must not stop the stderr drain.
+                errors="replace",
                 bufsize=1,  # line-buffered
                 env=self.env,
             )
@@ -164,13 +168,29 @@ class WorkerSession:
         return self._next_id
 
     def _drain_stderr(self) -> None:
-        """Keep reading worker stderr, remembering only the most recent lines."""
+        """Keep reading worker stderr, remembering only the most recent lines.
+
+        The worker blocks once the stderr pipe is full, so this must keep
+        reading until end of file whatever the content is.
+        """
         stream = self.proc.stderr if self.proc is not None else None
         if stream is None:
             return
-        with contextlib.suppress(Exception):
+        try:
             for line in stream:
                 self._stderr_lines.append(line)
+            return
+        except Exception as exc:  # noqa: BLE001 - must not end the drain
+            if stream.closed:
+                return  # close() ended the session
+            self._stderr_lines.append(
+                f"[bench_asr: cannot read worker stderr as text ({type(exc).__name__}); "
+                "discarding the rest]\n"
+            )
+        # Keep the pipe empty even though the rest cannot be shown.
+        with contextlib.suppress(Exception):
+            while stream.buffer.read(65536):
+                pass
 
     def _stderr_tail(self) -> str:
         """The most recent stderr lines the worker emitted, for diagnostics."""
@@ -325,11 +345,19 @@ def run_transcribe_loop(
     return records
 
 
-def run_benchmark(args: argparse.Namespace, audio_paths: list[Path]) -> dict[str, Any]:
-    cmd = build_worker_cmd(args)
+def worker_env(args: argparse.Namespace) -> dict[str, str]:
     env = dict(os.environ)
     # Make the backend selection explicit for default-cmd invocations too.
     env.setdefault("ASR_WORKER_BACKEND", args.backend)
+    # A piped Python stderr uses the Windows ANSI code page (cp932 on Japanese
+    # systems); UTF-8 keeps warnings and tracebacks readable in failure reports.
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    return env
+
+
+def run_benchmark(args: argparse.Namespace, audio_paths: list[Path]) -> dict[str, Any]:
+    cmd = build_worker_cmd(args)
+    env = worker_env(args)
 
     cold_load_ms: list[float] = []
     warm_records: list[dict[str, Any]] = []
