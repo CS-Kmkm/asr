@@ -12,7 +12,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -58,6 +58,8 @@ pub enum StorageError {
     Validation(String),
     #[error("CSV parsing failed")]
     Csv(#[from] csv::Error),
+    #[error("database schema version {version} is newer than supported version {supported}")]
+    NewerSchema { version: i64, supported: i64 },
 }
 
 pub struct Storage {
@@ -315,6 +317,217 @@ fn insert_history_row(
     Ok(())
 }
 
+/// One schema step. It runs inside the transaction that also advances
+/// `PRAGMA user_version`, so a failed step leaves the previous version.
+type Migration = fn(&Connection) -> Result<(), StorageError>;
+
+/// Ordered schema steps; step `n` (0-based) upgrades `user_version` `n` to
+/// `n + 1`. Append new steps; never edit or reorder released ones.
+const MIGRATIONS: &[Migration] = &[migrate_v1_baseline];
+
+/// Applies every step above the stored `user_version`, one transaction per
+/// step. A database written by a newer build is refused rather than opened
+/// with a schema this build does not know.
+fn run_migrations(
+    connection: &mut Connection,
+    migrations: &[Migration],
+) -> Result<(), StorageError> {
+    let supported = i64::try_from(migrations.len()).unwrap_or(i64::MAX);
+    loop {
+        // IMMEDIATE takes the write lock before the version is read, so two
+        // processes cannot both apply the same step.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: i64 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == supported {
+            return Ok(());
+        }
+        let Some(step) = usize::try_from(version)
+            .ok()
+            .and_then(|index| migrations.get(index))
+        else {
+            return Err(StorageError::NewerSchema { version, supported });
+        };
+        step(&transaction)?;
+        transaction.pragma_update(None, "user_version", version + 1)?;
+        transaction.commit()?;
+    }
+}
+
+/// Version 1: the schema as it stood before versioning. Databases from
+/// earlier builds have `user_version` 0 and any earlier additive shape, so
+/// every step probes and is idempotent.
+fn migrate_v1_baseline(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS settings (
+           key TEXT PRIMARY KEY NOT NULL,
+           value TEXT NOT NULL,
+           updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS dictionary_entries (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           reading TEXT NOT NULL,
+           surface TEXT NOT NULL,
+           category TEXT,
+           aliases TEXT NOT NULL DEFAULT '[]',
+           priority INTEGER NOT NULL DEFAULT 0,
+           app_scope TEXT,
+           source TEXT NOT NULL DEFAULT 'manual',
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS dictionary_candidates (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           original_span TEXT NOT NULL,
+           preferred_span TEXT NOT NULL,
+           confidence REAL NOT NULL,
+           history_id INTEGER,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           FOREIGN KEY(history_id) REFERENCES dictation_history(id) ON DELETE SET NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_dictionary_candidates_created_at ON dictionary_candidates(created_at DESC);
+         CREATE TABLE IF NOT EXISTS dictionary_candidate_decisions (
+           original_span TEXT NOT NULL,
+           preferred_span TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           PRIMARY KEY(original_span, preferred_span)
+         );
+         CREATE TABLE IF NOT EXISTS dictation_history (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           transcript_text TEXT NOT NULL,
+           processed_text TEXT,
+           source_text TEXT,
+           instruction_text TEXT,
+           action_kind TEXT,
+           search_site TEXT,
+           mode TEXT NOT NULL,
+           asr_provider TEXT NOT NULL,
+           llm_provider TEXT,
+           target_language TEXT,
+           app_category TEXT,
+           duration_ms INTEGER,
+           latency_ms INTEGER,
+           created_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_history_created_at ON dictation_history(created_at DESC);
+         CREATE TABLE IF NOT EXISTS pending_audio_deletions (
+           filename TEXT PRIMARY KEY NOT NULL,
+           created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS metrics (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           event_type TEXT NOT NULL,
+           provider TEXT,
+           duration_ms INTEGER,
+           success INTEGER NOT NULL,
+           error_code TEXT,
+           created_at TEXT NOT NULL
+         );",
+    )?;
+    let has_target_language: bool = connection.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM pragma_table_info('dictation_history')
+           WHERE name = 'target_language'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_target_language {
+        connection.execute(
+            "ALTER TABLE dictation_history ADD COLUMN target_language TEXT",
+            [],
+        )?;
+    }
+    for column in [
+        "source_text",
+        "instruction_text",
+        "action_kind",
+        "search_site",
+        "insertion_result",
+        "insertion_detail",
+    ] {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM pragma_table_info('dictation_history')
+               WHERE name = ?1
+             )",
+            [column],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            connection.execute(
+                &format!("ALTER TABLE dictation_history ADD COLUMN {column} TEXT"),
+                [],
+            )?;
+        }
+    }
+    for (column, definition) in [
+        ("audio_filename", "TEXT"),
+        ("expires_at", "TEXT"),
+        (
+            "retry_of_id",
+            "INTEGER REFERENCES dictation_history(id) ON DELETE SET NULL",
+        ),
+    ] {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('dictation_history') WHERE name = ?1)",
+            [column],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            connection.execute(
+                &format!("ALTER TABLE dictation_history ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    // A legacy/corrupt database may have shared a filename before this
+    // ownership invariant existed. Preserve the oldest association and
+    // clear later duplicates so the new partial unique index can migrate.
+    connection.execute(
+        "UPDATE dictation_history SET audio_filename = NULL
+         WHERE audio_filename IS NOT NULL AND id NOT IN (
+           SELECT MIN(id) FROM dictation_history
+           WHERE audio_filename IS NOT NULL GROUP BY audio_filename
+         )",
+        [],
+    )?;
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_history_audio_filename
+         ON dictation_history(audio_filename) WHERE audio_filename IS NOT NULL",
+        [],
+    )?;
+    let columns = {
+        let mut statement = connection.prepare("PRAGMA table_info(dictionary_entries)")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let has_source = columns.iter().any(|column| column == "source");
+    if !has_source {
+        connection.execute(
+            "ALTER TABLE dictionary_entries ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
+            [],
+        )?;
+    }
+    connection.execute("UPDATE dictionary_entries SET source = 'manual' WHERE source IS NULL OR source NOT IN ('manual', 'auto')", [])?;
+    let decision_columns = {
+        let mut statement =
+            connection.prepare("PRAGMA table_info(dictionary_candidate_decisions)")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if !decision_columns.iter().any(|column| column == "created_at") {
+        // An unreleased development database may have the old table. Its
+        // undated private spans cannot be retained under a time policy.
+        connection.execute(
+            "ALTER TABLE dictionary_candidate_decisions ADD COLUMN created_at TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 struct StagedHistoryAudio<'a> {
     filename: String,
     path: PathBuf,
@@ -421,177 +634,14 @@ impl Storage {
     }
 
     fn migrate(&self) -> Result<(), StorageError> {
-        let connection = self.connection()?;
+        let mut connection = self.connection()?;
+        // Neither pragma takes effect inside a transaction, so they run
+        // before the versioned steps.
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA foreign_keys = ON;
-             CREATE TABLE IF NOT EXISTS settings (
-               key TEXT PRIMARY KEY NOT NULL,
-               value TEXT NOT NULL,
-               updated_at TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS dictionary_entries (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               reading TEXT NOT NULL,
-               surface TEXT NOT NULL,
-               category TEXT,
-               aliases TEXT NOT NULL DEFAULT '[]',
-               priority INTEGER NOT NULL DEFAULT 0,
-               app_scope TEXT,
-               source TEXT NOT NULL DEFAULT 'manual',
-               created_at TEXT NOT NULL,
-               updated_at TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS dictionary_candidates (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               original_span TEXT NOT NULL,
-               preferred_span TEXT NOT NULL,
-               confidence REAL NOT NULL,
-               history_id INTEGER,
-               created_at TEXT NOT NULL,
-               updated_at TEXT NOT NULL,
-               FOREIGN KEY(history_id) REFERENCES dictation_history(id) ON DELETE SET NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_dictionary_candidates_created_at ON dictionary_candidates(created_at DESC);
-             CREATE TABLE IF NOT EXISTS dictionary_candidate_decisions (
-               original_span TEXT NOT NULL,
-               preferred_span TEXT NOT NULL,
-               created_at TEXT NOT NULL,
-               PRIMARY KEY(original_span, preferred_span)
-             );
-             CREATE TABLE IF NOT EXISTS dictation_history (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               transcript_text TEXT NOT NULL,
-               processed_text TEXT,
-               source_text TEXT,
-               instruction_text TEXT,
-               action_kind TEXT,
-               search_site TEXT,
-               mode TEXT NOT NULL,
-               asr_provider TEXT NOT NULL,
-               llm_provider TEXT,
-               target_language TEXT,
-               app_category TEXT,
-               duration_ms INTEGER,
-               latency_ms INTEGER,
-               created_at TEXT NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_history_created_at ON dictation_history(created_at DESC);
-             CREATE TABLE IF NOT EXISTS pending_audio_deletions (
-               filename TEXT PRIMARY KEY NOT NULL,
-               created_at TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS metrics (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               event_type TEXT NOT NULL,
-               provider TEXT,
-               duration_ms INTEGER,
-               success INTEGER NOT NULL,
-               error_code TEXT,
-               created_at TEXT NOT NULL
-             );",
+             PRAGMA foreign_keys = ON;",
         )?;
-        let has_target_language: bool = connection.query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM pragma_table_info('dictation_history')
-               WHERE name = 'target_language'
-             )",
-            [],
-            |row| row.get(0),
-        )?;
-        if !has_target_language {
-            connection.execute(
-                "ALTER TABLE dictation_history ADD COLUMN target_language TEXT",
-                [],
-            )?;
-        }
-        for column in [
-            "source_text",
-            "instruction_text",
-            "action_kind",
-            "search_site",
-            "insertion_result",
-            "insertion_detail",
-        ] {
-            let exists: bool = connection.query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM pragma_table_info('dictation_history')
-                   WHERE name = ?1
-                 )",
-                [column],
-                |row| row.get(0),
-            )?;
-            if !exists {
-                connection.execute(
-                    &format!("ALTER TABLE dictation_history ADD COLUMN {column} TEXT"),
-                    [],
-                )?;
-            }
-        }
-        for (column, definition) in [
-            ("audio_filename", "TEXT"),
-            ("expires_at", "TEXT"),
-            (
-                "retry_of_id",
-                "INTEGER REFERENCES dictation_history(id) ON DELETE SET NULL",
-            ),
-        ] {
-            let exists: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('dictation_history') WHERE name = ?1)",
-                [column],
-                |row| row.get(0),
-            )?;
-            if !exists {
-                connection.execute(
-                    &format!("ALTER TABLE dictation_history ADD COLUMN {column} {definition}"),
-                    [],
-                )?;
-            }
-        }
-        // A legacy/corrupt database may have shared a filename before this
-        // ownership invariant existed. Preserve the oldest association and
-        // clear later duplicates so the new partial unique index can migrate.
-        connection.execute(
-            "UPDATE dictation_history SET audio_filename = NULL
-             WHERE audio_filename IS NOT NULL AND id NOT IN (
-               SELECT MIN(id) FROM dictation_history
-               WHERE audio_filename IS NOT NULL GROUP BY audio_filename
-             )",
-            [],
-        )?;
-        connection.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_history_audio_filename
-             ON dictation_history(audio_filename) WHERE audio_filename IS NOT NULL",
-            [],
-        )?;
-        let columns = {
-            let mut statement = connection.prepare("PRAGMA table_info(dictionary_entries)")?;
-            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        let has_source = columns.iter().any(|column| column == "source");
-        if !has_source {
-            connection.execute(
-                "ALTER TABLE dictionary_entries ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
-                [],
-            )?;
-        }
-        connection.execute("UPDATE dictionary_entries SET source = 'manual' WHERE source IS NULL OR source NOT IN ('manual', 'auto')", [])?;
-        let decision_columns = {
-            let mut statement =
-                connection.prepare("PRAGMA table_info(dictionary_candidate_decisions)")?;
-            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        if !decision_columns.iter().any(|column| column == "created_at") {
-            // An unreleased development database may have the old table. Its
-            // undated private spans cannot be retained under a time policy.
-            connection.execute(
-                "ALTER TABLE dictionary_candidate_decisions ADD COLUMN created_at TEXT",
-                [],
-            )?;
-        }
-        Ok(())
+        run_migrations(&mut connection, MIGRATIONS)
     }
 
     pub fn get_settings(&self) -> Result<Settings, StorageError> {
@@ -2317,6 +2367,347 @@ mod tests {
                 .unwrap();
             assert!(exists, "missing migrated column {column}");
         }
+    }
+
+    fn user_version(connection: &Connection) -> i64 {
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap()
+    }
+
+    fn column_names(connection: &Connection, table: &str) -> Vec<String> {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap();
+        rows.collect::<Result<Vec<_>, _>>().unwrap()
+    }
+
+    fn object_exists(connection: &Connection, kind: &str, name: &str) -> bool {
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Writes `schema` to a fresh database file with the given History audio
+    /// files, then opens it with `Storage::open` twice: the second open must
+    /// be a no-op upgrade.
+    fn open_legacy_twice(schema: &str, audio_files: &[&str]) -> (tempfile::TempDir, Storage) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.sqlite3");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(schema)
+            .unwrap();
+        let audio_dir = directory.path().join("history-audio");
+        fs::create_dir_all(&audio_dir).unwrap();
+        for name in audio_files {
+            fs::write(audio_dir.join(name), b"RIFF").unwrap();
+        }
+        drop(Storage::open(&path).unwrap());
+        let storage = Storage::open(&path).unwrap();
+        (directory, storage)
+    }
+
+    fn assert_current_schema(connection: &Connection) {
+        assert_eq!(user_version(connection), MIGRATIONS.len() as i64);
+        for table in [
+            "settings",
+            "dictionary_entries",
+            "dictionary_candidates",
+            "dictionary_candidate_decisions",
+            "dictation_history",
+            "pending_audio_deletions",
+            "metrics",
+        ] {
+            assert!(object_exists(connection, "table", table), "{table}");
+        }
+        let history = column_names(connection, "dictation_history");
+        for column in [
+            "target_language",
+            "source_text",
+            "instruction_text",
+            "action_kind",
+            "search_site",
+            "insertion_result",
+            "insertion_detail",
+            "audio_filename",
+            "expires_at",
+            "retry_of_id",
+        ] {
+            assert!(history.iter().any(|name| name == column), "{column}");
+        }
+        assert!(column_names(connection, "dictionary_entries")
+            .iter()
+            .any(|name| name == "source"));
+        assert!(column_names(connection, "dictionary_candidate_decisions")
+            .iter()
+            .any(|name| name == "created_at"));
+        assert!(object_exists(
+            connection,
+            "index",
+            "idx_history_audio_filename"
+        ));
+    }
+
+    #[test]
+    fn fresh_database_migrates_to_the_latest_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fresh.sqlite3");
+        drop(Storage::open(&path).unwrap());
+        let storage = Storage::open(&path).unwrap();
+        assert_current_schema(&storage.connection().unwrap());
+    }
+
+    /// The schema of the first tracked build: no `source` on dictionary
+    /// entries, none of the later History columns, and no candidate tables.
+    #[test]
+    fn first_release_schema_upgrades_and_keeps_rows() {
+        let (_directory, storage) = open_legacy_twice(
+            "CREATE TABLE settings (
+               key TEXT PRIMARY KEY NOT NULL,
+               value TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE dictionary_entries (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               reading TEXT NOT NULL,
+               surface TEXT NOT NULL,
+               category TEXT,
+               aliases TEXT NOT NULL DEFAULT '[]',
+               priority INTEGER NOT NULL DEFAULT 0,
+               app_scope TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE dictation_history (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               transcript_text TEXT NOT NULL,
+               processed_text TEXT,
+               mode TEXT NOT NULL,
+               asr_provider TEXT NOT NULL,
+               llm_provider TEXT,
+               app_category TEXT,
+               duration_ms INTEGER,
+               latency_ms INTEGER,
+               created_at TEXT NOT NULL
+             );
+             CREATE INDEX idx_history_created_at ON dictation_history(created_at DESC);
+             CREATE TABLE metrics (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               event_type TEXT NOT NULL,
+               provider TEXT,
+               duration_ms INTEGER,
+               success INTEGER NOT NULL,
+               error_code TEXT,
+               created_at TEXT NOT NULL
+             );
+             INSERT INTO dictionary_entries(reading, surface, created_at, updated_at)
+               VALUES ('open ai', 'OpenAI', '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z');
+             INSERT INTO dictation_history(transcript_text, mode, asr_provider, created_at)
+               VALUES ('kept', 'dictate', 'mock', '2026-06-01T00:00:00Z');",
+            &[],
+        );
+        let connection = storage.connection().unwrap();
+        assert_current_schema(&connection);
+        let (surface, source): (String, String) = connection
+            .query_row(
+                "SELECT surface, source FROM dictionary_entries",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((surface.as_str(), source.as_str()), ("OpenAI", "manual"));
+        let (text, audio): (String, Option<String>) = connection
+            .query_row(
+                "SELECT transcript_text, audio_filename FROM dictation_history",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(text, "kept");
+        assert_eq!(audio, None);
+    }
+
+    /// An unreleased development build created the decisions table without
+    /// `created_at`; existing decisions stay and receive no date.
+    #[test]
+    fn undated_candidate_decisions_gain_a_created_at_column() {
+        let (_directory, storage) = open_legacy_twice(
+            "CREATE TABLE dictionary_candidate_decisions (
+               original_span TEXT NOT NULL,
+               preferred_span TEXT NOT NULL,
+               PRIMARY KEY(original_span, preferred_span)
+             );
+             INSERT INTO dictionary_candidate_decisions VALUES ('open ai', 'OpenAI');",
+            &[],
+        );
+        let connection = storage.connection().unwrap();
+        assert_current_schema(&connection);
+        let created_at: Option<String> = connection
+            .query_row(
+                "SELECT created_at FROM dictionary_candidate_decisions
+                 WHERE original_span = 'open ai' AND preferred_span = 'OpenAI'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(created_at, None);
+    }
+
+    /// Before the unique index existed, two rows could name one audio file
+    /// and dictionary entries could carry an unknown `source`.
+    #[test]
+    fn duplicate_audio_filenames_and_unknown_sources_are_normalized() {
+        const SHARED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.wav";
+        const OWN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.wav";
+        let (_directory, storage) = open_legacy_twice(
+            "CREATE TABLE dictation_history (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               transcript_text TEXT NOT NULL,
+               processed_text TEXT,
+               mode TEXT NOT NULL,
+               asr_provider TEXT NOT NULL,
+               llm_provider TEXT,
+               app_category TEXT,
+               duration_ms INTEGER,
+               latency_ms INTEGER,
+               created_at TEXT NOT NULL,
+               audio_filename TEXT
+             );
+             INSERT INTO dictation_history(id, transcript_text, mode, asr_provider, created_at, audio_filename) VALUES
+               (1, 'a', 'dictate', 'mock', '2026-06-01T00:00:00Z', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.wav'),
+               (2, 'b', 'dictate', 'mock', '2026-06-01T00:00:01Z', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.wav'),
+               (3, 'c', 'dictate', 'mock', '2026-06-01T00:00:02Z', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.wav'),
+               (4, 'd', 'dictate', 'mock', '2026-06-01T00:00:03Z', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.wav');
+             CREATE TABLE dictionary_entries (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               reading TEXT NOT NULL,
+               surface TEXT NOT NULL,
+               category TEXT,
+               aliases TEXT NOT NULL DEFAULT '[]',
+               priority INTEGER NOT NULL DEFAULT 0,
+               app_scope TEXT,
+               source TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             INSERT INTO dictionary_entries(reading, surface, source, created_at, updated_at) VALUES
+               ('a', 'A', 'auto', 'now', 'now'),
+               ('b', 'B', 'imported', 'now', 'now'),
+               ('c', 'C', NULL, 'now', 'now');",
+            &[SHARED, OWN],
+        );
+        let connection = storage.connection().unwrap();
+        assert_current_schema(&connection);
+        let audio = {
+            let mut statement = connection
+                .prepare("SELECT id, audio_filename FROM dictation_history ORDER BY id")
+                .unwrap();
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get(1)?)))
+                .unwrap();
+            rows.collect::<Result<Vec<(i64, Option<String>)>, _>>()
+                .unwrap()
+        };
+        // The oldest row keeps a shared file; later duplicates lose the link.
+        assert_eq!(
+            audio,
+            [
+                (1, Some(SHARED.to_owned())),
+                (2, None),
+                (3, Some(OWN.to_owned())),
+                (4, None),
+            ]
+        );
+        assert!(connection
+            .execute(
+                "UPDATE dictation_history SET audio_filename = ?1 WHERE id = 2",
+                [OWN],
+            )
+            .is_err());
+        let sources = {
+            let mut statement = connection
+                .prepare("SELECT source FROM dictionary_entries ORDER BY id")
+                .unwrap();
+            let rows = statement.query_map([], |row| row.get(0)).unwrap();
+            rows.collect::<Result<Vec<String>, _>>().unwrap()
+        };
+        assert_eq!(sources, ["auto", "manual", "manual"]);
+    }
+
+    #[test]
+    fn migrations_run_each_step_once_in_order() {
+        static RUNS: AtomicU64 = AtomicU64::new(0);
+        fn first(connection: &Connection) -> Result<(), StorageError> {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+            connection.execute_batch("CREATE TABLE first_step (id INTEGER);")?;
+            Ok(())
+        }
+        fn second(connection: &Connection) -> Result<(), StorageError> {
+            RUNS.fetch_add(10, Ordering::SeqCst);
+            connection.execute_batch("ALTER TABLE first_step ADD COLUMN extra TEXT;")?;
+            Ok(())
+        }
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_migrations(&mut connection, &[first]).unwrap();
+        assert_eq!(user_version(&connection), 1);
+        run_migrations(&mut connection, &[first, second]).unwrap();
+        run_migrations(&mut connection, &[first, second]).unwrap();
+        assert_eq!(user_version(&connection), 2);
+        assert_eq!(RUNS.load(Ordering::SeqCst), 11);
+        assert_eq!(column_names(&connection, "first_step"), ["id", "extra"]);
+    }
+
+    #[test]
+    fn a_failed_migration_step_leaves_the_previous_version() {
+        fn first(connection: &Connection) -> Result<(), StorageError> {
+            connection.execute_batch("CREATE TABLE kept (id INTEGER);")?;
+            Ok(())
+        }
+        fn failing(connection: &Connection) -> Result<(), StorageError> {
+            connection.execute_batch(
+                "CREATE TABLE partial (id INTEGER);
+                 INSERT INTO kept VALUES (1);",
+            )?;
+            Err(StorageError::Validation("injected failure".into()))
+        }
+        let mut connection = Connection::open_in_memory().unwrap();
+        assert!(run_migrations(&mut connection, &[first, failing]).is_err());
+        assert_eq!(user_version(&connection), 1);
+        assert!(object_exists(&connection, "table", "kept"));
+        assert!(!object_exists(&connection, "table", "partial"));
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM kept", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        // The step is retried, not skipped, on the next start.
+        assert!(run_migrations(&mut connection, &[first, failing]).is_err());
+        assert_eq!(user_version(&connection), 1);
+    }
+
+    #[test]
+    fn a_database_from_a_newer_build_is_refused_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("newer.sqlite3");
+        drop(Storage::open(&path).unwrap());
+        let newer = MIGRATIONS.len() as i64 + 1;
+        Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", newer)
+            .unwrap();
+        assert!(matches!(
+            Storage::open(&path),
+            Err(StorageError::NewerSchema { version, supported })
+                if version == newer && supported == MIGRATIONS.len() as i64
+        ));
+        assert_eq!(user_version(&Connection::open(&path).unwrap()), newer);
     }
 
     #[test]
