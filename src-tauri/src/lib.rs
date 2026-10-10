@@ -1042,16 +1042,22 @@ fn show_main_window(app: &AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     load_environment_file();
-    tauri::Builder::default()
-        // Must stay the first plugin: a second launch hands over to the running
-        // instance and exits inside this plugin's initialization, before the
-        // database, hotkeys, tray, or ASR worker of the new process start.
-        .plugin(tauri_plugin_single_instance::init(|app, arguments, _cwd| {
+    let builder = tauri::Builder::default();
+    // Must stay the first plugin: a second launch hands over to the running
+    // instance and exits inside this plugin's initialization, before the
+    // database, hotkeys, tray, or ASR worker of the new process start. The
+    // lock is keyed on the bundle identifier, so a development build would
+    // otherwise exit whenever an installed release build is resident.
+    #[cfg(not(debug_assertions))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(
+        |app, arguments, _cwd| {
             // A sign-in launch while already running must not pop the window.
             if !launched_by_autostart(&arguments) {
                 show_main_window(app);
             }
-        }))
+        },
+    ));
+    builder
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![AUTOSTART_ARGUMENT]),
