@@ -611,6 +611,29 @@ impl Storage {
         item: &NewHistoryItem<'_>,
         source_audio: Option<&Path>,
     ) -> Result<(bool, bool), StorageError> {
+        self.insert_history(item, source_audio, false)
+    }
+
+    /// Inserts a row that is useful only together with its audio, such as a
+    /// take whose transcription failed and that Retry must transcribe again.
+    /// Returns whether the row and its audio were committed; when the audio
+    /// cannot be retained (History or audio retention is off when the row is
+    /// written, or staging the copy fails), nothing is written.
+    pub fn add_history_requiring_audio(
+        &self,
+        item: &NewHistoryItem<'_>,
+        source_audio: &Path,
+    ) -> Result<bool, StorageError> {
+        self.insert_history(item, Some(source_audio), true)
+            .map(|(saved, _)| saved)
+    }
+
+    fn insert_history(
+        &self,
+        item: &NewHistoryItem<'_>,
+        source_audio: Option<&Path>,
+        require_audio: bool,
+    ) -> Result<(bool, bool), StorageError> {
         let settings = self.get_settings()?;
         if settings.history_retention == HistoryRetention::Never {
             return Ok((false, false));
@@ -668,6 +691,10 @@ impl Storage {
             staged_audio.as_ref().map(|audio| audio.filename())
         };
         let retained_audio = audio_filename.is_some();
+        if require_audio && !retained_audio {
+            // The staged copy, if any, is removed when it drops.
+            return Ok((false, false));
+        }
         let transaction = connection.transaction()?;
         let insert = transaction.execute(
             "INSERT INTO dictation_history(
@@ -3083,6 +3110,62 @@ mod tests {
 
             assert_eq!(history_texts(&storage), vec!["inside"], "{retention:?}");
         }
+    }
+
+    #[test]
+    fn a_row_requiring_audio_is_written_only_with_its_audio() {
+        let storage = Storage::in_memory().unwrap();
+        let keep_audio = Settings {
+            history_retention: HistoryRetention::OneMonth,
+            delete_audio_after_processing: false,
+            ..Settings::default()
+        };
+        storage.update_settings(&keep_audio).unwrap();
+        let source = source_wav();
+
+        assert!(storage
+            .add_history_requiring_audio(&item(), &source)
+            .unwrap());
+        assert_eq!(stored_row_count(&storage), 1);
+        assert_eq!(history_audio_files(&storage).len(), 1);
+
+        // Audio retention turned off before the row is written: no row.
+        storage
+            .update_settings(&Settings {
+                delete_audio_after_processing: true,
+                ..keep_audio.clone()
+            })
+            .unwrap();
+        assert!(!storage
+            .add_history_requiring_audio(&item(), &source)
+            .unwrap());
+        assert_eq!(stored_row_count(&storage), 1);
+        assert_eq!(history_audio_files(&storage).len(), 1);
+
+        assert!(source.exists(), "the caller still owns its temporary audio");
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
+    }
+
+    #[test]
+    fn a_row_requiring_audio_is_not_written_when_the_audio_copy_fails() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .update_settings(&Settings {
+                history_retention: HistoryRetention::OneMonth,
+                delete_audio_after_processing: false,
+                ..Settings::default()
+            })
+            .unwrap();
+        let missing =
+            std::env::temp_dir().join(format!("history-missing-{}.wav", random_audio_stem()));
+
+        assert!(!storage
+            .add_history_requiring_audio(&item(), &missing)
+            .unwrap());
+        assert_eq!(stored_row_count(&storage), 0);
+        assert!(history_audio_files(&storage).is_empty());
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
     }
 
     #[test]

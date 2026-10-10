@@ -107,10 +107,12 @@ fn preserve_failed_take(
     let Some(item) = item else {
         return false;
     };
+    // Storage re-checks the current settings and writes the row only with
+    // its audio: a text-less row without audio would offer nothing to retry.
     preserves_failed_takes(settings)
         && matches!(
-            storage.add_history_with_audio_report(&item, Some(audio_path)),
-            Ok((true, false))
+            storage.add_history_requiring_audio(&item, audio_path),
+            Ok(true)
         )
 }
 
@@ -3311,6 +3313,33 @@ mod tests {
         };
         assert!(!preserves_failed_takes(&disabled));
         assert!(!preserves_failed_takes(&Settings::default()));
+    }
+
+    #[test]
+    fn a_failed_take_is_never_saved_without_its_audio() {
+        // Audio retention was turned off while the take was being transcribed.
+        let (storage, _directory, take) = failed_take_storage(false);
+        let snapshot = Settings {
+            delete_audio_after_processing: false,
+            ..storage.get_settings().unwrap()
+        };
+        let item = failed_take_history_item(PipelineMode::Dictate, "mock", None, None, None, 1);
+        assert!(!preserve_failed_take(&storage, &snapshot, item, &take));
+        assert!(storage
+            .list_history(types::HistoryFilter::All, 10)
+            .unwrap()
+            .is_empty());
+
+        // The audio copy fails (here: the take no longer exists).
+        let (storage, directory, _take) = failed_take_storage(true);
+        let settings = storage.get_settings().unwrap();
+        let item = failed_take_history_item(PipelineMode::Dictate, "mock", None, None, None, 1);
+        let missing = directory.path().join("missing.wav");
+        assert!(!preserve_failed_take(&storage, &settings, item, &missing));
+        assert!(storage
+            .list_history(types::HistoryFilter::All, 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
