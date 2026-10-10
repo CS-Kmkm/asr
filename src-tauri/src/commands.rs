@@ -1027,10 +1027,11 @@ fn needs_model_preparation(status: &ModelStatus, model_id: &Option<String>) -> b
 }
 
 /// Waits until the speech model is ready or the start is cancelled, and
-/// returns whether it was cancelled first. The load runs as its own task: a
-/// worker request cannot be abandoned midway, so a cancelled start stops
-/// waiting (and never opens the microphone later), while the load finishes
-/// for the next start.
+/// returns whether it was cancelled first. The load runs as its own task on
+/// purpose: cancelling the start only stops this wait (the microphone never
+/// opens later), while the load, including a first-use download, keeps going
+/// so the next start finds the model ready. Quitting or changing the model
+/// still interrupts it.
 async fn wait_for_speech_model(
     app: &AppHandle,
     settings: &Settings,
