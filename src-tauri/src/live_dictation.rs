@@ -159,6 +159,8 @@ impl LiveDraft {
         }
     }
 
+    /// Shows a new live hypothesis. An empty one is ignored; withdrawing text
+    /// already shown is `retract`'s job.
     pub(crate) fn update(&mut self, text: &str) -> Result<(), injection::InjectionError> {
         if text.is_empty() || self.monitor.shortcut_pending() || self.defer_insertion {
             return Ok(());
@@ -167,11 +169,7 @@ impl LiveDraft {
             let result = self
                 .injector
                 .update_provisional(session, text, &self.monitor)?;
-            if result != InsertResult::ClipboardPaste {
-                return Err(injection::InjectionError::BackendFailure(
-                    "live insertion could not be confirmed",
-                ));
-            }
+            confirmed(result)?;
         } else if !self.attempted {
             self.attempted = true;
             // An interaction before the first result must also block insertion.
@@ -200,6 +198,26 @@ impl LiveDraft {
         }
         self.pasted |= self.session.as_ref().is_some_and(|s| s.paste_was_queued());
         Ok(())
+    }
+
+    /// Withdraws the uncommitted part of the live draft back to `committed`,
+    /// which may be empty, after an utterance ended without text. It only
+    /// edits the draft this session inserted, under the same guards as a
+    /// revision, and never starts an insertion of its own.
+    pub(crate) fn retract(&mut self, committed: &str) -> Result<(), injection::InjectionError> {
+        if self.monitor.shortcut_pending() || self.defer_insertion {
+            return Ok(());
+        }
+        let Some(session) = self.session.as_mut() else {
+            return Ok(());
+        };
+        let result = if committed.is_empty() {
+            self.injector.retract_provisional(session, &self.monitor)?
+        } else {
+            self.injector
+                .update_provisional(session, committed, &self.monitor)?
+        };
+        confirmed(result)
     }
 
     /// Input during recording and recognition does not block a deferred final
@@ -306,6 +324,18 @@ impl LiveDraft {
     }
 }
 
+/// A live edit of an existing draft must be confirmed; otherwise live
+/// insertion pauses and the final text is only copied.
+fn confirmed(result: InsertResult) -> Result<(), injection::InjectionError> {
+    if result == InsertResult::ClipboardPaste {
+        Ok(())
+    } else {
+        Err(injection::InjectionError::BackendFailure(
+            "live insertion could not be confirmed",
+        ))
+    }
+}
+
 impl Drop for LiveDraft {
     fn drop(&mut self) {
         // No updater retains this session. Cancellation cleanup may now remove
@@ -338,15 +368,19 @@ pub(crate) fn start(
             cancel,
             stopped,
             LIVE_INTERVAL,
-            |text| {
+            |live| {
                 if services.lifecycle.phase() != PipelinePhase::Recording
                     || services.lifecycle.is_cancelled(operation_id)
                 {
                     return;
                 }
                 let state = app.state::<AppState>();
-                let _ = app.emit("app-state", state.publish_result(text.to_owned()));
-                if draft.update(text).is_err() {
+                let _ = app.emit("app-state", state.publish_result(live.text().to_owned()));
+                let result = match live {
+                    LiveText::Revise(text) => draft.update(text),
+                    LiveText::Retract(committed) => draft.retract(committed),
+                };
+                if result.is_err() {
                     emit_status(&app, "live_insertion_unavailable", "Live text insertion paused. The final result will remain available in this app.");
                 }
             },
@@ -375,7 +409,7 @@ async fn run(
     mut cancel: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
     interval: Duration,
-    mut on_update: impl FnMut(&str),
+    mut on_update: impl FnMut(&LiveText),
 ) -> Result<(), String> {
     let mut segmentation = Segmentation::default();
     let mut cursor = Duration::ZERO;
@@ -426,37 +460,37 @@ async fn run(
         let artifact = tokio::task::spawn_blocking(move || prepared.into_artifact())
             .await
             .map_err(|_| "live audio writing failed")?;
-        let Some(artifact) = window_artifact(artifact)? else {
-            // Advance past the window; re-planning it would decode it forever.
-            segmentation.recognized(decoded_duration, voiced_until, Duration::ZERO, endpoint);
-            if endpoint {
-                cursor += decoded_duration;
+        // A silent window is never decoded but still ends its utterance, so it
+        // reconciles the display like an empty recognition result.
+        let (utterance, inference_cost) = match window_artifact(artifact)? {
+            None => (None, Duration::ZERO),
+            Some(artifact) => {
+                let mut cleanup = TempArtifact::new(artifact.path.clone(), false);
+                if *cancel.borrow() || *stopped.borrow() {
+                    return Ok(());
+                }
+                let inference_started = Instant::now();
+                let result = transcriber
+                    .transcribe_with_locale(&artifact.path, prompt, speech_locale, cancel.clone())
+                    .await;
+                let inference_cost = inference_started.elapsed();
+                cleanup.cleanup().map_err(command_error)?;
+                if *cancel.borrow() || *stopped.borrow() {
+                    return Ok(());
+                }
+                (window_text(result)?, inference_cost)
             }
-            continue;
         };
-        let mut cleanup = TempArtifact::new(artifact.path.clone(), false);
-        if *cancel.borrow() || *stopped.borrow() {
-            return Ok(());
-        }
-        let inference_started = Instant::now();
-        let result = transcriber
-            .transcribe_with_locale(&artifact.path, prompt, speech_locale, cancel.clone())
-            .await;
-        let inference_cost = inference_started.elapsed();
-        cleanup.cleanup().map_err(command_error)?;
-        if *cancel.borrow() || *stopped.borrow() {
-            return Ok(());
-        }
-        let utterance = window_text(result)?;
-        if let Some(text) = window_display(&completed, utterance.as_deref(), endpoint) {
-            if text != displayed {
-                on_update(&text);
-                displayed = text.clone();
+        if let Some(live) = window_display(&completed, utterance.as_deref(), endpoint) {
+            if live.text() != displayed {
+                on_update(&live);
+                displayed = live.text().to_owned();
             }
             if endpoint {
-                completed = text;
+                completed = live.text().to_owned();
             }
         }
+        // Advance even past a skipped window; re-planning it would decode it forever.
         segmentation.recognized(decoded_duration, voiced_until, inference_cost, endpoint);
         if endpoint {
             cursor += decoded_duration;
@@ -477,13 +511,32 @@ fn window_artifact(
     }
 }
 
-/// The live text after one recognized window, or `None` to keep the current
-/// display. An empty result at an utterance endpoint withdraws the partial
-/// shown earlier for that utterance, since it will never be committed.
-fn window_display(completed: &str, utterance: Option<&str>, endpoint: bool) -> Option<String> {
+/// What one live window asks the preview and the target draft to show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LiveText {
+    /// A new, non-empty hypothesis for the live text.
+    Revise(String),
+    /// The utterance ended without text: withdraw its uncommitted partial
+    /// back to the committed text, which may be empty.
+    Retract(String),
+}
+
+impl LiveText {
+    fn text(&self) -> &str {
+        match self {
+            Self::Revise(text) | Self::Retract(text) => text,
+        }
+    }
+}
+
+/// The live text after one window, or `None` to keep the current display. An
+/// utterance endpoint without text (an empty result or a silent window)
+/// withdraws the partial shown earlier for that utterance, since it will
+/// never be committed. An empty window mid-utterance changes nothing.
+fn window_display(completed: &str, utterance: Option<&str>, endpoint: bool) -> Option<LiveText> {
     match utterance {
-        Some(utterance) => Some(append_utterance(completed, utterance)),
-        None if endpoint => Some(completed.to_owned()),
+        Some(utterance) => Some(LiveText::Revise(append_utterance(completed, utterance))),
+        None if endpoint => Some(LiveText::Retract(completed.to_owned())),
         None => None,
     }
 }
@@ -711,6 +764,22 @@ mod tests {
     }
 
     #[test]
+    fn retraction_never_starts_an_insertion() {
+        for deferred in [true, false] {
+            let mut draft = deferred_test_draft();
+            draft.defer_insertion = deferred;
+            // Without a live draft in the target there is nothing to withdraw.
+            draft.retract("").unwrap();
+            draft.retract("前文").unwrap();
+            // An ordinary empty update is still ignored.
+            draft.update("").unwrap();
+            assert!(!draft.attempted);
+            assert!(draft.session.is_none());
+            assert!(!draft.pasted);
+        }
+    }
+
+    #[test]
     fn translate_final_requires_available_monitor_and_uncancelled_checkpoint() {
         let draft = deferred_test_draft();
         assert!(!draft.can_insert_final(""));
@@ -723,25 +792,54 @@ mod tests {
         assert!(!draft.can_insert_final("translated speech"));
     }
 
+    /// Successive snapshots return the recording so far, the last stage
+    /// repeating. Without stages, a tone grows after one second of silence.
     struct Capture {
         directory: PathBuf,
         snapshots: AtomicUsize,
-        source: Option<Vec<f32>>,
+        stages: Vec<Stage>,
     }
+
+    struct Stage {
+        samples: Vec<f32>,
+        /// The shortest window this snapshot accepts for recognition.
+        minimum_duration: Duration,
+    }
+
+    fn tone(seconds: f64) -> Vec<f32> {
+        (0..(seconds * 24_000.0) as usize)
+            .map(|i| (i as f32 * 0.1).sin() * 0.2)
+            .collect()
+    }
+
+    fn stage(samples: Vec<f32>) -> Stage {
+        Stage {
+            samples,
+            minimum_duration: CaptureConfig::default().minimum_duration,
+        }
+    }
+
     impl AudioCapture for Capture {
         fn snapshot(&self, since: Duration) -> Result<AudioSnapshot, AudioError> {
             let index = self.snapshots.fetch_add(1, Ordering::SeqCst);
-            let samples = self.source.clone().unwrap_or_else(|| {
-                let mut samples = vec![0.0; 24_000];
-                samples.extend((0..24_000 * index).map(|i| (i as f32 * 0.1).sin() * 0.2));
-                samples
-            });
+            let (samples, minimum_duration) = match self
+                .stages
+                .get(index.min(self.stages.len().saturating_sub(1)))
+            {
+                Some(stage) => (stage.samples.clone(), stage.minimum_duration),
+                None => {
+                    let mut samples = vec![0.0; 24_000];
+                    samples.extend(tone(index as f64));
+                    (samples, CaptureConfig::default().minimum_duration)
+                }
+            };
             let offset = (since.as_secs_f64() * 24_000.0).round() as usize;
             let samples = samples[offset.min(samples.len())..].to_vec();
             Ok(AudioSnapshot::for_test(
                 samples,
                 CaptureConfig {
                     artifact_directory: Some(self.directory.clone()),
+                    minimum_duration,
                     ..CaptureConfig::default()
                 },
             ))
@@ -819,7 +917,7 @@ mod tests {
             tokio::sync::Mutex::new(Box::new(Capture {
                 directory: directory.path().to_owned(),
                 snapshots: AtomicUsize::new(0),
-                source: None,
+                stages: vec![],
             }));
         let recognizer = Recognizer {
             calls: AtomicUsize::new(0),
@@ -851,7 +949,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(updates, ["途中", "途中の文章"]);
+        assert_eq!(updates, [revise("途中"), revise("途中の文章")]);
         assert_eq!(recognizer.calls.load(Ordering::SeqCst), 2);
         assert_eq!(audio.lock().await.state(), CaptureState::Capturing);
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
@@ -865,7 +963,7 @@ mod tests {
                 tokio::sync::Mutex::new(Box::new(Capture {
                     directory: directory.path().to_owned(),
                     snapshots: AtomicUsize::new(1),
-                    source: None,
+                    stages: vec![],
                 }));
             let release = Arc::new(Notify::new());
             let recognizer = Recognizer {
@@ -917,7 +1015,7 @@ mod tests {
             tokio::sync::Mutex::new(Box::new(Capture {
                 directory: directory.path().to_owned(),
                 snapshots: AtomicUsize::new(0),
-                source: Some(source),
+                stages: vec![stage(source)],
             }));
         let recognizer = Recognizer {
             calls: AtomicUsize::new(0),
@@ -948,7 +1046,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(updates, ["途中", "途中途中の文章"]);
+        assert_eq!(updates, [revise("途中"), revise("途中途中の文章")]);
         assert_eq!(recognizer.calls.load(Ordering::SeqCst), 2);
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
     }
@@ -993,13 +1091,19 @@ mod tests {
     fn an_empty_endpoint_withdraws_the_uncommitted_partial() {
         assert_eq!(
             window_display("前文", Some("途中"), false),
-            Some("前文途中".into())
+            Some(revise("前文途中"))
         );
         // An empty partial keeps whatever is displayed.
         assert_eq!(window_display("前文", None, false), None);
-        // An empty endpoint reverts to the committed text.
-        assert_eq!(window_display("前文", None, true), Some("前文".into()));
-        assert_eq!(window_display("", None, true), Some(String::new()));
+        // An empty endpoint retracts to the committed text, even when empty.
+        assert_eq!(
+            window_display("前文", None, true),
+            Some(LiveText::Retract("前文".into()))
+        );
+        assert_eq!(
+            window_display("", None, true),
+            Some(LiveText::Retract(String::new()))
+        );
     }
 
     /// Returns the scripted results in order, then repeats the last one.
@@ -1033,7 +1137,7 @@ mod tests {
         tokio::sync::Mutex::new(Box::new(Capture {
             directory: directory.to_owned(),
             snapshots: AtomicUsize::new(0),
-            source: None,
+            stages: vec![],
         }))
     }
 
@@ -1067,9 +1171,83 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(updates, ["途中"]);
+        // The empty partial neither ended live mode nor retracted anything.
+        assert_eq!(updates, [revise("途中")]);
         assert_eq!(recognizer.calls.load(Ordering::SeqCst), 2);
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    fn revise(text: &str) -> LiveText {
+        LiveText::Revise(text.into())
+    }
+
+    /// Runs live recognition over a partial window followed by an utterance
+    /// endpoint, until the first retraction or the timeout.
+    async fn partial_then_endpoint(
+        endpoint: Stage,
+        script: Vec<Option<&'static str>>,
+    ) -> (Vec<LiveText>, usize) {
+        let directory = tempfile::tempdir().unwrap();
+        // A partial window of ongoing speech, then the same speech followed by
+        // enough silence to end the utterance.
+        let audio: tokio::sync::Mutex<Box<dyn AudioCapture>> =
+            tokio::sync::Mutex::new(Box::new(Capture {
+                directory: directory.path().to_owned(),
+                snapshots: AtomicUsize::new(0),
+                stages: vec![stage(tone(1.6)), endpoint],
+            }));
+        let recognizer = ScriptedRecognizer {
+            calls: AtomicUsize::new(0),
+            script,
+        };
+        let (_cancel, cancel) = watch::channel(false);
+        let (stop, stopped) = watch::channel(false);
+        let mut updates = vec![];
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run(
+                &audio,
+                &recognizer,
+                None,
+                None,
+                cancel,
+                stopped,
+                Duration::from_millis(1),
+                |live| {
+                    updates.push(live.to_owned());
+                    if matches!(live, LiveText::Retract(_)) {
+                        stop.send_replace(true);
+                    }
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        (updates, recognizer.calls.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn an_empty_endpoint_retracts_the_partial_already_shown() {
+        let endpoint = stage([tone(1.6), vec![0.0; 24_000]].concat());
+        let (updates, calls) = partial_then_endpoint(endpoint, vec![Some("途中"), Some("")]).await;
+        // The preview and the target draft both drop the uncommitted partial.
+        assert_eq!(updates, [revise("途中"), LiveText::Retract(String::new())]);
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
+    async fn a_silent_endpoint_window_retracts_the_partial_already_shown() {
+        // The endpoint window (speech plus padding) is shorter than this
+        // snapshot accepts, so it is never decoded.
+        let endpoint = Stage {
+            samples: [tone(1.6), vec![0.0; 72_000]].concat(),
+            minimum_duration: Duration::from_secs(2),
+        };
+        let (updates, calls) = partial_then_endpoint(endpoint, vec![Some("途中")]).await;
+        assert_eq!(updates, [revise("途中"), LiveText::Retract(String::new())]);
+        assert_eq!(calls, 1);
     }
 
     #[tokio::test]

@@ -224,6 +224,14 @@ impl SystemTextInjector {
     ) -> Result<InsertResult, InjectionError> {
         batch::update(&self.backend, self.options, session, text, monitor, false)
     }
+    /// Removes the whole provisional draft; never edits text outside it.
+    pub(crate) fn retract_provisional(
+        &self,
+        session: &mut ProvisionalInsertion,
+        monitor: &InputMonitor,
+    ) -> Result<InsertResult, InjectionError> {
+        batch::retract(&self.backend, session, monitor)
+    }
     pub(crate) fn cancel_provisional(
         &self,
         session: &mut ProvisionalInsertion,
