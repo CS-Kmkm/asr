@@ -868,6 +868,12 @@ fn repair_shortcut_routes(settings: &mut Settings, repairs: &mut SettingsRepairs
 /// fallback, the stored value is kept, so an unrelated save (such as cycling
 /// the translation target) does not overwrite a newer build's choice. A
 /// value the user changed away from the fallback is written.
+///
+/// Known limit: a deliberate choice that equals the fallback (for example
+/// picking `forever` while the stored value is unreadable) cannot be told
+/// apart from an unchanged field, so the stored value is kept. The startup
+/// notice and the skipped stale-WAV cleanup then repeat on every start until
+/// a value other than the fallback is chosen.
 fn merged_settings_json(settings: &Settings, stored: Option<&str>) -> Result<String, StorageError> {
     let stored = stored.and_then(|raw| match serde_json::from_str(raw) {
         Ok(serde_json::Value::Object(object)) => Some((raw, object)),
@@ -1188,7 +1194,10 @@ impl Storage {
     /// not know.
     pub fn update_settings(&self, settings: &Settings) -> Result<(), StorageError> {
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        // IMMEDIATE takes the write lock before the read, so a concurrent
+        // writer makes this wait (busy timeout) instead of failing the
+        // upgrade from a read snapshot.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         save_settings_row(&transaction, settings)?;
         transaction.commit()?;
         Ok(())
@@ -1203,7 +1212,10 @@ impl Storage {
     ) -> Result<(), StorageError> {
         let now = Utc::now();
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        // IMMEDIATE takes the write lock before the read, so a concurrent
+        // writer makes this wait (busy timeout) instead of failing the
+        // upgrade from a read snapshot.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         save_settings_row(&transaction, settings)?;
         purge_history(&transaction, settings, now)?;
         transaction.commit()?;
