@@ -854,13 +854,34 @@ mod model_configuration_tests {
 
     #[test]
     fn worker_command_does_not_inherit_the_working_directory() {
-        let command = worker_command_for_settings(&Settings::default());
-        let executable = std::env::current_exe().ok();
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        let other = temp.path().join("other");
+        plant_worker(&checkout);
+        plant_worker(&other);
+        let current_dir = other.join("src-tauri");
+        let release_dir = checkout.join("src-tauri/target/release");
+        let executable = release_dir.join("local-voice-input.exe");
+
+        for include_current_dir in [false, true] {
+            let root =
+                find_project_root(Some(&executable), Some(&current_dir), include_current_dir);
+            let directory = worker_directory(root.as_deref(), Some(&executable));
+            assert_eq!(directory.as_ref(), Some(&checkout));
+        }
+
+        // Without a checkout above the executable, a release build falls back
+        // to the executable's directory rather than the working directory.
+        let installed = temp.path().join("installed").join("local-voice-input.exe");
+        let root = find_project_root(Some(&installed), Some(&current_dir), false);
         assert_eq!(
-            command.current_dir,
-            worker_directory(project_root().as_deref(), executable.as_deref())
+            worker_directory(root.as_deref(), Some(&installed)),
+            Some(temp.path().join("installed"))
         );
+
+        let command = worker_command_for_settings(&Settings::default());
         assert!(command.current_dir.is_some());
+        assert_ne!(command.current_dir, std::env::current_dir().ok());
     }
 
     #[test]

@@ -141,15 +141,20 @@ merged), checked in this order:
 
 1. next to the desktop executable;
 2. the project directory: the nearest ancestor of the executable that
-   contains `asr_worker/` (this is how autostart finds it);
+   contains `asr_worker/__main__.py` (this is how autostart finds it);
 3. debug builds (`pnpm run tauri dev`) only: the working directory, then the
    workspace above `src-tauri`.
 
 A `.env` at a drive root is never read. The Python worker is located the same
 way (working directory in debug builds only) and runs with the project
-directory as its working directory. The chosen project directory and `.env`
-path are printed to stderr at startup. Existing process/system environment
-variables take precedence over values from `.env`.
+directory (or, if none is found, the executable's folder) as its working
+directory, so relative paths passed to the worker, such as `PYTHONPATH`
+entries or local model paths, resolve against that directory rather than the
+directory the app was started from. The chosen project directory and `.env`
+path are printed to stderr at startup; they are visible only when the app is
+started from a console (for example `pnpm run tauri dev`), not from release
+builds started from a shortcut or autostart. Existing process/system
+environment variables take precedence over values from `.env`.
 
 ```powershell
 # Put this in .env instead:
