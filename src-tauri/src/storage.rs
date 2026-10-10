@@ -587,22 +587,19 @@ fn load_settings(raw: &str) -> LoadedSettings {
     if !object.contains_key("historyRetention") {
         let enabled = object
             .remove("historyEnabled")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(true);
+            .and_then(|value| value.as_bool());
         let days = object
             .remove("historyRetentionDays")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(30);
-        let retention = if !enabled {
-            "never"
-        } else if days < 7 {
-            "24_hours"
-        } else if days < 30 {
-            "one_week"
-        } else if days < 365 {
-            "one_month"
-        } else {
-            "one_year"
+            .and_then(|value| value.as_u64());
+        // An explicit "off" is the user's choice; without a readable window
+        // (an unreadable row also lands here) keep everything.
+        let retention = match (enabled, days) {
+            (Some(false), _) => "never",
+            (_, None) => "forever",
+            (_, Some(days)) if days < 7 => "24_hours",
+            (_, Some(days)) if days < 30 => "one_week",
+            (_, Some(days)) if days < 365 => "one_month",
+            (_, Some(_)) => "one_year",
         };
         object.insert("historyRetention".into(), retention.into());
         repairs.push("legacy_history".to_owned());
@@ -667,15 +664,38 @@ fn repair_shortcut_lists(
     }
 }
 
+/// Values used in place of stored fields this build cannot read.
+///
+/// Rule: a fallback must never destroy or drop user data, because it is
+/// applied to an existing installation (the startup retention purge and
+/// stale-audio cleanup run right after loading). Fields whose fresh-install
+/// default deletes data therefore fall back to the value that keeps it:
+/// - `historyRetention` -> `forever` (no History or candidate purge; the
+///   default `one_month` would delete everything older than 30 days);
+/// - `deleteAudioAfterProcessing` -> `false` (keeps retained recordings,
+///   failed takes, and older builds' capture WAVs that may be the only copy).
+///
+/// Every other default only changes behavior from now on. The unreadable
+/// raw value itself stays in `settings_backups`. `Settings::default` is
+/// unchanged and still applies to fresh installs.
+fn fallback_settings() -> Settings {
+    Settings {
+        history_retention: HistoryRetention::Forever,
+        delete_audio_after_processing: false,
+        ..Settings::default()
+    }
+}
+
 /// Decodes `object` one top-level field at a time: a field is kept when the
-/// defaults with only that field replaced decode, and otherwise falls back to
-/// its default. Returns the settings and the JSON of every known field.
+/// fallbacks with only that field replaced decode, and otherwise takes its
+/// [`fallback_settings`] value. Returns the settings and the JSON of every
+/// known field.
 fn decode_fields_leniently(
     object: &serde_json::Map<String, serde_json::Value>,
     repairs: &mut Vec<String>,
 ) -> (Settings, serde_json::Map<String, serde_json::Value>) {
-    let Ok(serde_json::Value::Object(defaults)) = serde_json::to_value(Settings::default()) else {
-        return (Settings::default(), serde_json::Map::new());
+    let Ok(serde_json::Value::Object(defaults)) = serde_json::to_value(fallback_settings()) else {
+        return (fallback_settings(), serde_json::Map::new());
     };
     let mut merged = defaults.clone();
     for key in defaults.keys() {
@@ -698,7 +718,7 @@ fn decode_fields_leniently(
         }
         Err(_) => {
             repairs.push("all_fields".to_owned());
-            (Settings::default(), defaults)
+            (fallback_settings(), defaults)
         }
     }
 }
@@ -3299,7 +3319,8 @@ mod tests {
         let defaults = Settings::default();
         assert!(settings.setup_complete);
         assert!(settings.interaction_sounds);
-        assert_eq!(settings.history_retention, HistoryRetention::OneMonth);
+        // Retention falls back to keeping everything, not to the default.
+        assert_eq!(settings.history_retention, HistoryRetention::Forever);
         assert_eq!(settings.theme, defaults.theme);
         assert_eq!(settings.input_gain_percent, defaults.input_gain_percent);
         assert_eq!(settings.shortcuts.dictate, ["Ctrl+Alt+V"]);
@@ -3330,7 +3351,7 @@ mod tests {
         let stored = stored_settings_value(&storage);
         assert_eq!(stored["futureSetting"]["keep"], true);
         assert_eq!(stored["shortcuts"]["futureMode"][0], "Ctrl+Alt+F");
-        assert_eq!(stored["historyRetention"], "one_month");
+        assert_eq!(stored["historyRetention"], "forever");
         assert_eq!(stored["setupComplete"], true);
         assert_eq!(stored["hotkey"], "Ctrl+Alt+V");
 
@@ -3353,7 +3374,7 @@ mod tests {
             store_raw_settings(&storage, raw);
             assert_eq!(
                 storage.get_settings().unwrap(),
-                Settings::default(),
+                fallback_settings(),
                 "{raw}"
             );
             let backups = settings_backups(&storage);
@@ -3362,7 +3383,7 @@ mod tests {
             assert!(backups[0].1.starts_with("unreadable"), "{}", backups[0].1);
             assert_eq!(
                 serde_json::from_value::<Settings>(stored_settings_value(&storage)).unwrap(),
-                Settings::default()
+                fallback_settings()
             );
         }
     }
@@ -3400,6 +3421,71 @@ mod tests {
         let stored = stored_settings_value(&storage);
         assert_eq!(stored["setupComplete"], false);
         assert_eq!(stored["futureSetting"], 7);
+    }
+
+    #[test]
+    fn unreadable_retention_and_audio_settings_never_delete_data() {
+        let storage = Storage::in_memory().unwrap();
+        insert_history_at(&storage, "old", Utc::now() - chrono::Duration::days(400));
+        insert_history_at(&storage, "recent", Utc::now());
+        let mut value = serde_json::to_value(Settings {
+            setup_complete: true,
+            ..Settings::default()
+        })
+        .unwrap();
+        value["historyRetention"] = "three_months".into();
+        value["deleteAudioAfterProcessing"] = "yes".into();
+        store_raw_settings(&storage, &value.to_string());
+
+        storage.enforce_current_history_policy().unwrap();
+
+        let settings = storage.get_settings().unwrap();
+        assert_eq!(settings.history_retention, HistoryRetention::Forever);
+        assert!(!settings.delete_audio_after_processing);
+        assert!(settings.setup_complete);
+        assert_eq!(history_texts(&storage).len(), 2);
+    }
+
+    #[test]
+    fn legacy_history_switch_without_a_readable_window_keeps_everything() {
+        for (legacy, expected) in [
+            (
+                serde_json::json!({"historyEnabled": true}),
+                HistoryRetention::Forever,
+            ),
+            (
+                serde_json::json!({"historyRetentionDays": "thirty"}),
+                HistoryRetention::Forever,
+            ),
+            (
+                serde_json::json!({"historyEnabled": false, "historyRetentionDays": 30}),
+                HistoryRetention::Never,
+            ),
+            (
+                serde_json::json!({"historyEnabled": true, "historyRetentionDays": 30}),
+                HistoryRetention::OneMonth,
+            ),
+        ] {
+            let mut value = serde_json::to_value(Settings::default()).unwrap();
+            let object = value.as_object_mut().unwrap();
+            object.remove("historyRetention");
+            object.extend(legacy.as_object().unwrap().clone());
+            assert_eq!(
+                load_settings(&value.to_string()).settings.history_retention,
+                expected,
+                "{legacy}"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_installs_keep_the_normal_defaults() {
+        let storage = Storage::in_memory().unwrap();
+        let settings = storage.get_settings().unwrap();
+        assert_eq!(settings, Settings::default());
+        assert_eq!(settings.history_retention, HistoryRetention::OneMonth);
+        assert!(settings.delete_audio_after_processing);
+        assert!(settings_backups(&storage).is_empty());
     }
 
     #[test]
