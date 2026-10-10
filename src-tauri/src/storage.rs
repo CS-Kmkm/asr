@@ -948,6 +948,49 @@ fn merge_over_stored(
     serde_json::Value::Object(object)
 }
 
+/// Copies the raw settings row `raw` to `settings_backups`, keeping only the
+/// newest [`MAX_SETTINGS_BACKUPS`] copies.
+fn back_up_settings_row(
+    connection: &Connection,
+    raw: &str,
+    reason: &str,
+) -> Result<(), StorageError> {
+    connection.execute(
+        "INSERT INTO settings_backups(key, value, reason, created_at)
+         VALUES ('app_settings', ?1, ?2, ?3)",
+        params![raw, reason, Utc::now().to_rfc3339()],
+    )?;
+    connection.execute(
+        "DELETE FROM settings_backups WHERE id NOT IN (
+           SELECT id FROM settings_backups ORDER BY id DESC LIMIT ?1
+         )",
+        [MAX_SETTINGS_BACKUPS],
+    )?;
+    Ok(())
+}
+
+/// Saves `settings` over the stored row within the caller's transaction. A
+/// stored row that is not a JSON object cannot be merged and is replaced,
+/// so it is backed up first.
+fn save_settings_row(connection: &Connection, settings: &Settings) -> Result<(), StorageError> {
+    let stored = stored_settings_row(connection)?;
+    let value = merged_settings_json(settings, stored.as_deref())?;
+    if let Some(raw) = stored.as_deref() {
+        if !matches!(
+            serde_json::from_str::<serde_json::Value>(raw),
+            Ok(serde_json::Value::Object(_))
+        ) {
+            back_up_settings_row(connection, raw, "replaced_unreadable")?;
+        }
+    }
+    connection.execute(
+        "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![value, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
 fn stored_settings_row(connection: &Connection) -> Result<Option<String>, StorageError> {
     Ok(connection
         .query_row(
@@ -1128,11 +1171,7 @@ impl Storage {
         let now = Utc::now().to_rfc3339();
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO settings_backups(key, value, reason, created_at)
-             VALUES ('app_settings', ?1, ?2, ?3)",
-            params![raw, reason, now],
-        )?;
+        back_up_settings_row(&transaction, raw, reason)?;
         let updated = transaction.execute(
             "UPDATE settings SET value = ?1, updated_at = ?2
              WHERE key = 'app_settings' AND value = ?3",
@@ -1141,12 +1180,6 @@ impl Storage {
         if updated == 0 {
             return Ok(());
         }
-        transaction.execute(
-            "DELETE FROM settings_backups WHERE id NOT IN (
-               SELECT id FROM settings_backups ORDER BY id DESC LIMIT ?1
-             )",
-            [MAX_SETTINGS_BACKUPS],
-        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -1154,13 +1187,10 @@ impl Storage {
     /// Saves `settings` over the stored row, keeping keys this build does
     /// not know.
     pub fn update_settings(&self, settings: &Settings) -> Result<(), StorageError> {
-        let connection = self.connection()?;
-        let value = merged_settings_json(settings, stored_settings_row(&connection)?.as_deref())?;
-        connection.execute(
-            "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            params![value, Utc::now().to_rfc3339()],
-        )?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        save_settings_row(&transaction, settings)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1174,12 +1204,7 @@ impl Storage {
         let now = Utc::now();
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        let value = merged_settings_json(settings, stored_settings_row(&transaction)?.as_deref())?;
-        transaction.execute(
-            "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            params![value, now.to_rfc3339()],
-        )?;
+        save_settings_row(&transaction, settings)?;
         purge_history(&transaction, settings, now)?;
         transaction.commit()?;
         drop(connection);
@@ -3770,6 +3795,33 @@ mod tests {
         let (reloaded, repairs) = storage.get_settings_with_repairs().unwrap();
         assert_eq!(reloaded, settings);
         assert!(repairs.is_empty());
+    }
+
+    #[test]
+    fn saving_over_an_unreadable_row_backs_it_up_first() {
+        for persist in [
+            Storage::update_settings as fn(&Storage, &Settings) -> Result<(), StorageError>,
+            Storage::update_settings_and_apply_history_policy,
+        ] {
+            let storage = Storage::in_memory().unwrap();
+            store_raw_settings(&storage, "{\"setupComplete\":");
+            let settings = storage.get_settings().unwrap();
+            assert!(settings_backups(&storage).is_empty());
+
+            persist(&storage, &settings).unwrap();
+
+            assert_eq!(
+                settings_backups(&storage),
+                [(
+                    "{\"setupComplete\":".to_owned(),
+                    "replaced_unreadable".to_owned()
+                )]
+            );
+            assert_eq!(storage.get_settings().unwrap(), settings);
+            // A readable row is merged, not backed up.
+            persist(&storage, &settings).unwrap();
+            assert_eq!(settings_backups(&storage).len(), 1);
+        }
     }
 
     #[test]
