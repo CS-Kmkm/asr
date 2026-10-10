@@ -4899,16 +4899,18 @@ pub(crate) async fn ensure_model_loaded_cancellable(
     cancel: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<ModelStatus, String> {
     let (model_id, detail) = model_identity(settings);
-    // A reset worker no longer holds the model, whatever the status says.
+    // A reset or restoring worker does not hold the model, whatever the
+    // status says.
     let resident = services
         .transcriber
         .model_residency()
-        .is_none_or(|residency| residency.borrow().is_some());
+        .is_none_or(|residency| matches!(*residency.borrow(), asr::ModelResidency::Resident(_)));
     if let Ok(status) = services.model.lock() {
         if resident && status.state == "ready" && status.model_id == model_id {
             return Ok(status.clone());
         }
     }
+    let load = NEXT_MODEL_LOAD.fetch_add(1, Ordering::Relaxed);
     emit_status(app, "model_loading", "Loading the speech model.");
     let loading = ModelStatus {
         model_id: model_id.clone(),
@@ -4916,10 +4918,8 @@ pub(crate) async fn ensure_model_loaded_cancellable(
         state: "loading".into(),
         detail: detail.clone(),
     };
-    *services
-        .model
-        .lock()
-        .map_err(|_| "model service is unavailable".to_string())? = loading.clone();
+    set_model_status(&services.model, load, None, loading.clone())
+        .ok_or_else(|| "model service is unavailable".to_string())?;
     let _ = app.emit("model-status", loading.clone());
 
     // Only the worker knows whether the model files are already cached, so the
@@ -4944,15 +4944,10 @@ pub(crate) async fn ensure_model_loaded_cancellable(
     }
 
     if let Err(asr::AsrError::Cancelled) = load_result {
-        // Abandoned for a cancelled recording, a model change or quit; a
-        // model change may already have published the new model's status.
-        let not_loaded = ModelStatus {
-            model_id,
-            installed: false,
-            state: "not_loaded".into(),
-            detail,
-        };
-        if let Some(status) = replace_model_status(&services.model, &loading, not_loaded) {
+        // Abandoned for a cancelled recording, a model change or quit. Another
+        // load or a model change may already show its own status.
+        let not_loaded = residency_status(asr::ModelResidency::Absent, &loading, &detail);
+        if let Some(status) = set_model_status(&services.model, load, Some(&loading), not_loaded) {
             let _ = app.emit("model-status", status);
         }
         return Err(MODEL_LOAD_CANCELLED.into());
@@ -4965,9 +4960,7 @@ pub(crate) async fn ensure_model_loaded_cancellable(
             state: "error".into(),
             detail: format!("{detail} {message}"),
         };
-        if let Ok(mut status) = services.model.lock() {
-            *status = failed.clone();
-        }
+        set_model_status(&services.model, load, None, failed.clone());
         let _ = app.emit("model-status", failed);
         return Err(message);
     }
@@ -4980,71 +4973,178 @@ pub(crate) async fn ensure_model_loaded_cancellable(
             settings.model_quantization
         ),
     };
-    *services
-        .model
-        .lock()
-        .map_err(|_| "model service is unavailable".to_string())? = status.clone();
+    set_model_status(&services.model, load, None, status.clone())
+        .ok_or_else(|| "model service is unavailable".to_string())?;
     let _ = app.emit("model-status", status.clone());
-    invalidate_status_when_model_is_lost(app, services, &status, detail);
+    follow_model_residency(app, services, load, &status, detail);
     Ok(status)
 }
 
-/// Set `next` unless the status is no longer `expected`, returning it when set.
-fn replace_model_status(
+static NEXT_MODEL_LOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// The `ensure_model_loaded` call whose status is shown. Statuses of two
+/// loads can be identical, so a stale call is told apart by this, not by
+/// the status value.
+static MODEL_STATUS_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn same_model_status(left: &ModelStatus, right: &ModelStatus) -> bool {
+    left.state == right.state
+        && left.model_id == right.model_id
+        && left.installed == right.installed
+        && left.detail == right.detail
+}
+
+/// Show `next` on behalf of `load`. With `expected`, only while `load` still
+/// owns the status and nothing (such as a settings save) replaced it since.
+fn set_model_status(
     model: &Mutex<ModelStatus>,
-    expected: &ModelStatus,
+    load: u64,
+    expected: Option<&ModelStatus>,
     next: ModelStatus,
 ) -> Option<ModelStatus> {
     let mut status = model.lock().ok()?;
-    let unchanged = status.state == expected.state
-        && status.model_id == expected.model_id
-        && status.detail == expected.detail;
-    unchanged.then(|| {
-        *status = next.clone();
-        next
-    })
+    if let Some(expected) = expected {
+        if MODEL_STATUS_OWNER.load(Ordering::Acquire) != load
+            || !same_model_status(&status, expected)
+        {
+            return None;
+        }
+    }
+    MODEL_STATUS_OWNER.store(load, Ordering::Release);
+    *status = next.clone();
+    Some(next)
 }
 
-/// Stop reporting the model as ready once its worker is reset (a crash, a
-/// timeout, or a cancel the worker did not confirm). The transcriber restores
-/// the model on the next request, and the next load shows its progress.
-fn invalidate_status_when_model_is_lost(
+/// The status a loaded model has while the transcriber reports `residency`.
+fn residency_status(
+    residency: asr::ModelResidency,
+    ready: &ModelStatus,
+    detail: &str,
+) -> ModelStatus {
+    let (installed, state) = match residency {
+        asr::ModelResidency::Resident(_) => return ready.clone(),
+        asr::ModelResidency::Restoring => (false, "loading"),
+        asr::ModelResidency::Absent => (false, "not_loaded"),
+    };
+    ModelStatus {
+        model_id: ready.model_id.clone(),
+        installed,
+        state: state.into(),
+        detail: detail.to_owned(),
+    }
+}
+
+/// Keep a loaded model's status true to the worker: not loaded once a reset
+/// loses it (a crash, a timeout, a cancel the worker did not confirm), loading
+/// with progress while a respawned worker restores it, and ready again after.
+/// Stops once another load or a settings change takes over the status.
+fn follow_model_residency(
     app: &AppHandle,
     services: &Services,
+    load: u64,
     ready: &ModelStatus,
     detail: String,
 ) {
     let Some(mut residency) = services.transcriber.model_residency() else {
         return;
     };
-    let Some(generation) = *residency.borrow_and_update() else {
-        return;
-    };
     let app = app.clone();
     let ready = ready.clone();
     tauri::async_runtime::spawn(async move {
-        let lost = match residency
-            .wait_for(|resident| *resident != Some(generation))
-            .await
-        {
-            // A newer load replaced this one and watches its own generation.
-            Ok(resident) => resident.is_none(),
-            Err(_) => false,
-        };
-        if !lost {
-            return;
-        }
-        let not_loaded = ModelStatus {
-            model_id: ready.model_id.clone(),
-            installed: false,
-            state: "not_loaded".into(),
-            detail,
-        };
         let services = app.state::<Services>();
-        if let Some(status) = replace_model_status(&services.model, &ready, not_loaded) {
-            let _ = app.emit("model-status", status);
+        let mut shown = ready.clone();
+        let mut forwarder: Option<tauri::async_runtime::JoinHandle<()>> = None;
+        // Checked at once: the model may already be gone.
+        let mut current = *residency.borrow_and_update();
+        loop {
+            let next = residency_status(current, &ready, &detail);
+            if !same_model_status(&next, &shown) {
+                let Some(status) = set_model_status(&services.model, load, Some(&shown), next)
+                else {
+                    break;
+                };
+                if let Some(forwarder) = forwarder.take() {
+                    forwarder.abort();
+                }
+                if current == asr::ModelResidency::Restoring {
+                    emit_status(&app, "model_loading", "Loading the speech model.");
+                    forwarder = spawn_load_progress_forwarder(&app, &services);
+                }
+                let _ = app.emit("model-status", status.clone());
+                shown = status;
+            }
+            if residency.changed().await.is_err() {
+                break;
+            }
+            current = *residency.borrow_and_update();
+        }
+        if let Some(forwarder) = forwarder {
+            forwarder.abort();
         }
     });
+}
+
+#[cfg(test)]
+mod model_status_tests {
+    use super::*;
+
+    fn status(state: &str, detail: &str) -> ModelStatus {
+        ModelStatus {
+            model_id: Some("model".into()),
+            installed: state == "ready",
+            state: state.into(),
+            detail: detail.into(),
+        }
+    }
+
+    #[test]
+    fn a_stale_load_cannot_replace_another_loads_identical_status() {
+        let model = Mutex::new(status("not_loaded", "d"));
+        let loading = status("loading", "d");
+        let first = NEXT_MODEL_LOAD.fetch_add(1, Ordering::Relaxed);
+        let second = NEXT_MODEL_LOAD.fetch_add(1, Ordering::Relaxed);
+        set_model_status(&model, first, None, loading.clone()).unwrap();
+        set_model_status(&model, second, None, loading.clone()).unwrap();
+
+        // The first load was cancelled; the second one is still downloading.
+        assert!(
+            set_model_status(&model, first, Some(&loading), status("not_loaded", "d")).is_none()
+        );
+        assert_eq!(model.lock().unwrap().state, "loading");
+        assert!(set_model_status(&model, second, Some(&loading), status("ready", "d")).is_some());
+    }
+
+    #[test]
+    fn a_status_replaced_by_a_settings_save_is_left_alone() {
+        let model = Mutex::new(status("not_loaded", "d"));
+        let load = NEXT_MODEL_LOAD.fetch_add(1, Ordering::Relaxed);
+        let ready = status("ready", "d");
+        set_model_status(&model, load, None, ready.clone()).unwrap();
+        *model.lock().unwrap() = status("not_loaded", "other model");
+
+        assert!(set_model_status(&model, load, Some(&ready), status("not_loaded", "d")).is_none());
+        assert_eq!(model.lock().unwrap().detail, "other model");
+    }
+
+    #[test]
+    fn residency_maps_to_the_status_of_the_loaded_model() {
+        let ready = status("ready", "d Loaded with 4bit quantization.");
+        assert!(same_model_status(
+            &residency_status(asr::ModelResidency::Resident(3), &ready, "d"),
+            &ready
+        ));
+        let restoring = residency_status(asr::ModelResidency::Restoring, &ready, "d");
+        assert_eq!(
+            (restoring.state.as_str(), restoring.installed),
+            ("loading", false)
+        );
+        assert_eq!(restoring.detail, "d");
+        let absent = residency_status(asr::ModelResidency::Absent, &ready, "d");
+        assert_eq!(
+            (absent.state.as_str(), absent.installed),
+            ("not_loaded", false)
+        );
+        assert_eq!(absent.model_id, ready.model_id);
+    }
 }
 
 /// Relay worker load progress to the window until the load finishes.

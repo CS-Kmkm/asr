@@ -205,13 +205,23 @@ pub trait Transcriber: Send + Sync {
     fn load_progress(&self) -> Option<broadcast::Receiver<LoadProgress>> {
         None
     }
-    /// Whether the loaded model is still in memory: `Some(generation)` from a
-    /// successful load (each load gets a new generation) until the worker is
-    /// reset, then `None`. A transcriber that does not track this returns
-    /// `None` from this method.
-    fn model_residency(&self) -> Option<watch::Receiver<Option<u64>>> {
+    /// Whether the loaded model is in memory (see `ModelResidency`). A
+    /// transcriber that does not track this returns `None`.
+    fn model_residency(&self) -> Option<watch::Receiver<ModelResidency>> {
         None
     }
+}
+
+/// What the worker holds, as seen by the desktop's model status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelResidency {
+    /// No model: nothing loaded yet, a failed load, or a reset worker.
+    Absent,
+    /// A respawned worker is reloading the model it held before a reset.
+    /// The worker's progress notifications are relayed meanwhile.
+    Restoring,
+    /// Loaded; every successful load or restore gets a new generation.
+    Resident(u64),
 }
 
 struct RunningWorker {
@@ -281,19 +291,23 @@ struct State {
     /// Quantization of the model the running worker holds (or held before a
     /// crash, so a respawn can restore it). `None` after a failed load.
     loaded_quantization: Option<String>,
-    residency: watch::Sender<Option<u64>>,
+    residency: watch::Sender<ModelResidency>,
     load_generation: u64,
 }
 
 impl State {
     fn mark_resident(&mut self) {
         self.load_generation += 1;
-        self.residency.send_replace(Some(self.load_generation));
+        self.residency
+            .send_replace(ModelResidency::Resident(self.load_generation));
     }
 
     fn mark_not_resident(&self) {
-        self.residency
-            .send_if_modified(|resident| resident.take().is_some());
+        self.residency.send_if_modified(|residency| {
+            let changed = *residency != ModelResidency::Absent;
+            *residency = ModelResidency::Absent;
+            changed
+        });
     }
 
     /// Kill the worker. The next request spawns a new one and reloads the
@@ -305,10 +319,13 @@ impl State {
         self.mark_not_resident();
     }
 
-    /// Kill a worker whose last response was abandoned without a drain.
+    /// Kill a worker whose last response was abandoned without a drain. A
+    /// restore abandoned the same way left no worker behind.
     async fn discard_abandoned_worker(&mut self) {
-        if self.running.as_ref().is_some_and(|worker| worker.in_flight) {
-            self.reset().await;
+        match &self.running {
+            Some(worker) if worker.in_flight => self.reset().await,
+            Some(_) => {}
+            None => self.mark_not_resident(),
         }
     }
 }
@@ -412,7 +429,7 @@ pub struct JsonlTranscriber {
     /// lock, so whatever holds it (a model download, a cancelled request
     /// being drained) kills the worker and lets go instead of blocking them.
     interrupt: watch::Sender<u64>,
-    residency: watch::Receiver<Option<u64>>,
+    residency: watch::Receiver<ModelResidency>,
 }
 
 /// Build the worker process command: the discovered working directory, no
@@ -451,7 +468,7 @@ fn worker_process_command(command_spec: &WorkerCommand, log_stderr: bool) -> Com
 
 impl JsonlTranscriber {
     pub fn new(command: WorkerCommand, request_timeout: Duration, load_timeout: Duration) -> Self {
-        let (residency, residency_receiver) = watch::channel(None);
+        let (residency, residency_receiver) = watch::channel(ModelResidency::Absent);
         Self {
             request_timeout,
             load_timeout,
@@ -688,6 +705,8 @@ impl JsonlTranscriber {
         }
         let mut worker = self.spawn(&state.command).await?;
         if let Some(quantization) = state.loaded_quantization.clone() {
+            // The desktop shows this restore like a load, with its progress.
+            state.residency.send_replace(ModelResidency::Restoring);
             let id = self.next_id();
             let restored = match worker.send(&load_request(id, &quantization)).await {
                 Ok(()) => until_cancelled(
@@ -701,6 +720,7 @@ impl JsonlTranscriber {
             };
             if let Err(error) = restored {
                 worker.kill().await;
+                state.mark_not_resident();
                 return Err(error);
             }
             state.mark_resident();
@@ -946,7 +966,7 @@ impl Transcriber for JsonlTranscriber {
         Some(self.progress.subscribe())
     }
 
-    fn model_residency(&self) -> Option<watch::Receiver<Option<u64>>> {
+    fn model_residency(&self) -> Option<watch::Receiver<ModelResidency>> {
         Some(self.residency.clone())
     }
 
@@ -1362,15 +1382,21 @@ mod tests {
         }
 
         fn resident(transcriber: &JsonlTranscriber) -> Option<u64> {
-            *transcriber.model_residency().unwrap().borrow()
+            match *transcriber.model_residency().unwrap().borrow() {
+                ModelResidency::Resident(generation) => Some(generation),
+                ModelResidency::Absent | ModelResidency::Restoring => None,
+            }
         }
 
         async fn wait_until_not_resident(transcriber: &JsonlTranscriber) {
             let mut residency = transcriber.model_residency().unwrap();
-            timeout(Duration::from_secs(10), residency.wait_for(Option::is_none))
-                .await
-                .expect("worker was never reset")
-                .unwrap();
+            timeout(
+                Duration::from_secs(10),
+                residency.wait_for(|residency| *residency == ModelResidency::Absent),
+            )
+            .await
+            .expect("worker was never reset")
+            .unwrap();
         }
 
         #[tokio::test]
@@ -1403,11 +1429,30 @@ mod tests {
 
             let crashed = mock.transcribe(&transcriber).await;
             assert!(matches!(crashed, Err(AsrError::Crashed)), "{crashed:?}");
-            assert_eq!(resident(&transcriber), None);
+            assert_eq!(
+                *transcriber.model_residency().unwrap().borrow(),
+                ModelResidency::Absent
+            );
 
+            let mut residency = transcriber.model_residency().unwrap();
+            let observed = tokio::spawn(async move {
+                let mut seen = Vec::new();
+                while residency.changed().await.is_ok() {
+                    let current = *residency.borrow_and_update();
+                    seen.push(current);
+                    if matches!(current, ModelResidency::Resident(_)) {
+                        break;
+                    }
+                }
+                seen
+            });
             let transcript = mock.transcribe(&transcriber).await.unwrap();
             assert_eq!(transcript.text, "mock transcription");
             assert!(resident(&transcriber).is_some());
+            assert_eq!(
+                observed.await.unwrap(),
+                [ModelResidency::Restoring, ModelResidency::Resident(2)]
+            );
             assert_eq!(
                 mock.event_names(),
                 ["load 8bit", "transcribe", "load 8bit", "transcribe"]

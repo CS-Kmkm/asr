@@ -439,11 +439,14 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 ワーカープロセスは正常に応答しており、再利用可能とみなす。`transcribe` のキャンセル自体も
 リセットを引き起こさない。
 
-リセットのたびに、Rust側はモデルが常駐していないことを `Transcriber::model_residency`
-(`watch` チャネル。ロード成功ごとに新しい世代番号、リセットで `None`)で通知する。
-デスクトップ側はこれを監視し、`ready` だったモデルステータスを `not_loaded` に戻す。
-次の録音・Retry・停止時の認識は `ready` でないモデルを読み込み直すため、再ロードは
-「Loading the speech model.」と進捗表示を伴って行われる。
+Rust側はモデルの常駐状態を `Transcriber::model_residency`(`watch` チャネルの
+`ModelResidency`)で通知する。ロード成功ごとに新しい世代番号の `Resident`、リセットで
+`Absent`、再spawn時の自動再ロード中は `Restoring` になる。デスクトップ側はロード成功後に
+これを監視し続け、`Absent` ならモデルステータスを `not_loaded` に、`Restoring` なら
+`loading` にして「Loading the speech model.」と進捗(`model-progress`)を表示し、再び
+`Resident` になれば `ready` に戻す。監視は、別のロードや設定保存がステータスを
+書き換えた時点で終わる(ステータスの値ではなく、どのロードが書いたかで判定する)。
+次の録音・Retry・停止時の認識は `ready` でないモデルを読み込み直す。
 
 ### 4.3 キャンセル(現行の実装)
 
