@@ -401,6 +401,10 @@ pub(crate) fn command_error(error: impl std::fmt::Display) -> String {
 pub(crate) fn worker_command_for_settings(settings: &Settings) -> WorkerCommand {
     let (python, project_root) = worker_runtime();
     let mut command = WorkerCommand::python(python).with_backend(&settings.asr_backend);
+    let executable = std::env::current_exe().ok();
+    if let Some(directory) = worker_directory(project_root.as_deref(), executable.as_deref()) {
+        command = command.with_current_dir(directory);
+    }
     if let Some(model_id) = settings
         .model_id
         .as_deref()
@@ -435,25 +439,71 @@ pub(crate) fn worker_command_for_settings(settings: &Settings) -> WorkerCommand 
     command
 }
 
-fn worker_runtime() -> (OsString, Option<PathBuf>) {
-    let roots = [
-        std::env::current_dir().ok(),
-        std::env::current_exe()
-            .ok()
-            .and_then(|path| path.parent().map(Path::to_path_buf)),
+/// The checkout that holds the Python worker. See [`project_root_candidates`]
+/// for the search order.
+fn project_root() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok();
+    let current_dir = std::env::current_dir().ok();
+    find_project_root(
+        executable.as_deref(),
+        current_dir.as_deref(),
+        cfg!(debug_assertions),
+    )
+}
+
+fn find_project_root(
+    executable: Option<&Path>,
+    current_dir: Option<&Path>,
+    include_current_dir: bool,
+) -> Option<PathBuf> {
+    project_root_candidates(executable, current_dir, include_current_dir)
+        .into_iter()
+        .find(|candidate| candidate.join("asr_worker").join("__main__.py").is_file())
+}
+
+/// Directories that may be the worker checkout, in priority order: the
+/// ancestors of the executable's directory, then (only when
+/// `include_current_dir`, i.e. debug builds run by `tauri dev`) the ancestors
+/// of the working directory. Release builds ignore the working directory when
+/// choosing the checkout, its `.venv`, and its `.env`, so autostart
+/// (`C:\Windows\System32`) or a shell in another checkout does not change
+/// which checkout is used. Filesystem and drive roots are never candidates.
+fn project_root_candidates(
+    executable: Option<&Path>,
+    current_dir: Option<&Path>,
+    include_current_dir: bool,
+) -> Vec<PathBuf> {
+    let starts = [
+        executable.and_then(Path::parent),
+        current_dir.filter(|_| include_current_dir),
     ];
-    let mut project_root = None;
-    for root in roots.into_iter().flatten() {
-        for candidate in root.ancestors() {
-            if candidate.join("asr_worker").join("__main__.py").is_file() {
-                project_root = Some(candidate.to_path_buf());
-                break;
-            }
-        }
-        if project_root.is_some() {
-            break;
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for candidate in starts.into_iter().flatten().flat_map(Path::ancestors) {
+        if !is_filesystem_root(candidate) && !candidates.iter().any(|known| known == candidate) {
+            candidates.push(candidate.to_path_buf());
         }
     }
+    candidates
+}
+
+/// A drive or filesystem root (`C:\`, `\\server\share\`, `/`), or the empty
+/// path that ends the ancestors of a relative path.
+fn is_filesystem_root(path: &Path) -> bool {
+    path.parent().is_none()
+}
+
+/// The worker's working directory. `python -m asr_worker` puts it first on
+/// `sys.path`, ahead of `PYTHONPATH`, so the inherited working directory
+/// (possibly another checkout) would decide which `asr_worker` is imported.
+/// Without a project root, the executable's directory is used instead.
+fn worker_directory(project_root: Option<&Path>, executable: Option<&Path>) -> Option<PathBuf> {
+    project_root
+        .or_else(|| executable.and_then(Path::parent))
+        .map(Path::to_path_buf)
+}
+
+fn worker_runtime() -> (OsString, Option<PathBuf>) {
+    let project_root = project_root();
 
     if let Some(python) = std::env::var_os("ASR_PYTHON") {
         return (python, project_root);
@@ -515,9 +565,24 @@ fn parse_shortcut(value: &str) -> Result<Shortcut, String> {
 fn load_environment_file() {
     let current_dir = std::env::current_dir().ok();
     let executable = std::env::current_exe().ok();
-    let candidates = environment_file_candidates(current_dir.as_deref(), executable.as_deref());
+    let project_root = project_root();
+    let candidates = environment_file_candidates(
+        executable.as_deref(),
+        project_root.as_deref(),
+        current_dir.as_deref(),
+        cfg!(debug_assertions),
+    );
+    match &project_root {
+        Some(root) => eprintln!("Worker project root: {}", root.display()),
+        None => eprintln!("Worker project root: none found"),
+    }
 
-    if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
+    let path = candidates.into_iter().find(|path| path.is_file());
+    match &path {
+        Some(path) => eprintln!("Environment file: {}", path.display()),
+        None => eprintln!("Environment file: none found"),
+    }
+    if let Some(path) = path {
         if let Err(error) = dotenvy::from_path(&path) {
             eprintln!(
                 "Failed to load environment file {}: {error}",
@@ -527,25 +592,31 @@ fn load_environment_file() {
     }
 }
 
+/// `.env` locations in priority order, following the worker search order:
+/// next to the executable, then the checkout that holds the worker (Windows
+/// autostart runs the release executable from `C:\Windows\System32`), then,
+/// only when `include_current_dir` (debug builds), the working directory and
+/// the workspace above `src-tauri`. A `.env` at a filesystem root is never read.
 fn environment_file_candidates(
-    current_dir: Option<&Path>,
     executable: Option<&Path>,
+    project_root: Option<&Path>,
+    current_dir: Option<&Path>,
+    include_current_dir: bool,
 ) -> Vec<PathBuf> {
+    let current_dir = current_dir.filter(|_| include_current_dir);
+    let workspace = current_dir
+        .filter(|dir| dir.file_name().is_some_and(|name| name == "src-tauri"))
+        .and_then(Path::parent);
+    let directories = [
+        executable.and_then(Path::parent),
+        project_root,
+        current_dir,
+        workspace,
+    ];
     let mut candidates = Vec::new();
-    if let Some(current_dir) = current_dir {
-        candidates.push(current_dir.join(".env"));
-        if current_dir
-            .file_name()
-            .is_some_and(|name| name == "src-tauri")
-        {
-            if let Some(workspace) = current_dir.parent() {
-                candidates.push(workspace.join(".env"));
-            }
-        }
-    }
-    if let Some(parent) = executable.and_then(Path::parent) {
-        let path = parent.join(".env");
-        if !candidates.contains(&path) {
+    for directory in directories.into_iter().flatten() {
+        let path = directory.join(".env");
+        if !is_filesystem_root(directory) && !candidates.contains(&path) {
             candidates.push(path);
         }
     }
@@ -575,15 +646,173 @@ mod microphone_test_tests {
 mod model_configuration_tests {
     use super::*;
 
+    fn filesystem_root() -> PathBuf {
+        PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" })
+    }
+
     #[test]
     fn development_launch_finds_workspace_environment_file() {
         let workspace = Path::new("workspace");
         let current_dir = workspace.join("src-tauri");
         let executable = current_dir.join("target/debug/local-voice-input.exe");
 
-        let candidates = environment_file_candidates(Some(&current_dir), Some(&executable));
+        let candidates =
+            environment_file_candidates(Some(&executable), None, Some(&current_dir), true);
 
         assert!(candidates.contains(&workspace.join(".env")));
+    }
+
+    #[test]
+    fn autostart_launch_finds_the_checkout_environment_file_last() {
+        // Windows autostart starts the release build from System32.
+        let workspace = Path::new("workspace");
+        let current_dir = Path::new("windows").join("system32");
+        let executable = workspace.join("src-tauri/target/release/local-voice-input.exe");
+
+        let candidates = environment_file_candidates(
+            Some(&executable),
+            Some(workspace),
+            Some(&current_dir),
+            false,
+        );
+
+        assert_eq!(
+            candidates,
+            [
+                workspace.join("src-tauri/target/release/.env"),
+                workspace.join(".env"),
+            ]
+        );
+    }
+
+    #[test]
+    fn debug_launch_reads_the_working_directory_environment_file_last() {
+        let workspace = Path::new("workspace");
+        let current_dir = workspace.join("src-tauri");
+        let executable = current_dir.join("target/debug/local-voice-input.exe");
+
+        let candidates = environment_file_candidates(
+            Some(&executable),
+            Some(workspace),
+            Some(&current_dir),
+            true,
+        );
+
+        assert_eq!(
+            candidates,
+            [
+                current_dir.join("target/debug/.env"),
+                workspace.join(".env"),
+                current_dir.join(".env"),
+            ]
+        );
+    }
+
+    #[test]
+    fn environment_file_at_a_filesystem_root_is_never_a_candidate() {
+        let root = filesystem_root();
+        let executable = root.join("local-voice-input.exe");
+
+        let candidates =
+            environment_file_candidates(Some(&executable), Some(&root), Some(&root), true);
+
+        assert!(candidates.is_empty(), "{candidates:?}");
+    }
+
+    #[test]
+    fn release_project_root_candidates_ignore_the_working_directory() {
+        let root = filesystem_root();
+        let checkout = root.join("Users").join("me").join("asr");
+        let executable = checkout.join("src-tauri/target/release/local-voice-input.exe");
+        let system32 = root.join("Windows").join("System32");
+
+        let candidates = project_root_candidates(Some(&executable), Some(&system32), false);
+
+        assert_eq!(
+            candidates,
+            [
+                checkout.join("src-tauri/target/release"),
+                checkout.join("src-tauri/target"),
+                checkout.join("src-tauri"),
+                checkout.clone(),
+                root.join("Users").join("me"),
+                root.join("Users"),
+            ]
+        );
+    }
+
+    #[test]
+    fn debug_project_root_candidates_search_the_working_directory_after_the_executable() {
+        let root = filesystem_root();
+        let checkout = root.join("asr");
+        let executable = checkout.join("src-tauri/target/debug/local-voice-input.exe");
+        let system32 = root.join("Windows").join("System32");
+
+        let candidates = project_root_candidates(Some(&executable), Some(&system32), true);
+
+        assert_eq!(
+            candidates,
+            [
+                checkout.join("src-tauri/target/debug"),
+                checkout.join("src-tauri/target"),
+                checkout.join("src-tauri"),
+                checkout.clone(),
+                system32.clone(),
+                root.join("Windows"),
+            ]
+        );
+    }
+
+    #[test]
+    fn project_root_candidates_never_include_a_filesystem_root() {
+        let root = filesystem_root();
+        let executable = root.join("local-voice-input.exe");
+
+        assert!(project_root_candidates(Some(&executable), Some(&root), true).is_empty());
+    }
+
+    fn plant_worker(root: &Path) {
+        let package = root.join("asr_worker");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("__main__.py"), "").unwrap();
+    }
+
+    #[test]
+    fn executable_checkout_wins_over_a_worker_planted_above_the_working_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        let planted = temp.path().join("planted");
+        plant_worker(&checkout);
+        plant_worker(&planted);
+        let executable = checkout.join("src-tauri/target/release/local-voice-input.exe");
+        let current_dir = planted.join("Windows").join("System32");
+
+        for include_current_dir in [false, true] {
+            assert_eq!(
+                find_project_root(Some(&executable), Some(&current_dir), include_current_dir),
+                Some(checkout.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn release_build_never_finds_a_worker_only_above_the_working_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let planted = temp.path().join("planted");
+        plant_worker(&planted);
+        let executable = temp
+            .path()
+            .join("installed/local-voice-input/local-voice-input.exe");
+        let current_dir = planted.join("Windows").join("System32");
+
+        assert_eq!(
+            find_project_root(Some(&executable), Some(&current_dir), false),
+            None
+        );
+        assert_eq!(
+            find_project_root(Some(&executable), Some(&current_dir), true),
+            Some(planted)
+        );
     }
 
     #[test]
@@ -604,6 +833,55 @@ mod model_configuration_tests {
             .env
             .iter()
             .any(|(key, value)| key == "ASR_MODEL_ID" && value == "openai/whisper-custom"));
+    }
+
+    #[test]
+    fn worker_runs_from_the_project_root_or_else_the_executable_directory() {
+        let root = filesystem_root();
+        let checkout = root.join("asr");
+        let executable = checkout.join("src-tauri/target/release/local-voice-input.exe");
+
+        assert_eq!(
+            worker_directory(Some(&checkout), Some(&executable)),
+            Some(checkout.clone())
+        );
+        assert_eq!(
+            worker_directory(None, Some(&executable)),
+            Some(checkout.join("src-tauri/target/release"))
+        );
+        assert_eq!(worker_directory(None, None), None);
+    }
+
+    #[test]
+    fn worker_command_does_not_inherit_the_working_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("checkout");
+        let other = temp.path().join("other");
+        plant_worker(&checkout);
+        plant_worker(&other);
+        let current_dir = other.join("src-tauri");
+        let release_dir = checkout.join("src-tauri/target/release");
+        let executable = release_dir.join("local-voice-input.exe");
+
+        for include_current_dir in [false, true] {
+            let root =
+                find_project_root(Some(&executable), Some(&current_dir), include_current_dir);
+            let directory = worker_directory(root.as_deref(), Some(&executable));
+            assert_eq!(directory.as_ref(), Some(&checkout));
+        }
+
+        // Without a checkout above the executable, a release build falls back
+        // to the executable's directory rather than the working directory.
+        let installed = temp.path().join("installed").join("local-voice-input.exe");
+        let root = find_project_root(Some(&installed), Some(&current_dir), false);
+        assert_eq!(
+            worker_directory(root.as_deref(), Some(&installed)),
+            Some(temp.path().join("installed"))
+        );
+
+        let command = worker_command_for_settings(&Settings::default());
+        assert!(command.current_dir.is_some());
+        assert_ne!(command.current_dir, std::env::current_dir().ok());
     }
 
     #[test]
