@@ -678,11 +678,18 @@ async fn start_recording_mode(
         .transpose()?;
     let mut ask_session = (mode == PipelineMode::Ask)
         .then(|| AskSession::new(&settings, active_hotkey, from_shortcut));
-    ensure_model_loaded(&app, &services, &settings).await?;
+    let model_ready = ensure_model_loaded_cancellable(
+        &app,
+        &services,
+        &settings,
+        services.lifecycle.cancellation(operation_id).ok(),
+    )
+    .await;
     if services.lifecycle.is_cancelled(operation_id) {
         emit_state(&app, &state, AppPhase::Idle, cancel_message);
         return Err(cancel_error.into());
     }
+    model_ready?;
     let target = (mode != PipelineMode::Edit && mode != PipelineMode::Ask)
         .then(|| {
             SystemTextInjector::default()
@@ -1037,9 +1044,9 @@ pub(crate) async fn stop_recording_for(
     let correction_cancel = cancel.clone();
     // Defense in depth: model changes are refused while a recording is
     // active, but if the model is not marked ready (for example its load
-    // failed), load it as a new recording would. A worker crash keeps the
-    // ready status; the transcriber reloads the model when it respawns.
-    let model_ready = ensure_model_loaded(&app, &services, &settings).await;
+    // failed, or a worker crash lost it), load it as a new recording would.
+    let model_ready =
+        ensure_model_loaded_cancellable(&app, &services, &settings, Some(cancel.clone())).await;
     if services.lifecycle.is_cancelled(operation_id) {
         report_temp_cleanup(&app, &mut artifact_cleanup);
         emit_state(&app, &state, AppPhase::Idle, cancel_message);
@@ -4366,10 +4373,12 @@ pub(crate) async fn retry_history_item(
         let settings = storage.get_settings().map_err(command_error)?;
         // Retry uses the current ASR settings, so it loads the selected model
         // first, as a new recording does; a backend or model change resets it.
-        ensure_model_loaded(&app, &services, &settings).await?;
+        let model_ready =
+            ensure_model_loaded_cancellable(&app, &services, &settings, Some(cancel.clone())).await;
         if services.lifecycle.is_cancelled(operation_id) {
             return Err("history retry was cancelled".into());
         }
+        model_ready?;
         // History keeps only the captured category, so Retry routes to
         // category-scoped and global dictionary entries and profiles.
         let retry_context = retry_app_context(&source);
@@ -4876,9 +4885,27 @@ pub(crate) async fn ensure_model_loaded(
     services: &Services,
     settings: &Settings,
 ) -> Result<ModelStatus, String> {
+    ensure_model_loaded_cancellable(app, services, settings, None).await
+}
+
+pub(crate) const MODEL_LOAD_CANCELLED: &str = "Speech model loading was cancelled.";
+
+/// `ensure_model_loaded` for a pipeline operation: cancelling the operation
+/// abandons a load (or first-use download) that nobody waits for any more.
+pub(crate) async fn ensure_model_loaded_cancellable(
+    app: &AppHandle,
+    services: &Services,
+    settings: &Settings,
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<ModelStatus, String> {
     let (model_id, detail) = model_identity(settings);
+    // A reset worker no longer holds the model, whatever the status says.
+    let resident = services
+        .transcriber
+        .model_residency()
+        .is_none_or(|residency| residency.borrow().is_some());
     if let Ok(status) = services.model.lock() {
-        if status.state == "ready" && status.model_id == model_id {
+        if resident && status.state == "ready" && status.model_id == model_id {
             return Ok(status.clone());
         }
     }
@@ -4893,19 +4920,43 @@ pub(crate) async fn ensure_model_loaded(
         .model
         .lock()
         .map_err(|_| "model service is unavailable".to_string())? = loading.clone();
-    let _ = app.emit("model-status", loading);
+    let _ = app.emit("model-status", loading.clone());
 
     // Only the worker knows whether the model files are already cached, so the
     // download message and progress bar are driven by what it reports.
     let progress_forwarder = spawn_load_progress_forwarder(app, services);
-    let load_result = services
-        .transcriber
-        .load(&settings.model_quantization)
-        .await;
+    let load_result = match cancel {
+        Some(cancel) => {
+            services
+                .transcriber
+                .load_cancellable(&settings.model_quantization, cancel)
+                .await
+        }
+        None => {
+            services
+                .transcriber
+                .load(&settings.model_quantization)
+                .await
+        }
+    };
     if let Some(forwarder) = progress_forwarder {
         forwarder.abort();
     }
 
+    if let Err(asr::AsrError::Cancelled) = load_result {
+        // Abandoned for a cancelled recording, a model change or quit; a
+        // model change may already have published the new model's status.
+        let not_loaded = ModelStatus {
+            model_id,
+            installed: false,
+            state: "not_loaded".into(),
+            detail,
+        };
+        if let Some(status) = replace_model_status(&services.model, &loading, not_loaded) {
+            let _ = app.emit("model-status", status);
+        }
+        return Err(MODEL_LOAD_CANCELLED.into());
+    }
     if let Err(error) = load_result {
         let message = command_error(&error);
         let failed = ModelStatus {
@@ -4934,7 +4985,66 @@ pub(crate) async fn ensure_model_loaded(
         .lock()
         .map_err(|_| "model service is unavailable".to_string())? = status.clone();
     let _ = app.emit("model-status", status.clone());
+    invalidate_status_when_model_is_lost(app, services, &status, detail);
     Ok(status)
+}
+
+/// Set `next` unless the status is no longer `expected`, returning it when set.
+fn replace_model_status(
+    model: &Mutex<ModelStatus>,
+    expected: &ModelStatus,
+    next: ModelStatus,
+) -> Option<ModelStatus> {
+    let mut status = model.lock().ok()?;
+    let unchanged = status.state == expected.state
+        && status.model_id == expected.model_id
+        && status.detail == expected.detail;
+    unchanged.then(|| {
+        *status = next.clone();
+        next
+    })
+}
+
+/// Stop reporting the model as ready once its worker is reset (a crash, a
+/// timeout, or a cancel the worker did not confirm). The transcriber restores
+/// the model on the next request, and the next load shows its progress.
+fn invalidate_status_when_model_is_lost(
+    app: &AppHandle,
+    services: &Services,
+    ready: &ModelStatus,
+    detail: String,
+) {
+    let Some(mut residency) = services.transcriber.model_residency() else {
+        return;
+    };
+    let Some(generation) = *residency.borrow_and_update() else {
+        return;
+    };
+    let app = app.clone();
+    let ready = ready.clone();
+    tauri::async_runtime::spawn(async move {
+        let lost = match residency
+            .wait_for(|resident| *resident != Some(generation))
+            .await
+        {
+            // A newer load replaced this one and watches its own generation.
+            Ok(resident) => resident.is_none(),
+            Err(_) => false,
+        };
+        if !lost {
+            return;
+        }
+        let not_loaded = ModelStatus {
+            model_id: ready.model_id.clone(),
+            installed: false,
+            state: "not_loaded".into(),
+            detail,
+        };
+        let services = app.state::<Services>();
+        if let Some(status) = replace_model_status(&services.model, &ready, not_loaded) {
+            let _ = app.emit("model-status", status);
+        }
+    });
 }
 
 /// Relay worker load progress to the window until the load finishes.
