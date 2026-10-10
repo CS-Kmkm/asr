@@ -401,6 +401,10 @@ pub(crate) fn command_error(error: impl std::fmt::Display) -> String {
 pub(crate) fn worker_command_for_settings(settings: &Settings) -> WorkerCommand {
     let (python, project_root) = worker_runtime();
     let mut command = WorkerCommand::python(python).with_backend(&settings.asr_backend);
+    let executable = std::env::current_exe().ok();
+    if let Some(directory) = worker_directory(project_root.as_deref(), executable.as_deref()) {
+        command = command.with_current_dir(directory);
+    }
     if let Some(model_id) = settings
         .model_id
         .as_deref()
@@ -460,10 +464,10 @@ fn find_project_root(
 /// Directories that may be the worker checkout, in priority order: the
 /// ancestors of the executable's directory, then (only when
 /// `include_current_dir`, i.e. debug builds run by `tauri dev`) the ancestors
-/// of the working directory. Release builds ignore the working directory so
-/// that autostart (`C:\Windows\System32`) or a shell in another checkout
-/// cannot pair this executable with an unrelated worker, venv, or `.env`.
-/// Filesystem and drive roots are never candidates.
+/// of the working directory. Release builds ignore the working directory when
+/// choosing the checkout, its `.venv`, and its `.env`, so autostart
+/// (`C:\Windows\System32`) or a shell in another checkout does not change
+/// which checkout is used. Filesystem and drive roots are never candidates.
 fn project_root_candidates(
     executable: Option<&Path>,
     current_dir: Option<&Path>,
@@ -486,6 +490,16 @@ fn project_root_candidates(
 /// path that ends the ancestors of a relative path.
 fn is_filesystem_root(path: &Path) -> bool {
     path.parent().is_none()
+}
+
+/// The worker's working directory. `python -m asr_worker` puts it first on
+/// `sys.path`, ahead of `PYTHONPATH`, so the inherited working directory
+/// (possibly another checkout) would decide which `asr_worker` is imported.
+/// Without a project root, the executable's directory is used instead.
+fn worker_directory(project_root: Option<&Path>, executable: Option<&Path>) -> Option<PathBuf> {
+    project_root
+        .or_else(|| executable.and_then(Path::parent))
+        .map(Path::to_path_buf)
 }
 
 fn worker_runtime() -> (OsString, Option<PathBuf>) {
@@ -810,6 +824,34 @@ mod model_configuration_tests {
             .env
             .iter()
             .any(|(key, value)| key == "ASR_MODEL_ID" && value == "openai/whisper-custom"));
+    }
+
+    #[test]
+    fn worker_runs_from_the_project_root_or_else_the_executable_directory() {
+        let root = filesystem_root();
+        let checkout = root.join("asr");
+        let executable = checkout.join("src-tauri/target/release/local-voice-input.exe");
+
+        assert_eq!(
+            worker_directory(Some(&checkout), Some(&executable)),
+            Some(checkout.clone())
+        );
+        assert_eq!(
+            worker_directory(None, Some(&executable)),
+            Some(checkout.join("src-tauri/target/release"))
+        );
+        assert_eq!(worker_directory(None, None), None);
+    }
+
+    #[test]
+    fn worker_command_does_not_inherit_the_working_directory() {
+        let command = worker_command_for_settings(&Settings::default());
+        let executable = std::env::current_exe().ok();
+        assert_eq!(
+            command.current_dir,
+            worker_directory(project_root().as_deref(), executable.as_deref())
+        );
+        assert!(command.current_dir.is_some());
     }
 
     #[test]

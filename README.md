@@ -139,7 +139,8 @@ file at startup and reads the environment variable named in the UI (by default
 `OPENAI_API_KEY`). The app reads the first `.env` found next to the desktop
 executable or in the project directory that contains the executable, so
 autostart finds it as well; debug builds (`pnpm run tauri dev`) also check the
-working directory. The Python worker is located the same way. Existing
+working directory. The Python worker is located the same way and runs with
+the project directory as its working directory. Existing
 process/system environment variables take precedence over values from `.env`.
 
 ```powershell
