@@ -2129,14 +2129,14 @@ fn openai_output_ceiling(model: &str) -> Option<usize> {
     prefix_ceiling(OPENAI_OUTPUT_CEILINGS, &base)
 }
 
-/// The documented output limit of a Gemini model. The `-latest` aliases
-/// (gemini-flash-latest, gemini-pro-latest, gemini-flash-lite-latest)
-/// currently resolve to Gemini 2.5 or 3 models, which allow 65,536.
+/// The documented output limit of a Gemini model. An explicit version wins
+/// (gemini-1.5-flash-latest allows 8,192); the unversioned `-latest`
+/// aliases (gemini-flash-latest, gemini-pro-latest,
+/// gemini-flash-lite-latest) currently resolve to Gemini 2.5 or 3 models,
+/// which allow 65,536.
 fn gemini_output_ceiling(model: &str) -> Option<usize> {
-    if model.starts_with("gemini-") && model.ends_with("-latest") {
-        return Some(65_536);
-    }
     prefix_ceiling(GEMINI_OUTPUT_CEILINGS, model)
+        .or_else(|| (model.starts_with("gemini-") && model.ends_with("-latest")).then_some(65_536))
 }
 
 fn prefix_ceiling(ceilings: &[(&str, usize)], model: &str) -> Option<usize> {
@@ -4390,6 +4390,7 @@ mod tests {
             "gemini-2.0-flash",
             "gemini-2.0-flash-lite",
             "gemini-1.5-pro",
+            "gemini-1.5-flash-latest",
         ] {
             let settings = Settings {
                 gemini_correction_model: model.into(),
@@ -4437,6 +4438,11 @@ mod tests {
             ("gemini-2.0-flash", Some(8_192)),
             ("gemini-2.0-flash-lite", Some(8_192)),
             ("gemini-1.5-flash", Some(8_192)),
+            ("gemini-1.5-flash-latest", Some(8_192)),
+            ("gemini-1.5-pro-latest", Some(8_192)),
+            ("gemini-2.0-flash-latest", Some(8_192)),
+            ("gemini-2.5-flash-latest", Some(65_536)),
+            ("gemini-pro-latest", Some(65_536)),
             ("gemma-3-27b-it", None),
         ] {
             assert_eq!(gemini_output_ceiling(model), ceiling, "{model}");
