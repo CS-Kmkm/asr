@@ -36,8 +36,12 @@ pub(crate) fn report_and_exit(error: &(dyn Error + 'static), log_dir: Option<&Pa
 }
 
 fn summary(error: &(dyn Error + 'static)) -> &'static str {
-    let newer_schema = std::iter::successors(Some(error), |&error| error.source())
-        .any(|error| matches!(error.downcast_ref(), Some(StorageError::NewerSchema { .. })));
+    let newer_schema = std::iter::successors(Some(error), |&error| error.source()).any(|error| {
+        matches!(
+            error.downcast_ref(),
+            Some(StorageError::IncompatibleSchema { .. })
+        )
+    });
     if newer_schema {
         "Local Voice Input could not start because its data was saved by a newer version. \
          Use that version to keep using this data."
@@ -129,8 +133,9 @@ mod tests {
         assert!(message.ends_with("C:/logs/startup-error.log"));
         assert!(message_text(&generic, None).contains("could not be written"));
 
-        let newer = Wrapped(StorageError::NewerSchema {
+        let newer = Wrapped(StorageError::IncompatibleSchema {
             version: 9,
+            min_reader_version: 5,
             supported: 2,
         });
         assert!(message_text(&newer, None).contains("saved by a newer version"));

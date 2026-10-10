@@ -58,8 +58,14 @@ pub enum StorageError {
     Validation(String),
     #[error("CSV parsing failed")]
     Csv(#[from] csv::Error),
-    #[error("database schema version {version} is newer than supported version {supported}")]
-    NewerSchema { version: i64, supported: i64 },
+    #[error(
+        "database schema version {version} requires a reader of version          {min_reader_version}; this build supports {supported}"
+    )]
+    IncompatibleSchema {
+        version: i64,
+        min_reader_version: i64,
+        supported: i64,
+    },
 }
 
 pub struct Storage {
@@ -320,15 +326,59 @@ fn insert_history_row(
 
 /// One schema step. It runs inside the transaction that also advances
 /// `PRAGMA user_version`, so a failed step leaves the previous version.
-type Migration = fn(&Connection) -> Result<(), StorageError>;
+struct Migration {
+    apply: fn(&Connection) -> Result<(), StorageError>,
+    /// Lowest schema version a build must support to keep using the
+    /// database after this step. An additive step (new tables or nullable
+    /// columns that older code ignores) keeps 1, so older builds still open
+    /// it; only a step that breaks older readers raises it.
+    min_reader_version: i64,
+}
 
 /// Ordered schema steps; step `n` (0-based) upgrades `user_version` `n` to
 /// `n + 1`. Append new steps; never edit or reorder released ones.
-const MIGRATIONS: &[Migration] = &[migrate_v1_baseline, migrate_v2_settings_backups];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        apply: migrate_v1_baseline,
+        min_reader_version: 1,
+    },
+    Migration {
+        apply: migrate_v2_settings_backups,
+        min_reader_version: 1,
+    },
+];
+
+/// Key in `schema_meta` holding the highest `min_reader_version` of every
+/// applied step.
+const MIN_READER_VERSION_KEY: &str = "min_reader_version";
+
+/// The compatibility marker a database declares; 1 when it has none.
+fn stored_min_reader_version(connection: &Connection) -> Result<i64, StorageError> {
+    let has_meta: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_meta {
+        return Ok(1);
+    }
+    Ok(connection
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = ?1",
+            [MIN_READER_VERSION_KEY],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(1))
+}
 
 /// Applies every step above the stored `user_version`, one transaction per
-/// step. A database written by a newer build is refused rather than opened
-/// with a schema this build does not know.
+/// step, and records the steps' compatibility marker with it.
+///
+/// A database from a newer build (a higher `user_version`) is opened as is
+/// when its marker says this build can still use it: no unknown step runs
+/// and `user_version` is never lowered. It is refused only when the marker
+/// exceeds this build's version.
 fn run_migrations(
     connection: &mut Connection,
     migrations: &[Migration],
@@ -347,9 +397,33 @@ fn run_migrations(
             .ok()
             .and_then(|index| migrations.get(index))
         else {
-            return Err(StorageError::NewerSchema { version, supported });
+            let min_reader_version = stored_min_reader_version(&transaction)?;
+            if version < 0 || min_reader_version > supported {
+                return Err(StorageError::IncompatibleSchema {
+                    version,
+                    min_reader_version,
+                    supported,
+                });
+            }
+            eprintln!(
+                "Database schema version {version} is newer than this build's {supported};                  opening it because it remains compatible with version {min_reader_version}."
+            );
+            return Ok(());
         };
-        step(&transaction)?;
+        (step.apply)(&transaction)?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_meta (
+               key TEXT PRIMARY KEY NOT NULL,
+               value INTEGER NOT NULL
+             );",
+        )?;
+        let min_reader_version =
+            stored_min_reader_version(&transaction)?.max(step.min_reader_version);
+        transaction.execute(
+            "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![MIN_READER_VERSION_KEY, min_reader_version],
+        )?;
         transaction.pragma_update(None, "user_version", version + 1)?;
         transaction.commit()?;
     }
@@ -2601,6 +2675,7 @@ mod tests {
 
     fn assert_current_schema(connection: &Connection) {
         assert_eq!(user_version(connection), MIGRATIONS.len() as i64);
+        assert_eq!(stored_min_reader_version(connection).unwrap(), 1);
         for table in [
             "settings",
             "dictionary_entries",
@@ -2827,6 +2902,16 @@ mod tests {
         assert_eq!(sources, ["auto", "manual", "manual"]);
     }
 
+    fn step(
+        apply: fn(&Connection) -> Result<(), StorageError>,
+        min_reader_version: i64,
+    ) -> Migration {
+        Migration {
+            apply,
+            min_reader_version,
+        }
+    }
+
     #[test]
     fn migrations_run_each_step_once_in_order() {
         static RUNS: AtomicU64 = AtomicU64::new(0);
@@ -2841,13 +2926,26 @@ mod tests {
             Ok(())
         }
         let mut connection = Connection::open_in_memory().unwrap();
-        run_migrations(&mut connection, &[first]).unwrap();
+        run_migrations(&mut connection, &[step(first, 1)]).unwrap();
         assert_eq!(user_version(&connection), 1);
-        run_migrations(&mut connection, &[first, second]).unwrap();
-        run_migrations(&mut connection, &[first, second]).unwrap();
+        assert_eq!(stored_min_reader_version(&connection).unwrap(), 1);
+        let both = [step(first, 1), step(second, 2)];
+        run_migrations(&mut connection, &both).unwrap();
+        run_migrations(&mut connection, &both).unwrap();
         assert_eq!(user_version(&connection), 2);
+        assert_eq!(stored_min_reader_version(&connection).unwrap(), 2);
         assert_eq!(RUNS.load(Ordering::SeqCst), 11);
         assert_eq!(column_names(&connection, "first_step"), ["id", "extra"]);
+        // The second step declared itself breaking, so a build that only
+        // knows the first step is refused.
+        assert!(matches!(
+            run_migrations(&mut connection, &[step(first, 1)]),
+            Err(StorageError::IncompatibleSchema {
+                version: 2,
+                min_reader_version: 2,
+                supported: 1,
+            })
+        ));
     }
 
     #[test]
@@ -2863,9 +2961,11 @@ mod tests {
             )?;
             Err(StorageError::Validation("injected failure".into()))
         }
+        let migrations = [step(first, 1), step(failing, 2)];
         let mut connection = Connection::open_in_memory().unwrap();
-        assert!(run_migrations(&mut connection, &[first, failing]).is_err());
+        assert!(run_migrations(&mut connection, &migrations).is_err());
         assert_eq!(user_version(&connection), 1);
+        assert_eq!(stored_min_reader_version(&connection).unwrap(), 1);
         assert!(object_exists(&connection, "table", "kept"));
         assert!(!object_exists(&connection, "table", "partial"));
         let rows: i64 = connection
@@ -2873,26 +2973,74 @@ mod tests {
             .unwrap();
         assert_eq!(rows, 0);
         // The step is retried, not skipped, on the next start.
-        assert!(run_migrations(&mut connection, &[first, failing]).is_err());
+        assert!(run_migrations(&mut connection, &migrations).is_err());
         assert_eq!(user_version(&connection), 1);
     }
 
-    #[test]
-    fn a_database_from_a_newer_build_is_refused_unchanged() {
+    /// Simulates a newer build that ran one more step on the database.
+    fn database_from_a_newer_build(min_reader_version: i64) -> (tempfile::TempDir, PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("newer.sqlite3");
         drop(Storage::open(&path).unwrap());
-        let newer = MIGRATIONS.len() as i64 + 1;
-        Connection::open(&path)
-            .unwrap()
-            .pragma_update(None, "user_version", newer)
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE future_feature (id INTEGER PRIMARY KEY);")
             .unwrap();
+        connection
+            .execute(
+                "UPDATE schema_meta SET value = ?1 WHERE key = ?2",
+                params![min_reader_version, MIN_READER_VERSION_KEY],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", MIGRATIONS.len() as i64 + 1)
+            .unwrap();
+        (directory, path)
+    }
+
+    #[test]
+    fn a_compatible_database_from_a_newer_build_opens_and_works() {
+        let (_directory, path) = database_from_a_newer_build(1);
+        let newer = MIGRATIONS.len() as i64 + 1;
+        let storage = Storage::open(&path).unwrap();
+        storage.add_history(&item()).unwrap();
+        let settings = Settings {
+            setup_complete: true,
+            ..Settings::default()
+        };
+        storage.update_settings(&settings).unwrap();
+        assert_eq!(storage.get_settings().unwrap(), settings);
+        assert_eq!(history_texts(&storage).len(), 1);
+        drop(storage);
+
+        // Reopening runs no unknown step and never lowers the version.
+        drop(Storage::open(&path).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&connection), newer);
+        assert_eq!(stored_min_reader_version(&connection).unwrap(), 1);
+        assert!(object_exists(&connection, "table", "future_feature"));
+    }
+
+    #[test]
+    fn an_incompatible_database_from_a_newer_build_is_refused_unchanged() {
+        let supported = MIGRATIONS.len() as i64;
+        let (_directory, path) = database_from_a_newer_build(supported + 1);
         assert!(matches!(
             Storage::open(&path),
-            Err(StorageError::NewerSchema { version, supported })
-                if version == newer && supported == MIGRATIONS.len() as i64
+            Err(StorageError::IncompatibleSchema {
+                version,
+                min_reader_version,
+                supported: reported,
+            }) if version == supported + 1
+                && min_reader_version == supported + 1
+                && reported == supported
         ));
-        assert_eq!(user_version(&Connection::open(&path).unwrap()), newer);
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&connection), supported + 1);
+        assert_eq!(
+            stored_min_reader_version(&connection).unwrap(),
+            supported + 1
+        );
     }
 
     #[test]
