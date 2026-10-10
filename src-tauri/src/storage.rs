@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs, io,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
@@ -12,6 +13,7 @@ use std::{
 
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::types::{
@@ -516,25 +518,13 @@ impl Storage {
         settings: &Settings,
     ) -> Result<(), StorageError> {
         let value = serialized_settings(settings)?;
-        let cutoff = match settings.history_retention {
-            HistoryRetention::Never => None,
-            HistoryRetention::Forever => {
+        let cutoff = match HistoryPurge::for_retention(settings.history_retention) {
+            HistoryPurge::KeepAll => {
                 self.update_settings(settings)?;
                 let _ = self.retry_pending_audio_deletions();
                 return Ok(());
             }
-            HistoryRetention::TwentyFourHours => {
-                Some((Utc::now() - chrono::Duration::days(1)).to_rfc3339())
-            }
-            HistoryRetention::OneWeek => {
-                Some((Utc::now() - chrono::Duration::days(7)).to_rfc3339())
-            }
-            HistoryRetention::OneMonth => {
-                Some((Utc::now() - chrono::Duration::days(30)).to_rfc3339())
-            }
-            HistoryRetention::OneYear => {
-                Some((Utc::now() - chrono::Duration::days(365)).to_rfc3339())
-            }
+            HistoryPurge::Before(cutoff) => cutoff,
         };
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
@@ -543,17 +533,7 @@ impl Storage {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             params![value, Utc::now().to_rfc3339()],
         )?;
-        let removed = {
-            let mut statement = transaction.prepare(
-                "SELECT id, audio_filename FROM dictation_history WHERE ?1 IS NULL OR created_at < ?1",
-            )?;
-            let rows = statement
-                .query_map(params![cutoff], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows
-        };
+        let removed = expired_history_rows(&transaction, cutoff.as_deref())?;
         for (_, filename) in &removed {
             if let Some(filename) = filename {
                 transaction.execute(
@@ -576,14 +556,38 @@ impl Storage {
     /// change must use `update_settings_and_apply_history_policy` instead, so
     /// the purge and the settings write cannot be split.
     fn apply_history_policy(&self, settings: &Settings) -> Result<(), StorageError> {
-        match settings.history_retention {
-            HistoryRetention::Never => self.delete_history_matching(None),
-            HistoryRetention::Forever => {
+        match HistoryPurge::for_retention(settings.history_retention) {
+            HistoryPurge::KeepAll => {
                 let _ = self.retry_pending_audio_deletions();
                 Ok(())
             }
-            retention => self.delete_history_matching(retention.days()),
+            HistoryPurge::Before(cutoff) => self.delete_history_before(cutoff.as_deref()),
         }
+    }
+
+    /// Counts what saving `retention` would delete right now, without
+    /// changing anything. It shares the cutoff and row selection with the
+    /// purge; the purge runs slightly later, so rows can only have aged into
+    /// it, never out of it.
+    pub fn history_purge_preview(
+        &self,
+        retention: HistoryRetention,
+    ) -> Result<HistoryPurgePreview, StorageError> {
+        let HistoryPurge::Before(cutoff) = HistoryPurge::for_retention(retention) else {
+            return Ok(HistoryPurgePreview::default());
+        };
+        let connection = self.connection()?;
+        let rows = expired_history_rows(&connection, cutoff.as_deref())?;
+        // The purge queues each distinct filename once.
+        let recordings = rows
+            .iter()
+            .filter_map(|(_, filename)| filename.as_deref())
+            .collect::<HashSet<_>>()
+            .len();
+        Ok(HistoryPurgePreview {
+            history_items: rows.len() as u64,
+            recordings: recordings as u64,
+        })
     }
 
     pub fn enforce_current_history_policy(&self) -> Result<(), StorageError> {
@@ -1095,26 +1099,10 @@ impl Storage {
         Ok(())
     }
 
-    fn delete_history_matching(&self, days: Option<i64>) -> Result<(), StorageError> {
-        let cutoff = days.map(|days| (Utc::now() - chrono::Duration::days(days)).to_rfc3339());
-        self.delete_history_before(cutoff.as_deref())
-    }
-
     fn delete_history_before(&self, cutoff: Option<&str>) -> Result<(), StorageError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        let removed = {
-            let mut statement = transaction.prepare(
-                "SELECT id, audio_filename FROM dictation_history
-                 WHERE ?1 IS NULL OR created_at < ?1",
-            )?;
-            let values = statement
-                .query_map(params![cutoff], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            values
-        };
+        let removed = expired_history_rows(&transaction, cutoff)?;
         for (_, filename) in &removed {
             if let Some(filename) = filename {
                 transaction.execute(
@@ -1717,6 +1705,56 @@ fn stored_history_is_off(raw: &str) -> Result<bool, StorageError> {
                 == Some(false)
         }
     })
+}
+
+/// What a History retention removes when it is applied now.
+enum HistoryPurge {
+    /// Forever: nothing expires.
+    KeepAll,
+    /// Rows created strictly before the RFC 3339 cutoff expire; `None` (Never)
+    /// expires every row.
+    Before(Option<String>),
+}
+
+impl HistoryPurge {
+    fn for_retention(retention: HistoryRetention) -> Self {
+        match retention {
+            HistoryRetention::Forever => Self::KeepAll,
+            HistoryRetention::Never => Self::Before(None),
+            HistoryRetention::TwentyFourHours
+            | HistoryRetention::OneWeek
+            | HistoryRetention::OneMonth
+            | HistoryRetention::OneYear => Self::Before(
+                retention
+                    .days()
+                    .map(|days| (Utc::now() - chrono::Duration::days(days)).to_rfc3339()),
+            ),
+        }
+    }
+}
+
+/// How many History rows and retained recordings a retention change would
+/// delete; read by the confirmation shown before a shorter retention is saved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryPurgePreview {
+    pub history_items: u64,
+    pub recordings: u64,
+}
+
+/// `(id, audio_filename)` of the History rows a purge with `cutoff` removes.
+/// Every retention purge and its preview select rows through this one query.
+fn expired_history_rows(
+    connection: &Connection,
+    cutoff: Option<&str>,
+) -> Result<Vec<(i64, Option<String>)>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT id, audio_filename FROM dictation_history WHERE ?1 IS NULL OR created_at < ?1",
+    )?;
+    let rows = statement
+        .query_map(params![cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Candidate spans come from transcripts, so they follow the History
@@ -3082,6 +3120,83 @@ mod tests {
                 .unwrap();
 
             assert_eq!(history_texts(&storage), vec!["inside"], "{retention:?}");
+        }
+    }
+
+    #[test]
+    fn purge_preview_counts_exactly_what_saving_the_retention_deletes() {
+        // (age, keeps a recording); ages stay clear of every window boundary.
+        let rows = [
+            (chrono::Duration::hours(1), true),
+            (chrono::Duration::hours(2), false),
+            (chrono::Duration::days(3), true),
+            (chrono::Duration::days(10), false),
+            (chrono::Duration::days(60), true),
+            (chrono::Duration::days(400), false),
+            (chrono::Duration::days(400), true),
+        ];
+        for (retention, expected) in [
+            (HistoryRetention::Forever, (0, 0)),
+            (HistoryRetention::OneYear, (2, 1)),
+            (HistoryRetention::OneMonth, (3, 2)),
+            (HistoryRetention::OneWeek, (4, 2)),
+            (HistoryRetention::TwentyFourHours, (5, 3)),
+            (HistoryRetention::Never, (7, 4)),
+        ] {
+            let storage = Storage::in_memory().unwrap();
+            let kept = Settings {
+                history_retention: HistoryRetention::Forever,
+                delete_audio_after_processing: false,
+                ..Settings::default()
+            };
+            storage.update_settings(&kept).unwrap();
+            let source = source_wav();
+            for (age, with_audio) in rows {
+                storage
+                    .add_history_with_audio(&item(), with_audio.then_some(source.as_path()))
+                    .unwrap();
+                storage
+                    .connection()
+                    .unwrap()
+                    .execute(
+                        "UPDATE dictation_history SET created_at = ?1
+                         WHERE id = (SELECT MAX(id) FROM dictation_history)",
+                        [(Utc::now() - age).to_rfc3339()],
+                    )
+                    .unwrap();
+            }
+            let rows_before = stored_row_count(&storage);
+            let files_before = history_audio_files(&storage).len();
+            assert_eq!((rows_before, files_before), (7, 4));
+
+            let preview = storage.history_purge_preview(retention).unwrap();
+            assert_eq!(
+                (
+                    stored_row_count(&storage),
+                    history_audio_files(&storage).len()
+                ),
+                (rows_before, files_before),
+                "the preview must not delete anything"
+            );
+
+            storage
+                .update_settings_and_apply_history_policy(&Settings {
+                    history_retention: retention,
+                    ..kept.clone()
+                })
+                .unwrap();
+            let deleted = (
+                (rows_before - stored_row_count(&storage)) as u64,
+                (files_before - history_audio_files(&storage).len()) as u64,
+            );
+            assert_eq!(
+                (preview.history_items, preview.recordings),
+                deleted,
+                "{retention:?}"
+            );
+            assert_eq!(deleted, expected, "{retention:?}");
+            let _ = fs::remove_file(source);
+            let _ = fs::remove_dir_all(&storage.history_audio_dir);
         }
     }
 
