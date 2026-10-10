@@ -728,6 +728,7 @@ async fn start_recording_mode(
 
     let app_for_levels = app.clone();
     tauri::async_runtime::spawn(async move {
+        let recording_started = Instant::now();
         loop {
             tokio::time::sleep(Duration::from_millis(80)).await;
             let Some(services) = app_for_levels.try_state::<Services>() else {
@@ -742,7 +743,11 @@ async fn start_recording_mode(
                 let audio = services.audio.lock().await;
                 (audio.level(), audio.stream_error().is_some())
             };
-            if let Some(reason) = automatic_stop_reason(stream_failed) {
+            if let Some(reason) = automatic_stop_reason(
+                stream_failed,
+                recording_started.elapsed(),
+                MAX_RECORDING_DURATION,
+            ) {
                 // The same path as a user stop: the audio captured so far is
                 // transcribed instead of being discarded.
                 let _ = stop_recording_for(
@@ -761,17 +766,31 @@ async fn start_recording_mode(
     Ok(())
 }
 
+/// Recordings stop automatically at this length and are transcribed as usual.
+const MAX_RECORDING_DURATION: Duration = Duration::from_secs(15 * 60);
+
 /// Why a recording stopped. Only `User` comes from an explicit request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StopReason {
     User,
     MicrophoneDisconnected,
+    MaximumDuration,
 }
 
 /// Decides, on each level tick, whether a recording must stop by itself. A
-/// failed input stream delivers no more audio.
-fn automatic_stop_reason(stream_failed: bool) -> Option<StopReason> {
-    stream_failed.then_some(StopReason::MicrophoneDisconnected)
+/// failed input stream delivers no more audio, so it wins over the time limit.
+fn automatic_stop_reason(
+    stream_failed: bool,
+    elapsed: Duration,
+    limit: Duration,
+) -> Option<StopReason> {
+    if stream_failed {
+        Some(StopReason::MicrophoneDisconnected)
+    } else if elapsed >= limit {
+        Some(StopReason::MaximumDuration)
+    } else {
+        None
+    }
 }
 
 /// Whether the input stream failed during this take, either noticed by the
@@ -789,6 +808,8 @@ fn microphone_disconnected(
 
 const MICROPHONE_DISCONNECTED: &str = "The microphone was disconnected, so recording stopped. The audio captured before the disconnection is being transcribed.";
 const MICROPHONE_DISCONNECTED_WITHOUT_SPEECH: &str = "The microphone was disconnected before usable speech was captured. Check the microphone and start a new recording.";
+const RECORDING_LIMIT_REACHED: &str =
+    "Recording reached the 15-minute limit and stopped. The audio is being transcribed.";
 
 #[tauri::command]
 pub(crate) async fn stop_recording(
@@ -887,6 +908,8 @@ pub(crate) async fn stop_recording_for(
     })?;
     if disconnected {
         emit_status(&app, "microphone_disconnected", MICROPHONE_DISCONNECTED);
+    } else if reason == StopReason::MaximumDuration {
+        emit_status(&app, "recording_limit_reached", RECORDING_LIMIT_REACHED);
     }
     let duration_ms = artifact.duration.as_millis() as u64;
     let mut artifact_cleanup = artifact_cleanup
@@ -3120,10 +3143,23 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_microphone_stops_the_recording() {
-        assert_eq!(automatic_stop_reason(false), None);
+    fn a_failed_microphone_or_the_time_limit_stops_the_recording() {
+        let limit = MAX_RECORDING_DURATION;
+        assert_eq!(limit, Duration::from_secs(15 * 60));
         assert_eq!(
-            automatic_stop_reason(true),
+            automatic_stop_reason(false, Duration::from_secs(60), limit),
+            None
+        );
+        assert_eq!(
+            automatic_stop_reason(true, Duration::from_secs(1), limit),
+            Some(StopReason::MicrophoneDisconnected)
+        );
+        assert_eq!(
+            automatic_stop_reason(false, limit, limit),
+            Some(StopReason::MaximumDuration)
+        );
+        assert_eq!(
+            automatic_stop_reason(true, limit * 2, limit),
             Some(StopReason::MicrophoneDisconnected)
         );
     }
@@ -3160,7 +3196,7 @@ mod tests {
             ))
         ));
         assert!(!microphone_disconnected(
-            StopReason::User,
+            StopReason::MaximumDuration,
             &Err(audio::AudioError::NoVoiceDetected)
         ));
     }
