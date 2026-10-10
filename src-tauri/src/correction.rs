@@ -2596,6 +2596,131 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    // Opt-in check that the output budgets and reasoning parameters sent for
+    // a short utterance are accepted by the live APIs. Each case runs the
+    // production Dictate correction path (conservative mode) independently;
+    // a provider whose key is absent and a model the key cannot use are
+    // skipped. Requires credentials and incurs provider charges. Run with:
+    // cargo test --lib live_short_utterance_budget_matrix -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "live API evaluation; requires OPENAI_API_KEY and/or GEMINI_API_KEY"]
+    async fn live_short_utterance_budget_matrix() {
+        const TEXT: &str = "はい、了解です";
+        // Gemini has no effort setting; its thinking follows the model.
+        let cases = [
+            ("openai", "gpt-5.6-luna", "none"),
+            ("openai", "gpt-5-mini", "none"),
+            ("openai", "gpt-5-mini", "low"),
+            ("openai", "gpt-5-mini", "high"),
+            // gpt-5.4 is in the "none"-capable table; the -mini name is
+            // skipped below if the key cannot use it.
+            ("openai", "gpt-5.4-mini", "none"),
+            ("openai", "gpt-4o-mini", "none"),
+            ("openai", "gpt-4o-mini", "high"),
+            ("openai", "gpt-4.1-mini", "high"),
+            ("gemini", "gemini-flash-lite-latest", "-"),
+            ("gemini", "gemini-2.5-flash", "-"),
+            ("gemini", "gemini-flash-latest", "-"),
+        ];
+
+        fn error_kind(error: &CorrectionError) -> &'static str {
+            match error {
+                CorrectionError::MissingApiKey(_) => "MissingApiKey",
+                CorrectionError::Request(_) => "Request",
+                CorrectionError::Api { .. } => "Api",
+                CorrectionError::InvalidResponse(_) => "InvalidResponse",
+                CorrectionError::OutputLimit => "OutputLimit",
+                CorrectionError::ProviderOutputLimit => "ProviderOutputLimit",
+                CorrectionError::ProtectedContentChanged => "ProtectedContentChanged",
+                CorrectionError::Cancelled => "Cancelled",
+                CorrectionError::InvalidEndpoint(_) => "InvalidEndpoint",
+                CorrectionError::UnsupportedProvider(_) => "UnsupportedProvider",
+                CorrectionError::EmptyEditInstruction => "EmptyEditInstruction",
+            }
+        }
+        fn model_unavailable(error: &CorrectionError) -> bool {
+            let CorrectionError::Api { status, message } = error else {
+                return false;
+            };
+            let message = message.to_lowercase();
+            *status == StatusCode::NOT_FOUND
+                || message.contains("model_not_found")
+                || message.contains("does not exist")
+                || message.contains("do not have access")
+        }
+        // A rejected request (HTTP 400: invalid max_output_tokens or an
+        // unsupported parameter) or a cut-off/unreadable response.
+        fn budget_related(error: &CorrectionError) -> bool {
+            match error {
+                CorrectionError::Api { status, .. } => *status == StatusCode::BAD_REQUEST,
+                CorrectionError::OutputLimit
+                | CorrectionError::ProviderOutputLimit
+                | CorrectionError::InvalidResponse(_) => true,
+                _ => false,
+            }
+        }
+
+        let _ = dotenvy::from_path(concat!(env!("CARGO_MANIFEST_DIR"), "/../.env"));
+        let mut budget_failures = Vec::new();
+        for (provider, model, effort) in cases {
+            let mut settings = Settings {
+                correction_provider: provider.into(),
+                correction_mode: "conservative".into(),
+                ..Settings::default()
+            };
+            let key_variable = if provider == "openai" {
+                settings.openai_correction_model = model.into();
+                settings.openai_reasoning_effort = effort.into();
+                settings.openai_api_key_env_var.clone()
+            } else {
+                settings.gemini_correction_model = model.into();
+                settings.gemini_api_key_env_var.clone()
+            };
+            let mut instruction = build_correction_instruction(&settings, &[], None);
+            append_speech_locale(&mut instruction, &settings);
+            let sent = if provider == "openai" {
+                openai_request(&settings, TEXT, &instruction)["max_output_tokens"].clone()
+            } else {
+                gemini_request(&settings, TEXT, &instruction)["generation_config"]
+                    ["max_output_tokens"]
+                    .clone()
+            };
+            let case = format!("{provider} {model} effort={effort} max_output_tokens={sent}");
+            if api_key(&key_variable).is_err() {
+                eprintln!("{case}: SKIP ({key_variable} is not set)");
+                continue;
+            }
+
+            let (_sender, cancel) = watch::channel(false);
+            match correct_transcript(&settings, TEXT, &[], None, cancel, |_| {}).await {
+                Ok(output) => eprintln!("{case}: ok ({} chars)", output.chars().count()),
+                Err(error) => {
+                    let (status, message) = match &error {
+                        CorrectionError::Api { status, message } => {
+                            (status.as_u16().to_string(), message.clone())
+                        }
+                        other => ("-".into(), other.to_string()),
+                    };
+                    let message: String = message.chars().take(200).collect();
+                    let kind = error_kind(&error);
+                    if model_unavailable(&error) {
+                        eprintln!("{case}: SKIP model unavailable ({kind} {status}: {message})");
+                    } else {
+                        eprintln!("{case}: ERROR {kind} HTTP {status}: {message}");
+                        if budget_related(&error) {
+                            budget_failures.push(format!("{case}: {kind} {status}: {message}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            budget_failures.is_empty(),
+            "budget-related failures:\n{}",
+            budget_failures.join("\n")
+        );
+    }
+
     #[test]
     fn builds_provider_requests_without_api_keys() {
         let settings = Settings::default();
