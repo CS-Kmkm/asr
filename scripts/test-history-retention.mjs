@@ -9,8 +9,9 @@ import { runInNewContext } from "node:vm";
 import ts from "typescript";
 
 const require = createRequire(import.meta.url);
-function load(relativePath, mocks = {}, runtimeWindow = {}) {
-  const source = readFileSync(new URL(relativePath, import.meta.url), "utf8");
+function load(relativePath, mocks = {}, runtimeWindow = {}, exposeMain = false) {
+  let source = readFileSync(new URL(relativePath, import.meta.url), "utf8");
+  if (exposeMain) source = source.replace("function MainAppContent(", "export function MainAppContent(");
   const output = ts.transpileModule(source, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2021 },
   }).outputText;
@@ -159,6 +160,117 @@ test("further changes while a count is pending do not open a second confirmation
   assert.deepEqual(component.previews, ["one_year"]);
   assert.equal(component.prompts.length, 1);
   assert.deepEqual(changes, ["one_year"]);
+});
+
+// Renders MainAppContent with the real History page and retention select, so
+// the select's displayed value is checked through App's save path.
+async function appWithStoredRetention(historyRetention, updateSettings) {
+  const slots = [];
+  const effects = [];
+  let cursor = 0;
+  let dirty = false;
+  let tree;
+  const appHooks = {
+    useState(initial) {
+      const index = cursor++;
+      if (!(index in slots)) slots[index] = typeof initial === "function" ? initial() : initial;
+      return [slots[index], (next) => {
+        const value = typeof next === "function" ? next(slots[index]) : next;
+        if (!Object.is(value, slots[index])) { slots[index] = value; dirty = true; }
+      }];
+    },
+    useRef(initial) {
+      const index = cursor++;
+      if (!(index in slots)) slots[index] = { current: initial };
+      return slots[index];
+    },
+    useMemo(make) { cursor++; return make(); },
+    useEffect(effect, deps) {
+      const index = cursor++;
+      const previous = slots[index];
+      if (!previous || deps.some((value, i) => !Object.is(value, previous.deps[i]))) {
+        effects.push(() => { previous?.cleanup?.(); slots[index] = { deps, cleanup: effect() }; });
+      }
+    },
+  };
+  const { defaultSettings } = load("../src/api.ts");
+  const stored = { ...structuredClone(defaultSettings), setupComplete: true, historyRetention };
+  const calls = { update: 0 };
+  const api = {
+    defaultSettings,
+    getStartupHotkeyWarning: async () => [],
+    getAppState: async () => ({ phase: "idle", message: null }),
+    getSettings: async () => stored,
+    getModelStatus: async () => ({ state: "ready" }),
+    getGpuDiagnostics: async () => ({}),
+    listAudioDevices: async () => [],
+    listDictionary: async () => [],
+    listHistory: async () => [],
+    listDictionaryCandidates: async () => [],
+    updateSettings: async (next) => { calls.update++; return updateSettings(next); },
+  };
+  const component = retentionSelect(true);
+  const historyModule = load("../src/pages/HistoryPage.tsx", {
+    react: hooks, "../components/ui": { Empty: "empty" }, "../components/HistoryRetentionSelect": component, "../i18n": { ...i18n, insertionDetailLabels: {}, insertionOutcomeLabels: {} },
+  });
+  const mocks = {
+    react: appHooks,
+    "@tauri-apps/api/event": { listen: async () => () => {} },
+    "@tauri-apps/api/webviewWindow": { getCurrentWebviewWindow: () => ({ label: "main" }) },
+    "./api": api,
+    "./i18n": { ...i18n, translate: (_, key) => key, translateAppMessage: (_, value) => value },
+    "./components/ui": {},
+    "./pages/HistoryPage": historyModule,
+  };
+  for (const name of ["Dashboard", "Setup", "Settings", "Models", "Dictionary", "Privacy", "Diagnostics"]) {
+    mocks[`./pages/${name}Page`] = { [`${name}Page`]: `${name}Page` };
+  }
+  const { MainAppContent } = load("../src/App.tsx", mocks, {}, true);
+  const render = () => {
+    cursor = 0;
+    dirty = false;
+    tree = MainAppContent({ onLanguageChange() {} });
+    while (effects.length) effects.shift()();
+  };
+  const settleApp = async () => {
+    if (!tree || dirty) render();
+    for (let i = 0; i < 8; i++) {
+      await new Promise(setImmediate);
+      if (dirty) render();
+    }
+  };
+  const all = () => nodes(tree);
+  await settleApp();
+  all().find((node) => node.type === "button" && node.props.children === "History").props.onClick();
+  render();
+  return {
+    calls, component, settle: settleApp,
+    // The retention select element as the History page currently renders it.
+    retentionSelect() {
+      const page = all().find((node) => node.type === historyModule.HistoryPage);
+      assert.ok(page, "History page not rendered");
+      return nodes(page.type(page.props)).find((node) => node.type === component.HistoryRetentionSelect);
+    },
+  };
+}
+
+test("a failed save of a confirmed shorter retention restores the displayed value", async () => {
+  const app = await appWithStoredRetention("forever", async () => { throw new Error("save failed"); });
+  const element = app.retentionSelect();
+  assert.equal(renderSelect(element).props.value, "forever");
+  retentionChange(element, "24_hours");
+  await app.settle();
+  assert.equal(app.component.prompts.length, 1);
+  assert.equal(app.calls.update, 1);
+  assert.equal(renderSelect(app.retentionSelect()).props.value, "forever");
+});
+
+test("a successful save of a confirmed shorter retention shows the new value", async () => {
+  const app = await appWithStoredRetention("forever", async (next) => next);
+  retentionChange(app.retentionSelect(), "24_hours");
+  await app.settle();
+  assert.equal(app.calls.update, 1);
+  assert.equal(renderSelect(app.retentionSelect()).props.value, "24_hours");
 });
 
 test("retention order treats every move toward Never as shortening", () => {
