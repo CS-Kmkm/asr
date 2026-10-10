@@ -1906,8 +1906,8 @@ async fn finish_ask(
             }
             let published = services.answer_panel.publish(operation_id, output.clone());
             if !published || !answer_panel::show(app, operation_id, &output) {
-                let _ = session.injector.copy_to_clipboard(&output);
-                insertion = "clipboard_only";
+                let copied = session.injector.copy_to_clipboard(&output).is_ok();
+                insertion = ask_fallback_insertion(copied);
             }
         }
     }
@@ -1940,13 +1940,7 @@ async fn finish_ask(
         },
         audio_path,
     );
-    let message = if insertion == "paste_unverified" {
-        "Ask insertion could not be confirmed; the result remains on the clipboard."
-    } else if insertion == "clipboard_only" {
-        "Ask result is on the clipboard."
-    } else {
-        "Ask completed."
-    };
+    let message = ask_completion_message(insertion);
     let snapshot = state.complete(output.clone(), message.into());
     let _ = app.emit("app-state", snapshot);
     report_history_save_warning(app, history_save_status);
@@ -1956,6 +1950,47 @@ async fn finish_ask(
         duration_ms,
         latency_ms,
     })
+}
+
+/// Where an answer goes when the answer panel cannot show it. A failed copy
+/// leaves the result only in this app's window.
+fn ask_fallback_insertion(copied: bool) -> &'static str {
+    if copied {
+        "clipboard_only"
+    } else {
+        "insertion_failed"
+    }
+}
+
+fn ask_completion_message(insertion: &str) -> &'static str {
+    match insertion {
+        "paste_unverified" => {
+            "Ask insertion could not be confirmed; the result remains on the clipboard."
+        }
+        "clipboard_only" => "Ask result is on the clipboard.",
+        "insertion_failed" => {
+            "The answer panel could not be shown and the clipboard is unavailable; the Ask result is available in this app."
+        }
+        _ => "Ask completed.",
+    }
+}
+
+#[cfg(test)]
+mod ask_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_copy_never_claims_the_result_is_on_the_clipboard() {
+        assert_eq!(ask_fallback_insertion(true), "clipboard_only");
+        assert_eq!(
+            ask_completion_message(ask_fallback_insertion(true)),
+            "Ask result is on the clipboard."
+        );
+        let message = ask_completion_message(ask_fallback_insertion(false));
+        assert!(!message.contains("is on the clipboard"), "{message}");
+        assert!(message.contains("available in this app"), "{message}");
+        assert_eq!(ask_completion_message("panel"), "Ask completed.");
+    }
 }
 
 fn require_ask_spoken_input(spoken: &str) -> Result<(), String> {
