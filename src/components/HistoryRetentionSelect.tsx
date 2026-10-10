@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import { previewHistoryRetentionPurge, type HistoryPurgePreview } from "../api";
 import type { HistoryRetention } from "../types";
 import { useI18n, type MessageKey } from "../i18n";
@@ -19,6 +19,20 @@ export function shortensHistoryRetention(current: HistoryRetention, next: Histor
   return rank(next) < rank(current);
 }
 
+// A count that has not arrived by then is treated as failed, so a stuck
+// backend call cannot block every later change.
+const PURGE_COUNT_TIMEOUT_MS = 3_000;
+
+function purgeCountWithin(next: HistoryRetention, timeoutMs: number) {
+  return new Promise<HistoryPurgePreview>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error("history purge count timed out")), timeoutMs);
+    previewHistoryRetentionPurge(next).then(
+      (preview) => { window.clearTimeout(timer); resolve(preview); },
+      (error: unknown) => { window.clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
 // Callers disable it until the stored retention is known; otherwise the
 // comparison would run against the default value and could skip the prompt.
 export function HistoryRetentionSelect({ value, disabled = false, onChange }: {
@@ -30,18 +44,23 @@ export function HistoryRetentionSelect({ value, disabled = false, onChange }: {
   const current = useRef(value);
   current.current = value;
   const confirming = useRef(false);
+  // Disables the select while counting, which also shows the pending state.
+  const [counting, setCounting] = useState(false);
 
   async function confirmShortening(next: HistoryRetention) {
     // Ignore further changes (for example repeated arrow keys) while one
     // confirmation is being prepared or shown.
     if (confirming.current) return;
     confirming.current = true;
+    setCounting(true);
     try {
       let preview: HistoryPurgePreview | null = null;
       try {
-        preview = await previewHistoryRetentionPurge(next);
+        preview = await purgeCountWithin(next, PURGE_COUNT_TIMEOUT_MS);
       } catch {
         // Without counts the generic warning below still asks for consent.
+      } finally {
+        setCounting(false);
       }
       // The stored retention changed while counting (for example from another
       // window); drop this change rather than confirm against a stale value.
@@ -65,7 +84,7 @@ export function HistoryRetentionSelect({ value, disabled = false, onChange }: {
     }
   }
 
-  return <select value={value} disabled={disabled} aria-label={t("History retention")} onChange={(event) => {
+  return <select value={value} disabled={disabled || counting} aria-busy={counting} aria-label={t("History retention")} onChange={(event) => {
     const next = event.target.value as HistoryRetention;
     if (shortensHistoryRetention(value, next)) void confirmShortening(next);
     else onChange(next);

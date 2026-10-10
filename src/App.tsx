@@ -449,6 +449,11 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     updatedAt: new Date().toISOString(),
   });
   const [settings, setSettings] = useState<Settings>(defaultSettings);
+  // A save can run from a callback captured renders ago (the retention select
+  // awaits a count and a confirmation first); it must merge its patch into
+  // the latest settings, or it would revert changes made in the meantime.
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
   // Saves send the whole Settings object, and a shorter history retention
   // purges data, so nothing is saved until the stored settings are known.
   const [settingsLoaded, setSettingsLoaded] = useState(false);
@@ -648,8 +653,9 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
 
   async function saveSettings(patch: Partial<Settings>): Promise<boolean> {
     if (!settingsReady()) return false;
-    const previous = settings;
-    const next = { ...settings, ...patch };
+    const previous = settingsRef.current;
+    const next = { ...previous, ...patch };
+    settingsRef.current = next;
     setSettings(next);
     try {
       const saved = await updateSettings(next);
@@ -672,6 +678,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
         hotkeyWarnings.length > 0 ? "warning" : "success",
       );
     } catch (error) {
+      settingsRef.current = previous;
       setSettings(previous);
       showNotice(String(error), "error");
       return false;

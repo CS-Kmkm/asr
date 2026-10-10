@@ -47,10 +47,16 @@ function retentionSelect(answer = true, preview = { historyItems: 12, recordings
       return typeof preview === "function" ? preview(retention) : preview;
     },
   };
-  const module = load("../src/components/HistoryRetentionSelect.tsx", { react: hooks, "../api": api, "../i18n": i18n }, {
+  // Records the counting state and leaves timers to the test to fire.
+  const counting = [];
+  const timers = [];
+  const componentHooks = { ...hooks, useState: (initial) => [initial, (value) => counting.push(value)] };
+  const module = load("../src/components/HistoryRetentionSelect.tsx", { react: componentHooks, "../api": api, "../i18n": i18n }, {
     confirm: (message) => { prompts.push(message); return answer; },
+    setTimeout: (fn, ms) => timers.push({ fn, ms }),
+    clearTimeout() {},
   });
-  return { ...module, prompts, previews };
+  return { ...module, prompts, previews, counting, timers };
 }
 function renderSelect(element) {
   const select = element.type(element.props);
@@ -160,11 +166,38 @@ test("further changes while a count is pending do not open a second confirmation
   assert.deepEqual(component.previews, ["one_year"]);
   assert.equal(component.prompts.length, 1);
   assert.deepEqual(changes, ["one_year"]);
+  assert.deepEqual(component.counting, [true, false]);
+});
+
+test("a count that never arrives times out to the generic warning and frees the select", async () => {
+  const component = retentionSelect(true, () => new Promise(() => {}));
+  const changes = [];
+  const select = renderSelect({ type: component.HistoryRetentionSelect, props: { value: "forever", onChange: (value) => changes.push(value) } });
+  select.props.onChange({ target: { value: "one_year" } });
+  await settle();
+  assert.equal(component.prompts.length, 0);
+  assert.deepEqual(component.counting, [true]);
+  assert.equal(component.timers.length, 1);
+  assert.equal(component.timers[0].ms, 3000);
+  component.timers[0].fn();
+  await settle();
+  assert.deepEqual(component.counting, [true, false]);
+  assert.equal(component.prompts.length, 1);
+  assert.doesNotMatch(component.prompts[0], /to delete:/);
+  assert.match(component.prompts[0], /older than the new period will be deleted immediately/);
+  assert.deepEqual(changes, ["one_year"]);
+  // The stuck call does not block a later shortening.
+  select.props.onChange({ target: { value: "one_month" } });
+  await settle();
+  component.timers[1].fn();
+  await settle();
+  assert.equal(component.prompts.length, 2);
+  assert.deepEqual(changes, ["one_year", "one_month"]);
 });
 
 // Renders MainAppContent with the real History page and retention select, so
 // the select's displayed value is checked through App's save path.
-async function appWithStoredRetention(historyRetention, updateSettings) {
+async function appWithStoredRetention(historyRetention, updateSettings, preview) {
   const slots = [];
   const effects = [];
   let cursor = 0;
@@ -195,7 +228,7 @@ async function appWithStoredRetention(historyRetention, updateSettings) {
   };
   const { defaultSettings } = load("../src/api.ts");
   const stored = { ...structuredClone(defaultSettings), setupComplete: true, historyRetention };
-  const calls = { update: 0 };
+  const calls = { update: 0, saved: [] };
   const api = {
     defaultSettings,
     getStartupHotkeyWarning: async () => [],
@@ -207,9 +240,9 @@ async function appWithStoredRetention(historyRetention, updateSettings) {
     listDictionary: async () => [],
     listHistory: async () => [],
     listDictionaryCandidates: async () => [],
-    updateSettings: async (next) => { calls.update++; return updateSettings(next); },
+    updateSettings: async (next) => { calls.update++; calls.saved.push(next); return updateSettings(next); },
   };
-  const component = retentionSelect(true);
+  const component = retentionSelect(true, preview);
   const historyModule = load("../src/pages/HistoryPage.tsx", {
     react: hooks, "../components/ui": { Empty: "empty" }, "../components/HistoryRetentionSelect": component, "../i18n": { ...i18n, insertionDetailLabels: {}, insertionOutcomeLabels: {} },
   });
@@ -240,11 +273,12 @@ async function appWithStoredRetention(historyRetention, updateSettings) {
     }
   };
   const all = () => nodes(tree);
+  const navigate = (label) => { all().find((node) => node.type === "button" && node.props.children === label).props.onClick(); render(); };
   await settleApp();
-  all().find((node) => node.type === "button" && node.props.children === "History").props.onClick();
-  render();
+  navigate("History");
   return {
-    calls, component, settle: settleApp,
+    calls, component, navigate, settle: settleApp,
+    props: (name) => all().find((node) => node.type === `${name}Page`).props,
     // The retention select element as the History page currently renders it.
     retentionSelect() {
       const page = all().find((node) => node.type === historyModule.HistoryPage);
@@ -271,6 +305,28 @@ test("a successful save of a confirmed shorter retention shows the new value", a
   await app.settle();
   assert.equal(app.calls.update, 1);
   assert.equal(renderSelect(app.retentionSelect()).props.value, "24_hours");
+});
+
+test("confirming after a slow count keeps settings changed while it was pending", async () => {
+  let release;
+  const pending = new Promise((resolve) => { release = resolve; });
+  const app = await appWithStoredRetention("forever", async (next) => next, () => pending);
+  retentionChange(app.retentionSelect(), "24_hours");
+  await app.settle();
+  assert.equal(app.calls.update, 0);
+  // Another setting changes elsewhere while the count is pending.
+  app.navigate("Privacy");
+  const audio = app.props("Privacy").settings.deleteAudioAfterProcessing;
+  app.props("Privacy").onSave({ deleteAudioAfterProcessing: !audio });
+  await app.settle();
+  assert.equal(app.calls.update, 1);
+  release({ historyItems: 2, recordings: 1 });
+  await app.settle();
+  assert.equal(app.component.prompts.length, 1);
+  assert.equal(app.calls.update, 2);
+  assert.equal(app.calls.saved[1].historyRetention, "24_hours");
+  assert.equal(app.calls.saved[1].deleteAudioAfterProcessing, !audio);
+  assert.equal(app.props("Privacy").settings.deleteAudioAfterProcessing, !audio);
 });
 
 test("retention order treats every move toward Never as shortening", () => {
