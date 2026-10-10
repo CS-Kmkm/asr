@@ -47,7 +47,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-function fixture(initialCandidates = [], startupWarning = null) {
+function fixture(initialCandidates = [], startupWarning = null, startup = {}) {
   const slots = [];
   const effects = [];
   const listeners = new Map();
@@ -55,12 +55,12 @@ function fixture(initialCandidates = [], startupWarning = null) {
   let cursor = 0;
   let dirty = false;
   let tree;
-  let settings = { ...structuredClone(defaultSettings), setupComplete: true };
+  let settings = { ...structuredClone(defaultSettings), setupComplete: true, ...startup.stored };
   let candidates = initialCandidates;
   let history = [];
   const pendingCandidates = [];
   const pendingSettings = [];
-  const calls = { candidates: 0, history: 0, stop: 0 };
+  const calls = { candidates: 0, history: 0, stop: 0, settings: 0, update: 0 };
   const hooks = {
     useState(initial) {
       const index = cursor++;
@@ -91,9 +91,9 @@ function fixture(initialCandidates = [], startupWarning = null) {
     defaultSettings,
     getStartupHotkeyWarning: startupWarningApi(startupWarning).getStartupHotkeyWarning,
     getAppState: async () => ({ phase: "idle", message: null }),
-    getSettings: async () => settings,
+    getSettings: async () => { calls.settings++; if (startup.settings) await startup.settings(); return settings; },
     getModelStatus: async () => ({ state: "ready" }),
-    getGpuDiagnostics: async () => ({}),
+    getGpuDiagnostics: async () => { if (startup.gpuFails) throw new Error("GPU probe failed"); return {}; },
     listAudioDevices: async () => [],
     listDictionary: async () => [],
     listHistory: async () => { calls.history++; return history; },
@@ -102,6 +102,7 @@ function fixture(initialCandidates = [], startupWarning = null) {
       return pendingCandidates.length ? pendingCandidates.shift().promise : candidates;
     },
     updateSettings: async (next) => {
+      calls.update++;
       if (pendingSettings.length) await pendingSettings.shift().promise;
       settings = next;
       return next;
@@ -145,7 +146,7 @@ function fixture(initialCandidates = [], startupWarning = null) {
     }
   }
   return {
-    calls, settle,
+    calls, settle, stored: () => settings,
     navigate(label) { nodes().find((node) => node.type === "button" && node.props.children === label).props.onClick(); render(); },
     props(name) { return nodes().find((node) => node.type === `${name}Page`).props; },
     event(phase) { listeners.get("app-state")({ payload: { phase, message: null } }); render(); },
@@ -264,4 +265,34 @@ test("History page entry and shortcut completion refresh retained rows", async (
   app.event("completed");
   await app.settle();
   assert.equal(app.props("History").history[0].id, 2);
+});
+
+test("No settings save or purge happens before the stored settings load", async () => {
+  const load = deferred();
+  const app = fixture([], null, { stored: { historyRetention: "forever" }, settings: () => load.promise });
+  await app.settle();
+  app.navigate("Privacy");
+  assert.equal(app.props("Privacy").settingsLoaded, false);
+  // The defaults (1 month) are all that is known; picking 1 year would look
+  // like lengthening and skip the confirmation, then purge the stored Forever.
+  app.props("Privacy").onSave({ historyRetention: "one_year" });
+  await app.settle();
+  assert.equal(app.calls.update, 0);
+  assert.equal(app.stored().historyRetention, "forever");
+  load.resolve();
+  await app.settle();
+  assert.equal(app.props("Privacy").settingsLoaded, true);
+  assert.equal(app.props("Privacy").settings.historyRetention, "forever");
+});
+
+test("A rejected non-settings startup call still loads settings and allows saving", async () => {
+  const app = fixture([], null, { stored: { historyRetention: "forever" }, gpuFails: true });
+  await app.settle();
+  app.navigate("History");
+  assert.equal(app.props("History").settingsLoaded, true);
+  assert.equal(app.props("History").settings.historyRetention, "forever");
+  app.props("History").onSave({ historyRetention: "one_year" });
+  await app.settle();
+  assert.equal(app.calls.update, 1);
+  assert.equal(app.stored().historyRetention, "one_year");
 });

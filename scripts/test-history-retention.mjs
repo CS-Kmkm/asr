@@ -49,12 +49,12 @@ function retentionChange(element, value) {
   select.props.onChange({ target: { value } });
 }
 const pages = {
-  history: (component, settings, onSave) => load("../src/pages/HistoryPage.tsx", {
+  history: (component, settings, onSave, settingsLoaded = true) => load("../src/pages/HistoryPage.tsx", {
     react: hooks, "../components/ui": { Empty: "empty" }, "../components/HistoryRetentionSelect": component, "../i18n": { ...i18n, insertionDetailLabels: {}, insertionOutcomeLabels: {} },
-  }).HistoryPage({ settings, history: [], filter: "all", onSave, onFilter() {}, onCopyItem() {}, onRetry() {}, onDelete() {}, onDeleteAll() {}, onLoadAudio() {}, onAudioError() {}, retryActive: false, onCancelRetry() {} }),
-  privacy: (component, settings, onSave) => load("../src/pages/PrivacyPage.tsx", {
+  }).HistoryPage({ settings, settingsLoaded, history: [], filter: "all", onSave, onFilter() {}, onCopyItem() {}, onRetry() {}, onDelete() {}, onDeleteAll() {}, onLoadAudio() {}, onAudioError() {}, retryActive: false, onCancelRetry() {} }),
+  privacy: (component, settings, onSave, settingsLoaded = true) => load("../src/pages/PrivacyPage.tsx", {
     "../components/ui": { SettingRow: "row", Toggle: "toggle" }, "../components/HistoryRetentionSelect": component, "../i18n": i18n,
-  }).PrivacyPage({ settings, onSave }),
+  }).PrivacyPage({ settings, settingsLoaded, onSave }),
 };
 
 for (const [name, render] of Object.entries(pages)) {
@@ -82,6 +82,15 @@ for (const [name, render] of Object.entries(pages)) {
     assert.equal(component.prompts.length, 0);
     assert.equal(patches.length, 1);
     assert.equal(patches[0].historyRetention, "one_year");
+  });
+
+  test(`${name} page: the retention select stays disabled until settings are loaded`, () => {
+    const component = retentionSelect();
+    for (const loaded of [false, true]) {
+      const tree = render(component, { historyRetention: "one_month", deleteAudioAfterProcessing: true }, () => {}, loaded);
+      const element = nodes(tree).find((node) => node.type === component.HistoryRetentionSelect);
+      assert.equal(element.type(element.props).props.disabled, !loaded);
+    }
   });
 }
 

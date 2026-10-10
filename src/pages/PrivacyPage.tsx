@@ -5,9 +5,11 @@ import { useI18n } from "../i18n";
 
 export function PrivacyPage({
   settings,
+  settingsLoaded,
   onSave,
 }: {
   settings: Settings;
+  settingsLoaded: boolean;
   onSave: (patch: Partial<Settings>) => void;
 }) {
   const { t } = useI18n();
@@ -29,6 +31,7 @@ export function PrivacyPage({
         control={
           <HistoryRetentionSelect
             value={settings.historyRetention}
+            disabled={!settingsLoaded}
             onChange={(historyRetention) => onSave({ historyRetention })}
           />
         }

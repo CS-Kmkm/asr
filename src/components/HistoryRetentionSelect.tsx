@@ -17,12 +17,15 @@ export function shortensHistoryRetention(current: HistoryRetention, next: Histor
   return rank(next) < rank(current);
 }
 
-export function HistoryRetentionSelect({ value, onChange }: {
+// Callers disable it until the stored retention is known; otherwise the
+// comparison would run against the default value and could skip the prompt.
+export function HistoryRetentionSelect({ value, disabled = false, onChange }: {
   value: HistoryRetention;
+  disabled?: boolean;
   onChange: (value: HistoryRetention) => void;
 }) {
   const { t } = useI18n();
-  return <select value={value} aria-label={t("History retention")} onChange={(event) => {
+  return <select value={value} disabled={disabled} aria-label={t("History retention")} onChange={(event) => {
     const next = event.target.value as HistoryRetention;
     if (shortensHistoryRetention(value, next)) {
       const message = [
