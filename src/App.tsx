@@ -452,6 +452,8 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   // Saves send the whole Settings object, and a shorter history retention
   // purges data, so nothing is saved until the stored settings are known.
   const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const settingsLoadedRef = useRef(false);
+  const settingsRequestRef = useRef(0);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>("all");
   const historyFilterRef = useRef<HistoryFilter>("all");
@@ -482,9 +484,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     void getStartupHotkeyWarning().then(setStartupHotkeyWarnings).catch(() => {});
     // Settings load on their own so a failing diagnostic or device call
     // cannot leave the defaults in place for the session.
-    void loadSettings().then((nextSettings) => {
-      if (nextSettings && !nextSettings.setupComplete) setPage("setup");
-    });
+    void loadSettings();
     Promise.all([
       getAppState(),
       listHistory(),
@@ -522,11 +522,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       }),
       listen<ModelProgress>("model-progress", (event) => setModelProgress(event.payload)),
       listen<GpuDiagnostics>("gpu-diagnostics", (event) => setGpu(event.payload)),
-      listen<Settings>("settings-changed", (event) => {
-        setSettings(event.payload);
-        setSettingsLoaded(true);
-        onLanguageChange(event.payload.uiLanguage);
-      }),
+      listen<Settings>("settings-changed", (event) => applyBackendSettings(event.payload)),
       listen<{ kind: string; message: string }>("status", (event) =>
         setNotice({
           message: event.payload.message,
@@ -617,30 +613,41 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     };
   }, [page, state.phase, settings.historyRetention]);
 
-  async function loadSettings(): Promise<Settings | null> {
+  // Applies settings known to come from the backend; the first of them also
+  // decides whether onboarding is still needed.
+  function applyBackendSettings(nextSettings: Settings) {
+    const first = !settingsLoadedRef.current;
+    settingsLoadedRef.current = true;
+    setSettings(nextSettings);
+    setSettingsLoaded(true);
+    onLanguageChange(nextSettings.uiLanguage);
+    if (first && !nextSettings.setupComplete) setPage("setup");
+  }
+
+  async function loadSettings() {
+    const request = ++settingsRequestRef.current;
     try {
       const nextSettings = await getSettings();
-      setSettings(nextSettings);
-      setSettingsLoaded(true);
-      onLanguageChange(nextSettings.uiLanguage);
-      return nextSettings;
+      // A slower or superseded read must not replace settings that are
+      // already known (for example from settings-changed after a save).
+      if (request !== settingsRequestRef.current || settingsLoadedRef.current) return;
+      applyBackendSettings(nextSettings);
     } catch (error) {
-      showNotice(String(error), "error");
-      return null;
+      if (request === settingsRequestRef.current && !settingsLoadedRef.current) showNotice(String(error), "error");
     }
   }
 
   // Refuses a save while only the defaults are known, and retries the load so
   // a transient startup failure does not block saving for the whole session.
   function settingsReady() {
-    if (settingsLoaded) return true;
+    if (settingsLoadedRef.current) return true;
     showNotice(t("Settings have not been loaded yet, so changes were not saved. Try again in a moment."), "warning");
     void loadSettings();
     return false;
   }
 
-  async function saveSettings(patch: Partial<Settings>) {
-    if (!settingsReady()) return;
+  async function saveSettings(patch: Partial<Settings>): Promise<boolean> {
+    if (!settingsReady()) return false;
     const previous = settings;
     const next = { ...settings, ...patch };
     setSettings(next);
@@ -667,7 +674,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     } catch (error) {
       setSettings(previous);
       showNotice(String(error), "error");
-      return;
+      return false;
     }
     if (patch.historyRetention !== undefined || patch.deleteAudioAfterProcessing !== undefined) {
       // The optimistic render can read before the settings transaction has
@@ -679,6 +686,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       }
       catch (error) { showNotice(String(error), "error"); }
     }
+    return true;
   }
 
   async function diagnoseGpu() {
@@ -924,8 +932,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             onConfigureModel={() => setPage("models")}
             onDiagnoseGpu={() => void diagnoseGpu()}
             onFinish={() => {
-              void saveSettings({ setupComplete: true });
-              setPage("dashboard");
+              void saveSettings({ setupComplete: true }).then((saved) => { if (saved) setPage("dashboard"); });
             }}
           />
         )}

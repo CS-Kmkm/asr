@@ -103,6 +103,7 @@ function fixture(initialCandidates = [], startupWarning = null, startup = {}) {
     },
     updateSettings: async (next) => {
       calls.update++;
+      if (startup.updateFails) throw new Error("save failed");
       if (pendingSettings.length) await pendingSettings.shift().promise;
       settings = next;
       return next;
@@ -149,6 +150,8 @@ function fixture(initialCandidates = [], startupWarning = null, startup = {}) {
     calls, settle, stored: () => settings,
     navigate(label) { nodes().find((node) => node.type === "button" && node.props.children === label).props.onClick(); render(); },
     props(name) { return nodes().find((node) => node.type === `${name}Page`).props; },
+    emit(name, payload) { listeners.get(name)({ payload }); render(); },
+    shows(name) { return nodes().some((node) => node.type === `${name}Page`); },
     event(phase) { listeners.get("app-state")({ payload: { phase, message: null } }); render(); },
     candidates(value) { candidates = value; },
     history(value) { history = value; },
@@ -295,4 +298,68 @@ test("A rejected non-settings startup call still loads settings and allows savin
   await app.settle();
   assert.equal(app.calls.update, 1);
   assert.equal(app.stored().historyRetention, "one_year");
+});
+
+test("A late settings load cannot replace settings already reported by settings-changed", async () => {
+  const loads = [deferred(), deferred()];
+  let next = 0;
+  const app = fixture([], null, { stored: { historyRetention: "forever" }, settings: () => loads[next++].promise });
+  await app.settle();
+  app.navigate("Privacy");
+  app.props("Privacy").onSave({ historyRetention: "one_year" });
+  await app.settle();
+  assert.equal(next, 2, "the refused save retries the load");
+  const current = { ...app.stored(), historyRetention: "one_week" };
+  app.emit("settings-changed", current);
+  assert.equal(app.props("Privacy").settingsLoaded, true);
+  loads[1].resolve();
+  loads[0].resolve();
+  await app.settle();
+  assert.equal(app.props("Privacy").settings.historyRetention, "one_week");
+  assert.equal(app.calls.update, 0);
+});
+
+test("Settings first obtained by a retry or settings-changed still route an unfinished setup once", async () => {
+  let fail = true;
+  const retried = fixture([], null, { stored: { setupComplete: false }, settings: async () => { if (fail) throw new Error("not ready"); } });
+  await retried.settle();
+  assert.ok(retried.shows("Dashboard"));
+  fail = false;
+  retried.navigate("Privacy");
+  retried.props("Privacy").onSave({ historyRetention: "one_year" });
+  await retried.settle();
+  assert.equal(retried.calls.update, 0);
+  assert.ok(retried.shows("Setup"));
+
+  const evented = fixture([], null, { stored: { setupComplete: false }, settings: () => new Promise(() => {}) });
+  await evented.settle();
+  evented.emit("settings-changed", { ...evented.stored() });
+  await evented.settle();
+  assert.ok(evented.shows("Setup"));
+  evented.navigate("Status");
+  evented.emit("settings-changed", { ...evented.stored() });
+  await evented.settle();
+  assert.ok(evented.shows("Dashboard"));
+});
+
+test("Finishing setup leaves the Setup page only after the save succeeds", async () => {
+  const unloaded = fixture([], null, { settings: () => new Promise(() => {}) });
+  await unloaded.settle();
+  unloaded.navigate("Setup");
+  unloaded.props("Setup").onFinish();
+  await unloaded.settle();
+  assert.ok(unloaded.shows("Setup"));
+  assert.equal(unloaded.calls.update, 0);
+  const startup = { stored: { setupComplete: false }, updateFails: true };
+  const app = fixture([], null, startup);
+  await app.settle();
+  assert.ok(app.shows("Setup"));
+  app.props("Setup").onFinish();
+  await app.settle();
+  assert.ok(app.shows("Setup"));
+  startup.updateFails = false;
+  app.props("Setup").onFinish();
+  await app.settle();
+  assert.ok(app.shows("Dashboard"));
+  assert.equal(app.stored().setupComplete, true);
 });
