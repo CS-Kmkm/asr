@@ -1990,6 +1990,9 @@ fn openai_reasoning_allowance(model: &str, effort: &str) -> usize {
     match (openai_model_kind(model), effort) {
         (OpenAiModelKind::NonReasoning, _) | (OpenAiModelKind::Unknown, "none") => 0,
         (OpenAiModelKind::Reasoning, "none") if supports_openai_none_reasoning(model) => 0,
+        // o1-mini and o1-preview reason but accept no effort, so they always
+        // run their default effort.
+        (OpenAiModelKind::Reasoning, _) if !accepts_openai_reasoning_effort(model) => 8_192,
         // The reasoning field is omitted for reasoning models that are not
         // known to accept "none", so they run their default effort (medium
         // for the GPT-5 and o-series families).
@@ -2005,10 +2008,19 @@ fn openai_reasoning_allowance(model: &str, effort: &str) -> usize {
 /// when the user chose an effort other than "none".
 fn sends_openai_reasoning_effort(model: &str, effort: &str) -> bool {
     match openai_model_kind(model) {
-        OpenAiModelKind::Reasoning => effort != "none" || supports_openai_none_reasoning(model),
+        OpenAiModelKind::Reasoning => {
+            accepts_openai_reasoning_effort(model)
+                && (effort != "none" || supports_openai_none_reasoning(model))
+        }
         OpenAiModelKind::Unknown => effort != "none",
         OpenAiModelKind::NonReasoning => false,
     }
+}
+
+/// o1-mini and o1-preview reason but reject `reasoning.effort`.
+fn accepts_openai_reasoning_effort(model: &str) -> bool {
+    let base = openai_base_model(model);
+    !base.starts_with("o1-mini") && !base.starts_with("o1-preview")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4119,6 +4131,35 @@ mod tests {
     }
 
     #[test]
+    fn o1_mini_and_preview_reason_without_an_effort_parameter() {
+        for model in ["o1-mini", "o1-preview-2024-09-12", "ft:o1-mini:org::abc123"] {
+            for effort in ["none", "low", "high", "max"] {
+                let settings = Settings {
+                    openai_correction_model: model.into(),
+                    openai_reasoning_effort: effort.into(),
+                    ..Settings::default()
+                };
+                let request = openai_request(&settings, "はい、了解です", "correct it");
+                assert!(request.get("reasoning").is_none(), "{model} {effort}");
+                assert_eq!(
+                    request["max_output_tokens"],
+                    128 + 8_192,
+                    "{model} {effort}"
+                );
+            }
+        }
+        // Other o1 models still take the effort.
+        let o1 = Settings {
+            openai_correction_model: "o1".into(),
+            openai_reasoning_effort: "low".into(),
+            ..Settings::default()
+        };
+        let request = openai_request(&o1, "はい、了解です", "correct it");
+        assert_eq!(request["reasoning"]["effort"], "low");
+        assert_eq!(request["max_output_tokens"], 128 + 4_096);
+    }
+
+    #[test]
     fn openai_models_are_classified_after_normalising_the_name() {
         use OpenAiModelKind::*;
         for (model, kind) in [
@@ -4414,7 +4455,7 @@ mod tests {
         // Reasoning families: the largest budget (32,768 visible plus the
         // 32,768 max-effort allowance) fits every reasoning ceiling.
         let long = "x".repeat(20_000);
-        for model in ["gpt-5-mini", "o1-mini", "o3", "o4-mini"] {
+        for model in ["gpt-5-mini", "o3", "o4-mini", "codex-mini-latest"] {
             let settings = Settings {
                 openai_correction_model: model.into(),
                 openai_reasoning_effort: "max".into(),
@@ -4426,15 +4467,20 @@ mod tests {
                 "{model}"
             );
         }
-        let settings = Settings {
-            openai_correction_model: "o1-preview".into(),
-            openai_reasoning_effort: "max".into(),
-            ..Settings::default()
-        };
-        assert_eq!(
-            openai_request(&settings, &long, "correct it")["max_output_tokens"],
-            32_768
-        );
+        // o1-mini and o1-preview accept no effort: they always get the
+        // default-effort allowance, and o1-preview is clamped to its limit.
+        for (model, budget) in [("o1-mini", 32_768 + 8_192), ("o1-preview", 32_768)] {
+            let settings = Settings {
+                openai_correction_model: model.into(),
+                openai_reasoning_effort: "max".into(),
+                ..Settings::default()
+            };
+            assert_eq!(
+                openai_request(&settings, &long, "correct it")["max_output_tokens"],
+                budget,
+                "{model}"
+            );
+        }
         let settings = Settings {
             gemini_correction_model: "gemini-2.5-pro".into(),
             ..Settings::default()
