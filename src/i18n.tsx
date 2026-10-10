@@ -306,6 +306,7 @@ const en = {
   "Preparing speech model": "Preparing speech model",
   "Preparing the speech model. Recording starts when it is ready.": "Preparing the speech model. Recording starts when it is ready.",
   "Starts when ready": "Starts when ready",
+  "Cancel (Esc)": "Cancel (Esc)",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
@@ -613,6 +614,7 @@ const ja: Record<MessageKey, string> = {
   "Preparing speech model": "音声認識モデルを準備中",
   "Preparing the speech model. Recording starts when it is ready.": "音声認識モデルを準備しています。準備ができたら録音を開始します。",
   "Starts when ready": "準備ができたら開始します",
+  "Cancel (Esc)": "キャンセル (Esc)",
 } satisfies Record<MessageKey, string>;
 
 const catalogs = { en, ja } satisfies Record<UiLanguage, Record<MessageKey, string>>;

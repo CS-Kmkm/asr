@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -10,8 +10,10 @@ use tauri::{
 use crate::types::AppPhase;
 
 const WINDOW_LABEL: &str = "recording-overlay";
-const RECORDING_WIDTH: f64 = 172.0;
-const TRANSLATION_WIDTH: f64 = 286.0;
+/// Wide enough for the label, the waveform, and the cancel button.
+const RECORDING_WIDTH: f64 = 200.0;
+/// Adds Voice Translate's target-language control.
+const TRANSLATION_WIDTH: f64 = 314.0;
 const RECORDING_HEIGHT: f64 = 48.0;
 const NOTICE_WIDTH: f64 = 380.0;
 const NOTICE_HEIGHT: f64 = 64.0;
@@ -25,6 +27,10 @@ const BOTTOM_MARGIN: f64 = 24.0;
 /// Advanced by every phase change and notice. A notice timer hides the window
 /// only if nothing replaced its notice, so it never hides a later recording.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Whether the live view shows Voice Translate's target-language control.
+static TRANSLATION_CONTROL: AtomicBool = AtomicBool::new(false);
+/// Whether the live view (not a notice) is showing.
+static LIVE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn create(app: &AppHandle) -> tauri::Result<()> {
     let window = WebviewWindowBuilder::new(app, WINDOW_LABEL, WebviewUrl::App("index.html".into()))
@@ -43,8 +49,9 @@ pub(crate) fn create(app: &AppHandle) -> tauri::Result<()> {
         .visible(false)
         .build()?;
 
-    // Dictate mode remains click-through. Voice Translate temporarily enables
-    // pointer events for its target-language control without activating this window.
+    // Notices are click-through. The live view takes pointer events for its
+    // cancel button (and Voice Translate's language control); the window is
+    // never focusable, so a click does not activate it.
     window.set_ignore_cursor_events(true)?;
     position_on_primary_monitor(&window)
 }
@@ -100,8 +107,12 @@ pub(crate) fn set_phase(app: &AppHandle, phase: &AppPhase) {
         return;
     };
 
-    if phase_view(phase) == PhaseView::Live {
-        let _ = window.set_size(LogicalSize::new(RECORDING_WIDTH, RECORDING_HEIGHT));
+    let live = phase_view(phase) == PhaseView::Live;
+    LIVE.store(live, Ordering::Release);
+    if live {
+        let (width, height) = live_size(TRANSLATION_CONTROL.load(Ordering::Acquire));
+        let _ = window.set_ignore_cursor_events(false);
+        let _ = window.set_size(LogicalSize::new(width, height));
         // Recalculate whenever shown in case display layout, DPI, or the
         // recording/processing window size changed.
         let _ = position_on_primary_monitor(&window);
@@ -109,6 +120,16 @@ pub(crate) fn set_phase(app: &AppHandle, phase: &AppPhase) {
     } else {
         let _ = window.hide();
     }
+}
+
+/// The live view's logical size.
+fn live_size(translation_control: bool) -> (f64, f64) {
+    let width = if translation_control {
+        TRANSLATION_WIDTH
+    } else {
+        RECORDING_WIDTH
+    };
+    (width, RECORDING_HEIGHT)
 }
 
 #[derive(Clone, Serialize)]
@@ -172,6 +193,7 @@ fn show_notice(
         return;
     };
     let generation = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    LIVE.store(false, Ordering::Release);
     emit(app);
     let _ = window.set_ignore_cursor_events(true);
     let _ = window.set_size(LogicalSize::new(width, height));
@@ -194,15 +216,16 @@ fn show_notice(
     });
 }
 
-pub(crate) fn set_interactive(app: &AppHandle, interactive: bool) {
+/// Shows or hides Voice Translate's target-language control in the live
+/// view. A notice or hidden overlay keeps its size until the next live phase.
+pub(crate) fn set_interactive(app: &AppHandle, translation_control: bool) {
+    TRANSLATION_CONTROL.store(translation_control, Ordering::Release);
+    if !LIVE.load(Ordering::Acquire) {
+        return;
+    }
     if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
-        let _ = window.set_ignore_cursor_events(!interactive);
-        let width = if interactive {
-            TRANSLATION_WIDTH
-        } else {
-            RECORDING_WIDTH
-        };
-        let _ = window.set_size(LogicalSize::new(width, RECORDING_HEIGHT));
+        let (width, height) = live_size(translation_control);
+        let _ = window.set_size(LogicalSize::new(width, height));
         let _ = position_on_primary_monitor(&window);
     }
 }
@@ -243,6 +266,15 @@ mod tests {
         // user asked for nothing to happen.
         assert_eq!(phase_view(&AppPhase::Completed), PhaseView::Hidden);
         assert_eq!(phase_view(&AppPhase::Idle), PhaseView::Hidden);
+    }
+
+    #[test]
+    fn the_live_view_makes_room_for_the_cancel_button_and_language_control() {
+        let (recording, height) = live_size(false);
+        let (translating, _) = live_size(true);
+        assert_eq!(height, RECORDING_HEIGHT);
+        assert!(recording >= 200.0);
+        assert!(translating > recording);
     }
 
     #[test]

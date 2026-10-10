@@ -350,6 +350,19 @@ function RecordingOverlay() {
     );
   }
 
+  // Cancels like Esc: nothing is inserted. Clicking never focuses the overlay.
+  const cancelButton = (
+    <button
+      className="overlay-cancel"
+      type="button"
+      title={t("Cancel (Esc)")}
+      aria-label={t("Cancel (Esc)")}
+      onClick={() => void cancelRecording().catch(() => undefined)}
+    >
+      ×
+    </button>
+  );
+
   if (phase === "recording") {
     return (
       <div className="recording-overlay recording" role="status" aria-label={t("Recording in progress")}>
@@ -384,6 +397,7 @@ function RecordingOverlay() {
             {t(translationLanguageKeys[voiceMode.targetLanguage] ?? "Language")} ↻
           </button>
         )}
+        {cancelButton}
       </div>
     );
   }
@@ -426,6 +440,7 @@ function RecordingOverlay() {
             : compactPreview || translateAppMessage(language, message) || t("Preparing text…")}
         </span>
       </div>
+      {phase === "processing" && cancelButton}
     </div>
   );
 }
