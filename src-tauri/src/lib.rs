@@ -1294,12 +1294,10 @@ async fn translate_selection(app: AppHandle) {
         }
     };
     match injector.replace_selection(&selection, &translated, &monitor, checkpoint) {
-        Ok(InsertResult::ClipboardOnly | InsertResult::PasteUnverified) => {
-            emit_status(
-                &app,
-                "error",
-                "The target changed; the translation remains on the clipboard.",
-            );
+        Ok(result) => {
+            let (kind, message) =
+                selection_translation_status(result, injector.take_clipboard_not_restored());
+            emit_status(&app, kind, message);
         }
         Err(_) => {
             let copied = injector.copy_to_clipboard(&translated).is_ok();
@@ -1310,12 +1308,56 @@ async fn translate_selection(app: AppHandle) {
             };
             emit_status(&app, "error", message);
         }
-        Ok(InsertResult::ClipboardPaste) if injector.take_clipboard_not_restored() => emit_status(
-            &app,
+    }
+}
+
+/// Status kind and message for a selected-text translation outcome. A paste
+/// that was sent but not confirmed may already have replaced the selection,
+/// so it must not read as a target change that invites a second paste.
+fn selection_translation_status(
+    result: InsertResult,
+    clipboard_not_restored: bool,
+) -> (&'static str, &'static str) {
+    match result {
+        InsertResult::ClipboardPaste if clipboard_not_restored => (
             "success",
             "Translation inserted. The previous clipboard contents could not be restored.",
         ),
-        Ok(InsertResult::ClipboardPaste) => emit_status(&app, "success", "Translation inserted."),
+        InsertResult::ClipboardPaste => ("success", "Translation inserted."),
+        InsertResult::PasteUnverified => (
+            "paste_unverified",
+            "Translation pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard).",
+        ),
+        InsertResult::ClipboardOnly => (
+            "error",
+            "The target changed; the translation remains on the clipboard.",
+        ),
+    }
+}
+
+#[cfg(test)]
+mod selection_translation_tests {
+    use super::*;
+
+    #[test]
+    fn an_unverified_paste_is_not_reported_as_a_target_change() {
+        let (kind, message) = selection_translation_status(InsertResult::PasteUnverified, false);
+        assert_eq!(kind, "paste_unverified");
+        assert!(!message.contains("target changed"), "{message}");
+        assert!(message.contains("only if the text did not appear"));
+        assert_eq!(
+            selection_translation_status(InsertResult::ClipboardOnly, false).1,
+            "The target changed; the translation remains on the clipboard."
+        );
+        assert_eq!(
+            selection_translation_status(InsertResult::ClipboardPaste, false),
+            ("success", "Translation inserted.")
+        );
+        assert!(
+            selection_translation_status(InsertResult::ClipboardPaste, true)
+                .1
+                .contains("could not be restored")
+        );
     }
 }
 
