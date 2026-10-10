@@ -363,6 +363,10 @@ pub(crate) async fn start_microphone_test(
     Ok(())
 }
 
+/// Event emitted when the backend ends a microphone test the Settings page
+/// did not stop itself (the main window was hidden to the tray).
+pub(crate) const MICROPHONE_TEST_STOPPED_EVENT: &str = "microphone-test-stopped";
+
 /// Release a running Settings microphone test; a no-op when none runs.
 ///
 /// Also used when the main window is hidden to the tray: the Settings page

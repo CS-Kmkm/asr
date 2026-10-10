@@ -1572,21 +1572,27 @@ pub fn run() {
                     let _ = window.hide();
                     // Hiding keeps the Settings page mounted, so it would not
                     // stop a running microphone test and the device would
-                    // stay open with no visible UI.
+                    // stay open with no visible UI. The page is told the test
+                    // ended so it does not still show it running when the
+                    // window is shown again.
                     let app = window.app_handle().clone();
                     tauri::async_runtime::spawn(async move {
                         let services = app.state::<Services>();
-                        if let Err(error) = commands::release_running_microphone_test(
+                        match commands::release_running_microphone_test(
                             &services.microphone_test,
                             &services.audio,
                         )
                         .await
                         {
-                            emit_status(
+                            Ok(true) => {
+                                let _ = app.emit(commands::MICROPHONE_TEST_STOPPED_EVENT, ());
+                            }
+                            Ok(false) => {}
+                            Err(error) => emit_status(
                                 &app,
                                 "microphone_test_failed",
                                 &format!("Microphone test failed. {error}"),
-                            );
+                            ),
                         }
                     });
                 }

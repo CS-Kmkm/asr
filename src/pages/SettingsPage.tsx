@@ -116,6 +116,13 @@ export function SettingsPage({
     let active = true;
     void Promise.all([
       listen<AudioLevel>("audio-level", ({ payload }) => setLevel(payload)),
+      // Hiding the main window to the tray keeps this page mounted while the
+      // backend releases the test, so reset the controls it left running.
+      listen("microphone-test-stopped", () => {
+        testRunningRef.current = false;
+        setTestRunning(false);
+        setLevel({ rms: 0, peak: 0 });
+      }),
       listen<{ kind: string; message: string }>("status", ({ payload }) => {
         if (payload.kind !== "microphone_test_failed") return;
         testRunningRef.current = false;
