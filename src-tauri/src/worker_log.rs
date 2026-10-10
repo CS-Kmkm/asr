@@ -27,12 +27,18 @@ static SINK: OnceLock<Mutex<RotatingLog>> = OnceLock::new();
 ///
 /// When a write would push the active file past `max_bytes`, the active file
 /// replaces `<name>.1` (discarding the older generation) and a fresh file is
-/// started, so disk use stays below roughly twice the limit.
+/// started, so disk use stays below roughly twice the limit. If another
+/// process blocks the rename (an open handle without delete sharing), the
+/// active file is truncated instead so logging continues.
 pub(crate) struct RotatingLog {
     path: PathBuf,
     max_bytes: u64,
     file: Option<File>,
     written: u64,
+    /// Active-file size that triggers the next rotation attempt. Raised after
+    /// an attempt that could neither rename nor truncate, so a blocked file is
+    /// retried once per further `max_bytes` rather than on every write.
+    rotate_at: u64,
 }
 
 impl RotatingLog {
@@ -42,6 +48,7 @@ impl RotatingLog {
             max_bytes: max_bytes.max(1),
             file: None,
             written: 0,
+            rotate_at: max_bytes.max(1),
         }
     }
 
@@ -59,8 +66,8 @@ impl RotatingLog {
         let cap = usize::try_from(self.max_bytes).unwrap_or(usize::MAX);
         let bytes = &bytes[bytes.len().saturating_sub(cap)..];
         self.ensure_open()?;
-        if self.written > 0 && self.written + bytes.len() as u64 > self.max_bytes {
-            self.rotate()?;
+        if self.written > 0 && self.written + bytes.len() as u64 > self.rotate_at {
+            self.rotate();
         }
         let file = self.ensure_open()?;
         file.write_all(bytes)?;
@@ -81,18 +88,38 @@ impl RotatingLog {
         Ok(self.file.as_mut().expect("log file was just opened"))
     }
 
-    fn rotate(&mut self) -> io::Result<()> {
-        // Windows cannot rename over an open file or onto an existing one.
+    fn rotate(&mut self) {
+        // Windows cannot rename an open file or onto an existing one.
         self.file = None;
+        let reset = self
+            .replace_previous()
+            .or_else(|_| self.truncate_active())
+            .is_ok();
+        if reset {
+            self.written = 0;
+            self.rotate_at = self.max_bytes;
+        } else {
+            // Keep appending to the oversized file; the next write reopens it.
+            self.rotate_at = self.written.saturating_add(self.max_bytes);
+        }
+    }
+
+    fn replace_previous(&self) -> io::Result<()> {
         let previous = self.previous_path();
         match fs::remove_file(&previous) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        fs::rename(&self.path, &previous)?;
-        self.written = 0;
-        Ok(())
+        fs::rename(&self.path, &previous)
+    }
+
+    fn truncate_active(&self) -> io::Result<()> {
+        OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .map(drop)
     }
 }
 
@@ -204,6 +231,26 @@ mod tests {
         let mut log = RotatingLog::new(path.clone(), 4);
         log.write(b"0123456789").unwrap();
         assert_eq!(read(&path), b"6789");
+    }
+
+    #[test]
+    fn a_blocked_rename_falls_back_to_truncating_the_active_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(LOG_FILE_NAME);
+        let mut log = RotatingLog::new(path.clone(), 4);
+        // A non-empty directory at the previous path can be neither removed
+        // as a file nor replaced by a rename, like a file another process
+        // holds open without delete sharing.
+        let previous = log.previous_path();
+        fs::create_dir(&previous).unwrap();
+        fs::write(previous.join("held"), b"x").unwrap();
+        log.write(b"aaaa").unwrap();
+        log.write(b"bbbb").unwrap();
+        assert_eq!(read(&path), b"bbbb");
+        log.write(b"cc").unwrap();
+        // Each later rotation still succeeds by truncating, never dropping.
+        assert_eq!(read(&path), b"cc");
+        assert!(previous.is_dir());
     }
 
     #[test]
