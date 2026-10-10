@@ -563,7 +563,12 @@ mod ask_capture_tests {
 fn parse_shortcut(value: &str) -> Result<Shortcut, String> {
     Shortcut::from_str(value.trim()).map_err(|_| "hotkey is invalid".to_string())
 }
-fn load_environment_file() {
+/// Load the first `.env` found and return content-free startup diagnostics
+/// (the chosen worker project root and `.env` path, never any value).
+///
+/// The text is echoed to stderr for debug runs and, because a release build
+/// has no console, written to the worker log once the app installs it.
+fn load_environment_file() -> String {
     let current_dir = std::env::current_dir().ok();
     let executable = std::env::current_exe().ok();
     let project_root = project_root();
@@ -573,23 +578,95 @@ fn load_environment_file() {
         current_dir.as_deref(),
         cfg!(debug_assertions),
     );
-    match &project_root {
-        Some(root) => eprintln!("Worker project root: {}", root.display()),
-        None => eprintln!("Worker project root: none found"),
+    let path = candidates.into_iter().find(|path| path.is_file());
+    let load_error = path.as_deref().and_then(|path| {
+        dotenvy::from_path(path)
+            .err()
+            .map(|error| describe_environment_error(&error))
+    });
+    let diagnostics = startup_diagnostics(
+        project_root.as_deref(),
+        path.as_deref(),
+        load_error.as_deref(),
+    );
+    eprint!("{diagnostics}");
+    diagnostics
+}
+
+/// Describe a `.env` load failure without the offending line or value, which
+/// may hold an API key.
+fn describe_environment_error(error: &dotenvy::Error) -> String {
+    match error {
+        dotenvy::Error::LineParse(_, index) => {
+            format!("a line could not be parsed (at character {index})")
+        }
+        dotenvy::Error::Io(error) => format!("I/O error: {error}"),
+        _ => "an environment variable could not be read".into(),
+    }
+}
+
+fn startup_diagnostics(
+    project_root: Option<&Path>,
+    environment_file: Option<&Path>,
+    load_error: Option<&str>,
+) -> String {
+    let describe = |path: Option<&Path>| {
+        path.map_or_else(
+            || "none found".to_string(),
+            |path| path.display().to_string(),
+        )
+    };
+    let mut text = format!(
+        "Worker project root: {}\nEnvironment file: {}\n",
+        describe(project_root),
+        describe(environment_file)
+    );
+    if let Some(error) = load_error {
+        text.push_str(&format!("Failed to load the environment file: {error}\n"));
+    }
+    text
+}
+
+#[cfg(test)]
+mod startup_diagnostics_tests {
+    use super::*;
+
+    #[test]
+    fn lists_the_chosen_paths_one_per_line() {
+        let root = Path::new("checkout");
+        let file = root.join(".env");
+        assert_eq!(
+            startup_diagnostics(Some(root), Some(&file), None),
+            format!(
+                "Worker project root: checkout\nEnvironment file: {}\n",
+                file.display()
+            )
+        );
+        assert_eq!(
+            startup_diagnostics(None, None, None),
+            "Worker project root: none found\nEnvironment file: none found\n"
+        );
     }
 
-    let path = candidates.into_iter().find(|path| path.is_file());
-    match &path {
-        Some(path) => eprintln!("Environment file: {}", path.display()),
-        None => eprintln!("Environment file: none found"),
+    #[test]
+    fn appends_a_load_failure_after_the_paths() {
+        let text = startup_diagnostics(None, Some(Path::new(".env")), Some("I/O error: denied"));
+        assert!(text.ends_with("Failed to load the environment file: I/O error: denied\n"));
     }
-    if let Some(path) = path {
-        if let Err(error) = dotenvy::from_path(&path) {
-            eprintln!(
-                "Failed to load environment file {}: {error}",
-                path.display()
-            );
-        }
+
+    #[test]
+    fn a_parse_failure_never_echoes_the_offending_line() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".env");
+        std::fs::write(&path, "ASR_API_KEY='sk-secret-value\n").unwrap();
+        let error = dotenvy::from_path_iter(&path)
+            .unwrap()
+            .find_map(Result::err)
+            .expect("an unterminated quote is a parse error");
+        assert!(error.to_string().contains("sk-secret-value"));
+        let description = describe_environment_error(&error);
+        assert!(!description.contains("sk-secret"), "{description}");
+        assert!(!description.contains("ASR_API_KEY"), "{description}");
     }
 }
 
@@ -1319,7 +1396,7 @@ fn show_main_window(app: &AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    load_environment_file();
+    let startup_diagnostics = load_environment_file();
     let builder = tauri::Builder::default();
     // Must stay the first plugin: a second launch hands over to the running
     // instance and exits inside this plugin's initialization, before the
@@ -1353,7 +1430,9 @@ pub fn run() {
             // Must precede the first worker spawn (initialize_model_runtime).
             // A missing log directory only loses diagnostics, never startup.
             if let Ok(directory) = app.path().app_log_dir() {
-                let _ = worker_log::install(&directory);
+                if worker_log::install(&directory).is_ok() {
+                    worker_log::record_app_start(&startup_diagnostics);
+                }
             }
             let storage = Storage::open(&database_path(app.handle())?)?;
             storage.enforce_current_history_policy()?;

@@ -3,9 +3,10 @@
 //! The worker reports `internal_error` details only on stderr. A release build
 //! has no console to inherit, so the stream is piped into a log file that is
 //! rotated once it would exceed [`MAX_LOG_BYTES`], keeping one previous file.
-//! Only the worker's own diagnostics and content-free process markers are
-//! written here; the Rust side never adds transcript, audio, window-title, or
-//! clipboard content.
+//! Only the worker's own diagnostics, content-free process markers, and the
+//! app's startup paths (worker project root and `.env` location) are written
+//! here; the Rust side never adds transcript, audio, window-title, clipboard,
+//! or environment-variable content.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -150,12 +151,20 @@ fn append(bytes: &[u8]) {
     let _ = log.write(bytes);
 }
 
+fn timestamp() -> String {
+    chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
+}
+
+/// Record an app start with its content-free startup diagnostics, so the
+/// worker discovery is visible in release builds that have no console.
+pub(crate) fn record_app_start(diagnostics: &str) {
+    let record = format!("--- app started {} ---\n{diagnostics}", timestamp());
+    append(record.as_bytes());
+}
+
 /// Record that a new worker process started, without any content.
 pub(crate) fn mark_worker_start() {
-    let marker = format!(
-        "--- ASR worker started {} ---\n",
-        chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, false)
-    );
+    let marker = format!("--- ASR worker started {} ---\n", timestamp());
     append(marker.as_bytes());
 }
 
