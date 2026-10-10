@@ -175,8 +175,26 @@ button { color: inherit; }
 }
 .correction-preview.pending { color: var(--text-muted); }
 .recording-overlay.notice {
+  /* The main window's toast rule (.notice) must not move or restyle the
+     overlay notice, which fills its own small window. */
+  position: static;
+  width: 100vw;
+  padding: 0 15px;
+  border-radius: 18px;
+  background: linear-gradient(135deg, var(--surface-raised), var(--surface-subtle));
+  color: var(--text);
+  animation: none;
   justify-content: flex-start;
   border-color: var(--warning-border);
+}
+.notice.message .notice-detail {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 11px;
+  line-height: 14px;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
 }
 .recording-overlay.notice.failed { border-color: var(--error-border); }
 .notice-mark {

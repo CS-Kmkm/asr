@@ -300,6 +300,9 @@ const en = {
   "The clipboard was unavailable.": "The clipboard was unavailable.",
   "The insertion backend failed.": "The insertion backend failed.",
   "Translation failed; the transcript was copied.": "Translation failed; the transcript was copied.",
+  "Not completed": "Not completed",
+  "Completed with a warning": "Completed with a warning",
+  "selected-text translation is already active": "selected-text translation is already active",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
@@ -601,6 +604,9 @@ const ja: Record<MessageKey, string> = {
   "The clipboard was unavailable.": "クリップボードを使用できませんでした。",
   "The insertion backend failed.": "挿入処理でエラーが発生しました。",
   "Translation failed; the transcript was copied.": "翻訳に失敗したため、原文をコピーしました。",
+  "Not completed": "完了しませんでした",
+  "Completed with a warning": "完了しました（注意あり）",
+  "selected-text translation is already active": "選択テキストの翻訳を実行中です。",
 } satisfies Record<MessageKey, string>;
 
 const catalogs = { en, ja } satisfies Record<UiLanguage, Record<MessageKey, string>>;
@@ -772,6 +778,7 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "The original selection was not changed, and the clipboard is unavailable; the edit is available in this app.",
       "Speak to edit is disabled because its saved hotkey is already used by another action. Change the overlapping hotkeys in Settings.",
       "Speak to edit is disabled because its saved hotkey is already used by another action, and a saved hotkey could not be registered. Change them in Settings.",
+      "selected-text translation is already active",
   ] satisfies MessageKey[],
 );
 

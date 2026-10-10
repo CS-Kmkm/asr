@@ -128,6 +128,18 @@ interface InsertionNoticeEvent {
 // Matches the backend timer that hides the overlay window.
 const INSERTION_NOTICE_MS = 5_000;
 
+// A failure or warning sentence from the backend, shown while the main
+// window may be hidden. The backend chooses how long it stays up.
+interface OverlayMessageEvent {
+  severity: "failure" | "warning";
+  message: string;
+  durationMs: number;
+}
+
+type OverlayNotice =
+  | ({ kind: "insertion" } & InsertionNoticeEvent)
+  | ({ kind: "message" } & OverlayMessageEvent);
+
 const translationLanguageKeys: Record<string, MessageKey> = {
   en: "English",
   ja: "Japanese",
@@ -244,15 +256,22 @@ function RecordingOverlay() {
     mode: "dictate",
     targetLanguage: null,
   });
-  const [notice, setNotice] = useState<InsertionNoticeEvent | null>(null);
+  const [notice, setNotice] = useState<OverlayNotice | null>(null);
   const noticeTimer = useRef<number | undefined>(undefined);
 
   useEffect(() => {
+    // The latest notice replaces any earlier one, like the backend window.
+    const showNotice = (next: OverlayNotice, durationMs: number) => {
+      window.clearTimeout(noticeTimer.current);
+      setNotice(next);
+      noticeTimer.current = window.setTimeout(() => setNotice(null), durationMs);
+    };
     const listeners = Promise.all([
       listen<InsertionNoticeEvent>("insertion-notice", ({ payload }) => {
-        window.clearTimeout(noticeTimer.current);
-        setNotice(payload);
-        noticeTimer.current = window.setTimeout(() => setNotice(null), INSERTION_NOTICE_MS);
+        showNotice({ kind: "insertion", ...payload }, INSERTION_NOTICE_MS);
+      }),
+      listen<OverlayMessageEvent>("overlay-message", ({ payload }) => {
+        showNotice({ kind: "message", ...payload }, payload.durationMs);
       }),
       listen<AudioLevel>("audio-level", ({ payload }) => {
         const rms = Number.isFinite(payload.rms) ? payload.rms : 0;
@@ -296,7 +315,20 @@ function RecordingOverlay() {
     };
   }, []);
 
-  if (phase !== "recording" && phase !== "processing" && phase !== "injecting" && notice) {
+  if (phase !== "recording" && phase !== "processing" && phase !== "injecting" && notice?.kind === "message") {
+    const failed = notice.severity === "failure";
+    return (
+      <div className={`recording-overlay notice message${failed ? " failed" : ""}`} role="alert" aria-live="assertive">
+        <span className="notice-mark" aria-hidden="true" />
+        <div className="processing-copy">
+          <span className="recording-overlay-label">{t(failed ? "Not completed" : "Completed with a warning")}</span>
+          <span className="notice-detail">{translateAppMessage(language, notice.message)}</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (phase !== "recording" && phase !== "processing" && phase !== "injecting" && notice?.kind === "insertion") {
     const failed = notice.outcome === "insertion_failed";
     // The paste was sent; only its confirmation is unavailable in this field.
     const sent = notice.outcome === "paste_unverified";

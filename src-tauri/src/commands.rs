@@ -639,6 +639,37 @@ pub(crate) async fn start_ask_with_origin(
     .await
 }
 
+/// What a failed start publishes while it still owns the lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartFailure {
+    /// Leave the published phase: the caller's window reports the error.
+    Keep,
+    /// Clear a busy phase the start published (the model-preparing state).
+    Idle,
+    /// Publish Error with the failure, which the overlay shows as a notice.
+    Error,
+}
+
+/// A hotkey start has no visible window to report a failure, so it always
+/// publishes Error; a start from the main window does so only when it had
+/// published a busy phase. A cancellation is never reported as a failure.
+fn start_failure(
+    cancelled: bool,
+    from_shortcut: bool,
+    published: Option<&AppPhase>,
+) -> StartFailure {
+    let busy = matches!(
+        published,
+        Some(AppPhase::Recording | AppPhase::Processing | AppPhase::Injecting)
+    );
+    match (cancelled, from_shortcut || busy) {
+        (true, _) if busy => StartFailure::Idle,
+        (true, _) => StartFailure::Keep,
+        (false, true) => StartFailure::Error,
+        (false, false) => StartFailure::Keep,
+    }
+}
+
 async fn start_recording_mode(
     app: AppHandle,
     services: State<'_, Services>,
@@ -648,15 +679,73 @@ async fn start_recording_mode(
     trigger_chord: Option<String>,
     mode: PipelineMode,
 ) -> Result<(), String> {
-    let (cancel_message, cancel_error) = cancellation_copy(mode);
-    if services.translation_active.load(Ordering::Acquire) {
-        return Err("selected-text translation is already active".into());
-    }
-    let operation_id = MODEL_CHANGE_GATE.begin_pipeline(|| services.lifecycle.begin_start(mode))?;
+    let claimed = if services.translation_active.load(Ordering::Acquire) {
+        Err("selected-text translation is already active")
+    } else {
+        MODEL_CHANGE_GATE.begin_pipeline(|| services.lifecycle.begin_start(mode))
+    };
+    let operation_id = match claimed {
+        Ok(id) => id,
+        Err(error) => {
+            // Nothing is owned, so only the overlay reports it, and only when
+            // no other operation is using the overlay.
+            if from_shortcut && services.lifecycle.phase() == PipelinePhase::Idle {
+                recording_overlay::show_message_notice(
+                    &app,
+                    recording_overlay::NoticeSeverity::Failure,
+                    error,
+                );
+            }
+            return Err(error.into());
+        }
+    };
     let guard = PipelineGuard {
         lifecycle: &services.lifecycle,
         id: operation_id,
     };
+    let result = start_owned_recording(
+        app.clone(),
+        services.clone(),
+        state.clone(),
+        storage.clone(),
+        from_shortcut,
+        trigger_chord,
+        mode,
+        operation_id,
+    )
+    .await;
+    match result {
+        // The recording keeps the lifecycle until it is stopped or cancelled.
+        Ok(()) => std::mem::forget(guard),
+        Err(ref error) => {
+            let (cancel_message, _) = cancellation_copy(mode);
+            match start_failure(
+                services.lifecycle.is_cancelled(operation_id),
+                from_shortcut,
+                state.phase().as_ref(),
+            ) {
+                StartFailure::Keep => {}
+                StartFailure::Idle => emit_state(&app, &state, AppPhase::Idle, cancel_message),
+                StartFailure::Error => emit_state(&app, &state, AppPhase::Error, error),
+            }
+        }
+    }
+    result
+}
+
+/// The part of a start that runs while it owns the lifecycle as Starting.
+#[allow(clippy::too_many_arguments)]
+async fn start_owned_recording(
+    app: AppHandle,
+    services: State<'_, Services>,
+    state: State<'_, AppState>,
+    storage: State<'_, Storage>,
+    from_shortcut: bool,
+    trigger_chord: Option<String>,
+    mode: PipelineMode,
+    operation_id: u64,
+) -> Result<(), String> {
+    let (cancel_message, cancel_error) = cancellation_copy(mode);
     if services.translation_active.load(Ordering::Acquire) {
         return Err("selected-text translation is already active".into());
     }
@@ -801,7 +890,6 @@ async fn start_recording_mode(
     drop(ask_slot);
     drop(edit_slot);
     drop(live_slot);
-    std::mem::forget(guard);
 
     let app_for_levels = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -1660,6 +1748,13 @@ pub(crate) async fn stop_recording_for(
             _ => insertion_label,
         };
         recording_overlay::show_insertion_notice(&app, notice, insertion_detail);
+    } else if correction_failed {
+        // The text arrived uncorrected; say why where the user is looking.
+        recording_overlay::show_message_notice(
+            &app,
+            recording_overlay::NoticeSeverity::Warning,
+            completion,
+        );
     }
     report_temp_cleanup(&app, &mut artifact_cleanup);
     Ok(RecordingResult {
@@ -3448,6 +3543,27 @@ mod tests {
         assert_eq!(
             processing_message(StopReason::MaximumDuration, true, "Stopping"),
             MICROPHONE_DISCONNECTED_PROCESSING
+        );
+    }
+
+    #[test]
+    fn a_hotkey_start_failure_is_published_for_the_overlay() {
+        let idle = Some(&AppPhase::Idle);
+        let preparing = Some(&AppPhase::Processing);
+        // A hotkey has no visible window: the failure must reach the overlay.
+        assert_eq!(start_failure(false, true, idle), StartFailure::Error);
+        assert_eq!(start_failure(false, true, None), StartFailure::Error);
+        // The main window reports its own command error, unless the start
+        // had already shown the preparing state.
+        assert_eq!(start_failure(false, false, idle), StartFailure::Keep);
+        assert_eq!(start_failure(false, false, preparing), StartFailure::Error);
+        // A cancellation is not a failure; it only clears a busy phase.
+        assert_eq!(start_failure(true, true, idle), StartFailure::Keep);
+        assert_eq!(start_failure(true, true, preparing), StartFailure::Idle);
+        assert_eq!(start_failure(true, false, preparing), StartFailure::Idle);
+        assert_eq!(
+            start_failure(true, false, Some(&AppPhase::Completed)),
+            StartFailure::Keep
         );
     }
 

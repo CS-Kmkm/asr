@@ -525,7 +525,9 @@ fn worker_runtime() -> (OsString, Option<PathBuf>) {
 }
 
 pub(crate) fn emit_state(app: &AppHandle, state: &AppState, phase: AppPhase, message: &str) {
-    recording_overlay::set_phase(app, &phase);
+    // The overlay is the feedback surface while the main window is hidden:
+    // an Error shows its message there instead of only reaching the windows.
+    recording_overlay::publish(app, &phase, message);
     let snapshot = state.transition(phase, Some(message.into()));
     let _ = app.emit("app-state", snapshot);
 }
