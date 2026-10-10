@@ -3299,6 +3299,33 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_model_changes_are_refused() {
+        let gate = ModelChangeGate::new();
+        let (previous, next) = model_change();
+        let first = gate
+            .begin_change(&previous, &next, || PipelinePhase::Idle)
+            .unwrap();
+        assert!(first.is_some());
+        // A stale save reverting the model while the first change is pending.
+        assert_eq!(
+            gate.begin_change(&next, &previous, || PipelinePhase::Idle)
+                .err(),
+            Some(MODEL_CHANGE_IN_PROGRESS.to_string())
+        );
+        // The refused change did not clear the first change's mark.
+        assert_eq!(
+            gate.begin_pipeline(|| Ok(())),
+            Err(MODEL_CHANGE_IN_PROGRESS)
+        );
+        drop(first);
+        assert_eq!(gate.begin_pipeline(|| Ok(())), Ok(()));
+        assert!(gate
+            .begin_change(&next, &previous, || PipelinePhase::Idle)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
     fn a_start_during_a_model_change_fails_fast_instead_of_waiting() {
         let gate = Arc::new(ModelChangeGate::new());
         let lifecycle = PipelineLifecycle::default();
@@ -3826,6 +3853,12 @@ impl ModelChangeGate {
         let mut changing = self.changing();
         if !speech_model_changed(previous, next) {
             return Ok(None);
+        }
+        // A second change while one is pending (for example a stale save
+        // carrying the old model) would let the first guard clear the mark
+        // while its own reconfiguration is still pending.
+        if *changing {
+            return Err(MODEL_CHANGE_IN_PROGRESS.into());
         }
         reject_model_change_while_busy(previous, next, phase())?;
         *changing = true;
