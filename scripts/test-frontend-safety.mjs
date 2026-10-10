@@ -45,9 +45,10 @@ function nodes(tree) {
   return found;
 }
 
-function dictionaryFixture() {
+function dictionaryFixture(entries = []) {
   const slots = [];
   const added = [];
+  const updated = [];
   const validity = [];
   let cursor = 0;
   let effects = [];
@@ -70,7 +71,7 @@ function dictionaryFixture() {
     cursor = 0;
     effects = [];
     const found = nodes(module.DictionaryPage({
-      entries: [], candidates: [], onAdd: async (entry) => { added.push(entry); return true; }, onUpdate: async () => true,
+      entries, candidates: [], onAdd: async (entry) => { added.push(entry); return true; }, onUpdate: async (id, entry) => { updated.push([id, entry]); return true; },
       onDelete() {}, onImport: async () => true, onConfirmCandidate() {}, onRejectCandidate() {},
     }));
     const priority = found.find((node) => node.type === "input" && node.props["aria-label"] === "Priority");
@@ -80,7 +81,9 @@ function dictionaryFixture() {
   }
   const priorityInput = () => render().find((node) => node.type === "input" && node.props["aria-label"] === "Priority");
   return {
-    module, added, validity, render, priorityInput,
+    module, added, updated, validity, render, priorityInput,
+    edit: (id) => render().filter((node) => node.type === "button" && node.props.children === "Edit")[entries.findIndex((entry) => entry.id === id)].props.onClick(),
+    setPriority: (priority) => priorityInput().props.onChange({ target: { value: priority } }),
     fill(priority) {
       render().filter((node) => node.type === "input" && node.props.required).forEach((node) => node.props.onChange({ target: { value: "OpenAI" } }));
       priorityInput().props.onChange({ target: { value: priority } });
@@ -178,4 +181,31 @@ test("Settings shows the startup shortcut warning only when some shortcut is ina
   assert.equal(rest.length, 0);
   assert.match(warning, /^Some saved shortcuts could not be activated at startup\./);
   assert.match(warning, /Inactive shortcuts: Voice Translate \(Ctrl\+Shift\+Y\), Ask Anything \(Ctrl\+Shift\+A\)$/);
+});
+
+test("editing an entry keeps its stored out-of-range priority but rejects new out-of-range values", async () => {
+  const stored = { id: 4, reading: "open ai", surface: "OpenAI", category: null, aliases: [], priority: 5_000_000, appScope: null, source: "manual", createdAt: "" };
+  const page = dictionaryFixture([stored]);
+  page.edit(4);
+  const input = page.priorityInput().props;
+  assert.equal(input.value, "5000000");
+  assert.ok(input.max >= 5_000_000, "native range check must not block the stored value");
+  assert.equal(page.alert(), undefined);
+  await page.submit();
+  assert.equal(page.updated.length, 1);
+  assert.equal(page.updated[0][0], 4);
+  assert.equal(page.updated[0][1].priority, 5_000_000);
+
+  page.edit(4);
+  page.setPriority("5000001");
+  assert.equal(page.alert(), "Priority must be a whole number from -1000000 to 1000000.");
+  await page.submit();
+  assert.equal(page.updated.length, 1);
+
+  const fresh = dictionaryFixture([stored]);
+  fresh.fill("5000000");
+  assert.equal(fresh.alert(), "Priority must be a whole number from -1000000 to 1000000.");
+  await fresh.submit();
+  assert.equal(fresh.added.length, 0);
+  assert.equal(fresh.module.parsePriority("5000000.5", 5_000_000), null);
 });
