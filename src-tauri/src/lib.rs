@@ -1310,6 +1310,11 @@ async fn translate_selection(app: AppHandle) {
             };
             emit_status(&app, "error", message);
         }
+        Ok(InsertResult::ClipboardPaste) if injector.take_clipboard_not_restored() => emit_status(
+            &app,
+            "success",
+            "Translation inserted. The previous clipboard contents could not be restored.",
+        ),
         Ok(InsertResult::ClipboardPaste) => emit_status(&app, "success", "Translation inserted."),
     }
 }

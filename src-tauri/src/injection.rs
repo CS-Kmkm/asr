@@ -3,6 +3,7 @@
 
 use crate::input_monitor::InputMonitor;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::watch;
 
 #[cfg(all(test, target_os = "windows"))]
@@ -347,6 +348,13 @@ impl SystemTextInjector {
         )
     }
 
+    /// True once after a confirmed paste whose previous clipboard could not
+    /// be preserved (an unsupported or oversized format) or restored. The
+    /// pasted text then stays on the clipboard.
+    pub(crate) fn take_clipboard_not_restored(&self) -> bool {
+        self.backend.take_clipboard_not_restored()
+    }
+
     pub(crate) fn copy_to_clipboard(&self, text: &str) -> Result<(), InjectionError> {
         self.backend
             .clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)
@@ -552,6 +560,22 @@ trait Backend {
     fn paste(&self, target: &TargetWindow, policy: SafetyPolicy) -> Result<bool, InjectionError>;
     fn delete_selection(&self, target: &TargetWindow) -> Result<bool, InjectionError>;
     fn wait_for_target(&self);
+    /// Records that a confirmed paste left its text on the clipboard because
+    /// the previous contents could not be snapshotted or restored.
+    fn clipboard_not_restored(&self);
+}
+
+/// Remembers a confirmed paste that could not restore the clipboard until
+/// the caller reports it.
+#[derive(Default)]
+struct UnrestoredClipboard(AtomicBool);
+impl UnrestoredClipboard {
+    fn record(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+    fn take(&self) -> bool {
+        self.0.swap(false, Ordering::AcqRel)
+    }
 }
 
 /// Test builds can swap the platform backend for the batch mock target.
@@ -676,11 +700,18 @@ pub(crate) mod test_backend {
 }
 
 #[cfg(not(target_os = "windows"))]
-struct PlatformBackend;
+struct PlatformBackend {
+    unrestored: UnrestoredClipboard,
+}
 #[cfg(not(target_os = "windows"))]
 impl PlatformBackend {
     fn new() -> Self {
-        Self
+        Self {
+            unrestored: UnrestoredClipboard::default(),
+        }
+    }
+    fn take_clipboard_not_restored(&self) -> bool {
+        self.unrestored.take()
     }
 }
 #[cfg(not(target_os = "windows"))]
@@ -725,6 +756,9 @@ impl Backend for PlatformBackend {
         Err(InjectionError::UnsupportedPlatform)
     }
     fn wait_for_target(&self) {}
+    fn clipboard_not_restored(&self) {
+        self.unrestored.record();
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -734,7 +768,7 @@ use windows_backend::PlatformBackend;
 mod windows_backend {
     use super::{
         accessibility, clipboard, target, Backend, ClipboardExclusion, InjectionError,
-        SafetyPolicy, TargetText, TargetWindow, INJECTION_MARKER,
+        SafetyPolicy, TargetText, TargetWindow, UnrestoredClipboard, INJECTION_MARKER,
     };
     use std::mem::{size_of, zeroed};
     use std::thread;
@@ -764,10 +798,17 @@ mod windows_backend {
         GetWindowThreadProcessId, GUITHREADINFO, GWL_STYLE,
     };
     const ES_PASSWORD: isize = 0x20;
-    pub(super) struct PlatformBackend;
+    pub(super) struct PlatformBackend {
+        unrestored: UnrestoredClipboard,
+    }
     impl PlatformBackend {
         pub(super) fn new() -> Self {
-            Self
+            Self {
+                unrestored: UnrestoredClipboard::default(),
+            }
+        }
+        pub(super) fn take_clipboard_not_restored(&self) -> bool {
+            self.unrestored.take()
         }
     }
 
@@ -1084,6 +1125,9 @@ mod windows_backend {
         }
         fn wait_for_target(&self) {
             thread::sleep(Duration::from_millis(20));
+        }
+        fn clipboard_not_restored(&self) {
+            self.unrestored.record();
         }
     }
 
