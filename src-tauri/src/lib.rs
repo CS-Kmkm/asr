@@ -1324,6 +1324,43 @@ async fn translate_selection(app: AppHandle) {
     }
 }
 
+/// Esc while a session is active: the same cancel as the windows' button.
+async fn cancel_voice_session(app: AppHandle) {
+    if let Err(error) = commands::cancel_recording(
+        app.clone(),
+        app.state::<Services>(),
+        app.state::<AppState>(),
+        app.state::<Storage>(),
+    )
+    .await
+    {
+        emit_status(&app, "error", &error);
+    }
+}
+
+/// Holds the Esc cancel chord exactly while the lifecycle is busy, so other
+/// apps receive Esc whenever no voice session is starting, recording, or
+/// processing.
+async fn follow_cancel_chord(app: AppHandle) {
+    let mut phases = app.state::<Services>().lifecycle.subscribe_phase();
+    let mut registered = false;
+    while phases.changed().await.is_ok() {
+        let phase = *phases.borrow_and_update();
+        let wanted = app
+            .state::<Services>()
+            .shortcut_routes
+            .lock()
+            .map(|routes| shortcuts::wants_cancel_chord(phase, &routes))
+            .unwrap_or(false);
+        shortcuts::sync_cancel_chord(
+            &mut registered,
+            wanted,
+            |chord| app.global_shortcut().register(chord),
+            |chord| app.global_shortcut().unregister(chord),
+        );
+    }
+}
+
 fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
     let route = app
         .state::<Services>()
@@ -1332,6 +1369,9 @@ fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
         .ok()
         .and_then(|routes| routes.find(shortcut).cloned());
     let Some(route) = route else {
+        if shortcut == shortcuts::cancel_chord() {
+            tauri::async_runtime::spawn(cancel_voice_session(app));
+        }
         return;
     };
     match route.action {
@@ -1490,6 +1530,7 @@ pub fn run() {
                 inactive.push(route.describe());
             }
             *app.state::<Services>().inactive_shortcuts.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = inactive;
+            tauri::async_runtime::spawn(follow_cancel_chord(app.handle().clone()));
             if cleanup_stale_artifacts(
                 &std::env::temp_dir(),
                 settings.delete_audio_after_processing,

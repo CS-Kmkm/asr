@@ -35,6 +35,9 @@ struct PipelineOperation {
 pub struct PipelineLifecycle {
     inner: Mutex<Option<PipelineOperation>>,
     next_id: std::sync::atomic::AtomicU64,
+    /// Every phase change, published under `inner`'s lock so observers see
+    /// them in order (for example the cancel hotkey registration).
+    phase_changes: watch::Sender<PipelinePhase>,
 }
 
 impl Default for PipelineLifecycle {
@@ -42,11 +45,30 @@ impl Default for PipelineLifecycle {
         Self {
             inner: Mutex::new(None),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            phase_changes: watch::channel(PipelinePhase::Idle).0,
         }
     }
 }
 
 impl PipelineLifecycle {
+    /// Observes the lifecycle phase; the current phase is marked unseen.
+    pub fn subscribe_phase(&self) -> watch::Receiver<PipelinePhase> {
+        let mut receiver = self.phase_changes.subscribe();
+        receiver.mark_changed();
+        receiver
+    }
+
+    fn publish_phase(&self, operation: &Option<PipelineOperation>) {
+        let phase = operation
+            .as_ref()
+            .map_or(PipelinePhase::Idle, |operation| operation.phase);
+        self.phase_changes.send_if_modified(|current| {
+            let changed = *current != phase;
+            *current = phase;
+            changed
+        });
+    }
+
     pub fn begin_retry(
         &self,
         mode: PipelineMode,
@@ -69,6 +91,7 @@ impl PipelineLifecycle {
             cancel,
             committed: false,
         });
+        self.publish_phase(&inner);
         Ok((id, receiver))
     }
 
@@ -91,6 +114,7 @@ impl PipelineLifecycle {
             cancel,
             committed: false,
         });
+        self.publish_phase(&inner);
         Ok(id)
     }
 
@@ -125,7 +149,9 @@ impl PipelineLifecycle {
             return Err("pipeline operation was cancelled");
         }
         operation.phase = PipelinePhase::Processing;
-        Ok((operation.id, operation.mode, operation.cancel.subscribe()))
+        let claimed = (operation.id, operation.mode, operation.cancel.subscribe());
+        self.publish_phase(&inner);
+        Ok(claimed)
     }
 
     pub fn cancel(&self) -> Result<Option<(u64, PipelinePhase)>, &'static str> {
@@ -147,6 +173,7 @@ impl PipelineLifecycle {
         if let Ok(mut inner) = self.inner.lock() {
             if inner.as_ref().is_some_and(|operation| operation.id == id) {
                 *inner = None;
+                self.publish_phase(&inner);
             }
         }
     }
@@ -231,6 +258,7 @@ impl PipelineLifecycle {
             return Err("pipeline operation was cancelled");
         }
         operation.phase = to;
+        self.publish_phase(&inner);
         Ok(())
     }
 }
@@ -637,6 +665,29 @@ mod tests {
         lifecycle.finish(id);
         assert_eq!(lifecycle.phase(), PipelinePhase::Idle);
         assert!(lifecycle.begin_start(PipelineMode::Dictate).is_ok());
+    }
+
+    #[test]
+    fn phase_observers_see_every_lifecycle_transition() {
+        let lifecycle = PipelineLifecycle::default();
+        let mut phases = lifecycle.subscribe_phase();
+        assert!(phases.has_changed().unwrap());
+        assert_eq!(*phases.borrow_and_update(), PipelinePhase::Idle);
+        let id = lifecycle.begin_start(PipelineMode::Dictate).unwrap();
+        assert_eq!(*phases.borrow_and_update(), PipelinePhase::Starting);
+        lifecycle.mark_recording(id).unwrap();
+        assert_eq!(*phases.borrow_and_update(), PipelinePhase::Recording);
+        lifecycle.begin_processing().unwrap();
+        assert_eq!(*phases.borrow_and_update(), PipelinePhase::Processing);
+        // A stale finish changes nothing and is not reported.
+        lifecycle.finish(id + 1);
+        assert!(!phases.has_changed().unwrap());
+        lifecycle.finish(id);
+        assert_eq!(*phases.borrow_and_update(), PipelinePhase::Idle);
+        let (retry, _) = lifecycle.begin_retry(PipelineMode::Ask).unwrap();
+        assert_eq!(*phases.borrow_and_update(), PipelinePhase::Processing);
+        lifecycle.finish(retry);
+        assert_eq!(*phases.borrow_and_update(), PipelinePhase::Idle);
     }
 
     #[test]

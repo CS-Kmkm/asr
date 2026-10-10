@@ -3,7 +3,7 @@ use crate::{
     state::{PipelineMode, PipelinePhase},
     types::Settings,
 };
-use tauri_plugin_global_shortcut::Shortcut;
+use tauri_plugin_global_shortcut::{Code, Shortcut};
 
 /// What a voice-mode hotkey press does in the current lifecycle phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +30,41 @@ pub(crate) fn press(
         PipelinePhase::Recording => Press::Busy("another voice mode is already recording"),
         PipelinePhase::Starting => Press::CancelStart,
         PipelinePhase::Processing => Press::Ignore,
+    }
+}
+
+/// The chord that cancels the active voice session: Esc, with no modifier.
+pub(crate) fn cancel_chord() -> Shortcut {
+    Shortcut::new(None, Code::Escape)
+}
+
+/// Whether the cancel chord should be registered. A global hotkey takes the
+/// key from every app, so Esc is held only while a session is starting,
+/// recording, or processing, and never when a saved route already owns it.
+pub(crate) fn wants_cancel_chord(phase: PipelinePhase, routes: &Routes) -> bool {
+    phase != PipelinePhase::Idle && routes.find(cancel_chord()).is_none()
+}
+
+/// Brings the cancel chord registration in line with `wanted`. A refused
+/// registration (another app holds Esc) stays unregistered and is retried
+/// at the next phase change; a failed removal is retried the same way.
+pub(crate) fn sync_cancel_chord<E: std::fmt::Display>(
+    registered: &mut bool,
+    wanted: bool,
+    register: impl FnOnce(Shortcut) -> Result<(), E>,
+    unregister: impl FnOnce(Shortcut) -> Result<(), E>,
+) {
+    if wanted == *registered {
+        return;
+    }
+    let result = if wanted {
+        register(cancel_chord())
+    } else {
+        unregister(cancel_chord())
+    };
+    match result {
+        Ok(()) => *registered = wanted,
+        Err(error) => eprintln!("Cancel shortcut (Esc) update failed: {error}"),
     }
 }
 
@@ -331,6 +366,57 @@ pub(crate) fn update_registrations<E: std::fmt::Display>(
 mod tests {
     use super::*;
     use std::{cell::RefCell, collections::HashSet};
+
+    #[test]
+    fn esc_is_held_only_while_a_voice_session_is_active() {
+        let routes = Routes::parse(&Settings::default()).unwrap();
+        assert!(!wants_cancel_chord(PipelinePhase::Idle, &routes));
+        for active in [
+            PipelinePhase::Starting,
+            PipelinePhase::Recording,
+            PipelinePhase::Processing,
+        ] {
+            assert!(wants_cancel_chord(active, &routes));
+        }
+        // A saved route that already uses Esc keeps it.
+        let mut settings = Settings::default();
+        settings.shortcuts.ask[0] = "Escape".into();
+        let routes = Routes::parse(&settings).unwrap();
+        assert!(routes.find(cancel_chord()).is_some());
+        assert!(!wants_cancel_chord(PipelinePhase::Recording, &routes));
+    }
+
+    #[test]
+    fn cancel_chord_registration_follows_the_session_and_retries_refusals() {
+        let calls = RefCell::new(Vec::new());
+        let register = |result: Result<(), &'static str>| {
+            let calls = &calls;
+            move |chord: Shortcut| {
+                assert_eq!(chord, cancel_chord());
+                calls.borrow_mut().push("register");
+                result
+            }
+        };
+        let unregister = |chord: Shortcut| {
+            assert_eq!(chord, cancel_chord());
+            calls.borrow_mut().push("unregister");
+            Ok::<(), &'static str>(())
+        };
+        let mut registered = false;
+        // Idle: nothing to do.
+        sync_cancel_chord(&mut registered, false, register(Ok(())), unregister);
+        assert!(calls.borrow().is_empty());
+        // Another app holds Esc: stays unregistered, retried next change.
+        sync_cancel_chord(&mut registered, true, register(Err("taken")), unregister);
+        assert!(!registered);
+        sync_cancel_chord(&mut registered, true, register(Ok(())), unregister);
+        assert!(registered);
+        // Starting -> Recording keeps the one registration.
+        sync_cancel_chord(&mut registered, true, register(Ok(())), unregister);
+        sync_cancel_chord(&mut registered, false, register(Ok(())), unregister);
+        assert!(!registered);
+        assert_eq!(*calls.borrow(), vec!["register", "register", "unregister"]);
+    }
 
     #[test]
     fn a_second_press_while_starting_cancels_instead_of_being_ignored() {
