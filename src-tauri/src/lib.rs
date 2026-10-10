@@ -12,6 +12,7 @@ mod live_dictation;
 mod personalization;
 mod recording_overlay;
 mod shortcuts;
+mod startup_error;
 mod state;
 mod storage;
 mod types;
@@ -1396,6 +1397,108 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+fn setup_app(
+    app: &mut tauri::App,
+    log_dir: Option<&Path>,
+    startup_diagnostics: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Must precede the first worker spawn (initialize_model_runtime).
+    // A missing log directory only loses diagnostics, never startup.
+    if let Some(directory) = log_dir {
+        if worker_log::install(directory).is_ok() {
+            worker_log::record_app_start(startup_diagnostics);
+        }
+    }
+    let storage = Storage::open(&database_path(app.handle())?)?;
+    storage.enforce_current_history_policy()?;
+    let settings = storage.get_settings()?;
+    // The autostart plugin registers the currently running executable.
+    // A development executable depends on Vite's dev server and cannot
+    // run on its own at Windows sign-in, so it must never replace the
+    // registration created by an installed/release build.
+    // enable() rewrites the Run entry on every start, which also adds
+    // --autostart to entries registered before the argument existed.
+    #[cfg(not(debug_assertions))]
+    {
+        let autostart_result = if settings.auto_start {
+            app.autolaunch().enable()
+        } else {
+            app.autolaunch().disable()
+        };
+        if let Err(error) = autostart_result {
+            emit_status(
+                app.handle(),
+                "autostart_update_failed",
+                &format!("Autostart update failed: {error}"),
+            );
+        }
+    }
+    let (routes, shadowed) = shortcuts::Routes::parse_saved_with_shadowed(&settings)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    app.manage(storage);
+    app.manage(AppState::default());
+    app.manage(Services::new(&settings));
+    recording_overlay::create(app.handle())?;
+    answer_panel::create(app.handle())?;
+    // Collision losers stay inactive until reassigned (older action
+    // keeps the chord); the warning names them with refused chords.
+    let mut inactive: Vec<String> = shadowed.iter().map(shortcuts::Route::describe).collect();
+    let (active_routes, failures) =
+        shortcuts::register_available(&routes, |chord| app.global_shortcut().register(chord));
+    *app.state::<Services>()
+        .shortcut_routes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = active_routes;
+    if !failures.is_empty() {
+        emit_status(app.handle(), "shortcut_registration_failed", "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.");
+    }
+    for (route, error) in failures {
+        eprintln!("Shortcut registration failed for {}: {error}", route.text);
+        inactive.push(route.describe());
+    }
+    *app.state::<Services>()
+        .inactive_shortcuts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = inactive;
+    if cleanup_stale_artifacts(
+        &std::env::temp_dir(),
+        settings.delete_audio_after_processing,
+    )
+    .is_err()
+    {
+        emit_status(
+            app.handle(),
+            "artifact_cleanup_failed",
+            "Stale temporary audio cleanup failed.",
+        );
+    }
+
+    let show = MenuItem::with_id(app, "show", "Open Local Voice Input", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    TrayIconBuilder::new()
+        .menu(&menu)
+        .tooltip("Local Voice Input")
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .build(app)?;
+    // The main window is configured hidden so a sign-in launch stays in
+    // the tray; every other launch shows it.
+    if !launched_by_autostart(std::env::args_os()) {
+        show_main_window(app.handle());
+    }
+    let app_handle = app.handle().clone();
+    let initialization =
+        tauri::async_runtime::spawn(initialize_model_runtime(app_handle, settings));
+    if let Ok(mut task) = app.state::<Services>().initialization.lock() {
+        *task = Some(initialization);
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let startup_diagnostics = load_environment_file();
@@ -1429,93 +1532,11 @@ pub fn run() {
                 .build(),
         )
         .setup(move |app| {
-            // Must precede the first worker spawn (initialize_model_runtime).
-            // A missing log directory only loses diagnostics, never startup.
-            if let Ok(directory) = app.path().app_log_dir() {
-                if worker_log::install(&directory).is_ok() {
-                    worker_log::record_app_start(&startup_diagnostics);
-                }
-            }
-            let storage = Storage::open(&database_path(app.handle())?)?;
-            storage.enforce_current_history_policy()?;
-            let settings = storage.get_settings()?;
-            // The autostart plugin registers the currently running executable.
-            // A development executable depends on Vite's dev server and cannot
-            // run on its own at Windows sign-in, so it must never replace the
-            // registration created by an installed/release build.
-            // enable() rewrites the Run entry on every start, which also adds
-            // --autostart to entries registered before the argument existed.
-            #[cfg(not(debug_assertions))]
-            {
-                let autostart_result = if settings.auto_start {
-                    app.autolaunch().enable()
-                } else {
-                    app.autolaunch().disable()
-                };
-                if let Err(error) = autostart_result {
-                    emit_status(
-                        app.handle(),
-                        "autostart_update_failed",
-                        &format!("Autostart update failed: {error}"),
-                    );
-                }
-            }
-            let (routes, shadowed) = shortcuts::Routes::parse_saved_with_shadowed(&settings)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-            app.manage(storage);
-            app.manage(AppState::default());
-            app.manage(Services::new(&settings));
-            recording_overlay::create(app.handle())?;
-            answer_panel::create(app.handle())?;
-            // Collision losers stay inactive until reassigned (older action
-            // keeps the chord); the warning names them with refused chords.
-            let mut inactive: Vec<String> = shadowed.iter().map(shortcuts::Route::describe).collect();
-            let (active_routes, failures) = shortcuts::register_available(&routes, |chord| app.global_shortcut().register(chord));
-            *app.state::<Services>().shortcut_routes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = active_routes;
-            if !failures.is_empty() {
-                emit_status(app.handle(), "shortcut_registration_failed", "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.");
-            }
-            for (route, error) in failures {
-                eprintln!("Shortcut registration failed for {}: {error}", route.text);
-                inactive.push(route.describe());
-            }
-            *app.state::<Services>().inactive_shortcuts.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = inactive;
-            if cleanup_stale_artifacts(
-                &std::env::temp_dir(),
-                settings.delete_audio_after_processing,
-            )
-            .is_err()
-            {
-                emit_status(
-                    app.handle(),
-                    "artifact_cleanup_failed",
-                    "Stale temporary audio cleanup failed.",
-                );
-            }
-
-            let show =
-                MenuItem::with_id(app, "show", "Open Local Voice Input", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &quit])?;
-            TrayIconBuilder::new()
-                .menu(&menu)
-                .tooltip("Local Voice Input")
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => show_main_window(app),
-                    "quit" => app.exit(0),
-                    _ => {}
-                })
-                .build(app)?;
-            // The main window is configured hidden so a sign-in launch stays in
-            // the tray; every other launch shows it.
-            if !launched_by_autostart(std::env::args_os()) {
-                show_main_window(app.handle());
-            }
-            let app_handle = app.handle().clone();
-            let initialization =
-                tauri::async_runtime::spawn(initialize_model_runtime(app_handle, settings));
-            if let Ok(mut task) = app.state::<Services>().initialization.lock() {
-                *task = Some(initialization);
+            // Tauri runs this inside the event loop and panics on an error,
+            // which would end the tray app without any visible sign.
+            let log_dir = app.path().app_log_dir().ok();
+            if let Err(error) = setup_app(app, log_dir.as_deref(), &startup_diagnostics) {
+                startup_error::report_and_exit(error.as_ref(), log_dir.as_deref());
             }
             Ok(())
         })
@@ -1602,7 +1623,7 @@ pub fn run() {
             }
         })
         .build(tauri::generate_context!())
-        .expect("error while building Local Voice Input")
+        .unwrap_or_else(|error| startup_error::report_and_exit(&error, None))
         .run(|app, event| {
             if let RunEvent::ExitRequested { api, code, .. } = event {
                 let services = app.state::<Services>();
