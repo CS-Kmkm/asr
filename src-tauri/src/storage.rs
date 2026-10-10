@@ -653,6 +653,11 @@ impl SettingsRepairs {
             .any(|repaired| repaired == key || repaired == UNREADABLE_ROW)
     }
 
+    /// Whether exactly this field was replaced.
+    fn replaced(&self, key: &str) -> bool {
+        self.0.iter().any(|repaired| repaired == key)
+    }
+
     fn push(&mut self, key: impl Into<String>) {
         self.0.push(key.into());
     }
@@ -857,29 +862,90 @@ fn repair_shortcut_routes(settings: &mut Settings, repairs: &mut SettingsRepairs
 
 /// Serializes `settings` over the stored row, so top-level keys and keys
 /// inside `shortcuts` that this build does not know survive a save.
+///
+/// A field this build could not read was shown with its in-memory fallback
+/// (see `load_settings`). While the incoming value still equals that
+/// fallback, the stored value is kept, so an unrelated save (such as cycling
+/// the translation target) does not overwrite a newer build's choice. A
+/// value the user changed away from the fallback is written.
 fn merged_settings_json(settings: &Settings, stored: Option<&str>) -> Result<String, StorageError> {
-    let stored = stored.and_then(|raw| serde_json::from_str(raw).ok());
+    let stored = stored.and_then(|raw| match serde_json::from_str(raw) {
+        Ok(serde_json::Value::Object(object)) => Some((raw, object)),
+        _ => None,
+    });
+    let mut kept_modes = Vec::new();
     let mut value = match (stored, serde_json::to_value(settings)?) {
-        (Some(serde_json::Value::Object(mut object)), serde_json::Value::Object(typed)) => {
-            for (key, field) in typed {
-                if key == "shortcuts" {
-                    if let (
-                        Some(serde_json::Value::Object(saved)),
-                        serde_json::Value::Object(modes),
-                    ) = (object.get_mut(&key), &field)
-                    {
-                        saved.extend(modes.clone());
-                        continue;
-                    }
-                }
-                object.insert(key, field);
-            }
-            serde_json::Value::Object(object)
+        (Some((raw, object)), serde_json::Value::Object(typed)) => {
+            merge_over_stored(raw, object, typed, &mut kept_modes)
         }
         (_, typed) => typed,
     };
+    // A kept mode also keeps its stored scalar mirror.
+    let kept_mirrors: Vec<(&str, Option<serde_json::Value>)> = kept_modes
+        .iter()
+        .map(|&index| {
+            let key = LEGACY_SHORTCUT_KEYS[index];
+            (key, value.get(key).cloned())
+        })
+        .collect();
     mirror_legacy_shortcut_keys(&mut value, &settings.shortcuts)?;
+    if let Some(object) = value.as_object_mut() {
+        for (key, saved) in kept_mirrors {
+            match saved {
+                Some(saved) => object.insert(key.into(), saved),
+                None => object.remove(key),
+            };
+        }
+    }
     Ok(serde_json::to_string(&value)?)
+}
+
+/// Writes `typed` over the stored `object`, keeping each stored value whose
+/// field was replaced in memory and is saved unchanged. Records the indexes
+/// (in `SHORTCUT_MODES` order) of the shortcut modes kept that way.
+fn merge_over_stored(
+    raw: &str,
+    mut object: serde_json::Map<String, serde_json::Value>,
+    typed: serde_json::Map<String, serde_json::Value>,
+    kept_modes: &mut Vec<usize>,
+) -> serde_json::Value {
+    let loaded = load_settings(raw);
+    let fallback = serde_json::to_value(&loaded.settings).unwrap_or_default();
+    let unchanged_fallback =
+        |key: &str, path: Option<&serde_json::Value>, incoming: &serde_json::Value| {
+            loaded.repairs.replaced(key) && path == Some(incoming)
+        };
+    for (key, field) in typed {
+        if unchanged_fallback(&key, fallback.get(&key), &field) {
+            if key == "shortcuts" {
+                kept_modes.extend(0..SHORTCUT_MODES.len());
+            }
+            continue;
+        }
+        if key == "shortcuts" {
+            if let (Some(serde_json::Value::Object(saved)), serde_json::Value::Object(modes)) =
+                (object.get_mut(&key), &field)
+            {
+                for (index, (mode, _)) in SHORTCUT_MODES.iter().enumerate() {
+                    let Some(incoming) = modes.get(*mode) else {
+                        continue;
+                    };
+                    if unchanged_fallback(
+                        &format!("shortcuts.{mode}"),
+                        fallback["shortcuts"].get(*mode),
+                        incoming,
+                    ) {
+                        kept_modes.push(index);
+                    } else {
+                        saved.insert((*mode).into(), incoming.clone());
+                    }
+                }
+                continue;
+            }
+        }
+        object.insert(key, field);
+    }
+    serde_json::Value::Object(object)
 }
 
 fn stored_settings_row(connection: &Connection) -> Result<Option<String>, StorageError> {
@@ -3631,6 +3697,79 @@ mod tests {
             assert_eq!(stored["theme"], "dark");
             assert_eq!(storage.get_settings().unwrap(), settings);
         }
+    }
+
+    /// A row written by a newer build: an unknown retention, five Ask
+    /// chords, and an unreadable audio flag.
+    fn newer_build_row() -> serde_json::Value {
+        let mut value = serde_json::to_value(Settings {
+            setup_complete: true,
+            ..Settings::default()
+        })
+        .unwrap();
+        value["historyRetention"] = "three_months".into();
+        value["deleteAudioAfterProcessing"] = "sometimes".into();
+        value["shortcuts"]["ask"] = serde_json::json!([
+            "Ctrl+Alt+1",
+            "Ctrl+Alt+2",
+            "Ctrl+Alt+3",
+            "Ctrl+Alt+4",
+            "Ctrl+Alt+5"
+        ]);
+        value["askHotkey"] = "Ctrl+Alt+1".into();
+        value
+    }
+
+    #[test]
+    fn unrelated_saves_keep_values_this_build_could_not_read() {
+        for persist in [
+            Storage::update_settings as fn(&Storage, &Settings) -> Result<(), StorageError>,
+            Storage::update_settings_and_apply_history_policy,
+        ] {
+            let storage = Storage::in_memory().unwrap();
+            let row = newer_build_row();
+            store_raw_settings(&storage, &row.to_string());
+            // Same path as cycling the voice translation target.
+            let mut settings = storage.get_settings().unwrap();
+            settings.translation_target_language = "ja".into();
+
+            persist(&storage, &settings).unwrap();
+
+            let stored = stored_settings_value(&storage);
+            assert_eq!(stored["translationTargetLanguage"], "ja");
+            assert_eq!(stored["historyRetention"], "three_months");
+            assert_eq!(stored["deleteAudioAfterProcessing"], "sometimes");
+            assert_eq!(stored["shortcuts"]["ask"], row["shortcuts"]["ask"]);
+            assert_eq!(stored["askHotkey"], "Ctrl+Alt+1");
+            assert_eq!(stored["hotkey"], "Ctrl+Shift+Space");
+            let (reloaded, repairs) = storage.get_settings_with_repairs().unwrap();
+            assert_eq!(reloaded, settings);
+            assert!(repairs.contains("historyRetention"));
+        }
+    }
+
+    #[test]
+    fn explicit_changes_to_unreadable_fields_are_saved() {
+        let storage = Storage::in_memory().unwrap();
+        store_raw_settings(&storage, &newer_build_row().to_string());
+        let mut settings = storage.get_settings().unwrap();
+        settings.history_retention = HistoryRetention::OneWeek;
+        settings.delete_audio_after_processing = false;
+        settings.shortcuts.ask = vec!["Ctrl+Alt+Q".into()];
+
+        storage.update_settings(&settings).unwrap();
+
+        let stored = stored_settings_value(&storage);
+        assert_eq!(stored["historyRetention"], "one_week");
+        assert_eq!(stored["deleteAudioAfterProcessing"], false);
+        assert_eq!(
+            stored["shortcuts"]["ask"],
+            serde_json::json!(["Ctrl+Alt+Q"])
+        );
+        assert_eq!(stored["askHotkey"], "Ctrl+Alt+Q");
+        let (reloaded, repairs) = storage.get_settings_with_repairs().unwrap();
+        assert_eq!(reloaded, settings);
+        assert!(repairs.is_empty());
     }
 
     #[test]
