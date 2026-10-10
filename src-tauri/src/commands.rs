@@ -738,15 +738,57 @@ async fn start_recording_mode(
             {
                 break;
             }
-            let level = {
+            let (level, stream_failed) = {
                 let audio = services.audio.lock().await;
-                audio.level()
+                (audio.level(), audio.stream_error().is_some())
             };
+            if let Some(reason) = automatic_stop_reason(stream_failed) {
+                // The same path as a user stop: the audio captured so far is
+                // transcribed instead of being discarded.
+                let _ = stop_recording_for(
+                    app_for_levels.clone(),
+                    app_for_levels.state::<Services>(),
+                    app_for_levels.state::<AppState>(),
+                    app_for_levels.state::<Storage>(),
+                    reason,
+                )
+                .await;
+                break;
+            }
             let _ = app_for_levels.emit("audio-level", level);
         }
     });
     Ok(())
 }
+
+/// Why a recording stopped. Only `User` comes from an explicit request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopReason {
+    User,
+    MicrophoneDisconnected,
+}
+
+/// Decides, on each level tick, whether a recording must stop by itself. A
+/// failed input stream delivers no more audio.
+fn automatic_stop_reason(stream_failed: bool) -> Option<StopReason> {
+    stream_failed.then_some(StopReason::MicrophoneDisconnected)
+}
+
+/// Whether the input stream failed during this take, either noticed by the
+/// level loop or only by the final capture (a stop within one level tick).
+fn microphone_disconnected(
+    reason: StopReason,
+    artifact: &Result<audio::AudioArtifact, audio::AudioError>,
+) -> bool {
+    reason == StopReason::MicrophoneDisconnected
+        || match artifact {
+            Ok(artifact) => artifact.warning.is_some(),
+            Err(error) => matches!(error, audio::AudioError::StreamFailure(_)),
+        }
+}
+
+const MICROPHONE_DISCONNECTED: &str = "The microphone was disconnected, so recording stopped. The audio captured before the disconnection is being transcribed.";
+const MICROPHONE_DISCONNECTED_WITHOUT_SPEECH: &str = "The microphone was disconnected before usable speech was captured. Check the microphone and start a new recording.";
 
 #[tauri::command]
 pub(crate) async fn stop_recording(
@@ -755,10 +797,22 @@ pub(crate) async fn stop_recording(
     state: State<'_, AppState>,
     storage: State<'_, Storage>,
 ) -> Result<RecordingResult, String> {
+    stop_recording_for(app, services, state, storage, StopReason::User).await
+}
+
+pub(crate) async fn stop_recording_for(
+    app: AppHandle,
+    services: State<'_, Services>,
+    state: State<'_, AppState>,
+    storage: State<'_, Storage>,
+    reason: StopReason,
+) -> Result<RecordingResult, String> {
     let (operation_id, mode, cancel) = match services.lifecycle.begin_processing() {
         Ok(operation) => operation,
         Err(error) => {
-            if error == "no recording is active" {
+            // An automatic stop that lost a race with the user's own stop must
+            // not overwrite the state that stop publishes.
+            if error == "no recording is active" && reason == StopReason::User {
                 emit_state(
                     &app,
                     &state,
@@ -817,15 +871,23 @@ pub(crate) async fn stop_recording(
         None => return Err("live dictation session is unavailable".into()),
     };
     let settings = storage.get_settings().map_err(command_error)?;
+    let disconnected = microphone_disconnected(reason, &artifact_result);
     let artifact = artifact_result.map_err(|error| {
         emit_state(
             &app,
             &state,
             AppPhase::Error,
-            "No usable speech was captured. Start a new recording and try again.",
+            if disconnected {
+                MICROPHONE_DISCONNECTED_WITHOUT_SPEECH
+            } else {
+                "No usable speech was captured. Start a new recording and try again."
+            },
         );
         command_error(error)
     })?;
+    if disconnected {
+        emit_status(&app, "microphone_disconnected", MICROPHONE_DISCONNECTED);
+    }
     let duration_ms = artifact.duration.as_millis() as u64;
     let mut artifact_cleanup = artifact_cleanup
         .take()
@@ -3055,6 +3117,52 @@ mod tests {
             correction_failure_metric_code(&invalid),
             "correction_failed"
         );
+    }
+
+    #[test]
+    fn a_failed_microphone_stops_the_recording() {
+        assert_eq!(automatic_stop_reason(false), None);
+        assert_eq!(
+            automatic_stop_reason(true),
+            Some(StopReason::MicrophoneDisconnected)
+        );
+    }
+
+    #[test]
+    fn a_stream_failure_is_reported_even_when_the_user_stopped_first() {
+        let artifact = |warning: Option<&str>| audio::AudioArtifact {
+            path: PathBuf::from("take.wav"),
+            sample_rate: 24_000,
+            channels: 1,
+            sample_count: 24_000,
+            duration: Duration::from_secs(1),
+            peak_level: 0.5,
+            rms_level: 0.1,
+            vad: audio::VadAnalysis::default(),
+            warning: warning.map(str::to_owned),
+        };
+        assert!(!microphone_disconnected(
+            StopReason::User,
+            &Ok(artifact(None))
+        ));
+        assert!(microphone_disconnected(
+            StopReason::User,
+            &Ok(artifact(Some("device disconnected")))
+        ));
+        assert!(microphone_disconnected(
+            StopReason::MicrophoneDisconnected,
+            &Ok(artifact(None))
+        ));
+        assert!(microphone_disconnected(
+            StopReason::User,
+            &Err(audio::AudioError::StreamFailure(
+                "device disconnected".into()
+            ))
+        ));
+        assert!(!microphone_disconnected(
+            StopReason::User,
+            &Err(audio::AudioError::NoVoiceDetected)
+        ));
     }
 
     #[test]
