@@ -70,10 +70,12 @@ fn failed_take_history_item<'a>(
     app_category: Option<&'a str>,
     duration_ms: u64,
 ) -> Option<NewHistoryItem<'a>> {
-    let (history_mode, source_text, target_language) = match mode {
-        PipelineMode::Dictate => ("faithful", None, None),
-        PipelineMode::Translate => ("translate", None, Some(target_language?)),
-        PipelineMode::Edit => ("edit", Some(edit_source?), None),
+    // Edit captures a selection, not a target window, so like a successful
+    // Edit row it records no app category.
+    let (history_mode, source_text, target_language, app_category) = match mode {
+        PipelineMode::Dictate => ("faithful", None, None, app_category),
+        PipelineMode::Translate => ("translate", None, Some(target_language?), app_category),
+        PipelineMode::Edit => ("edit", Some(edit_source?), None, None),
         PipelineMode::Ask => return None,
     };
     Some(NewHistoryItem {
@@ -3355,11 +3357,18 @@ mod tests {
         .unwrap();
         assert_eq!(translate.mode, "translate");
         assert_eq!(translate.target_language, Some("English"));
-        let edit =
-            failed_take_history_item(PipelineMode::Edit, "mock", Some("selected"), None, None, 1)
-                .unwrap();
+        let edit = failed_take_history_item(
+            PipelineMode::Edit,
+            "mock",
+            Some("selected"),
+            None,
+            Some("messaging"),
+            1,
+        )
+        .unwrap();
         assert_eq!(edit.mode, "edit");
         assert_eq!(edit.source_text, Some("selected"));
+        assert_eq!(edit.app_category, None);
         for mode in ["faithful", "translate", "edit"] {
             assert!(history_pipeline_mode(mode).is_ok());
         }
