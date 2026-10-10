@@ -679,6 +679,9 @@ async fn start_recording_mode(
     trigger_chord: Option<String>,
     mode: PipelineMode,
 ) -> Result<(), String> {
+    if from_shortcut {
+        recording_overlay::anchor_to_foreground();
+    }
     let claimed = if services.translation_active.load(Ordering::Acquire) {
         Err("selected-text translation is already active")
     } else {
@@ -776,6 +779,25 @@ async fn start_owned_recording(
                 .map_err(command_error)
         })
         .transpose()?;
+    // The overlay appears on the monitor of the window this take targets.
+    let ask_target = ask_session
+        .as_ref()
+        .and_then(|session| match &session.capture {
+            AskCapture::Selected(selection) => Some(selection.target()),
+            AskCapture::Caret(target) => Some(target),
+            AskCapture::Unavailable => None,
+        });
+    recording_overlay::set_anchor(
+        target
+            .as_ref()
+            .or_else(|| {
+                edit_session
+                    .as_ref()
+                    .map(|session| session.selection.target())
+            })
+            .or(ask_target)
+            .map(|target| target.window_handle),
+    );
     let preparing = services
         .model
         .lock()
