@@ -356,7 +356,11 @@ pub(super) fn diagnose<B: Backend>(
         Ok(Some(false)) => {}
         // Only a paste after input requires an explicitly inactive IME.
         _ if strict => return InsertionDetail::ImeUnknown,
-        _ => {}
+        Ok(None) => {}
+        // Every paste guard requires an answer, so a failed query blocked a
+        // paste that was never sent. It says nothing about readability.
+        Err(_) if !after_paste => return InsertionDetail::ImeUnknown,
+        Err(_) => {}
     }
     // A queued paste's payload remains intact even if the selection later
     // changes. These reasons describe only a paste that was never sent, and
@@ -1130,6 +1134,7 @@ pub(super) mod tests {
         sequence: Cell<u32>,
         target_valid: Cell<bool>,
         pub(crate) ime: Cell<Option<bool>>,
+        ime_query_fails: Cell<bool>,
         text_readable: Cell<bool>,
         selection_readable: Cell<bool>,
         paste_accepted: Cell<bool>,
@@ -1165,6 +1170,7 @@ pub(super) mod tests {
                 sequence: Cell::new(0),
                 target_valid: Cell::new(true),
                 ime: Cell::new(Some(false)),
+                ime_query_fails: Cell::new(false),
                 text_readable: Cell::new(true),
                 selection_readable: Cell::new(true),
                 paste_accepted: Cell::new(true),
@@ -1215,6 +1221,11 @@ pub(super) mod tests {
             }
         }
         fn ime_composition_active(&self, _: &TargetWindow) -> Result<Option<bool>, InjectionError> {
+            if self.ime_query_fails.get() {
+                return Err(InjectionError::BackendFailure(
+                    "failed to query IME composition",
+                ));
+            }
             Ok(self.ime.get())
         }
         fn focus_identity(&self, _: &TargetWindow) -> Result<Vec<i32>, InjectionError> {
@@ -1498,6 +1509,45 @@ pub(super) mod tests {
             .iter()
             .filter(|call| **call == "paste")
             .count()
+    }
+
+    #[test]
+    fn a_failed_ime_query_is_reported_as_unknown_not_unreadable() {
+        let backend = MockBackend::new();
+        backend.ime_query_fails.set(true);
+        backend.text_readable.set(false);
+        // Every paste guard requires an IME answer, so nothing is sent.
+        assert_eq!(
+            final_paste(&backend, FinalGuard::Untouched),
+            InsertResult::ClipboardOnly
+        );
+        assert_eq!(pastes(&backend), 0);
+        let monitor = monitor();
+        for guard in [FinalGuard::Untouched, FinalGuard::AfterInput] {
+            assert_eq!(
+                diagnose(
+                    &backend,
+                    &target(),
+                    &monitor,
+                    monitor.checkpoint(),
+                    false,
+                    guard
+                ),
+                InsertionDetail::ImeUnknown
+            );
+        }
+        // After a sent paste, the unreadable field explains the outcome.
+        assert_eq!(
+            diagnose(
+                &backend,
+                &target(),
+                &monitor,
+                monitor.checkpoint(),
+                true,
+                FinalGuard::Untouched
+            ),
+            InsertionDetail::TargetUnreadable
+        );
     }
 
     #[test]
