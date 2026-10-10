@@ -670,6 +670,48 @@ fn start_failure(
     }
 }
 
+const START_NO_TARGET: &str =
+    "No target window was found. Click where the text should go, then try again.";
+const START_SECURE_TARGET: &str =
+    "Password and other protected fields cannot receive dictated text.";
+const START_ELEVATED_TARGET: &str =
+    "The target app runs with higher privileges, so this app cannot type into it.";
+const START_MICROPHONE_NOT_FOUND: &str =
+    "The selected microphone was not found. Check the microphone in Settings.";
+const START_MICROPHONE_UNAVAILABLE: &str =
+    "The microphone could not be opened. Check the microphone in Settings.";
+
+/// The fixed, translatable sentence a failed start publishes for a known
+/// error kind. Errors arrive as display text (often behind `command_error`'s
+/// prefix) and may carry details such as a device id, which a fixed message
+/// must not embed. Other errors pass through; the overlay shows a generic
+/// translated message for any it does not know.
+fn start_failure_message(error: &str) -> String {
+    let detail = error
+        .strip_prefix("local operation failed: ")
+        .unwrap_or(error);
+    let known = match detail {
+        "no foreground target is available" => Some(START_NO_TARGET),
+        "text insertion into secure controls is disabled" => Some(START_SECURE_TARGET),
+        "the target cannot be accessed at this privilege level" => Some(START_ELEVATED_TARGET),
+        _ if detail.starts_with("audio input device not found") => Some(START_MICROPHONE_NOT_FOUND),
+        _ if [
+            "microphone capture is supported on Windows only",
+            "failed to enumerate audio devices",
+            "failed to configure audio device",
+            "failed to build input stream",
+            "failed to start input stream",
+        ]
+        .iter()
+        .any(|prefix| detail.starts_with(prefix)) =>
+        {
+            Some(START_MICROPHONE_UNAVAILABLE)
+        }
+        _ => None,
+    };
+    known.map_or_else(|| error.to_owned(), str::to_owned)
+}
+
 async fn start_recording_mode(
     app: AppHandle,
     services: State<'_, Services>,
@@ -729,7 +771,9 @@ async fn start_recording_mode(
             ) {
                 StartFailure::Keep => {}
                 StartFailure::Idle => emit_state(&app, &state, AppPhase::Idle, cancel_message),
-                StartFailure::Error => emit_state(&app, &state, AppPhase::Error, error),
+                StartFailure::Error => {
+                    emit_state(&app, &state, AppPhase::Error, &start_failure_message(error))
+                }
             }
         }
     }
@@ -3722,6 +3766,44 @@ mod tests {
         assert_eq!(
             load_unless_cancelled(async { Err("load failed".into()) }, cancel).await,
             Err("load failed".to_string())
+        );
+    }
+
+    #[test]
+    fn known_start_errors_become_fixed_translatable_messages() {
+        let wrapped = |detail: &str| format!("local operation failed: {detail}");
+        assert_eq!(
+            start_failure_message(&wrapped("no foreground target is available")),
+            START_NO_TARGET
+        );
+        assert_eq!(
+            start_failure_message(&wrapped("text insertion into secure controls is disabled")),
+            START_SECURE_TARGET
+        );
+        assert_eq!(
+            start_failure_message(&wrapped(
+                "the target cannot be accessed at this privilege level"
+            )),
+            START_ELEVATED_TARGET
+        );
+        // The device id is not part of the message.
+        let missing = start_failure_message(&wrapped(
+            "audio input device not found: {0.0.1.00000000}.{abc}",
+        ));
+        assert_eq!(missing, START_MICROPHONE_NOT_FOUND);
+        assert!(!missing.contains("abc"));
+        assert_eq!(
+            start_failure_message(&wrapped("failed to build input stream: busy")),
+            START_MICROPHONE_UNAVAILABLE
+        );
+        // Already fixed sentences and unknown errors pass through.
+        assert_eq!(
+            start_failure_message("Select text in a supported foreground edit control."),
+            "Select text in a supported foreground edit control."
+        );
+        assert_eq!(
+            start_failure_message(&wrapped("worker exited unexpectedly")),
+            wrapped("worker exited unexpectedly")
         );
     }
 

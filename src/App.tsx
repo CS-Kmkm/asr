@@ -62,6 +62,7 @@ import {
   I18nProvider,
   insertionDetailLabels,
   insertionOutcomeNotices,
+  isAppMessage,
   translate,
   translateAppMessage,
   useI18n,
@@ -341,7 +342,11 @@ function RecordingOverlay() {
         <span className="notice-mark" aria-hidden="true" />
         <div className="processing-copy">
           <span className="recording-overlay-label">{t(failed ? "Not completed" : "Completed with a warning")}</span>
-          <span className="notice-detail">{translateAppMessage(language, notice.message)}</span>
+          <span className="notice-detail">
+            {isAppMessage(notice.message)
+              ? translateAppMessage(language, notice.message)
+              : t("Open the app window for details.")}
+          </span>
         </div>
       </div>
     );
