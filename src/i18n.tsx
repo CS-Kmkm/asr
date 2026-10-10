@@ -300,6 +300,7 @@ const en = {
   "The clipboard was unavailable.": "The clipboard was unavailable.",
   "The insertion backend failed.": "The insertion backend failed.",
   "Translation failed; the transcript was copied.": "Translation failed; the transcript was copied.",
+  "Started from this app, so the result was copied instead of inserted.": "Started from this app, so the result was copied instead of inserted.",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
@@ -601,6 +602,7 @@ const ja: Record<MessageKey, string> = {
   "The clipboard was unavailable.": "クリップボードを使用できませんでした。",
   "The insertion backend failed.": "挿入処理でエラーが発生しました。",
   "Translation failed; the transcript was copied.": "翻訳に失敗したため、原文をコピーしました。",
+  "Started from this app, so the result was copied instead of inserted.": "このアプリから開始したため、挿入せずにクリップボードにコピーしました。",
 } satisfies Record<MessageKey, string>;
 
 const catalogs = { en, ja } satisfies Record<UiLanguage, Record<MessageKey, string>>;
@@ -638,6 +640,7 @@ export const insertionDetailLabels: Record<string, MessageKey> = {
   backend_failure: "The insertion backend failed.",
   translation_failed: "Translation failed; the transcript was copied.",
   transcript_truncated: "The recording was too long for this speech model. Retrying with the same model will fail the same way; record shorter clips or switch to faster-whisper.",
+  no_external_target: "Started from this app, so the result was copied instead of inserted.",
 };
 
 const appMessageKeys: ReadonlySet<MessageKey> = new Set(

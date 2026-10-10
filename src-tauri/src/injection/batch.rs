@@ -9,7 +9,8 @@ fn safe<B: Backend>(
     activity: Option<(&InputMonitor, u64)>,
     policy: SafetyPolicy,
 ) -> bool {
-    activity.is_none_or(|(monitor, checkpoint)| monitor.unchanged_since(checkpoint))
+    !target.is_this_app()
+        && activity.is_none_or(|(monitor, checkpoint)| monitor.unchanged_since(checkpoint))
         && backend.validate_target(target).is_ok()
         && backend
             .ime_composition_active(target)
@@ -21,12 +22,14 @@ fn safe<B: Backend>(
 /// foreground and focused, and no IME composition is known to be open. An IME
 /// state or selection that cannot be read stays unreadable however long we
 /// wait, so the paste guard decides those immediately. Input is checked
-/// separately.
+/// separately. This app's own window is never pasted into, so nothing is
+/// worth waiting for.
 pub(super) fn ready<B: Backend>(backend: &B, target: &TargetWindow) -> bool {
-    backend.validate_target(target).is_ok()
-        && !backend
-            .ime_composition_active(target)
-            .is_ok_and(|active| active == Some(true))
+    target.is_this_app()
+        || backend.validate_target(target).is_ok()
+            && !backend
+                .ime_composition_active(target)
+                .is_ok_and(|active| active == Some(true))
 }
 
 /// How a final additive paste is guarded.
@@ -332,6 +335,9 @@ pub(super) fn diagnose<B: Backend>(
     guard: FinalGuard,
 ) -> InsertionDetail {
     let strict = guard == FinalGuard::AfterInput;
+    if target.is_this_app() {
+        return InsertionDetail::NoExternalTarget;
+    }
     let Some(checkpoint) = checkpoint.filter(|_| monitor.checkpoint().is_some()) else {
         return InsertionDetail::InputMonitorUnavailable;
     };
@@ -1548,6 +1554,74 @@ pub(super) mod tests {
             ),
             InsertionDetail::TargetUnreadable
         );
+    }
+
+    #[test]
+    fn a_recording_started_in_this_app_is_copied_without_pasting() {
+        let monitor = monitor();
+        let checkpoint = monitor.checkpoint().unwrap();
+        let (_sender, cancel) = watch::channel(false);
+        let app = TargetWindow::this_app();
+        assert!(app.is_this_app());
+        assert!(!target().is_this_app());
+        for guard in [FinalGuard::Untouched, FinalGuard::AfterInput] {
+            let backend = MockBackend::new();
+            assert!(ready(&backend, &app), "nothing to wait for");
+            assert_eq!(
+                insert_final(
+                    &backend,
+                    InjectionOptions::default(),
+                    "result",
+                    &app,
+                    &monitor,
+                    checkpoint,
+                    &cancel,
+                    guard
+                )
+                .unwrap(),
+                InsertResult::ClipboardOnly
+            );
+            assert_eq!(*backend.calls.borrow(), ["write"]);
+            assert_eq!(*backend.clipboard.borrow(), "result");
+            assert_eq!(backend.content(), "prefix  suffix");
+            assert_eq!(
+                diagnose(&backend, &app, &monitor, Some(checkpoint), false, guard),
+                InsertionDetail::NoExternalTarget
+            );
+        }
+        // Opt-in live text never reaches this app's window either.
+        let backend = MockBackend::new();
+        let mut session = begin(
+            &backend,
+            InjectionOptions::default(),
+            "draft",
+            &app,
+            &monitor,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!session.paste_was_queued());
+        finish(
+            &backend,
+            InjectionOptions::default(),
+            &mut session,
+            "final",
+            &monitor,
+        )
+        .unwrap();
+        assert_eq!(pastes(&backend), 0);
+        assert_eq!(*backend.clipboard.borrow(), "final");
+    }
+
+    #[test]
+    fn only_a_recording_started_from_this_apps_ui_loses_its_target() {
+        let mut own = target();
+        own.process_id = std::process::id();
+        assert!(recording_target(own.clone(), false).is_this_app());
+        // A hotkey keeps the captured foreground window, even this app's.
+        assert_eq!(recording_target(own.clone(), true), own);
+        // Starting from the tray while another app is foreground keeps it.
+        assert_eq!(recording_target(target(), false), target());
     }
 
     #[test]

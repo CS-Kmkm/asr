@@ -687,6 +687,7 @@ async fn start_recording_mode(
         .then(|| {
             SystemTextInjector::default()
                 .capture_target()
+                .map(|target| injection::recording_target(target, from_shortcut))
                 .map_err(command_error)
         })
         .transpose()?;

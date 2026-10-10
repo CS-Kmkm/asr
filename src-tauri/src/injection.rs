@@ -27,6 +27,37 @@ pub struct TargetWindow {
     pub is_secure: bool,
 }
 
+impl TargetWindow {
+    /// Stands for this app's own window, which is never an insertion target.
+    /// It has no window handle, so it never matches a captured foreground
+    /// window; every insertion copies the result instead.
+    pub(crate) fn this_app() -> Self {
+        Self {
+            window_handle: 0,
+            control_handle: 0,
+            process_id: std::process::id(),
+            thread_id: 0,
+            is_secure: false,
+        }
+    }
+
+    pub(crate) fn is_this_app(&self) -> bool {
+        self.window_handle == 0 && self.process_id == std::process::id()
+    }
+}
+
+/// The target of a recording. Starting from this app's own UI (its Record
+/// button) leaves this app in the foreground, so there is no external field
+/// to insert into and the result is delivered on the clipboard. A hotkey
+/// keeps whatever foreground window it captured.
+pub(crate) fn recording_target(captured: TargetWindow, from_shortcut: bool) -> TargetWindow {
+    if !from_shortcut && captured.process_id == std::process::id() {
+        TargetWindow::this_app()
+    } else {
+        captured
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InsertResult {
     ClipboardPaste,
@@ -52,6 +83,8 @@ pub enum InsertionDetail {
     NotConfirmed,
     ClipboardUnavailable,
     BackendFailure,
+    /// The recording was started from this app's own window.
+    NoExternalTarget,
 }
 
 impl InsertionDetail {
@@ -69,6 +102,7 @@ impl InsertionDetail {
             Self::NotConfirmed => "not_confirmed",
             Self::ClipboardUnavailable => "clipboard_unavailable",
             Self::BackendFailure => "backend_failure",
+            Self::NoExternalTarget => "no_external_target",
         }
     }
 
