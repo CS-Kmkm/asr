@@ -152,6 +152,9 @@ def _install_fake_faster_whisper() -> dict[str, types.ModuleType]:
     return {"faster_whisper": fake_fw, "ctranslate2": fake_ct2}
 
 
+BUILTIN_REPO = "Systran/faster-whisper-tiny"
+
+
 class ResolveModelFilesTests(unittest.TestCase):
     def test_cached_model_is_loaded_without_downloading(self) -> None:
         backend = FasterWhisperBackend()
@@ -194,8 +197,13 @@ class ResolveModelFilesTests(unittest.TestCase):
             ],
         )
 
-    def resolve_with_cached_files(self, files: list[str]) -> tuple[str, list[dict], list[dict]]:
-        """Resolve against a fake hub cache whose snapshot folder holds ``files``."""
+    def resolve_with_cached_files(
+        self, files: list[str], repo_id: str = "org/repo"
+    ) -> tuple[str, list[dict], list[dict]]:
+        """Resolve against a fake hub cache whose snapshot folder holds ``files``.
+
+        ``BUILTIN_REPO`` is the only repository faster-whisper maps a name to.
+        """
         backend = FasterWhisperBackend()
         events: list[dict] = []
         backend.progress = events.append
@@ -211,8 +219,15 @@ class ResolveModelFilesTests(unittest.TestCase):
                 (snapshot / name).write_bytes(b"x")
             hub = types.ModuleType("huggingface_hub")
             hub.snapshot_download = lambda repo_id, **kwargs: str(snapshot)  # type: ignore[attr-defined]
-            with patch.dict(sys.modules, {"huggingface_hub": hub}), patch(
-                "asr_worker.backends.faster_whisper_repo_id", return_value="org/repo"
+            fw_utils = types.ModuleType("faster_whisper.utils")
+            fw_utils._MODELS = {"tiny": BUILTIN_REPO}  # type: ignore[attr-defined]
+            fake_modules = {
+                "huggingface_hub": hub,
+                "faster_whisper": types.ModuleType("faster_whisper"),
+                "faster_whisper.utils": fw_utils,
+            }
+            with patch.dict(sys.modules, fake_modules), patch(
+                "asr_worker.backends.faster_whisper_repo_id", return_value=repo_id
             ), patch("asr_worker.backends.download_snapshot", fake_download):
                 source = backend._resolve_model_files()
                 if source == str(snapshot):
@@ -231,6 +246,35 @@ class ResolveModelFilesTests(unittest.TestCase):
     def test_complete_cached_snapshot_is_loaded_without_downloading(self) -> None:
         source, events, downloads = self.resolve_with_cached_files(
             ["config.json", "model.bin", "tokenizer.json", "vocabulary.json", "preprocessor_config.json"]
+        )
+
+        self.assertEqual(source, "<cached snapshot>")
+        self.assertEqual(downloads, [])
+        self.assertEqual(events, [])
+
+    def test_builtin_model_without_tokenizer_is_downloaded_again(self) -> None:
+        source, events, downloads = self.resolve_with_cached_files(
+            ["config.json", "model.bin", "vocabulary.json"], BUILTIN_REPO
+        )
+
+        self.assertEqual(source, "/downloaded/repo")
+        self.assertEqual(len(downloads), 1)
+        self.assertEqual(events, [{"stage": "download", "model": BUILTIN_REPO}])
+
+    def test_complete_builtin_snapshot_is_loaded_without_downloading(self) -> None:
+        source, events, downloads = self.resolve_with_cached_files(
+            ["config.json", "model.bin", "tokenizer.json", "vocabulary.txt"], BUILTIN_REPO
+        )
+
+        self.assertEqual(source, "<cached snapshot>")
+        self.assertEqual(downloads, [])
+        self.assertEqual(events, [])
+
+    def test_custom_repository_without_tokenizer_counts_as_cached(self) -> None:
+        # faster-whisper falls back to another tokenizer for such repositories,
+        # so a missing tokenizer.json must not re-download on every load.
+        source, events, downloads = self.resolve_with_cached_files(
+            ["config.json", "model.bin", "vocabulary.json"], "org/custom-whisper"
         )
 
         self.assertEqual(source, "<cached snapshot>")

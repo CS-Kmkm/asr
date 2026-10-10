@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from asr_worker.download import (
     FASTER_WHISPER_ALLOW_PATTERNS,
+    FASTER_WHISPER_BUILTIN_REQUIRED_FILES,
     FASTER_WHISPER_REQUIRED_FILES,
     byte_progress_tqdm,
     cached_snapshot_path,
@@ -86,7 +87,7 @@ class CachedSnapshotPathTests(unittest.TestCase):
         return result, str(snapshot), calls
 
     def test_complete_snapshot_is_cached(self) -> None:
-        result, snapshot, calls = self.resolve(COMPLETE_SNAPSHOT, FASTER_WHISPER_REQUIRED_FILES)
+        result, snapshot, calls = self.resolve(COMPLETE_SNAPSHOT, FASTER_WHISPER_BUILTIN_REQUIRED_FILES)
 
         self.assertEqual(result, snapshot)
         # The cache lookup itself must never reach the network.
@@ -94,7 +95,7 @@ class CachedSnapshotPathTests(unittest.TestCase):
 
     def test_older_vocabulary_format_counts_as_complete(self) -> None:
         files = ["config.json", "model.bin", "tokenizer.json", "vocabulary.txt"]
-        result, snapshot, _ = self.resolve(files, FASTER_WHISPER_REQUIRED_FILES)
+        result, snapshot, _ = self.resolve(files, FASTER_WHISPER_BUILTIN_REQUIRED_FILES)
 
         self.assertEqual(result, snapshot)
 
@@ -102,17 +103,28 @@ class CachedSnapshotPathTests(unittest.TestCase):
         # huggingface_hub creates the snapshot folder before fetching files, and
         # the small files finish first, so an interrupted download leaves this.
         files = ["config.json", "tokenizer.json", "vocabulary.json"]
-        result, _, _ = self.resolve(files, FASTER_WHISPER_REQUIRED_FILES)
+        result, _, _ = self.resolve(files, FASTER_WHISPER_BUILTIN_REQUIRED_FILES)
 
         self.assertIsNone(result)
 
     def test_snapshot_without_any_vocabulary_is_not_cached(self) -> None:
-        result, _, _ = self.resolve(["config.json", "model.bin", "tokenizer.json"], FASTER_WHISPER_REQUIRED_FILES)
+        result, _, _ = self.resolve(
+            ["config.json", "model.bin", "tokenizer.json"], FASTER_WHISPER_BUILTIN_REQUIRED_FILES
+        )
 
         self.assertIsNone(result)
 
     def test_optional_preprocessor_config_is_not_required(self) -> None:
         self.assertNotIn("preprocessor_config.json", FASTER_WHISPER_REQUIRED_FILES)
+        self.assertNotIn("preprocessor_config.json", FASTER_WHISPER_BUILTIN_REQUIRED_FILES)
+
+    def test_tokenizer_is_required_only_for_builtin_repositories(self) -> None:
+        files = ["config.json", "model.bin", "vocabulary.json"]
+        builtin, _, _ = self.resolve(files, FASTER_WHISPER_BUILTIN_REQUIRED_FILES)
+        custom, snapshot, _ = self.resolve(files, FASTER_WHISPER_REQUIRED_FILES)
+
+        self.assertIsNone(builtin)
+        self.assertEqual(custom, snapshot)
 
     def test_without_required_files_any_snapshot_folder_counts(self) -> None:
         result, snapshot, _ = self.resolve([], None)

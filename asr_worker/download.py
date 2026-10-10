@@ -15,22 +15,24 @@ FASTER_WHISPER_ALLOW_PATTERNS = [
     "vocabulary.*",
 ]
 
-# Files a faster-whisper snapshot cannot load correctly without. huggingface_hub
-# creates the snapshot folder before it fetches the files, so an interrupted
-# first download leaves a folder that looks cached but lacks the large model.bin.
-# CTranslate2 needs model.bin, config.json and a vocabulary file; without
-# tokenizer.json faster-whisper silently fetches the openai/whisper-tiny
-# tokenizer instead, which needs the network and lacks the language token
-# large-v3 adds.
-# Every repository faster-whisper maps a model name to ships all of these.
+# Files a faster-whisper snapshot cannot load without. huggingface_hub creates
+# the snapshot folder before it fetches the files, so an interrupted first
+# download leaves a folder that looks cached but lacks the large model.bin.
+# CTranslate2 needs model.bin, config.json and a vocabulary file.
 # preprocessor_config.json is left out: older repositories (large-v2 and the
 # non-distilled models before large-v3) do not have it.
 FASTER_WHISPER_REQUIRED_FILES = [
     "config.json",
     "model.bin",
-    "tokenizer.json",
     "vocabulary.*",
 ]
+
+# Also required for the repositories faster-whisper maps a model name to, all
+# of which ship it. Without it faster-whisper silently fetches the
+# openai/whisper-tiny tokenizer, which needs the network and lacks the
+# language token large-v3 adds. A custom repository may lack it legitimately,
+# so requiring it there would re-download on every load.
+FASTER_WHISPER_BUILTIN_REQUIRED_FILES = [*FASTER_WHISPER_REQUIRED_FILES, "tokenizer.json"]
 
 # Progress travels over the JSONL protocol, so report often enough for a smooth
 # progress bar without flooding stdout.
