@@ -86,6 +86,9 @@ pub enum InsertionDetail {
     BackendFailure,
     /// The recording was started from this app's own window.
     NoExternalTarget,
+    /// The paste was confirmed, but the previous clipboard could not be
+    /// preserved or restored, so the pasted text replaced it.
+    ClipboardNotRestored,
 }
 
 impl InsertionDetail {
@@ -104,7 +107,18 @@ impl InsertionDetail {
             Self::ClipboardUnavailable => "clipboard_unavailable",
             Self::BackendFailure => "backend_failure",
             Self::NoExternalTarget => "no_external_target",
+            Self::ClipboardNotRestored => "clipboard_not_restored",
         }
+    }
+
+    /// The only detail a confirmed paste carries: it left the clipboard
+    /// unrestored.
+    pub(crate) fn for_confirmed_paste(
+        result: InsertResult,
+        clipboard_not_restored: bool,
+    ) -> Option<Self> {
+        (result == InsertResult::ClipboardPaste && clipboard_not_restored)
+            .then_some(Self::ClipboardNotRestored)
     }
 
     /// Cancellation is not an insertion outcome and has no detail.
@@ -124,6 +138,31 @@ impl InsertionDetail {
             InjectionError::UnsupportedPlatform
             | InjectionError::NoSelection
             | InjectionError::BackendFailure(_) => Some(Self::BackendFailure),
+        }
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_confirmed_paste_reports_an_unrestored_clipboard() {
+        assert_eq!(
+            InsertionDetail::for_confirmed_paste(InsertResult::ClipboardPaste, true),
+            Some(InsertionDetail::ClipboardNotRestored)
+        );
+        assert_eq!(
+            InsertionDetail::ClipboardNotRestored.code(),
+            "clipboard_not_restored"
+        );
+        assert_eq!(
+            InsertionDetail::for_confirmed_paste(InsertResult::ClipboardPaste, false),
+            None
+        );
+        // Other outcomes leave the text on the clipboard by design.
+        for result in [InsertResult::ClipboardOnly, InsertResult::PasteUnverified] {
+            assert_eq!(InsertionDetail::for_confirmed_paste(result, true), None);
         }
     }
 }
@@ -360,6 +399,15 @@ impl SystemTextInjector {
     /// pasted text then stays on the clipboard.
     pub(crate) fn take_clipboard_not_restored(&self) -> bool {
         self.backend.take_clipboard_not_restored()
+    }
+
+    /// Detail to record with a confirmed paste, consuming the not-restored
+    /// flag. `None` for every other outcome, which has its own diagnosis.
+    pub(crate) fn confirmed_paste_detail(&self, result: InsertResult) -> Option<InsertionDetail> {
+        if result != InsertResult::ClipboardPaste {
+            return None;
+        }
+        InsertionDetail::for_confirmed_paste(result, self.take_clipboard_not_restored())
     }
 
     pub(crate) fn copy_to_clipboard(&self, text: &str) -> Result<(), InjectionError> {

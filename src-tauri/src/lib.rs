@@ -1293,8 +1293,10 @@ async fn translate_selection(app: AppHandle) {
     };
     match injector.replace_selection(&selection, &translated, &monitor, checkpoint) {
         Ok(result) => {
-            let (kind, message) =
-                selection_translation_status(result, injector.take_clipboard_not_restored());
+            let (kind, message) = selection_translation_status(
+                result,
+                injector.confirmed_paste_detail(result).is_some(),
+            );
             emit_status(&app, kind, message);
         }
         Err(_) => {

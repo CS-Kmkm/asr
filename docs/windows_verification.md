@@ -200,7 +200,8 @@ pnpm run tauri dev
 最終挿入: insert_final()
   ガード（入力なし → validate_target → IME）を確認する。満たさない場合は clipboard_only
   入力欄の内容を UI Automation (TextPattern) で読む
-    読める:   clipboard_snapshot()（Restore clipboard が ON のときだけ。失敗しても続行し、復元しない）
+    読める:   clipboard_snapshot()（Restore clipboard が ON のときだけ。約 155 ms 再試行しても開けない場合は中止する。
+              保存できない形式なら続行し、復元せずに clipboard_not_restored を記録する）
               → clipboard_write(ExcludeFromHistory) → ガードを再確認 → Ctrl+V (SendInput)
               → 内容の変化を最大約 1 秒確認する
               → 確認できた: clipboard_paste（スナップショットがあればクリップボードを復元する）
@@ -245,7 +246,8 @@ pnpm run tauri dev
 | `selection_active` / `selection_unknown` | 録音中の操作の後、入力欄で文字が選択されていた／選択範囲を確認できなかった |
 | `target_unreadable` | Ctrl+V を送ったが、入力欄の内容を読めないため確認できなかった |
 | `not_confirmed` | 入力欄は読めたが、貼り付けた内容を照合できなかった |
-| `clipboard_unavailable` | クリップボードに書き込めなかった |
+| `clipboard_unavailable` | クリップボードに書き込めなかった、または別のアプリが開いたままだった |
+| `clipboard_not_restored` | 挿入は確認できたが、元のクリップボードを保存・復元できなかった（結果は `clipboard_paste`） |
 | `no_external_target` | アプリ自身のウィンドウから録音を開始した |
 | `translation_failed` | 翻訳に失敗したため、原文をコピーした |
 
@@ -310,7 +312,7 @@ pnpm run tauri dev
 |---|---|---|
 | 1 | Settings → **「Restore clipboard」** を **ON** にする | 設定が保存される |
 | 2 | テキスト A をコピーし、メモ帳でホットキーから発話・停止する | `clipboard_paste` になり、クリップボードが **A に戻る** |
-| 3 | 64 MiB を超える画像やリモートデスクトップ経由のデータなど、保存できない形式をコピーしてから手順 2 を繰り返す | スナップショットを取れなくても貼り付ける。クリップボードは復元されず、認識テキストが残る |
+| 3 | 64 MiB を超える画像やリモートデスクトップ経由のデータなど、保存できない形式をコピーしてから手順 2 を繰り返す | スナップショットを取れなくても貼り付ける（`clipboard_paste`、理由 `clipboard_not_restored`）。オーバーレイに「挿入しました。元のクリップボードの内容は復元できませんでした。」と表示され、クリップボードには認識テキストが残る |
 | 4 | Settings → **「Restore clipboard」** を **OFF** にして手順 2 を繰り返す | `clipboard_paste` になり、クリップボードは復元されない（認識テキストが残る） |
 | 5 | Windows Terminal など `paste_unverified` になる入力欄で手順 2 を繰り返す | ON でもクリップボードは復元されない（貼り付けがまだ処理中の可能性があるため） |
 

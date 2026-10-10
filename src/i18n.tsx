@@ -29,6 +29,7 @@ const en = {
   "Ask result is on the clipboard.": "Ask result is on the clipboard.",
   "The answer panel could not be shown and the clipboard is unavailable; the Ask result is available in this app.": "The answer panel could not be shown and the clipboard is unavailable; the Ask result is available in this app.",
   "Ask completed.": "Ask completed.",
+  "Ask completed. Your previous clipboard could not be restored.": "Ask completed. Your previous clipboard could not be restored.",
   "Not configured": "Not configured",
   "Configure global profile": "Configure global profile",
   "Profile scopes must be valid and unique before changes are saved.": "Profile scopes must be valid and unique before changes are saved.",
@@ -303,6 +304,8 @@ const en = {
   "The insertion backend failed.": "The insertion backend failed.",
   "Translation failed; the transcript was copied.": "Translation failed; the transcript was copied.",
   "Started from this app, so the result was copied instead of inserted.": "Started from this app, so the result was copied instead of inserted.",
+  "Inserted. Your previous clipboard could not be restored.": "Inserted. Your previous clipboard could not be restored.",
+  "The previous clipboard could not be restored.": "The previous clipboard could not be restored.",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
@@ -335,6 +338,7 @@ const ja: Record<MessageKey, string> = {
   "Ask result is on the clipboard.": "結果はクリップボードにあります。",
   "The answer panel could not be shown and the clipboard is unavailable; the Ask result is available in this app.": "回答パネルを表示できず、クリップボードも利用できません。結果はこのアプリで確認できます。",
   "Ask completed.": "質問・操作が完了しました。",
+  "Ask completed. Your previous clipboard could not be restored.": "質問・操作が完了しました。元のクリップボードの内容は復元できませんでした。",
   "Text was published, but History and usage metrics could not be saved.": "テキストは出力されましたが、履歴と使用状況の記録を保存できませんでした。",
   "Some saved hotkeys overlap. Change them in Settings to enable each action independently.": "保存されたホットキーが重複しています。各操作を使えるように設定で変更してください。",
   "The selected-text translation hotkey matches the recording hotkey, so selected-text translation is off until you change it in Settings.": "選択テキスト翻訳ホットキーが録音ホットキーと同じため、設定で変更するまで選択テキスト翻訳は無効です。",
@@ -607,6 +611,8 @@ const ja: Record<MessageKey, string> = {
   "The insertion backend failed.": "挿入処理でエラーが発生しました。",
   "Translation failed; the transcript was copied.": "翻訳に失敗したため、原文をコピーしました。",
   "Started from this app, so the result was copied instead of inserted.": "このアプリから開始したため、挿入せずにクリップボードにコピーしました。",
+  "Inserted. Your previous clipboard could not be restored.": "挿入しました。元のクリップボードの内容は復元できませんでした。",
+  "The previous clipboard could not be restored.": "元のクリップボードの内容を復元できませんでした。",
 } satisfies Record<MessageKey, string>;
 
 const catalogs = { en, ja } satisfies Record<UiLanguage, Record<MessageKey, string>>;
@@ -618,6 +624,7 @@ export const insertionOutcomeNotices: Record<string, MessageKey> = {
   insertion_failed: "Not inserted. The result is shown in the app window.",
   draft_kept: "The draft stayed in the field; the final text was copied (Ctrl+V to paste).",
   draft_unverified: "The live draft could not be confirmed. The final text is shown in the app window.",
+  clipboard_not_restored: "Inserted. Your previous clipboard could not be restored.",
 };
 
 export const insertionOutcomeLabels: Record<string, MessageKey> = {
@@ -645,6 +652,7 @@ export const insertionDetailLabels: Record<string, MessageKey> = {
   translation_failed: "Translation failed; the transcript was copied.",
   transcript_truncated: "The recording was too long for this speech model. Retrying with the same model will fail the same way; record shorter clips or switch to faster-whisper.",
   no_external_target: "Started from this app, so the result was copied instead of inserted.",
+  clipboard_not_restored: "The previous clipboard could not be restored.",
 };
 
 const appMessageKeys: ReadonlySet<MessageKey> = new Set(
@@ -778,6 +786,7 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "Ask result is on the clipboard.",
       "The answer panel could not be shown and the clipboard is unavailable; the Ask result is available in this app.",
       "Ask completed.",
+      "Ask completed. Your previous clipboard could not be restored.",
       "The original selection was not changed, and the clipboard is unavailable; the edit is available in this app.",
       "Speak to edit is disabled because its saved hotkey is already used by another action. Change the overlapping hotkeys in Settings.",
       "Speak to edit is disabled because its saved hotkey is already used by another action, and a saved hotkey could not be registered. Change them in Settings.",
