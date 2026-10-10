@@ -746,7 +746,7 @@ pub(super) fn cancel<B: Backend>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
 
@@ -973,7 +973,7 @@ mod tests {
         session
     }
 
-    fn calls(backend: &MockBackend, name: &str) -> usize {
+    pub(crate) fn calls(backend: &MockBackend, name: &str) -> usize {
         backend
             .calls
             .borrow()
@@ -1122,13 +1122,14 @@ mod tests {
         assert_eq!(*backend.clipboard.borrow(), clipboard);
     }
 
-    struct MockBackend {
+    /// Shared with `live_dictation` tests through `SystemTextInjector::with_mock`.
+    pub(crate) struct MockBackend {
         text: RefCell<TargetText>,
         clipboard: RefCell<String>,
         calls: RefCell<Vec<&'static str>>,
         sequence: Cell<u32>,
         target_valid: Cell<bool>,
-        ime: Cell<Option<bool>>,
+        pub(crate) ime: Cell<Option<bool>>,
         text_readable: Cell<bool>,
         selection_readable: Cell<bool>,
         paste_accepted: Cell<bool>,
@@ -1136,22 +1137,22 @@ mod tests {
         pending_selection: RefCell<Option<TargetText>>,
         selection_settle_after: usize,
         selection_waits: Cell<usize>,
-        on_selection_wait: Option<Box<dyn Fn(&MockBackend)>>,
+        on_selection_wait: Option<Box<dyn Fn(&MockBackend) + Send>>,
         exclusions: RefCell<Vec<ClipboardExclusion>>,
         settle_after: usize,
         waits: Cell<usize>,
         change_clipboard_on_paste: bool,
         change_identity_on_paste: bool,
-        on_paste: Option<Box<dyn Fn()>>,
-        on_validate: Option<Box<dyn Fn()>>,
-        on_clipboard_write: Option<Box<dyn Fn(&MockBackend)>>,
+        on_paste: Option<Box<dyn Fn() + Send>>,
+        on_validate: Option<Box<dyn Fn() + Send>>,
+        on_clipboard_write: Option<Box<dyn Fn(&MockBackend) + Send>>,
         /// What the target exposes after processing a paste, for editors
         /// whose readable text is a proxy or a window of the document.
         readback_after_paste: RefCell<Option<TargetText>>,
     }
 
     impl MockBackend {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 text: RefCell::new(TargetText {
                     identity: vec![1],
@@ -1192,7 +1193,7 @@ mod tests {
                 }
             }
         }
-        fn content(&self) -> String {
+        pub(crate) fn content(&self) -> String {
             let text = self.text.borrow();
             format!("{}{}{}", text.before, text.selected, text.after)
         }
@@ -1323,7 +1324,7 @@ mod tests {
             }
         }
     }
-    fn target() -> TargetWindow {
+    pub(crate) fn target() -> TargetWindow {
         TargetWindow {
             window_handle: 1,
             control_handle: 2,

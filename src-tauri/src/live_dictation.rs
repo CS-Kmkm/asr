@@ -552,6 +552,7 @@ fn window_text(result: Result<asr::Transcript, asr::AsrError>) -> Result<Option<
 mod tests {
     use super::*;
     use audio::{AudioArtifact, AudioFuture, AudioSnapshot, CaptureState, LevelMeter};
+    use injection::test_backend::{self, MockBackend};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
@@ -777,6 +778,120 @@ mod tests {
             assert!(draft.session.is_none());
             assert!(!draft.pasted);
         }
+    }
+
+    type SharedMock = Arc<std::sync::Mutex<MockBackend>>;
+
+    /// A live-insertion draft whose injector drives the batch mock target,
+    /// which reads "prefix | suffix" with the caret at `|`.
+    fn live_test_draft() -> (LiveDraft, SharedMock) {
+        let mock = Arc::new(std::sync::Mutex::new(MockBackend::new()));
+        let monitor = available_monitor();
+        let checkpoint = monitor.checkpoint();
+        let draft = LiveDraft {
+            injector: SystemTextInjector::with_mock(Arc::clone(&mock), InjectionOptions::default()),
+            monitor,
+            target: test_backend::target(),
+            session: None,
+            checkpoint,
+            focus_identity: None,
+            after_input: false,
+            attempted: false,
+            defer_insertion: false,
+            pasted: false,
+        };
+        (draft, mock)
+    }
+
+    fn content(mock: &SharedMock) -> String {
+        mock.lock().unwrap().content()
+    }
+
+    fn mock_calls(mock: &SharedMock, name: &str) -> usize {
+        test_backend::calls(&mock.lock().unwrap(), name)
+    }
+
+    #[test]
+    fn an_empty_endpoint_deletes_the_live_draft_and_the_next_utterance_resumes_there() {
+        let (mut draft, mock) = live_test_draft();
+        draft.update("途中").unwrap();
+        assert_eq!(content(&mock), "prefix 途中 suffix");
+        assert!(draft.pasted);
+        draft.retract("").unwrap();
+        assert_eq!(content(&mock), "prefix  suffix");
+        assert_eq!(mock_calls(&mock, "delete"), 1);
+        // The session keeps the withdrawn range, and the queued live paste
+        // still rules out a second additive paste of the final text.
+        assert!(draft.session.is_some());
+        assert!(draft.pasted);
+        assert_eq!(draft.finalization("最終"), Finalization::FinishSession);
+        draft.update("次の文").unwrap();
+        assert_eq!(content(&mock), "prefix 次の文 suffix");
+        let (_cancel, cancelled) = watch::channel(false);
+        assert_eq!(
+            draft.finish("次の文。", &cancelled),
+            Ok(InsertResult::ClipboardPaste)
+        );
+        assert_eq!(content(&mock), "prefix 次の文。 suffix");
+        drop(draft);
+        // A finished session is never removed on drop.
+        assert_eq!(content(&mock), "prefix 次の文。 suffix");
+    }
+
+    #[test]
+    fn retracting_to_committed_text_replaces_only_the_uncommitted_partial() {
+        let (mut draft, mock) = live_test_draft();
+        draft.update("前文").unwrap();
+        draft.update("前文途中").unwrap();
+        assert_eq!(content(&mock), "prefix 前文途中 suffix");
+        draft.retract("前文").unwrap();
+        assert_eq!(content(&mock), "prefix 前文 suffix");
+        // The guarded replacement selects the draft and pastes over it.
+        assert_eq!(mock_calls(&mock, "delete"), 0);
+        assert_eq!(mock_calls(&mock, "select"), 2);
+        assert_eq!(mock_calls(&mock, "paste"), 3);
+    }
+
+    #[test]
+    fn retraction_waits_for_a_pending_shortcut_and_never_touches_a_deferred_target() {
+        for case in ["shortcut", "deferred"] {
+            let (mut draft, mock) = live_test_draft();
+            draft.update("途中").unwrap();
+            let edits = || ["select", "paste", "delete"].map(|name| mock_calls(&mock, name));
+            let before = edits();
+            match case {
+                "shortcut" => draft.monitor.test_set_async_modifier_pending(true),
+                "deferred" => draft.defer_insertion = true,
+                _ => unreachable!(),
+            }
+            draft.retract("").unwrap();
+            draft.retract("前文").unwrap();
+            assert_eq!(content(&mock), "prefix 途中 suffix", "{case}");
+            assert_eq!(edits(), before, "{case}");
+        }
+    }
+
+    #[test]
+    fn only_a_confirmed_live_edit_keeps_live_insertion_running() {
+        assert_eq!(confirmed(InsertResult::ClipboardPaste), Ok(()));
+        for result in [InsertResult::PasteUnverified, InsertResult::ClipboardOnly] {
+            assert!(confirmed(result).is_err());
+        }
+        let (mut draft, mock) = live_test_draft();
+        draft.update("途中").unwrap();
+        // An unknown IME state fails the deletion guard: live insertion
+        // pauses and the target is never edited again.
+        mock.lock().unwrap().ime.set(None);
+        assert!(draft.retract("").is_err());
+        mock.lock().unwrap().ime.set(Some(false));
+        assert!(draft.update("次の文").is_err());
+        let (_cancel, cancelled) = watch::channel(false);
+        assert_eq!(
+            draft.finish("最終", &cancelled),
+            Ok(InsertResult::ClipboardOnly)
+        );
+        assert_eq!(content(&mock), "prefix 途中 suffix");
+        assert_eq!(mock_calls(&mock, "delete"), 0);
     }
 
     #[test]
