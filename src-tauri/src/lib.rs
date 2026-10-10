@@ -572,8 +572,17 @@ fn load_environment_file() {
         current_dir.as_deref(),
         cfg!(debug_assertions),
     );
+    match &project_root {
+        Some(root) => eprintln!("Worker project root: {}", root.display()),
+        None => eprintln!("Worker project root: none found"),
+    }
 
-    if let Some(path) = candidates.into_iter().find(|path| path.is_file()) {
+    let path = candidates.into_iter().find(|path| path.is_file());
+    match &path {
+        Some(path) => eprintln!("Environment file: {}", path.display()),
+        None => eprintln!("Environment file: none found"),
+    }
+    if let Some(path) = path {
         if let Err(error) = dotenvy::from_path(&path) {
             eprintln!(
                 "Failed to load environment file {}: {error}",
