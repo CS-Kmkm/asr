@@ -75,38 +75,54 @@ fn copy_only<B: Backend>(backend: &B, text: &str) -> Result<InsertResult, Inject
     Ok(InsertResult::ClipboardOnly)
 }
 
+enum Selection {
+    /// The target shows exactly the requested selection.
+    Confirmed(TargetText),
+    /// Select() was issued but never confirmed. The target may still apply
+    /// it, so the caller may need to collapse it again.
+    Unconfirmed(TargetText),
+    /// Nothing was selected in the target.
+    NotRequested,
+}
+
 fn select_verified<B: Backend>(
     backend: &B,
     target: &TargetWindow,
     before: &TargetText,
     text: &str,
     activity: Option<(&InputMonitor, u64)>,
-) -> Option<TargetText> {
-    let selected = before.select_recent(text)?;
+) -> Selection {
+    let Some(selected) = before.select_recent(text) else {
+        return Selection::NotRequested;
+    };
     if !safe(backend, target, activity, SafetyPolicy::Destructive)
-        || !backend.target_text(target).ok()?.same_content(before)
-        || !backend.select_recent(target, before, text).ok()?
+        || !backend
+            .target_text(target)
+            .is_ok_and(|actual| actual.same_content(before))
+        || !backend.select_recent(target, before, text).unwrap_or(false)
     {
-        return None;
+        return Selection::NotRequested;
     }
     for attempt in 0..=VERIFY_ATTEMPTS {
         if attempt > 0 {
             backend.wait_for_target();
         }
         if !safe(backend, target, activity, SafetyPolicy::Destructive) {
-            return None;
+            return Selection::Unconfirmed(selected);
         }
-        let actual = backend.target_text(target).ok()?;
+        let Ok(actual) = backend.target_text(target) else {
+            return Selection::Unconfirmed(selected);
+        };
         if actual.same_content(&selected) {
-            return Some(selected);
+            return Selection::Confirmed(selected);
         }
         // Only the unchanged caret state may precede the requested selection.
         // An unrelated edit or selection must never authorize replacement.
         if !actual.same_content(before) {
-            return None;
+            return Selection::Unconfirmed(selected);
         }
     }
-    None
+    Selection::Unconfirmed(selected)
 }
 
 /// Returns a selection this module requested to a caret at its end, where
@@ -602,17 +618,22 @@ pub(super) fn update<B: Backend>(
     }
     let range = session.replacement.as_ref().expect("range was checked");
     let activity = Some((monitor, range.checkpoint));
-    let Some(selected) = revision_range(
+    let selected = match revision_range(
         backend,
         &session.target,
         range,
         &session.displayed,
         activity,
-    ) else {
-        // A selection the target applied after verification gave up.
-        if let Some(requested) = range.after.select_recent(&session.displayed) {
+    ) {
+        Selection::Confirmed(selected) => Some(selected),
+        // The target may have applied the selection after verification gave up.
+        Selection::Unconfirmed(requested) => {
             collapse_selected(backend, &session.target, &requested);
+            None
         }
+        Selection::NotRequested => None,
+    };
+    let Some(selected) = selected else {
         session.replacement = None;
         session.result = if finalizing {
             copy_only(backend, final_text)?
@@ -684,22 +705,27 @@ fn confirm_queued_draft<B: Backend>(
 /// The target state a revision replaces: the verified selection of the
 /// current draft or, after the draft was retracted, the unchanged empty caret
 /// where it began. Either way the target must still show exactly the state
-/// this session left, so nothing outside the draft is ever replaced.
+/// this session left, so nothing outside the draft is ever replaced. The
+/// empty caret needs no Select(), so it is never reported as unconfirmed.
 fn revision_range<B: Backend>(
     backend: &B,
     target: &TargetWindow,
     range: &ReplacementRange,
     displayed: &str,
     activity: Option<(&InputMonitor, u64)>,
-) -> Option<TargetText> {
+) -> Selection {
     if !displayed.is_empty() {
         return select_verified(backend, target, &range.after, displayed, activity);
     }
-    (safe(backend, target, activity, SafetyPolicy::Destructive)
+    if safe(backend, target, activity, SafetyPolicy::Destructive)
         && backend
             .target_text(target)
-            .is_ok_and(|actual| actual.same_content(&range.after)))
-    .then(|| range.after.clone())
+            .is_ok_and(|actual| actual.same_content(&range.after))
+    {
+        Selection::Confirmed(range.after.clone())
+    } else {
+        Selection::NotRequested
+    }
 }
 
 /// Withdraws the whole live draft from the target, for an utterance that
@@ -731,7 +757,7 @@ pub(super) fn retract<B: Backend>(
     // A failure after selecting must not authorize another target edit.
     session.replacement = None;
     session.result = InsertResult::ClipboardOnly;
-    let Some(selected) = selected else {
+    let Selection::Confirmed(selected) = selected else {
         return Ok(session.result);
     };
     if !safe(
@@ -788,17 +814,19 @@ pub(super) fn cancel<B: Backend>(
         return;
     };
     let activity = Some((monitor, range.checkpoint));
-    let Some(selected) = select_verified(
+    let selected = match select_verified(
         backend,
         &session.target,
         &range.after,
         &session.displayed,
         activity,
-    ) else {
-        if let Some(requested) = range.after.select_recent(&session.displayed) {
+    ) {
+        Selection::Confirmed(selected) => selected,
+        Selection::Unconfirmed(requested) => {
             collapse_selected(backend, &session.target, &requested);
+            return;
         }
-        return;
+        Selection::NotRequested => return,
     };
     let deleted = safe(
         backend,
@@ -1401,7 +1429,7 @@ pub(super) mod tests {
             _: &TargetWindow,
             expected: &TargetText,
         ) -> Result<bool, InjectionError> {
-            if self.ime.get() == Some(true) || !self.text.borrow().same_content(expected) {
+            if self.ime.get() != Some(false) || !self.text.borrow().same_content(expected) {
                 return Ok(false);
             }
             self.calls.borrow_mut().push("collapse");
@@ -1921,6 +1949,49 @@ pub(super) mod tests {
         assert_eq!(*backend.clipboard.borrow(), "original rich clipboard");
         assert_eq!(backend.content(), "prefix  suffix");
         assert_eq!(backend.not_restored.get(), 0);
+    }
+
+    #[test]
+    fn collapse_is_limited_to_a_selection_this_attempt_requested() {
+        for case in ["input_before_select", "ime_unknown"] {
+            let watcher = monitor();
+            let mut backend = MockBackend::new();
+            let mut session = begin(
+                &backend,
+                InjectionOptions::default(),
+                "draft",
+                &target(),
+                &watcher,
+            )
+            .unwrap()
+            .unwrap();
+            if case == "input_before_select" {
+                // Nothing is selected for us; the user selected exactly the
+                // draft themselves, and that selection is theirs.
+                watcher.test_record_input();
+                backend.text.borrow_mut().before = "prefix ".into();
+                backend.text.borrow_mut().selected = "draft".into();
+            } else {
+                // The IME state becomes unknown after Select().
+                backend.on_snapshot = Some(Box::new(|backend| backend.ime.set(None)));
+            }
+            update(
+                &backend,
+                InjectionOptions::default(),
+                &mut session,
+                "revised draft",
+                &watcher,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                backend.calls.borrow().contains(&"select"),
+                case == "ime_unknown",
+                "{case}"
+            );
+            assert!(!backend.calls.borrow().contains(&"collapse"), "{case}");
+            assert_eq!(backend.text.borrow().selected, "draft", "{case}");
+        }
     }
 
     #[test]

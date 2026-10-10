@@ -1194,8 +1194,9 @@ mod windows_backend {
             expected: &TargetText,
         ) -> Result<bool, InjectionError> {
             self.validate_target(target)?;
-            // Moving the caret could commit or cancel an open conversion.
-            if self.ime_composition_active(target)? == Some(true) {
+            // Moving the caret could commit or cancel an open conversion, so
+            // the IME must be known to be inactive.
+            if self.ime_composition_active(target)? != Some(false) {
                 return Ok(false);
             }
             accessibility::collapse_selection(target, expected)
