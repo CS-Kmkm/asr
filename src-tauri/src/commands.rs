@@ -363,11 +363,22 @@ pub(crate) async fn start_microphone_test(
     Ok(())
 }
 
+/// Release a running Settings microphone test; a no-op when none runs.
+///
+/// Also used when the main window is hidden to the tray: the Settings page
+/// stays mounted there, so it would never stop the test itself.
+pub(crate) async fn release_running_microphone_test(
+    test: &tokio::sync::Mutex<MicrophoneTestState>,
+    audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
+) -> Result<bool, audio::AudioError> {
+    let mut test = test.lock().await;
+    let mut audio = audio.lock().await;
+    release_microphone_test(&mut test, audio.as_mut()).await
+}
+
 #[tauri::command]
 pub(crate) async fn stop_microphone_test(services: State<'_, Services>) -> Result<(), String> {
-    let mut test = services.microphone_test.lock().await;
-    let mut audio = services.audio.lock().await;
-    release_microphone_test(&mut test, audio.as_mut())
+    release_running_microphone_test(&services.microphone_test, &services.audio)
         .await
         .map_err(|error| format!("Microphone test could not stop. {error}"))?;
     Ok(())
@@ -2663,6 +2674,30 @@ mod tests {
                 .unwrap());
             assert_eq!(disarms.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn hiding_the_main_window_releases_a_running_microphone_test() {
+        let disarms = Arc::new(AtomicUsize::new(0));
+        let audio: tokio::sync::Mutex<Box<dyn AudioCapture>> =
+            tokio::sync::Mutex::new(Box::new(TestAudio {
+                cancel_error: false,
+                disarm_error: false,
+                disarms: Arc::clone(&disarms),
+                stream_error: None,
+            }));
+        let test = tokio::sync::Mutex::new(MicrophoneTestState::default());
+        let generation = test.lock().await.start();
+        assert!(release_running_microphone_test(&test, &audio)
+            .await
+            .unwrap());
+        // The meter task stops at its next tick once its generation is stale.
+        assert!(!test.lock().await.is_current(generation));
+        // Closing again with no test running leaves the device alone.
+        assert!(!release_running_microphone_test(&test, &audio)
+            .await
+            .unwrap());
+        assert_eq!(disarms.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
