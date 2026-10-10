@@ -104,7 +104,7 @@ export function DashboardPage({
           settings.historyRetention !== "never"
             ? t("History stored locally on this device")
             : settings.keepFailedTakes
-              ? t("History disabled; only failed recordings are kept for 24 hours for Retry")
+              ? t("History disabled; only failed recordings (and Edit selections) are kept for 24 hours for Retry")
               : t("History disabled; nothing is stored")
         }
       />

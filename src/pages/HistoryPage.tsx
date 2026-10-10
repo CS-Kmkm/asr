@@ -90,9 +90,11 @@ export function HistoryPage({ settings, history, filter, onSave, onFilter, onCop
       {retryActive && <button onClick={onCancelRetry}>{t("Cancel")}</button>}
     </div>
     {audioUrl && <audio className="history-player" src={audioUrl} controls autoPlay onError={onAudioError} />}
-    {settings.historyRetention === "never" && history.length === 0 ? <Empty title={t("History is disabled")} detail={t("New transcripts will not be written to SQLite.")} />
+    {settings.historyRetention === "never" && history.length === 0 ? <Empty title={t("History is disabled")} detail={settings.keepFailedTakes
+      ? t("New transcripts are not saved. A failed recording (and, for Edit, the selected text) is kept for 24 hours so you can retry it.")
+      : t("New transcripts will not be written to SQLite.")} />
       : history.length === 0 ? <Empty title={t("No dictations yet")} detail={t("Completed local dictations will appear here.")} />
-      : <>{settings.historyRetention === "never" && <p className="muted">{t("History is off. Failed recordings are kept here for 24 hours so you can retry them.")}</p>}
+      : <>{settings.historyRetention === "never" && <p className="muted">{t("History is off. Failed recordings (and, for Edit, the selected text) are kept here for 24 hours so you can retry them.")}</p>}
       <div className="history-list">{history.map(item => <article className="history-item" key={item.id}>
           <div className="history-meta"><time dateTime={item.createdAt}>{new Date(item.createdAt).toLocaleString()}</time>
             <span className="history-mode">{item.mode in modeLabels

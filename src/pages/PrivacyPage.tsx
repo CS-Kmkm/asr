@@ -41,7 +41,7 @@ export function PrivacyPage({
       />
       <SettingRow
         title={t("Keep failed recordings for 24 hours")}
-        detail={t("On by default: when transcription fails, the recording is kept in History for 24 hours so you can retry it, even if History retention is Never or Delete audio after processing is on. It is then deleted with its audio, or as soon as a Retry succeeds, unless your History and audio settings keep it. Turning this off deletes such recordings; failed recordings are then kept only when History keeps audio.")}
+        detail={t("On by default: when transcription fails, the recording (and, for Edit, the selected text) is kept in History for 24 hours so you can retry it, even if History retention is Never or Delete audio after processing is on. It is then deleted, or as soon as a Retry succeeds, unless your History and audio settings keep it. Turning this off deletes such recordings; failed recordings are then kept only when History keeps audio.")}
         control={
           <Toggle
             checked={settings.keepFailedTakes}

@@ -72,6 +72,7 @@ test("the Privacy page explains and toggles failed-take retention next to Histor
   assert.match(keep.props.detail, /24 hours/);
   assert.match(keep.props.detail, /History retention is Never/);
   assert.match(keep.props.detail, /Delete audio after processing is on/);
+  assert.match(keep.props.detail, /for Edit, the selected text/);
   assert.match(rows[0].props.detail, /except failed recordings kept by the setting below/);
   assert.equal(keep.props.control.props.checked, true);
   keep.props.control.props.onChange(false);
@@ -86,7 +87,9 @@ test("the failed-take retention copy is translated", () => {
     KEEP_TITLE,
     privacyRows(structuredClone(defaultSettings)).rows[2].props.detail,
     "Transcription failed. The recording is kept in History for 24 hours, where you can retry it.",
-    "History is off. Failed recordings are kept here for 24 hours so you can retry them.",
+    "History is off. Failed recordings (and, for Edit, the selected text) are kept here for 24 hours so you can retry them.",
+    "New transcripts are not saved. A failed recording (and, for Edit, the selected text) is kept for 24 hours so you can retry it.",
+    "History disabled; only failed recordings (and Edit selections) are kept for 24 hours for Retry",
   ]) {
     assert.equal(translate("en", key), key);
     assert.notEqual(translate("ja", key), key, key);
@@ -119,11 +122,15 @@ const failedTake = {
 test("History off still lists failed takes kept for Retry", () => {
   const settings = { ...structuredClone(defaultSettings), historyRetention: "never" };
   const empty = historyPage(settings, []);
-  assert.equal(empty.find((node) => node.type === "empty").props.title, "History is disabled");
+  const disabled = empty.find((node) => node.type === "empty").props;
+  assert.equal(disabled.title, "History is disabled");
+  assert.match(disabled.detail, /for Edit, the selected text\) is kept for 24 hours/);
+  const nothingKept = historyPage({ ...settings, keepFailedTakes: false }, []);
+  assert.equal(nothingKept.find((node) => node.type === "empty").props.detail, "New transcripts will not be written to SQLite.");
 
   const listed = historyPage(settings, [failedTake]);
   assert.equal(listed.some((node) => node.type === "empty"), false);
-  assert.ok(listed.some((node) => text(node) === "History is off. Failed recordings are kept here for 24 hours so you can retry them."));
+  assert.ok(listed.some((node) => text(node) === "History is off. Failed recordings (and, for Edit, the selected text) are kept here for 24 hours so you can retry them."));
   assert.ok(listed.some((node) => node.type === "small" && text(node).startsWith("Deleted automatically:")));
   const retry = listed.find((node) => node.type === "button" && text(node) === "Retry");
   assert.equal(retry.props.disabled, false);
