@@ -287,6 +287,82 @@ impl AppState {
             .expect("app state lock poisoned")
             .last_result = None;
     }
+
+    /// The published phase, or `None` if the state lock is poisoned. Unlike
+    /// `snapshot`, this never panics, so a drop guard may call it.
+    pub fn phase(&self) -> Option<AppPhase> {
+        self.inner.read().ok().map(|state| state.phase.clone())
+    }
+}
+
+/// Published when an operation ends early (an error return or a panic) while
+/// the shared state still shows it busy. Every UI and the overlay recover
+/// from it; it is an existing, localized message.
+pub(crate) const OPERATION_INCOMPLETE: &str =
+    "Recording could not be completed. Start a new recording and try again.";
+
+/// Decides the terminal phase an exiting operation owner must still publish.
+/// A busy phase (Recording, Processing, Injecting) must never outlive its
+/// owner: a cancelled operation becomes Idle with its cancel message, any
+/// other early exit becomes Error. A terminal phase the owner already
+/// published (Idle, Completed, Error) is kept as is.
+pub(crate) fn unfinished_exit_phase(
+    current: &AppPhase,
+    cancelled: bool,
+    cancel_message: &'static str,
+) -> Option<(AppPhase, &'static str)> {
+    match current {
+        AppPhase::Recording | AppPhase::Processing | AppPhase::Injecting => Some(if cancelled {
+            (AppPhase::Idle, cancel_message)
+        } else {
+            (AppPhase::Error, OPERATION_INCOMPLETE)
+        }),
+        AppPhase::Idle | AppPhase::Completed | AppPhase::Error => None,
+    }
+}
+
+/// RAII counterpart of `PipelineGuard` for the published phase. Declare it
+/// after the `PipelineGuard` of the same operation: locals drop in reverse
+/// order, so this publishes while the operation still owns the lifecycle and
+/// a newer operation's phase can never be overwritten.
+pub(crate) struct TerminalPhaseGuard<'a, P: FnMut(AppPhase, &'static str)> {
+    state: &'a AppState,
+    lifecycle: &'a PipelineLifecycle,
+    id: u64,
+    cancel_message: &'static str,
+    publish: P,
+}
+
+impl<'a, P: FnMut(AppPhase, &'static str)> TerminalPhaseGuard<'a, P> {
+    pub(crate) fn new(
+        state: &'a AppState,
+        lifecycle: &'a PipelineLifecycle,
+        id: u64,
+        cancel_message: &'static str,
+        publish: P,
+    ) -> Self {
+        Self {
+            state,
+            lifecycle,
+            id,
+            cancel_message,
+            publish,
+        }
+    }
+}
+
+impl<P: FnMut(AppPhase, &'static str)> Drop for TerminalPhaseGuard<'_, P> {
+    fn drop(&mut self) {
+        let Some(current) = self.state.phase() else {
+            return;
+        };
+        let cancelled = self.lifecycle.is_cancelled(self.id);
+        if let Some((phase, message)) =
+            unfinished_exit_phase(&current, cancelled, self.cancel_message)
+        {
+            (self.publish)(phase, message);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -561,6 +637,103 @@ mod tests {
         lifecycle.finish(id);
         assert_eq!(lifecycle.phase(), PipelinePhase::Idle);
         assert!(lifecycle.begin_start(PipelineMode::Dictate).is_ok());
+    }
+
+    #[test]
+    fn only_a_busy_phase_needs_a_terminal_phase_on_exit() {
+        for busy in [
+            AppPhase::Recording,
+            AppPhase::Processing,
+            AppPhase::Injecting,
+        ] {
+            assert_eq!(
+                unfinished_exit_phase(&busy, false, "Dictation cancelled."),
+                Some((AppPhase::Error, OPERATION_INCOMPLETE))
+            );
+            assert_eq!(
+                unfinished_exit_phase(&busy, true, "Dictation cancelled."),
+                Some((AppPhase::Idle, "Dictation cancelled."))
+            );
+        }
+        for terminal in [AppPhase::Idle, AppPhase::Completed, AppPhase::Error] {
+            assert_eq!(unfinished_exit_phase(&terminal, false, "x"), None);
+            assert_eq!(unfinished_exit_phase(&terminal, true, "x"), None);
+        }
+    }
+
+    /// Mirrors `stop_recording_for`: the phase guard is declared after the
+    /// lifecycle guard, so it publishes while the operation is still owned.
+    fn exit_early(
+        lifecycle: &PipelineLifecycle,
+        state: &AppState,
+        cancel: bool,
+    ) -> Result<(), &'static str> {
+        let (id, _, _) = lifecycle.begin_processing()?;
+        struct Finish<'a>(&'a PipelineLifecycle, u64);
+        impl Drop for Finish<'_> {
+            fn drop(&mut self) {
+                self.0.finish(self.1);
+            }
+        }
+        let _owner = Finish(lifecycle, id);
+        let _phase = TerminalPhaseGuard::new(
+            state,
+            lifecycle,
+            id,
+            "Dictation cancelled.",
+            |phase, message| {
+                assert_eq!(lifecycle.phase(), PipelinePhase::Processing);
+                state.transition(phase, Some(message.into()));
+            },
+        );
+        state.transition(AppPhase::Processing, Some("Transcribing locally.".into()));
+        if cancel {
+            lifecycle.cancel()?;
+        }
+        Err("session lock poisoned")
+    }
+
+    fn recording(lifecycle: &PipelineLifecycle, state: &AppState) {
+        let id = lifecycle.begin_start(PipelineMode::Dictate).unwrap();
+        lifecycle.mark_recording(id).unwrap();
+        state.transition(AppPhase::Recording, None);
+    }
+
+    #[test]
+    fn an_early_stop_exit_publishes_error_before_releasing_the_lifecycle() {
+        let lifecycle = PipelineLifecycle::default();
+        let state = AppState::default();
+        recording(&lifecycle, &state);
+        assert!(exit_early(&lifecycle, &state, false).is_err());
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.phase, AppPhase::Error);
+        assert_eq!(snapshot.message.as_deref(), Some(OPERATION_INCOMPLETE));
+        assert_eq!(lifecycle.phase(), PipelinePhase::Idle);
+    }
+
+    #[test]
+    fn an_early_exit_after_cancel_publishes_idle() {
+        let lifecycle = PipelineLifecycle::default();
+        let state = AppState::default();
+        recording(&lifecycle, &state);
+        assert!(exit_early(&lifecycle, &state, true).is_err());
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.phase, AppPhase::Idle);
+        assert_eq!(snapshot.message.as_deref(), Some("Dictation cancelled."));
+    }
+
+    #[test]
+    fn a_published_outcome_is_not_replaced_on_exit() {
+        let lifecycle = PipelineLifecycle::default();
+        let state = AppState::default();
+        let id = lifecycle.begin_start(PipelineMode::Dictate).unwrap();
+        {
+            let _phase = TerminalPhaseGuard::new(&state, &lifecycle, id, "x", |_, _| {
+                panic!("a terminal phase must not be republished")
+            });
+            state.complete("text".into(), "Dictation inserted successfully.".into());
+        }
+        assert_eq!(state.snapshot().phase, AppPhase::Completed);
     }
 
     #[test]

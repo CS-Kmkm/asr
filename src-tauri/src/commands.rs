@@ -946,6 +946,15 @@ pub(crate) async fn stop_recording_for(
         id: operation_id,
     };
     let (cancel_message, cancel_error) = cancellation_copy(mode);
+    // Every exit below, `?` returns included, leaves a terminal phase, so
+    // the windows and the overlay never stay in Processing.
+    let _phase_guard = crate::state::TerminalPhaseGuard::new(
+        &state,
+        &services.lifecycle,
+        operation_id,
+        cancel_message,
+        |phase, message| emit_state(&app, &state, phase, message),
+    );
     recording_overlay::set_interactive(&app, false);
     // Publish the lifecycle transition immediately. Previously the UI stayed
     // in Recording until audio finalization completed; if finalization failed
@@ -2164,6 +2173,7 @@ pub(crate) async fn cancel_recording(
     storage: State<'_, Storage>,
 ) -> Result<(), String> {
     let mode = services.lifecycle.mode().unwrap_or(PipelineMode::Dictate);
+    let (cancel_message, _) = cancellation_copy(mode);
     let cancelled = cancel_pipeline_operation(
         &services.lifecycle,
         &services.audio,
@@ -2172,6 +2182,7 @@ pub(crate) async fn cancel_recording(
         &services.live,
         &services.edit,
         &services.ask,
+        || emit_state(&app, &state, AppPhase::Idle, cancel_message),
     )
     .await?;
     if cancelled.is_none() {
@@ -2186,25 +2197,26 @@ pub(crate) async fn cancel_recording(
                 .unwrap_or(false),
         );
     }
-    if services.lifecycle.phase() == PipelinePhase::Idle {
-        emit_state(
-            &app,
-            &state,
-            AppPhase::Idle,
-            if mode == PipelineMode::Translate {
-                "Translation cancelled."
-            } else if mode == PipelineMode::Edit {
-                "Editing cancelled."
-            } else if mode == PipelineMode::Ask {
-                "Ask cancelled."
-            } else {
-                "Dictation cancelled."
-            },
-        );
-    }
     Ok(())
 }
 
+/// Runs its callback once when dropped, on every exit path.
+struct OnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(callback) = self.0.take() {
+            callback();
+        }
+    }
+}
+
+/// Cancels the active operation. A cancelled recording is released here, and
+/// `publish_cancelled` runs on every exit (audio or live errors included)
+/// before the lifecycle is released, so its Idle phase can neither be skipped
+/// nor overwrite a newer recording. Starting and Processing keep their owner,
+/// which publishes their terminal phase.
+#[allow(clippy::too_many_arguments)]
 async fn cancel_pipeline_operation(
     lifecycle: &PipelineLifecycle,
     audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
@@ -2213,6 +2225,7 @@ async fn cancel_pipeline_operation(
     live: &tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
     edit: &tokio::sync::Mutex<Option<EditSession>>,
     ask: &tokio::sync::Mutex<Option<AskSession>>,
+    publish_cancelled: impl FnOnce(),
 ) -> Result<Option<PipelinePhase>, String> {
     let Some((operation_id, phase)) = lifecycle.cancel()? else {
         return Ok(None);
@@ -2226,6 +2239,9 @@ async fn cancel_pipeline_operation(
         lifecycle,
         id: operation_id,
     };
+    // Declared after `_guard`, so it runs first, while this cancel owns the
+    // lifecycle.
+    let _published = OnDrop(Some(publish_cancelled));
     if let Ok(mut target) = target.lock() {
         target.take();
     }
@@ -3127,8 +3143,16 @@ mod tests {
         let edit = tokio::sync::Mutex::new(None);
         let ask = tokio::sync::Mutex::new(None);
         let language = Mutex::new(None);
-        let cancellation =
-            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit, &ask);
+        let cancellation = cancel_pipeline_operation(
+            &lifecycle,
+            &audio,
+            &target,
+            &language,
+            &live,
+            &edit,
+            &ask,
+            || (),
+        );
         tokio::pin!(cancellation);
 
         assert!(
@@ -3137,7 +3161,14 @@ mod tests {
                 .is_err()
         );
         assert!(cancel_pipeline_operation(
-            &lifecycle, &audio, &target, &language, &live, &edit, &ask
+            &lifecycle,
+            &audio,
+            &target,
+            &language,
+            &live,
+            &edit,
+            &ask,
+            || ()
         )
         .await
         .unwrap()
@@ -3160,6 +3191,7 @@ mod tests {
         lifecycle.mark_recording(operation_id).unwrap();
         let audio = test_audio(true);
         let target = Mutex::new(None);
+        let published = std::cell::Cell::new(None);
 
         assert!(cancel_pipeline_operation(
             &lifecycle,
@@ -3168,10 +3200,14 @@ mod tests {
             &Mutex::new(None),
             &tokio::sync::Mutex::new(None),
             &tokio::sync::Mutex::new(None),
-            &tokio::sync::Mutex::new(None)
+            &tokio::sync::Mutex::new(None),
+            || published.set(Some(lifecycle.phase())),
         )
         .await
         .is_err());
+        // The failed cancel still published its Idle phase, while it owned
+        // the lifecycle, so no newer recording could be overwritten.
+        assert_eq!(published.get(), Some(PipelinePhase::Recording));
         assert!(lifecycle.begin_start(PipelineMode::Dictate).is_ok());
     }
 
@@ -3189,6 +3225,7 @@ mod tests {
             &tokio::sync::Mutex::new(None),
             &tokio::sync::Mutex::new(None),
             &tokio::sync::Mutex::new(None),
+            || panic!("Processing keeps its owner, which publishes its phase"),
         )
         .await
         .unwrap();
@@ -3210,7 +3247,14 @@ mod tests {
         // Nothing to cancel: a target published by a concurrent start stays.
         let language = Mutex::new(Some("ja".to_string()));
         assert!(cancel_pipeline_operation(
-            &lifecycle, &audio, &target, &language, &live, &edit, &ask
+            &lifecycle,
+            &audio,
+            &target,
+            &language,
+            &live,
+            &edit,
+            &ask,
+            || ()
         )
         .await
         .unwrap()
@@ -3222,9 +3266,18 @@ mod tests {
         lifecycle.mark_recording(id).unwrap();
         lifecycle.begin_processing().unwrap();
         assert_eq!(
-            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit, &ask)
-                .await
-                .unwrap(),
+            cancel_pipeline_operation(
+                &lifecycle,
+                &audio,
+                &target,
+                &language,
+                &live,
+                &edit,
+                &ask,
+                || ()
+            )
+            .await
+            .unwrap(),
             Some(PipelinePhase::Processing)
         );
         assert_eq!(language.lock().unwrap().as_deref(), Some("ja"));
@@ -3233,9 +3286,18 @@ mod tests {
         let id = lifecycle.begin_start(PipelineMode::Translate).unwrap();
         lifecycle.mark_recording(id).unwrap();
         assert_eq!(
-            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit, &ask)
-                .await
-                .unwrap(),
+            cancel_pipeline_operation(
+                &lifecycle,
+                &audio,
+                &target,
+                &language,
+                &live,
+                &edit,
+                &ask,
+                || ()
+            )
+            .await
+            .unwrap(),
             Some(PipelinePhase::Recording)
         );
         assert_eq!(*language.lock().unwrap(), None);
