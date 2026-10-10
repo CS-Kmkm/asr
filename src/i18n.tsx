@@ -87,6 +87,8 @@ const en = {
   "Transcription failed. Check model and GPU diagnostics.": "Transcription failed. Check model and GPU diagnostics.",
   "Transcription failed. The recording was saved to History, where you can retry it.": "Transcription failed. The recording was saved to History, where you can retry it.",
   "Transcription failed. The recording is kept in History for 24 hours, where you can retry it.": "Transcription failed. The recording is kept in History for 24 hours, where you can retry it.",
+  "The recording was too long for this speech model. Retrying with the same model will fail the same way; record shorter clips or switch to faster-whisper.": "The recording was too long for this speech model. Retrying with the same model will fail the same way; record shorter clips or switch to faster-whisper.",
+  "The recording was too long for this speech model. It was saved to History, but retrying with the same model will fail the same way; switch to faster-whisper before retrying, or record shorter clips.": "The recording was too long for this speech model. It was saved to History, but retrying with the same model will fail the same way; switch to faster-whisper before retrying, or record shorter clips.",
   "Keep failed recordings for 24 hours": "Keep failed recordings for 24 hours",
   "On by default: when transcription fails, the recording (and, for Edit, the selected text) is kept in History for 24 hours so you can retry it, even if History retention is Never or Delete audio after processing is on. It is then deleted, or as soon as a Retry succeeds, unless your History and audio settings keep it. Turning this off deletes such recordings; failed recordings are then kept only when History keeps audio.": "On by default: when transcription fails, the recording (and, for Edit, the selected text) is kept in History for 24 hours so you can retry it, even if History retention is Never or Delete audio after processing is on. It is then deleted, or as soon as a Retry succeeds, unless your History and audio settings keep it. Turning this off deletes such recordings; failed recordings are then kept only when History keeps audio.",
   "History is off. Failed recordings (and, for Edit, the selected text) are kept here for 24 hours so you can retry them.": "History is off. Failed recordings (and, for Edit, the selected text) are kept here for 24 hours so you can retry them.",
@@ -391,6 +393,8 @@ const ja: Record<MessageKey, string> = {
   "Transcription failed. Check model and GPU diagnostics.": "文字起こしに失敗しました。モデルとGPU診断を確認してください。",
   "Transcription failed. The recording was saved to History, where you can retry it.": "文字起こしに失敗しました。録音は履歴に保存したので、履歴から再試行できます。",
   "Transcription failed. The recording is kept in History for 24 hours, where you can retry it.": "文字起こしに失敗しました。録音は履歴に24時間保持されるので、履歴から再試行できます。",
+  "The recording was too long for this speech model. Retrying with the same model will fail the same way; record shorter clips or switch to faster-whisper.": "録音がこの音声認識モデルには長すぎました。同じモデルで再試行しても同様に失敗します。録音を短く区切るか、faster-whisper に切り替えてください。",
+  "The recording was too long for this speech model. It was saved to History, but retrying with the same model will fail the same way; switch to faster-whisper before retrying, or record shorter clips.": "録音がこの音声認識モデルには長すぎました。録音は履歴に保存しましたが、同じモデルで再試行しても同様に失敗します。faster-whisper に切り替えてから再試行するか、録音を短く区切ってください。",
   "Keep failed recordings for 24 hours": "失敗した録音を24時間保持",
   "On by default: when transcription fails, the recording (and, for Edit, the selected text) is kept in History for 24 hours so you can retry it, even if History retention is Never or Delete audio after processing is on. It is then deleted, or as soon as a Retry succeeds, unless your History and audio settings keep it. Turning this off deletes such recordings; failed recordings are then kept only when History keeps audio.": "既定でオンです。文字起こしに失敗した録音（編集の場合は選択テキストも）は、履歴の保持期間が「保存しない」の場合や「処理後に音声を削除」がオンの場合でも、再試行できるよう履歴に24時間保持されます。その後、または再試行が成功した時点で、履歴と音声の設定で保持される場合を除き削除されます。オフにするとこうした録音は削除され、失敗した録音は履歴が音声を保持する場合にのみ残ります。",
   "History is off. Failed recordings (and, for Edit, the selected text) are kept here for 24 hours so you can retry them.": "履歴はオフです。失敗した録音（編集の場合は選択テキストも）は再試行できるよう、ここに24時間保持されます。",
@@ -621,6 +625,7 @@ export const insertionDetailLabels: Record<string, MessageKey> = {
   clipboard_unavailable: "The clipboard was unavailable.",
   backend_failure: "The insertion backend failed.",
   translation_failed: "Translation failed; the transcript was copied.",
+  transcript_truncated: "The recording was too long for this speech model. Retrying with the same model will fail the same way; record shorter clips or switch to faster-whisper.",
 };
 
 const appMessageKeys: ReadonlySet<MessageKey> = new Set(
@@ -639,6 +644,8 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "Transcription failed. Check model and GPU diagnostics.",
       "Transcription failed. The recording was saved to History, where you can retry it.",
       "Transcription failed. The recording is kept in History for 24 hours, where you can retry it.",
+      "The recording was too long for this speech model. Retrying with the same model will fail the same way; record shorter clips or switch to faster-whisper.",
+      "The recording was too long for this speech model. It was saved to History, but retrying with the same model will fail the same way; switch to faster-whisper before retrying, or record shorter clips.",
       "Live transcription stopped because the microphone input failed.",
       "The microphone was disconnected, so recording stopped. The audio captured before the disconnection is being transcribed.",
       "The microphone was disconnected before usable speech was captured. Check the microphone and start a new recording.",

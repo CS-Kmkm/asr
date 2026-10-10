@@ -22,7 +22,7 @@ function load(relativePath, mocks = {}) {
   return module.exports;
 }
 const { defaultSettings } = load("../src/api.ts");
-const { translate } = load("../src/i18n.tsx");
+const { translate, translateAppMessage, insertionDetailLabels } = load("../src/i18n.tsx");
 const i18n = { useI18n: () => ({ language: "en", t: (key) => key }) };
 const hooks = {
   useState: (initial) => [typeof initial === "function" ? initial() : initial, () => {}],
@@ -134,4 +134,16 @@ test("History off still lists failed takes kept for Retry", () => {
   assert.ok(listed.some((node) => node.type === "small" && text(node).startsWith("Deleted automatically:")));
   const retry = listed.find((node) => node.type === "button" && text(node) === "Retry");
   assert.equal(retry.props.disabled, false);
+});
+
+test("a transcript cut off by the model is explained in both languages", () => {
+  const tooLong = "The recording was too long for this speech model. Retrying with the same model will fail the same way; record shorter clips or switch to faster-whisper.";
+  const saved = "The recording was too long for this speech model. It was saved to History, but retrying with the same model will fail the same way; switch to faster-whisper before retrying, or record shorter clips.";
+  assert.equal(insertionDetailLabels.transcript_truncated, tooLong);
+  for (const message of [tooLong, saved]) {
+    assert.equal(translateAppMessage("en", message), message);
+    const ja = translateAppMessage("ja", message);
+    assert.notEqual(ja, message);
+    assert.match(ja, /faster-whisper/);
+  }
 });

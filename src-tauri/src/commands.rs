@@ -51,6 +51,42 @@ const TRANSCRIPTION_FAILED_SAVED_TO_HISTORY: &str =
 const TRANSCRIPTION_FAILED_KEPT_FOR_RETRY: &str =
     "Transcription failed. The recording is kept in History for 24 hours, where you can retry it.";
 
+const TRANSCRIPTION_TOO_LONG_FOR_MODEL: &str = "The recording was too long for this speech model. Retrying with the same model will fail the same way; record shorter clips or switch to faster-whisper.";
+
+const TRANSCRIPTION_TOO_LONG_SAVED_TO_HISTORY: &str = "The recording was too long for this speech model. It was saved to History, but retrying with the same model will fail the same way; switch to faster-whisper before retrying, or record shorter clips.";
+
+/// Worker error code for a transcript cut off at the model's output limit.
+const TRANSCRIPT_TRUNCATED_CODE: &str = "transcript_truncated";
+
+/// Why a take's transcription failed, as far as Retry is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranscriptionFailure {
+    /// Retrying may succeed, for example after a transient worker failure.
+    Retryable,
+    /// The take exceeds what the speech model can transcribe; Retry with the
+    /// same model fails the same way.
+    TooLongForModel,
+}
+
+impl TranscriptionFailure {
+    fn of(error: &asr::AsrError) -> Self {
+        match error {
+            asr::AsrError::Worker(worker) if worker.code == TRANSCRIPT_TRUNCATED_CODE => {
+                Self::TooLongForModel
+            }
+            _ => Self::Retryable,
+        }
+    }
+
+    /// `insertion_detail` of the failed take's History row.
+    fn history_detail(self) -> Option<&'static str> {
+        match self {
+            Self::Retryable => None,
+            Self::TooLongForModel => Some(TRANSCRIPT_TRUNCATED_CODE),
+        }
+    }
+}
+
 /// `insertion_result` of a History row whose final transcription failed. The
 /// row carries no text, only the audio that Retry transcribes again.
 const TRANSCRIPTION_FAILED_OUTCOME: &str = "transcription_failed";
@@ -127,11 +163,16 @@ fn save_retry_result(
     status
 }
 
-fn failed_take_message(kept: Option<storage::FailedTakeRetention>) -> &'static str {
-    match kept {
-        Some(storage::FailedTakeRetention::Normal) => TRANSCRIPTION_FAILED_SAVED_TO_HISTORY,
-        Some(storage::FailedTakeRetention::Temporary) => TRANSCRIPTION_FAILED_KEPT_FOR_RETRY,
-        None => "Transcription failed. Check model and GPU diagnostics.",
+fn failed_take_message(
+    kept: Option<storage::FailedTakeRetention>,
+    failure: TranscriptionFailure,
+) -> &'static str {
+    match (failure, kept) {
+        (TranscriptionFailure::TooLongForModel, Some(_)) => TRANSCRIPTION_TOO_LONG_SAVED_TO_HISTORY,
+        (TranscriptionFailure::TooLongForModel, None) => TRANSCRIPTION_TOO_LONG_FOR_MODEL,
+        (_, Some(storage::FailedTakeRetention::Normal)) => TRANSCRIPTION_FAILED_SAVED_TO_HISTORY,
+        (_, Some(storage::FailedTakeRetention::Temporary)) => TRANSCRIPTION_FAILED_KEPT_FOR_RETRY,
+        (_, None) => "Transcription failed. Check model and GPU diagnostics.",
     }
 }
 
@@ -990,7 +1031,7 @@ pub(crate) async fn stop_recording_for(
         return Err(cancel_error.into());
     }
     let transcript_result = match model_ready {
-        Err(error) => Err(error),
+        Err(error) => Err((error, TranscriptionFailure::Retryable)),
         Ok(_) => match services
             .transcriber
             .transcribe_with_locale(
@@ -1007,12 +1048,15 @@ pub(crate) async fn stop_recording_for(
                 emit_state(&app, &state, AppPhase::Idle, cancel_message);
                 return Err(cancel_error.into());
             }
-            Err(error) => Err(command_error(error)),
+            Err(error) => {
+                let failure = TranscriptionFailure::of(&error);
+                Err((command_error(error), failure))
+            }
         },
     };
     let transcript = match transcript_result {
         Ok(value) => value,
-        Err(error) => {
+        Err((error, failure)) => {
             let _ = storage.add_metric(
                 "asr",
                 Some(settings.asr_backend.as_str()),
@@ -1035,14 +1079,18 @@ pub(crate) async fn stop_recording_for(
                     translation_target.as_deref(),
                     app_context::history_category(app_context.as_ref()),
                     duration_ms,
-                ),
+                )
+                .map(|item| NewHistoryItem {
+                    insertion_detail: failure.history_detail(),
+                    ..item
+                }),
                 &artifact.path,
             );
             emit_state(
                 &app,
                 &state,
                 AppPhase::Error,
-                failed_take_message(preserved),
+                failed_take_message(preserved, failure),
             );
             // History keeps its own copy, so the temporary capture is always removed.
             report_temp_cleanup(&app, &mut artifact_cleanup);
@@ -3476,7 +3524,7 @@ mod tests {
         let kept = preserve_failed_take(&storage, &settings, item, &take);
         assert_eq!(kept, Some(storage::FailedTakeRetention::Normal));
         assert_eq!(
-            failed_take_message(kept),
+            failed_take_message(kept, TranscriptionFailure::Retryable),
             TRANSCRIPTION_FAILED_SAVED_TO_HISTORY
         );
 
@@ -3517,7 +3565,7 @@ mod tests {
             let kept = preserve_failed_take(&storage, &settings, dictate_failure(), &take);
             assert_eq!(kept, Some(storage::FailedTakeRetention::Temporary));
             assert_eq!(
-                failed_take_message(kept),
+                failed_take_message(kept, TranscriptionFailure::Retryable),
                 TRANSCRIPTION_FAILED_KEPT_FOR_RETRY
             );
 
@@ -3550,7 +3598,7 @@ mod tests {
             let kept = preserve_failed_take(&storage, &settings, dictate_failure(), &take);
             assert_eq!(kept, None, "{settings:?}");
             assert_eq!(
-                failed_take_message(kept),
+                failed_take_message(kept, TranscriptionFailure::Retryable),
                 "Transcription failed. Check model and GPU diagnostics."
             );
             assert!(storage
@@ -3678,6 +3726,78 @@ mod tests {
         assert!(kept.has_audio);
         assert_eq!(kept.expires_at, None);
         assert_eq!(history_audio_count(&storage), 2);
+        storage.delete_all_history().unwrap();
+    }
+
+    #[test]
+    fn a_truncated_transcript_is_not_presented_as_retryable() {
+        let worker = |code: &str| {
+            asr::AsrError::Worker(asr::WorkerError {
+                code: code.into(),
+                message: "failed".into(),
+            })
+        };
+        assert_eq!(
+            TranscriptionFailure::of(&worker(TRANSCRIPT_TRUNCATED_CODE)),
+            TranscriptionFailure::TooLongForModel
+        );
+        for error in [
+            worker("transcription_failed"),
+            worker("cuda_oom"),
+            asr::AsrError::Timeout,
+            asr::AsrError::Crashed,
+            asr::AsrError::Protocol("transcript_truncated".into()),
+        ] {
+            assert_eq!(
+                TranscriptionFailure::of(&error),
+                TranscriptionFailure::Retryable,
+                "{error}"
+            );
+        }
+
+        let too_long = TranscriptionFailure::TooLongForModel;
+        assert_eq!(too_long.history_detail(), Some("transcript_truncated"));
+        assert_eq!(TranscriptionFailure::Retryable.history_detail(), None);
+        assert_eq!(
+            failed_take_message(None, too_long),
+            TRANSCRIPTION_TOO_LONG_FOR_MODEL
+        );
+        for kept in [
+            storage::FailedTakeRetention::Normal,
+            storage::FailedTakeRetention::Temporary,
+        ] {
+            assert_eq!(
+                failed_take_message(Some(kept), too_long),
+                TRANSCRIPTION_TOO_LONG_SAVED_TO_HISTORY
+            );
+        }
+        for message in [
+            TRANSCRIPTION_TOO_LONG_FOR_MODEL,
+            TRANSCRIPTION_TOO_LONG_SAVED_TO_HISTORY,
+        ] {
+            assert!(message.contains("will fail the same way"));
+            assert!(message.contains("faster-whisper"));
+        }
+    }
+
+    #[test]
+    fn a_truncated_failed_take_records_why_in_history() {
+        let (storage, _directory, take) = failed_take_storage(keeping_nothing(true));
+        let settings = storage.get_settings().unwrap();
+        let item = dictate_failure().map(|item| NewHistoryItem {
+            insertion_detail: TranscriptionFailure::TooLongForModel.history_detail(),
+            ..item
+        });
+        assert!(preserve_failed_take(&storage, &settings, item, &take).is_some());
+        let row = &storage.list_history(types::HistoryFilter::All, 1).unwrap()[0];
+        assert_eq!(
+            row.insertion_result.as_deref(),
+            Some(TRANSCRIPTION_FAILED_OUTCOME)
+        );
+        assert_eq!(
+            row.insertion_detail.as_deref(),
+            Some("transcript_truncated")
+        );
         storage.delete_all_history().unwrap();
     }
 
