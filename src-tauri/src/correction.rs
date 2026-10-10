@@ -17,6 +17,9 @@ const LOCAL_READ_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_ERROR_BODY_CHARS: usize = 500;
 const ASK_PLAN_MIN_OUTPUT_TOKENS: usize = 512;
 const ASK_TEXT_MIN_OUTPUT_TOKENS: usize = 4096;
+/// Smallest visible-text budget sent to any provider; per-model output
+/// ceilings never reduce a request below it.
+const MIN_VISIBLE_OUTPUT_TOKENS: usize = 128;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CorrectionError {
@@ -1955,7 +1958,7 @@ fn max_output_tokens(transcript: &str) -> usize {
         .count()
         .saturating_mul(2)
         .saturating_add(64)
-        .clamp(128, 32_768)
+        .clamp(MIN_VISIBLE_OUTPUT_TOKENS, 32_768)
 }
 
 fn request_output_tokens(input: &str, instruction: &str) -> usize {
@@ -1979,8 +1982,13 @@ fn request_output_tokens(input: &str, instruction: &str) -> usize {
 /// reasoning and end as an incomplete response. The values are deliberately
 /// generous ceilings, not expected usage: the cap only bounds the worst case,
 /// and correction prompts are short, so they stay below OpenAI's general
-/// "reserve about 25k tokens" advice except at the highest efforts.
+/// "reserve about 25k tokens" advice except at the highest efforts. Models
+/// that do not reason (or are not known to) get no allowance whatever the
+/// effort setting, since it would only push them past their output limit.
 fn openai_reasoning_allowance(model: &str, effort: &str) -> usize {
+    if !openai_model_reasons(model) {
+        return 0;
+    }
     match effort {
         "none" if supports_openai_none_reasoning(model) => 0,
         // The reasoning field is omitted for models that are not known to
@@ -1991,6 +1999,15 @@ fn openai_reasoning_allowance(model: &str, effort: &str) -> usize {
         "high" => 16_384,
         _ => 32_768,
     }
+}
+
+/// OpenAI reasoning families: GPT-5 (except the non-reasoning `-chat`
+/// variants such as gpt-5-chat-latest) and the o1/o3/o4 series.
+fn openai_model_reasons(model: &str) -> bool {
+    (model.starts_with("gpt-5") && !model.contains("-chat"))
+        || ["o1", "o3", "o4"]
+            .iter()
+            .any(|prefix| model.starts_with(prefix))
 }
 
 /// Thinking tokens reserved for Gemini. `thinking_level=minimal` is sent to
@@ -2010,17 +2027,95 @@ fn gemini_thinking_allowance(model: &str) -> usize {
     }
 }
 
+// Documented maximum output tokens per model family, from the providers'
+// public model pages (platform.openai.com/docs/models and
+// ai.google.dev/gemini-api/docs/models) as known when written (2026).
+// A request above a model's limit is rejected outright, so the final budget
+// is clamped to these values. Prefixes are matched in order, so specific
+// snapshots come before their family. Unlisted models are not clamped and
+// keep the visible budget (at most 32,768), as before. These limits are not
+// verified against the live APIs here and may change with new snapshots or
+// alias targets.
+const OPENAI_OUTPUT_CEILINGS: &[(&str, usize)] = &[
+    // gpt-4o-2024-05-13: 4,096; later gpt-4o, gpt-4o-mini and
+    // chatgpt-4o-latest: 16,384.
+    ("gpt-4o-2024-05-13", 4_096),
+    ("gpt-4o", 16_384),
+    ("chatgpt-4o", 16_384),
+    // gpt-4.1, gpt-4.1-mini, gpt-4.1-nano: 32,768.
+    ("gpt-4.1", 32_768),
+    // o1-preview: 32,768; o1-mini: 65,536; o1, o1-pro, o3, o3-mini, o3-pro,
+    // o4-mini: 100,000.
+    ("o1-preview", 32_768),
+    ("o1-mini", 65_536),
+    ("o1", 100_000),
+    ("o3", 100_000),
+    ("o4", 100_000),
+];
+const GEMINI_OUTPUT_CEILINGS: &[(&str, usize)] = &[
+    // gemini-2.5-pro/-flash/-flash-lite and the gemini-3 previews: 65,536.
+    ("gemini-2.5", 65_536),
+    ("gemini-3", 65_536),
+    // gemini-2.0-flash, gemini-2.0-flash-lite and gemini-1.5: 8,192.
+    ("gemini-2.0", 8_192),
+    ("gemini-1.5", 8_192),
+];
+
+/// The documented output limit of an OpenAI model. GPT-5 `-chat` variants
+/// (such as gpt-5-chat-latest) allow 16,384; the reasoning GPT-5 family
+/// allows 128,000.
+fn openai_output_ceiling(model: &str) -> Option<usize> {
+    if model.starts_with("gpt-5") {
+        return Some(if model.contains("-chat") {
+            16_384
+        } else {
+            128_000
+        });
+    }
+    prefix_ceiling(OPENAI_OUTPUT_CEILINGS, model)
+}
+
+/// The documented output limit of a Gemini model. The `-latest` aliases
+/// (gemini-flash-latest, gemini-pro-latest, gemini-flash-lite-latest)
+/// currently resolve to Gemini 2.5 or 3 models, which allow 65,536.
+fn gemini_output_ceiling(model: &str) -> Option<usize> {
+    if model.starts_with("gemini-") && model.ends_with("-latest") {
+        return Some(65_536);
+    }
+    prefix_ceiling(GEMINI_OUTPUT_CEILINGS, model)
+}
+
+fn prefix_ceiling(ceilings: &[(&str, usize)], model: &str) -> Option<usize> {
+    ceilings
+        .iter()
+        .find(|(prefix, _)| model.starts_with(prefix))
+        .map(|&(_, ceiling)| ceiling)
+}
+
+fn clamp_output_budget(budget: usize, ceiling: Option<usize>) -> usize {
+    match ceiling {
+        Some(ceiling) => budget.min(ceiling.max(MIN_VISIBLE_OUTPUT_TOKENS)),
+        None => budget,
+    }
+}
+
 fn openai_output_budget(settings: &Settings, visible_tokens: usize) -> usize {
-    visible_tokens.saturating_add(openai_reasoning_allowance(
-        settings.openai_correction_model.trim(),
-        settings.openai_reasoning_effort.as_str(),
-    ))
+    let model = settings.openai_correction_model.trim();
+    clamp_output_budget(
+        visible_tokens.saturating_add(openai_reasoning_allowance(
+            model,
+            settings.openai_reasoning_effort.as_str(),
+        )),
+        openai_output_ceiling(model),
+    )
 }
 
 fn gemini_output_budget(settings: &Settings, visible_tokens: usize) -> usize {
-    visible_tokens.saturating_add(gemini_thinking_allowance(
-        settings.gemini_correction_model.trim(),
-    ))
+    let model = settings.gemini_correction_model.trim();
+    clamp_output_budget(
+        visible_tokens.saturating_add(gemini_thinking_allowance(model)),
+        gemini_output_ceiling(model),
+    )
 }
 
 fn supports_openai_none_reasoning(model: &str) -> bool {
@@ -3819,6 +3914,28 @@ mod tests {
         // default (medium) reasoning still needs room.
         assert_eq!(openai_reasoning_allowance("gpt-5-mini", "none"), 8_192);
         assert_eq!(openai_reasoning_allowance("gpt-5-mini", "low"), 4_096);
+        for model in ["o1", "o3-mini", "o4-mini"] {
+            assert_eq!(openai_reasoning_allowance(model, "high"), 16_384, "{model}");
+        }
+        // Models that do not reason never get an allowance, whatever the
+        // effort setting.
+        for model in [
+            "gpt-4o-mini",
+            "gpt-4o",
+            "chatgpt-4o-latest",
+            "gpt-4.1",
+            "gpt-4.1-nano",
+            "gpt-5-chat-latest",
+            "some-future-model",
+        ] {
+            for effort in ["none", "low", "medium", "high", "xhigh", "max"] {
+                assert_eq!(
+                    openai_reasoning_allowance(model, effort),
+                    0,
+                    "{model} {effort}"
+                );
+            }
+        }
 
         assert_eq!(gemini_thinking_allowance("gemini-flash-lite-latest"), 0);
         assert_eq!(gemini_thinking_allowance("gemini-3-flash-preview"), 0);
@@ -3901,6 +4018,180 @@ mod tests {
         assert_eq!(
             gemini_output_budget(&Settings::default(), ASK_PLAN_MIN_OUTPUT_TOKENS),
             512
+        );
+    }
+
+    #[test]
+    fn default_models_keep_their_request_budgets() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.openai_correction_model, "gpt-5.6-luna");
+        assert_eq!(defaults.openai_reasoning_effort, "none");
+        assert_eq!(defaults.gemini_correction_model, "gemini-flash-lite-latest");
+        let input = "はい、了解です";
+        assert_eq!(
+            openai_request(&defaults, input, "correct it")["max_output_tokens"],
+            128
+        );
+        assert_eq!(
+            gemini_request(&defaults, input, "correct it")["generation_config"]
+                ["max_output_tokens"],
+            128
+        );
+
+        let instruction = build_edit_instruction();
+        let edit_input = edit_request_input("short", "expand substantially");
+        assert_eq!(
+            openai_request(&defaults, &edit_input, instruction)["max_output_tokens"],
+            2_048
+        );
+        assert_eq!(
+            gemini_request(&defaults, &edit_input, instruction)["generation_config"]
+                ["max_output_tokens"],
+            2_048
+        );
+
+        for minimum in [ASK_PLAN_MIN_OUTPUT_TOKENS, ASK_TEXT_MIN_OUTPUT_TOKENS] {
+            let visible = max_output_tokens("short").max(minimum);
+            assert_eq!(openai_output_budget(&defaults, visible), minimum);
+            assert_eq!(gemini_output_budget(&defaults, visible), minimum);
+        }
+    }
+
+    #[test]
+    fn non_reasoning_models_stay_within_their_output_ceiling() {
+        let long = "x".repeat(20_000);
+        for (model, ceiling) in [
+            ("gpt-4o-mini", 16_384),
+            ("gpt-4o", 16_384),
+            ("chatgpt-4o-latest", 16_384),
+            ("gpt-4o-2024-05-13", 4_096),
+            ("gpt-4.1", 32_768),
+            ("gpt-4.1-mini", 32_768),
+            ("gpt-5-chat-latest", 16_384),
+        ] {
+            let settings = Settings {
+                openai_correction_model: model.into(),
+                openai_reasoning_effort: "high".into(),
+                ..Settings::default()
+            };
+            // A short utterance gets no reasoning allowance.
+            assert_eq!(
+                openai_request(&settings, "はい、了解です", "correct it")["max_output_tokens"],
+                128,
+                "{model}"
+            );
+            // A long transcript is clamped to the model's ceiling.
+            assert_eq!(
+                openai_request(&settings, &long, "correct it")["max_output_tokens"],
+                32_768.min(ceiling),
+                "{model}"
+            );
+            // Ask budgets keep their minimum even under a low ceiling.
+            assert_eq!(
+                openai_output_budget(&settings, ASK_TEXT_MIN_OUTPUT_TOKENS),
+                ASK_TEXT_MIN_OUTPUT_TOKENS,
+                "{model}"
+            );
+        }
+
+        for model in [
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-1.5-pro",
+        ] {
+            let settings = Settings {
+                gemini_correction_model: model.into(),
+                ..Settings::default()
+            };
+            assert_eq!(
+                gemini_request(&settings, &long, "correct it")["generation_config"]
+                    ["max_output_tokens"],
+                8_192,
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_ceilings_cover_each_known_family() {
+        for (model, ceiling) in [
+            ("gpt-4o-2024-05-13", Some(4_096)),
+            ("gpt-4o-mini", Some(16_384)),
+            ("gpt-4o", Some(16_384)),
+            ("chatgpt-4o-latest", Some(16_384)),
+            ("gpt-4.1", Some(32_768)),
+            ("gpt-4.1-nano", Some(32_768)),
+            ("gpt-5", Some(128_000)),
+            ("gpt-5-mini", Some(128_000)),
+            ("gpt-5.6-luna", Some(128_000)),
+            ("gpt-5-chat-latest", Some(16_384)),
+            ("o1-preview", Some(32_768)),
+            ("o1-mini", Some(65_536)),
+            ("o1", Some(100_000)),
+            ("o3", Some(100_000)),
+            ("o3-mini", Some(100_000)),
+            ("o4-mini", Some(100_000)),
+            ("some-future-model", None),
+        ] {
+            assert_eq!(openai_output_ceiling(model), ceiling, "{model}");
+        }
+        for (model, ceiling) in [
+            ("gemini-2.5-pro", Some(65_536)),
+            ("gemini-2.5-flash", Some(65_536)),
+            ("gemini-2.5-flash-lite", Some(65_536)),
+            ("gemini-3-flash-preview", Some(65_536)),
+            ("gemini-flash-latest", Some(65_536)),
+            ("gemini-flash-lite-latest", Some(65_536)),
+            ("gemini-2.0-flash", Some(8_192)),
+            ("gemini-2.0-flash-lite", Some(8_192)),
+            ("gemini-1.5-flash", Some(8_192)),
+            ("gemma-3-27b-it", None),
+        ] {
+            assert_eq!(gemini_output_ceiling(model), ceiling, "{model}");
+        }
+
+        // The clamp binds only when the budget exceeds the ceiling and never
+        // drops below the minimum visible budget.
+        assert_eq!(clamp_output_budget(40_000, Some(8_192)), 8_192);
+        assert_eq!(clamp_output_budget(4_000, Some(8_192)), 4_000);
+        assert_eq!(clamp_output_budget(40_000, None), 40_000);
+        assert_eq!(
+            clamp_output_budget(4_000, Some(64)),
+            MIN_VISIBLE_OUTPUT_TOKENS
+        );
+
+        // Reasoning families: the largest budget (32,768 visible plus the
+        // 32,768 max-effort allowance) fits every reasoning ceiling.
+        let long = "x".repeat(20_000);
+        for model in ["gpt-5-mini", "o1-mini", "o3", "o4-mini"] {
+            let settings = Settings {
+                openai_correction_model: model.into(),
+                openai_reasoning_effort: "max".into(),
+                ..Settings::default()
+            };
+            assert_eq!(
+                openai_request(&settings, &long, "correct it")["max_output_tokens"],
+                65_536,
+                "{model}"
+            );
+        }
+        let settings = Settings {
+            openai_correction_model: "o1-preview".into(),
+            openai_reasoning_effort: "max".into(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            openai_request(&settings, &long, "correct it")["max_output_tokens"],
+            32_768
+        );
+        let settings = Settings {
+            gemini_correction_model: "gemini-2.5-pro".into(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            gemini_request(&settings, &long, "correct it")["generation_config"]
+                ["max_output_tokens"],
+            32_768 + 8_192
         );
     }
 
