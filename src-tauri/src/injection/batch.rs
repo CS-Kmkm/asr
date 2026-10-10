@@ -109,6 +109,19 @@ fn select_verified<B: Backend>(
     None
 }
 
+/// Returns a selection this module requested to a caret at its end, where
+/// the caret was before Select(), when nothing else has changed the field.
+/// A selected draft left behind would be replaced whole by the user's next
+/// keystroke. Collapsing edits no text, so recent input does not block it.
+fn collapse_selected<B: Backend>(backend: &B, target: &TargetWindow, selected: &TargetText) {
+    if backend
+        .target_text(target)
+        .is_ok_and(|actual| actual.same_content(selected))
+    {
+        let _ = backend.collapse_selection(target, selected);
+    }
+}
+
 /// Some editors (for example VS Code) expose only a proxy or a window of their
 /// text, so an exact before/after match never succeeds there. For an additive
 /// paste, the inserted text ending right at the caret, as one more occurrence
@@ -590,6 +603,10 @@ pub(super) fn update<B: Backend>(
         &session.displayed,
         activity,
     ) else {
+        // A selection the target applied after verification gave up.
+        if let Some(requested) = range.after.select_recent(&session.displayed) {
+            collapse_selected(backend, &session.target, &requested);
+        }
         session.replacement = None;
         session.result = if finalizing {
             copy_only(backend, final_text)?
@@ -601,7 +618,7 @@ pub(super) fn update<B: Backend>(
     let checkpoint = range.checkpoint;
     // A failure after selecting must not authorize another target edit.
     session.replacement = None;
-    session.result = paste(
+    let result = paste(
         backend,
         options,
         final_text,
@@ -610,7 +627,15 @@ pub(super) fn update<B: Backend>(
         activity,
         SafetyPolicy::Destructive,
         None,
-    )?;
+    );
+    // Without a queued paste, the previous draft would stay selected.
+    if !matches!(
+        result,
+        Ok(InsertResult::ClipboardPaste | InsertResult::PasteUnverified)
+    ) {
+        collapse_selected(backend, &session.target, &selected);
+    }
+    session.result = result?;
     if session.result != InsertResult::ClipboardOnly {
         session.displayed = final_text.to_owned();
         session.replacement = Some(ReplacementRange {
@@ -764,9 +789,12 @@ pub(super) fn cancel<B: Backend>(
         &session.displayed,
         activity,
     ) else {
+        if let Some(requested) = range.after.select_recent(&session.displayed) {
+            collapse_selected(backend, &session.target, &requested);
+        }
         return;
     };
-    if safe(
+    let deleted = safe(
         backend,
         &session.target,
         activity,
@@ -774,8 +802,9 @@ pub(super) fn cancel<B: Backend>(
     ) && backend
         .target_text(&session.target)
         .is_ok_and(|actual| actual.same_content(&selected))
-    {
-        let _ = backend.delete_selection(&session.target);
+        && backend.delete_selection(&session.target).unwrap_or(false);
+    if !deleted {
+        collapse_selected(backend, &session.target, &selected);
     }
 }
 
@@ -1183,6 +1212,7 @@ pub(super) mod tests {
         on_paste: Option<Box<dyn Fn() + Send>>,
         on_validate: Option<Box<dyn Fn() + Send>>,
         on_clipboard_write: Option<Box<dyn Fn(&MockBackend) + Send>>,
+        on_snapshot: Option<Box<dyn Fn(&MockBackend) + Send>>,
         /// What the target exposes after processing a paste, for editors
         /// whose readable text is a proxy or a window of the document.
         readback_after_paste: RefCell<Option<TargetText>>,
@@ -1221,6 +1251,7 @@ pub(super) mod tests {
                 on_paste: None,
                 on_validate: None,
                 on_clipboard_write: None,
+                on_snapshot: None,
                 readback_after_paste: RefCell::new(None),
             }
         }
@@ -1297,6 +1328,9 @@ pub(super) mod tests {
             Ok(true)
         }
         fn clipboard_snapshot(&self) -> Result<Self::Clipboard, InjectionError> {
+            if let Some(on_snapshot) = &self.on_snapshot {
+                on_snapshot(self);
+            }
             if self.snapshot_fails.get() {
                 return Err(InjectionError::ClipboardUnavailable);
             }
@@ -1352,6 +1386,20 @@ pub(super) mod tests {
         fn delete_selection(&self, _: &TargetWindow) -> Result<bool, InjectionError> {
             self.text.borrow_mut().selected.clear();
             self.calls.borrow_mut().push("delete");
+            Ok(true)
+        }
+        fn collapse_selection(
+            &self,
+            _: &TargetWindow,
+            expected: &TargetText,
+        ) -> Result<bool, InjectionError> {
+            if self.ime.get() == Some(true) || !self.text.borrow().same_content(expected) {
+                return Ok(false);
+            }
+            self.calls.borrow_mut().push("collapse");
+            let mut text = self.text.borrow_mut();
+            let selected = std::mem::take(&mut text.selected);
+            text.before.push_str(&selected);
             Ok(true)
         }
         fn clipboard_not_restored(&self) {
@@ -1732,6 +1780,114 @@ pub(super) mod tests {
         let (target, state) = capture_selection(&backend).unwrap();
         assert_eq!(target, self::target());
         assert_eq!(state.selected, "original");
+    }
+
+    #[test]
+    fn an_aborted_live_update_does_not_leave_the_draft_selected() {
+        let monitor = std::sync::Arc::new(monitor());
+        let mut backend = MockBackend::new();
+        let mut session = begin(
+            &backend,
+            InjectionOptions::default(),
+            "draft",
+            &target(),
+            &monitor,
+        )
+        .unwrap()
+        .unwrap();
+        // A click after the draft was selected, before its replacement.
+        let interrupting = std::sync::Arc::clone(&monitor);
+        backend.on_snapshot = Some(Box::new(move |_| interrupting.test_record_input()));
+        assert_eq!(
+            update(
+                &backend,
+                InjectionOptions::default(),
+                &mut session,
+                "revised draft",
+                &monitor,
+                false,
+            )
+            .unwrap(),
+            InsertResult::ClipboardOnly
+        );
+        assert!(backend
+            .calls
+            .borrow()
+            .ends_with(&["select", "write", "collapse"]));
+        let text = backend.text.borrow().clone();
+        assert_eq!(text.before, "prefix draft");
+        assert!(text.selected.is_empty());
+        assert_eq!(text.after, " suffix");
+    }
+
+    #[test]
+    fn a_selection_the_user_already_changed_is_left_alone() {
+        let monitor = monitor();
+        let mut backend = MockBackend::new();
+        let mut session = begin(
+            &backend,
+            InjectionOptions::default(),
+            "draft",
+            &target(),
+            &monitor,
+        )
+        .unwrap()
+        .unwrap();
+        // The user typed over the selected draft before the replacement.
+        backend.on_snapshot = Some(Box::new(|backend| {
+            let mut text = backend.text.borrow_mut();
+            text.selected.clear();
+            text.before.push('x');
+        }));
+        update(
+            &backend,
+            InjectionOptions::default(),
+            &mut session,
+            "revised draft",
+            &monitor,
+            false,
+        )
+        .unwrap();
+        assert!(!backend.calls.borrow().contains(&"collapse"));
+        assert_eq!(backend.content(), "prefix x suffix");
+    }
+
+    #[test]
+    fn cancellation_that_cannot_delete_restores_the_caret() {
+        for case in ["input", "ime"] {
+            let monitor = std::sync::Arc::new(monitor());
+            let mut backend = MockBackend::new();
+            let mut session = begin(
+                &backend,
+                InjectionOptions::default(),
+                "draft",
+                &target(),
+                &monitor,
+            )
+            .unwrap()
+            .unwrap();
+            // The selection settles after a wait, during which the user acts.
+            backend.selection_settle_after = 1;
+            let interrupting = std::sync::Arc::clone(&monitor);
+            backend.on_selection_wait = Some(Box::new(move |backend| match case {
+                "input" => interrupting.test_record_input(),
+                _ => backend.ime.set(Some(true)),
+            }));
+            cancel(&backend, &mut session, &monitor);
+            assert!(!backend.calls.borrow().contains(&"delete"), "{case}");
+            assert_eq!(backend.content(), "prefix draft suffix", "{case}");
+            // Moving the caret could disturb an open IME conversion.
+            assert_eq!(
+                backend.calls.borrow().contains(&"collapse"),
+                case == "input",
+                "{case}"
+            );
+            assert_eq!(
+                backend.text.borrow().selected.is_empty(),
+                case == "input",
+                "{case}"
+            );
+        }
     }
 
     #[test]

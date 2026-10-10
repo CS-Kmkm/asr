@@ -180,6 +180,31 @@ pub(super) fn focused_identity(target: &TargetWindow) -> Result<Vec<i32>, Inject
     runtime_id(&element)
 }
 
+/// Moves the start of the selection to its end and selects that caret,
+/// only while the field still shows exactly `expected`. No text changes.
+pub(super) fn collapse_selection(
+    target: &TargetWindow,
+    expected: &TargetText,
+) -> Result<bool, InjectionError> {
+    let control = TextControl::focused(target)?;
+    if !control.state()?.same_content(expected) {
+        return Ok(false);
+    }
+    let range = control.selection()?;
+    let end = unsafe { range.Clone() }.map_err(|_| unavailable())?;
+    unsafe {
+        range
+            .MoveEndpointByRange(
+                TextPatternRangeEndpoint_Start,
+                &end,
+                TextPatternRangeEndpoint_End,
+            )
+            .map_err(|_| unavailable())?;
+        range.Select().map_err(|_| unavailable())?;
+    }
+    Ok(true)
+}
+
 pub(super) fn select_recent(
     target: &TargetWindow,
     expected: &TargetText,

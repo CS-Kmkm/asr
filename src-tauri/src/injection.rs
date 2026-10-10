@@ -558,6 +558,13 @@ trait Backend {
     /// Returns true if any input was queued, including a partial SendInput.
     fn paste(&self, target: &TargetWindow, policy: SafetyPolicy) -> Result<bool, InjectionError>;
     fn delete_selection(&self, target: &TargetWindow) -> Result<bool, InjectionError>;
+    /// Collapses the selection to a caret at its end when the field still
+    /// holds exactly `expected`. Returns true when the collapse was requested.
+    fn collapse_selection(
+        &self,
+        target: &TargetWindow,
+        expected: &TargetText,
+    ) -> Result<bool, InjectionError>;
     fn wait_for_target(&self);
     /// Records that a confirmed paste left its text on the clipboard because
     /// the previous contents could not be snapshotted or restored.
@@ -752,6 +759,9 @@ impl Backend for PlatformBackend {
         Err(InjectionError::UnsupportedPlatform)
     }
     fn delete_selection(&self, _: &TargetWindow) -> Result<bool, InjectionError> {
+        Err(InjectionError::UnsupportedPlatform)
+    }
+    fn collapse_selection(&self, _: &TargetWindow, _: &TargetText) -> Result<bool, InjectionError> {
         Err(InjectionError::UnsupportedPlatform)
     }
     fn wait_for_target(&self) {}
@@ -1121,6 +1131,18 @@ mod windows_backend {
                 keyboard_input(VK_BACK, KEYEVENTF_KEYUP.0),
             ];
             Ok(unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) } == inputs.len() as u32)
+        }
+        fn collapse_selection(
+            &self,
+            target: &TargetWindow,
+            expected: &TargetText,
+        ) -> Result<bool, InjectionError> {
+            self.validate_target(target)?;
+            // Moving the caret could commit or cancel an open conversion.
+            if self.ime_composition_active(target)? == Some(true) {
+                return Ok(false);
+            }
+            accessibility::collapse_selection(target, expected)
         }
         fn wait_for_target(&self) {
             thread::sleep(Duration::from_millis(20));
