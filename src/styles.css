@@ -146,6 +146,14 @@ button { color: inherit; }
   line-height: 1;
   cursor: pointer;
 }
+.overlay-hint {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--warning);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .overlay-cancel:hover { border-color: var(--error-border); background: var(--error-soft); color: var(--error); }
 .translation-target-settings { min-width: 300px; display: grid; gap: 8px; }
 .translation-target-list { margin: 0; padding: 0; display: grid; gap: 6px; list-style: none; }

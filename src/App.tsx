@@ -139,6 +139,12 @@ interface OverlayMessageEvent {
   durationMs: number;
 }
 
+// A refused hotkey press, flashed inside the live view without replacing it.
+interface OverlayHintEvent {
+  message: string;
+  durationMs: number;
+}
+
 type OverlayNotice =
   | ({ kind: "insertion" } & InsertionNoticeEvent)
   | ({ kind: "message" } & OverlayMessageEvent);
@@ -261,6 +267,8 @@ function RecordingOverlay() {
   });
   const [notice, setNotice] = useState<OverlayNotice | null>(null);
   const noticeTimer = useRef<number | undefined>(undefined);
+  const [hint, setHint] = useState<string | null>(null);
+  const hintTimer = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     // The latest notice replaces any earlier one, like the backend window.
@@ -275,6 +283,11 @@ function RecordingOverlay() {
       }),
       listen<OverlayMessageEvent>("overlay-message", ({ payload }) => {
         showNotice({ kind: "message", ...payload }, payload.durationMs);
+      }),
+      listen<OverlayHintEvent>("overlay-hint", ({ payload }) => {
+        window.clearTimeout(hintTimer.current);
+        setHint(payload.message);
+        hintTimer.current = window.setTimeout(() => setHint(null), payload.durationMs);
       }),
       listen<AudioLevel>("audio-level", ({ payload }) => {
         const rms = Number.isFinite(payload.rms) ? payload.rms : 0;
@@ -316,6 +329,7 @@ function RecordingOverlay() {
 
     return () => {
       window.clearTimeout(noticeTimer.current);
+      window.clearTimeout(hintTimer.current);
       void listeners.then((unlisten) => unlisten.forEach((fn) => fn()));
     };
   }, []);
@@ -367,8 +381,13 @@ function RecordingOverlay() {
     return (
       <div className="recording-overlay recording" role="status" aria-label={t("Recording in progress")}>
         <span className="recording-live-dot" aria-hidden="true" />
-        <span className="recording-overlay-label">
-          {voiceMode.mode === "translate"
+        <span
+          className={`recording-overlay-label${hint ? " overlay-hint" : ""}`}
+          role={hint ? "alert" : undefined}
+        >
+          {hint
+            ? translateAppMessage(language, hint)
+            : voiceMode.mode === "translate"
             ? t("Translating")
             : voiceMode.mode === "edit"
               ? t("Editing")

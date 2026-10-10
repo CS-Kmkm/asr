@@ -1176,7 +1176,10 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode, trigger
             )
             .await
         }
-        shortcuts::Press::Busy(error) => Err(error.into()),
+        shortcuts::Press::Busy(error) => {
+            recording_overlay::show_busy(&app, error);
+            Err(error.into())
+        }
         shortcuts::Press::Start => match requested_mode {
             PipelineMode::Dictate => {
                 commands::start_recording_with_origin(

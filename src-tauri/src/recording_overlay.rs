@@ -23,6 +23,8 @@ const NOTICE_DURATION: Duration = Duration::from_secs(5);
 const MESSAGE_NOTICE_WIDTH: f64 = 420.0;
 const MESSAGE_NOTICE_HEIGHT: f64 = 84.0;
 const BOTTOM_MARGIN: f64 = 24.0;
+/// A refused hotkey press is flashed inside the live view this long.
+const HINT_DURATION: Duration = Duration::from_secs(3);
 
 /// Advanced by every phase change and notice. A notice timer hides the window
 /// only if nothing replaced its notice, so it never hides a later recording.
@@ -154,6 +156,49 @@ pub(crate) fn set_phase(app: &AppHandle, phase: &AppPhase) {
 /// Voice Translate's language control) take pointer events.
 pub(crate) fn click_through(phase: &AppPhase) -> bool {
     !matches!(phase, AppPhase::Recording | AppPhase::Processing)
+}
+
+/// How a hotkey press refused while a session runs is reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BusyPresentation {
+    /// Flashed inside the live view, which keeps its size and controls.
+    Inline,
+    /// A warning notice, when no live view is showing.
+    Notice,
+}
+
+pub(crate) fn busy_presentation(live_view_showing: bool) -> BusyPresentation {
+    if live_view_showing {
+        BusyPresentation::Inline
+    } else {
+        BusyPresentation::Notice
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Hint<'a> {
+    message: &'a str,
+    duration_ms: u64,
+}
+
+/// Reports a refused hotkey press (another mode is recording) without
+/// replacing the recording's live view: a notice would hide it once its
+/// timer ends while the recording continues.
+pub(crate) fn show_busy(app: &AppHandle, message: &str) {
+    match busy_presentation(LIVE.load(Ordering::Acquire)) {
+        BusyPresentation::Inline => {
+            let _ = app.emit_to(
+                WINDOW_LABEL,
+                "overlay-hint",
+                Hint {
+                    message,
+                    duration_ms: HINT_DURATION.as_millis() as u64,
+                },
+            );
+        }
+        BusyPresentation::Notice => show_message_notice(app, NoticeSeverity::Warning, message),
+    }
 }
 
 /// The live view's logical size.
@@ -446,6 +491,12 @@ mod tests {
         // Injecting has no cancel button: clicks reach the target.
         assert!(click_through(&AppPhase::Injecting));
         assert!(click_through(&AppPhase::Error));
+    }
+
+    #[test]
+    fn a_refused_press_flashes_inside_a_showing_live_view() {
+        assert_eq!(busy_presentation(true), BusyPresentation::Inline);
+        assert_eq!(busy_presentation(false), BusyPresentation::Notice);
     }
 
     #[test]
