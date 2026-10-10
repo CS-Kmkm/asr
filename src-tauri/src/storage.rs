@@ -855,8 +855,29 @@ fn repair_shortcut_routes(settings: &mut Settings, repairs: &mut SettingsRepairs
     }
 }
 
-fn serialized_settings(settings: &Settings) -> Result<String, StorageError> {
-    let mut value = serde_json::to_value(settings)?;
+/// Serializes `settings` over the stored row, so top-level keys and keys
+/// inside `shortcuts` that this build does not know survive a save.
+fn merged_settings_json(settings: &Settings, stored: Option<&str>) -> Result<String, StorageError> {
+    let stored = stored.and_then(|raw| serde_json::from_str(raw).ok());
+    let mut value = match (stored, serde_json::to_value(settings)?) {
+        (Some(serde_json::Value::Object(mut object)), serde_json::Value::Object(typed)) => {
+            for (key, field) in typed {
+                if key == "shortcuts" {
+                    if let (
+                        Some(serde_json::Value::Object(saved)),
+                        serde_json::Value::Object(modes),
+                    ) = (object.get_mut(&key), &field)
+                    {
+                        saved.extend(modes.clone());
+                        continue;
+                    }
+                }
+                object.insert(key, field);
+            }
+            serde_json::Value::Object(object)
+        }
+        (_, typed) => typed,
+    };
     mirror_legacy_shortcut_keys(&mut value, &settings.shortcuts)?;
     Ok(serde_json::to_string(&value)?)
 }
@@ -1064,9 +1085,12 @@ impl Storage {
         Ok(())
     }
 
+    /// Saves `settings` over the stored row, keeping keys this build does
+    /// not know.
     pub fn update_settings(&self, settings: &Settings) -> Result<(), StorageError> {
-        let value = serialized_settings(settings)?;
-        self.connection()?.execute(
+        let connection = self.connection()?;
+        let value = merged_settings_json(settings, stored_settings_row(&connection)?.as_deref())?;
+        connection.execute(
             "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
             params![value, Utc::now().to_rfc3339()],
@@ -1084,7 +1108,7 @@ impl Storage {
         let now = Utc::now();
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        let value = serialized_settings(settings)?;
+        let value = merged_settings_json(settings, stored_settings_row(&transaction)?.as_deref())?;
         transaction.execute(
             "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
@@ -3581,6 +3605,32 @@ mod tests {
 
         assert!(storage.add_history(&item()).unwrap());
         assert_eq!(history_texts(&storage).len(), 1);
+    }
+
+    #[test]
+    fn saving_settings_keeps_keys_this_build_does_not_know() {
+        let storage = Storage::in_memory().unwrap();
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value["futureSetting"] = serde_json::json!({"keep": true});
+        value["shortcuts"]["futureMode"] = serde_json::json!(["Ctrl+Alt+F"]);
+        store_raw_settings(&storage, &value.to_string());
+        let mut settings = storage.get_settings().unwrap();
+        settings.theme = "dark".into();
+        settings.shortcuts.dictate = vec!["Ctrl+Alt+V".into()];
+
+        for persist in [
+            Storage::update_settings as fn(&Storage, &Settings) -> Result<(), StorageError>,
+            Storage::update_settings_and_apply_history_policy,
+        ] {
+            persist(&storage, &settings).unwrap();
+            let stored = stored_settings_value(&storage);
+            assert_eq!(stored["futureSetting"]["keep"], true);
+            assert_eq!(stored["shortcuts"]["futureMode"][0], "Ctrl+Alt+F");
+            assert_eq!(stored["shortcuts"]["dictate"][0], "Ctrl+Alt+V");
+            assert_eq!(stored["hotkey"], "Ctrl+Alt+V");
+            assert_eq!(stored["theme"], "dark");
+            assert_eq!(storage.get_settings().unwrap(), settings);
+        }
     }
 
     #[test]
