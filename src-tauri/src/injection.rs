@@ -119,9 +119,9 @@ impl InsertionDetail {
             }
             InjectionError::ImeCompositionActive => Some(Self::ImeActive),
             InjectionError::ClipboardUnavailable => Some(Self::ClipboardUnavailable),
-            InjectionError::UnsupportedPlatform | InjectionError::BackendFailure(_) => {
-                Some(Self::BackendFailure)
-            }
+            InjectionError::UnsupportedPlatform
+            | InjectionError::NoSelection
+            | InjectionError::BackendFailure(_) => Some(Self::BackendFailure),
         }
     }
 }
@@ -155,6 +155,8 @@ pub enum InjectionError {
     ImeCompositionActive,
     ClipboardUnavailable,
     Cancelled,
+    /// The focused field is readable but nothing is selected in it.
+    NoSelection,
     BackendFailure(&'static str),
 }
 
@@ -169,6 +171,7 @@ impl fmt::Display for InjectionError {
             Self::ImeCompositionActive => "an IME composition is in progress",
             Self::ClipboardUnavailable => "the clipboard is unavailable",
             Self::Cancelled => "text insertion was cancelled",
+            Self::NoSelection => "no text is selected",
             Self::BackendFailure(message) => message,
         })
     }
@@ -298,11 +301,7 @@ impl SystemTextInjector {
     }
 
     pub(crate) fn capture_selection(&self) -> Result<SelectedText, InjectionError> {
-        let target = self.capture_target()?;
-        let state = self.backend.target_text(&target)?;
-        if state.selected.is_empty() {
-            return Err(InjectionError::BackendFailure("no text is selected"));
-        }
+        let (target, state) = batch::capture_selection(&self.backend)?;
         Ok(SelectedText {
             target,
             text: state.selected.clone(),

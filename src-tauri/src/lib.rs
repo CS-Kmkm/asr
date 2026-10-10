@@ -290,13 +290,11 @@ impl AskSession {
                 AskCapture::Selected(selection)
             }
             Ok(_) => AskCapture::Unavailable,
-            Err(injection::InjectionError::BackendFailure("no text is selected")) => {
-                match injector.capture_target() {
-                    Ok(target) if is_external_ask_target(&target) => AskCapture::Caret(target),
-                    Ok(_) => AskCapture::Unavailable,
-                    Err(_) => AskCapture::Unavailable,
-                }
-            }
+            Err(injection::InjectionError::NoSelection) => match injector.capture_target() {
+                Ok(target) if is_external_ask_target(&target) => AskCapture::Caret(target),
+                Ok(_) => AskCapture::Unavailable,
+                Err(_) => AskCapture::Unavailable,
+            },
             Err(_) => AskCapture::Unavailable,
         };
         let monitor = match &capture {

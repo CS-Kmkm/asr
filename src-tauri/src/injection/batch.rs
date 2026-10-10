@@ -394,6 +394,20 @@ pub(super) fn diagnose<B: Backend>(
     InsertionDetail::NotConfirmed
 }
 
+/// The focused field and its selected text. An empty selection in a
+/// readable field is the typed `NoSelection`, distinct from a field that
+/// cannot be read.
+pub(super) fn capture_selection<B: Backend>(
+    backend: &B,
+) -> Result<(TargetWindow, TargetText), InjectionError> {
+    let target = backend.capture_target()?;
+    let state = backend.target_text(&target)?;
+    if state.selected.is_empty() {
+        return Err(InjectionError::NoSelection);
+    }
+    Ok((target, state))
+}
+
 pub(super) fn replace_selection<B: Backend>(
     backend: &B,
     options: InjectionOptions,
@@ -1699,6 +1713,25 @@ pub(super) mod tests {
         final_paste(&backend, FinalGuard::Untouched);
         assert_eq!(*backend.clipboard.borrow(), "original rich clipboard");
         assert_eq!(backend.not_restored.get(), 0);
+    }
+
+    #[test]
+    fn an_empty_selection_is_a_typed_outcome_unlike_an_unreadable_field() {
+        let backend = MockBackend::new();
+        assert_eq!(
+            capture_selection(&backend).err(),
+            Some(InjectionError::NoSelection)
+        );
+        backend.text_readable.set(false);
+        assert!(matches!(
+            capture_selection(&backend).err(),
+            Some(InjectionError::BackendFailure(_))
+        ));
+        backend.text_readable.set(true);
+        *backend.text.borrow_mut() = selected_state();
+        let (target, state) = capture_selection(&backend).unwrap();
+        assert_eq!(target, self::target());
+        assert_eq!(state.selected, "original");
     }
 
     #[test]
