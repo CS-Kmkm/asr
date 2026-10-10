@@ -1527,7 +1527,9 @@ fn openai_request(settings: &Settings, transcript: &str, instruction: &str) -> V
         "store": false,
         "stream": true
     });
-    if effort != "none" || supports_openai_none_reasoning(model) {
+    // Non-reasoning models reject the reasoning parameter, so it is sent only
+    // to the families that also receive a reasoning allowance.
+    if openai_model_reasons(model) && (effort != "none" || supports_openai_none_reasoning(model)) {
         request["reasoning"] = json!({"effort": effort});
     }
     if supports_openai_none_reasoning(model) {
@@ -4226,6 +4228,45 @@ mod tests {
         let openai = openai_request(&openai_settings, "text", "edit");
         assert!(openai.get("reasoning").is_none());
         assert!(openai.get("text").is_none());
+
+        // Non-reasoning models never receive a reasoning effort, whatever
+        // the setting, and stay within their output ceiling.
+        for model in [
+            "gpt-4o-mini",
+            "chatgpt-4o-latest",
+            "gpt-4.1-mini",
+            "gpt-5-chat-latest",
+            "some-future-model",
+        ] {
+            for effort in ["low", "medium", "high", "xhigh", "max"] {
+                let settings = Settings {
+                    openai_correction_model: model.into(),
+                    openai_reasoning_effort: effort.into(),
+                    ..Settings::default()
+                };
+                let request = openai_request(&settings, "はい、了解です", "correct it");
+                assert!(request.get("reasoning").is_none(), "{model} {effort}");
+                assert_eq!(request["max_output_tokens"], 128, "{model} {effort}");
+            }
+        }
+        let mini_high = Settings {
+            openai_correction_model: "gpt-4o-mini".into(),
+            openai_reasoning_effort: "high".into(),
+            ..Settings::default()
+        };
+        let long = openai_request(&mini_high, &"x".repeat(20_000), "correct it");
+        assert!(long.get("reasoning").is_none());
+        assert_eq!(long["max_output_tokens"], 16_384);
+
+        // Reasoning models keep the effort and its allowance.
+        let reasoning_high = Settings {
+            openai_correction_model: "gpt-5-mini".into(),
+            openai_reasoning_effort: "high".into(),
+            ..Settings::default()
+        };
+        let request = openai_request(&reasoning_high, "はい、了解です", "correct it");
+        assert_eq!(request["reasoning"]["effort"], "high");
+        assert_eq!(request["max_output_tokens"], 128 + 16_384);
 
         let gemini_settings = Settings {
             gemini_correction_model: "gemini-2.5-flash-lite".into(),
