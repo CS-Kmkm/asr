@@ -11,6 +11,8 @@ from urllib.parse import urlparse
 
 from .download import (
     FASTER_WHISPER_ALLOW_PATTERNS,
+    FASTER_WHISPER_BUILTIN_REQUIRED_FILES,
+    FASTER_WHISPER_REQUIRED_FILES,
     ProgressCallback,
     cached_snapshot_path,
     download_snapshot,
@@ -73,6 +75,17 @@ def faster_whisper_repo_id(model_id: str) -> str | None:
     except ImportError:
         return None
     return _MODELS.get(model_id)
+
+
+def faster_whisper_required_files(repo_id: str) -> list[str]:
+    """Files a cached snapshot of ``repo_id`` must hold to count as complete."""
+    try:
+        from faster_whisper.utils import _MODELS
+    except ImportError:
+        return list(FASTER_WHISPER_REQUIRED_FILES)
+    if repo_id in _MODELS.values():
+        return list(FASTER_WHISPER_BUILTIN_REQUIRED_FILES)
+    return list(FASTER_WHISPER_REQUIRED_FILES)
 
 
 def faster_whisper_compute_type(quantization: str, *, cuda: bool) -> str:
@@ -389,7 +402,9 @@ class FasterWhisperBackend(ProgressReporting):
         repo_id = faster_whisper_repo_id(self.model_id)
         if repo_id is None:
             return self.model_id
-        cached = cached_snapshot_path(repo_id, FASTER_WHISPER_ALLOW_PATTERNS)
+        cached = cached_snapshot_path(
+            repo_id, FASTER_WHISPER_ALLOW_PATTERNS, faster_whisper_required_files(repo_id)
+        )
         if cached is not None:
             return cached
         self.report_progress("download", model=repo_id)
