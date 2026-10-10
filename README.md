@@ -136,9 +136,11 @@ can use OpenAI or a compatible local server. In **Models**, select
 **OpenAI-compatible API**, then configure the base URL and model ID. API secrets
 are not stored in application settings. The desktop app loads a local `.env`
 file at startup and reads the environment variable named in the UI (by default
-`OPENAI_API_KEY`). The `.env` file may be placed in the project directory during
-development or next to the desktop executable. Existing process/system
-environment variables take precedence over values from `.env`.
+`OPENAI_API_KEY`). The app reads the first `.env` found next to the desktop
+executable or in the project directory that contains the executable, so
+autostart finds it as well; debug builds (`pnpm run tauri dev`) also check the
+working directory. The Python worker is located the same way. Existing
+process/system environment variables take precedence over values from `.env`.
 
 ```powershell
 # Put this in .env instead:
