@@ -2701,6 +2701,37 @@ mod tests {
                 || message.contains("does not exist")
                 || message.contains("do not have access")
         }
+        // A missing or rejected credential is not a budget problem.
+        fn invalid_key(error: &CorrectionError) -> bool {
+            let CorrectionError::Api { status, message } = error else {
+                return false;
+            };
+            let message = message.to_lowercase();
+            matches!(*status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+                || (*status == StatusCode::BAD_REQUEST
+                    && [
+                        "api key not valid",
+                        "api_key_invalid",
+                        "invalid api key",
+                        "incorrect api key",
+                    ]
+                    .iter()
+                    .any(|cue| message.contains(cue)))
+        }
+        // Provider messages can echo part of a key; never print one.
+        fn redact_keys(message: &str) -> String {
+            message
+                .split(' ')
+                .map(|word| {
+                    if word.contains("sk-") || word.contains("AIza") {
+                        "[redacted]"
+                    } else {
+                        word
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
         // A rejected request (HTTP 400: invalid max_output_tokens or an
         // unsupported parameter) or a cut-off/unreadable response.
         fn budget_related(error: &CorrectionError) -> bool {
@@ -2754,9 +2785,13 @@ mod tests {
                         }
                         other => ("-".into(), other.to_string()),
                     };
-                    let message: String = message.chars().take(200).collect();
+                    let message: String = redact_keys(&message).chars().take(200).collect();
                     let kind = error_kind(&error);
-                    if model_unavailable(&error) {
+                    if invalid_key(&error) {
+                        eprintln!(
+                            "{case}: SKIP invalid key ({kind} HTTP {status}; check {key_variable})"
+                        );
+                    } else if model_unavailable(&error) {
                         eprintln!("{case}: SKIP model unavailable ({kind} {status}: {message})");
                     } else {
                         eprintln!("{case}: ERROR {kind} HTTP {status}: {message}");
