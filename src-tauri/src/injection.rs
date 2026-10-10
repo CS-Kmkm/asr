@@ -13,6 +13,8 @@ mod accessibility;
 mod batch;
 #[cfg(target_os = "windows")]
 mod clipboard;
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod target;
 
 pub(crate) const INJECTION_MARKER: usize = 0x4C56_494A;
 
@@ -697,12 +699,13 @@ use windows_backend::PlatformBackend;
 #[cfg(target_os = "windows")]
 mod windows_backend {
     use super::{
-        accessibility, clipboard, Backend, ClipboardExclusion, InjectionError, SafetyPolicy,
-        TargetText, TargetWindow, INJECTION_MARKER,
+        accessibility, clipboard, target, Backend, ClipboardExclusion, InjectionError,
+        SafetyPolicy, TargetText, TargetWindow, INJECTION_MARKER,
     };
     use std::mem::{size_of, zeroed};
     use std::thread;
     use std::time::Duration;
+    use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
     use windows::Win32::Security::{
         GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
@@ -723,7 +726,7 @@ mod windows_backend {
         VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_MENU, VK_SHIFT, VK_V,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongPtrW,
+        FindWindowExW, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongPtrW,
         GetWindowThreadProcessId, GUITHREADINFO, GWL_STYLE,
     };
     const ES_PASSWORD: isize = 0x20;
@@ -761,12 +764,37 @@ mod windows_backend {
         Some(String::from_utf16_lossy(&class_name[..length as usize]))
     }
 
-    fn is_known_credential_surface(control: HWND) -> bool {
-        control_class(control).is_some_and(|class_name| {
-            class_name.eq_ignore_ascii_case("Credential Dialog Xaml Host")
-                || class_name.eq_ignore_ascii_case("Windows.UI.Core.CoreWindow")
-                || class_name.eq_ignore_ascii_case("CredentialUIBroker")
-        })
+    fn is_known_credential_surface(control: HWND, hosted_app: bool) -> bool {
+        control_class(control)
+            .is_some_and(|class_name| target::is_credential_surface(&class_name, hosted_app))
+    }
+
+    /// Direct CoreWindow children of a frame, with their owners. A frame hosts
+    /// one app; the bound only guards against a misbehaving window tree.
+    fn core_windows(frame: HWND) -> Vec<target::ChildWindow> {
+        let mut children = Vec::new();
+        let mut after = HWND::default();
+        for _ in 0..8 {
+            let Ok(child) = (unsafe {
+                FindWindowExW(
+                    frame,
+                    after,
+                    w!("Windows.UI.Core.CoreWindow"),
+                    PCWSTR::null(),
+                )
+            }) else {
+                break;
+            };
+            let mut process_id = 0;
+            let thread_id = unsafe { GetWindowThreadProcessId(child, Some(&mut process_id)) };
+            children.push(target::ChildWindow {
+                class_name: target::CORE_WINDOW_CLASS.into(),
+                process_id,
+                thread_id,
+            });
+            after = child;
+        }
+        children
     }
 
     struct ComGuard(bool);
@@ -817,7 +845,9 @@ mod windows_backend {
             // The Windows binding represents the documented null range (no
             // active conversion) as an empty-interface error.
             Err(error) if error.code() == windows::core::Error::empty().code() => Ok(Some(false)),
-            Err(_) => Err(()),
+            // Providers that implement the pattern partially (E_NOTIMPL) know
+            // no more than one without it: the state is unknown.
+            Err(_) => Ok(None),
         }
     }
 
@@ -887,6 +917,12 @@ mod windows_backend {
             if thread_id == 0 || process_id == 0 {
                 return Err(InjectionError::NoForegroundWindow);
             }
+            // UI Automation reports the hosted app's process for a UWP field,
+            // never the frame host's, so every check uses the hosted app.
+            let hosted = target::is_frame_host(control_class(window).as_deref())
+                .then(|| target::hosted_app(process_id, &core_windows(window)))
+                .flatten();
+            let (process_id, thread_id) = hosted.unwrap_or((process_id, thread_id));
             let process = target_process(process_id)?;
             let integrity_result = reject_higher_integrity(process);
             unsafe {
@@ -895,12 +931,11 @@ mod windows_backend {
             integrity_result?;
 
             let control = focused_control(window, thread_id);
-            let style_password = is_password_style(control);
-            let known_credential_surface = is_known_credential_surface(control);
-            let uia_password = uia_is_password(process_id);
-            let is_secure = style_password
-                || matches!(uia_password, Ok(true))
-                || known_credential_surface && uia_password.is_err();
+            let is_secure = target::is_secure(
+                is_password_style(control),
+                is_known_credential_surface(control, hosted.is_some()),
+                uia_is_password(process_id).ok(),
+            );
             Ok(TargetWindow {
                 window_handle: window.0 as isize,
                 control_handle: control.0 as isize,
