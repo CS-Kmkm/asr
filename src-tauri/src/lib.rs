@@ -1281,13 +1281,9 @@ async fn translate_selection(app: AppHandle) {
     let translated = match translated {
         Ok(text) => text,
         Err(_) => {
-            let copied = injector.copy_to_clipboard(&source).is_ok();
-            let message = if copied {
-                "Translation failed; the selected text remains on the clipboard."
-            } else {
-                "Translation failed and the clipboard is unavailable."
-            };
-            emit_status(&app, "error", message);
+            // The selection is unchanged, so there is nothing to recover and
+            // no reason to overwrite the user's clipboard with its source.
+            emit_status(&app, "error", TRANSLATION_FAILED_SELECTION_UNCHANGED);
             return;
         }
     };
@@ -1310,6 +1306,9 @@ async fn translate_selection(app: AppHandle) {
         }
     }
 }
+
+const TRANSLATION_FAILED_SELECTION_UNCHANGED: &str =
+    "Translation failed; the selected text was not changed.";
 
 /// Status kind and message for a selected-text translation outcome. A paste
 /// that was sent but not confirmed may already have replaced the selection,
@@ -1338,6 +1337,11 @@ fn selection_translation_status(
 #[cfg(test)]
 mod selection_translation_tests {
     use super::*;
+
+    #[test]
+    fn a_failed_translation_does_not_claim_the_clipboard() {
+        assert!(!TRANSLATION_FAILED_SELECTION_UNCHANGED.contains("clipboard"));
+    }
 
     #[test]
     fn an_unverified_paste_is_not_reported_as_a_target_change() {
