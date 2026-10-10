@@ -1527,9 +1527,7 @@ fn openai_request(settings: &Settings, transcript: &str, instruction: &str) -> V
         "store": false,
         "stream": true
     });
-    // Non-reasoning models reject the reasoning parameter, so it is sent only
-    // to the families that also receive a reasoning allowance.
-    if openai_model_reasons(model) && (effort != "none" || supports_openai_none_reasoning(model)) {
+    if sends_openai_reasoning_effort(model, effort) {
         request["reasoning"] = json!({"effort": effort});
     }
     if supports_openai_none_reasoning(model) {
@@ -1984,32 +1982,72 @@ fn request_output_tokens(input: &str, instruction: &str) -> usize {
 /// reasoning and end as an incomplete response. The values are deliberately
 /// generous ceilings, not expected usage: the cap only bounds the worst case,
 /// and correction prompts are short, so they stay below OpenAI's general
-/// "reserve about 25k tokens" advice except at the highest efforts. Models
-/// that do not reason (or are not known to) get no allowance whatever the
-/// effort setting, since it would only push them past their output limit.
+/// "reserve about 25k tokens" advice except at the highest efforts. Known
+/// non-reasoning models get no allowance whatever the effort setting, since
+/// it would only push them past their output limit. For unknown models the
+/// user's effort choice is trusted: a non-"none" effort is sent and reserved.
 fn openai_reasoning_allowance(model: &str, effort: &str) -> usize {
-    if !openai_model_reasons(model) {
-        return 0;
-    }
-    match effort {
-        "none" if supports_openai_none_reasoning(model) => 0,
-        // The reasoning field is omitted for models that are not known to
-        // accept "none", so a reasoning model runs its default effort
-        // (medium for the GPT-5 and o-series families).
-        "none" | "medium" => 8_192,
-        "low" => 4_096,
-        "high" => 16_384,
+    match (openai_model_kind(model), effort) {
+        (OpenAiModelKind::NonReasoning, _) | (OpenAiModelKind::Unknown, "none") => 0,
+        (OpenAiModelKind::Reasoning, "none") if supports_openai_none_reasoning(model) => 0,
+        // The reasoning field is omitted for reasoning models that are not
+        // known to accept "none", so they run their default effort (medium
+        // for the GPT-5 and o-series families).
+        (_, "none" | "medium") => 8_192,
+        (_, "low") => 4_096,
+        (_, "high") => 16_384,
         _ => 32_768,
     }
 }
 
-/// OpenAI reasoning families: GPT-5 (except the non-reasoning `-chat`
-/// variants such as gpt-5-chat-latest) and the o1/o3/o4 series.
-fn openai_model_reasons(model: &str) -> bool {
-    (model.starts_with("gpt-5") && !model.contains("-chat"))
-        || ["o1", "o3", "o4"]
+/// Whether an OpenAI request carries `reasoning.effort`. Known
+/// non-reasoning models reject the parameter; unknown models get it only
+/// when the user chose an effort other than "none".
+fn sends_openai_reasoning_effort(model: &str, effort: &str) -> bool {
+    match openai_model_kind(model) {
+        OpenAiModelKind::Reasoning => effort != "none" || supports_openai_none_reasoning(model),
+        OpenAiModelKind::Unknown => effort != "none",
+        OpenAiModelKind::NonReasoning => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenAiModelKind {
+    Reasoning,
+    NonReasoning,
+    Unknown,
+}
+
+/// The base model of an OpenAI model name: trimmed, lower-case, and without
+/// a fine-tune wrapper (`ft:gpt-4o-mini:org::id` -> `gpt-4o-mini`).
+fn openai_base_model(model: &str) -> String {
+    let model = model.trim().to_ascii_lowercase();
+    let model = model.strip_prefix("ft:").unwrap_or(&model);
+    model.split(':').next().unwrap_or_default().to_owned()
+}
+
+/// Reasoning: GPT-5 (except the `-chat` variants such as
+/// gpt-5-chat-latest), the o1/o3/o4 series and codex-mini. Non-reasoning:
+/// gpt-4o, chatgpt-4o, gpt-4.1 and the GPT-5 `-chat` variants. Anything
+/// else is unknown.
+fn openai_model_kind(model: &str) -> OpenAiModelKind {
+    let base = openai_base_model(model);
+    let gpt5 = base.starts_with("gpt-5");
+    if (gpt5 && base.contains("-chat"))
+        || ["gpt-4o", "chatgpt-4o", "gpt-4.1"]
             .iter()
-            .any(|prefix| model.starts_with(prefix))
+            .any(|prefix| base.starts_with(prefix))
+    {
+        OpenAiModelKind::NonReasoning
+    } else if gpt5
+        || ["o1", "o3", "o4", "codex-mini"]
+            .iter()
+            .any(|prefix| base.starts_with(prefix))
+    {
+        OpenAiModelKind::Reasoning
+    } else {
+        OpenAiModelKind::Unknown
+    }
 }
 
 /// Thinking tokens reserved for Gemini. `thinking_level=minimal` is sent to
@@ -2047,12 +2085,13 @@ const OPENAI_OUTPUT_CEILINGS: &[(&str, usize)] = &[
     // gpt-4.1, gpt-4.1-mini, gpt-4.1-nano: 32,768.
     ("gpt-4.1", 32_768),
     // o1-preview: 32,768; o1-mini: 65,536; o1, o1-pro, o3, o3-mini, o3-pro,
-    // o4-mini: 100,000.
+    // o4-mini: 100,000. codex-mini-latest (based on o4-mini): 100,000.
     ("o1-preview", 32_768),
     ("o1-mini", 65_536),
     ("o1", 100_000),
     ("o3", 100_000),
     ("o4", 100_000),
+    ("codex-mini", 100_000),
 ];
 const GEMINI_OUTPUT_CEILINGS: &[(&str, usize)] = &[
     // gemini-2.5-pro/-flash/-flash-lite and the gemini-3 previews: 65,536.
@@ -2065,16 +2104,17 @@ const GEMINI_OUTPUT_CEILINGS: &[(&str, usize)] = &[
 
 /// The documented output limit of an OpenAI model. GPT-5 `-chat` variants
 /// (such as gpt-5-chat-latest) allow 16,384; the reasoning GPT-5 family
-/// allows 128,000.
+/// allows 128,000. Fine-tuned models share their base model's limit.
 fn openai_output_ceiling(model: &str) -> Option<usize> {
-    if model.starts_with("gpt-5") {
-        return Some(if model.contains("-chat") {
+    let base = openai_base_model(model);
+    if base.starts_with("gpt-5") {
+        return Some(if base.contains("-chat") {
             16_384
         } else {
             128_000
         });
     }
-    prefix_ceiling(OPENAI_OUTPUT_CEILINGS, model)
+    prefix_ceiling(OPENAI_OUTPUT_CEILINGS, &base)
 }
 
 /// The documented output limit of a Gemini model. The `-latest` aliases
@@ -2121,9 +2161,10 @@ fn gemini_output_budget(settings: &Settings, visible_tokens: usize) -> usize {
 }
 
 fn supports_openai_none_reasoning(model: &str) -> bool {
+    let base = openai_base_model(model);
     ["gpt-5.4", "gpt-5.5", "gpt-5.6"]
         .iter()
-        .any(|prefix| model.starts_with(prefix))
+        .any(|prefix| base.starts_with(prefix))
 }
 
 fn supports_gemini_minimal_thinking(model: &str) -> bool {
@@ -4053,7 +4094,8 @@ mod tests {
             "gpt-4.1",
             "gpt-4.1-nano",
             "gpt-5-chat-latest",
-            "some-future-model",
+            "ft:gpt-4o-mini:org::abc123",
+            "GPT-4.1-MINI",
         ] {
             for effort in ["none", "low", "medium", "high", "xhigh", "max"] {
                 assert_eq!(
@@ -4074,6 +4116,88 @@ mod tests {
         for model in ["gemini-2.0-flash", "gemini-1.5-pro", "gemma-3-27b-it"] {
             assert_eq!(gemini_thinking_allowance(model), 0, "{model}");
         }
+    }
+
+    #[test]
+    fn openai_models_are_classified_after_normalising_the_name() {
+        use OpenAiModelKind::*;
+        for (model, kind) in [
+            ("gpt-5-mini", Reasoning),
+            ("GPT-5-MINI", Reasoning),
+            ("  gpt-5.6-luna  ", Reasoning),
+            ("ft:gpt-5-mini:org::abc123", Reasoning),
+            ("ft:o4-mini:org::abc123", Reasoning),
+            ("O3-MINI", Reasoning),
+            ("o1-mini", Reasoning),
+            ("codex-mini-latest", Reasoning),
+            ("gpt-4o-mini", NonReasoning),
+            ("GPT-4O", NonReasoning),
+            ("ft:gpt-4o-mini:org::abc123", NonReasoning),
+            ("chatgpt-4o-latest", NonReasoning),
+            ("gpt-4.1-nano", NonReasoning),
+            ("gpt-5-chat-latest", NonReasoning),
+            ("ft:gpt-4.1-mini:org:custom:abc123", NonReasoning),
+            ("some-future-model", Unknown),
+            ("gpt-3.5-turbo", Unknown),
+        ] {
+            assert_eq!(openai_model_kind(model), kind, "{model}");
+        }
+        assert_eq!(openai_base_model(" FT:GPT-4o-mini:org::id "), "gpt-4o-mini");
+        assert_eq!(
+            openai_output_ceiling("ft:gpt-4o-mini:org::id"),
+            Some(16_384)
+        );
+        assert_eq!(openai_output_ceiling("codex-mini-latest"), Some(100_000));
+        assert!(supports_openai_none_reasoning("GPT-5.6-luna"));
+
+        // Reasoning models keep the effort and its allowance however the name
+        // is written.
+        for model in [
+            "ft:o4-mini:org::abc123",
+            "ft:gpt-5-mini:org::abc123",
+            "codex-mini-latest",
+            "GPT-5-MINI",
+        ] {
+            let settings = Settings {
+                openai_correction_model: model.into(),
+                openai_reasoning_effort: "high".into(),
+                ..Settings::default()
+            };
+            let request = openai_request(&settings, "はい、了解です", "correct it");
+            assert_eq!(request["reasoning"]["effort"], "high", "{model}");
+            assert_eq!(request["max_output_tokens"], 128 + 16_384, "{model}");
+        }
+
+        // Unknown models follow the user's choice: a non-"none" effort is
+        // sent with its allowance and no ceiling; "none" is omitted.
+        for (effort, budget) in [
+            ("none", 128),
+            ("low", 128 + 4_096),
+            ("high", 128 + 16_384),
+            ("max", 128 + 32_768),
+        ] {
+            let settings = Settings {
+                openai_correction_model: "some-future-model".into(),
+                openai_reasoning_effort: effort.into(),
+                ..Settings::default()
+            };
+            let request = openai_request(&settings, "はい、了解です", "correct it");
+            assert_eq!(request["max_output_tokens"], budget, "{effort}");
+            if effort == "none" {
+                assert!(request.get("reasoning").is_none());
+            } else {
+                assert_eq!(request["reasoning"]["effort"], effort);
+            }
+        }
+        let unknown_max = Settings {
+            openai_correction_model: "some-future-model".into(),
+            openai_reasoning_effort: "max".into(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            openai_request(&unknown_max, &"x".repeat(20_000), "correct it")["max_output_tokens"],
+            32_768 + 32_768
+        );
     }
 
     #[test]
@@ -4361,7 +4485,8 @@ mod tests {
             "chatgpt-4o-latest",
             "gpt-4.1-mini",
             "gpt-5-chat-latest",
-            "some-future-model",
+            "ft:gpt-4o-mini:org::abc123",
+            "GPT-4O-MINI",
         ] {
             for effort in ["low", "medium", "high", "xhigh", "max"] {
                 let settings = Settings {
