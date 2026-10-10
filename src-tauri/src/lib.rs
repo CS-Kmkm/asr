@@ -1032,6 +1032,14 @@ mod model_configuration_tests {
     }
 
     #[test]
+    fn settings_fallback_notice_is_translated() {
+        let catalog = include_str!("../../src/i18n.tsx");
+        let key = format!("\"{SETTINGS_FALLBACK_MESSAGE}\"");
+        // English and Japanese catalogs plus the backend message list.
+        assert_eq!(catalog.matches(&key).count(), 4);
+    }
+
+    #[test]
     fn startup_cleanup_keeps_captures_when_the_audio_setting_was_unreadable() {
         let storage = Storage::in_memory().unwrap();
         let settings = Settings::default();
@@ -1090,6 +1098,12 @@ enum StaleArtifactKind {
     /// A guarded History Retry copy. It is always cleanup-owned.
     RetryCopy,
 }
+
+/// Status kind and fixed (content-free) text of the startup notice shown
+/// when some stored settings could not be read. Keep the text in sync with
+/// `src/i18n.tsx`.
+const SETTINGS_FALLBACK_STATUS_KIND: &str = "settings_fallback";
+const SETTINGS_FALLBACK_MESSAGE: &str = "Some settings could not be read, so defaults are used for them. The stored settings were not changed.";
 
 /// Whether the startup cleanup may delete stale capture WAVs. Older builds
 /// kept them when "Delete audio after processing" was off, so a stored value
@@ -1442,6 +1456,14 @@ fn setup_app(
     let storage = Storage::open(&database_path(app.handle())?)?;
     storage.enforce_current_history_policy()?;
     let (settings, repairs) = storage.get_settings_with_repairs()?;
+    if !repairs.is_empty() {
+        // Once per start: later reads use the same in-memory fallbacks.
+        emit_status(
+            app.handle(),
+            SETTINGS_FALLBACK_STATUS_KIND,
+            SETTINGS_FALLBACK_MESSAGE,
+        );
+    }
     // The autostart plugin registers the currently running executable.
     // A development executable depends on Vite's dev server and cannot
     // run on its own at Windows sign-in, so it must never replace the
