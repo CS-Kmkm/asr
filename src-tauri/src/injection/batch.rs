@@ -836,6 +836,8 @@ pub(super) fn cancel<B: Backend>(
     ) && backend
         .target_text(&session.target)
         .is_ok_and(|actual| actual.same_content(&selected))
+        // A partially queued deletion may still remove the draft, so only a
+        // deletion that queued nothing leaves the selection to collapse.
         && backend.delete_selection(&session.target).unwrap_or(false);
     if !deleted {
         collapse_selected(backend, &session.target, &selected);
@@ -1232,6 +1234,9 @@ pub(super) mod tests {
         ime_query_fails: Cell<bool>,
         snapshot_error: RefCell<Option<InjectionError>>,
         not_restored: Cell<usize>,
+        /// SendInput queued only part of the deletion; the target has not
+        /// processed it yet.
+        delete_partial: Cell<bool>,
         text_readable: Cell<bool>,
         selection_readable: Cell<bool>,
         paste_accepted: Cell<bool>,
@@ -1271,6 +1276,7 @@ pub(super) mod tests {
                 ime_query_fails: Cell::new(false),
                 snapshot_error: RefCell::new(None),
                 not_restored: Cell::new(0),
+                delete_partial: Cell::new(false),
                 text_readable: Cell::new(true),
                 selection_readable: Cell::new(true),
                 paste_accepted: Cell::new(true),
@@ -1420,8 +1426,10 @@ pub(super) mod tests {
             Ok(true)
         }
         fn delete_selection(&self, _: &TargetWindow) -> Result<bool, InjectionError> {
-            self.text.borrow_mut().selected.clear();
             self.calls.borrow_mut().push("delete");
+            if !self.delete_partial.get() {
+                self.text.borrow_mut().selected.clear();
+            }
             Ok(true)
         }
         fn collapse_selection(
@@ -1992,6 +2000,25 @@ pub(super) mod tests {
             assert!(!backend.calls.borrow().contains(&"collapse"), "{case}");
             assert_eq!(backend.text.borrow().selected, "draft", "{case}");
         }
+    }
+
+    #[test]
+    fn a_partially_queued_deletion_is_not_followed_by_a_collapse() {
+        let watcher = monitor();
+        let backend = MockBackend::new();
+        let mut session = begin(
+            &backend,
+            InjectionOptions::default(),
+            "draft",
+            &target(),
+            &watcher,
+        )
+        .unwrap()
+        .unwrap();
+        backend.delete_partial.set(true);
+        cancel(&backend, &mut session, &watcher);
+        assert!(backend.calls.borrow().ends_with(&["select", "delete"]));
+        assert!(!backend.calls.borrow().contains(&"collapse"));
     }
 
     #[test]

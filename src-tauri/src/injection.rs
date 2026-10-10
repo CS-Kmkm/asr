@@ -613,6 +613,7 @@ trait Backend {
     ) -> Result<bool, InjectionError>;
     /// Returns true if any input was queued, including a partial SendInput.
     fn paste(&self, target: &TargetWindow, policy: SafetyPolicy) -> Result<bool, InjectionError>;
+    /// Returns true if any input was queued, including a partial SendInput.
     fn delete_selection(&self, target: &TargetWindow) -> Result<bool, InjectionError>;
     /// Collapses the selection to a caret at its end when the field still
     /// holds exactly `expected`. Returns true when the collapse was requested.
@@ -1186,7 +1187,12 @@ mod windows_backend {
                 keyboard_input(VK_BACK, 0),
                 keyboard_input(VK_BACK, KEYEVENTF_KEYUP.0),
             ];
-            Ok(unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) } == inputs.len() as u32)
+            let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
+            if sent > 0 && sent < inputs.len() as u32 {
+                // Release the key only; the deletion may already be queued.
+                let _ = unsafe { SendInput(&inputs[1..], size_of::<INPUT>() as i32) };
+            }
+            Ok(sent > 0)
         }
         fn collapse_selection(
             &self,
