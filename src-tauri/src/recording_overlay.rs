@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{
-    AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, WebviewUrl, WebviewWindow,
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder,
 };
 
@@ -37,17 +37,18 @@ static LIVE: AtomicBool = AtomicBool::new(false);
 /// overlay is placed on that window's monitor.
 static ANCHOR: AtomicI64 = AtomicI64::new(0);
 
-/// Places the overlay on the monitor of the window a session targets, or on
-/// the primary monitor when there is none (`None`).
-pub(crate) fn set_anchor(window_handle: Option<isize>) {
-    ANCHOR.store(window_handle.unwrap_or(0) as i64, Ordering::Release);
+/// Places the overlay on the monitor of the window a session targets.
+pub(crate) fn set_anchor(window_handle: isize) {
+    ANCHOR.store(window_handle as i64, Ordering::Release);
 }
 
-/// Anchors to the foreground window until a session captures its target, so
-/// a hotkey press that fails before capturing reports on the user's monitor.
-/// The overlay is never focusable, so it is never the foreground window.
+/// Anchors to the foreground window (or the primary monitor when there is
+/// none) until a session captures its own target, so a press that fails
+/// early, a take without a target, or a History Retry started from the main
+/// window reports on the monitor the user is working on. The overlay is
+/// never focusable, so it is never the foreground window.
 pub(crate) fn anchor_to_foreground() {
-    set_anchor(foreground_window());
+    ANCHOR.store(foreground_window().unwrap_or(0) as i64, Ordering::Release);
 }
 
 #[cfg(target_os = "windows")]
@@ -82,7 +83,7 @@ pub(crate) fn create(app: &AppHandle) -> tauri::Result<()> {
     // cancel button (and Voice Translate's language control); the window is
     // never focusable, so a click does not activate it.
     window.set_ignore_cursor_events(true)?;
-    position_on_target_monitor(&window)
+    place(&window, (RECORDING_WIDTH, RECORDING_HEIGHT))
 }
 
 /// How the overlay presents a published phase.
@@ -139,12 +140,13 @@ pub(crate) fn set_phase(app: &AppHandle, phase: &AppPhase) {
     let live = phase_view(phase) == PhaseView::Live;
     LIVE.store(live, Ordering::Release);
     if live {
-        let (width, height) = live_size(TRANSLATION_CONTROL.load(Ordering::Acquire));
         let _ = window.set_ignore_cursor_events(click_through(phase));
-        let _ = window.set_size(LogicalSize::new(width, height));
         // Recalculate whenever shown in case display layout, DPI, or the
         // recording/processing window size changed.
-        let _ = position_on_target_monitor(&window);
+        let _ = place(
+            &window,
+            live_size(TRANSLATION_CONTROL.load(Ordering::Acquire)),
+        );
         let _ = window.show();
     } else {
         let _ = window.hide();
@@ -275,8 +277,7 @@ fn show_notice(
     LIVE.store(false, Ordering::Release);
     emit(app);
     let _ = window.set_ignore_cursor_events(true);
-    let _ = window.set_size(LogicalSize::new(width, height));
-    let _ = position_on_target_monitor(&window);
+    let _ = place(&window, (width, height));
     let _ = window.show();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -303,16 +304,18 @@ pub(crate) fn set_interactive(app: &AppHandle, translation_control: bool) {
         return;
     }
     if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
-        let (width, height) = live_size(translation_control);
-        let _ = window.set_size(LogicalSize::new(width, height));
-        let _ = position_on_target_monitor(&window);
+        let _ = place(&window, live_size(translation_control));
     }
 }
 
-fn position_on_target_monitor(window: &WebviewWindow) -> tauri::Result<()> {
+/// Sizes and moves the overlay to the bottom center of the anchor's monitor.
+/// The size is converted with that monitor's scale and applied after the
+/// move, so a first show on a monitor with a different DPI does not keep the
+/// previous monitor's scale (and drift off center).
+fn place(window: &WebviewWindow, logical_size: (f64, f64)) -> tauri::Result<()> {
     let target = match ANCHOR.load(Ordering::Acquire) {
         0 => None,
-        handle => window_rect(handle as isize),
+        handle => monitor_of_window(handle as isize),
     };
     let monitor = match target {
         Some(target) => {
@@ -336,14 +339,33 @@ fn position_on_target_monitor(window: &WebviewWindow) -> tauri::Result<()> {
         return Ok(());
     };
     let work_area = monitor.work_area();
-    let window_size = window.outer_size()?;
-    let bottom_margin = (BOTTOM_MARGIN * monitor.scale_factor()).round() as i32;
-    let x =
-        work_area.position.x + (work_area.size.width.saturating_sub(window_size.width) / 2) as i32;
-    let y = work_area.position.y + work_area.size.height as i32
-        - window_size.height as i32
-        - bottom_margin;
-    window.set_position(PhysicalPosition::new(x, y))
+    let (position, size) = placement(
+        Rect {
+            x: work_area.position.x,
+            y: work_area.position.y,
+            width: work_area.size.width,
+            height: work_area.size.height,
+        },
+        monitor.scale_factor(),
+        logical_size,
+    );
+    window.set_position(PhysicalPosition::new(position.0, position.1))?;
+    window.set_size(PhysicalSize::new(size.0, size.1))
+}
+
+/// The physical position and size of a `logical_size` overlay centered at
+/// the bottom of `work_area`, `BOTTOM_MARGIN` above its edge.
+fn placement(
+    work_area: Rect,
+    scale_factor: f64,
+    (width, height): (f64, f64),
+) -> ((i32, i32), (u32, u32)) {
+    let width = (width * scale_factor).round() as u32;
+    let height = (height * scale_factor).round() as u32;
+    let bottom_margin = (BOTTOM_MARGIN * scale_factor).round() as i32;
+    let x = work_area.x + (work_area.width.saturating_sub(width) / 2) as i32;
+    let y = work_area.y + work_area.height as i32 - height as i32 - bottom_margin;
+    ((x, y), (width, height))
 }
 
 /// A physical-pixel rectangle in virtual-screen coordinates.
@@ -367,37 +389,80 @@ impl Rect {
     }
 }
 
-/// The monitor that shows most of the target window, like Windows'
-/// `MonitorFromWindow`. `None` (use the primary monitor) when the window is
-/// on no monitor, for example minimized to its off-screen position.
+impl Rect {
+    /// Squared distance between the closest points of two rectangles.
+    fn gap(&self, other: &Rect) -> i64 {
+        let axis = |start: i32, length: u32, other_start: i32, other_length: u32| {
+            let end = i64::from(start) + i64::from(length);
+            let other_end = i64::from(other_start) + i64::from(other_length);
+            (i64::from(other_start) - end)
+                .max(i64::from(start) - other_end)
+                .max(0)
+        };
+        let dx = axis(self.x, self.width, other.x, other.width);
+        let dy = axis(self.y, self.height, other.y, other.height);
+        dx * dx + dy * dy
+    }
+}
+
+/// The monitor that shows most of `target`, or the nearest one when it shows
+/// none of it, like `MonitorFromWindow(MONITOR_DEFAULTTONEAREST)`. `None`
+/// only when there is no monitor.
 fn select_monitor(monitors: &[Rect], target: Rect) -> Option<usize> {
-    monitors
+    let overlapping = monitors
         .iter()
         .enumerate()
         .map(|(index, monitor)| (index, monitor.overlap_area(&target)))
         .filter(|(_, area)| *area > 0)
         .max_by_key(|(index, area)| (*area, std::cmp::Reverse(*index)))
-        .map(|(index, _)| index)
+        .map(|(index, _)| index);
+    overlapping.or_else(|| {
+        monitors
+            .iter()
+            .enumerate()
+            .min_by_key(|(index, monitor)| (monitor.gap(&target), *index))
+            .map(|(index, _)| index)
+    })
 }
 
+/// The bounds of the monitor Windows associates with the window: the one
+/// showing most of it, or the nearest one. A minimized window uses its
+/// restored position, so it is not sent to the primary monitor.
 #[cfg(target_os = "windows")]
-fn window_rect(handle: isize) -> Option<Rect> {
+fn monitor_of_window(handle: isize) -> Option<Rect> {
     use windows::Win32::{
-        Foundation::{HWND, RECT},
-        UI::WindowsAndMessaging::GetWindowRect,
+        Foundation::HWND,
+        Graphics::Gdi::{
+            GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        },
     };
-    let mut rect = RECT::default();
-    unsafe { GetWindowRect(HWND(handle as *mut core::ffi::c_void), &mut rect) }.ok()?;
+    let monitor = unsafe {
+        MonitorFromWindow(
+            HWND(handle as *mut core::ffi::c_void),
+            MONITOR_DEFAULTTONEAREST,
+        )
+    };
+    if monitor.is_invalid() {
+        return None;
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return None;
+    }
+    let bounds = info.rcMonitor;
     Some(Rect {
-        x: rect.left,
-        y: rect.top,
-        width: u32::try_from(rect.right - rect.left).ok()?,
-        height: u32::try_from(rect.bottom - rect.top).ok()?,
+        x: bounds.left,
+        y: bounds.top,
+        width: u32::try_from(bounds.right - bounds.left).ok()?,
+        height: u32::try_from(bounds.bottom - bounds.top).ok()?,
     })
 }
 
 #[cfg(not(target_os = "windows"))]
-fn window_rect(_: isize) -> Option<Rect> {
+fn monitor_of_window(_: isize) -> Option<Rect> {
     None
 }
 
@@ -476,12 +541,37 @@ mod tests {
             select_monitor(&monitors, window(-500, 100, 800, 600)),
             Some(1)
         );
-        // A minimized window sits off-screen: fall back to the primary.
+        // Off every monitor: the nearest one, not the primary.
         assert_eq!(
-            select_monitor(&monitors, window(-32000, -32000, 160, 28)),
-            None
+            select_monitor(&monitors, window(-3000, 2000, 100, 100)),
+            Some(1)
         );
+        assert_eq!(
+            select_monitor(&monitors, window(2500, 500, 100, 100)),
+            Some(0)
+        );
+        // Windows reports the monitor's own bounds, which select themselves.
+        assert_eq!(select_monitor(&monitors, left), Some(1));
         assert_eq!(select_monitor(&[], window(0, 0, 10, 10)), None);
+    }
+
+    #[test]
+    fn placement_uses_the_target_monitors_scale() {
+        let work_area = Rect {
+            x: -2560,
+            y: -360,
+            width: 2560,
+            height: 1400,
+        };
+        // 200x48 logical at 150%: 300x72 physical, 36 px margin.
+        assert_eq!(
+            placement(work_area, 1.5, (200.0, 48.0)),
+            ((-2560 + 1130, -360 + 1400 - 72 - 36), (300, 72))
+        );
+        assert_eq!(
+            placement(work_area, 1.0, (200.0, 48.0)),
+            ((-2560 + 1180, -360 + 1400 - 48 - 24), (200, 48))
+        );
     }
 
     #[test]

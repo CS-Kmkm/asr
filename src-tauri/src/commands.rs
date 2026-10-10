@@ -721,7 +721,9 @@ async fn start_recording_mode(
     trigger_chord: Option<String>,
     mode: PipelineMode,
 ) -> Result<(), String> {
-    if from_shortcut {
+    // Until this take captures its own target, the overlay follows the
+    // window the user is working in. Never move a running session's overlay.
+    if services.lifecycle.phase() == PipelinePhase::Idle {
         recording_overlay::anchor_to_foreground();
     }
     let claimed = if services.translation_active.load(Ordering::Acquire) {
@@ -831,17 +833,19 @@ async fn start_owned_recording(
             AskCapture::Caret(target) => Some(target),
             AskCapture::Unavailable => None,
         });
-    recording_overlay::set_anchor(
-        target
-            .as_ref()
-            .or_else(|| {
-                edit_session
-                    .as_ref()
-                    .map(|session| session.selection.target())
-            })
-            .or(ask_target)
-            .map(|target| target.window_handle),
-    );
+    // Without a captured target (Ask with no usable context) the overlay
+    // keeps the foreground anchor instead of moving to the primary monitor.
+    if let Some(target) = target
+        .as_ref()
+        .or_else(|| {
+            edit_session
+                .as_ref()
+                .map(|session| session.selection.target())
+        })
+        .or(ask_target)
+    {
+        recording_overlay::set_anchor(target.window_handle);
+    }
     let preparing = services
         .model
         .lock()
@@ -4776,6 +4780,9 @@ pub(crate) async fn retry_history_item(
         lifecycle: &services.lifecycle,
         id: operation_id,
     };
+    // Retry has no target window; show its overlay where the user started it,
+    // not on the last take's monitor.
+    recording_overlay::anchor_to_foreground();
     let mut retry_cleanup = None;
     let result = async {
         emit_state(
