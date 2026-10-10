@@ -1185,6 +1185,8 @@ pub(super) mod tests {
         assert_eq!(*backend.clipboard.borrow(), clipboard);
     }
 
+    type MockHook = Box<dyn Fn(&MockBackend) + Send>;
+
     /// Shared with `live_dictation` tests through `SystemTextInjector::with_mock`.
     pub(crate) struct MockBackend {
         text: RefCell<TargetText>,
@@ -1212,7 +1214,7 @@ pub(super) mod tests {
         on_paste: Option<Box<dyn Fn() + Send>>,
         on_validate: Option<Box<dyn Fn() + Send>>,
         on_clipboard_write: Option<Box<dyn Fn(&MockBackend) + Send>>,
-        on_snapshot: Option<Box<dyn Fn(&MockBackend) + Send>>,
+        on_snapshot: Option<MockHook>,
         /// What the target exposes after processing a paste, for editors
         /// whose readable text is a proxy or a window of the document.
         readback_after_paste: RefCell<Option<TargetText>>,
