@@ -814,6 +814,26 @@ const MICROPHONE_DISCONNECTED: &str = "The microphone was disconnected, so recor
 const MICROPHONE_DISCONNECTED_WITHOUT_SPEECH: &str = "The microphone was disconnected before usable speech was captured. Check the microphone and start a new recording.";
 const RECORDING_LIMIT_REACHED: &str =
     "Recording reached the 15-minute limit and stopped. The audio is being transcribed.";
+const MICROPHONE_DISCONNECTED_PROCESSING: &str =
+    "Microphone disconnected. Transcribing what was captured.";
+const RECORDING_LIMIT_PROCESSING: &str = "Recording limit reached. Transcribing.";
+
+/// The Processing message the overlay shows. An automatic stop keeps its
+/// reason visible there (the status notice appears only in the main window);
+/// a user stop shows `default`.
+fn processing_message(
+    reason: StopReason,
+    disconnected: bool,
+    default: &'static str,
+) -> &'static str {
+    if disconnected || reason == StopReason::MicrophoneDisconnected {
+        MICROPHONE_DISCONNECTED_PROCESSING
+    } else if reason == StopReason::MaximumDuration {
+        RECORDING_LIMIT_PROCESSING
+    } else {
+        default
+    }
+}
 
 #[tauri::command]
 pub(crate) async fn stop_recording(
@@ -862,7 +882,7 @@ pub(crate) async fn stop_recording_for(
         &app,
         &state,
         AppPhase::Processing,
-        "Stopping recording and preparing audio.",
+        processing_message(reason, false, "Stopping recording and preparing audio."),
     );
     let started = Instant::now();
     let (live_task, mut edit_session, mut ask_session, translation_target) =
@@ -926,7 +946,12 @@ pub(crate) async fn stop_recording_for(
         emit_state(&app, &state, AppPhase::Idle, cancel_message);
         return Err(cancel_error.into());
     }
-    emit_state(&app, &state, AppPhase::Processing, "Transcribing locally.");
+    emit_state(
+        &app,
+        &state,
+        AppPhase::Processing,
+        processing_message(reason, disconnected, "Transcribing locally."),
+    );
 
     let app_context = services
         .app_context
@@ -3203,6 +3228,30 @@ mod tests {
             StopReason::MaximumDuration,
             &Err(audio::AudioError::NoVoiceDetected)
         ));
+    }
+
+    #[test]
+    fn an_automatic_stop_keeps_its_reason_in_the_overlay() {
+        assert_eq!(
+            processing_message(StopReason::User, false, "Transcribing locally."),
+            "Transcribing locally."
+        );
+        assert_eq!(
+            processing_message(StopReason::User, true, "Transcribing locally."),
+            MICROPHONE_DISCONNECTED_PROCESSING
+        );
+        assert_eq!(
+            processing_message(StopReason::MicrophoneDisconnected, false, "Stopping"),
+            MICROPHONE_DISCONNECTED_PROCESSING
+        );
+        assert_eq!(
+            processing_message(StopReason::MaximumDuration, false, "Stopping"),
+            RECORDING_LIMIT_PROCESSING
+        );
+        assert_eq!(
+            processing_message(StopReason::MaximumDuration, true, "Stopping"),
+            MICROPHONE_DISCONNECTED_PROCESSING
+        );
     }
 
     #[test]
