@@ -179,6 +179,21 @@ pub trait Transcriber: Send + Sync {
         let _ = cancel;
         self.load(quantization).await
     }
+    /// `load`, optionally cancellable, that calls `started` once the load
+    /// has the worker to itself (any load ahead of it has finished). A load
+    /// cancelled while still waiting returns without calling it.
+    async fn load_when_started(
+        &self,
+        quantization: &str,
+        cancel: Option<watch::Receiver<bool>>,
+        started: &(dyn Fn() + Send + Sync),
+    ) -> Result<(), AsrError> {
+        started();
+        match cancel {
+            Some(cancel) => self.load_cancellable(quantization, cancel).await,
+            None => self.load(quantization).await,
+        }
+    }
     async fn transcribe(
         &self,
         audio_path: &Path,
@@ -733,9 +748,13 @@ impl JsonlTranscriber {
         &self,
         quantization: &str,
         mut cancel: Option<watch::Receiver<bool>>,
+        started: Option<&(dyn Fn() + Send + Sync)>,
     ) -> Result<(), AsrError> {
         let mut interrupt = self.interrupt.subscribe();
         let mut state = self.lock_state(&mut cancel, &mut interrupt).await?;
+        if let Some(started) = started {
+            started();
+        }
         if state.running.is_some() && state.loaded_quantization.as_deref() == Some(quantization) {
             // Already in memory, for example restored after a worker restart.
             return Ok(());
@@ -886,7 +905,7 @@ fn transcribe_request(
 #[async_trait]
 impl Transcriber for JsonlTranscriber {
     async fn load(&self, quantization: &str) -> Result<(), AsrError> {
-        self.load_with(quantization, None).await
+        self.load_with(quantization, None, None).await
     }
 
     async fn load_cancellable(
@@ -894,7 +913,16 @@ impl Transcriber for JsonlTranscriber {
         quantization: &str,
         cancel: watch::Receiver<bool>,
     ) -> Result<(), AsrError> {
-        self.load_with(quantization, Some(cancel)).await
+        self.load_with(quantization, Some(cancel), None).await
+    }
+
+    async fn load_when_started(
+        &self,
+        quantization: &str,
+        cancel: Option<watch::Receiver<bool>>,
+        started: &(dyn Fn() + Send + Sync),
+    ) -> Result<(), AsrError> {
+        self.load_with(quantization, cancel, Some(started)).await
     }
 
     async fn transcribe(

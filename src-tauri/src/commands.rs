@@ -4911,54 +4911,7 @@ pub(crate) async fn ensure_model_loaded_cancellable(
         state: "loading".into(),
         detail: detail.clone(),
     };
-    let load = services.model.begin_load(loading.clone())?;
-    let _ = app.emit("model-status", loading.clone());
-
-    // Only the worker knows whether the model files are already cached, so the
-    // download message and progress bar are driven by what it reports.
-    let progress_forwarder = spawn_load_progress_forwarder(app, services);
-    let load_result = match cancel {
-        Some(cancel) => {
-            services
-                .transcriber
-                .load_cancellable(&settings.model_quantization, cancel)
-                .await
-        }
-        None => {
-            services
-                .transcriber
-                .load(&settings.model_quantization)
-                .await
-        }
-    };
-    if let Some(forwarder) = progress_forwarder {
-        forwarder.abort();
-    }
-
-    // Every outcome is shown only while this load still owns the status: a
-    // newer load or a settings save may already show its own.
-    if let Err(asr::AsrError::Cancelled) = load_result {
-        // Abandoned for a cancelled recording, a model change or quit.
-        let not_loaded = residency_status(asr::ModelResidency::Absent, &loading, &detail);
-        if let Some(status) = services.model.update(load, not_loaded) {
-            let _ = app.emit("model-status", status);
-        }
-        return Err(MODEL_LOAD_CANCELLED.into());
-    }
-    if let Err(error) = load_result {
-        let message = command_error(&error);
-        let failed = ModelStatus {
-            model_id,
-            installed: false,
-            state: "error".into(),
-            detail: format!("{detail} {message}"),
-        };
-        if let Some(status) = services.model.update(load, failed) {
-            let _ = app.emit("model-status", status);
-        }
-        return Err(message);
-    }
-    let status = ModelStatus {
+    let ready = ModelStatus {
         model_id,
         installed: true,
         state: "ready".into(),
@@ -4967,11 +4920,108 @@ pub(crate) async fn ensure_model_loaded_cancellable(
             settings.model_quantization
         ),
     };
-    if let Some(shown) = services.model.update(load, status.clone()) {
-        let _ = app.emit("model-status", shown);
-        follow_model_residency(app, services, load, &status, detail);
+
+    // Only the worker knows whether the model files are already cached, so the
+    // download message and progress bar are driven by what it reports.
+    let progress_forwarder = spawn_load_progress_forwarder(app, services);
+    let publish = |status: ModelStatus| {
+        let _ = app.emit("model-status", status);
+    };
+    let (result, shown_by) = load_and_publish_status(
+        &services.model,
+        services.transcriber.as_ref(),
+        &settings.model_quantization,
+        cancel,
+        ModelLoadStatuses {
+            loading: &loading,
+            ready: &ready,
+            detail: &detail,
+        },
+        &publish,
+    )
+    .await;
+    if let Some(forwarder) = progress_forwarder {
+        forwarder.abort();
     }
-    Ok(status)
+    if let Some(load) = shown_by {
+        follow_model_residency(app, services, load, &ready, detail);
+    }
+    result.map(|()| ready)
+}
+
+/// The statuses one load may publish.
+struct ModelLoadStatuses<'a> {
+    loading: &'a ModelStatus,
+    ready: &'a ModelStatus,
+    /// Detail of the model without the "Loaded with" suffix.
+    detail: &'a str,
+}
+
+/// Load the model and publish its status, returning the load's ownership
+/// id when its `ready` status is shown.
+///
+/// A load takes over the status only once the transcriber starts it (has
+/// its worker lock). A load that waits behind another one, for example a
+/// recording start during the startup download, and is cancelled meanwhile
+/// therefore never touches the status, and the running load still shows its
+/// own outcome.
+async fn load_and_publish_status(
+    slot: &ModelStatusSlot,
+    transcriber: &dyn Transcriber,
+    quantization: &str,
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    statuses: ModelLoadStatuses<'_>,
+    publish: &(dyn Fn(ModelStatus) + Send + Sync),
+) -> (Result<(), String>, Option<u64>) {
+    let owner = Mutex::new(None);
+    let started = || {
+        if let Ok(load) = slot.begin_load(statuses.loading.clone()) {
+            *owner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(load);
+            publish(statuses.loading.clone());
+        }
+    };
+    let result = transcriber
+        .load_when_started(quantization, cancel, &started)
+        .await;
+    let owner = owner
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Every outcome is shown only while this load still owns the status: a
+    // newer load or a settings save may already show its own.
+    let show = |status: ModelStatus| {
+        let shown = owner.and_then(|load| slot.update(load, status));
+        if let Some(status) = shown.clone() {
+            publish(status);
+        }
+        shown.is_some()
+    };
+    match result {
+        Ok(()) => {
+            let shown = show(statuses.ready.clone());
+            (Ok(()), owner.filter(|_| shown))
+        }
+        Err(asr::AsrError::Cancelled) => {
+            // Abandoned for a cancelled recording, a model change or quit.
+            show(residency_status(
+                asr::ModelResidency::Absent,
+                statuses.loading,
+                statuses.detail,
+            ));
+            (Err(MODEL_LOAD_CANCELLED.into()), None)
+        }
+        Err(error) => {
+            let message = command_error(&error);
+            show(ModelStatus {
+                model_id: statuses.loading.model_id.clone(),
+                installed: false,
+                state: "error".into(),
+                detail: format!("{} {message}", statuses.detail),
+            });
+            (Err(message), None)
+        }
+    }
 }
 
 /// The model status and the load that may change it, under one lock.
@@ -5176,6 +5226,133 @@ mod model_status_tests {
 
         assert!(slot.update(load, status("ready", "d")).is_none());
         assert_eq!(slot.get().unwrap().detail, "other model");
+    }
+
+    /// Loads run one at a time like the worker's: a load holds `worker`
+    /// until `release` opens.
+    struct QueuedTranscriber {
+        worker: tokio::sync::Mutex<()>,
+        release: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transcriber for QueuedTranscriber {
+        async fn load(&self, _: &str) -> Result<(), asr::AsrError> {
+            unreachable!("loads go through load_when_started")
+        }
+
+        async fn load_when_started(
+            &self,
+            _: &str,
+            cancel: Option<tokio::sync::watch::Receiver<bool>>,
+            started: &(dyn Fn() + Send + Sync),
+        ) -> Result<(), asr::AsrError> {
+            let _worker = match cancel {
+                Some(mut cancel) => tokio::select! {
+                    worker = self.worker.lock() => worker,
+                    _ = cancel.wait_for(|cancelled| *cancelled) => {
+                        return Err(asr::AsrError::Cancelled);
+                    }
+                },
+                None => self.worker.lock().await,
+            };
+            started();
+            let mut release = self.release.clone();
+            let _ = release.wait_for(|open| *open).await;
+            Ok(())
+        }
+
+        async fn transcribe(
+            &self,
+            _: &Path,
+            _: Option<&str>,
+            _: tokio::sync::watch::Receiver<bool>,
+        ) -> Result<asr::Transcript, asr::AsrError> {
+            unreachable!("not used")
+        }
+
+        async fn shutdown(&self) -> Result<(), asr::AsrError> {
+            Ok(())
+        }
+
+        async fn reconfigure(&self, _: asr::WorkerCommand) {}
+    }
+
+    fn spawn_load(
+        slot: &Arc<ModelStatusSlot>,
+        transcriber: &Arc<QueuedTranscriber>,
+        cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> tokio::task::JoinHandle<(Result<(), String>, Option<u64>)> {
+        let slot = slot.clone();
+        let transcriber = transcriber.clone();
+        tokio::spawn(async move {
+            let loading = status("loading", "d");
+            let ready = status("ready", "d Loaded with 4bit quantization.");
+            load_and_publish_status(
+                &slot,
+                transcriber.as_ref(),
+                "4bit",
+                cancel,
+                ModelLoadStatuses {
+                    loading: &loading,
+                    ready: &ready,
+                    detail: "d",
+                },
+                &|_| {},
+            )
+            .await
+        })
+    }
+
+    #[tokio::test]
+    async fn a_load_cancelled_while_waiting_leaves_the_running_load_its_status() {
+        // The startup download (A) is running when a recording start (B)
+        // needs the model; Esc cancels B before it ever reaches the worker.
+        let slot = Arc::new(ModelStatusSlot::new(status("not_loaded", "d")));
+        let (release_tx, release) = tokio::sync::watch::channel(false);
+        let transcriber = Arc::new(QueuedTranscriber {
+            worker: tokio::sync::Mutex::new(()),
+            release,
+        });
+        let startup = spawn_load(&slot, &transcriber, None);
+        while slot.get().unwrap().state != "loading" {
+            tokio::task::yield_now().await;
+        }
+
+        let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+        let recording = spawn_load(&slot, &transcriber, Some(cancel));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel_tx.send_replace(true);
+        let (result, shown_by) = recording.await.unwrap();
+        assert_eq!(result, Err(MODEL_LOAD_CANCELLED.to_string()));
+        assert_eq!(shown_by, None);
+        assert_eq!(slot.get().unwrap().state, "loading");
+
+        release_tx.send_replace(true);
+        let (result, shown_by) = startup.await.unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(shown_by.is_some());
+        assert_eq!(slot.get().unwrap().state, "ready");
+    }
+
+    #[tokio::test]
+    async fn a_load_that_reaches_the_worker_takes_the_status_over() {
+        let slot = Arc::new(ModelStatusSlot::new(status("not_loaded", "d")));
+        let (release_tx, release) = tokio::sync::watch::channel(true);
+        let transcriber = Arc::new(QueuedTranscriber {
+            worker: tokio::sync::Mutex::new(()),
+            release,
+        });
+        let (result, first) = spawn_load(&slot, &transcriber, None).await.unwrap();
+        assert_eq!(result, Ok(()));
+        let (result, second) = spawn_load(&slot, &transcriber, None).await.unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(first.is_some() && second.is_some() && first != second);
+        // The first load no longer owns the status.
+        assert!(slot
+            .update(first.unwrap(), status("error", "late"))
+            .is_none());
+        drop(release_tx);
     }
 
     #[test]
