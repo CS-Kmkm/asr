@@ -4,7 +4,7 @@
 //! handles are copied while the clipboard is open, then transferred one by
 //! one only after `SetClipboardData` succeeds.
 
-use super::{ClipboardExclusion, InjectionError};
+use super::{ClipboardExclusion, InjectionError, WriteError};
 use std::mem::size_of;
 use std::ptr;
 use std::thread;
@@ -407,14 +407,29 @@ pub(super) fn snapshot() -> Result<Snapshot, InjectionError> {
     Ok(Snapshot { entries })
 }
 
-pub(super) fn sequence() -> u32 {
-    unsafe { GetClipboardSequenceNumber() }
+/// Only a failure after EmptyClipboard changed the clipboard; failing to open
+/// it (another process holds it, perhaps while placing a newer copy) did not.
+pub(super) fn write(text: &str, exclusion: ClipboardExclusion) -> Result<u32, WriteError> {
+    let mut emptied = false;
+    let result = write_opened(text, exclusion, &mut emptied);
+    // Closing materializes synthesized formats and advances the sequence.
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    match result {
+        Ok(()) => Ok(sequence),
+        Err(error) if emptied => Err(WriteError::AfterEmpty { error, sequence }),
+        Err(error) => Err(WriteError::Untouched(error)),
+    }
 }
 
-pub(super) fn write(text: &str, exclusion: ClipboardExclusion) -> Result<u32, InjectionError> {
+fn write_opened(
+    text: &str,
+    exclusion: ClipboardExclusion,
+    emptied: &mut bool,
+) -> Result<(), InjectionError> {
     {
         let _guard = open_clipboard()?;
         unsafe { EmptyClipboard() }.map_err(|_| InjectionError::ClipboardUnavailable)?;
+        *emptied = true;
         if exclusion == ClipboardExclusion::ExcludeFromHistory && !apply_history_exclusion() {
             return Err(InjectionError::ClipboardUnavailable);
         }
@@ -439,8 +454,7 @@ pub(super) fn write(text: &str, exclusion: ClipboardExclusion) -> Result<u32, In
             InjectionError::ClipboardUnavailable
         })?;
     }
-    // Closing materializes synthesized formats and advances the sequence.
-    Ok(unsafe { GetClipboardSequenceNumber() })
+    Ok(())
 }
 
 #[cfg(test)]

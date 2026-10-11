@@ -726,18 +726,13 @@ trait Backend {
         text: &str,
     ) -> Result<bool, InjectionError>;
     fn clipboard_snapshot(&self) -> Result<Self::Clipboard, InjectionError>;
-    fn clipboard_write(
-        &self,
-        text: &str,
-        exclusion: ClipboardExclusion,
-    ) -> Result<u32, InjectionError>;
+    fn clipboard_write(&self, text: &str, exclusion: ClipboardExclusion)
+        -> Result<u32, WriteError>;
     fn clipboard_restore(
         &self,
         snapshot: Self::Clipboard,
         expected_sequence: u32,
     ) -> Result<bool, InjectionError>;
-    /// The system clipboard sequence number; it changes with every change.
-    fn clipboard_sequence(&self) -> u32;
     /// Returns true if any input was queued, including a partial SendInput.
     fn paste(&self, target: &TargetWindow, policy: SafetyPolicy) -> Result<bool, InjectionError>;
     /// Returns true if any input was queued, including a partial SendInput.
@@ -753,6 +748,20 @@ trait Backend {
     /// Records that, with Restore clipboard on, an attempt left this app's
     /// text in place of the user's clipboard.
     fn clipboard_not_restored(&self);
+}
+
+/// A failed clipboard write.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WriteError {
+    /// The clipboard was never opened or emptied, so nothing changed. A
+    /// sequence change meanwhile belongs to another process.
+    Untouched(InjectionError),
+    /// The write emptied the clipboard, then failed. `sequence` is the
+    /// clipboard sequence right after it closed, identifying the change as ours.
+    AfterEmpty {
+        error: InjectionError,
+        sequence: u32,
+    },
 }
 
 /// Remembers a lost user clipboard until the caller reports it.
@@ -862,7 +871,7 @@ pub(crate) mod test_backend {
             &self,
             text: &str,
             exclusion: ClipboardExclusion,
-        ) -> Result<u32, InjectionError> {
+        ) -> Result<u32, WriteError> {
             delegate!(self, |b| b.clipboard_write(text, exclusion))
         }
         fn clipboard_restore(
@@ -897,9 +906,6 @@ pub(crate) mod test_backend {
             expected: &TargetText,
         ) -> Result<bool, InjectionError> {
             delegate!(self, |b| b.collapse_selection(target, expected))
-        }
-        fn clipboard_sequence(&self) -> u32 {
-            delegate!(self, |b| b.clipboard_sequence())
         }
         fn wait_for_target(&self) {
             delegate!(self, |b| b.wait_for_target())
@@ -954,8 +960,8 @@ impl Backend for PlatformBackend {
     fn clipboard_snapshot(&self) -> Result<Self::Clipboard, InjectionError> {
         Err(InjectionError::UnsupportedPlatform)
     }
-    fn clipboard_write(&self, _: &str, _: ClipboardExclusion) -> Result<u32, InjectionError> {
-        Err(InjectionError::UnsupportedPlatform)
+    fn clipboard_write(&self, _: &str, _: ClipboardExclusion) -> Result<u32, WriteError> {
+        Err(WriteError::Untouched(InjectionError::UnsupportedPlatform))
     }
     fn clipboard_restore(&self, _: Self::Clipboard, _: u32) -> Result<bool, InjectionError> {
         Err(InjectionError::UnsupportedPlatform)
@@ -968,9 +974,6 @@ impl Backend for PlatformBackend {
     }
     fn collapse_selection(&self, _: &TargetWindow, _: &TargetText) -> Result<bool, InjectionError> {
         Err(InjectionError::UnsupportedPlatform)
-    }
-    fn clipboard_sequence(&self) -> u32 {
-        0
     }
     fn wait_for_target(&self) {}
     fn clipboard_not_restored(&self) {
@@ -985,7 +988,7 @@ use windows_backend::PlatformBackend;
 mod windows_backend {
     use super::{
         accessibility, clipboard, target, Backend, ClipboardExclusion, InjectionError,
-        SafetyPolicy, TargetText, TargetWindow, UnrestoredClipboard, INJECTION_MARKER,
+        SafetyPolicy, TargetText, TargetWindow, UnrestoredClipboard, WriteError, INJECTION_MARKER,
     };
     use std::mem::{size_of, zeroed};
     use std::thread;
@@ -1293,7 +1296,7 @@ mod windows_backend {
             &self,
             text: &str,
             exclusion: ClipboardExclusion,
-        ) -> Result<u32, InjectionError> {
+        ) -> Result<u32, WriteError> {
             clipboard::write(text, exclusion)
         }
         fn clipboard_restore(
@@ -1357,9 +1360,6 @@ mod windows_backend {
                 return Ok(false);
             }
             accessibility::collapse_selection(target, expected)
-        }
-        fn clipboard_sequence(&self) -> u32 {
-            clipboard::sequence()
         }
         fn wait_for_target(&self) {
             thread::sleep(Duration::from_millis(20));

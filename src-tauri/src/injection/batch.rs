@@ -117,7 +117,6 @@ impl<'a, B: Backend> UserClipboard<'a, B> {
                 Err(error) => return Err(error),
             });
         }
-        let before = self.backend.clipboard_sequence();
         match self
             .backend
             .clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)
@@ -126,15 +125,13 @@ impl<'a, B: Backend> UserClipboard<'a, B> {
                 self.written = Some(sequence);
                 Ok(sequence)
             }
-            Err(error) => {
-                // A write can fail after emptying the clipboard. If it changed,
-                // treat the change as ours so the guard restores or reports it.
-                let after = self.backend.clipboard_sequence();
-                if after != before {
-                    self.written = Some(after);
-                }
+            // The write emptied the clipboard: restore or report it as ours.
+            Err(WriteError::AfterEmpty { error, sequence }) => {
+                self.written = Some(sequence);
                 Err(error)
             }
+            // Nothing changed; a newer copy by another process stays.
+            Err(WriteError::Untouched(error)) => Err(error),
         }
     }
 
@@ -1342,6 +1339,9 @@ pub(super) mod tests {
         restore_fails: Cell<bool>,
         /// The write empties the clipboard, then fails.
         write_fails_after_empty: Cell<bool>,
+        /// Another app holds the clipboard to place a newer copy, so the
+        /// write times out opening it.
+        write_blocked_by_copy: Cell<bool>,
         not_restored: Cell<usize>,
         /// SendInput queued only part of the deletion; the target has not
         /// processed it yet.
@@ -1388,6 +1388,7 @@ pub(super) mod tests {
                 snapshot_error: RefCell::new(None),
                 restore_fails: Cell::new(false),
                 write_fails_after_empty: Cell::new(false),
+                write_blocked_by_copy: Cell::new(false),
                 not_restored: Cell::new(0),
                 delete_partial: Cell::new(false),
                 delete_accepted: Cell::new(true),
@@ -1500,12 +1501,20 @@ pub(super) mod tests {
             &self,
             text: &str,
             exclusion: ClipboardExclusion,
-        ) -> Result<u32, InjectionError> {
+        ) -> Result<u32, WriteError> {
             self.calls.borrow_mut().push("write");
+            if self.write_blocked_by_copy.get() {
+                *self.clipboard.borrow_mut() = "new user copy".into();
+                self.sequence.set(self.sequence.get() + 1);
+                return Err(WriteError::Untouched(InjectionError::ClipboardUnavailable));
+            }
             if self.write_fails_after_empty.get() {
                 self.clipboard.borrow_mut().clear();
                 self.sequence.set(self.sequence.get() + 1);
-                return Err(InjectionError::ClipboardUnavailable);
+                return Err(WriteError::AfterEmpty {
+                    error: InjectionError::ClipboardUnavailable,
+                    sequence: self.sequence.get(),
+                });
             }
             *self.clipboard.borrow_mut() = text.into();
             self.exclusions.borrow_mut().push(exclusion);
@@ -1574,9 +1583,6 @@ pub(super) mod tests {
             let selected = std::mem::take(&mut text.selected);
             text.before.push_str(&selected);
             Ok(true)
-        }
-        fn clipboard_sequence(&self) -> u32 {
-            self.sequence.get()
         }
         fn clipboard_not_restored(&self) {
             self.not_restored.set(self.not_restored.get() + 1);
@@ -2073,6 +2079,20 @@ pub(super) mod tests {
         };
         assert!(copy(&backend, off, "text").is_err());
         assert!(!backend.calls.borrow().contains(&"restore"));
+        assert_eq!(backend.not_restored.get(), 0);
+    }
+
+    #[test]
+    fn a_write_that_never_opened_the_clipboard_leaves_a_newer_copy_alone() {
+        let backend = MockBackend::new();
+        backend.write_blocked_by_copy.set(true);
+        assert_eq!(
+            restore_on(&backend, FinalGuard::Untouched),
+            Err(InjectionError::ClipboardUnavailable)
+        );
+        assert_eq!(pastes(&backend), 0);
+        assert!(!backend.calls.borrow().contains(&"restore"));
+        assert_eq!(*backend.clipboard.borrow(), "new user copy");
         assert_eq!(backend.not_restored.get(), 0);
     }
 
