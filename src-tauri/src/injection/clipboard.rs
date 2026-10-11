@@ -407,6 +407,10 @@ pub(super) fn snapshot() -> Result<Snapshot, InjectionError> {
     Ok(Snapshot { entries })
 }
 
+pub(super) fn sequence() -> u32 {
+    unsafe { GetClipboardSequenceNumber() }
+}
+
 pub(super) fn write(text: &str, exclusion: ClipboardExclusion) -> Result<u32, InjectionError> {
     {
         let _guard = open_clipboard()?;

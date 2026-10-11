@@ -117,11 +117,25 @@ impl<'a, B: Backend> UserClipboard<'a, B> {
                 Err(error) => return Err(error),
             });
         }
-        let sequence = self
+        let before = self.backend.clipboard_sequence();
+        match self
             .backend
-            .clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)?;
-        self.written = Some(sequence);
-        Ok(sequence)
+            .clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)
+        {
+            Ok(sequence) => {
+                self.written = Some(sequence);
+                Ok(sequence)
+            }
+            Err(error) => {
+                // A write can fail after emptying the clipboard. If it changed,
+                // treat the change as ours so the guard restores or reports it.
+                let after = self.backend.clipboard_sequence();
+                if after != before {
+                    self.written = Some(after);
+                }
+                Err(error)
+            }
+        }
     }
 
     /// Leaves `text` on the clipboard as the outcome.
@@ -1326,6 +1340,8 @@ pub(super) mod tests {
         ime_query_fails: Cell<bool>,
         snapshot_error: RefCell<Option<InjectionError>>,
         restore_fails: Cell<bool>,
+        /// The write empties the clipboard, then fails.
+        write_fails_after_empty: Cell<bool>,
         not_restored: Cell<usize>,
         /// SendInput queued only part of the deletion; the target has not
         /// processed it yet.
@@ -1371,6 +1387,7 @@ pub(super) mod tests {
                 ime_query_fails: Cell::new(false),
                 snapshot_error: RefCell::new(None),
                 restore_fails: Cell::new(false),
+                write_fails_after_empty: Cell::new(false),
                 not_restored: Cell::new(0),
                 delete_partial: Cell::new(false),
                 delete_accepted: Cell::new(true),
@@ -1485,6 +1502,11 @@ pub(super) mod tests {
             exclusion: ClipboardExclusion,
         ) -> Result<u32, InjectionError> {
             self.calls.borrow_mut().push("write");
+            if self.write_fails_after_empty.get() {
+                self.clipboard.borrow_mut().clear();
+                self.sequence.set(self.sequence.get() + 1);
+                return Err(InjectionError::ClipboardUnavailable);
+            }
             *self.clipboard.borrow_mut() = text.into();
             self.exclusions.borrow_mut().push(exclusion);
             self.sequence.set(self.sequence.get() + 1);
@@ -1552,6 +1574,9 @@ pub(super) mod tests {
             let selected = std::mem::take(&mut text.selected);
             text.before.push_str(&selected);
             Ok(true)
+        }
+        fn clipboard_sequence(&self) -> u32 {
+            self.sequence.get()
         }
         fn clipboard_not_restored(&self) {
             self.not_restored.set(self.not_restored.get() + 1);
@@ -2018,6 +2043,37 @@ pub(super) mod tests {
                 assert_eq!(backend.not_restored.get(), 0);
             }
         }
+    }
+
+    #[test]
+    fn a_write_that_empties_the_clipboard_and_fails_is_restored_or_reported() {
+        for restore_fails in [false, true] {
+            let backend = MockBackend::new();
+            backend.write_fails_after_empty.set(true);
+            backend.restore_fails.set(restore_fails);
+            assert_eq!(
+                restore_on(&backend, FinalGuard::Untouched),
+                Err(InjectionError::ClipboardUnavailable)
+            );
+            assert_eq!(pastes(&backend), 0);
+            assert!(backend.calls.borrow().ends_with(&["write", "restore"]));
+            if restore_fails {
+                assert_eq!(*backend.clipboard.borrow(), "");
+                assert_eq!(backend.not_restored.get(), 1);
+            } else {
+                assert_eq!(*backend.clipboard.borrow(), "original rich clipboard");
+                assert_eq!(backend.not_restored.get(), 0);
+            }
+        }
+        // With Restore clipboard off the user accepted replacement.
+        let backend = MockBackend::new();
+        backend.write_fails_after_empty.set(true);
+        let off = InjectionOptions {
+            restore_clipboard: false,
+        };
+        assert!(copy(&backend, off, "text").is_err());
+        assert!(!backend.calls.borrow().contains(&"restore"));
+        assert_eq!(backend.not_restored.get(), 0);
     }
 
     #[test]

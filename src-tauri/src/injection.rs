@@ -651,6 +651,8 @@ trait Backend {
         snapshot: Self::Clipboard,
         expected_sequence: u32,
     ) -> Result<bool, InjectionError>;
+    /// The system clipboard sequence number; it changes with every change.
+    fn clipboard_sequence(&self) -> u32;
     /// Returns true if any input was queued, including a partial SendInput.
     fn paste(&self, target: &TargetWindow, policy: SafetyPolicy) -> Result<bool, InjectionError>;
     /// Returns true if any input was queued, including a partial SendInput.
@@ -811,6 +813,9 @@ pub(crate) mod test_backend {
         ) -> Result<bool, InjectionError> {
             delegate!(self, |b| b.collapse_selection(target, expected))
         }
+        fn clipboard_sequence(&self) -> u32 {
+            delegate!(self, |b| b.clipboard_sequence())
+        }
         fn wait_for_target(&self) {
             delegate!(self, |b| b.wait_for_target())
         }
@@ -878,6 +883,9 @@ impl Backend for PlatformBackend {
     }
     fn collapse_selection(&self, _: &TargetWindow, _: &TargetText) -> Result<bool, InjectionError> {
         Err(InjectionError::UnsupportedPlatform)
+    }
+    fn clipboard_sequence(&self) -> u32 {
+        0
     }
     fn wait_for_target(&self) {}
     fn clipboard_not_restored(&self) {
@@ -1264,6 +1272,9 @@ mod windows_backend {
                 return Ok(false);
             }
             accessibility::collapse_selection(target, expected)
+        }
+        fn clipboard_sequence(&self) -> u32 {
+            clipboard::sequence()
         }
         fn wait_for_target(&self) {
             thread::sleep(Duration::from_millis(20));
