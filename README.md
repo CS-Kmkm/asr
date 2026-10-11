@@ -118,6 +118,13 @@ data directory itself. Release data is never copied or migrated into `dev`;
 a fresh debug build starts with empty data. Worker logs stay in the shared
 app log directory.
 
+Debug builds also leave other release state alone. They never register or
+remove startup at Windows sign-in: toggling **Start with Windows** in a debug
+build only saves the setting and shows a notice. They also skip the startup
+cleanup of stale capture WAVs in the shared temporary folder, because those
+files cannot be told apart from ones a release instance keeps; delete old
+`local-ai-voice-*.wav` files there by hand if a debug build leaves any.
+
 To inspect release data from a debug build, opt in explicitly:
 
 ```powershell
@@ -127,8 +134,11 @@ pnpm run tauri dev
 
 Only the exact value `1` opts in. While it is set, the debug build opens and
 migrates the release database and recordings directly, so destructive tests
-and unreleased migrations then affect your real data. Remove the variable
-(`Remove-Item Env:LVI_USE_RELEASE_DATA`) when you are done.
+and unreleased migrations then affect your real data. Quit any running
+release app first: the single-instance guard exists only in release builds,
+so nothing stops both from opening the same database and `history-audio`
+folder at once. Remove the variable (`Remove-Item Env:LVI_USE_RELEASE_DATA`)
+when you are done.
 
 ## Backends
 
