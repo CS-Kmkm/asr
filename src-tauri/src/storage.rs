@@ -3236,26 +3236,46 @@ mod tests {
             .unwrap()
     }
 
-    /// Lists the History audio files after the deletion queue has settled.
-    /// On Windows a just-written file can be briefly held open (Defender, the
-    /// indexer), so a delete is queued and retried instead of failing; counting
-    /// immediately would then see a file the product has already given up.
+    fn pending_audio_deletions(storage: &Storage) -> Vec<String> {
+        let connection = storage.connection().unwrap();
+        let mut statement = connection
+            .prepare("SELECT filename FROM pending_audio_deletions ORDER BY filename")
+            .unwrap();
+        let filenames = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        filenames
+    }
+
+    /// Lists the History audio files the product still keeps.
+    ///
+    /// Deleting a recording succeeds once the file is removed or queued in
+    /// `pending_audio_deletions`: on Windows a just-written file can be held
+    /// open briefly (Defender, the indexer), and the queue retries it later.
+    /// The queue is retried here for up to about a second so most runs see the
+    /// physical result; a file still queued after that counts as deleted, as it
+    /// does for the product, and is named on stderr for diagnosis.
     fn history_audio_files(storage: &Storage) -> Vec<PathBuf> {
-        for _ in 0..40 {
+        let mut pending = Vec::new();
+        for attempt in 0..40 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
             storage.retry_pending_audio_deletions().unwrap();
-            let pending: i64 = storage
-                .connection()
-                .unwrap()
-                .query_row("SELECT COUNT(*) FROM pending_audio_deletions", [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            if pending == 0 {
+            pending = pending_audio_deletions(storage);
+            if pending.is_empty() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        match fs::read_dir(&storage.history_audio_dir) {
+        if !pending.is_empty() {
+            eprintln!(
+                "history audio still queued for deletion after retries: {}",
+                pending.join(", ")
+            );
+        }
+        let files: Vec<PathBuf> = match fs::read_dir(&storage.history_audio_dir) {
             Ok(entries) => entries
                 .filter_map(Result::ok)
                 .map(|entry| entry.path())
@@ -3263,7 +3283,15 @@ mod tests {
                 .collect(),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(error) => panic!("history audio directory is unreadable: {error}"),
-        }
+        };
+        files
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_none_or(|name| !pending.iter().any(|queued| queued == name))
+            })
+            .collect()
     }
 
     fn source_wav() -> PathBuf {
