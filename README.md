@@ -107,6 +107,29 @@ pnpm run tauri dev
 See [docs/adr/0004-default-asr-backend.md](docs/adr/0004-default-asr-backend.md)
 for the rationale behind the default backend choice.
 
+### Development data
+
+Debug builds (`pnpm run tauri dev`, `cargo build` without `--release`) keep
+their SQLite database and `history-audio` folder in a `dev` subfolder of the
+app data directory (`%APPDATA%\org.localvoice.input\dev\` on Windows), so
+development and destructive testing never touch the History, settings, or
+recordings of an installed release build. Release builds keep using the app
+data directory itself. Release data is never copied or migrated into `dev`;
+a fresh debug build starts with empty data. Worker logs stay in the shared
+app log directory.
+
+To inspect release data from a debug build, opt in explicitly:
+
+```powershell
+$env:LVI_USE_RELEASE_DATA = "1"
+pnpm run tauri dev
+```
+
+Only the exact value `1` opts in. While it is set, the debug build opens and
+migrates the release database and recordings directly, so destructive tests
+and unreleased migrations then affect your real data. Remove the variable
+(`Remove-Item Env:LVI_USE_RELEASE_DATA`) when you are done.
+
 ## Backends
 
 Three ASR backends are supported. The backend is selected via the `--backend`

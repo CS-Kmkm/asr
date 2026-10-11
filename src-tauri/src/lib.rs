@@ -537,10 +537,71 @@ pub(crate) fn emit_status(app: &AppHandle, kind: &str, message: &str) {
     );
 }
 
+const DATABASE_FILE_NAME: &str = "local-voice-input.sqlite3";
+/// Debug builds keep their data in this app-data subfolder so destructive
+/// development (tests, new migrations) never touches release data.
+const DEBUG_DATA_SUBDIRECTORY: &str = "dev";
+/// Set to `1` to make a debug build open the release data instead.
+const USE_RELEASE_DATA_ENV_VAR: &str = "LVI_USE_RELEASE_DATA";
+
+/// Returns the directory holding the database. Storage::open derives the
+/// `history-audio` folder from the database's parent, so audio follows it.
+/// Release builds always use `app_data_dir` itself, exactly as before.
+fn data_directory(
+    app_data_dir: &Path,
+    debug_build: bool,
+    use_release_data: Option<OsString>,
+) -> PathBuf {
+    let opted_into_release_data = use_release_data.is_some_and(|value| value == "1");
+    if debug_build && !opted_into_release_data {
+        app_data_dir.join(DEBUG_DATA_SUBDIRECTORY)
+    } else {
+        app_data_dir.to_path_buf()
+    }
+}
+
 fn database_path(app: &AppHandle) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let directory = app.path().app_data_dir()?;
+    let directory = data_directory(
+        &app.path().app_data_dir()?,
+        cfg!(debug_assertions),
+        std::env::var_os(USE_RELEASE_DATA_ENV_VAR),
+    );
     fs::create_dir_all(&directory)?;
-    Ok(directory.join("local-voice-input.sqlite3"))
+    Ok(directory.join(DATABASE_FILE_NAME))
+}
+
+#[cfg(test)]
+mod data_directory_tests {
+    use super::*;
+
+    #[test]
+    fn release_build_keeps_the_app_data_directory() {
+        let root = Path::new("app-data");
+        assert_eq!(data_directory(root, false, None), root);
+        assert_eq!(data_directory(root, false, Some("1".into())), root);
+        assert_eq!(data_directory(root, false, Some("0".into())), root);
+    }
+
+    #[test]
+    fn debug_build_uses_a_separate_subdirectory() {
+        let root = Path::new("app-data");
+        let debug = data_directory(root, true, None);
+        assert_ne!(debug, root);
+        assert_eq!(debug, root.join(DEBUG_DATA_SUBDIRECTORY));
+    }
+
+    #[test]
+    fn only_an_explicit_opt_in_gives_debug_builds_release_data() {
+        let root = Path::new("app-data");
+        assert_eq!(data_directory(root, true, Some("1".into())), root);
+        for value in ["", "0", "true", "yes", " 1"] {
+            assert_eq!(
+                data_directory(root, true, Some(value.into())),
+                root.join(DEBUG_DATA_SUBDIRECTORY),
+                "{value:?} must not opt in"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
