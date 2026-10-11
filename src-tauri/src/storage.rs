@@ -12,13 +12,13 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use thiserror::Error;
 
 use crate::types::{
     DictionaryCandidate, DictionaryEntry, HistoryAudioPayload, HistoryFilter, HistoryItem,
-    HistoryRetention, NewDictionaryEntry, NewHistoryItem, Settings,
+    HistoryRetention, NewDictionaryEntry, NewHistoryItem, Settings, VoiceShortcuts,
 };
 
 const MAX_HISTORY_AUDIO_BYTES: u64 = 50 * 1024 * 1024;
@@ -58,6 +58,14 @@ pub enum StorageError {
     Validation(String),
     #[error("CSV parsing failed")]
     Csv(#[from] csv::Error),
+    #[error(
+        "database schema version {version} requires a reader of version {min_reader_version}; this build supports {supported}"
+    )]
+    IncompatibleSchema {
+        version: i64,
+        min_reader_version: i64,
+        supported: i64,
+    },
 }
 
 pub struct Storage {
@@ -112,12 +120,6 @@ fn mirror_legacy_shortcut_keys(
         }
     }
     Ok(changed)
-}
-
-fn serialized_settings(settings: &Settings) -> Result<String, StorageError> {
-    let mut value = serde_json::to_value(settings)?;
-    mirror_legacy_shortcut_keys(&mut value, &settings.shortcuts)?;
-    Ok(serde_json::to_string(&value)?)
 }
 
 /// How long a failed take is kept for Retry when the History and audio
@@ -258,19 +260,13 @@ fn purge_history(
 }
 
 /// Reads the stored settings while the caller holds the connection, so a
-/// privacy decision is serialized with the write that depends on it.
+/// privacy decision is serialized with the write that depends on it. Reads
+/// like `get_settings`, so a value from a newer build cannot make the write
+/// fail.
 fn stored_settings(connection: &Connection) -> Result<Settings, StorageError> {
-    let raw: Option<String> = connection
-        .query_row(
-            "SELECT value FROM settings WHERE key = 'app_settings'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(raw
+    Ok(stored_settings_row(connection)?
         .as_deref()
-        .map(serde_json::from_str::<Settings>)
-        .transpose()?
+        .map(|raw| load_settings(raw).settings)
         .unwrap_or_default())
 }
 
@@ -313,6 +309,735 @@ fn insert_history_row(
         ],
     )?;
     Ok(())
+}
+
+/// One schema step. It runs inside the transaction that also advances
+/// `PRAGMA user_version`, so a failed step leaves the previous version.
+struct Migration {
+    apply: fn(&Connection) -> Result<(), StorageError>,
+    /// Lowest schema version a build must support to keep using the
+    /// database after this step. An additive step (new tables or nullable
+    /// columns that older code ignores) keeps 1, so older builds still open
+    /// it; only a step that breaks older readers raises it.
+    min_reader_version: i64,
+}
+
+/// Ordered schema steps; step `n` (0-based) upgrades `user_version` `n` to
+/// `n + 1`. Append new steps; never edit or reorder released ones.
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        apply: migrate_v1_baseline,
+        min_reader_version: 1,
+    },
+    Migration {
+        apply: migrate_v2_settings_backups,
+        min_reader_version: 1,
+    },
+];
+
+/// Key in `schema_meta` holding the highest `min_reader_version` of every
+/// applied step.
+const MIN_READER_VERSION_KEY: &str = "min_reader_version";
+
+/// The compatibility marker a database declares; 1 when it has none.
+fn stored_min_reader_version(connection: &Connection) -> Result<i64, StorageError> {
+    let has_meta: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_meta {
+        return Ok(1);
+    }
+    Ok(connection
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = ?1",
+            [MIN_READER_VERSION_KEY],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(1))
+}
+
+/// Applies every step above the stored `user_version`, one transaction per
+/// step, and records the steps' compatibility marker with it.
+///
+/// A database from a newer build (a higher `user_version`) is opened as is
+/// when its marker says this build can still use it: no unknown step runs
+/// and `user_version` is never lowered. It is refused only when the marker
+/// exceeds this build's version.
+fn run_migrations(
+    connection: &mut Connection,
+    migrations: &[Migration],
+) -> Result<(), StorageError> {
+    let supported = i64::try_from(migrations.len()).unwrap_or(i64::MAX);
+    loop {
+        // IMMEDIATE takes the write lock before the version is read, so two
+        // processes cannot both apply the same step.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: i64 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == supported {
+            return Ok(());
+        }
+        let Some(step) = usize::try_from(version)
+            .ok()
+            .and_then(|index| migrations.get(index))
+        else {
+            let min_reader_version = stored_min_reader_version(&transaction)?;
+            if version < 0 || min_reader_version > supported {
+                return Err(StorageError::IncompatibleSchema {
+                    version,
+                    min_reader_version,
+                    supported,
+                });
+            }
+            eprintln!(
+                "Database schema version {version} is newer than this build's {supported}; opening it because it remains compatible with version {min_reader_version}."
+            );
+            return Ok(());
+        };
+        (step.apply)(&transaction)?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_meta (
+               key TEXT PRIMARY KEY NOT NULL,
+               value INTEGER NOT NULL
+             );",
+        )?;
+        let min_reader_version =
+            stored_min_reader_version(&transaction)?.max(step.min_reader_version);
+        transaction.execute(
+            "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![MIN_READER_VERSION_KEY, min_reader_version],
+        )?;
+        transaction.pragma_update(None, "user_version", version + 1)?;
+        transaction.commit()?;
+    }
+}
+
+/// Version 1: the schema as it stood before versioning. Databases from
+/// earlier builds have `user_version` 0 and any earlier additive shape, so
+/// every step probes and is idempotent.
+fn migrate_v1_baseline(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS settings (
+           key TEXT PRIMARY KEY NOT NULL,
+           value TEXT NOT NULL,
+           updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS dictionary_entries (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           reading TEXT NOT NULL,
+           surface TEXT NOT NULL,
+           category TEXT,
+           aliases TEXT NOT NULL DEFAULT '[]',
+           priority INTEGER NOT NULL DEFAULT 0,
+           app_scope TEXT,
+           source TEXT NOT NULL DEFAULT 'manual',
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS dictionary_candidates (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           original_span TEXT NOT NULL,
+           preferred_span TEXT NOT NULL,
+           confidence REAL NOT NULL,
+           history_id INTEGER,
+           created_at TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           FOREIGN KEY(history_id) REFERENCES dictation_history(id) ON DELETE SET NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_dictionary_candidates_created_at ON dictionary_candidates(created_at DESC);
+         CREATE TABLE IF NOT EXISTS dictionary_candidate_decisions (
+           original_span TEXT NOT NULL,
+           preferred_span TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           PRIMARY KEY(original_span, preferred_span)
+         );
+         CREATE TABLE IF NOT EXISTS dictation_history (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           transcript_text TEXT NOT NULL,
+           processed_text TEXT,
+           source_text TEXT,
+           instruction_text TEXT,
+           action_kind TEXT,
+           search_site TEXT,
+           mode TEXT NOT NULL,
+           asr_provider TEXT NOT NULL,
+           llm_provider TEXT,
+           target_language TEXT,
+           app_category TEXT,
+           duration_ms INTEGER,
+           latency_ms INTEGER,
+           created_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_history_created_at ON dictation_history(created_at DESC);
+         CREATE TABLE IF NOT EXISTS pending_audio_deletions (
+           filename TEXT PRIMARY KEY NOT NULL,
+           created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS metrics (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           event_type TEXT NOT NULL,
+           provider TEXT,
+           duration_ms INTEGER,
+           success INTEGER NOT NULL,
+           error_code TEXT,
+           created_at TEXT NOT NULL
+         );",
+    )?;
+    let has_target_language: bool = connection.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM pragma_table_info('dictation_history')
+           WHERE name = 'target_language'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_target_language {
+        connection.execute(
+            "ALTER TABLE dictation_history ADD COLUMN target_language TEXT",
+            [],
+        )?;
+    }
+    for column in [
+        "source_text",
+        "instruction_text",
+        "action_kind",
+        "search_site",
+        "insertion_result",
+        "insertion_detail",
+    ] {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM pragma_table_info('dictation_history')
+               WHERE name = ?1
+             )",
+            [column],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            connection.execute(
+                &format!("ALTER TABLE dictation_history ADD COLUMN {column} TEXT"),
+                [],
+            )?;
+        }
+    }
+    for (column, definition) in [
+        ("audio_filename", "TEXT"),
+        ("expires_at", "TEXT"),
+        (
+            "retry_of_id",
+            "INTEGER REFERENCES dictation_history(id) ON DELETE SET NULL",
+        ),
+    ] {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('dictation_history') WHERE name = ?1)",
+            [column],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            connection.execute(
+                &format!("ALTER TABLE dictation_history ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    // A legacy/corrupt database may have shared a filename before this
+    // ownership invariant existed. Preserve the oldest association and
+    // clear later duplicates so the new partial unique index can migrate.
+    connection.execute(
+        "UPDATE dictation_history SET audio_filename = NULL
+         WHERE audio_filename IS NOT NULL AND id NOT IN (
+           SELECT MIN(id) FROM dictation_history
+           WHERE audio_filename IS NOT NULL GROUP BY audio_filename
+         )",
+        [],
+    )?;
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_history_audio_filename
+         ON dictation_history(audio_filename) WHERE audio_filename IS NOT NULL",
+        [],
+    )?;
+    let columns = {
+        let mut statement = connection.prepare("PRAGMA table_info(dictionary_entries)")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let has_source = columns.iter().any(|column| column == "source");
+    if !has_source {
+        connection.execute(
+            "ALTER TABLE dictionary_entries ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
+            [],
+        )?;
+    }
+    connection.execute("UPDATE dictionary_entries SET source = 'manual' WHERE source IS NULL OR source NOT IN ('manual', 'auto')", [])?;
+    let decision_columns = {
+        let mut statement =
+            connection.prepare("PRAGMA table_info(dictionary_candidate_decisions)")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if !decision_columns.iter().any(|column| column == "created_at") {
+        // An unreleased development database may have the old table. Its
+        // undated private spans cannot be retained under a time policy.
+        connection.execute(
+            "ALTER TABLE dictionary_candidate_decisions ADD COLUMN created_at TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Version 2: raw settings rows kept before a repair rewrites them, so a
+/// value this build could not read is never lost.
+fn migrate_v2_settings_backups(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS settings_backups (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           key TEXT NOT NULL,
+           value TEXT NOT NULL,
+           reason TEXT NOT NULL,
+           created_at TEXT NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
+/// Raw settings rows kept after a repair rewrote them; older ones are pruned.
+const MAX_SETTINGS_BACKUPS: i64 = 10;
+
+/// Selects one voice mode's chord list.
+type ShortcutMode = fn(&mut VoiceShortcuts) -> &mut Vec<String>;
+
+/// The JSON key and field of each voice mode's chord list in `shortcuts`.
+const SHORTCUT_MODES: [(&str, ShortcutMode); 4] = [
+    ("dictate", |shortcuts| &mut shortcuts.dictate),
+    ("translate", |shortcuts| &mut shortcuts.translate),
+    ("ask", |shortcuts| &mut shortcuts.ask),
+    ("edit", |shortcuts| &mut shortcuts.edit),
+];
+
+fn default_chords(mode: ShortcutMode) -> Vec<String> {
+    std::mem::take(mode(&mut VoiceShortcuts::default()))
+}
+
+/// Settings decoded from a stored row.
+struct LoadedSettings {
+    settings: Settings,
+    /// The stored row after the legacy-layout migrations, when one changed
+    /// it. Only these migrations are ever persisted.
+    migrated: Option<serde_json::Value>,
+    /// Content-free names of the legacy migrations in `migrated`.
+    migrations: Vec<&'static str>,
+    /// Content-free names of the fields replaced in memory only.
+    repairs: SettingsRepairs,
+}
+
+/// Fields of the stored settings this build could not read and replaced in
+/// memory for this run. The stored row keeps the original values, so a newer
+/// build that wrote them still finds them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SettingsRepairs(Vec<String>);
+
+impl SettingsRepairs {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether the field with this JSON key (or the whole row) was replaced.
+    pub fn contains(&self, key: &str) -> bool {
+        self.0
+            .iter()
+            .any(|repaired| repaired == key || repaired == UNREADABLE_ROW)
+    }
+
+    /// Content-free names of the replaced fields, each once: JSON keys,
+    /// `shortcuts.<mode>`, or `unreadable` for the whole row.
+    pub fn fields(&self) -> Vec<String> {
+        let mut fields: Vec<String> = Vec::new();
+        for field in &self.0 {
+            if !fields.contains(field) {
+                fields.push(field.clone());
+            }
+        }
+        fields
+    }
+
+    /// Whether exactly this field was replaced.
+    fn replaced(&self, key: &str) -> bool {
+        self.0.iter().any(|repaired| repaired == key)
+    }
+
+    fn push(&mut self, key: impl Into<String>) {
+        self.0.push(key.into());
+    }
+}
+
+/// Repair marker for a row that is not a JSON object at all.
+const UNREADABLE_ROW: &str = "unreadable";
+
+/// Decodes a stored settings row without failing.
+///
+/// Legacy layouts (pre-retention History switches, scalar shortcut keys, and
+/// the scalar mirrors) are migrated and may be persisted as before. Any
+/// field this build cannot read is replaced only in memory, each on its own,
+/// so one bad value never discards the other settings and a value written by
+/// a newer build is never overwritten by an older one.
+fn load_settings(raw: &str) -> LoadedSettings {
+    let mut repairs = SettingsRepairs::default();
+    let mut migrations = Vec::new();
+    let parsed = serde_json::from_str::<serde_json::Value>(raw);
+    let readable = matches!(parsed, Ok(serde_json::Value::Object(_)));
+    let mut object = match parsed {
+        Ok(serde_json::Value::Object(object)) => object,
+        _ => {
+            repairs.push(UNREADABLE_ROW);
+            serde_json::Map::new()
+        }
+    };
+    if !object.contains_key("historyRetention") {
+        let enabled = object
+            .remove("historyEnabled")
+            .and_then(|value| value.as_bool());
+        let days = object
+            .remove("historyRetentionDays")
+            .and_then(|value| value.as_u64());
+        // An explicit "off" is the user's choice; without a readable window
+        // (an unreadable row also lands here) keep everything.
+        let retention = match (enabled, days) {
+            (Some(false), _) => "never",
+            (_, None) => "forever",
+            (_, Some(days)) if days < 7 => "24_hours",
+            (_, Some(days)) if days < 30 => "one_week",
+            (_, Some(days)) if days < 365 => "one_month",
+            (_, Some(_)) => "one_year",
+        };
+        object.insert("historyRetention".into(), retention.into());
+        migrations.push("legacy_history");
+    }
+    if !object.contains_key("shortcuts") {
+        let scalar = |name: &str, fallback: &str| {
+            object
+                .get(name)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(fallback)
+                .to_owned()
+        };
+        let shortcuts = serde_json::json!({
+            "dictate": [scalar("hotkey", "Ctrl+Shift+Space")],
+            "translate": [scalar("voiceTranslateHotkey", "Ctrl+Shift+Y")],
+            "ask": [scalar("askHotkey", "Ctrl+Shift+A")],
+            "edit": [scalar("speakToEditHotkey", "Ctrl+Shift+E")],
+        });
+        object.insert("shortcuts".into(), shortcuts);
+        migrations.push("legacy_shortcuts");
+    }
+    let mut migrated = serde_json::Value::Object(object.clone());
+    repair_shortcut_lists(&mut object, &mut repairs);
+    let mut settings = serde_json::from_value(serde_json::Value::Object(object.clone()))
+        .unwrap_or_else(|_| decode_fields_leniently(&object, &mut repairs));
+    repair_shortcut_routes(&mut settings, &mut repairs);
+    // V2 `shortcuts` is canonical; the scalar keys only mirror primaries.
+    // Mirror only chords that are exactly what is stored.
+    if repairs.is_empty()
+        && mirror_legacy_shortcut_keys(&mut migrated, &settings.shortcuts).unwrap_or(false)
+    {
+        migrations.push("legacy_shortcut_mirror");
+    }
+    LoadedSettings {
+        settings,
+        migrated: (readable && !migrations.is_empty()).then_some(migrated),
+        migrations,
+        repairs,
+    }
+}
+
+/// Replaces each mode's chord list that is not a list of strings with that
+/// mode's default, keeping the other modes.
+fn repair_shortcut_lists(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    repairs: &mut SettingsRepairs,
+) {
+    let Some(serde_json::Value::Object(shortcuts)) = object.get_mut("shortcuts") else {
+        return;
+    };
+    for (key, mode) in SHORTCUT_MODES {
+        let readable = shortcuts
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|chords| chords.iter().all(serde_json::Value::is_string));
+        if !readable {
+            shortcuts.insert(key.into(), default_chords(mode).into());
+            repairs.push(format!("shortcuts.{key}"));
+        }
+    }
+}
+
+/// Values used in memory in place of stored fields this build cannot read.
+///
+/// Rule: a fallback must never destroy user data or undo a choice the user
+/// already made, because it applies to an existing installation and runs
+/// right before the startup retention purge. So, unlike `Settings::default`
+/// (still used for fresh installs):
+/// - `historyRetention` -> `forever` (no History or candidate purge; the
+///   default `one_month` would delete everything older than 30 days);
+/// - `setupComplete` -> `true` (a stored row means setup already ran).
+///
+/// `keepFailedTakes` keeps its default `true`, which only keeps failed takes
+/// for Retry until they expire; `false` would remove every one of them, with
+/// its audio, at the next purge.
+///
+/// `deleteAudioAfterProcessing` keeps its privacy default `true`; the only
+/// data that value would destroy, older builds' stale capture WAVs, is
+/// protected by skipping that startup cleanup when the field was replaced
+/// (see [`SettingsRepairs`]). Known limit: with that field replaced, a failed
+/// take kept only for Retry is not promoted to a normal History row and still
+/// expires after 24 hours, as it would before the user turned audio
+/// retention on; and a successful Retry of such a take removes its row and
+/// audio, as it does whenever audio is not retained. Only takes created during
+/// a repaired run are affected. Conversely, with `historyRetention` replaced by
+/// `forever` while audio retention is readable and on, unexpired temporary
+/// takes become permanent rows until a build that can read the stored window
+/// applies it. Likewise the autostart registration is left alone when
+/// `autoStart` was replaced. Every other default only changes behavior for
+/// this run, and the stored row is never rewritten with it.
+fn fallback_settings() -> Settings {
+    Settings {
+        history_retention: HistoryRetention::Forever,
+        setup_complete: true,
+        ..Settings::default()
+    }
+}
+
+/// Decodes `object` one top-level field at a time: a field is kept when the
+/// fallbacks with only that field replaced decode, and otherwise (unreadable,
+/// or missing without a serde default) takes its [`fallback_settings`] value.
+fn decode_fields_leniently(
+    object: &serde_json::Map<String, serde_json::Value>,
+    repairs: &mut SettingsRepairs,
+) -> Settings {
+    let Ok(serde_json::Value::Object(fallbacks)) = serde_json::to_value(fallback_settings()) else {
+        return fallback_settings();
+    };
+    let decodes = |candidate: serde_json::Map<String, serde_json::Value>| {
+        serde_json::from_value::<Settings>(serde_json::Value::Object(candidate)).is_ok()
+    };
+    let mut merged = fallbacks.clone();
+    for key in fallbacks.keys() {
+        let mut probe = fallbacks.clone();
+        match object.get(key) {
+            Some(saved) => {
+                probe.insert(key.clone(), saved.clone());
+                if decodes(probe) {
+                    merged.insert(key.clone(), saved.clone());
+                } else {
+                    repairs.push(key.clone());
+                }
+            }
+            None => {
+                // A missing field with a serde default decodes as before.
+                probe.remove(key);
+                if decodes(probe) {
+                    merged.remove(key);
+                } else {
+                    repairs.push(key.clone());
+                }
+            }
+        }
+    }
+    // Fields decode independently, so the accepted values decode together.
+    serde_json::from_value(serde_json::Value::Object(merged)).unwrap_or_else(|_| {
+        repairs.push("all_fields");
+        fallback_settings()
+    })
+}
+
+/// Resets, in memory, each action whose saved chords cannot be routed (a
+/// wrong count or an unparseable chord) to its default, keeping the other
+/// actions. Collisions stay allowed, as for any saved settings.
+fn repair_shortcut_routes(settings: &mut Settings, repairs: &mut SettingsRepairs) {
+    let defaults = Settings::default();
+    let routable = |candidate: &Settings| crate::shortcuts::Routes::parse_saved(candidate).is_ok();
+    for (key, mode) in SHORTCUT_MODES {
+        let mut candidate = defaults.clone();
+        *mode(&mut candidate.shortcuts) = mode(&mut settings.shortcuts).clone();
+        if !routable(&candidate) {
+            *mode(&mut settings.shortcuts) = default_chords(mode);
+            repairs.push(format!("shortcuts.{key}"));
+        }
+    }
+    let candidate = Settings {
+        translation_hotkey: settings.translation_hotkey.clone(),
+        ..defaults.clone()
+    };
+    if !routable(&candidate) {
+        settings.translation_hotkey = defaults.translation_hotkey.clone();
+        repairs.push("translationHotkey");
+    }
+    if !routable(settings) {
+        // Unreachable while collisions are allowed; keeps startup safe anyway.
+        settings.shortcuts = defaults.shortcuts;
+        settings.translation_hotkey = defaults.translation_hotkey;
+        repairs.push("shortcuts");
+    }
+}
+
+/// Serializes `settings` over the stored row, so top-level keys and keys
+/// inside `shortcuts` that this build does not know survive a save.
+///
+/// A field this build could not read was shown with its in-memory fallback
+/// (see `load_settings`). While the incoming value still equals that
+/// fallback, the stored value is kept, so an unrelated save (such as cycling
+/// the translation target) does not overwrite a newer build's choice. A
+/// value the user changed away from the fallback is written.
+///
+/// A deliberate choice that equals the fallback (for example picking
+/// `forever` while the stored value is unreadable) cannot be told apart from
+/// an unchanged field here, so the stored value is kept. The user persists
+/// such a choice explicitly with `Storage::persist_repaired_settings`.
+fn merged_settings_json(settings: &Settings, stored: Option<&str>) -> Result<String, StorageError> {
+    let stored = stored.and_then(|raw| match serde_json::from_str(raw) {
+        Ok(serde_json::Value::Object(object)) => Some((raw, object)),
+        _ => None,
+    });
+    let mut kept_modes = Vec::new();
+    let mut value = match (stored, serde_json::to_value(settings)?) {
+        (Some((raw, object)), serde_json::Value::Object(typed)) => {
+            merge_over_stored(raw, object, typed, &mut kept_modes)
+        }
+        (_, typed) => typed,
+    };
+    // A kept mode also keeps its stored scalar mirror.
+    let kept_mirrors: Vec<(&str, Option<serde_json::Value>)> = kept_modes
+        .iter()
+        .map(|&index| {
+            let key = LEGACY_SHORTCUT_KEYS[index];
+            (key, value.get(key).cloned())
+        })
+        .collect();
+    mirror_legacy_shortcut_keys(&mut value, &settings.shortcuts)?;
+    if let Some(object) = value.as_object_mut() {
+        for (key, saved) in kept_mirrors {
+            match saved {
+                Some(saved) => object.insert(key.into(), saved),
+                None => object.remove(key),
+            };
+        }
+    }
+    Ok(serde_json::to_string(&value)?)
+}
+
+/// Writes `typed` over the stored `object`, keeping each stored value whose
+/// field was replaced in memory and is saved unchanged. Records the indexes
+/// (in `SHORTCUT_MODES` order) of the shortcut modes kept that way.
+fn merge_over_stored(
+    raw: &str,
+    mut object: serde_json::Map<String, serde_json::Value>,
+    typed: serde_json::Map<String, serde_json::Value>,
+    kept_modes: &mut Vec<usize>,
+) -> serde_json::Value {
+    let loaded = load_settings(raw);
+    let fallback = serde_json::to_value(&loaded.settings).unwrap_or_default();
+    let unchanged_fallback =
+        |key: &str, path: Option<&serde_json::Value>, incoming: &serde_json::Value| {
+            loaded.repairs.replaced(key) && path == Some(incoming)
+        };
+    for (key, field) in typed {
+        if unchanged_fallback(&key, fallback.get(&key), &field) {
+            if key == "shortcuts" {
+                kept_modes.extend(0..SHORTCUT_MODES.len());
+            }
+            continue;
+        }
+        if key == "shortcuts" {
+            if let (Some(serde_json::Value::Object(saved)), serde_json::Value::Object(modes)) =
+                (object.get_mut(&key), &field)
+            {
+                for (index, (mode, _)) in SHORTCUT_MODES.iter().enumerate() {
+                    let Some(incoming) = modes.get(*mode) else {
+                        continue;
+                    };
+                    if unchanged_fallback(
+                        &format!("shortcuts.{mode}"),
+                        fallback["shortcuts"].get(*mode),
+                        incoming,
+                    ) {
+                        kept_modes.push(index);
+                    } else {
+                        saved.insert((*mode).into(), incoming.clone());
+                    }
+                }
+                continue;
+            }
+        }
+        object.insert(key, field);
+    }
+    serde_json::Value::Object(object)
+}
+
+/// Copies the raw settings row `raw` to `settings_backups`, keeping only the
+/// newest [`MAX_SETTINGS_BACKUPS`] copies. A row whose exact content is
+/// already backed up is not copied again.
+fn back_up_settings_row(
+    connection: &Connection,
+    raw: &str,
+    reason: &str,
+) -> Result<(), StorageError> {
+    connection.execute(
+        "INSERT INTO settings_backups(key, value, reason, created_at)
+         SELECT 'app_settings', ?1, ?2, ?3
+         WHERE NOT EXISTS (
+           SELECT 1 FROM settings_backups WHERE key = 'app_settings' AND value = ?1
+         )",
+        params![raw, reason, Utc::now().to_rfc3339()],
+    )?;
+    connection.execute(
+        "DELETE FROM settings_backups WHERE id NOT IN (
+           SELECT id FROM settings_backups ORDER BY id DESC LIMIT ?1
+         )",
+        [MAX_SETTINGS_BACKUPS],
+    )?;
+    Ok(())
+}
+
+/// Saves `settings` over the stored row within the caller's transaction. A
+/// stored row that is not a JSON object cannot be merged and is replaced,
+/// so it is backed up first.
+fn save_settings_row(connection: &Connection, settings: &Settings) -> Result<(), StorageError> {
+    let stored = stored_settings_row(connection)?;
+    let value = merged_settings_json(settings, stored.as_deref())?;
+    if let Some(raw) = stored.as_deref() {
+        if !matches!(
+            serde_json::from_str::<serde_json::Value>(raw),
+            Ok(serde_json::Value::Object(_))
+        ) {
+            back_up_settings_row(connection, raw, "replaced_unreadable")?;
+        }
+    }
+    connection.execute(
+        "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![value, Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+fn stored_settings_row(connection: &Connection) -> Result<Option<String>, StorageError> {
+    Ok(connection
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'app_settings'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// Whether stored settings turn History off. Reads like `get_settings`, so an
+/// unreadable value follows the same fallback.
+fn stored_history_is_off(raw: &str) -> bool {
+    load_settings(raw).settings.history_retention == HistoryRetention::Never
 }
 
 struct StagedHistoryAudio<'a> {
@@ -401,6 +1126,19 @@ impl Storage {
         Ok(storage)
     }
 
+    /// Stores `raw` as the settings row as is, as another build might.
+    #[cfg(test)]
+    pub(crate) fn store_raw_settings_for_test(&self, raw: &str) {
+        self.connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, 'now')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [raw],
+            )
+            .unwrap();
+    }
+
     fn with_connection(connection: Connection, history_audio_dir: PathBuf) -> Self {
         Self {
             connection: Mutex::new(connection),
@@ -421,288 +1159,142 @@ impl Storage {
     }
 
     fn migrate(&self) -> Result<(), StorageError> {
-        let connection = self.connection()?;
+        let mut connection = self.connection()?;
+        // Neither pragma takes effect inside a transaction, so they run
+        // before the versioned steps.
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA foreign_keys = ON;
-             CREATE TABLE IF NOT EXISTS settings (
-               key TEXT PRIMARY KEY NOT NULL,
-               value TEXT NOT NULL,
-               updated_at TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS dictionary_entries (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               reading TEXT NOT NULL,
-               surface TEXT NOT NULL,
-               category TEXT,
-               aliases TEXT NOT NULL DEFAULT '[]',
-               priority INTEGER NOT NULL DEFAULT 0,
-               app_scope TEXT,
-               source TEXT NOT NULL DEFAULT 'manual',
-               created_at TEXT NOT NULL,
-               updated_at TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS dictionary_candidates (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               original_span TEXT NOT NULL,
-               preferred_span TEXT NOT NULL,
-               confidence REAL NOT NULL,
-               history_id INTEGER,
-               created_at TEXT NOT NULL,
-               updated_at TEXT NOT NULL,
-               FOREIGN KEY(history_id) REFERENCES dictation_history(id) ON DELETE SET NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_dictionary_candidates_created_at ON dictionary_candidates(created_at DESC);
-             CREATE TABLE IF NOT EXISTS dictionary_candidate_decisions (
-               original_span TEXT NOT NULL,
-               preferred_span TEXT NOT NULL,
-               created_at TEXT NOT NULL,
-               PRIMARY KEY(original_span, preferred_span)
-             );
-             CREATE TABLE IF NOT EXISTS dictation_history (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               transcript_text TEXT NOT NULL,
-               processed_text TEXT,
-               source_text TEXT,
-               instruction_text TEXT,
-               action_kind TEXT,
-               search_site TEXT,
-               mode TEXT NOT NULL,
-               asr_provider TEXT NOT NULL,
-               llm_provider TEXT,
-               target_language TEXT,
-               app_category TEXT,
-               duration_ms INTEGER,
-               latency_ms INTEGER,
-               created_at TEXT NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_history_created_at ON dictation_history(created_at DESC);
-             CREATE TABLE IF NOT EXISTS pending_audio_deletions (
-               filename TEXT PRIMARY KEY NOT NULL,
-               created_at TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS metrics (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               event_type TEXT NOT NULL,
-               provider TEXT,
-               duration_ms INTEGER,
-               success INTEGER NOT NULL,
-               error_code TEXT,
-               created_at TEXT NOT NULL
-             );",
+             PRAGMA foreign_keys = ON;",
         )?;
-        let has_target_language: bool = connection.query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM pragma_table_info('dictation_history')
-               WHERE name = 'target_language'
-             )",
-            [],
-            |row| row.get(0),
-        )?;
-        if !has_target_language {
-            connection.execute(
-                "ALTER TABLE dictation_history ADD COLUMN target_language TEXT",
-                [],
-            )?;
+        run_migrations(&mut connection, MIGRATIONS)
+    }
+
+    /// Reads the stored settings without ever failing on their content.
+    /// Fields this build cannot read are replaced in memory only (see
+    /// `load_settings`); only legacy-layout migrations are persisted, after
+    /// the raw row is copied to `settings_backups`.
+    pub fn get_settings(&self) -> Result<Settings, StorageError> {
+        Ok(self.get_settings_with_repairs()?.0)
+    }
+
+    /// Like `get_settings`, also naming the fields replaced in memory.
+    pub fn get_settings_with_repairs(&self) -> Result<(Settings, SettingsRepairs), StorageError> {
+        let Some(raw) = stored_settings_row(&*self.connection()?)? else {
+            return Ok((Settings::default(), SettingsRepairs::default()));
+        };
+        let loaded = load_settings(&raw);
+        if let Some(migrated) = &loaded.migrated {
+            // Best effort: the migrated values are used for this run even if
+            // they cannot be persisted, and the next read migrates again.
+            let _ = self.rewrite_settings(&raw, migrated, &loaded.migrations.join(","));
         }
-        for column in [
-            "source_text",
-            "instruction_text",
-            "action_kind",
-            "search_site",
-            "insertion_result",
-            "insertion_detail",
-        ] {
-            let exists: bool = connection.query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM pragma_table_info('dictation_history')
-                   WHERE name = ?1
-                 )",
-                [column],
-                |row| row.get(0),
-            )?;
-            if !exists {
-                connection.execute(
-                    &format!("ALTER TABLE dictation_history ADD COLUMN {column} TEXT"),
-                    [],
-                )?;
+        Ok((loaded.settings, loaded.repairs))
+    }
+
+    /// Copies the stored settings row to `settings_backups` when this build
+    /// cannot read all of it (the whole row or any field). Called at
+    /// startup, so the original is kept from the first start that found it
+    /// unreadable; an identical copy is not added again on later starts.
+    pub fn back_up_unreadable_settings(&self) -> Result<(), StorageError> {
+        let connection = self.connection()?;
+        let Some(raw) = stored_settings_row(&connection)? else {
+            return Ok(());
+        };
+        if load_settings(&raw).repairs.is_empty() {
+            return Ok(());
+        }
+        back_up_settings_row(&connection, &raw, "unreadable_at_startup")
+    }
+
+    /// The fields of the stored settings this build currently replaces in
+    /// memory; empty when the row reads cleanly.
+    pub fn settings_repair_status(&self) -> Result<SettingsRepairs, StorageError> {
+        Ok(self.get_settings_with_repairs()?.1)
+    }
+
+    /// Persists the current in-memory values of exactly the replaced fields,
+    /// bypassing the unchanged-fallback rule of a normal save. Every other
+    /// stored field and every unknown key stays as it is. The previous row is
+    /// backed up first. Returns the settings now stored.
+    pub fn persist_repaired_settings(&self) -> Result<Settings, StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(raw) = stored_settings_row(&transaction)? else {
+            return Ok(Settings::default());
+        };
+        let loaded = load_settings(&raw);
+        if loaded.repairs.is_empty() {
+            return Ok(loaded.settings);
+        }
+        let current = serde_json::to_value(&loaded.settings)?;
+        let whole_row = loaded
+            .repairs
+            .0
+            .iter()
+            .any(|field| field == UNREADABLE_ROW || field == "all_fields");
+        let mut value = if whole_row {
+            current.clone()
+        } else if let Some(migrated) = &loaded.migrated {
+            migrated.clone()
+        } else {
+            serde_json::from_str(&raw)?
+        };
+        for field in loaded.repairs.fields() {
+            if let Some(mode) = field.strip_prefix("shortcuts.") {
+                if !value["shortcuts"].is_object() {
+                    value["shortcuts"] = current["shortcuts"].clone();
+                }
+                value["shortcuts"][mode] = current["shortcuts"][mode].clone();
+            } else if let Some(fallback) = current.get(&field) {
+                value[field.as_str()] = fallback.clone();
             }
         }
-        for (column, definition) in [
-            ("audio_filename", "TEXT"),
-            ("expires_at", "TEXT"),
-            (
-                "retry_of_id",
-                "INTEGER REFERENCES dictation_history(id) ON DELETE SET NULL",
-            ),
-        ] {
-            let exists: bool = connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('dictation_history') WHERE name = ?1)",
-                [column],
-                |row| row.get(0),
-            )?;
-            if !exists {
-                connection.execute(
-                    &format!("ALTER TABLE dictation_history ADD COLUMN {column} {definition}"),
-                    [],
-                )?;
-            }
-        }
-        // A legacy/corrupt database may have shared a filename before this
-        // ownership invariant existed. Preserve the oldest association and
-        // clear later duplicates so the new partial unique index can migrate.
-        connection.execute(
-            "UPDATE dictation_history SET audio_filename = NULL
-             WHERE audio_filename IS NOT NULL AND id NOT IN (
-               SELECT MIN(id) FROM dictation_history
-               WHERE audio_filename IS NOT NULL GROUP BY audio_filename
-             )",
-            [],
+        mirror_legacy_shortcut_keys(&mut value, &loaded.settings.shortcuts)?;
+        back_up_settings_row(&transaction, &raw, "repair_persisted")?;
+        transaction.execute(
+            "UPDATE settings SET value = ?1, updated_at = ?2 WHERE key = 'app_settings'",
+            params![serde_json::to_string(&value)?, Utc::now().to_rfc3339()],
         )?;
-        connection.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_history_audio_filename
-             ON dictation_history(audio_filename) WHERE audio_filename IS NOT NULL",
-            [],
+        transaction.commit()?;
+        Ok(loaded.settings)
+    }
+
+    /// Replaces the stored row `raw` with `migrated`, keeping `raw` in
+    /// `settings_backups` within the same transaction. A row changed by a
+    /// concurrent writer since it was read is left untouched.
+    fn rewrite_settings(
+        &self,
+        raw: &str,
+        migrated: &serde_json::Value,
+        reason: &str,
+    ) -> Result<(), StorageError> {
+        let migrated = serde_json::to_string(migrated)?;
+        let now = Utc::now().to_rfc3339();
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        back_up_settings_row(&transaction, raw, reason)?;
+        let updated = transaction.execute(
+            "UPDATE settings SET value = ?1, updated_at = ?2
+             WHERE key = 'app_settings' AND value = ?3",
+            params![migrated, now, raw],
         )?;
-        let columns = {
-            let mut statement = connection.prepare("PRAGMA table_info(dictionary_entries)")?;
-            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        let has_source = columns.iter().any(|column| column == "source");
-        if !has_source {
-            connection.execute(
-                "ALTER TABLE dictionary_entries ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
-                [],
-            )?;
+        if updated == 0 {
+            return Ok(());
         }
-        connection.execute("UPDATE dictionary_entries SET source = 'manual' WHERE source IS NULL OR source NOT IN ('manual', 'auto')", [])?;
-        let decision_columns = {
-            let mut statement =
-                connection.prepare("PRAGMA table_info(dictionary_candidate_decisions)")?;
-            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        if !decision_columns.iter().any(|column| column == "created_at") {
-            // An unreleased development database may have the old table. Its
-            // undated private spans cannot be retained under a time policy.
-            connection.execute(
-                "ALTER TABLE dictionary_candidate_decisions ADD COLUMN created_at TEXT",
-                [],
-            )?;
-        }
+        transaction.commit()?;
         Ok(())
     }
 
-    pub fn get_settings(&self) -> Result<Settings, StorageError> {
-        let stored: Option<String> = self
-            .connection()?
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'app_settings'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(raw) = stored else {
-            return Ok(Settings::default());
-        };
-        let mut value: serde_json::Value = serde_json::from_str(&raw)?;
-        let object = value.as_object_mut().ok_or_else(|| {
-            serde_json::Error::io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "settings must be an object",
-            ))
-        })?;
-        let legacy_history = !object.contains_key("historyRetention");
-        if legacy_history {
-            let enabled = object
-                .remove("historyEnabled")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(true);
-            let days = object
-                .remove("historyRetentionDays")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(30);
-            let retention = if !enabled {
-                "never"
-            } else if days < 7 {
-                "24_hours"
-            } else if days < 30 {
-                "one_week"
-            } else if days < 365 {
-                "one_month"
-            } else {
-                "one_year"
-            };
-            object.insert("historyRetention".into(), retention.into());
-        }
-        let legacy_shortcuts = !object.contains_key("shortcuts");
-        if legacy_shortcuts {
-            let scalar = |name: &str, fallback: &str| {
-                object
-                    .get(name)
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(fallback)
-                    .to_owned()
-            };
-            object.insert(
-                "shortcuts".into(),
-                serde_json::json!({
-                    "dictate": [scalar("hotkey", "Ctrl+Shift+Space")],
-                    "translate": [scalar("voiceTranslateHotkey", "Ctrl+Shift+Y")],
-                    "ask": [scalar("askHotkey", "Ctrl+Shift+A")],
-                    "edit": [scalar("speakToEditHotkey", "Ctrl+Shift+E")],
-                }),
-            );
-        }
-        let mut settings: Settings = serde_json::from_value(value.clone())?;
-        let defaults = crate::types::VoiceShortcuts::default();
-        let mut recovered_empty_shortcuts = false;
-        for (key, saved, fallback) in [
-            ("dictate", &mut settings.shortcuts.dictate, defaults.dictate),
-            (
-                "translate",
-                &mut settings.shortcuts.translate,
-                defaults.translate,
-            ),
-            ("ask", &mut settings.shortcuts.ask, defaults.ask),
-            ("edit", &mut settings.shortcuts.edit, defaults.edit),
-        ] {
-            if saved.is_empty() {
-                *saved = fallback;
-                value["shortcuts"][key] = serde_json::to_value(&*saved)?;
-                recovered_empty_shortcuts = true;
-            }
-        }
-        crate::shortcuts::Routes::parse_saved(&settings).map_err(|message| {
-            StorageError::InvalidSettings(serde_json::Error::io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                message,
-            )))
-        })?;
-        // V2 `shortcuts` is canonical; the scalar keys only mirror primaries.
-        let legacy_keys_changed = mirror_legacy_shortcut_keys(&mut value, &settings.shortcuts)?;
-        if legacy_history || legacy_shortcuts || legacy_keys_changed || recovered_empty_shortcuts {
-            // Persist the normalized V2 retention value, but keep fields that
-            // this version does not own. A migration must not erase a newer
-            // client's unrelated setting merely because it encountered an
-            // older retention representation.
-            self.connection()?.execute(
-                "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-                params![serde_json::to_string(&value)?, Utc::now().to_rfc3339()],
-            )?;
-        }
-        Ok(settings)
-    }
-
+    /// Saves `settings` over the stored row, keeping keys this build does
+    /// not know.
     pub fn update_settings(&self, settings: &Settings) -> Result<(), StorageError> {
-        let value = serialized_settings(settings)?;
-        self.connection()?.execute(
-            "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            params![value, Utc::now().to_rfc3339()],
-        )?;
+        let mut connection = self.connection()?;
+        // IMMEDIATE takes the write lock before the read, so a concurrent
+        // writer makes this wait (busy timeout) instead of failing the
+        // upgrade from a read snapshot.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        save_settings_row(&transaction, settings)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -713,15 +1305,13 @@ impl Storage {
         &self,
         settings: &Settings,
     ) -> Result<(), StorageError> {
-        let value = serialized_settings(settings)?;
         let now = Utc::now();
         let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            params![value, now.to_rfc3339()],
-        )?;
+        // IMMEDIATE takes the write lock before the read, so a concurrent
+        // writer makes this wait (busy timeout) instead of failing the
+        // upgrade from a read snapshot.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        save_settings_row(&transaction, settings)?;
         purge_history(&transaction, settings, now)?;
         transaction.commit()?;
         drop(connection);
@@ -1540,9 +2130,7 @@ impl Storage {
             .optional()?;
         let history_off = stored_settings
             .as_deref()
-            .map(stored_history_is_off)
-            .transpose()?
-            .unwrap_or(false);
+            .is_some_and(stored_history_is_off);
         if history_off {
             return Ok(None);
         }
@@ -1904,25 +2492,6 @@ fn validate_dictionary_collisions(
         }
     }
     Ok(())
-}
-
-/// Reads the History switch from raw stored settings while the caller holds
-/// the connection. Legacy settings without `historyRetention` use
-/// `historyEnabled`, as `get_settings` migrates them.
-fn stored_history_is_off(raw: &str) -> Result<bool, StorageError> {
-    let value: serde_json::Value = serde_json::from_str(raw)?;
-    Ok(match value.get("historyRetention") {
-        Some(retention) => {
-            serde_json::from_value::<HistoryRetention>(retention.clone())?
-                == HistoryRetention::Never
-        }
-        None => {
-            value
-                .get("historyEnabled")
-                .and_then(serde_json::Value::as_bool)
-                == Some(false)
-        }
-    })
 }
 
 /// How many History rows and retained recordings a retention change would
@@ -2319,6 +2888,482 @@ mod tests {
         }
     }
 
+    fn user_version(connection: &Connection) -> i64 {
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap()
+    }
+
+    fn column_names(connection: &Connection, table: &str) -> Vec<String> {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap();
+        rows.collect::<Result<Vec<_>, _>>().unwrap()
+    }
+
+    fn object_exists(connection: &Connection, kind: &str, name: &str) -> bool {
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2)",
+                [kind, name],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Writes `schema` to a fresh database file with the given History audio
+    /// files, then opens it with `Storage::open` twice: the second open must
+    /// be a no-op upgrade.
+    fn open_legacy_twice(schema: &str, audio_files: &[&str]) -> (tempfile::TempDir, Storage) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.sqlite3");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(schema)
+            .unwrap();
+        let audio_dir = directory.path().join("history-audio");
+        fs::create_dir_all(&audio_dir).unwrap();
+        for name in audio_files {
+            fs::write(audio_dir.join(name), b"RIFF").unwrap();
+        }
+        drop(Storage::open(&path).unwrap());
+        let storage = Storage::open(&path).unwrap();
+        (directory, storage)
+    }
+
+    fn assert_current_schema(connection: &Connection) {
+        assert_eq!(user_version(connection), MIGRATIONS.len() as i64);
+        assert_eq!(stored_min_reader_version(connection).unwrap(), 1);
+        for table in [
+            "settings",
+            "dictionary_entries",
+            "dictionary_candidates",
+            "dictionary_candidate_decisions",
+            "dictation_history",
+            "pending_audio_deletions",
+            "metrics",
+            "settings_backups",
+        ] {
+            assert!(object_exists(connection, "table", table), "{table}");
+        }
+        let history = column_names(connection, "dictation_history");
+        for column in [
+            "target_language",
+            "source_text",
+            "instruction_text",
+            "action_kind",
+            "search_site",
+            "insertion_result",
+            "insertion_detail",
+            "audio_filename",
+            "expires_at",
+            "retry_of_id",
+        ] {
+            assert!(history.iter().any(|name| name == column), "{column}");
+        }
+        assert!(column_names(connection, "dictionary_entries")
+            .iter()
+            .any(|name| name == "source"));
+        assert!(column_names(connection, "dictionary_candidate_decisions")
+            .iter()
+            .any(|name| name == "created_at"));
+        assert!(object_exists(
+            connection,
+            "index",
+            "idx_history_audio_filename"
+        ));
+    }
+
+    #[test]
+    fn fresh_database_migrates_to_the_latest_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fresh.sqlite3");
+        drop(Storage::open(&path).unwrap());
+        let storage = Storage::open(&path).unwrap();
+        assert_current_schema(&storage.connection().unwrap());
+    }
+
+    /// The schema of the first tracked build: no `source` on dictionary
+    /// entries, none of the later History columns, and no candidate tables.
+    #[test]
+    fn first_release_schema_upgrades_and_keeps_rows() {
+        let (_directory, storage) = open_legacy_twice(
+            "CREATE TABLE settings (
+               key TEXT PRIMARY KEY NOT NULL,
+               value TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE dictionary_entries (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               reading TEXT NOT NULL,
+               surface TEXT NOT NULL,
+               category TEXT,
+               aliases TEXT NOT NULL DEFAULT '[]',
+               priority INTEGER NOT NULL DEFAULT 0,
+               app_scope TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             CREATE TABLE dictation_history (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               transcript_text TEXT NOT NULL,
+               processed_text TEXT,
+               mode TEXT NOT NULL,
+               asr_provider TEXT NOT NULL,
+               llm_provider TEXT,
+               app_category TEXT,
+               duration_ms INTEGER,
+               latency_ms INTEGER,
+               created_at TEXT NOT NULL
+             );
+             CREATE INDEX idx_history_created_at ON dictation_history(created_at DESC);
+             CREATE TABLE metrics (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               event_type TEXT NOT NULL,
+               provider TEXT,
+               duration_ms INTEGER,
+               success INTEGER NOT NULL,
+               error_code TEXT,
+               created_at TEXT NOT NULL
+             );
+             INSERT INTO dictionary_entries(reading, surface, created_at, updated_at)
+               VALUES ('open ai', 'OpenAI', '2026-06-01T00:00:00Z', '2026-06-01T00:00:00Z');
+             INSERT INTO dictation_history(transcript_text, mode, asr_provider, created_at)
+               VALUES ('kept', 'dictate', 'mock', '2026-06-01T00:00:00Z');",
+            &[],
+        );
+        let connection = storage.connection().unwrap();
+        assert_current_schema(&connection);
+        let (surface, source): (String, String) = connection
+            .query_row(
+                "SELECT surface, source FROM dictionary_entries",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((surface.as_str(), source.as_str()), ("OpenAI", "manual"));
+        let (text, audio): (String, Option<String>) = connection
+            .query_row(
+                "SELECT transcript_text, audio_filename FROM dictation_history",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(text, "kept");
+        assert_eq!(audio, None);
+    }
+
+    /// The last unversioned build already had every baseline column,
+    /// including `expires_at` for failed takes kept only for Retry; the
+    /// baseline adopts it as is and keeps each row's expiry.
+    #[test]
+    fn unversioned_database_with_failed_take_expiry_adopts_the_baseline() {
+        const AUDIO: &str = "cccccccccccccccccccccccccccccccc.wav";
+        let (_directory, storage) = open_legacy_twice(
+            "CREATE TABLE dictation_history (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               transcript_text TEXT NOT NULL,
+               processed_text TEXT,
+               source_text TEXT,
+               instruction_text TEXT,
+               action_kind TEXT,
+               search_site TEXT,
+               mode TEXT NOT NULL,
+               asr_provider TEXT NOT NULL,
+               llm_provider TEXT,
+               target_language TEXT,
+               app_category TEXT,
+               duration_ms INTEGER,
+               latency_ms INTEGER,
+               created_at TEXT NOT NULL,
+               insertion_result TEXT,
+               insertion_detail TEXT,
+               audio_filename TEXT,
+               expires_at TEXT,
+               retry_of_id INTEGER REFERENCES dictation_history(id) ON DELETE SET NULL
+             );
+             INSERT INTO dictation_history(transcript_text, mode, asr_provider, created_at, audio_filename, expires_at)
+               VALUES ('', 'faithful', 'mock', '2026-10-01T00:00:00+00:00',
+                       'cccccccccccccccccccccccccccccccc.wav', '2999-01-01T00:00:00+00:00');",
+            &[AUDIO],
+        );
+        let connection = storage.connection().unwrap();
+        assert_current_schema(&connection);
+        let (audio, expires_at): (Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT audio_filename, expires_at FROM dictation_history",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(audio.as_deref(), Some(AUDIO));
+        assert_eq!(expires_at.as_deref(), Some("2999-01-01T00:00:00+00:00"));
+    }
+
+    /// An unreleased development build created the decisions table without
+    /// `created_at`; existing decisions stay and receive no date.
+    #[test]
+    fn undated_candidate_decisions_gain_a_created_at_column() {
+        let (_directory, storage) = open_legacy_twice(
+            "CREATE TABLE dictionary_candidate_decisions (
+               original_span TEXT NOT NULL,
+               preferred_span TEXT NOT NULL,
+               PRIMARY KEY(original_span, preferred_span)
+             );
+             INSERT INTO dictionary_candidate_decisions VALUES ('open ai', 'OpenAI');",
+            &[],
+        );
+        let connection = storage.connection().unwrap();
+        assert_current_schema(&connection);
+        let created_at: Option<String> = connection
+            .query_row(
+                "SELECT created_at FROM dictionary_candidate_decisions
+                 WHERE original_span = 'open ai' AND preferred_span = 'OpenAI'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(created_at, None);
+    }
+
+    /// Before the unique index existed, two rows could name one audio file
+    /// and dictionary entries could carry an unknown `source`.
+    #[test]
+    fn duplicate_audio_filenames_and_unknown_sources_are_normalized() {
+        const SHARED: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.wav";
+        const OWN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.wav";
+        let (_directory, storage) = open_legacy_twice(
+            "CREATE TABLE dictation_history (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               transcript_text TEXT NOT NULL,
+               processed_text TEXT,
+               mode TEXT NOT NULL,
+               asr_provider TEXT NOT NULL,
+               llm_provider TEXT,
+               app_category TEXT,
+               duration_ms INTEGER,
+               latency_ms INTEGER,
+               created_at TEXT NOT NULL,
+               audio_filename TEXT
+             );
+             INSERT INTO dictation_history(id, transcript_text, mode, asr_provider, created_at, audio_filename) VALUES
+               (1, 'a', 'dictate', 'mock', '2026-06-01T00:00:00Z', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.wav'),
+               (2, 'b', 'dictate', 'mock', '2026-06-01T00:00:01Z', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.wav'),
+               (3, 'c', 'dictate', 'mock', '2026-06-01T00:00:02Z', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.wav'),
+               (4, 'd', 'dictate', 'mock', '2026-06-01T00:00:03Z', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.wav');
+             CREATE TABLE dictionary_entries (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               reading TEXT NOT NULL,
+               surface TEXT NOT NULL,
+               category TEXT,
+               aliases TEXT NOT NULL DEFAULT '[]',
+               priority INTEGER NOT NULL DEFAULT 0,
+               app_scope TEXT,
+               source TEXT,
+               created_at TEXT NOT NULL,
+               updated_at TEXT NOT NULL
+             );
+             INSERT INTO dictionary_entries(reading, surface, source, created_at, updated_at) VALUES
+               ('a', 'A', 'auto', 'now', 'now'),
+               ('b', 'B', 'imported', 'now', 'now'),
+               ('c', 'C', NULL, 'now', 'now');",
+            &[SHARED, OWN],
+        );
+        let connection = storage.connection().unwrap();
+        assert_current_schema(&connection);
+        let audio = {
+            let mut statement = connection
+                .prepare("SELECT id, audio_filename FROM dictation_history ORDER BY id")
+                .unwrap();
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get(1)?)))
+                .unwrap();
+            rows.collect::<Result<Vec<(i64, Option<String>)>, _>>()
+                .unwrap()
+        };
+        // The oldest row keeps a shared file; later duplicates lose the link.
+        assert_eq!(
+            audio,
+            [
+                (1, Some(SHARED.to_owned())),
+                (2, None),
+                (3, Some(OWN.to_owned())),
+                (4, None),
+            ]
+        );
+        assert!(connection
+            .execute(
+                "UPDATE dictation_history SET audio_filename = ?1 WHERE id = 2",
+                [OWN],
+            )
+            .is_err());
+        let sources = {
+            let mut statement = connection
+                .prepare("SELECT source FROM dictionary_entries ORDER BY id")
+                .unwrap();
+            let rows = statement.query_map([], |row| row.get(0)).unwrap();
+            rows.collect::<Result<Vec<String>, _>>().unwrap()
+        };
+        assert_eq!(sources, ["auto", "manual", "manual"]);
+    }
+
+    fn step(
+        apply: fn(&Connection) -> Result<(), StorageError>,
+        min_reader_version: i64,
+    ) -> Migration {
+        Migration {
+            apply,
+            min_reader_version,
+        }
+    }
+
+    #[test]
+    fn migrations_run_each_step_once_in_order() {
+        static RUNS: AtomicU64 = AtomicU64::new(0);
+        fn first(connection: &Connection) -> Result<(), StorageError> {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+            connection.execute_batch("CREATE TABLE first_step (id INTEGER);")?;
+            Ok(())
+        }
+        fn second(connection: &Connection) -> Result<(), StorageError> {
+            RUNS.fetch_add(10, Ordering::SeqCst);
+            connection.execute_batch("ALTER TABLE first_step ADD COLUMN extra TEXT;")?;
+            Ok(())
+        }
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_migrations(&mut connection, &[step(first, 1)]).unwrap();
+        assert_eq!(user_version(&connection), 1);
+        assert_eq!(stored_min_reader_version(&connection).unwrap(), 1);
+        let both = [step(first, 1), step(second, 2)];
+        run_migrations(&mut connection, &both).unwrap();
+        run_migrations(&mut connection, &both).unwrap();
+        assert_eq!(user_version(&connection), 2);
+        assert_eq!(stored_min_reader_version(&connection).unwrap(), 2);
+        assert_eq!(RUNS.load(Ordering::SeqCst), 11);
+        assert_eq!(column_names(&connection, "first_step"), ["id", "extra"]);
+        // The second step declared itself breaking, so a build that only
+        // knows the first step is refused.
+        assert!(matches!(
+            run_migrations(&mut connection, &[step(first, 1)]),
+            Err(StorageError::IncompatibleSchema {
+                version: 2,
+                min_reader_version: 2,
+                supported: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn a_failed_migration_step_leaves_the_previous_version() {
+        fn first(connection: &Connection) -> Result<(), StorageError> {
+            connection.execute_batch("CREATE TABLE kept (id INTEGER);")?;
+            Ok(())
+        }
+        fn failing(connection: &Connection) -> Result<(), StorageError> {
+            connection.execute_batch(
+                "CREATE TABLE partial (id INTEGER);
+                 INSERT INTO kept VALUES (1);",
+            )?;
+            Err(StorageError::Validation("injected failure".into()))
+        }
+        let migrations = [step(first, 1), step(failing, 2)];
+        let mut connection = Connection::open_in_memory().unwrap();
+        assert!(run_migrations(&mut connection, &migrations).is_err());
+        assert_eq!(user_version(&connection), 1);
+        assert_eq!(stored_min_reader_version(&connection).unwrap(), 1);
+        assert!(object_exists(&connection, "table", "kept"));
+        assert!(!object_exists(&connection, "table", "partial"));
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM kept", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        // The step is retried, not skipped, on the next start.
+        assert!(run_migrations(&mut connection, &migrations).is_err());
+        assert_eq!(user_version(&connection), 1);
+    }
+
+    /// Simulates a newer build that ran one more step on the database.
+    fn database_from_a_newer_build(min_reader_version: i64) -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("newer.sqlite3");
+        drop(Storage::open(&path).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE future_feature (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE schema_meta SET value = ?1 WHERE key = ?2",
+                params![min_reader_version, MIN_READER_VERSION_KEY],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", MIGRATIONS.len() as i64 + 1)
+            .unwrap();
+        (directory, path)
+    }
+
+    #[test]
+    fn a_compatible_database_from_a_newer_build_opens_and_works() {
+        let (_directory, path) = database_from_a_newer_build(1);
+        let newer = MIGRATIONS.len() as i64 + 1;
+        let storage = Storage::open(&path).unwrap();
+        storage.add_history(&item()).unwrap();
+        let settings = Settings {
+            setup_complete: true,
+            ..Settings::default()
+        };
+        storage.update_settings(&settings).unwrap();
+        assert_eq!(storage.get_settings().unwrap(), settings);
+        assert_eq!(history_texts(&storage).len(), 1);
+        drop(storage);
+
+        // Reopening runs no unknown step and never lowers the version.
+        drop(Storage::open(&path).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&connection), newer);
+        assert_eq!(stored_min_reader_version(&connection).unwrap(), 1);
+        assert!(object_exists(&connection, "table", "future_feature"));
+    }
+
+    #[test]
+    fn an_incompatible_database_from_a_newer_build_is_refused_unchanged() {
+        let supported = MIGRATIONS.len() as i64;
+        let (_directory, path) = database_from_a_newer_build(supported + 1);
+        assert!(matches!(
+            Storage::open(&path),
+            Err(StorageError::IncompatibleSchema {
+                version,
+                min_reader_version,
+                supported: reported,
+            }) if version == supported + 1
+                && min_reader_version == supported + 1
+                && reported == supported
+        ));
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&connection), supported + 1);
+        assert_eq!(
+            stored_min_reader_version(&connection).unwrap(),
+            supported + 1
+        );
+    }
+
+    #[test]
+    fn incompatible_schema_error_reads_as_one_sentence() {
+        let error = StorageError::IncompatibleSchema {
+            version: 4,
+            min_reader_version: 3,
+            supported: 2,
+        };
+        assert_eq!(
+            error.to_string(),
+            "database schema version 4 requires a reader of version 3; this build supports 2"
+        );
+    }
+
     #[test]
     fn translation_history_round_trips_target_language() {
         let storage = Storage::in_memory().unwrap();
@@ -2601,78 +3646,554 @@ mod tests {
         assert_eq!(upgraded.shortcuts.edit, ["Ctrl+Alt+E"]);
     }
 
-    #[test]
-    fn empty_persisted_dictation_shortcuts_recover_before_primary_lookup() {
-        let storage = Storage::in_memory().unwrap();
-        let mut value = serde_json::to_value(Settings::default()).unwrap();
-        value["shortcuts"]["dictate"] = serde_json::json!([]);
-        value["futureSetting"] = serde_json::json!({"keep": true});
+    fn store_raw_settings(storage: &Storage, raw: &str) {
+        storage.store_raw_settings_for_test(raw);
+    }
+
+    fn stored_settings_raw(storage: &Storage) -> String {
         storage
             .connection()
             .unwrap()
-            .execute(
-                "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, 'now')",
-                [value.to_string()],
-            )
-            .unwrap();
-        let recovered = storage.get_settings().unwrap();
-        assert_eq!(recovered.shortcuts.dictate, ["Ctrl+Shift+Space"]);
-        let raw: String = storage
-            .connection()
-            .unwrap()
             .query_row(
-                "SELECT value FROM settings WHERE key='app_settings'",
+                "SELECT value FROM settings WHERE key = 'app_settings'",
                 [],
                 |row| row.get(0),
             )
+            .unwrap()
+    }
+
+    fn stored_settings_value(storage: &Storage) -> serde_json::Value {
+        serde_json::from_str(&stored_settings_raw(storage)).unwrap()
+    }
+
+    /// `(value, reason)` of each settings backup, oldest first.
+    fn settings_backups(storage: &Storage) -> Vec<(String, String)> {
+        let connection = storage.connection().unwrap();
+        let mut statement = connection
+            .prepare("SELECT value, reason FROM settings_backups ORDER BY id")
             .unwrap();
-        let saved: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(saved["hotkey"], "Ctrl+Shift+Space");
-        assert_eq!(saved["shortcuts"]["dictate"][0], "Ctrl+Shift+Space");
-        assert_eq!(saved["futureSetting"]["keep"], true);
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        rows.collect::<Result<Vec<_>, _>>().unwrap()
     }
 
     #[test]
-    fn empty_shortcut_recovery_preserves_unknown_nested_chords() {
+    fn empty_shortcut_lists_are_recovered_in_memory_only() {
         let storage = Storage::in_memory().unwrap();
         let mut value = serde_json::to_value(Settings::default()).unwrap();
         value["shortcuts"]["dictate"] = serde_json::json!([]);
         value["shortcuts"]["ask"] = serde_json::json!([]);
         value["shortcuts"]["futureMode"] = serde_json::json!(["Ctrl+Alt+F"]);
-        storage
-            .connection()
-            .unwrap()
-            .execute(
-                "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, 'now')",
-                [value.to_string()],
-            )
-            .unwrap();
+        value["futureSetting"] = serde_json::json!({"keep": true});
+        let raw = value.to_string();
+        store_raw_settings(&storage, &raw);
 
-        let recovered = storage.get_settings().unwrap();
+        let (recovered, repairs) = storage.get_settings_with_repairs().unwrap();
+
         assert_eq!(recovered.shortcuts.dictate, ["Ctrl+Shift+Space"]);
         assert_eq!(recovered.shortcuts.ask, ["Ctrl+Shift+A"]);
-        let raw: String = storage
-            .connection()
-            .unwrap()
-            .query_row(
-                "SELECT value FROM settings WHERE key='app_settings'",
-                [],
-                |row| row.get(0),
-            )
+        assert!(repairs.contains("shortcuts.dictate"));
+        assert!(repairs.contains("shortcuts.ask"));
+        assert!(!repairs.contains("shortcuts.edit"));
+        assert_eq!(stored_settings_raw(&storage), raw);
+        assert!(settings_backups(&storage).is_empty());
+    }
+
+    #[test]
+    fn values_from_a_newer_build_are_replaced_in_memory_and_kept_in_the_row() {
+        let storage = Storage::in_memory().unwrap();
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value["setupComplete"] = true.into();
+        value["interactionSounds"] = true.into();
+        value["historyRetention"] = "three_months".into();
+        value["theme"] = 42.into();
+        value["inputGainPercent"] = 70_000.into();
+        value["futureSetting"] = serde_json::json!({"keep": true});
+        value["shortcuts"]["dictate"] = serde_json::json!(["Ctrl+Alt+V"]);
+        value["shortcuts"]["translate"] = "Ctrl+Alt+Y".into();
+        value["shortcuts"]["ask"] = serde_json::json!([
+            "Ctrl+Alt+1",
+            "Ctrl+Alt+2",
+            "Ctrl+Alt+3",
+            "Ctrl+Alt+4",
+            "Ctrl+Alt+5"
+        ]);
+        value["shortcuts"]["edit"] = serde_json::json!(["Ctrl+Shift+NotAKey"]);
+        value["shortcuts"]["futureMode"] = serde_json::json!(["Ctrl+Alt+F"]);
+        value["translationHotkey"] = "Nope+Nope".into();
+        let raw = value.to_string();
+        store_raw_settings(&storage, &raw);
+        assert!(!stored_history_is_off(&raw));
+
+        let (settings, repairs) = storage.get_settings_with_repairs().unwrap();
+
+        let defaults = Settings::default();
+        assert!(settings.setup_complete);
+        assert!(settings.interaction_sounds);
+        // Retention falls back to keeping everything, not to the default.
+        assert_eq!(settings.history_retention, HistoryRetention::Forever);
+        assert_eq!(settings.theme, defaults.theme);
+        assert_eq!(settings.input_gain_percent, defaults.input_gain_percent);
+        assert_eq!(settings.shortcuts.dictate, ["Ctrl+Alt+V"]);
+        assert_eq!(settings.shortcuts.translate, defaults.shortcuts.translate);
+        assert_eq!(settings.shortcuts.ask, defaults.shortcuts.ask);
+        assert_eq!(settings.shortcuts.edit, defaults.shortcuts.edit);
+        assert_eq!(settings.translation_hotkey, defaults.translation_hotkey);
+        crate::shortcuts::Routes::parse_saved(&settings).unwrap();
+        for repaired in [
+            "historyRetention",
+            "theme",
+            "inputGainPercent",
+            "shortcuts.translate",
+            "shortcuts.ask",
+            "shortcuts.edit",
+            "translationHotkey",
+        ] {
+            assert!(repairs.contains(repaired), "{repaired} in {repairs:?}");
+        }
+        assert!(!repairs.contains("setupComplete"));
+        assert!(!repairs.contains("shortcuts.dictate"));
+
+        // The newer build's values stay stored, so it still finds them.
+        assert_eq!(stored_settings_raw(&storage), raw);
+        assert!(settings_backups(&storage).is_empty());
+        assert_eq!(storage.get_settings().unwrap(), settings);
+        assert_eq!(stored_settings_raw(&storage), raw);
+    }
+
+    #[test]
+    fn unreadable_settings_rows_use_fallbacks_and_stay_stored() {
+        for raw in [
+            "not json",
+            "[1, 2]",
+            "null",
+            "\"text\"",
+            "{\"setupComplete\":",
+        ] {
+            let storage = Storage::in_memory().unwrap();
+            store_raw_settings(&storage, raw);
+            let (settings, repairs) = storage.get_settings_with_repairs().unwrap();
+            assert_eq!(settings, fallback_settings(), "{raw}");
+            assert!(settings.setup_complete);
+            assert!(settings.delete_audio_after_processing);
+            assert!(repairs.contains("autoStart"));
+            assert!(repairs.contains("deleteAudioAfterProcessing"));
+            assert_eq!(stored_settings_raw(&storage), raw);
+            assert!(settings_backups(&storage).is_empty());
+        }
+    }
+
+    #[test]
+    fn missing_required_fields_use_fallbacks_without_losing_the_rest() {
+        let storage = Storage::in_memory().unwrap();
+        let mut value = serde_json::to_value(Settings {
+            auto_start: true,
+            history_retention: HistoryRetention::OneYear,
+            clipboard_restore: false,
+            ..Settings::default()
+        })
+        .unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("setupComplete");
+        object.remove("deleteAudioAfterProcessing");
+        object.insert("futureSetting".into(), 7.into());
+        let raw = value.to_string();
+        store_raw_settings(&storage, &raw);
+
+        let (settings, repairs) = storage.get_settings_with_repairs().unwrap();
+
+        // A stored row means setup already ran.
+        assert!(settings.setup_complete);
+        assert!(settings.delete_audio_after_processing);
+        assert!(settings.auto_start);
+        assert!(!settings.clipboard_restore);
+        assert_eq!(settings.history_retention, HistoryRetention::OneYear);
+        assert!(repairs.contains("setupComplete"));
+        assert!(repairs.contains("deleteAudioAfterProcessing"));
+        assert!(!repairs.contains("autoStart"));
+        assert!(!repairs.contains("theme"));
+        assert_eq!(stored_settings_raw(&storage), raw);
+    }
+
+    #[test]
+    fn unreadable_retention_never_purges_history() {
+        let storage = Storage::in_memory().unwrap();
+        insert_history_at(&storage, "old", Utc::now() - chrono::Duration::days(400));
+        insert_history_at(&storage, "recent", Utc::now());
+        let mut value = serde_json::to_value(Settings {
+            setup_complete: true,
+            ..Settings::default()
+        })
+        .unwrap();
+        value["historyRetention"] = "three_months".into();
+        value["deleteAudioAfterProcessing"] = "yes".into();
+        store_raw_settings(&storage, &value.to_string());
+
+        storage.enforce_current_history_policy().unwrap();
+
+        let (settings, repairs) = storage.get_settings_with_repairs().unwrap();
+        assert_eq!(settings.history_retention, HistoryRetention::Forever);
+        // The privacy default stays; startup skips only the cleanup it
+        // would trigger (see `repairs`).
+        assert!(settings.delete_audio_after_processing);
+        assert!(repairs.contains("deleteAudioAfterProcessing"));
+        assert_eq!(history_texts(&storage).len(), 2);
+    }
+
+    #[test]
+    fn history_inserts_succeed_while_the_row_holds_newer_values() {
+        let storage = Storage::in_memory().unwrap();
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value["historyRetention"] = "three_months".into();
+        store_raw_settings(&storage, &value.to_string());
+
+        assert!(storage.add_history(&item()).unwrap());
+        assert_eq!(history_texts(&storage).len(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_failed_take_switch_keeps_failed_takes() {
+        let storage = Storage::in_memory().unwrap();
+        let mut value = serde_json::to_value(Settings {
+            setup_complete: true,
+            ..keeping_nothing(false)
+        })
+        .unwrap();
+        value["keepFailedTakes"] = "for_a_week".into();
+        store_raw_settings(&storage, &value.to_string());
+
+        let (settings, repairs) = storage.get_settings_with_repairs().unwrap();
+        // The fallback keeps failed takes; the other fields stay as stored.
+        assert!(settings.keep_failed_takes);
+        assert!(repairs.contains("keepFailedTakes"));
+        assert_eq!(settings.history_retention, HistoryRetention::Never);
+        assert!(settings.delete_audio_after_processing);
+
+        // The insert and the purges read the row the same way.
+        let source = source_wav();
+        assert_eq!(
+            storage.add_failed_take(&item(), &source).unwrap(),
+            Some(FailedTakeRetention::Temporary)
+        );
+        let _ = fs::remove_file(&source);
+        storage.enforce_current_history_policy().unwrap();
+        assert_eq!(stored_row_count(&storage), 1);
+
+        // An unrelated save keeps the stored value and the failed take.
+        let mut changed = settings.clone();
+        changed.theme = "dark".into();
+        storage
+            .update_settings_and_apply_history_policy(&changed)
             .unwrap();
-        let saved: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(
-            saved["shortcuts"]["futureMode"],
-            serde_json::json!(["Ctrl+Alt+F"])
+            stored_settings_value(&storage)["keepFailedTakes"],
+            "for_a_week"
         );
+        assert_eq!(stored_row_count(&storage), 1);
+        assert_eq!(history_audio_files(&storage).len(), 1);
+        storage.delete_all_history().unwrap();
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
+    }
+
+    #[test]
+    fn saving_settings_keeps_keys_this_build_does_not_know() {
+        let storage = Storage::in_memory().unwrap();
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value["futureSetting"] = serde_json::json!({"keep": true});
+        value["shortcuts"]["futureMode"] = serde_json::json!(["Ctrl+Alt+F"]);
+        store_raw_settings(&storage, &value.to_string());
+        let mut settings = storage.get_settings().unwrap();
+        settings.theme = "dark".into();
+        settings.shortcuts.dictate = vec!["Ctrl+Alt+V".into()];
+
+        for persist in [
+            Storage::update_settings as fn(&Storage, &Settings) -> Result<(), StorageError>,
+            Storage::update_settings_and_apply_history_policy,
+        ] {
+            persist(&storage, &settings).unwrap();
+            let stored = stored_settings_value(&storage);
+            assert_eq!(stored["futureSetting"]["keep"], true);
+            assert_eq!(stored["shortcuts"]["futureMode"][0], "Ctrl+Alt+F");
+            assert_eq!(stored["shortcuts"]["dictate"][0], "Ctrl+Alt+V");
+            assert_eq!(stored["hotkey"], "Ctrl+Alt+V");
+            assert_eq!(stored["theme"], "dark");
+            assert_eq!(storage.get_settings().unwrap(), settings);
+        }
+    }
+
+    /// A row written by a newer build: an unknown retention, five Ask
+    /// chords, and an unreadable audio flag.
+    fn newer_build_row() -> serde_json::Value {
+        let mut value = serde_json::to_value(Settings {
+            setup_complete: true,
+            ..Settings::default()
+        })
+        .unwrap();
+        value["historyRetention"] = "three_months".into();
+        value["deleteAudioAfterProcessing"] = "sometimes".into();
+        value["shortcuts"]["ask"] = serde_json::json!([
+            "Ctrl+Alt+1",
+            "Ctrl+Alt+2",
+            "Ctrl+Alt+3",
+            "Ctrl+Alt+4",
+            "Ctrl+Alt+5"
+        ]);
+        value["askHotkey"] = "Ctrl+Alt+1".into();
+        value
+    }
+
+    #[test]
+    fn unrelated_saves_keep_values_this_build_could_not_read() {
+        for persist in [
+            Storage::update_settings as fn(&Storage, &Settings) -> Result<(), StorageError>,
+            Storage::update_settings_and_apply_history_policy,
+        ] {
+            let storage = Storage::in_memory().unwrap();
+            let row = newer_build_row();
+            store_raw_settings(&storage, &row.to_string());
+            // Same path as cycling the voice translation target.
+            let mut settings = storage.get_settings().unwrap();
+            settings.translation_target_language = "ja".into();
+
+            persist(&storage, &settings).unwrap();
+
+            let stored = stored_settings_value(&storage);
+            assert_eq!(stored["translationTargetLanguage"], "ja");
+            assert_eq!(stored["historyRetention"], "three_months");
+            assert_eq!(stored["deleteAudioAfterProcessing"], "sometimes");
+            assert_eq!(stored["shortcuts"]["ask"], row["shortcuts"]["ask"]);
+            assert_eq!(stored["askHotkey"], "Ctrl+Alt+1");
+            assert_eq!(stored["hotkey"], "Ctrl+Shift+Space");
+            let (reloaded, repairs) = storage.get_settings_with_repairs().unwrap();
+            assert_eq!(reloaded, settings);
+            assert!(repairs.contains("historyRetention"));
+        }
+    }
+
+    #[test]
+    fn explicit_changes_to_unreadable_fields_are_saved() {
+        let storage = Storage::in_memory().unwrap();
+        store_raw_settings(&storage, &newer_build_row().to_string());
+        let mut settings = storage.get_settings().unwrap();
+        settings.history_retention = HistoryRetention::OneWeek;
+        settings.delete_audio_after_processing = false;
+        settings.shortcuts.ask = vec!["Ctrl+Alt+Q".into()];
+
+        storage.update_settings(&settings).unwrap();
+
+        let stored = stored_settings_value(&storage);
+        assert_eq!(stored["historyRetention"], "one_week");
+        assert_eq!(stored["deleteAudioAfterProcessing"], false);
         assert_eq!(
-            saved["shortcuts"]["dictate"],
-            serde_json::json!(["Ctrl+Shift+Space"])
+            stored["shortcuts"]["ask"],
+            serde_json::json!(["Ctrl+Alt+Q"])
         );
+        assert_eq!(stored["askHotkey"], "Ctrl+Alt+Q");
+        let (reloaded, repairs) = storage.get_settings_with_repairs().unwrap();
+        assert_eq!(reloaded, settings);
+        assert!(repairs.is_empty());
+    }
+
+    #[test]
+    fn saving_over_an_unreadable_row_backs_it_up_first() {
+        for persist in [
+            Storage::update_settings as fn(&Storage, &Settings) -> Result<(), StorageError>,
+            Storage::update_settings_and_apply_history_policy,
+        ] {
+            let storage = Storage::in_memory().unwrap();
+            store_raw_settings(&storage, "{\"setupComplete\":");
+            let settings = storage.get_settings().unwrap();
+            assert!(settings_backups(&storage).is_empty());
+
+            persist(&storage, &settings).unwrap();
+
+            assert_eq!(
+                settings_backups(&storage),
+                [(
+                    "{\"setupComplete\":".to_owned(),
+                    "replaced_unreadable".to_owned()
+                )]
+            );
+            assert_eq!(storage.get_settings().unwrap(), settings);
+            // A readable row is merged, not backed up.
+            persist(&storage, &settings).unwrap();
+            assert_eq!(settings_backups(&storage).len(), 1);
+        }
+    }
+
+    #[test]
+    fn unreadable_rows_are_backed_up_once_at_startup() {
+        for raw in ["not json".to_owned(), {
+            let mut value = serde_json::to_value(Settings::default()).unwrap();
+            value["historyRetention"] = "three_months".into();
+            value.to_string()
+        }] {
+            let storage = Storage::in_memory().unwrap();
+            store_raw_settings(&storage, &raw);
+            for _ in 0..3 {
+                storage.back_up_unreadable_settings().unwrap();
+            }
+            assert_eq!(
+                settings_backups(&storage),
+                [(raw.clone(), "unreadable_at_startup".to_owned())]
+            );
+            // The row itself is left as it is.
+            assert_eq!(stored_settings_raw(&storage), raw);
+            // A later replacement does not duplicate the same content.
+            storage
+                .update_settings(&storage.get_settings().unwrap())
+                .unwrap();
+            assert_eq!(settings_backups(&storage).len(), 1);
+        }
+    }
+
+    #[test]
+    fn readable_rows_are_not_backed_up_at_startup() {
+        let storage = Storage::in_memory().unwrap();
+        storage.back_up_unreadable_settings().unwrap();
+        storage.update_settings(&Settings::default()).unwrap();
+        storage.back_up_unreadable_settings().unwrap();
+        assert!(settings_backups(&storage).is_empty());
+    }
+
+    #[test]
+    fn persisting_repaired_fields_writes_exactly_those_fields() {
+        let storage = Storage::in_memory().unwrap();
+        let mut row = newer_build_row();
+        row["futureSetting"] = serde_json::json!({"keep": true});
+        row["shortcuts"]["futureMode"] = serde_json::json!(["Ctrl+Alt+F"]);
+        row["theme"] = "dark".into();
+        let raw = row.to_string();
+        store_raw_settings(&storage, &raw);
+        let before = storage.get_settings().unwrap();
+        let mut repairs = storage.settings_repair_status().unwrap().fields();
+        repairs.sort();
         assert_eq!(
-            saved["shortcuts"]["ask"],
+            repairs,
+            [
+                "deleteAudioAfterProcessing",
+                "historyRetention",
+                "shortcuts.ask"
+            ]
+        );
+        // A normal save of the same values keeps the unreadable originals.
+        storage.update_settings(&before).unwrap();
+        assert_eq!(
+            stored_settings_value(&storage)["historyRetention"],
+            "three_months"
+        );
+
+        let persisted = storage.persist_repaired_settings().unwrap();
+
+        assert_eq!(persisted, before);
+        let stored = stored_settings_value(&storage);
+        assert_eq!(stored["historyRetention"], "forever");
+        assert_eq!(stored["deleteAudioAfterProcessing"], true);
+        assert_eq!(
+            stored["shortcuts"]["ask"],
             serde_json::json!(["Ctrl+Shift+A"])
         );
+        assert_eq!(stored["askHotkey"], "Ctrl+Shift+A");
+        assert_eq!(stored["theme"], "dark");
+        assert_eq!(stored["futureSetting"]["keep"], true);
+        assert_eq!(stored["shortcuts"]["futureMode"][0], "Ctrl+Alt+F");
+        assert!(storage.settings_repair_status().unwrap().is_empty());
+        assert_eq!(storage.get_settings().unwrap(), before);
+        assert!(settings_backups(&storage)
+            .iter()
+            .any(|(value, _)| value.contains("three_months")));
+    }
+
+    #[test]
+    fn persisting_an_unreadable_row_stores_the_current_settings() {
+        let storage = Storage::in_memory().unwrap();
+        store_raw_settings(&storage, "not json");
+        let repairs = storage.settings_repair_status().unwrap();
+        assert_eq!(repairs.fields()[0], "unreadable");
+        assert!(repairs.contains("historyRetention"));
+
+        let persisted = storage.persist_repaired_settings().unwrap();
+
+        assert_eq!(persisted, fallback_settings());
+        assert!(storage.settings_repair_status().unwrap().is_empty());
+        assert_eq!(storage.get_settings().unwrap(), fallback_settings());
+        assert_eq!(settings_backups(&storage)[0].0, "not json");
+        // Nothing left to persist: a second call changes nothing.
+        let stored = stored_settings_raw(&storage);
+        storage.persist_repaired_settings().unwrap();
+        assert_eq!(stored_settings_raw(&storage), stored);
+    }
+
+    #[test]
+    fn legacy_history_switch_without_a_readable_window_keeps_everything() {
+        for (legacy, expected) in [
+            (
+                serde_json::json!({"historyEnabled": true}),
+                HistoryRetention::Forever,
+            ),
+            (
+                serde_json::json!({"historyRetentionDays": "thirty"}),
+                HistoryRetention::Forever,
+            ),
+            (
+                serde_json::json!({"historyEnabled": false, "historyRetentionDays": 30}),
+                HistoryRetention::Never,
+            ),
+            (
+                serde_json::json!({"historyEnabled": true, "historyRetentionDays": 30}),
+                HistoryRetention::OneMonth,
+            ),
+        ] {
+            let mut value = serde_json::to_value(Settings::default()).unwrap();
+            let object = value.as_object_mut().unwrap();
+            object.remove("historyRetention");
+            object.extend(legacy.as_object().unwrap().clone());
+            assert_eq!(
+                load_settings(&value.to_string()).settings.history_retention,
+                expected,
+                "{legacy}"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_installs_keep_the_normal_defaults() {
+        let storage = Storage::in_memory().unwrap();
+        let (settings, repairs) = storage.get_settings_with_repairs().unwrap();
+        assert_eq!(settings, Settings::default());
+        assert_eq!(settings.history_retention, HistoryRetention::OneMonth);
+        assert!(settings.delete_audio_after_processing);
+        assert!(!settings.setup_complete);
+        assert!(repairs.is_empty());
+        assert!(settings_backups(&storage).is_empty());
+    }
+
+    #[test]
+    fn legacy_migrations_are_persisted_after_a_capped_backup() {
+        let storage = Storage::in_memory().unwrap();
+        let total = MAX_SETTINGS_BACKUPS + 3;
+        for index in 0..total {
+            let mut value = serde_json::to_value(Settings::default()).unwrap();
+            let object = value.as_object_mut().unwrap();
+            object.remove("historyRetention");
+            object.insert("historyEnabled".into(), true.into());
+            object.insert("historyRetentionDays".into(), 7.into());
+            object.insert("futureSetting".into(), index.into());
+            store_raw_settings(&storage, &value.to_string());
+            let (settings, repairs) = storage.get_settings_with_repairs().unwrap();
+            assert_eq!(settings.history_retention, HistoryRetention::OneWeek);
+            assert!(repairs.is_empty());
+            let stored = stored_settings_value(&storage);
+            assert_eq!(stored["historyRetention"], "one_week");
+            assert_eq!(stored["futureSetting"], index);
+        }
+        let backups = settings_backups(&storage);
+        assert_eq!(backups.len() as i64, MAX_SETTINGS_BACKUPS);
+        assert!(backups[0].0.contains("\"futureSetting\":3"));
+        assert!(backups
+            .iter()
+            .all(|(_, reason)| reason.split(',').any(|name| name == "legacy_history")));
     }
 
     #[test]
@@ -5034,11 +6555,11 @@ mod tests {
 
     #[test]
     fn candidate_text_follows_history_retention_and_legacy_history_switch() {
-        assert!(stored_history_is_off(r#"{"historyRetention":"never"}"#).unwrap());
-        assert!(!stored_history_is_off(r#"{"historyRetention":"forever"}"#).unwrap());
-        assert!(stored_history_is_off(r#"{"historyEnabled":false}"#).unwrap());
-        assert!(!stored_history_is_off(r#"{"historyEnabled":true}"#).unwrap());
-        assert!(!stored_history_is_off("{}").unwrap());
+        assert!(stored_history_is_off(r#"{"historyRetention":"never"}"#));
+        assert!(!stored_history_is_off(r#"{"historyRetention":"forever"}"#));
+        assert!(stored_history_is_off(r#"{"historyEnabled":false}"#));
+        assert!(!stored_history_is_off(r#"{"historyEnabled":true}"#));
+        assert!(!stored_history_is_off("{}"));
 
         let storage = Storage::in_memory().unwrap();
         let settings = Settings {

@@ -4466,6 +4466,36 @@ pub(crate) fn get_shortcut_warning(services: State<'_, Services>) -> Vec<String>
         .clone()
 }
 
+/// Names the stored settings fields this build could not read and replaces
+/// in memory (content-free JSON keys such as `historyRetention` or
+/// `shortcuts.ask`, or `unreadable` for the whole row). The Settings page
+/// fetches this on mount, so the notice does not depend on a startup event.
+#[tauri::command]
+pub(crate) fn get_settings_repair_status(
+    storage: State<'_, Storage>,
+) -> Result<Vec<String>, String> {
+    storage
+        .settings_repair_status()
+        .map(|repairs| repairs.fields())
+        .map_err(command_error)
+}
+
+/// Saves the current values of the replaced fields, so a user who wants the
+/// fallback values keeps them. Returns the fields still replaced afterwards.
+#[tauri::command]
+pub(crate) async fn persist_repaired_settings(
+    services: State<'_, Services>,
+    storage: State<'_, Storage>,
+) -> Result<Vec<String>, String> {
+    let _update_guard = services.settings_update.lock().await;
+    let _settings_writes = storage.lock_settings_writes().map_err(command_error)?;
+    storage.persist_repaired_settings().map_err(command_error)?;
+    storage
+        .settings_repair_status()
+        .map(|repairs| repairs.fields())
+        .map_err(command_error)
+}
+
 #[tauri::command]
 pub(crate) async fn update_settings(
     app: AppHandle,

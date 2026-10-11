@@ -45,7 +45,7 @@ function fixture(settings = structuredClone(defaultSettings)) {
     react: hooks,
     "@tauri-apps/api/event": {},
     "../components/ui": { SettingRow: "row", Toggle: "toggle" },
-    "../components/AiCorrectionSettings": { AiCorrectionSettings: "correction" },
+    "../components/AiCorrectionSettings": { AiCorrectionSettings: "correction" }, "../components/SettingsRepairBanner": { SettingsRepairBanner: "repair-banner" },
     "../types": registries,
     "../api": {},
     "../i18n": { useI18n: () => ({ language: "en", t: (key) => key }) },
