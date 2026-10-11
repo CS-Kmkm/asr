@@ -773,12 +773,19 @@ fn repair_shortcut_lists(
 ///   default `one_month` would delete everything older than 30 days);
 /// - `setupComplete` -> `true` (a stored row means setup already ran).
 ///
+/// `keepFailedTakes` keeps its default `true`, which only keeps failed takes
+/// for Retry until they expire; `false` would remove every one of them, with
+/// its audio, at the next purge.
+///
 /// `deleteAudioAfterProcessing` keeps its privacy default `true`; the only
 /// data that value would destroy, older builds' stale capture WAVs, is
 /// protected by skipping that startup cleanup when the field was replaced
-/// (see [`SettingsRepairs`]). Likewise the autostart registration is left
-/// alone when `autoStart` was replaced. Every other default only changes
-/// behavior for this run, and the stored row is never rewritten with it.
+/// (see [`SettingsRepairs`]). Known limit: with that field replaced, a failed
+/// take kept only for Retry is not promoted to a normal History row and still
+/// expires after 24 hours, as it would before the user turned audio
+/// retention on. Likewise the autostart registration is left alone when
+/// `autoStart` was replaced. Every other default only changes behavior for
+/// this run, and the stored row is never rewritten with it.
 fn fallback_settings() -> Settings {
     Settings {
         history_retention: HistoryRetention::Forever,
@@ -3708,6 +3715,50 @@ mod tests {
 
         assert!(storage.add_history(&item()).unwrap());
         assert_eq!(history_texts(&storage).len(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_failed_take_switch_keeps_failed_takes() {
+        let storage = Storage::in_memory().unwrap();
+        let mut value = serde_json::to_value(Settings {
+            setup_complete: true,
+            ..keeping_nothing(false)
+        })
+        .unwrap();
+        value["keepFailedTakes"] = "for_a_week".into();
+        store_raw_settings(&storage, &value.to_string());
+
+        let (settings, repairs) = storage.get_settings_with_repairs().unwrap();
+        // The fallback keeps failed takes; the other fields stay as stored.
+        assert!(settings.keep_failed_takes);
+        assert!(repairs.contains("keepFailedTakes"));
+        assert_eq!(settings.history_retention, HistoryRetention::Never);
+        assert!(settings.delete_audio_after_processing);
+
+        // The insert and the purges read the row the same way.
+        let source = source_wav();
+        assert_eq!(
+            storage.add_failed_take(&item(), &source).unwrap(),
+            Some(FailedTakeRetention::Temporary)
+        );
+        let _ = fs::remove_file(&source);
+        storage.enforce_current_history_policy().unwrap();
+        assert_eq!(stored_row_count(&storage), 1);
+
+        // An unrelated save keeps the stored value and the failed take.
+        let mut changed = settings.clone();
+        changed.theme = "dark".into();
+        storage
+            .update_settings_and_apply_history_policy(&changed)
+            .unwrap();
+        assert_eq!(
+            stored_settings_value(&storage)["keepFailedTakes"],
+            "for_a_week"
+        );
+        assert_eq!(stored_row_count(&storage), 1);
+        assert_eq!(history_audio_files(&storage).len(), 1);
+        storage.delete_all_history().unwrap();
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
     }
 
     #[test]
