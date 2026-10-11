@@ -314,6 +314,7 @@ const en = {
   "The target app runs with higher privileges, so this app cannot type into it.": "The target app runs with higher privileges, so this app cannot type into it.",
   "The selected microphone was not found. Check the microphone in Settings.": "The selected microphone was not found. Check the microphone in Settings.",
   "The microphone could not be opened. Check the microphone in Settings.": "The microphone could not be opened. Check the microphone in Settings.",
+  "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.": "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
@@ -629,6 +630,7 @@ const ja: Record<MessageKey, string> = {
   "The target app runs with higher privileges, so this app cannot type into it.": "入力先のアプリが高い権限で実行されているため、このアプリから入力できません。",
   "The selected microphone was not found. Check the microphone in Settings.": "選択したマイクが見つかりません。設定でマイクを確認してください。",
   "The microphone could not be opened. Check the microphone in Settings.": "マイクを開けませんでした。設定でマイクを確認してください。",
+  "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.": "Esc は録音中のキャンセルキーでもあります。この割り当てでは、× ボタンでキャンセルしてください。",
 } satisfies Record<MessageKey, string>;
 
 const catalogs = { en, ja } satisfies Record<UiLanguage, Record<MessageKey, string>>;

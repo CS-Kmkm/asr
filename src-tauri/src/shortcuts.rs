@@ -40,7 +40,10 @@ pub(crate) fn cancel_chord() -> Shortcut {
 
 /// Whether the cancel chord should be registered. A global hotkey takes the
 /// key from every app, so Esc is held only while a session is starting,
-/// recording, or processing, and never when a saved route already owns it.
+/// recording, or processing. A route the user assigned to Esc wins: the app
+/// never takes a chord the user chose, so Esc keeps running that route and
+/// the overlay's cancel button is the cancel path. Settings warns about this
+/// on any route that uses Esc (`isCancelKeyChord` in `SettingsPage.tsx`).
 pub(crate) fn wants_cancel_chord(phase: PipelinePhase, routes: &Routes) -> bool {
     phase != PipelinePhase::Idle && routes.find(cancel_chord()).is_none()
 }
@@ -410,12 +413,22 @@ mod tests {
         ] {
             assert!(wants_cancel_chord(active, &routes));
         }
-        // A saved route that already uses Esc keeps it.
+        // A route the user assigned to Esc keeps it, under any spelling the
+        // Settings warning recognizes; Esc with a modifier is another chord.
+        for spelling in ["Escape", "Esc", " esc "] {
+            let mut settings = Settings::default();
+            settings.shortcuts.ask[0] = spelling.into();
+            let routes = Routes::parse(&settings).unwrap();
+            assert!(routes.find(cancel_chord()).is_some(), "{spelling}");
+            assert!(!wants_cancel_chord(PipelinePhase::Recording, &routes));
+        }
         let mut settings = Settings::default();
-        settings.shortcuts.ask[0] = "Escape".into();
+        settings.translation_hotkey = "Escape".into();
         let routes = Routes::parse(&settings).unwrap();
-        assert!(routes.find(cancel_chord()).is_some());
-        assert!(!wants_cancel_chord(PipelinePhase::Recording, &routes));
+        assert!(!wants_cancel_chord(PipelinePhase::Starting, &routes));
+        settings.translation_hotkey = "Ctrl+Escape".into();
+        let routes = Routes::parse(&settings).unwrap();
+        assert!(wants_cancel_chord(PipelinePhase::Recording, &routes));
     }
 
     #[test]

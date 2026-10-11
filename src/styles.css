@@ -379,6 +379,8 @@ textarea { width: min(420px, 42vw); resize: vertical; line-height: 1.45; }
 .microphone-level-track { height: 12px; overflow: hidden; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-muted); }
 .microphone-level-track span { display: block; height: 100%; background: var(--accent); transition: width 80ms linear; }
 .settings-error { margin: 8px 0 12px; color: var(--error); font-size: 13px; }
+.shortcut-item:has(.settings-warning) { flex-wrap: wrap; }
+.settings-warning { flex-basis: 100%; margin: 2px 0 4px; color: var(--warning); font-size: 12px; }
 .settings-note { margin: 8px 0 22px; padding: 12px 14px; border-radius: 8px; background: var(--surface-subtle); color: var(--text-muted); font-size: 13px; }
 .ai-correction-panel { background: transparent; }
 .ai-correction-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 32px; padding-bottom: 18px; border-bottom: 1px solid var(--border); }
