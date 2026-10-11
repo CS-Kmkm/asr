@@ -422,8 +422,10 @@ mod tests {
             assert!(routes.find(cancel_chord()).is_some(), "{spelling}");
             assert!(!wants_cancel_chord(PipelinePhase::Recording, &routes));
         }
-        let mut settings = Settings::default();
-        settings.translation_hotkey = "Escape".into();
+        let mut settings = Settings {
+            translation_hotkey: "Escape".into(),
+            ..Settings::default()
+        };
         let routes = Routes::parse(&settings).unwrap();
         assert!(!wants_cancel_chord(PipelinePhase::Starting, &routes));
         settings.translation_hotkey = "Ctrl+Escape".into();
