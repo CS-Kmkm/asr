@@ -353,9 +353,11 @@ function RecordingOverlay() {
   }
 
   if (phase !== "recording" && phase !== "processing" && phase !== "injecting" && notice?.kind === "insertion") {
-    const failed = notice.outcome === "insertion_failed";
+    // A lost previous clipboard does not change how the insertion went.
+    const outcome = notice.outcome.replace(/_not_restored$/, "");
+    const failed = outcome === "insertion_failed";
     // The paste was sent; only its confirmation is unavailable in this field.
-    const sent = notice.outcome === "paste_unverified";
+    const sent = outcome === "paste_unverified";
     const outcomeKey = insertionOutcomeNotices[notice.outcome];
     const detailKey = notice.detail ? insertionDetailLabels[notice.detail] : undefined;
     return (

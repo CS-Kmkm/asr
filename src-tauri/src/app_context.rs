@@ -66,6 +66,10 @@ pub(crate) fn from_executable_path(path: Option<&str>) -> Option<AppContext> {
 }
 
 pub(crate) fn from_target(target: &TargetWindow) -> Option<AppContext> {
+    // This app's own window is not a dictation context.
+    if target.is_this_app() {
+        return None;
+    }
     #[cfg(target_os = "windows")]
     let path = executable_path(target.process_id);
     #[cfg(not(target_os = "windows"))]
@@ -114,6 +118,7 @@ mod tests {
             is_secure: false,
         });
         assert_eq!(context, None);
+        assert_eq!(from_target(&TargetWindow::this_app()), None);
         assert_eq!(from_executable_path(None), None);
         assert_eq!(history_category(context.as_ref()), None);
     }

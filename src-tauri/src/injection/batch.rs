@@ -9,7 +9,8 @@ fn safe<B: Backend>(
     activity: Option<(&InputMonitor, u64)>,
     policy: SafetyPolicy,
 ) -> bool {
-    activity.is_none_or(|(monitor, checkpoint)| monitor.unchanged_since(checkpoint))
+    !target.is_this_app()
+        && activity.is_none_or(|(monitor, checkpoint)| monitor.unchanged_since(checkpoint))
         && backend.validate_target(target).is_ok()
         && backend
             .ime_composition_active(target)
@@ -21,12 +22,14 @@ fn safe<B: Backend>(
 /// foreground and focused, and no IME composition is known to be open. An IME
 /// state or selection that cannot be read stays unreadable however long we
 /// wait, so the paste guard decides those immediately. Input is checked
-/// separately.
+/// separately. This app's own window is never pasted into, so nothing is
+/// worth waiting for.
 pub(super) fn ready<B: Backend>(backend: &B, target: &TargetWindow) -> bool {
-    backend.validate_target(target).is_ok()
-        && !backend
-            .ime_composition_active(target)
-            .is_ok_and(|active| active == Some(true))
+    target.is_this_app()
+        || backend.validate_target(target).is_ok()
+            && !backend
+                .ime_composition_active(target)
+                .is_ok_and(|active| active == Some(true))
 }
 
 /// How a final additive paste is guarded.
@@ -67,9 +70,125 @@ fn safe_after_injected_paste<B: Backend>(
             .is_ok_and(|active| policy.permits_ime(active))
 }
 
-fn copy_only<B: Backend>(backend: &B, text: &str) -> Result<InsertResult, InjectionError> {
-    backend.clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)?;
-    Ok(InsertResult::ClipboardOnly)
+/// The user's clipboard during one insertion attempt.
+///
+/// With Restore clipboard on, the clipboard is snapshotted before the first
+/// write. Data that cannot be snapshotted is never overwritten: the attempt
+/// fails with `ClipboardProtected` before anything is written or pasted, and
+/// the caller keeps the text in the app. A clipboard that stays locked fails
+/// with `ClipboardUnavailable` as well. After a write, the snapshot is put back
+/// once a paste is confirmed, or when the attempt ends before any paste was
+/// queued (cancellation or an error). When the text is left on the clipboard
+/// on purpose (a copy-only result or a queued but unconfirmed paste) or the
+/// restore fails, the user's clipboard is lost and the attempt records
+/// `clipboard_not_restored`. A newer copy made meanwhile is the user's own
+/// and is never replaced.
+///
+/// With Restore clipboard off the user accepts that insertion replaces the
+/// clipboard: nothing is snapshotted, restored or reported.
+struct UserClipboard<'a, B: Backend> {
+    backend: &'a B,
+    restore: bool,
+    previous: Option<B::Clipboard>,
+    /// Sequence of our last write while it replaces the user's clipboard.
+    written: Option<u32>,
+    /// The written text is the outcome and stays on the clipboard.
+    kept: bool,
+}
+
+impl<'a, B: Backend> UserClipboard<'a, B> {
+    fn new(backend: &'a B, options: InjectionOptions) -> Self {
+        Self {
+            backend,
+            restore: options.restore_clipboard,
+            previous: None,
+            written: None,
+            kept: false,
+        }
+    }
+
+    fn write(&mut self, text: &str) -> Result<u32, InjectionError> {
+        if self.restore && self.previous.is_none() {
+            self.previous = Some(match self.backend.clipboard_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(InjectionError::ClipboardUnpreservable) => {
+                    return Err(InjectionError::ClipboardProtected)
+                }
+                Err(error) => return Err(error),
+            });
+        }
+        match self
+            .backend
+            .clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)
+        {
+            Ok(sequence) => {
+                self.written = Some(sequence);
+                Ok(sequence)
+            }
+            // The write emptied the clipboard: restore or report it as ours.
+            Err(WriteError::AfterEmpty { error, sequence }) => {
+                self.written = Some(sequence);
+                Err(error)
+            }
+            // Nothing changed; a newer copy by another process stays.
+            Err(WriteError::Untouched(error)) => Err(error),
+        }
+    }
+
+    /// Leaves `text` on the clipboard as the outcome.
+    fn copy(&mut self, text: &str) -> Result<InsertResult, InjectionError> {
+        self.write(text)?;
+        self.kept = true;
+        Ok(InsertResult::ClipboardOnly)
+    }
+
+    /// A paste was queued: its payload must stay until the target confirms it.
+    fn keep(&mut self) {
+        self.kept = true;
+    }
+
+    /// Puts the user's clipboard back unless a newer copy replaced ours.
+    fn restore(&mut self) {
+        if let (Some(previous), Some(sequence)) = (self.previous.take(), self.written) {
+            if self.backend.clipboard_restore(previous, sequence).is_ok() {
+                self.written = None;
+            }
+        }
+    }
+}
+
+impl<B: Backend> Drop for UserClipboard<'_, B> {
+    fn drop(&mut self) {
+        if !self.restore || self.written.is_none() {
+            return;
+        }
+        if !self.kept {
+            // Nothing was queued, so nothing can still read our text.
+            self.restore();
+        }
+        if self.written.is_some() {
+            self.backend.clipboard_not_restored();
+        }
+    }
+}
+
+/// Copies `text` as an outcome, under the same clipboard policy.
+pub(super) fn copy<B: Backend>(
+    backend: &B,
+    options: InjectionOptions,
+    text: &str,
+) -> Result<(), InjectionError> {
+    UserClipboard::new(backend, options).copy(text).map(|_| ())
+}
+
+enum Selection {
+    /// The target shows exactly the requested selection.
+    Confirmed(TargetText),
+    /// Select() was issued but never confirmed. The target may still apply
+    /// it, so the caller may need to collapse it again.
+    Unconfirmed(TargetText),
+    /// Nothing was selected in the target.
+    NotRequested,
 }
 
 fn select_verified<B: Backend>(
@@ -78,32 +197,54 @@ fn select_verified<B: Backend>(
     before: &TargetText,
     text: &str,
     activity: Option<(&InputMonitor, u64)>,
-) -> Option<TargetText> {
-    let selected = before.select_recent(text)?;
+) -> Selection {
+    let Some(selected) = before.select_recent(text) else {
+        return Selection::NotRequested;
+    };
     if !safe(backend, target, activity, SafetyPolicy::Destructive)
-        || !backend.target_text(target).ok()?.same_content(before)
-        || !backend.select_recent(target, before, text).ok()?
+        || !backend
+            .target_text(target)
+            .is_ok_and(|actual| actual.same_content(before))
+        || !backend.select_recent(target, before, text).unwrap_or(false)
     {
-        return None;
+        return Selection::NotRequested;
     }
     for attempt in 0..=VERIFY_ATTEMPTS {
         if attempt > 0 {
             backend.wait_for_target();
         }
         if !safe(backend, target, activity, SafetyPolicy::Destructive) {
-            return None;
+            return Selection::Unconfirmed(selected);
         }
-        let actual = backend.target_text(target).ok()?;
+        let Ok(actual) = backend.target_text(target) else {
+            return Selection::Unconfirmed(selected);
+        };
         if actual.same_content(&selected) {
-            return Some(selected);
+            return Selection::Confirmed(selected);
         }
         // Only the unchanged caret state may precede the requested selection.
         // An unrelated edit or selection must never authorize replacement.
         if !actual.same_content(before) {
-            return None;
+            return Selection::Unconfirmed(selected);
         }
     }
-    None
+    Selection::Unconfirmed(selected)
+}
+
+/// Returns a selection this module requested to a caret at its end, where
+/// the caret was before Select(), when nothing else has changed the field.
+/// A selected draft left behind would be replaced whole by the user's next
+/// keystroke. Collapsing edits no text, so recent input does not block it.
+/// The empty caret a retracted draft left was never selected, so it is left
+/// alone.
+fn collapse_selected<B: Backend>(backend: &B, target: &TargetWindow, selected: &TargetText) {
+    if !selected.selected.is_empty()
+        && backend
+            .target_text(target)
+            .is_ok_and(|actual| actual.same_content(selected))
+    {
+        let _ = backend.collapse_selection(target, selected);
+    }
 }
 
 /// Some editors (for example VS Code) expose only a proxy or a window of their
@@ -126,7 +267,7 @@ fn shows_inserted_text(before: &TargetText, actual: &TargetText, text: &str) -> 
 #[allow(clippy::too_many_arguments)]
 fn paste<B: Backend>(
     backend: &B,
-    options: InjectionOptions,
+    clipboard: &mut UserClipboard<'_, B>,
     text: &str,
     target: &TargetWindow,
     before: &TargetText,
@@ -137,11 +278,18 @@ fn paste<B: Backend>(
     if cancel.is_some_and(|receiver| *receiver.borrow()) {
         return Err(InjectionError::Cancelled);
     }
-    let previous = if options.restore_clipboard {
-        Some(backend.clipboard_snapshot()?)
-    } else {
-        None
-    };
+    if !safe(backend, target, activity, policy)
+        || !backend
+            .target_text(target)
+            .is_ok_and(|actual| actual.same_content(before))
+    {
+        if cancel.is_some_and(|receiver| *receiver.borrow()) {
+            return Err(InjectionError::Cancelled);
+        }
+        return clipboard.copy(text);
+    }
+    // Snapshots first; an unpreservable or locked clipboard stops here.
+    clipboard.write(text)?;
     if cancel.is_some_and(|receiver| *receiver.borrow()) {
         return Err(InjectionError::Cancelled);
     }
@@ -153,25 +301,12 @@ fn paste<B: Backend>(
         if cancel.is_some_and(|receiver| *receiver.borrow()) {
             return Err(InjectionError::Cancelled);
         }
-        return copy_only(backend, text);
-    }
-    let sequence = backend.clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)?;
-    if cancel.is_some_and(|receiver| *receiver.borrow()) {
-        return Err(InjectionError::Cancelled);
-    }
-    if !safe(backend, target, activity, policy)
-        || !backend
-            .target_text(target)
-            .is_ok_and(|actual| actual.same_content(before))
-    {
-        if cancel.is_some_and(|receiver| *receiver.borrow()) {
-            return Err(InjectionError::Cancelled);
-        }
-        return copy_only(backend, text);
+        return clipboard.copy(text);
     }
     if !backend.paste(target, policy).unwrap_or(false) {
-        return copy_only(backend, text);
+        return clipboard.copy(text);
     }
+    clipboard.keep();
     let expected = before.replaced_with(text);
     for attempt in 0..=VERIFY_ATTEMPTS {
         if attempt > 0 {
@@ -187,11 +322,9 @@ fn paste<B: Backend>(
                 || (policy != SafetyPolicy::Destructive
                     && shows_inserted_text(before, &actual, text))
         }) {
-            if let Some(previous) = previous {
-                // Restoration failure cannot undo a confirmed edit and must
-                // never initiate a second insertion. New clipboard copies win.
-                let _ = backend.clipboard_restore(previous, sequence);
-            }
+            // Restoration failure cannot undo a confirmed edit and must never
+            // initiate a second insertion; it is reported instead.
+            clipboard.restore();
             return Ok(InsertResult::ClipboardPaste);
         }
     }
@@ -200,10 +333,12 @@ fn paste<B: Backend>(
 
 fn paste_unverified<B: Backend>(
     backend: &B,
+    clipboard: &mut UserClipboard<'_, B>,
     text: &str,
     target: &TargetWindow,
 ) -> Result<InsertResult, InjectionError> {
-    backend.clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)?;
+    // Either the paste is queued or the text is the copy-only outcome.
+    clipboard.copy(text)?;
     if backend
         .paste(target, SafetyPolicy::Additive)
         .unwrap_or(false)
@@ -220,15 +355,16 @@ pub(super) fn insert<B: Backend>(
     text: &str,
     target: &TargetWindow,
 ) -> Result<InsertResult, InjectionError> {
+    let mut clipboard = UserClipboard::new(backend, options);
     if !safe(backend, target, None, SafetyPolicy::Additive) {
-        return copy_only(backend, text);
+        return clipboard.copy(text);
     }
     let Ok(before) = backend.target_text(target) else {
-        return paste_unverified(backend, text, target);
+        return paste_unverified(backend, &mut clipboard, text, target);
     };
     paste(
         backend,
-        options,
+        &mut clipboard,
         text,
         target,
         &before,
@@ -277,6 +413,7 @@ pub(super) fn insert_final<B: Backend>(
     // Ask insertion keeps its original activity checkpoint and policy.
     let policy = guard.policy();
     let allow_unverified = guard != FinalGuard::Monitored;
+    let mut clipboard = UserClipboard::new(backend, options);
     if cancelled() {
         return Err(InjectionError::Cancelled);
     }
@@ -284,19 +421,21 @@ pub(super) fn insert_final<B: Backend>(
         if cancelled() {
             return Err(InjectionError::Cancelled);
         }
-        return copy_only(backend, text);
+        return clipboard.copy(text);
     }
     let Ok(before) = backend.target_text(target) else {
         if cancelled() {
             return Err(InjectionError::Cancelled);
         }
         if allow_unverified {
-            backend.clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)?;
+            clipboard.write(text)?;
             if cancelled() {
                 return Err(InjectionError::Cancelled);
             }
             // Recheck after clipboard access, before queueing exactly one paste.
             if safe(backend, target, Some((monitor, checkpoint)), policy) {
+                // Queued or not, the text is now the outcome on the clipboard.
+                clipboard.keep();
                 return Ok(if backend.paste(target, policy).unwrap_or(false) {
                     InsertResult::PasteUnverified
                 } else {
@@ -307,11 +446,11 @@ pub(super) fn insert_final<B: Backend>(
                 return Err(InjectionError::Cancelled);
             }
         }
-        return copy_only(backend, text);
+        return clipboard.copy(text);
     };
     paste(
         backend,
-        options,
+        &mut clipboard,
         text,
         target,
         &before,
@@ -332,6 +471,9 @@ pub(super) fn diagnose<B: Backend>(
     guard: FinalGuard,
 ) -> InsertionDetail {
     let strict = guard == FinalGuard::AfterInput;
+    if target.is_this_app() {
+        return InsertionDetail::NoExternalTarget;
+    }
     let Some(checkpoint) = checkpoint.filter(|_| monitor.checkpoint().is_some()) else {
         return InsertionDetail::InputMonitorUnavailable;
     };
@@ -356,7 +498,11 @@ pub(super) fn diagnose<B: Backend>(
         Ok(Some(false)) => {}
         // Only a paste after input requires an explicitly inactive IME.
         _ if strict => return InsertionDetail::ImeUnknown,
-        _ => {}
+        Ok(None) => {}
+        // Every paste guard requires an answer, so a failed query blocked a
+        // paste that was never sent. It says nothing about readability.
+        Err(_) if !after_paste => return InsertionDetail::ImeUnknown,
+        Err(_) => {}
     }
     // A queued paste's payload remains intact even if the selection later
     // changes. These reasons describe only a paste that was never sent, and
@@ -374,6 +520,20 @@ pub(super) fn diagnose<B: Backend>(
     InsertionDetail::NotConfirmed
 }
 
+/// The focused field and its selected text. An empty selection in a
+/// readable field is the typed `NoSelection`, distinct from a field that
+/// cannot be read.
+pub(super) fn capture_selection<B: Backend>(
+    backend: &B,
+) -> Result<(TargetWindow, TargetText), InjectionError> {
+    let target = backend.capture_target()?;
+    let state = backend.target_text(&target)?;
+    if state.selected.is_empty() {
+        return Err(InjectionError::NoSelection);
+    }
+    Ok((target, state))
+}
+
 pub(super) fn replace_selection<B: Backend>(
     backend: &B,
     options: InjectionOptions,
@@ -385,7 +545,7 @@ pub(super) fn replace_selection<B: Backend>(
 ) -> Result<InsertResult, InjectionError> {
     paste(
         backend,
-        options,
+        &mut UserClipboard::new(backend, options),
         text,
         target,
         before,
@@ -407,7 +567,7 @@ pub(super) fn replace_selection_monitored<B: Backend>(
 ) -> Result<InsertResult, InjectionError> {
     paste(
         backend,
-        options,
+        &mut UserClipboard::new(backend, options),
         text,
         target,
         before,
@@ -477,7 +637,7 @@ fn begin_with_checkpoint<B: Backend>(
     let (result, replacement) = if let Some((checkpoint, before)) = replacement {
         let result = paste(
             backend,
-            options,
+            &mut UserClipboard::new(backend, options),
             draft,
             target,
             &before,
@@ -531,13 +691,14 @@ pub(super) fn update<B: Backend>(
     if session.finished {
         return Ok(session.result);
     }
+    let mut clipboard = UserClipboard::new(backend, options);
     if session.replacement.is_none() {
         if finalizing
             && session.result != InsertResult::PasteUnverified
             && (session.result == InsertResult::ClipboardOnly
                 || normalize_text(&session.displayed) != normalize_text(final_text))
         {
-            session.result = copy_only(backend, final_text)?;
+            session.result = clipboard.copy(final_text)?;
         }
         return Ok(session.result);
     }
@@ -549,16 +710,25 @@ pub(super) fn update<B: Backend>(
     }
     let range = session.replacement.as_ref().expect("range was checked");
     let activity = Some((monitor, range.checkpoint));
-    let Some(selected) = revision_range(
+    let selected = match revision_range(
         backend,
         &session.target,
         range,
         &session.displayed,
         activity,
-    ) else {
+    ) {
+        Selection::Confirmed(selected) => Some(selected),
+        // The target may have applied the selection after verification gave up.
+        Selection::Unconfirmed(requested) => {
+            collapse_selected(backend, &session.target, &requested);
+            None
+        }
+        Selection::NotRequested => None,
+    };
+    let Some(selected) = selected else {
         session.replacement = None;
         session.result = if finalizing {
-            copy_only(backend, final_text)?
+            clipboard.copy(final_text)?
         } else {
             InsertResult::ClipboardOnly
         };
@@ -567,16 +737,24 @@ pub(super) fn update<B: Backend>(
     let checkpoint = range.checkpoint;
     // A failure after selecting must not authorize another target edit.
     session.replacement = None;
-    session.result = paste(
+    let result = paste(
         backend,
-        options,
+        &mut clipboard,
         final_text,
         &session.target,
         &selected,
         activity,
         SafetyPolicy::Destructive,
         None,
-    )?;
+    );
+    // Without a queued paste, the previous draft would stay selected.
+    if !matches!(
+        result,
+        Ok(InsertResult::ClipboardPaste | InsertResult::PasteUnverified)
+    ) {
+        collapse_selected(backend, &session.target, &selected);
+    }
+    session.result = result?;
     if session.result != InsertResult::ClipboardOnly {
         session.displayed = final_text.to_owned();
         session.replacement = Some(ReplacementRange {
@@ -619,29 +797,36 @@ fn confirm_queued_draft<B: Backend>(
 /// The target state a revision replaces: the verified selection of the
 /// current draft or, after the draft was retracted, the unchanged empty caret
 /// where it began. Either way the target must still show exactly the state
-/// this session left, so nothing outside the draft is ever replaced.
+/// this session left, so nothing outside the draft is ever replaced. The
+/// empty caret needs no Select(), so it is never reported as unconfirmed.
 fn revision_range<B: Backend>(
     backend: &B,
     target: &TargetWindow,
     range: &ReplacementRange,
     displayed: &str,
     activity: Option<(&InputMonitor, u64)>,
-) -> Option<TargetText> {
+) -> Selection {
     if !displayed.is_empty() {
         return select_verified(backend, target, &range.after, displayed, activity);
     }
-    (safe(backend, target, activity, SafetyPolicy::Destructive)
+    if safe(backend, target, activity, SafetyPolicy::Destructive)
         && backend
             .target_text(target)
-            .is_ok_and(|actual| actual.same_content(&range.after)))
-    .then(|| range.after.clone())
+            .is_ok_and(|actual| actual.same_content(&range.after))
+    {
+        Selection::Confirmed(range.after.clone())
+    } else {
+        Selection::NotRequested
+    }
 }
 
 /// Withdraws the whole live draft from the target, for an utterance that
 /// ended without text. The draft is selected and deleted under the same
 /// guards as a replacement; a later revision is pasted at the caret it left.
 /// Any failed guard freezes the session as a failed replacement does: the
-/// target is never edited again and finalization only copies the text.
+/// target is never edited again and finalization only copies the text. As
+/// for cancellation, a selection it requested but queued no deletion for is
+/// collapsed back to a caret so the next keystroke cannot replace the draft.
 pub(super) fn retract<B: Backend>(
     backend: &B,
     session: &mut ProvisionalInsertion,
@@ -666,19 +851,28 @@ pub(super) fn retract<B: Backend>(
     // A failure after selecting must not authorize another target edit.
     session.replacement = None;
     session.result = InsertResult::ClipboardOnly;
-    let Some(selected) = selected else {
-        return Ok(session.result);
+    let selected = match selected {
+        Selection::Confirmed(selected) => selected,
+        // The target may have applied the selection after verification gave up.
+        Selection::Unconfirmed(requested) => {
+            collapse_selected(backend, &session.target, &requested);
+            return Ok(session.result);
+        }
+        Selection::NotRequested => return Ok(session.result),
     };
-    if !safe(
+    let queued = safe(
         backend,
         &session.target,
         activity,
         SafetyPolicy::Destructive,
-    ) || !backend
+    ) && backend
         .target_text(&session.target)
         .is_ok_and(|actual| actual.same_content(&selected))
-        || !backend.delete_selection(&session.target).unwrap_or(false)
-    {
+        // A partially queued deletion may still remove the draft, so only a
+        // deletion that queued nothing leaves the selection to collapse.
+        && backend.delete_selection(&session.target).unwrap_or(false);
+    if !queued {
+        collapse_selected(backend, &session.target, &selected);
         return Ok(session.result);
     }
     let expected = selected.replaced_with("");
@@ -723,16 +917,21 @@ pub(super) fn cancel<B: Backend>(
         return;
     };
     let activity = Some((monitor, range.checkpoint));
-    let Some(selected) = select_verified(
+    let selected = match select_verified(
         backend,
         &session.target,
         &range.after,
         &session.displayed,
         activity,
-    ) else {
-        return;
+    ) {
+        Selection::Confirmed(selected) => selected,
+        Selection::Unconfirmed(requested) => {
+            collapse_selected(backend, &session.target, &requested);
+            return;
+        }
+        Selection::NotRequested => return,
     };
-    if safe(
+    let deleted = safe(
         backend,
         &session.target,
         activity,
@@ -740,8 +939,11 @@ pub(super) fn cancel<B: Backend>(
     ) && backend
         .target_text(&session.target)
         .is_ok_and(|actual| actual.same_content(&selected))
-    {
-        let _ = backend.delete_selection(&session.target);
+        // A partially queued deletion may still remove the draft, so only a
+        // deletion that queued nothing leaves the selection to collapse.
+        && backend.delete_selection(&session.target).unwrap_or(false);
+    if !deleted {
+        collapse_selected(backend, &session.target, &selected);
     }
 }
 
@@ -1122,6 +1324,8 @@ pub(super) mod tests {
         assert_eq!(*backend.clipboard.borrow(), clipboard);
     }
 
+    type MockHook = Box<dyn Fn(&MockBackend) + Send>;
+
     /// Shared with `live_dictation` tests through `SystemTextInjector::with_mock`.
     pub(crate) struct MockBackend {
         text: RefCell<TargetText>,
@@ -1130,7 +1334,21 @@ pub(super) mod tests {
         sequence: Cell<u32>,
         target_valid: Cell<bool>,
         pub(crate) ime: Cell<Option<bool>>,
-        text_readable: Cell<bool>,
+        ime_query_fails: Cell<bool>,
+        snapshot_error: RefCell<Option<InjectionError>>,
+        restore_fails: Cell<bool>,
+        /// The write empties the clipboard, then fails.
+        write_fails_after_empty: Cell<bool>,
+        /// Another app holds the clipboard to place a newer copy, so the
+        /// write times out opening it.
+        write_blocked_by_copy: Cell<bool>,
+        not_restored: Cell<usize>,
+        /// SendInput queued only part of the deletion; the target has not
+        /// processed it yet.
+        delete_partial: Cell<bool>,
+        /// False when SendInput queued none of the deletion.
+        delete_accepted: Cell<bool>,
+        pub(crate) text_readable: Cell<bool>,
         selection_readable: Cell<bool>,
         paste_accepted: Cell<bool>,
         pending: RefCell<Option<String>>,
@@ -1146,6 +1364,7 @@ pub(super) mod tests {
         on_paste: Option<Box<dyn Fn() + Send>>,
         on_validate: Option<Box<dyn Fn() + Send>>,
         on_clipboard_write: Option<Box<dyn Fn(&MockBackend) + Send>>,
+        on_snapshot: Option<MockHook>,
         /// What the target exposes after processing a paste, for editors
         /// whose readable text is a proxy or a window of the document.
         readback_after_paste: RefCell<Option<TargetText>>,
@@ -1165,6 +1384,14 @@ pub(super) mod tests {
                 sequence: Cell::new(0),
                 target_valid: Cell::new(true),
                 ime: Cell::new(Some(false)),
+                ime_query_fails: Cell::new(false),
+                snapshot_error: RefCell::new(None),
+                restore_fails: Cell::new(false),
+                write_fails_after_empty: Cell::new(false),
+                write_blocked_by_copy: Cell::new(false),
+                not_restored: Cell::new(0),
+                delete_partial: Cell::new(false),
+                delete_accepted: Cell::new(true),
                 text_readable: Cell::new(true),
                 selection_readable: Cell::new(true),
                 paste_accepted: Cell::new(true),
@@ -1181,6 +1408,7 @@ pub(super) mod tests {
                 on_paste: None,
                 on_validate: None,
                 on_clipboard_write: None,
+                on_snapshot: None,
                 readback_after_paste: RefCell::new(None),
             }
         }
@@ -1196,6 +1424,10 @@ pub(super) mod tests {
         pub(crate) fn content(&self) -> String {
             let text = self.text.borrow();
             format!("{}{}{}", text.before, text.selected, text.after)
+        }
+        /// Consumes the unrestored-clipboard record, as the platform backends do.
+        pub(crate) fn take_clipboard_not_restored(&self) -> bool {
+            self.not_restored.replace(0) > 0
         }
     }
 
@@ -1215,6 +1447,11 @@ pub(super) mod tests {
             }
         }
         fn ime_composition_active(&self, _: &TargetWindow) -> Result<Option<bool>, InjectionError> {
+            if self.ime_query_fails.get() {
+                return Err(InjectionError::BackendFailure(
+                    "failed to query IME composition",
+                ));
+            }
             Ok(self.ime.get())
         }
         fn focus_identity(&self, _: &TargetWindow) -> Result<Vec<i32>, InjectionError> {
@@ -1252,14 +1489,33 @@ pub(super) mod tests {
             Ok(true)
         }
         fn clipboard_snapshot(&self) -> Result<Self::Clipboard, InjectionError> {
+            if let Some(on_snapshot) = &self.on_snapshot {
+                on_snapshot(self);
+            }
+            if let Some(error) = self.snapshot_error.borrow().clone() {
+                return Err(error);
+            }
             Ok(self.clipboard.borrow().clone())
         }
         fn clipboard_write(
             &self,
             text: &str,
             exclusion: ClipboardExclusion,
-        ) -> Result<u32, InjectionError> {
+        ) -> Result<u32, WriteError> {
             self.calls.borrow_mut().push("write");
+            if self.write_blocked_by_copy.get() {
+                *self.clipboard.borrow_mut() = "new user copy".into();
+                self.sequence.set(self.sequence.get() + 1);
+                return Err(WriteError::Untouched(InjectionError::ClipboardUnavailable));
+            }
+            if self.write_fails_after_empty.get() {
+                self.clipboard.borrow_mut().clear();
+                self.sequence.set(self.sequence.get() + 1);
+                return Err(WriteError::AfterEmpty {
+                    error: InjectionError::ClipboardUnavailable,
+                    sequence: self.sequence.get(),
+                });
+            }
             *self.clipboard.borrow_mut() = text.into();
             self.exclusions.borrow_mut().push(exclusion);
             self.sequence.set(self.sequence.get() + 1);
@@ -1274,6 +1530,9 @@ pub(super) mod tests {
             expected: u32,
         ) -> Result<bool, InjectionError> {
             self.calls.borrow_mut().push("restore");
+            if self.restore_fails.get() {
+                return Err(InjectionError::ClipboardUnavailable);
+            }
             if self.sequence.get() != expected {
                 return Ok(false);
             }
@@ -1302,9 +1561,31 @@ pub(super) mod tests {
             Ok(true)
         }
         fn delete_selection(&self, _: &TargetWindow) -> Result<bool, InjectionError> {
-            self.text.borrow_mut().selected.clear();
             self.calls.borrow_mut().push("delete");
+            if !self.delete_accepted.get() {
+                return Ok(false);
+            }
+            if !self.delete_partial.get() {
+                self.text.borrow_mut().selected.clear();
+            }
             Ok(true)
+        }
+        fn collapse_selection(
+            &self,
+            _: &TargetWindow,
+            expected: &TargetText,
+        ) -> Result<bool, InjectionError> {
+            if self.ime.get() != Some(false) || !self.text.borrow().same_content(expected) {
+                return Ok(false);
+            }
+            self.calls.borrow_mut().push("collapse");
+            let mut text = self.text.borrow_mut();
+            let selected = std::mem::take(&mut text.selected);
+            text.before.push_str(&selected);
+            Ok(true)
+        }
+        fn clipboard_not_restored(&self) {
+            self.not_restored.set(self.not_restored.get() + 1);
         }
         fn wait_for_target(&self) {
             if self.pending_selection.borrow().is_some() {
@@ -1498,6 +1779,640 @@ pub(super) mod tests {
             .iter()
             .filter(|call| **call == "paste")
             .count()
+    }
+
+    #[test]
+    fn a_failed_ime_query_is_reported_as_unknown_not_unreadable() {
+        let backend = MockBackend::new();
+        backend.ime_query_fails.set(true);
+        backend.text_readable.set(false);
+        // Every paste guard requires an IME answer, so nothing is sent.
+        assert_eq!(
+            final_paste(&backend, FinalGuard::Untouched),
+            InsertResult::ClipboardOnly
+        );
+        assert_eq!(pastes(&backend), 0);
+        let monitor = monitor();
+        for guard in [FinalGuard::Untouched, FinalGuard::AfterInput] {
+            assert_eq!(
+                diagnose(
+                    &backend,
+                    &target(),
+                    &monitor,
+                    monitor.checkpoint(),
+                    false,
+                    guard
+                ),
+                InsertionDetail::ImeUnknown
+            );
+        }
+        // After a sent paste, the unreadable field explains the outcome.
+        assert_eq!(
+            diagnose(
+                &backend,
+                &target(),
+                &monitor,
+                monitor.checkpoint(),
+                true,
+                FinalGuard::Untouched
+            ),
+            InsertionDetail::TargetUnreadable
+        );
+    }
+
+    #[test]
+    fn a_recording_started_in_this_app_is_copied_without_pasting() {
+        let monitor = monitor();
+        let checkpoint = monitor.checkpoint().unwrap();
+        let (_sender, cancel) = watch::channel(false);
+        let app = TargetWindow::this_app();
+        assert!(app.is_this_app());
+        assert!(!target().is_this_app());
+        for guard in [FinalGuard::Untouched, FinalGuard::AfterInput] {
+            let backend = MockBackend::new();
+            assert!(ready(&backend, &app), "nothing to wait for");
+            assert_eq!(
+                insert_final(
+                    &backend,
+                    InjectionOptions::default(),
+                    "result",
+                    &app,
+                    &monitor,
+                    checkpoint,
+                    &cancel,
+                    guard
+                )
+                .unwrap(),
+                InsertResult::ClipboardOnly
+            );
+            assert_eq!(*backend.calls.borrow(), ["write"]);
+            assert_eq!(*backend.clipboard.borrow(), "result");
+            assert_eq!(backend.content(), "prefix  suffix");
+            assert_eq!(
+                diagnose(&backend, &app, &monitor, Some(checkpoint), false, guard),
+                InsertionDetail::NoExternalTarget
+            );
+        }
+        // Opt-in live text never reaches this app's window either.
+        let backend = MockBackend::new();
+        let mut session = begin(
+            &backend,
+            InjectionOptions::default(),
+            "draft",
+            &app,
+            &monitor,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!session.paste_was_queued());
+        finish(
+            &backend,
+            InjectionOptions::default(),
+            &mut session,
+            "final",
+            &monitor,
+        )
+        .unwrap();
+        assert_eq!(pastes(&backend), 0);
+        assert_eq!(*backend.clipboard.borrow(), "final");
+    }
+
+    #[test]
+    fn only_a_recording_started_from_this_apps_ui_loses_its_target() {
+        let mut own = target();
+        own.process_id = std::process::id();
+        assert!(recording_target(own.clone(), false).is_this_app());
+        // A hotkey keeps the captured foreground window, even this app's.
+        assert_eq!(recording_target(own.clone(), true), own);
+        // Starting from the tray while another app is foreground keeps it.
+        assert_eq!(recording_target(target(), false), target());
+    }
+
+    fn restore_on(
+        backend: &MockBackend,
+        guard: FinalGuard,
+    ) -> Result<InsertResult, InjectionError> {
+        let monitor = monitor();
+        let (_sender, cancel) = watch::channel(false);
+        insert_final(
+            backend,
+            InjectionOptions::default(),
+            "new",
+            &target(),
+            &monitor,
+            monitor.checkpoint().unwrap(),
+            &cancel,
+            guard,
+        )
+    }
+
+    #[test]
+    fn restore_on_never_overwrites_an_unpreservable_clipboard() {
+        for case in ["readable", "unreadable", "copy_only"] {
+            let backend = MockBackend::new();
+            *backend.snapshot_error.borrow_mut() = Some(InjectionError::ClipboardUnpreservable);
+            match case {
+                "unreadable" => backend.text_readable.set(false),
+                "copy_only" => backend.target_valid.set(false),
+                _ => {}
+            }
+            assert_eq!(
+                restore_on(&backend, FinalGuard::Untouched),
+                Err(InjectionError::ClipboardProtected),
+                "{case}"
+            );
+            assert!(
+                backend.calls.borrow().is_empty(),
+                "{case}: no write or paste"
+            );
+            assert_eq!(
+                *backend.clipboard.borrow(),
+                "original rich clipboard",
+                "{case}"
+            );
+            assert_eq!(backend.content(), "prefix  suffix", "{case}");
+            assert_eq!(backend.not_restored.get(), 0, "{case}");
+        }
+        // A copy requested by the caller follows the same rule.
+        let backend = MockBackend::new();
+        *backend.snapshot_error.borrow_mut() = Some(InjectionError::ClipboardUnpreservable);
+        assert_eq!(
+            copy(&backend, InjectionOptions::default(), "result"),
+            Err(InjectionError::ClipboardProtected)
+        );
+        assert_eq!(*backend.clipboard.borrow(), "original rich clipboard");
+        assert_eq!(
+            InsertionDetail::from_error(&InjectionError::ClipboardProtected),
+            Some(InsertionDetail::ClipboardProtected)
+        );
+    }
+
+    #[test]
+    fn restore_off_overwrites_without_a_snapshot_or_report() {
+        let backend = MockBackend::new();
+        *backend.snapshot_error.borrow_mut() = Some(InjectionError::ClipboardUnpreservable);
+        let monitor = monitor();
+        let (_sender, cancel) = watch::channel(false);
+        let off = InjectionOptions {
+            restore_clipboard: false,
+        };
+        assert_eq!(
+            insert_final(
+                &backend,
+                off,
+                "new",
+                &target(),
+                &monitor,
+                monitor.checkpoint().unwrap(),
+                &cancel,
+                FinalGuard::Untouched,
+            ),
+            Ok(InsertResult::ClipboardPaste)
+        );
+        assert_eq!(*backend.clipboard.borrow(), "new");
+        backend.target_valid.set(false);
+        copy(&backend, off, "copied").unwrap();
+        assert_eq!(*backend.clipboard.borrow(), "copied");
+        assert_eq!(backend.not_restored.get(), 0);
+    }
+
+    #[test]
+    fn a_clipboard_left_with_our_text_is_reported_unless_restore_is_off() {
+        // A queued paste that is never confirmed keeps its payload.
+        let mut backend = MockBackend::new();
+        backend.settle_after = VERIFY_ATTEMPTS + 5;
+        assert_eq!(
+            restore_on(&backend, FinalGuard::Untouched),
+            Ok(InsertResult::PasteUnverified)
+        );
+        assert!(!backend.calls.borrow().contains(&"restore"));
+        assert_eq!(backend.not_restored.get(), 1);
+        // An unreadable field gets one unverified paste, never restored.
+        let backend = MockBackend::new();
+        backend.text_readable.set(false);
+        assert_eq!(
+            restore_on(&backend, FinalGuard::Untouched),
+            Ok(InsertResult::PasteUnverified)
+        );
+        assert_eq!(backend.not_restored.get(), 1);
+        // A copy-only outcome replaces the clipboard on purpose.
+        let backend = MockBackend::new();
+        backend.target_valid.set(false);
+        assert_eq!(
+            restore_on(&backend, FinalGuard::Untouched),
+            Ok(InsertResult::ClipboardOnly)
+        );
+        assert_eq!(*backend.clipboard.borrow(), "new");
+        assert_eq!(backend.not_restored.get(), 1);
+        // A confirmed paste restores and reports nothing.
+        let backend = MockBackend::new();
+        assert_eq!(
+            restore_on(&backend, FinalGuard::Untouched),
+            Ok(InsertResult::ClipboardPaste)
+        );
+        assert_eq!(*backend.clipboard.borrow(), "original rich clipboard");
+        assert_eq!(backend.not_restored.get(), 0);
+    }
+
+    #[test]
+    fn cancellation_after_the_write_restores_the_clipboard() {
+        for restore_fails in [false, true] {
+            let backend = MockBackend::new();
+            backend.restore_fails.set(restore_fails);
+            backend.text_readable.set(false);
+            let monitor = monitor();
+            let (cancel, cancelled) = watch::channel(false);
+            let mut backend = backend;
+            backend.on_clipboard_write = Some(Box::new(move |_| {
+                cancel.send_replace(true);
+            }));
+            assert_eq!(
+                insert_final(
+                    &backend,
+                    InjectionOptions::default(),
+                    "new",
+                    &target(),
+                    &monitor,
+                    monitor.checkpoint().unwrap(),
+                    &cancelled,
+                    FinalGuard::Untouched,
+                ),
+                Err(InjectionError::Cancelled)
+            );
+            assert_eq!(pastes(&backend), 0);
+            assert!(backend.calls.borrow().ends_with(&["write", "restore"]));
+            if restore_fails {
+                // The user's clipboard is lost: reported.
+                assert_eq!(backend.not_restored.get(), 1);
+            } else {
+                assert_eq!(*backend.clipboard.borrow(), "original rich clipboard");
+                assert_eq!(backend.not_restored.get(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_write_that_empties_the_clipboard_and_fails_is_restored_or_reported() {
+        for restore_fails in [false, true] {
+            let backend = MockBackend::new();
+            backend.write_fails_after_empty.set(true);
+            backend.restore_fails.set(restore_fails);
+            assert_eq!(
+                restore_on(&backend, FinalGuard::Untouched),
+                Err(InjectionError::ClipboardUnavailable)
+            );
+            assert_eq!(pastes(&backend), 0);
+            assert!(backend.calls.borrow().ends_with(&["write", "restore"]));
+            if restore_fails {
+                assert_eq!(*backend.clipboard.borrow(), "");
+                assert_eq!(backend.not_restored.get(), 1);
+            } else {
+                assert_eq!(*backend.clipboard.borrow(), "original rich clipboard");
+                assert_eq!(backend.not_restored.get(), 0);
+            }
+        }
+        // With Restore clipboard off the user accepted replacement.
+        let backend = MockBackend::new();
+        backend.write_fails_after_empty.set(true);
+        let off = InjectionOptions {
+            restore_clipboard: false,
+        };
+        assert!(copy(&backend, off, "text").is_err());
+        assert!(!backend.calls.borrow().contains(&"restore"));
+        assert_eq!(backend.not_restored.get(), 0);
+    }
+
+    #[test]
+    fn a_write_that_never_opened_the_clipboard_leaves_a_newer_copy_alone() {
+        let backend = MockBackend::new();
+        backend.write_blocked_by_copy.set(true);
+        assert_eq!(
+            restore_on(&backend, FinalGuard::Untouched),
+            Err(InjectionError::ClipboardUnavailable)
+        );
+        assert_eq!(pastes(&backend), 0);
+        assert!(!backend.calls.borrow().contains(&"restore"));
+        assert_eq!(*backend.clipboard.borrow(), "new user copy");
+        assert_eq!(backend.not_restored.get(), 0);
+    }
+
+    #[test]
+    fn a_failed_restore_after_a_confirmed_paste_is_reported() {
+        let backend = MockBackend::new();
+        backend.restore_fails.set(true);
+        assert_eq!(
+            restore_on(&backend, FinalGuard::Untouched),
+            Ok(InsertResult::ClipboardPaste)
+        );
+        assert!(backend.calls.borrow().contains(&"restore"));
+        assert_eq!(*backend.clipboard.borrow(), "new");
+        assert_eq!(backend.not_restored.get(), 1);
+        // A newer copy made meanwhile wins and is the user's own.
+        let mut backend = MockBackend::new();
+        backend.change_clipboard_on_paste = true;
+        assert_eq!(
+            restore_on(&backend, FinalGuard::Untouched),
+            Ok(InsertResult::ClipboardPaste)
+        );
+        assert_eq!(*backend.clipboard.borrow(), "new user copy");
+        assert_eq!(backend.not_restored.get(), 0);
+    }
+
+    #[test]
+    fn an_empty_selection_is_a_typed_outcome_unlike_an_unreadable_field() {
+        let backend = MockBackend::new();
+        assert_eq!(
+            capture_selection(&backend).err(),
+            Some(InjectionError::NoSelection)
+        );
+        backend.text_readable.set(false);
+        assert!(matches!(
+            capture_selection(&backend).err(),
+            Some(InjectionError::BackendFailure(_))
+        ));
+        backend.text_readable.set(true);
+        *backend.text.borrow_mut() = selected_state();
+        let (target, state) = capture_selection(&backend).unwrap();
+        assert_eq!(target, self::target());
+        assert_eq!(state.selected, "original");
+    }
+
+    #[test]
+    fn an_aborted_live_update_does_not_leave_the_draft_selected() {
+        let monitor = std::sync::Arc::new(monitor());
+        let mut backend = MockBackend::new();
+        let mut session = begin(
+            &backend,
+            InjectionOptions::default(),
+            "draft",
+            &target(),
+            &monitor,
+        )
+        .unwrap()
+        .unwrap();
+        // A click after the draft was selected, before its replacement.
+        let interrupting = std::sync::Arc::clone(&monitor);
+        backend.on_snapshot = Some(Box::new(move |_| interrupting.test_record_input()));
+        assert_eq!(
+            update(
+                &backend,
+                InjectionOptions::default(),
+                &mut session,
+                "revised draft",
+                &monitor,
+                false,
+            )
+            .unwrap(),
+            InsertResult::ClipboardOnly
+        );
+        assert!(backend
+            .calls
+            .borrow()
+            .ends_with(&["select", "write", "write", "collapse"]));
+        let text = backend.text.borrow().clone();
+        assert_eq!(text.before, "prefix draft");
+        assert!(text.selected.is_empty());
+        assert_eq!(text.after, " suffix");
+    }
+
+    #[test]
+    fn a_selection_the_user_already_changed_is_left_alone() {
+        let monitor = monitor();
+        let mut backend = MockBackend::new();
+        let mut session = begin(
+            &backend,
+            InjectionOptions::default(),
+            "draft",
+            &target(),
+            &monitor,
+        )
+        .unwrap()
+        .unwrap();
+        // The user typed over the selected draft before the replacement.
+        backend.on_snapshot = Some(Box::new(|backend| {
+            let mut text = backend.text.borrow_mut();
+            text.selected.clear();
+            text.before.push('x');
+        }));
+        update(
+            &backend,
+            InjectionOptions::default(),
+            &mut session,
+            "revised draft",
+            &monitor,
+            false,
+        )
+        .unwrap();
+        assert!(!backend.calls.borrow().contains(&"collapse"));
+        assert_eq!(backend.content(), "prefix x suffix");
+    }
+
+    #[test]
+    fn cancellation_that_cannot_delete_restores_the_caret() {
+        for case in ["input", "ime"] {
+            let monitor = std::sync::Arc::new(monitor());
+            let mut backend = MockBackend::new();
+            let mut session = begin(
+                &backend,
+                InjectionOptions::default(),
+                "draft",
+                &target(),
+                &monitor,
+            )
+            .unwrap()
+            .unwrap();
+            // The selection settles after a wait, during which the user acts.
+            backend.selection_settle_after = 1;
+            let interrupting = std::sync::Arc::clone(&monitor);
+            backend.on_selection_wait = Some(Box::new(move |backend| match case {
+                "input" => interrupting.test_record_input(),
+                _ => backend.ime.set(Some(true)),
+            }));
+            cancel(&backend, &mut session, &monitor);
+            assert!(!backend.calls.borrow().contains(&"delete"), "{case}");
+            assert_eq!(backend.content(), "prefix draft suffix", "{case}");
+            // Moving the caret could disturb an open IME conversion.
+            assert_eq!(
+                backend.calls.borrow().contains(&"collapse"),
+                case == "input",
+                "{case}"
+            );
+            assert_eq!(
+                backend.text.borrow().selected.is_empty(),
+                case == "input",
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clipboard_that_stays_locked_aborts_before_any_target_input() {
+        let backend = MockBackend::new();
+        *backend.snapshot_error.borrow_mut() = Some(InjectionError::ClipboardUnavailable);
+        let monitor = monitor();
+        let (_sender, cancel) = watch::channel(false);
+        assert_eq!(
+            insert_final(
+                &backend,
+                InjectionOptions::default(),
+                "new",
+                &target(),
+                &monitor,
+                monitor.checkpoint().unwrap(),
+                &cancel,
+                FinalGuard::Untouched,
+            ),
+            Err(InjectionError::ClipboardUnavailable)
+        );
+        assert!(backend.calls.borrow().is_empty());
+        assert_eq!(*backend.clipboard.borrow(), "original rich clipboard");
+        assert_eq!(backend.content(), "prefix  suffix");
+        assert_eq!(backend.not_restored.get(), 0);
+    }
+
+    #[test]
+    fn collapse_is_limited_to_a_selection_this_attempt_requested() {
+        for case in ["input_before_select", "ime_unknown"] {
+            let watcher = monitor();
+            let mut backend = MockBackend::new();
+            let mut session = begin(
+                &backend,
+                InjectionOptions::default(),
+                "draft",
+                &target(),
+                &watcher,
+            )
+            .unwrap()
+            .unwrap();
+            if case == "input_before_select" {
+                // Nothing is selected for us; the user selected exactly the
+                // draft themselves, and that selection is theirs.
+                watcher.test_record_input();
+                backend.text.borrow_mut().before = "prefix ".into();
+                backend.text.borrow_mut().selected = "draft".into();
+            } else {
+                // The IME state becomes unknown after Select().
+                backend.on_snapshot = Some(Box::new(|backend| backend.ime.set(None)));
+            }
+            update(
+                &backend,
+                InjectionOptions::default(),
+                &mut session,
+                "revised draft",
+                &watcher,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                backend.calls.borrow().contains(&"select"),
+                case == "ime_unknown",
+                "{case}"
+            );
+            assert!(!backend.calls.borrow().contains(&"collapse"), "{case}");
+            assert_eq!(backend.text.borrow().selected, "draft", "{case}");
+        }
+    }
+
+    #[test]
+    fn a_partially_queued_deletion_is_not_followed_by_a_collapse() {
+        let watcher = monitor();
+        let backend = MockBackend::new();
+        let mut session = begin(
+            &backend,
+            InjectionOptions::default(),
+            "draft",
+            &target(),
+            &watcher,
+        )
+        .unwrap()
+        .unwrap();
+        backend.delete_partial.set(true);
+        cancel(&backend, &mut session, &watcher);
+        assert!(backend.calls.borrow().ends_with(&["select", "delete"]));
+        assert!(!backend.calls.borrow().contains(&"collapse"));
+    }
+
+    #[test]
+    fn an_aborted_revision_after_retraction_does_not_touch_the_unselected_caret() {
+        let monitor = std::sync::Arc::new(monitor());
+        let mut backend = MockBackend::new();
+        let mut session = live_draft(&backend, &monitor, "draft");
+        retract(&backend, &mut session, &monitor).unwrap();
+        // Input arrives after the caret was confirmed, before the paste.
+        let interrupting = std::sync::Arc::clone(&monitor);
+        backend.on_snapshot = Some(Box::new(move |_| interrupting.test_record_input()));
+        assert_eq!(
+            update(
+                &backend,
+                InjectionOptions::default(),
+                &mut session,
+                "next",
+                &monitor,
+                false,
+            )
+            .unwrap(),
+            InsertResult::ClipboardOnly
+        );
+        assert_eq!(backend.content(), "prefix  suffix");
+        assert_eq!(calls(&backend, "collapse"), 0);
+    }
+
+    #[test]
+    fn retraction_collapses_only_a_selection_it_requested_and_could_not_delete() {
+        for case in ["input", "ime", "nothing_queued", "partial"] {
+            let monitor = std::sync::Arc::new(monitor());
+            let mut backend = MockBackend::new();
+            let mut session = live_draft(&backend, &monitor, "draft");
+            match case {
+                // The selection settles after a wait, during which the user acts.
+                "input" | "ime" => {
+                    backend.selection_settle_after = 1;
+                    let interrupting = std::sync::Arc::clone(&monitor);
+                    backend.on_selection_wait = Some(Box::new(move |backend| match case {
+                        "input" => interrupting.test_record_input(),
+                        _ => backend.ime.set(Some(true)),
+                    }));
+                }
+                "nothing_queued" => backend.delete_accepted.set(false),
+                "partial" => backend.delete_partial.set(true),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                retract(&backend, &mut session, &monitor).unwrap(),
+                InsertResult::ClipboardOnly,
+                "{case}"
+            );
+            assert_eq!(backend.content(), "prefix draft suffix", "{case}");
+            assert_eq!(
+                calls(&backend, "delete"),
+                usize::from(matches!(case, "nothing_queued" | "partial")),
+                "{case}"
+            );
+            // Moving the caret could disturb an open IME conversion, and a
+            // partially queued deletion may still remove the draft.
+            let collapsed = matches!(case, "input" | "nothing_queued");
+            assert_eq!(
+                calls(&backend, "collapse"),
+                usize::from(collapsed),
+                "{case}"
+            );
+            assert_eq!(
+                backend.text.borrow().selected.is_empty(),
+                collapsed,
+                "{case}"
+            );
+            // The session stays frozen: a later revision never edits the target.
+            update(
+                &backend,
+                InjectionOptions::default(),
+                &mut session,
+                "later",
+                &monitor,
+                false,
+            )
+            .unwrap();
+            assert_eq!(backend.content(), "prefix draft suffix", "{case}");
+        }
     }
 
     #[test]

@@ -822,6 +822,7 @@ async fn start_owned_recording(
         .then(|| {
             SystemTextInjector::default()
                 .capture_target()
+                .map(|target| injection::recording_target(target, from_shortcut))
                 .map_err(command_error)
         })
         .transpose()?;
@@ -835,8 +836,11 @@ async fn start_owned_recording(
         });
     // Without a captured target (Ask with no usable context) the overlay
     // keeps the foreground anchor instead of moving to the primary monitor.
+    // A start from this app has no window handle to anchor to, so it keeps
+    // the foreground anchor (the app window) too.
     if let Some(target) = target
         .as_ref()
+        .filter(|target| !target.is_this_app())
         .or_else(|| {
             edit_session
                 .as_ref()
@@ -877,16 +881,34 @@ async fn start_owned_recording(
     let mut live_slot = services.live.lock().await;
     let mut edit_slot = services.edit.lock().await;
     let mut ask_slot = services.ask.lock().await;
+    // Every session reports a lost clipboard on drop unless its completion
+    // already did, so cancellation and early returns cannot forget it.
+    let report_loss = || {
+        let app = app.clone();
+        move || report_clipboard_not_restored(&app)
+    };
     let draft = target.as_ref().map(|target| {
-        live_dictation::LiveDraft::new(
+        let mut draft = live_dictation::LiveDraft::new(
             target.clone(),
             &settings,
             active_hotkey,
             mode_shortcuts,
             from_shortcut,
             live_dictation::defers_target_insertion(mode, &settings),
-        )
+        );
+        draft.injector.report_clipboard_loss_on_drop(report_loss());
+        draft
     });
+    if let Some(session) = edit_session.as_mut() {
+        session
+            .injector
+            .report_clipboard_loss_on_drop(report_loss());
+    }
+    if let Some(session) = ask_session.as_mut() {
+        session
+            .injector
+            .report_clipboard_loss_on_drop(report_loss());
+    }
     let cancel = services.lifecycle.cancellation(operation_id)?;
     if let Some(session) = edit_session.as_ref() {
         session.monitor.observe_cancellation(Some(cancel.clone()));
@@ -1413,15 +1435,22 @@ pub(crate) async fn stop_recording_for(
             AppPhase::Injecting,
             "Replacing the original selection.",
         );
-        let insertion = edit_insertion_outcome(
-            session.injector.replace_selection(
-                &session.selection,
-                &edited,
-                &session.monitor,
-                session.checkpoint,
-            ),
-            || session.injector.copy_to_clipboard(&edited),
+        let replaced = session.injector.replace_selection(
+            &session.selection,
+            &edited,
+            &session.monitor,
+            session.checkpoint,
         );
+        let failure_detail = if replaced == Err(injection::InjectionError::ClipboardProtected) {
+            InsertionDetail::ClipboardProtected
+        } else {
+            InsertionDetail::ClipboardUnavailable
+        };
+        let insertion =
+            edit_insertion_outcome(replaced, || session.injector.copy_to_clipboard(&edited));
+        let clipboard_lost = session.injector.take_clipboard_not_restored();
+        let restore_detail = insertion
+            .and_then(|result| InsertionDetail::for_confirmed_paste(result, clipboard_lost));
         recording_overlay::set_phase(&app, &AppPhase::Completed);
         let (insertion_label, completion) = match insertion {
             Some(InsertResult::ClipboardPaste) => ("clipboard_paste", "Selected text updated."),
@@ -1456,7 +1485,9 @@ pub(crate) async fn stop_recording_for(
                 insertion_result: Some(insertion_label),
                 insertion_detail: insertion
                     .is_none()
-                    .then_some(InsertionDetail::ClipboardUnavailable.code()),
+                    .then_some(failure_detail)
+                    .or(restore_detail)
+                    .map(InsertionDetail::code),
             },
             Some(&artifact.path),
             settings.correction_provider.as_str(),
@@ -1474,8 +1505,8 @@ pub(crate) async fn stop_recording_for(
             }
             recording_overlay::show_insertion_notice(
                 &app,
-                insertion_label,
-                Some(InsertionDetail::ClipboardUnavailable.code()),
+                injection::notice_outcome(insertion_label, clipboard_lost),
+                Some(failure_detail.code()),
             );
             report_temp_cleanup(&app, &mut artifact_cleanup);
             return Err(EDIT_CLIPBOARD_UNAVAILABLE.into());
@@ -1483,8 +1514,12 @@ pub(crate) async fn stop_recording_for(
         let snapshot = state.complete(edited.clone(), completion.into());
         let _ = app.emit("app-state", snapshot);
         emit_status(&app, insertion_label, completion);
-        if insertion != InsertResult::ClipboardPaste {
-            recording_overlay::show_insertion_notice(&app, insertion_label, None);
+        if insertion != InsertResult::ClipboardPaste || clipboard_lost {
+            recording_overlay::show_insertion_notice(
+                &app,
+                injection::notice_outcome(insertion_label, clipboard_lost),
+                None,
+            );
         }
         let warning = if history_save_status == HistorySaveStatus::AudioUnavailable {
             completion_persistence_warning(history_save_status, metric_failed)
@@ -1736,9 +1771,16 @@ pub(crate) async fn stop_recording_for(
         draft.finish(&final_text, &cancel)
     };
     // Diagnose before the draft stops its input monitor. Fixed codes only.
+    let clipboard_lost = draft.injector.take_clipboard_not_restored();
     let insertion_detail = match &insertion_result {
         Ok(_) if translation_failed => Some("translation_failed"),
-        Ok(result) => draft.diagnose(*result).map(InsertionDetail::code),
+        Ok(result) => draft
+            .diagnose(*result)
+            .or(InsertionDetail::for_confirmed_paste(
+                *result,
+                clipboard_lost,
+            ))
+            .map(InsertionDetail::code),
         Err(error) => InsertionDetail::from_error(error).map(InsertionDetail::code),
     };
     // Insertion has returned; helper shutdown and persistence are not insertion.
@@ -1749,6 +1791,9 @@ pub(crate) async fn stop_recording_for(
     drop(draft);
     if insertion_result == Err(injection::InjectionError::Cancelled) {
         emit_state(&app, &state, AppPhase::Idle, cancel_message);
+        if clipboard_lost {
+            report_clipboard_not_restored(&app);
+        }
         return Err(cancel_error.into());
     }
     let latency_ms = started.elapsed().as_millis() as u64;
@@ -1834,7 +1879,11 @@ pub(crate) async fn stop_recording_for(
             {
                 emit_status(&app, kind, message);
             }
-            recording_overlay::show_insertion_notice(&app, insertion_label, insertion_detail);
+            recording_overlay::show_insertion_notice(
+                &app,
+                injection::notice_outcome(insertion_label, clipboard_lost),
+                insertion_detail,
+            );
             report_temp_cleanup(&app, &mut artifact_cleanup);
             return Err(command_error(error));
         }
@@ -1878,7 +1927,12 @@ pub(crate) async fn stop_recording_for(
             InsertResult::PasteUnverified if streamed_into_target => "draft_unverified",
             _ => insertion_label,
         };
+        let notice = injection::notice_outcome(notice, clipboard_lost);
         recording_overlay::show_insertion_notice(&app, notice, insertion_detail);
+    } else if clipboard_lost {
+        // A confirmed paste that could not restore the previous clipboard.
+        let notice = injection::notice_outcome(insertion_label, true);
+        recording_overlay::show_insertion_notice(&app, notice, None);
     } else if correction_failed {
         // The text arrived uncorrected; say why where the user is looking.
         recording_overlay::show_message_notice(
@@ -2090,11 +2144,8 @@ async fn finish_ask(
                     return Err("ask was cancelled".into())
                 }
                 _ if !*cancel.borrow() => {
-                    session
-                        .injector
-                        .copy_to_clipboard(&output)
-                        .map_err(command_error)?;
-                    insertion = "clipboard_only";
+                    let copied = session.injector.copy_to_clipboard(&output);
+                    insertion = ask_fallback_insertion(copied);
                 }
                 _ => return Err("ask was cancelled".into()),
             }
@@ -2125,11 +2176,8 @@ async fn finish_ask(
                 }
                 Some(InsertResult::PasteUnverified) => insertion = "paste_unverified",
                 None if !*cancel.borrow() => {
-                    session
-                        .injector
-                        .copy_to_clipboard(&output)
-                        .map_err(command_error)?;
-                    insertion = "clipboard_only";
+                    let copied = session.injector.copy_to_clipboard(&output);
+                    insertion = ask_fallback_insertion(copied);
                 }
                 None => return Err("ask was cancelled".into()),
             }
@@ -2140,8 +2188,8 @@ async fn finish_ask(
             }
             let published = services.answer_panel.publish(operation_id, output.clone());
             if !published || !answer_panel::show(app, operation_id, &output) {
-                let _ = session.injector.copy_to_clipboard(&output);
-                insertion = "clipboard_only";
+                let copied = session.injector.copy_to_clipboard(&output);
+                insertion = ask_fallback_insertion(copied);
             }
         }
     }
@@ -2174,15 +2222,12 @@ async fn finish_ask(
         },
         audio_path,
     );
-    let message = if insertion == "paste_unverified" {
-        "Ask insertion could not be confirmed; the result remains on the clipboard."
-    } else if insertion == "clipboard_only" {
-        "Ask result is on the clipboard."
-    } else {
-        "Ask completed."
-    };
+    let message = ask_completion_message(insertion);
     let snapshot = state.complete(output.clone(), message.into());
     let _ = app.emit("app-state", snapshot);
+    if session.injector.take_clipboard_not_restored() {
+        report_clipboard_not_restored(app);
+    }
     report_history_save_warning(app, history_save_status);
     Ok(RecordingResult {
         text: output,
@@ -2190,6 +2235,70 @@ async fn finish_ask(
         duration_ms,
         latency_ms,
     })
+}
+
+pub(crate) const CLIPBOARD_NOT_RESTORED: &str =
+    "Your previous clipboard contents could not be restored.";
+
+/// Reports a lost user clipboard where no insertion notice is shown (Ask,
+/// selected-text translation, cancellation). Restore clipboard was on.
+pub(crate) fn report_clipboard_not_restored(app: &AppHandle) {
+    emit_status(app, "clipboard_not_restored", CLIPBOARD_NOT_RESTORED);
+}
+
+/// Where an answer goes when it was neither inserted nor shown in the answer
+/// panel. A copy that failed, or was refused because Restore clipboard could
+/// not save the user's clipboard, leaves the result only in this app's window.
+fn ask_fallback_insertion(copied: Result<(), injection::InjectionError>) -> &'static str {
+    match copied {
+        Ok(()) => "clipboard_only",
+        Err(injection::InjectionError::ClipboardProtected) => "clipboard_protected",
+        Err(_) => "insertion_failed",
+    }
+}
+
+fn ask_completion_message(insertion: &str) -> &'static str {
+    match insertion {
+        "paste_unverified" => {
+            "Ask insertion could not be confirmed; the result remains on the clipboard."
+        }
+        "clipboard_only" => "Ask result is on the clipboard.",
+        "insertion_failed" => {
+            "The Ask result could not be inserted or copied to the clipboard; it is available in this app."
+        }
+        "clipboard_protected" => {
+            "Your clipboard could not be saved for restoring, so it was left unchanged; the Ask result is available in this app."
+        }
+        _ => "Ask completed.",
+    }
+}
+
+#[cfg(test)]
+mod ask_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_copy_never_claims_the_result_is_on_the_clipboard() {
+        use injection::InjectionError;
+        assert_eq!(ask_fallback_insertion(Ok(())), "clipboard_only");
+        assert_eq!(
+            ask_completion_message(ask_fallback_insertion(Ok(()))),
+            "Ask result is on the clipboard."
+        );
+        let failed = Err(InjectionError::ClipboardUnavailable);
+        let message = ask_completion_message(ask_fallback_insertion(failed));
+        assert!(!message.contains("is on the clipboard"), "{message}");
+        assert!(message.contains("available in this app"), "{message}");
+        // A copy refused to protect the clipboard says so.
+        let protected = Err(InjectionError::ClipboardProtected);
+        let message = ask_completion_message(ask_fallback_insertion(protected));
+        assert!(message.contains("left unchanged"), "{message}");
+        assert!(message.contains("available in this app"), "{message}");
+        assert_eq!(ask_completion_message("panel"), "Ask completed.");
+        for insertion in ["selection", "caret"] {
+            assert_eq!(ask_completion_message(insertion), "Ask completed.");
+        }
+    }
 }
 
 fn require_ask_spoken_input(spoken: &str) -> Result<(), String> {

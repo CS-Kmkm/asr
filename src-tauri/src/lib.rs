@@ -294,13 +294,11 @@ impl AskSession {
                 AskCapture::Selected(selection)
             }
             Ok(_) => AskCapture::Unavailable,
-            Err(injection::InjectionError::BackendFailure("no text is selected")) => {
-                match injector.capture_target() {
-                    Ok(target) if is_external_ask_target(&target) => AskCapture::Caret(target),
-                    Ok(_) => AskCapture::Unavailable,
-                    Err(_) => AskCapture::Unavailable,
-                }
-            }
+            Err(injection::InjectionError::NoSelection) => match injector.capture_target() {
+                Ok(target) if is_external_ask_target(&target) => AskCapture::Caret(target),
+                Ok(_) => AskCapture::Unavailable,
+                Err(_) => AskCapture::Unavailable,
+            },
             Err(_) => AskCapture::Unavailable,
         };
         let monitor = match &capture {
@@ -1300,34 +1298,85 @@ async fn translate_selection(app: AppHandle) {
     let translated = match translated {
         Ok(text) => text,
         Err(_) => {
-            let copied = injector.copy_to_clipboard(&source).is_ok();
-            let message = if copied {
-                "Translation failed; the selected text remains on the clipboard."
-            } else {
-                "Translation failed and the clipboard is unavailable."
-            };
-            emit_status(&app, "error", message);
+            // The selection is unchanged, so there is nothing to recover and
+            // no reason to overwrite the user's clipboard with its source.
+            emit_status(&app, "error", TRANSLATION_FAILED_SELECTION_UNCHANGED);
             return;
         }
     };
     match injector.replace_selection(&selection, &translated, &monitor, checkpoint) {
-        Ok(InsertResult::ClipboardOnly | InsertResult::PasteUnverified) => {
-            emit_status(
-                &app,
-                "error",
-                "The target changed; the translation remains on the clipboard.",
-            );
+        Ok(result) => {
+            let (kind, message) = selection_translation_status(result);
+            emit_status(&app, kind, message);
         }
         Err(_) => {
-            let copied = injector.copy_to_clipboard(&translated).is_ok();
-            let message = if copied {
-                "The target changed; the translation remains on the clipboard."
+            if injector.copy_to_clipboard(&translated).is_ok() {
+                emit_status(
+                    &app,
+                    "error",
+                    "The target changed; the translation remains on the clipboard.",
+                );
             } else {
-                "The target changed and the clipboard is unavailable."
-            };
-            emit_status(&app, "error", message);
+                // Not inserted, and the clipboard was unavailable or protected
+                // under Restore clipboard: keep the translation in this app.
+                let state = app.state::<AppState>();
+                let _ = app.emit("app-state", state.publish_result(translated));
+                emit_status(&app, "error", TRANSLATION_KEPT_IN_APP);
+            }
         }
-        Ok(InsertResult::ClipboardPaste) => emit_status(&app, "success", "Translation inserted."),
+    }
+    if injector.take_clipboard_not_restored() {
+        commands::report_clipboard_not_restored(&app);
+    }
+}
+
+const TRANSLATION_KEPT_IN_APP: &str =
+    "The translation could not be inserted or copied to the clipboard; it is available in this app.";
+
+const TRANSLATION_FAILED_SELECTION_UNCHANGED: &str =
+    "Translation failed; the selected text was not changed.";
+
+/// Status kind and message for a selected-text translation outcome. A paste
+/// that was sent but not confirmed may already have replaced the selection,
+/// so it must not read as a target change that invites a second paste.
+fn selection_translation_status(result: InsertResult) -> (&'static str, &'static str) {
+    match result {
+        InsertResult::ClipboardPaste => ("success", "Translation inserted."),
+        InsertResult::PasteUnverified => (
+            "paste_unverified",
+            "Translation pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard).",
+        ),
+        InsertResult::ClipboardOnly => (
+            "error",
+            "The target changed; the translation remains on the clipboard.",
+        ),
+    }
+}
+
+#[cfg(test)]
+mod selection_translation_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_translation_does_not_claim_the_clipboard() {
+        assert!(!TRANSLATION_FAILED_SELECTION_UNCHANGED.contains("clipboard"));
+        assert!(TRANSLATION_KEPT_IN_APP.contains("available in this app"));
+    }
+
+    #[test]
+    fn an_unverified_paste_is_not_reported_as_a_target_change() {
+        let (kind, message) = selection_translation_status(InsertResult::PasteUnverified);
+        assert_eq!(kind, "paste_unverified");
+        assert!(!message.contains("target changed"), "{message}");
+        assert!(message.contains("only if the text did not appear"));
+        assert_eq!(
+            selection_translation_status(InsertResult::ClipboardOnly).1,
+            "The target changed; the translation remains on the clipboard."
+        );
+        assert_eq!(
+            selection_translation_status(InsertResult::ClipboardPaste),
+            ("success", "Translation inserted.")
+        );
     }
 }
 
