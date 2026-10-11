@@ -1906,7 +1906,7 @@ async fn finish_ask(
                     return Err("ask was cancelled".into())
                 }
                 _ if !*cancel.borrow() => {
-                    let copied = session.injector.copy_to_clipboard(&output).is_ok();
+                    let copied = session.injector.copy_to_clipboard(&output);
                     insertion = ask_fallback_insertion(copied);
                 }
                 _ => return Err("ask was cancelled".into()),
@@ -1938,7 +1938,7 @@ async fn finish_ask(
                 }
                 Some(InsertResult::PasteUnverified) => insertion = "paste_unverified",
                 None if !*cancel.borrow() => {
-                    let copied = session.injector.copy_to_clipboard(&output).is_ok();
+                    let copied = session.injector.copy_to_clipboard(&output);
                     insertion = ask_fallback_insertion(copied);
                 }
                 None => return Err("ask was cancelled".into()),
@@ -1950,7 +1950,7 @@ async fn finish_ask(
             }
             let published = services.answer_panel.publish(operation_id, output.clone());
             if !published || !answer_panel::show(app, operation_id, &output) {
-                let copied = session.injector.copy_to_clipboard(&output).is_ok();
+                let copied = session.injector.copy_to_clipboard(&output);
                 insertion = ask_fallback_insertion(copied);
             }
         }
@@ -2009,13 +2009,13 @@ pub(crate) fn report_clipboard_not_restored(app: &AppHandle) {
 }
 
 /// Where an answer goes when it was neither inserted nor shown in the answer
-/// panel. A copy that failed or was refused to protect the user's clipboard
-/// leaves the result only in this app's window.
-fn ask_fallback_insertion(copied: bool) -> &'static str {
-    if copied {
-        "clipboard_only"
-    } else {
-        "insertion_failed"
+/// panel. A copy that failed, or was refused because Restore clipboard could
+/// not save the user's clipboard, leaves the result only in this app's window.
+fn ask_fallback_insertion(copied: Result<(), injection::InjectionError>) -> &'static str {
+    match copied {
+        Ok(()) => "clipboard_only",
+        Err(injection::InjectionError::ClipboardProtected) => "clipboard_protected",
+        Err(_) => "insertion_failed",
     }
 }
 
@@ -2028,6 +2028,9 @@ fn ask_completion_message(insertion: &str) -> &'static str {
         "insertion_failed" => {
             "The Ask result could not be inserted or copied to the clipboard; it is available in this app."
         }
+        "clipboard_protected" => {
+            "Your clipboard could not be saved for restoring, so it was left unchanged; the Ask result is available in this app."
+        }
         _ => "Ask completed.",
     }
 }
@@ -2038,13 +2041,20 @@ mod ask_outcome_tests {
 
     #[test]
     fn a_failed_copy_never_claims_the_result_is_on_the_clipboard() {
-        assert_eq!(ask_fallback_insertion(true), "clipboard_only");
+        use injection::InjectionError;
+        assert_eq!(ask_fallback_insertion(Ok(())), "clipboard_only");
         assert_eq!(
-            ask_completion_message(ask_fallback_insertion(true)),
+            ask_completion_message(ask_fallback_insertion(Ok(()))),
             "Ask result is on the clipboard."
         );
-        let message = ask_completion_message(ask_fallback_insertion(false));
+        let failed = Err(InjectionError::ClipboardUnavailable);
+        let message = ask_completion_message(ask_fallback_insertion(failed));
         assert!(!message.contains("is on the clipboard"), "{message}");
+        assert!(message.contains("available in this app"), "{message}");
+        // A copy refused to protect the clipboard says so.
+        let protected = Err(InjectionError::ClipboardProtected);
+        let message = ask_completion_message(ask_fallback_insertion(protected));
+        assert!(message.contains("left unchanged"), "{message}");
         assert!(message.contains("available in this app"), "{message}");
         assert_eq!(ask_completion_message("panel"), "Ask completed.");
         for insertion in ["selection", "caret"] {
