@@ -544,6 +544,19 @@ const DEBUG_DATA_SUBDIRECTORY: &str = "dev";
 /// Set to `1` to make a debug build open the release data instead.
 const USE_RELEASE_DATA_ENV_VAR: &str = "LVI_USE_RELEASE_DATA";
 
+/// Whether this build owns release state: release builds always do, debug
+/// builds only after the explicit `LVI_USE_RELEASE_DATA=1` opt-in.
+fn uses_release_data(debug_build: bool, use_release_data: Option<OsString>) -> bool {
+    !debug_build || use_release_data.is_some_and(|value| value == "1")
+}
+
+fn current_build_uses_release_data() -> bool {
+    uses_release_data(
+        cfg!(debug_assertions),
+        std::env::var_os(USE_RELEASE_DATA_ENV_VAR),
+    )
+}
+
 /// Returns the directory holding the database. Storage::open derives the
 /// `history-audio` folder from the database's parent, so audio follows it.
 /// Release builds always use `app_data_dir` itself, exactly as before.
@@ -552,12 +565,20 @@ fn data_directory(
     debug_build: bool,
     use_release_data: Option<OsString>,
 ) -> PathBuf {
-    let opted_into_release_data = use_release_data.is_some_and(|value| value == "1");
-    if debug_build && !opted_into_release_data {
-        app_data_dir.join(DEBUG_DATA_SUBDIRECTORY)
-    } else {
+    if uses_release_data(debug_build, use_release_data) {
         app_data_dir.to_path_buf()
+    } else {
+        app_data_dir.join(DEBUG_DATA_SUBDIRECTORY)
     }
+}
+
+/// Stale capture WAVs share the system temp folder with every build and are
+/// named only by process id, so a debug build cannot tell its own from a
+/// release instance's. A release user who keeps audio may own them, and the
+/// debug build's separate settings say nothing about that, so only a build
+/// that uses the release data applies the release setting to them.
+fn removes_stale_captures(delete_audio_after_processing: bool, uses_release_data: bool) -> bool {
+    delete_audio_after_processing && uses_release_data
 }
 
 fn database_path(app: &AppHandle) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -588,6 +609,19 @@ mod data_directory_tests {
         let debug = data_directory(root, true, None);
         assert_ne!(debug, root);
         assert_eq!(debug, root.join(DEBUG_DATA_SUBDIRECTORY));
+    }
+
+    #[test]
+    fn debug_builds_never_remove_captures_a_release_instance_may_keep() {
+        let debug = uses_release_data(true, None);
+        assert!(!removes_stale_captures(true, debug));
+        assert!(!removes_stale_captures(false, debug));
+        let opted_in = uses_release_data(true, Some("1".into()));
+        assert!(removes_stale_captures(true, opted_in));
+        assert!(!removes_stale_captures(false, opted_in));
+        let release = uses_release_data(false, None);
+        assert!(removes_stale_captures(true, release));
+        assert!(!removes_stale_captures(false, release));
     }
 
     #[test]
@@ -1543,7 +1577,10 @@ pub fn run() {
             *app.state::<Services>().inactive_shortcuts.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = inactive;
             if cleanup_stale_artifacts(
                 &std::env::temp_dir(),
-                settings.delete_audio_after_processing,
+                removes_stale_captures(
+                    settings.delete_audio_after_processing,
+                    current_build_uses_release_data(),
+                ),
             )
             .is_err()
             {
