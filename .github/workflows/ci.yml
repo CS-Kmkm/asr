@@ -33,6 +33,13 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy
       - run: cargo test --lib
+      - name: Repeat storage tests (Windows file-deletion timing)
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 10; $i++) {
+            cargo test --lib --quiet storage::
+            if ($LASTEXITCODE -ne 0) { Write-Error "storage tests failed on repeat $i"; exit 1 }
+          }
 
   python-worker:
     runs-on: ubuntu-latest
