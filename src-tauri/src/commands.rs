@@ -2404,6 +2404,32 @@ fn completion_persistence_warning(
     persistence_warning(history_status == HistorySaveStatus::Failed, metric_failed)
 }
 
+const AUTOSTART_UNCHANGED_IN_DEBUG: &str =
+    "Debug builds do not change startup at Windows sign-in; only the setting was saved.";
+
+#[derive(Debug, PartialEq, Eq)]
+enum AutostartUpdate {
+    Unchanged,
+    /// Register (`true`) or remove (`false`) the sign-in Run entry.
+    Apply(bool),
+    SkippedInDebugBuild,
+}
+
+/// The autostart plugin registers the currently running executable. A debug
+/// executable depends on Vite's dev server and cannot run on its own at
+/// sign-in, so a debug build never writes or removes the Run entry owned by
+/// an installed/release build, even with LVI_USE_RELEASE_DATA=1 (startup
+/// skips it the same way).
+fn autostart_update(previous: bool, desired: bool, debug_build: bool) -> AutostartUpdate {
+    if previous == desired {
+        AutostartUpdate::Unchanged
+    } else if debug_build {
+        AutostartUpdate::SkippedInDebugBuild
+    } else {
+        AutostartUpdate::Apply(desired)
+    }
+}
+
 /// The single persistence step of `update_settings`. Settings and their
 /// History retention (including the History-off purge) commit in one SQLite
 /// transaction, so a failed settings write cannot erase History and an insert
@@ -2689,6 +2715,28 @@ fn correction_failure_metric_code(error: &correction::CorrectionError) -> &'stat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_builds_never_change_the_release_autostart_registration() {
+        for desired in [false, true] {
+            assert_eq!(
+                autostart_update(desired, desired, false),
+                AutostartUpdate::Unchanged
+            );
+            assert_eq!(
+                autostart_update(desired, desired, true),
+                AutostartUpdate::Unchanged
+            );
+            assert_eq!(
+                autostart_update(!desired, desired, false),
+                AutostartUpdate::Apply(desired)
+            );
+            assert_eq!(
+                autostart_update(!desired, desired, true),
+                AutostartUpdate::SkippedInDebugBuild
+            );
+        }
+    }
 
     #[test]
     fn blank_ask_input_is_rejected_before_planning() {
@@ -4709,18 +4757,32 @@ pub(crate) async fn update_settings(
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = inactive;
         (previous, model_change)
     };
-    if settings.auto_start != previous.auto_start {
-        let result = if settings.auto_start {
-            app.autolaunch().enable()
-        } else {
-            app.autolaunch().disable()
-        };
-        if let Err(error) = result {
+    match autostart_update(
+        previous.auto_start,
+        settings.auto_start,
+        cfg!(debug_assertions),
+    ) {
+        AutostartUpdate::Unchanged => {}
+        AutostartUpdate::SkippedInDebugBuild => {
             emit_status(
                 &app,
-                "autostart_update_failed",
-                &format!("Autostart update failed: {error}"),
+                "autostart_unchanged_in_debug",
+                AUTOSTART_UNCHANGED_IN_DEBUG,
             );
+        }
+        AutostartUpdate::Apply(enable) => {
+            let result = if enable {
+                app.autolaunch().enable()
+            } else {
+                app.autolaunch().disable()
+            };
+            if let Err(error) = result {
+                emit_status(
+                    &app,
+                    "autostart_update_failed",
+                    &format!("Autostart update failed: {error}"),
+                );
+            }
         }
     }
     let model_configuration_changed = worker_configuration_changed(&previous, &settings);

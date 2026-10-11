@@ -542,10 +542,105 @@ pub(crate) fn emit_status(app: &AppHandle, kind: &str, message: &str) {
     );
 }
 
+const DATABASE_FILE_NAME: &str = "local-voice-input.sqlite3";
+/// Debug builds keep their data in this app-data subfolder so destructive
+/// development (tests, new migrations) never touches release data.
+const DEBUG_DATA_SUBDIRECTORY: &str = "dev";
+/// Set to `1` to make a debug build open the release data instead.
+const USE_RELEASE_DATA_ENV_VAR: &str = "LVI_USE_RELEASE_DATA";
+
+/// Whether this build owns release state: release builds always do, debug
+/// builds only after the explicit `LVI_USE_RELEASE_DATA=1` opt-in.
+fn uses_release_data(debug_build: bool, use_release_data: Option<OsString>) -> bool {
+    !debug_build || use_release_data.is_some_and(|value| value == "1")
+}
+
+fn current_build_uses_release_data() -> bool {
+    uses_release_data(
+        cfg!(debug_assertions),
+        std::env::var_os(USE_RELEASE_DATA_ENV_VAR),
+    )
+}
+
+/// Returns the directory holding the database. Storage::open derives the
+/// `history-audio` folder from the database's parent, so audio follows it.
+/// Release builds always use `app_data_dir` itself, exactly as before.
+fn data_directory(
+    app_data_dir: &Path,
+    debug_build: bool,
+    use_release_data: Option<OsString>,
+) -> PathBuf {
+    if uses_release_data(debug_build, use_release_data) {
+        app_data_dir.to_path_buf()
+    } else {
+        app_data_dir.join(DEBUG_DATA_SUBDIRECTORY)
+    }
+}
+
+/// Stale capture WAVs share the system temp folder with every build and are
+/// named only by process id, so a debug build cannot tell its own from a
+/// release instance's. A release user who keeps audio may own them, and the
+/// debug build's separate settings say nothing about that, so only a build
+/// that uses the release data applies the release setting to them.
+fn removes_stale_captures(delete_audio_after_processing: bool, uses_release_data: bool) -> bool {
+    delete_audio_after_processing && uses_release_data
+}
+
 fn database_path(app: &AppHandle) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let directory = app.path().app_data_dir()?;
+    let directory = data_directory(
+        &app.path().app_data_dir()?,
+        cfg!(debug_assertions),
+        std::env::var_os(USE_RELEASE_DATA_ENV_VAR),
+    );
     fs::create_dir_all(&directory)?;
-    Ok(directory.join("local-voice-input.sqlite3"))
+    Ok(directory.join(DATABASE_FILE_NAME))
+}
+
+#[cfg(test)]
+mod data_directory_tests {
+    use super::*;
+
+    #[test]
+    fn release_build_keeps_the_app_data_directory() {
+        let root = Path::new("app-data");
+        assert_eq!(data_directory(root, false, None), root);
+        assert_eq!(data_directory(root, false, Some("1".into())), root);
+        assert_eq!(data_directory(root, false, Some("0".into())), root);
+    }
+
+    #[test]
+    fn debug_build_uses_a_separate_subdirectory() {
+        let root = Path::new("app-data");
+        let debug = data_directory(root, true, None);
+        assert_ne!(debug, root);
+        assert_eq!(debug, root.join(DEBUG_DATA_SUBDIRECTORY));
+    }
+
+    #[test]
+    fn debug_builds_never_remove_captures_a_release_instance_may_keep() {
+        let debug = uses_release_data(true, None);
+        assert!(!removes_stale_captures(true, debug));
+        assert!(!removes_stale_captures(false, debug));
+        let opted_in = uses_release_data(true, Some("1".into()));
+        assert!(removes_stale_captures(true, opted_in));
+        assert!(!removes_stale_captures(false, opted_in));
+        let release = uses_release_data(false, None);
+        assert!(removes_stale_captures(true, release));
+        assert!(!removes_stale_captures(false, release));
+    }
+
+    #[test]
+    fn only_an_explicit_opt_in_gives_debug_builds_release_data() {
+        let root = Path::new("app-data");
+        assert_eq!(data_directory(root, true, Some("1".into())), root);
+        for value in ["", "0", "true", "yes", " 1"] {
+            assert_eq!(
+                data_directory(root, true, Some(value.into())),
+                root.join(DEBUG_DATA_SUBDIRECTORY),
+                "{value:?} must not opt in"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1630,7 +1725,10 @@ fn setup_app(
     tauri::async_runtime::spawn(follow_cancel_chord(app.handle().clone()));
     if cleanup_stale_artifacts(
         &std::env::temp_dir(),
-        startup_cleanup_removes_captures(&settings, &repairs),
+        removes_stale_captures(
+            startup_cleanup_removes_captures(&settings, &repairs),
+            current_build_uses_release_data(),
+        ),
     )
     .is_err()
     {

@@ -113,6 +113,39 @@ pnpm run tauri dev
 See [docs/adr/0004-default-asr-backend.md](docs/adr/0004-default-asr-backend.md)
 for the rationale behind the default backend choice.
 
+### Development data
+
+Debug builds (`pnpm run tauri dev`, `cargo build` without `--release`) keep
+their SQLite database and `history-audio` folder in a `dev` subfolder of the
+app data directory (`%APPDATA%\org.localvoice.input\dev\` on Windows), so
+development and destructive testing never touch the History, settings, or
+recordings of an installed release build. Release builds keep using the app
+data directory itself. Release data is never copied or migrated into `dev`;
+a fresh debug build starts with empty data. Worker logs stay in the shared
+app log directory.
+
+Debug builds also leave other release state alone. They never register or
+remove startup at Windows sign-in: toggling **Start with Windows** in a debug
+build only saves the setting and shows a notice. They also skip the startup
+cleanup of stale capture WAVs in the shared temporary folder, because those
+files cannot be told apart from ones a release instance keeps; delete old
+`local-ai-voice-*.wav` files there by hand if a debug build leaves any.
+
+To inspect release data from a debug build, opt in explicitly:
+
+```powershell
+$env:LVI_USE_RELEASE_DATA = "1"
+pnpm run tauri dev
+```
+
+Only the exact value `1` opts in. While it is set, the debug build opens and
+migrates the release database and recordings directly, so destructive tests
+and unreleased migrations then affect your real data. Quit any running
+release app first: the single-instance guard exists only in release builds,
+so nothing stops both from opening the same database and `history-audio`
+folder at once. Remove the variable (`Remove-Item Env:LVI_USE_RELEASE_DATA`)
+when you are done.
+
 ## Backends
 
 Three ASR backends are supported. The backend is selected via the `--backend`
