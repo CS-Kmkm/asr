@@ -1,5 +1,107 @@
-use crate::{parse_shortcut, types::Settings};
-use tauri_plugin_global_shortcut::Shortcut;
+use crate::{
+    parse_shortcut,
+    state::{PipelineMode, PipelinePhase},
+    types::Settings,
+};
+use tauri_plugin_global_shortcut::{Code, Shortcut};
+
+/// What a voice-mode hotkey press does in the current lifecycle phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Press {
+    Start,
+    Stop,
+    /// A second press while a start waits (for example for the speech
+    /// model) cancels it, so the microphone never opens unexpectedly later.
+    CancelStart,
+    /// Another mode is recording; the press is reported and changes nothing.
+    Busy(&'static str),
+    /// Processing is already visible on the overlay and finishes by itself.
+    Ignore,
+}
+
+pub(crate) fn press(
+    phase: PipelinePhase,
+    active: Option<PipelineMode>,
+    requested: PipelineMode,
+) -> Press {
+    match phase {
+        PipelinePhase::Idle => Press::Start,
+        PipelinePhase::Recording if active == Some(requested) => Press::Stop,
+        PipelinePhase::Recording => Press::Busy("another voice mode is already recording"),
+        PipelinePhase::Starting => Press::CancelStart,
+        PipelinePhase::Processing => Press::Ignore,
+    }
+}
+
+/// The chord that cancels the active voice session: Esc, with no modifier.
+pub(crate) fn cancel_chord() -> Shortcut {
+    Shortcut::new(None, Code::Escape)
+}
+
+/// Whether the cancel chord should be registered. A global hotkey takes the
+/// key from every app, so Esc is held only while a session is starting,
+/// recording, or processing. A route the user assigned to Esc wins: the app
+/// never takes a chord the user chose, so Esc keeps running that route and
+/// the overlay's cancel button is the cancel path. Settings warns about this
+/// on any route that uses Esc (`isCancelKeyChord` in `SettingsPage.tsx`).
+pub(crate) fn wants_cancel_chord(phase: PipelinePhase, routes: &Routes) -> bool {
+    phase != PipelinePhase::Idle && routes.find(cancel_chord()).is_none()
+}
+
+/// Brings the cancel chord registration in line with `wanted`. A refused
+/// registration (another app holds Esc) stays unregistered and is retried
+/// at the next phase change; a failed removal is retried the same way.
+pub(crate) fn sync_cancel_chord<E: std::fmt::Display>(
+    registered: &mut bool,
+    wanted: bool,
+    register: impl FnOnce(Shortcut) -> Result<(), E>,
+    unregister: impl FnOnce(Shortcut) -> Result<(), E>,
+) {
+    if wanted == *registered {
+        return;
+    }
+    let result = if wanted {
+        register(cancel_chord())
+    } else {
+        unregister(cancel_chord())
+    };
+    match result {
+        Ok(()) => *registered = wanted,
+        Err(error) => eprintln!("Cancel shortcut (Esc) update failed: {error}"),
+    }
+}
+
+/// `update_registrations` for a settings save, keeping the Esc cancel chord
+/// consistent with the routes. Esc is released first when the new routes
+/// take it (a route registration would otherwise fail on our own hold), and
+/// afterwards follows the routes in effect: the new ones, or the old ones
+/// after a rollback. A route that gave Esc up during a session hands it back
+/// to the cancel chord.
+pub(crate) fn update_registrations_with_cancel_chord<E: std::fmt::Display>(
+    cancel_chord: &mut bool,
+    phase: PipelinePhase,
+    old: &Routes,
+    new: &Routes,
+    mut register: impl FnMut(Shortcut) -> Result<(), E>,
+    mut unregister: impl FnMut(Shortcut) -> Result<(), E>,
+    persist: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    sync_cancel_chord(
+        cancel_chord,
+        wants_cancel_chord(phase, old) && wants_cancel_chord(phase, new),
+        &mut register,
+        &mut unregister,
+    );
+    let result = update_registrations(old, new, &mut register, &mut unregister, persist);
+    let routes = if result.is_ok() { new } else { old };
+    sync_cancel_chord(
+        cancel_chord,
+        wants_cancel_chord(phase, routes),
+        &mut register,
+        &mut unregister,
+    );
+    result
+}
 
 /// Routed actions in collision precedence order: when saved chords collide,
 /// the older action keeps the chord (Dictate, selected-text Translate, voice
@@ -299,6 +401,235 @@ pub(crate) fn update_registrations<E: std::fmt::Display>(
 mod tests {
     use super::*;
     use std::{cell::RefCell, collections::HashSet};
+
+    #[test]
+    fn esc_is_held_only_while_a_voice_session_is_active() {
+        let routes = Routes::parse(&Settings::default()).unwrap();
+        assert!(!wants_cancel_chord(PipelinePhase::Idle, &routes));
+        for active in [
+            PipelinePhase::Starting,
+            PipelinePhase::Recording,
+            PipelinePhase::Processing,
+        ] {
+            assert!(wants_cancel_chord(active, &routes));
+        }
+        // A route the user assigned to Esc keeps it, under any spelling the
+        // Settings warning recognizes; Esc with a modifier is another chord.
+        for spelling in ["Escape", "Esc", " esc "] {
+            let mut settings = Settings::default();
+            settings.shortcuts.ask[0] = spelling.into();
+            let routes = Routes::parse(&settings).unwrap();
+            assert!(routes.find(cancel_chord()).is_some(), "{spelling}");
+            assert!(!wants_cancel_chord(PipelinePhase::Recording, &routes));
+        }
+        let mut settings = Settings {
+            translation_hotkey: "Escape".into(),
+            ..Settings::default()
+        };
+        let routes = Routes::parse(&settings).unwrap();
+        assert!(!wants_cancel_chord(PipelinePhase::Starting, &routes));
+        settings.translation_hotkey = "Ctrl+Escape".into();
+        let routes = Routes::parse(&settings).unwrap();
+        assert!(wants_cancel_chord(PipelinePhase::Recording, &routes));
+    }
+
+    #[test]
+    fn cancel_chord_registration_follows_the_session_and_retries_refusals() {
+        let calls = RefCell::new(Vec::new());
+        let register = |result: Result<(), &'static str>| {
+            let calls = &calls;
+            move |chord: Shortcut| {
+                assert_eq!(chord, cancel_chord());
+                calls.borrow_mut().push("register");
+                result
+            }
+        };
+        let unregister = |chord: Shortcut| {
+            assert_eq!(chord, cancel_chord());
+            calls.borrow_mut().push("unregister");
+            Ok::<(), &'static str>(())
+        };
+        let mut registered = false;
+        // Idle: nothing to do.
+        sync_cancel_chord(&mut registered, false, register(Ok(())), unregister);
+        assert!(calls.borrow().is_empty());
+        // Another app holds Esc: stays unregistered, retried next change.
+        sync_cancel_chord(&mut registered, true, register(Err("taken")), unregister);
+        assert!(!registered);
+        sync_cancel_chord(&mut registered, true, register(Ok(())), unregister);
+        assert!(registered);
+        // Starting -> Recording keeps the one registration.
+        sync_cancel_chord(&mut registered, true, register(Ok(())), unregister);
+        sync_cancel_chord(&mut registered, false, register(Ok(())), unregister);
+        assert!(!registered);
+        assert_eq!(*calls.borrow(), vec!["register", "register", "unregister"]);
+    }
+
+    /// A registry that, like the OS, refuses a chord registered twice.
+    struct Registry(RefCell<HashSet<Shortcut>>);
+
+    impl Registry {
+        fn register(&self, chord: Shortcut) -> Result<(), &'static str> {
+            self.0
+                .borrow_mut()
+                .insert(chord)
+                .then_some(())
+                .ok_or("already registered")
+        }
+
+        fn unregister(&self, chord: Shortcut) -> Result<(), &'static str> {
+            self.0
+                .borrow_mut()
+                .remove(&chord)
+                .then_some(())
+                .ok_or("not registered")
+        }
+
+        fn holds(&self, chord: Shortcut) -> bool {
+            self.0.borrow().contains(&chord)
+        }
+    }
+
+    fn with_esc_on_ask() -> Settings {
+        let mut settings = Settings::default();
+        settings.shortcuts.ask[0] = "Escape".into();
+        settings
+    }
+
+    fn save(
+        registry: &Registry,
+        cancel_chord: &mut bool,
+        phase: PipelinePhase,
+        old: &Routes,
+        new: &Routes,
+        persisted: Result<(), String>,
+    ) -> Result<(), String> {
+        let mut persisted = Some(persisted);
+        update_registrations_with_cancel_chord(
+            cancel_chord,
+            phase,
+            old,
+            new,
+            |chord| registry.register(chord),
+            |chord| registry.unregister(chord),
+            || persisted.take().unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_route_can_take_esc_from_the_cancel_chord_mid_session() {
+        let old = Routes::parse(&Settings::default()).unwrap();
+        let new = Routes::parse(&with_esc_on_ask()).unwrap();
+        let registry = Registry(RefCell::new(old.chords().into_iter().collect()));
+        registry.register(cancel_chord()).unwrap();
+        let mut cancel = true;
+        save(
+            &registry,
+            &mut cancel,
+            PipelinePhase::Recording,
+            &old,
+            &new,
+            Ok(()),
+        )
+        .unwrap();
+        // Esc is now the Ask route's; the cancel chord let go of it.
+        assert!(!cancel);
+        assert!(registry.holds(cancel_chord()));
+        assert_eq!(
+            new.find(cancel_chord()).map(|route| route.action),
+            Some(Action::Ask)
+        );
+    }
+
+    #[test]
+    fn removing_an_esc_route_mid_session_hands_esc_back_to_cancel() {
+        let old = Routes::parse(&with_esc_on_ask()).unwrap();
+        let new = Routes::parse(&Settings::default()).unwrap();
+        let registry = Registry(RefCell::new(old.chords().into_iter().collect()));
+        let mut cancel = false;
+        save(
+            &registry,
+            &mut cancel,
+            PipelinePhase::Processing,
+            &old,
+            &new,
+            Ok(()),
+        )
+        .unwrap();
+        assert!(cancel);
+        assert!(registry.holds(cancel_chord()));
+        // While idle the removed route simply frees Esc.
+        let registry = Registry(RefCell::new(old.chords().into_iter().collect()));
+        let mut cancel = false;
+        save(
+            &registry,
+            &mut cancel,
+            PipelinePhase::Idle,
+            &old,
+            &new,
+            Ok(()),
+        )
+        .unwrap();
+        assert!(!cancel);
+        assert!(!registry.holds(cancel_chord()));
+    }
+
+    #[test]
+    fn a_failed_save_restores_the_cancel_chord_with_the_old_routes() {
+        let old = Routes::parse(&Settings::default()).unwrap();
+        let new = Routes::parse(&with_esc_on_ask()).unwrap();
+        let registry = Registry(RefCell::new(old.chords().into_iter().collect()));
+        registry.register(cancel_chord()).unwrap();
+        let mut cancel = true;
+        assert_eq!(
+            save(
+                &registry,
+                &mut cancel,
+                PipelinePhase::Recording,
+                &old,
+                &new,
+                Err("write failed".into()),
+            ),
+            Err("write failed".into())
+        );
+        assert!(cancel);
+        assert!(registry.holds(cancel_chord()));
+        assert_eq!(
+            *registry.0.borrow(),
+            old.chords()
+                .into_iter()
+                .chain([cancel_chord()])
+                .collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn a_second_press_while_starting_cancels_instead_of_being_ignored() {
+        use PipelineMode::{Dictate, Translate};
+        assert_eq!(press(PipelinePhase::Idle, None, Dictate), Press::Start);
+        assert_eq!(
+            press(PipelinePhase::Starting, Some(Dictate), Dictate),
+            Press::CancelStart
+        );
+        // Any voice hotkey cancels a pending start: nothing should begin
+        // recording minutes later because a model was still loading.
+        assert_eq!(
+            press(PipelinePhase::Starting, Some(Dictate), Translate),
+            Press::CancelStart
+        );
+        assert_eq!(
+            press(PipelinePhase::Recording, Some(Dictate), Dictate),
+            Press::Stop
+        );
+        assert_eq!(
+            press(PipelinePhase::Recording, Some(Dictate), Translate),
+            Press::Busy("another voice mode is already recording")
+        );
+        assert_eq!(
+            press(PipelinePhase::Processing, Some(Dictate), Dictate),
+            Press::Ignore
+        );
+    }
 
     #[test]
     fn detects_cross_action_collisions_and_chord_swaps() {

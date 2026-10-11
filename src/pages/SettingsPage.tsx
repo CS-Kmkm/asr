@@ -20,6 +20,18 @@ const shortcutModes: Array<{ mode: ShortcutMode; label: "Dictation shortcuts" | 
   { mode: "edit", label: "Speak to edit shortcuts" },
 ];
 
+/**
+ * Whether a chord is plain Esc, the key that cancels a recording. A route the
+ * user assigns to Esc keeps it (the app never takes a chord back), so Esc no
+ * longer cancels and the overlay's × button is the cancel path.
+ */
+const ESC_ROUTE_WARNING = "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.";
+
+export function isCancelKeyChord(chord: string): boolean {
+  const key = chord.trim().toUpperCase();
+  return key === "ESC" || key === "ESCAPE";
+}
+
 // Inactive shortcuts arrive as "Action (chord)" with the English action label.
 const shortcutActionLabels = ["Dictation", "Selected-text translation", "Voice Translate", "Speak to edit", "Ask Anything"] as const;
 
@@ -334,6 +346,7 @@ export function SettingsPage({
               {shortcuts[mode].map((chord, index) => <div className="shortcut-item" key={`${mode}-${index}`}>
                 <input aria-label={`${t(label)} ${index + 1}`} value={chord} onChange={(event) => setShortcut(mode, index, event.target.value)} />
                 <button type="button" className="secondary" aria-label={`${t("Remove shortcut")} ${chord || index + 1}`} disabled={shortcuts[mode].length <= 1} onClick={() => removeShortcut(mode, index)}>{t("Remove")}</button>
+                {isCancelKeyChord(chord) && <p className="settings-warning" role="note">{t(ESC_ROUTE_WARNING)}</p>}
               </div>)}
               <button type="button" className="secondary" disabled={shortcuts[mode].length >= 4} onClick={() => addShortcut(mode)}>{t("Add shortcut")}</button>
             </div>} />
@@ -344,10 +357,13 @@ export function SettingsPage({
           return action ? `${t(action)}${entry.slice(action.length)}` : entry;
         }).join(", ")}</p>}
         <SettingRow title={t("Selected-text translation hotkey")} detail={t("Translates selected text; the default is Ctrl+Shift+T.")}
-          control={<input value={translationHotkey} aria-label={t("Selected-text translation hotkey")} onChange={(event) => { setTranslationHotkey(event.target.value); setShortcutError(null); }} onKeyDown={(event) => {
-            if (event.key === "Enter") { event.preventDefault(); commitShortcuts(); event.currentTarget.blur(); }
-            if (event.key === "Escape") { setTranslationHotkey(settings.translationHotkey); setShortcutError(null); event.currentTarget.blur(); }
-          }} />} />
+          control={<div className="shortcut-item">
+            <input value={translationHotkey} aria-label={t("Selected-text translation hotkey")} onChange={(event) => { setTranslationHotkey(event.target.value); setShortcutError(null); }} onKeyDown={(event) => {
+              if (event.key === "Enter") { event.preventDefault(); commitShortcuts(); event.currentTarget.blur(); }
+              if (event.key === "Escape") { setTranslationHotkey(settings.translationHotkey); setShortcutError(null); event.currentTarget.blur(); }
+            }} />
+            {isCancelKeyChord(translationHotkey) && <p className="settings-warning" role="note">{t(ESC_ROUTE_WARNING)}</p>}
+          </div>} />
         <button type="button" className="primary shortcut-save" onClick={commitShortcuts}>{t("Save shortcuts")}</button>
         <SettingRow title={t("Voice Translate target")} detail={`${t("The first language is the default. Reorder the list or choose the active target.")} ${t("Voice and selected-text Translate send text to the provider shown under AI text correction, even when correction is off.")} ${t("Provider:")} ${settings.correctionProvider === "openai" ? "OpenAI" : settings.correctionProvider === "gemini" ? "Google Gemini" : t("Local (OpenAI-compatible)")}.`}
           control={<div className="translation-target-settings">

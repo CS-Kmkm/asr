@@ -639,6 +639,79 @@ pub(crate) async fn start_ask_with_origin(
     .await
 }
 
+/// What a failed start publishes while it still owns the lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartFailure {
+    /// Leave the published phase: the caller's window reports the error.
+    Keep,
+    /// Clear a busy phase the start published (the model-preparing state).
+    Idle,
+    /// Publish Error with the failure, which the overlay shows as a notice.
+    Error,
+}
+
+/// A hotkey start has no visible window to report a failure, so it always
+/// publishes Error; a start from the main window does so only when it had
+/// published a busy phase. A cancellation is never reported as a failure.
+fn start_failure(
+    cancelled: bool,
+    from_shortcut: bool,
+    published: Option<&AppPhase>,
+) -> StartFailure {
+    let busy = matches!(
+        published,
+        Some(AppPhase::Recording | AppPhase::Processing | AppPhase::Injecting)
+    );
+    match (cancelled, from_shortcut || busy) {
+        (true, _) if busy => StartFailure::Idle,
+        (true, _) => StartFailure::Keep,
+        (false, true) => StartFailure::Error,
+        (false, false) => StartFailure::Keep,
+    }
+}
+
+const START_NO_TARGET: &str =
+    "No target window was found. Click where the text should go, then try again.";
+const START_SECURE_TARGET: &str =
+    "Password and other protected fields cannot receive dictated text.";
+const START_ELEVATED_TARGET: &str =
+    "The target app runs with higher privileges, so this app cannot type into it.";
+const START_MICROPHONE_NOT_FOUND: &str =
+    "The selected microphone was not found. Check the microphone in Settings.";
+const START_MICROPHONE_UNAVAILABLE: &str =
+    "The microphone could not be opened. Check the microphone in Settings.";
+
+/// The fixed, translatable sentence a failed start publishes for a known
+/// error kind. Errors arrive as display text (often behind `command_error`'s
+/// prefix) and may carry details such as a device id, which a fixed message
+/// must not embed. Other errors pass through; the overlay shows a generic
+/// translated message for any it does not know.
+fn start_failure_message(error: &str) -> String {
+    let detail = error
+        .strip_prefix("local operation failed: ")
+        .unwrap_or(error);
+    let known = match detail {
+        "no foreground target is available" => Some(START_NO_TARGET),
+        "text insertion into secure controls is disabled" => Some(START_SECURE_TARGET),
+        "the target cannot be accessed at this privilege level" => Some(START_ELEVATED_TARGET),
+        _ if detail.starts_with("audio input device not found") => Some(START_MICROPHONE_NOT_FOUND),
+        _ if [
+            "microphone capture is supported on Windows only",
+            "failed to enumerate audio devices",
+            "failed to configure audio device",
+            "failed to build input stream",
+            "failed to start input stream",
+        ]
+        .iter()
+        .any(|prefix| detail.starts_with(prefix)) =>
+        {
+            Some(START_MICROPHONE_UNAVAILABLE)
+        }
+        _ => None,
+    };
+    known.map_or_else(|| error.to_owned(), str::to_owned)
+}
+
 async fn start_recording_mode(
     app: AppHandle,
     services: State<'_, Services>,
@@ -648,15 +721,80 @@ async fn start_recording_mode(
     trigger_chord: Option<String>,
     mode: PipelineMode,
 ) -> Result<(), String> {
-    let (cancel_message, cancel_error) = cancellation_copy(mode);
-    if services.translation_active.load(Ordering::Acquire) {
-        return Err("selected-text translation is already active".into());
+    // Until this take captures its own target, the overlay follows the
+    // window the user is working in. Never move a running session's overlay.
+    if services.lifecycle.phase() == PipelinePhase::Idle {
+        recording_overlay::anchor_to_foreground();
     }
-    let operation_id = MODEL_CHANGE_GATE.begin_pipeline(|| services.lifecycle.begin_start(mode))?;
+    let claimed = if services.translation_active.load(Ordering::Acquire) {
+        Err("selected-text translation is already active")
+    } else {
+        MODEL_CHANGE_GATE.begin_pipeline(|| services.lifecycle.begin_start(mode))
+    };
+    let operation_id = match claimed {
+        Ok(id) => id,
+        Err(error) => {
+            // Nothing is owned, so only the overlay reports it, and only when
+            // no other operation is using the overlay.
+            if from_shortcut && services.lifecycle.phase() == PipelinePhase::Idle {
+                recording_overlay::show_message_notice(
+                    &app,
+                    recording_overlay::NoticeSeverity::Failure,
+                    error,
+                );
+            }
+            return Err(error.into());
+        }
+    };
     let guard = PipelineGuard {
         lifecycle: &services.lifecycle,
         id: operation_id,
     };
+    let result = start_owned_recording(
+        app.clone(),
+        services.clone(),
+        state.clone(),
+        storage.clone(),
+        from_shortcut,
+        trigger_chord,
+        mode,
+        operation_id,
+    )
+    .await;
+    match result {
+        // The recording keeps the lifecycle until it is stopped or cancelled.
+        Ok(()) => std::mem::forget(guard),
+        Err(ref error) => {
+            let (cancel_message, _) = cancellation_copy(mode);
+            match start_failure(
+                services.lifecycle.is_cancelled(operation_id),
+                from_shortcut,
+                state.phase().as_ref(),
+            ) {
+                StartFailure::Keep => {}
+                StartFailure::Idle => emit_state(&app, &state, AppPhase::Idle, cancel_message),
+                StartFailure::Error => {
+                    emit_state(&app, &state, AppPhase::Error, &start_failure_message(error))
+                }
+            }
+        }
+    }
+    result
+}
+
+/// The part of a start that runs while it owns the lifecycle as Starting.
+#[allow(clippy::too_many_arguments)]
+async fn start_owned_recording(
+    app: AppHandle,
+    services: State<'_, Services>,
+    state: State<'_, AppState>,
+    storage: State<'_, Storage>,
+    from_shortcut: bool,
+    trigger_chord: Option<String>,
+    mode: PipelineMode,
+    operation_id: u64,
+) -> Result<(), String> {
+    let (cancel_message, cancel_error) = cancellation_copy(mode);
     if services.translation_active.load(Ordering::Acquire) {
         return Err("selected-text translation is already active".into());
     }
@@ -678,11 +816,8 @@ async fn start_recording_mode(
         .transpose()?;
     let mut ask_session = (mode == PipelineMode::Ask)
         .then(|| AskSession::new(&settings, active_hotkey, from_shortcut));
-    ensure_model_loaded(&app, &services, &settings).await?;
-    if services.lifecycle.is_cancelled(operation_id) {
-        emit_state(&app, &state, AppPhase::Idle, cancel_message);
-        return Err(cancel_error.into());
-    }
+    // Capture the target at the press: a model load may take minutes, and
+    // the foreground window by then is not necessarily the one meant.
     let target = (mode != PipelineMode::Edit && mode != PipelineMode::Ask)
         .then(|| {
             SystemTextInjector::default()
@@ -690,6 +825,45 @@ async fn start_recording_mode(
                 .map_err(command_error)
         })
         .transpose()?;
+    // The overlay appears on the monitor of the window this take targets.
+    let ask_target = ask_session
+        .as_ref()
+        .and_then(|session| match &session.capture {
+            AskCapture::Selected(selection) => Some(selection.target()),
+            AskCapture::Caret(target) => Some(target),
+            AskCapture::Unavailable => None,
+        });
+    // Without a captured target (Ask with no usable context) the overlay
+    // keeps the foreground anchor instead of moving to the primary monitor.
+    if let Some(target) = target
+        .as_ref()
+        .or_else(|| {
+            edit_session
+                .as_ref()
+                .map(|session| session.selection.target())
+        })
+        .or(ask_target)
+    {
+        recording_overlay::set_anchor(target.window_handle);
+    }
+    let preparing = services
+        .model
+        .get()
+        .map(|status| needs_model_preparation(&status, &model_identity(&settings).0))
+        .unwrap_or(true);
+    if preparing {
+        emit_state(&app, &state, AppPhase::Processing, PREPARING_SPEECH_MODEL);
+    }
+    let cancelled = wait_for_speech_model(
+        &app,
+        &settings,
+        services.lifecycle.cancellation(operation_id)?,
+    )
+    .await?;
+    if cancelled || services.lifecycle.is_cancelled(operation_id) {
+        emit_state(&app, &state, AppPhase::Idle, cancel_message);
+        return Err(cancel_error.into());
+    }
     // The start cue finishes before the microphone opens (`arm` below), so it
     // is neither recorded nor detected as speech by the live draft.
     play_start_cue_before_capture(settings.interaction_sounds, play_start_cue_to_completion).await;
@@ -801,7 +975,6 @@ async fn start_recording_mode(
     drop(ask_slot);
     drop(edit_slot);
     drop(live_slot);
-    std::mem::forget(guard);
 
     let app_for_levels = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -841,6 +1014,52 @@ async fn start_recording_mode(
         }
     });
     Ok(())
+}
+
+/// Shown on the overlay while a start waits for the speech model.
+const PREPARING_SPEECH_MODEL: &str =
+    "Preparing the speech model. Recording starts when it is ready.";
+
+/// Whether a start must wait for a model load, and therefore shows the
+/// preparing state instead of appearing to ignore the hotkey.
+fn needs_model_preparation(status: &ModelStatus, model_id: &Option<String>) -> bool {
+    !(status.state == "ready" && &status.model_id == model_id)
+}
+
+/// Waits until the speech model is ready or the start is cancelled, and
+/// returns whether it was cancelled first. The load runs as its own task on
+/// purpose: cancelling the start only stops this wait (the microphone never
+/// opens later), while the load, including a first-use download, keeps going
+/// so the next start finds the model ready. Quitting or changing the model
+/// still interrupts it.
+async fn wait_for_speech_model(
+    app: &AppHandle,
+    settings: &Settings,
+    cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<bool, String> {
+    let load = {
+        let app = app.clone();
+        let settings = settings.clone();
+        tauri::async_runtime::spawn(async move {
+            let services = app.state::<Services>();
+            ensure_model_loaded(&app, &services, &settings)
+                .await
+                .map(|_| ())
+        })
+    };
+    load_unless_cancelled(async move { load.await.map_err(command_error)? }, cancel).await
+}
+
+/// Returns `Ok(true)` as soon as `cancel` is set, without waiting for `load`.
+async fn load_unless_cancelled(
+    load: impl std::future::Future<Output = Result<(), String>>,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<bool, String> {
+    tokio::select! {
+        loaded = load => loaded.map(|()| false),
+        // A closed channel means the operation is gone, which is a cancel too.
+        _ = cancel.wait_for(|cancelled| *cancelled) => Ok(true),
+    }
 }
 
 /// Recordings stop automatically at this length and are transcribed as usual.
@@ -946,6 +1165,15 @@ pub(crate) async fn stop_recording_for(
         id: operation_id,
     };
     let (cancel_message, cancel_error) = cancellation_copy(mode);
+    // Every exit below, `?` returns included, leaves a terminal phase, so
+    // the windows and the overlay never stay in Processing.
+    let _phase_guard = crate::state::TerminalPhaseGuard::new(
+        &state,
+        &services.lifecycle,
+        operation_id,
+        cancel_message,
+        |phase, message| emit_state(&app, &state, phase, message),
+    );
     recording_overlay::set_interactive(&app, false);
     // Publish the lifecycle transition immediately. Previously the UI stayed
     // in Recording until audio finalization completed; if finalization failed
@@ -1037,9 +1265,9 @@ pub(crate) async fn stop_recording_for(
     let correction_cancel = cancel.clone();
     // Defense in depth: model changes are refused while a recording is
     // active, but if the model is not marked ready (for example its load
-    // failed), load it as a new recording would. A worker crash keeps the
-    // ready status; the transcriber reloads the model when it respawns.
-    let model_ready = ensure_model_loaded(&app, &services, &settings).await;
+    // failed, or a worker crash lost it), load it as a new recording would.
+    let model_ready =
+        ensure_model_loaded_cancellable(&app, &services, &settings, Some(cancel.clone())).await;
     if services.lifecycle.is_cancelled(operation_id) {
         report_temp_cleanup(&app, &mut artifact_cleanup);
         emit_state(&app, &state, AppPhase::Idle, cancel_message);
@@ -1651,6 +1879,13 @@ pub(crate) async fn stop_recording_for(
             _ => insertion_label,
         };
         recording_overlay::show_insertion_notice(&app, notice, insertion_detail);
+    } else if correction_failed {
+        // The text arrived uncorrected; say why where the user is looking.
+        recording_overlay::show_message_notice(
+            &app,
+            recording_overlay::NoticeSeverity::Warning,
+            completion,
+        );
     }
     report_temp_cleanup(&app, &mut artifact_cleanup);
     Ok(RecordingResult {
@@ -2164,6 +2399,7 @@ pub(crate) async fn cancel_recording(
     storage: State<'_, Storage>,
 ) -> Result<(), String> {
     let mode = services.lifecycle.mode().unwrap_or(PipelineMode::Dictate);
+    let (cancel_message, _) = cancellation_copy(mode);
     let cancelled = cancel_pipeline_operation(
         &services.lifecycle,
         &services.audio,
@@ -2172,6 +2408,7 @@ pub(crate) async fn cancel_recording(
         &services.live,
         &services.edit,
         &services.ask,
+        || emit_state(&app, &state, AppPhase::Idle, cancel_message),
     )
     .await?;
     if cancelled.is_none() {
@@ -2186,25 +2423,26 @@ pub(crate) async fn cancel_recording(
                 .unwrap_or(false),
         );
     }
-    if services.lifecycle.phase() == PipelinePhase::Idle {
-        emit_state(
-            &app,
-            &state,
-            AppPhase::Idle,
-            if mode == PipelineMode::Translate {
-                "Translation cancelled."
-            } else if mode == PipelineMode::Edit {
-                "Editing cancelled."
-            } else if mode == PipelineMode::Ask {
-                "Ask cancelled."
-            } else {
-                "Dictation cancelled."
-            },
-        );
-    }
     Ok(())
 }
 
+/// Runs its callback once when dropped, on every exit path.
+struct OnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(callback) = self.0.take() {
+            callback();
+        }
+    }
+}
+
+/// Cancels the active operation. A cancelled recording is released here, and
+/// `publish_cancelled` runs on every exit (audio or live errors included)
+/// before the lifecycle is released, so its Idle phase can neither be skipped
+/// nor overwrite a newer recording. Starting and Processing keep their owner,
+/// which publishes their terminal phase.
+#[allow(clippy::too_many_arguments)]
 async fn cancel_pipeline_operation(
     lifecycle: &PipelineLifecycle,
     audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
@@ -2213,6 +2451,7 @@ async fn cancel_pipeline_operation(
     live: &tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
     edit: &tokio::sync::Mutex<Option<EditSession>>,
     ask: &tokio::sync::Mutex<Option<AskSession>>,
+    publish_cancelled: impl FnOnce(),
 ) -> Result<Option<PipelinePhase>, String> {
     let Some((operation_id, phase)) = lifecycle.cancel()? else {
         return Ok(None);
@@ -2226,6 +2465,9 @@ async fn cancel_pipeline_operation(
         lifecycle,
         id: operation_id,
     };
+    // Declared after `_guard`, so it runs first, while this cancel owns the
+    // lifecycle.
+    let _published = OnDrop(Some(publish_cancelled));
     if let Ok(mut target) = target.lock() {
         target.take();
     }
@@ -3127,8 +3369,16 @@ mod tests {
         let edit = tokio::sync::Mutex::new(None);
         let ask = tokio::sync::Mutex::new(None);
         let language = Mutex::new(None);
-        let cancellation =
-            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit, &ask);
+        let cancellation = cancel_pipeline_operation(
+            &lifecycle,
+            &audio,
+            &target,
+            &language,
+            &live,
+            &edit,
+            &ask,
+            || (),
+        );
         tokio::pin!(cancellation);
 
         assert!(
@@ -3137,7 +3387,14 @@ mod tests {
                 .is_err()
         );
         assert!(cancel_pipeline_operation(
-            &lifecycle, &audio, &target, &language, &live, &edit, &ask
+            &lifecycle,
+            &audio,
+            &target,
+            &language,
+            &live,
+            &edit,
+            &ask,
+            || ()
         )
         .await
         .unwrap()
@@ -3160,6 +3417,7 @@ mod tests {
         lifecycle.mark_recording(operation_id).unwrap();
         let audio = test_audio(true);
         let target = Mutex::new(None);
+        let published = std::cell::Cell::new(None);
 
         assert!(cancel_pipeline_operation(
             &lifecycle,
@@ -3168,10 +3426,14 @@ mod tests {
             &Mutex::new(None),
             &tokio::sync::Mutex::new(None),
             &tokio::sync::Mutex::new(None),
-            &tokio::sync::Mutex::new(None)
+            &tokio::sync::Mutex::new(None),
+            || published.set(Some(lifecycle.phase())),
         )
         .await
         .is_err());
+        // The failed cancel still published its Idle phase, while it owned
+        // the lifecycle, so no newer recording could be overwritten.
+        assert_eq!(published.get(), Some(PipelinePhase::Recording));
         assert!(lifecycle.begin_start(PipelineMode::Dictate).is_ok());
     }
 
@@ -3189,6 +3451,7 @@ mod tests {
             &tokio::sync::Mutex::new(None),
             &tokio::sync::Mutex::new(None),
             &tokio::sync::Mutex::new(None),
+            || panic!("Processing keeps its owner, which publishes its phase"),
         )
         .await
         .unwrap();
@@ -3210,7 +3473,14 @@ mod tests {
         // Nothing to cancel: a target published by a concurrent start stays.
         let language = Mutex::new(Some("ja".to_string()));
         assert!(cancel_pipeline_operation(
-            &lifecycle, &audio, &target, &language, &live, &edit, &ask
+            &lifecycle,
+            &audio,
+            &target,
+            &language,
+            &live,
+            &edit,
+            &ask,
+            || ()
         )
         .await
         .unwrap()
@@ -3222,9 +3492,18 @@ mod tests {
         lifecycle.mark_recording(id).unwrap();
         lifecycle.begin_processing().unwrap();
         assert_eq!(
-            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit, &ask)
-                .await
-                .unwrap(),
+            cancel_pipeline_operation(
+                &lifecycle,
+                &audio,
+                &target,
+                &language,
+                &live,
+                &edit,
+                &ask,
+                || ()
+            )
+            .await
+            .unwrap(),
             Some(PipelinePhase::Processing)
         );
         assert_eq!(language.lock().unwrap().as_deref(), Some("ja"));
@@ -3233,9 +3512,18 @@ mod tests {
         let id = lifecycle.begin_start(PipelineMode::Translate).unwrap();
         lifecycle.mark_recording(id).unwrap();
         assert_eq!(
-            cancel_pipeline_operation(&lifecycle, &audio, &target, &language, &live, &edit, &ask)
-                .await
-                .unwrap(),
+            cancel_pipeline_operation(
+                &lifecycle,
+                &audio,
+                &target,
+                &language,
+                &live,
+                &edit,
+                &ask,
+                || ()
+            )
+            .await
+            .unwrap(),
             Some(PipelinePhase::Recording)
         );
         assert_eq!(*language.lock().unwrap(), None);
@@ -3386,6 +3674,141 @@ mod tests {
         assert_eq!(
             processing_message(StopReason::MaximumDuration, true, "Stopping"),
             MICROPHONE_DISCONNECTED_PROCESSING
+        );
+    }
+
+    #[test]
+    fn a_hotkey_start_failure_is_published_for_the_overlay() {
+        let idle = Some(&AppPhase::Idle);
+        let preparing = Some(&AppPhase::Processing);
+        // A hotkey has no visible window: the failure must reach the overlay.
+        assert_eq!(start_failure(false, true, idle), StartFailure::Error);
+        assert_eq!(start_failure(false, true, None), StartFailure::Error);
+        // The main window reports its own command error, unless the start
+        // had already shown the preparing state.
+        assert_eq!(start_failure(false, false, idle), StartFailure::Keep);
+        assert_eq!(start_failure(false, false, preparing), StartFailure::Error);
+        // A cancellation is not a failure; it only clears a busy phase.
+        assert_eq!(start_failure(true, true, idle), StartFailure::Keep);
+        assert_eq!(start_failure(true, true, preparing), StartFailure::Idle);
+        assert_eq!(start_failure(true, false, preparing), StartFailure::Idle);
+        assert_eq!(
+            start_failure(true, false, Some(&AppPhase::Completed)),
+            StartFailure::Keep
+        );
+    }
+
+    #[test]
+    fn only_a_start_that_must_load_the_model_shows_the_preparing_state() {
+        let status = |state: &str, model: &str| ModelStatus {
+            model_id: Some(model.into()),
+            installed: true,
+            state: state.into(),
+            detail: String::new(),
+        };
+        let current = Some("faster-whisper:large-v3-turbo".to_string());
+        let ready = status("ready", "faster-whisper:large-v3-turbo");
+        assert!(!needs_model_preparation(&ready, &current));
+        for state in ["loading", "not_loaded", "error"] {
+            assert!(needs_model_preparation(
+                &status(state, "faster-whisper:large-v3-turbo"),
+                &current
+            ));
+        }
+        // A ready model that is not the configured one is reloaded first.
+        assert!(needs_model_preparation(
+            &status("ready", "faster-whisper:small"),
+            &current
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelling_while_the_model_loads_never_starts_the_recording() {
+        let lifecycle = PipelineLifecycle::default();
+        let id = lifecycle.begin_start(PipelineMode::Dictate).unwrap();
+        let cancel = lifecycle.cancellation(id).unwrap();
+        let (finish_load, load_finished) = tokio::sync::oneshot::channel::<()>();
+        let waiting = load_unless_cancelled(
+            async move {
+                let _ = load_finished.await;
+                Ok(())
+            },
+            cancel,
+        );
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), waiting.as_mut())
+                .await
+                .is_err()
+        );
+        // A second press cancels the Starting operation mid-load.
+        assert_eq!(
+            lifecycle.cancel().unwrap(),
+            Some((id, PipelinePhase::Starting))
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .unwrap(),
+            Ok(true)
+        );
+        // The load finishing later cannot open the microphone.
+        let _ = finish_load.send(());
+        assert!(lifecycle.mark_recording(id).is_err());
+        lifecycle.finish(id);
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_ready_model_starts_without_waiting_for_cancellation() {
+        let lifecycle = PipelineLifecycle::default();
+        let id = lifecycle.begin_start(PipelineMode::Dictate).unwrap();
+        let cancel = lifecycle.cancellation(id).unwrap();
+        assert_eq!(
+            load_unless_cancelled(async { Ok(()) }, cancel.clone()).await,
+            Ok(false)
+        );
+        assert_eq!(
+            load_unless_cancelled(async { Err("load failed".into()) }, cancel).await,
+            Err("load failed".to_string())
+        );
+    }
+
+    #[test]
+    fn known_start_errors_become_fixed_translatable_messages() {
+        let wrapped = |detail: &str| format!("local operation failed: {detail}");
+        assert_eq!(
+            start_failure_message(&wrapped("no foreground target is available")),
+            START_NO_TARGET
+        );
+        assert_eq!(
+            start_failure_message(&wrapped("text insertion into secure controls is disabled")),
+            START_SECURE_TARGET
+        );
+        assert_eq!(
+            start_failure_message(&wrapped(
+                "the target cannot be accessed at this privilege level"
+            )),
+            START_ELEVATED_TARGET
+        );
+        // The device id is not part of the message.
+        let missing = start_failure_message(&wrapped(
+            "audio input device not found: {0.0.1.00000000}.{abc}",
+        ));
+        assert_eq!(missing, START_MICROPHONE_NOT_FOUND);
+        assert!(!missing.contains("abc"));
+        assert_eq!(
+            start_failure_message(&wrapped("failed to build input stream: busy")),
+            START_MICROPHONE_UNAVAILABLE
+        );
+        // Already fixed sentences and unknown errors pass through.
+        assert_eq!(
+            start_failure_message("Select text in a supported foreground edit control."),
+            "Select text in a supported foreground edit control."
+        );
+        assert_eq!(
+            start_failure_message(&wrapped("worker exited unexpectedly")),
+            wrapped("worker exited unexpectedly")
         );
     }
 
@@ -4148,18 +4571,29 @@ pub(crate) async fn update_settings(
                 .into(),
         );
         }
-        shortcuts::update_registrations(
+        // Held until the new routes are published, so the Esc cancel chord
+        // follower cannot re-register Esc from the old routes in between.
+        let mut cancel_chord = services
+            .cancel_chord_registered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let phase = services.lifecycle.phase();
+        let registration = shortcuts::update_registrations_with_cancel_chord(
+            &mut cancel_chord,
+            phase,
             &old_routes,
             &desired_routes,
             |chord| app.global_shortcut().register(chord),
             |chord| app.global_shortcut().unregister(chord),
             || persist_settings(&storage, &settings),
-        )?;
+        );
+        registration?;
         let inactive = shortcuts::inactive_descriptions(&settings, &desired_routes)?;
         *services
             .shortcut_routes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = desired_routes;
+        drop(cancel_chord);
         *services
             .inactive_shortcuts
             .lock()
@@ -4195,10 +4629,8 @@ pub(crate) async fn update_settings(
             state: "not_loaded".into(),
             detail,
         };
-        *services
-            .model
-            .lock()
-            .map_err(|_| "model service is unavailable".to_string())? = status.clone();
+        // A settings save takes the status from any load still running.
+        services.model.replace(status.clone())?;
         let _ = app.emit("model-status", status);
     }
     let _ = app.emit("settings-changed", &settings);
@@ -4377,6 +4809,9 @@ pub(crate) async fn retry_history_item(
         lifecycle: &services.lifecycle,
         id: operation_id,
     };
+    // Retry has no target window; show its overlay where the user started it,
+    // not on the last take's monitor.
+    recording_overlay::anchor_to_foreground();
     let mut retry_cleanup = None;
     let result = async {
         emit_state(
@@ -4396,10 +4831,12 @@ pub(crate) async fn retry_history_item(
         let settings = storage.get_settings().map_err(command_error)?;
         // Retry uses the current ASR settings, so it loads the selected model
         // first, as a new recording does; a backend or model change resets it.
-        ensure_model_loaded(&app, &services, &settings).await?;
+        let model_ready =
+            ensure_model_loaded_cancellable(&app, &services, &settings, Some(cancel.clone())).await;
         if services.lifecycle.is_cancelled(operation_id) {
             return Err("history retry was cancelled".into());
         }
+        model_ready?;
         // History keeps only the captured category, so Retry routes to
         // category-scoped and global dictionary entries and profiles.
         let retry_context = retry_app_context(&source);
@@ -4863,11 +5300,7 @@ pub(crate) fn dismiss_ask_answer(
 
 #[tauri::command]
 pub(crate) fn get_model_status(services: State<'_, Services>) -> Result<ModelStatus, String> {
-    services
-        .model
-        .lock()
-        .map(|status| status.clone())
-        .map_err(|_| "model service is unavailable".into())
+    services.model.get()
 }
 
 #[tauri::command]
@@ -4906,10 +5339,29 @@ pub(crate) async fn ensure_model_loaded(
     services: &Services,
     settings: &Settings,
 ) -> Result<ModelStatus, String> {
+    ensure_model_loaded_cancellable(app, services, settings, None).await
+}
+
+pub(crate) const MODEL_LOAD_CANCELLED: &str = "Speech model loading was cancelled.";
+
+/// `ensure_model_loaded` for a pipeline operation: cancelling the operation
+/// abandons a load (or first-use download) that nobody waits for any more.
+pub(crate) async fn ensure_model_loaded_cancellable(
+    app: &AppHandle,
+    services: &Services,
+    settings: &Settings,
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<ModelStatus, String> {
     let (model_id, detail) = model_identity(settings);
-    if let Ok(status) = services.model.lock() {
-        if status.state == "ready" && status.model_id == model_id {
-            return Ok(status.clone());
+    // A reset or restoring worker does not hold the model, whatever the
+    // status says.
+    let resident = services
+        .transcriber
+        .model_residency()
+        .is_none_or(|residency| matches!(*residency.borrow(), asr::ModelResidency::Resident(_)));
+    if let Ok(status) = services.model.get() {
+        if resident && status.state == "ready" && status.model_id == model_id {
+            return Ok(status);
         }
     }
     emit_status(app, "model_loading", "Loading the speech model.");
@@ -4919,38 +5371,7 @@ pub(crate) async fn ensure_model_loaded(
         state: "loading".into(),
         detail: detail.clone(),
     };
-    *services
-        .model
-        .lock()
-        .map_err(|_| "model service is unavailable".to_string())? = loading.clone();
-    let _ = app.emit("model-status", loading);
-
-    // Only the worker knows whether the model files are already cached, so the
-    // download message and progress bar are driven by what it reports.
-    let progress_forwarder = spawn_load_progress_forwarder(app, services);
-    let load_result = services
-        .transcriber
-        .load(&settings.model_quantization)
-        .await;
-    if let Some(forwarder) = progress_forwarder {
-        forwarder.abort();
-    }
-
-    if let Err(error) = load_result {
-        let message = command_error(&error);
-        let failed = ModelStatus {
-            model_id,
-            installed: false,
-            state: "error".into(),
-            detail: format!("{detail} {message}"),
-        };
-        if let Ok(mut status) = services.model.lock() {
-            *status = failed.clone();
-        }
-        let _ = app.emit("model-status", failed);
-        return Err(message);
-    }
-    let status = ModelStatus {
+    let ready = ModelStatus {
         model_id,
         installed: true,
         state: "ready".into(),
@@ -4959,12 +5380,472 @@ pub(crate) async fn ensure_model_loaded(
             settings.model_quantization
         ),
     };
-    *services
-        .model
-        .lock()
-        .map_err(|_| "model service is unavailable".to_string())? = status.clone();
-    let _ = app.emit("model-status", status.clone());
-    Ok(status)
+
+    // Only the worker knows whether the model files are already cached, so the
+    // download message and progress bar are driven by what it reports.
+    let progress_forwarder = spawn_load_progress_forwarder(app, services);
+    let publish = |status: ModelStatus| {
+        let _ = app.emit("model-status", status);
+    };
+    let (result, shown_by) = load_and_publish_status(
+        &services.model,
+        services.transcriber.as_ref(),
+        &settings.model_quantization,
+        cancel,
+        ModelLoadStatuses {
+            loading: &loading,
+            ready: &ready,
+            detail: &detail,
+        },
+        &publish,
+    )
+    .await;
+    if let Some(forwarder) = progress_forwarder {
+        forwarder.abort();
+    }
+    if let Some(load) = shown_by {
+        follow_model_residency(app, services, load, &ready, detail);
+    }
+    result.map(|()| ready)
+}
+
+/// The statuses one load may publish.
+struct ModelLoadStatuses<'a> {
+    loading: &'a ModelStatus,
+    ready: &'a ModelStatus,
+    /// Detail of the model without the "Loaded with" suffix.
+    detail: &'a str,
+}
+
+/// Load the model and publish its status, returning the load's ownership
+/// id when its `ready` status is shown.
+///
+/// A load takes over the status only once the transcriber starts it (has
+/// its worker lock). A load that waits behind another one, for example a
+/// recording start during the startup download, and is cancelled meanwhile
+/// therefore never touches the status, and the running load still shows its
+/// own outcome.
+async fn load_and_publish_status(
+    slot: &ModelStatusSlot,
+    transcriber: &dyn Transcriber,
+    quantization: &str,
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    statuses: ModelLoadStatuses<'_>,
+    publish: &(dyn Fn(ModelStatus) + Send + Sync),
+) -> (Result<(), String>, Option<u64>) {
+    let owner = Mutex::new(None);
+    let started = || {
+        if let Ok(load) = slot.begin_load(statuses.loading.clone()) {
+            *owner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(load);
+            publish(statuses.loading.clone());
+        }
+    };
+    let result = transcriber
+        .load_when_started(quantization, cancel, &started)
+        .await;
+    let owner = owner
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Every outcome is shown only while this load still owns the status: a
+    // newer load or a settings save may already show its own.
+    let show = |status: ModelStatus| {
+        let shown = owner.and_then(|load| slot.update(load, status));
+        if let Some(status) = shown.clone() {
+            publish(status);
+        }
+        shown.is_some()
+    };
+    match result {
+        Ok(()) => {
+            let shown = show(statuses.ready.clone());
+            (Ok(()), owner.filter(|_| shown))
+        }
+        Err(asr::AsrError::Cancelled) => {
+            // Abandoned for a cancelled recording, a model change or quit.
+            show(residency_status(
+                asr::ModelResidency::Absent,
+                statuses.loading,
+                statuses.detail,
+            ));
+            (Err(MODEL_LOAD_CANCELLED.into()), None)
+        }
+        Err(error) => {
+            let message = command_error(&error);
+            show(ModelStatus {
+                model_id: statuses.loading.model_id.clone(),
+                installed: false,
+                state: "error".into(),
+                detail: format!("{} {message}", statuses.detail),
+            });
+            (Err(message), None)
+        }
+    }
+}
+
+/// The model status and the load that may change it, under one lock.
+///
+/// A load takes ownership when it starts and may write only while it still
+/// owns the status, so a slow load never overwrites a newer load's status.
+/// Statuses of two loads can be identical, so ownership is an id, not a
+/// value. A settings save takes ownership away from every load.
+pub(crate) struct ModelStatusSlot {
+    inner: Mutex<OwnedModelStatus>,
+}
+
+struct OwnedModelStatus {
+    status: ModelStatus,
+    /// Id of the load that owns `status`; ids of settings saves own none.
+    owner: u64,
+    next_owner: u64,
+}
+
+impl ModelStatusSlot {
+    pub(crate) fn new(status: ModelStatus) -> Self {
+        Self {
+            inner: Mutex::new(OwnedModelStatus {
+                status,
+                owner: 0,
+                next_owner: 1,
+            }),
+        }
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, OwnedModelStatus>, String> {
+        self.inner
+            .lock()
+            .map_err(|_| "model service is unavailable".to_string())
+    }
+
+    pub(crate) fn get(&self) -> Result<ModelStatus, String> {
+        self.lock().map(|inner| inner.status.clone())
+    }
+
+    fn take_ownership(inner: &mut OwnedModelStatus, status: ModelStatus) -> u64 {
+        let owner = inner.next_owner;
+        inner.next_owner += 1;
+        inner.owner = owner;
+        inner.status = status;
+        owner
+    }
+
+    /// Show `status` for a load that starts now; it owns the status from here.
+    pub(crate) fn begin_load(&self, status: ModelStatus) -> Result<u64, String> {
+        let mut inner = self.lock()?;
+        Ok(Self::take_ownership(&mut inner, status))
+    }
+
+    /// Show `status` for a user action (a settings save); no load owns it.
+    pub(crate) fn replace(&self, status: ModelStatus) -> Result<(), String> {
+        let mut inner = self.lock()?;
+        Self::take_ownership(&mut inner, status);
+        Ok(())
+    }
+
+    /// Show `status` for `load`, only while it still owns the status.
+    pub(crate) fn update(&self, load: u64, status: ModelStatus) -> Option<ModelStatus> {
+        let mut inner = self.inner.lock().ok()?;
+        (inner.owner == load).then(|| {
+            inner.status = status.clone();
+            status
+        })
+    }
+}
+
+fn same_model_status(left: &ModelStatus, right: &ModelStatus) -> bool {
+    left.state == right.state
+        && left.model_id == right.model_id
+        && left.installed == right.installed
+        && left.detail == right.detail
+}
+
+/// The status a loaded model has while the transcriber reports `residency`.
+fn residency_status(
+    residency: asr::ModelResidency,
+    ready: &ModelStatus,
+    detail: &str,
+) -> ModelStatus {
+    let (installed, state) = match residency {
+        asr::ModelResidency::Resident(_) => return ready.clone(),
+        asr::ModelResidency::Restoring => (false, "loading"),
+        asr::ModelResidency::Absent => (false, "not_loaded"),
+    };
+    ModelStatus {
+        model_id: ready.model_id.clone(),
+        installed,
+        state: state.into(),
+        detail: detail.to_owned(),
+    }
+}
+
+/// Keep a loaded model's status true to the worker: not loaded once a reset
+/// loses it (a crash, a timeout, a cancel the worker did not confirm), loading
+/// with progress while a respawned worker restores it, and ready again after.
+/// Stops once another load or a settings change takes over the status.
+fn follow_model_residency(
+    app: &AppHandle,
+    services: &Services,
+    load: u64,
+    ready: &ModelStatus,
+    detail: String,
+) {
+    let Some(mut residency) = services.transcriber.model_residency() else {
+        return;
+    };
+    let app = app.clone();
+    let ready = ready.clone();
+    tauri::async_runtime::spawn(async move {
+        let services = app.state::<Services>();
+        let mut shown = ready.clone();
+        let mut forwarder: Option<tauri::async_runtime::JoinHandle<()>> = None;
+        // Checked at once: the model may already be gone.
+        let mut current = *residency.borrow_and_update();
+        loop {
+            let next = residency_status(current, &ready, &detail);
+            if !same_model_status(&next, &shown) {
+                let Some(status) = services.model.update(load, next) else {
+                    break;
+                };
+                if let Some(forwarder) = forwarder.take() {
+                    forwarder.abort();
+                }
+                if current == asr::ModelResidency::Restoring {
+                    emit_status(&app, "model_loading", "Loading the speech model.");
+                    forwarder = spawn_load_progress_forwarder(&app, &services);
+                }
+                let _ = app.emit("model-status", status.clone());
+                shown = status;
+            }
+            if residency.changed().await.is_err() {
+                break;
+            }
+            current = *residency.borrow_and_update();
+        }
+        if let Some(forwarder) = forwarder {
+            forwarder.abort();
+        }
+    });
+}
+
+#[cfg(test)]
+mod model_status_tests {
+    use super::*;
+
+    fn status(state: &str, detail: &str) -> ModelStatus {
+        ModelStatus {
+            model_id: Some("model".into()),
+            installed: state == "ready",
+            state: state.into(),
+            detail: detail.into(),
+        }
+    }
+
+    #[test]
+    fn a_slower_older_load_never_overwrites_a_newer_loads_status() {
+        for (newer_outcome, older_outcome) in [
+            ("ready", "ready"),
+            ("ready", "error"),
+            ("error", "ready"),
+            ("error", "error"),
+        ] {
+            let slot = ModelStatusSlot::new(status("not_loaded", "d"));
+            let older = slot.begin_load(status("loading", "d")).unwrap();
+            let newer = slot.begin_load(status("loading", "d")).unwrap();
+
+            // B finishes first, then A's outcome arrives late.
+            assert!(slot.update(newer, status(newer_outcome, "B")).is_some());
+            assert!(slot.update(older, status(older_outcome, "A")).is_none());
+            let shown = slot.get().unwrap();
+            assert_eq!(
+                (shown.state.as_str(), shown.detail.as_str()),
+                (newer_outcome, "B")
+            );
+        }
+    }
+
+    #[test]
+    fn an_older_load_finishing_first_is_replaced_when_the_newer_one_ends() {
+        let slot = ModelStatusSlot::new(status("not_loaded", "d"));
+        let older = slot.begin_load(status("loading", "d")).unwrap();
+        let newer = slot.begin_load(status("loading", "d")).unwrap();
+
+        // Identical "loading" statuses: A's cancel must not touch B's download.
+        assert!(slot.update(older, status("not_loaded", "A")).is_none());
+        assert_eq!(slot.get().unwrap().state, "loading");
+        assert!(slot.update(older, status("ready", "A")).is_none());
+        assert!(slot.update(newer, status("error", "B")).is_some());
+        assert_eq!(slot.get().unwrap().detail, "B");
+    }
+
+    #[test]
+    fn a_settings_save_takes_the_status_from_every_load() {
+        let slot = ModelStatusSlot::new(status("not_loaded", "d"));
+        let load = slot.begin_load(status("loading", "d")).unwrap();
+        slot.replace(status("not_loaded", "other model")).unwrap();
+
+        assert!(slot.update(load, status("ready", "d")).is_none());
+        assert_eq!(slot.get().unwrap().detail, "other model");
+    }
+
+    /// Loads run one at a time like the worker's: a load holds `worker`
+    /// until `release` opens.
+    struct QueuedTranscriber {
+        worker: tokio::sync::Mutex<()>,
+        release: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transcriber for QueuedTranscriber {
+        async fn load(&self, _: &str) -> Result<(), asr::AsrError> {
+            unreachable!("loads go through load_when_started")
+        }
+
+        async fn load_when_started(
+            &self,
+            _: &str,
+            cancel: Option<tokio::sync::watch::Receiver<bool>>,
+            started: &(dyn Fn() + Send + Sync),
+        ) -> Result<(), asr::AsrError> {
+            let _worker = match cancel {
+                Some(mut cancel) => tokio::select! {
+                    worker = self.worker.lock() => worker,
+                    _ = cancel.wait_for(|cancelled| *cancelled) => {
+                        return Err(asr::AsrError::Cancelled);
+                    }
+                },
+                None => self.worker.lock().await,
+            };
+            started();
+            let mut release = self.release.clone();
+            let _ = release.wait_for(|open| *open).await;
+            Ok(())
+        }
+
+        async fn transcribe(
+            &self,
+            _: &Path,
+            _: Option<&str>,
+            _: tokio::sync::watch::Receiver<bool>,
+        ) -> Result<asr::Transcript, asr::AsrError> {
+            unreachable!("not used")
+        }
+
+        async fn shutdown(&self) -> Result<(), asr::AsrError> {
+            Ok(())
+        }
+
+        async fn reconfigure(&self, _: asr::WorkerCommand) {}
+    }
+
+    fn spawn_load(
+        slot: &Arc<ModelStatusSlot>,
+        transcriber: &Arc<QueuedTranscriber>,
+        cancel: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> tokio::task::JoinHandle<(Result<(), String>, Option<u64>)> {
+        let slot = slot.clone();
+        let transcriber = transcriber.clone();
+        tokio::spawn(async move {
+            let loading = status("loading", "d");
+            let ready = status("ready", "d Loaded with 4bit quantization.");
+            load_and_publish_status(
+                &slot,
+                transcriber.as_ref(),
+                "4bit",
+                cancel,
+                ModelLoadStatuses {
+                    loading: &loading,
+                    ready: &ready,
+                    detail: "d",
+                },
+                &|_| {},
+            )
+            .await
+        })
+    }
+
+    #[tokio::test]
+    async fn a_load_cancelled_while_waiting_leaves_the_running_load_its_status() {
+        // The startup download (A) is running when a recording start (B)
+        // needs the model; Esc cancels B before it ever reaches the worker.
+        let slot = Arc::new(ModelStatusSlot::new(status("not_loaded", "d")));
+        let (release_tx, release) = tokio::sync::watch::channel(false);
+        let transcriber = Arc::new(QueuedTranscriber {
+            worker: tokio::sync::Mutex::new(()),
+            release,
+        });
+        let startup = spawn_load(&slot, &transcriber, None);
+        while slot.get().unwrap().state != "loading" {
+            tokio::task::yield_now().await;
+        }
+
+        let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+        let recording = spawn_load(&slot, &transcriber, Some(cancel));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel_tx.send_replace(true);
+        let (result, shown_by) = recording.await.unwrap();
+        assert_eq!(result, Err(MODEL_LOAD_CANCELLED.to_string()));
+        assert_eq!(shown_by, None);
+        assert_eq!(slot.get().unwrap().state, "loading");
+
+        release_tx.send_replace(true);
+        let (result, shown_by) = startup.await.unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(shown_by.is_some());
+        assert_eq!(slot.get().unwrap().state, "ready");
+    }
+
+    #[tokio::test]
+    async fn a_load_that_reaches_the_worker_takes_the_status_over() {
+        let slot = Arc::new(ModelStatusSlot::new(status("not_loaded", "d")));
+        let (release_tx, release) = tokio::sync::watch::channel(true);
+        let transcriber = Arc::new(QueuedTranscriber {
+            worker: tokio::sync::Mutex::new(()),
+            release,
+        });
+        let (result, first) = spawn_load(&slot, &transcriber, None).await.unwrap();
+        assert_eq!(result, Ok(()));
+        let (result, second) = spawn_load(&slot, &transcriber, None).await.unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(first.is_some() && second.is_some() && first != second);
+        // The first load no longer owns the status.
+        assert!(slot
+            .update(first.unwrap(), status("error", "late"))
+            .is_none());
+        drop(release_tx);
+    }
+
+    #[test]
+    fn slots_do_not_share_ownership() {
+        let first = ModelStatusSlot::new(status("not_loaded", "d"));
+        let second = ModelStatusSlot::new(status("not_loaded", "d"));
+        let load = first.begin_load(status("loading", "d")).unwrap();
+        second.begin_load(status("loading", "d")).unwrap();
+        second.begin_load(status("loading", "d")).unwrap();
+
+        assert!(first.update(load, status("ready", "d")).is_some());
+    }
+
+    #[test]
+    fn residency_maps_to_the_status_of_the_loaded_model() {
+        let ready = status("ready", "d Loaded with 4bit quantization.");
+        assert!(same_model_status(
+            &residency_status(asr::ModelResidency::Resident(3), &ready, "d"),
+            &ready
+        ));
+        let restoring = residency_status(asr::ModelResidency::Restoring, &ready, "d");
+        assert_eq!(
+            (restoring.state.as_str(), restoring.installed),
+            ("loading", false)
+        );
+        assert_eq!(restoring.detail, "d");
+        let absent = residency_status(asr::ModelResidency::Absent, &ready, "d");
+        assert_eq!(
+            (absent.state.as_str(), absent.installed),
+            ("not_loaded", false)
+        );
+        assert_eq!(absent.model_id, ready.model_id);
+    }
 }
 
 /// Relay worker load progress to the window until the load finishes.

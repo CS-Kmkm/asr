@@ -435,8 +435,10 @@ impl From<&str> for LiveFailure {
 }
 
 /// Serial snapshot inference provides backpressure: slow models never build a
-/// queue. Stop drains the current request; cancellation uses the worker's
-/// existing cancellation protocol. A late result is never published.
+/// queue. Stop drains the current request; cancellation returns at once
+/// while the transcriber cancels the request in the worker, which keeps
+/// the loaded model for the next recording. A late result is never
+/// published.
 async fn run(
     audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
     transcriber: &dyn Transcriber,

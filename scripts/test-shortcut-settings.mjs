@@ -74,6 +74,7 @@ function fixture(settings = structuredClone(defaultSettings)) {
     key: (label, key) => input(label).onKeyDown({ key, preventDefault() {}, currentTarget: { blur() { input(label).onBlur?.(); } } }),
     value: (label) => input(label).value,
     save: () => render().find((node) => node.type === "button" && node.props.children === "Save shortcuts").props.onClick(),
+    escWarnings: () => render().filter((node) => node.props.className === "settings-warning").length,
   };
 }
 const voice = "Voice Translate shortcuts 1";
@@ -128,4 +129,17 @@ test("Escape restores selected-text draft without saving, and unchanged Save is 
   assert.equal(page.value(selected), page.settings.translationHotkey);
   page.save();
   assert.equal(page.patches.length, 0);
+});
+
+test("A route on Esc warns that the overlay's x button becomes the cancel path", () => {
+  const plain = fixture();
+  assert.equal(plain.escWarnings(), 0);
+  const settings = structuredClone(defaultSettings);
+  settings.shortcuts.ask = ["Escape"];
+  settings.translationHotkey = " esc ";
+  const esc = fixture(settings);
+  assert.equal(esc.escWarnings(), 2);
+  // Esc with a modifier is a different chord and does not shadow cancel.
+  esc.change("Ask Anything shortcuts 1", "Ctrl+Escape");
+  assert.equal(esc.escWarnings(), 1);
 });

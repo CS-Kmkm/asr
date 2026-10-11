@@ -4,9 +4,10 @@ import contextlib
 import gc
 import mimetypes
 import os
+import time
 import wave
 from pathlib import Path
-from typing import Any, Iterator, Protocol
+from typing import Any, Callable, Iterator, Protocol
 from urllib.parse import urlparse
 
 from .download import (
@@ -17,6 +18,8 @@ from .download import (
     cached_snapshot_path,
     download_snapshot,
 )
+
+CancelCheck = Callable[[], bool]
 
 MODEL_ID = "microsoft/VibeVoice-ASR-HF"
 QUANTIZATIONS = {"4bit", "8bit", "bf16"}
@@ -30,9 +33,14 @@ class BackendError(Exception):
         self.message = message
 
 
+def cancelled_error() -> BackendError:
+    return BackendError("cancelled", "Transcription was cancelled")
+
+
 class Backend(Protocol):
     model_name: str
     progress: ProgressCallback | None
+    cancel_requested: CancelCheck | None
 
     def load(self, quantization: str) -> None: ...
 
@@ -54,11 +62,23 @@ class ProgressReporting:
     """
 
     progress: ProgressCallback | None = None
+    # Assigned by the worker for the duration of a transcription. A backend
+    # polls it where it can stop early (between segments or tokens) and raises
+    # the `cancelled` error; one that cannot poll simply finishes.
+    cancel_requested: CancelCheck | None = None
 
     def report_progress(self, stage: str, **fields: Any) -> None:
         callback = self.progress
         if callback is not None:
             callback({"stage": stage, **fields})
+
+    def is_cancel_requested(self) -> bool:
+        check = self.cancel_requested
+        return check is not None and check()
+
+    def raise_if_cancelled(self) -> None:
+        if self.is_cancel_requested():
+            raise cancelled_error()
 
 
 def faster_whisper_repo_id(model_id: str) -> str | None:
@@ -305,16 +325,47 @@ def vibevoice_dependency_error(exc: ModuleNotFoundError) -> BackendError:
 
 
 class MockBackend(ProgressReporting):
+    """Model-free backend for tests and protocol debugging.
+
+    Environment hooks let process-level tests drive the worker lifecycle
+    without downloading a model:
+
+    - ``ASR_WORKER_MOCK_HOLD_FILE``: while this file exists, ``load``,
+      ``transcribe`` and ``unload`` wait. A held transcription stops when it is
+      cancelled, unless ``ASR_WORKER_MOCK_IGNORE_CANCEL=1``.
+    - ``ASR_WORKER_MOCK_CRASH_FILE``: a transcription that finds this file
+      removes it and exits the process, so it crashes exactly once.
+    - ``ASR_WORKER_MOCK_EVENT_LOG``: appends ``<pid> <event>`` lines.
+    """
+
     model_name = f"{MODEL_ID}:mock"
 
     def __init__(self) -> None:
         self.loaded = False
+
+    @staticmethod
+    def _log_event(event: str) -> None:
+        path = os.environ.get("ASR_WORKER_MOCK_EVENT_LOG")
+        if path:
+            with open(path, "a", encoding="utf-8") as log:
+                log.write(f"{os.getpid()} {event}\n")
+
+    def _hold(self, *, cancellable: bool) -> None:
+        hold_file = os.environ.get("ASR_WORKER_MOCK_HOLD_FILE")
+        honor_cancel = cancellable and os.environ.get("ASR_WORKER_MOCK_IGNORE_CANCEL") != "1"
+        while hold_file and os.path.exists(hold_file):
+            if honor_cancel and self.is_cancel_requested():
+                self._log_event("cancelled")
+                raise cancelled_error()
+            time.sleep(0.01)
 
     def load(self, quantization: str) -> None:
         if quantization not in QUANTIZATIONS:
             raise BackendError("unsupported_quantization", f"Unsupported quantization: {quantization}")
         if os.environ.get("ASR_WORKER_MOCK_LOAD_ERROR") == "oom":
             raise BackendError("gpu_oom", "GPU out of memory while operating the ASR model")
+        self._log_event(f"load {quantization}")
+        self._hold(cancellable=False)
         self.loaded = True
 
     def transcribe(
@@ -323,10 +374,17 @@ class MockBackend(ProgressReporting):
         prompt: str | None,
         language: str | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
+        self._log_event("transcribe")
+        crash_file = os.environ.get("ASR_WORKER_MOCK_CRASH_FILE")
+        if crash_file and os.path.exists(crash_file):
+            os.remove(crash_file)
+            os._exit(3)
+        self._hold(cancellable=True)
         text = os.environ.get("ASR_WORKER_MOCK_TEXT", "mock transcription")
         return text, [{"start": 0.0, "end": 0.0, "speaker": 0, "text": text}]
 
     def unload(self) -> None:
+        self._hold(cancellable=False)
         self.loaded = False
 
 
@@ -428,9 +486,15 @@ class VibeVoiceBackend(ProgressReporting):
                     wav_duration_seconds(audio_path),
                     os.environ.get("ASR_MAX_NEW_TOKENS"),
                 )
-                output_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
-                generated_ids = output_ids[:, input_length:]
+                generate_options: dict[str, Any] = {"max_new_tokens": max_new_tokens}
+                if self.cancel_requested is not None:
+                    generate_options["stopping_criteria"] = _cancel_stopping_criteria(self)
+                output_ids = self.model.generate(**inputs, **generate_options)
                 del inputs
+                # A cancelled generation stops at the next token; its partial
+                # output is never parsed.
+                self.raise_if_cancelled()
+                generated_ids = output_ids[:, input_length:]
                 # A cut-off transcript is an unterminated JSON array, which the
                 # parser reports only as an opaque JSONDecodeError.
                 if generation_reached_limit(generated_ids, max_new_tokens, _eos_token_ids(self.model)):
@@ -457,6 +521,23 @@ class VibeVoiceBackend(ProgressReporting):
             raise
         except BaseException as exc:
             raise map_backend_exception(exc, "transcribe") from exc
+
+
+def _cancel_stopping_criteria(backend: ProgressReporting) -> Any:
+    """Stop `generate` at the next token once the worker cancels the request."""
+    import torch
+    from transformers import StoppingCriteria, StoppingCriteriaList
+
+    class _CancelCriteria(StoppingCriteria):
+        def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> Any:
+            return torch.full(
+                (input_ids.shape[0],),
+                backend.is_cancel_requested(),
+                dtype=torch.bool,
+                device=input_ids.device,
+            )
+
+    return StoppingCriteriaList([_CancelCriteria()])
 
 
 class FasterWhisperBackend(ProgressReporting):
@@ -526,7 +607,13 @@ class FasterWhisperBackend(ProgressReporting):
         prompt: str | None,
         language: str | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
-        segments = list(self.transcribe_segments(audio_path, prompt, language))
+        segments: list[dict[str, Any]] = []
+        # faster-whisper decodes lazily, so cancellation takes effect at the
+        # next segment boundary.
+        for segment in self.transcribe_segments(audio_path, prompt, language):
+            self.raise_if_cancelled()
+            segments.append(segment)
+        self.raise_if_cancelled()
         text = "".join(segment["text"] for segment in segments).strip()
         return text, segments
 
@@ -626,6 +713,9 @@ class OpenAICompatibleBackend(ProgressReporting):
             # The Audio Transcriptions API accepts the base language only.
             data["language"] = language.split("-", 1)[0]
         media_type = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
+        # An HTTP request in flight cannot be interrupted; the worker discards
+        # its result when the request was cancelled meanwhile.
+        self.raise_if_cancelled()
         try:
             with audio_path.open("rb") as audio:
                 response = self.client.post(

@@ -134,7 +134,7 @@ pub(crate) struct Services {
     app_context: Mutex<Option<types::AppContext>>,
     transcriber: Arc<dyn Transcriber>,
     input_monitor: Arc<InputMonitor>,
-    model: Mutex<ModelStatus>,
+    model: commands::ModelStatusSlot,
     gpu_diagnostics: Mutex<Option<GpuDiagnostics>>,
     lifecycle: PipelineLifecycle,
     initialization: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
@@ -147,6 +147,9 @@ pub(crate) struct Services {
     inactive_shortcuts: Mutex<Vec<String>>,
     settings_update: tokio::sync::Mutex<()>,
     microphone_test: tokio::sync::Mutex<MicrophoneTestState>,
+    /// Whether this app holds the Esc cancel chord. Locked before
+    /// `shortcut_routes` whenever both are needed.
+    cancel_chord_registered: Mutex<bool>,
 }
 
 impl Services {
@@ -166,7 +169,7 @@ impl Services {
                 ASR_MODEL_LOAD_TIMEOUT,
             )),
             input_monitor: Arc::new(InputMonitor::default()),
-            model: Mutex::new(ModelStatus {
+            model: commands::ModelStatusSlot::new(ModelStatus {
                 model_id,
                 installed: false,
                 state: "not_loaded".into(),
@@ -184,6 +187,7 @@ impl Services {
             inactive_shortcuts: Mutex::new(Vec::new()),
             settings_update: tokio::sync::Mutex::new(()),
             microphone_test: tokio::sync::Mutex::new(MicrophoneTestState::default()),
+            cancel_chord_registered: Mutex::new(false),
         }
     }
 
@@ -526,7 +530,9 @@ fn worker_runtime() -> (OsString, Option<PathBuf>) {
 }
 
 pub(crate) fn emit_state(app: &AppHandle, state: &AppState, phase: AppPhase, message: &str) {
-    recording_overlay::set_phase(app, &phase);
+    // The overlay is the feedback surface while the main window is hidden:
+    // an Error shows its message there instead of only reaching the windows.
+    recording_overlay::publish(app, &phase, message);
     let snapshot = state.transition(phase, Some(message.into()));
     let _ = app.emit("app-state", snapshot);
 }
@@ -1197,22 +1203,33 @@ fn cleanup_stale_artifacts(
 }
 
 async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode, trigger_chord: String) {
-    let phase = app.state::<Services>().lifecycle.phase();
-    let result = match phase {
-        PipelinePhase::Recording
-            if app.state::<Services>().lifecycle.mode() == Some(requested_mode) =>
-        {
-            commands::stop_recording(
+    let press = {
+        let lifecycle = &app.state::<Services>().inner().lifecycle;
+        shortcuts::press(lifecycle.phase(), lifecycle.mode(), requested_mode)
+    };
+    let result = match press {
+        shortcuts::Press::Stop => commands::stop_recording(
+            app.clone(),
+            app.state::<Services>(),
+            app.state::<AppState>(),
+            app.state::<Storage>(),
+        )
+        .await
+        .map(|_| ()),
+        shortcuts::Press::CancelStart => {
+            commands::cancel_recording(
                 app.clone(),
                 app.state::<Services>(),
                 app.state::<AppState>(),
                 app.state::<Storage>(),
             )
             .await
-            .map(|_| ())
         }
-        PipelinePhase::Recording => Err("another voice mode is already recording".into()),
-        PipelinePhase::Idle => match requested_mode {
+        shortcuts::Press::Busy(error) => {
+            recording_overlay::show_busy(&app, error);
+            Err(error.into())
+        }
+        shortcuts::Press::Start => match requested_mode {
             PipelineMode::Dictate => {
                 commands::start_recording_with_origin(
                     app.clone(),
@@ -1258,7 +1275,7 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode, trigger
                 .await
             }
         },
-        PipelinePhase::Starting | PipelinePhase::Processing => Ok(()),
+        shortcuts::Press::Ignore => Ok(()),
     };
     if let Err(error) = result {
         emit_status(&app, "error", &error);
@@ -1359,6 +1376,48 @@ async fn translate_selection(app: AppHandle) {
     }
 }
 
+/// Esc while a session is active: the same cancel as the windows' button.
+async fn cancel_voice_session(app: AppHandle) {
+    if let Err(error) = commands::cancel_recording(
+        app.clone(),
+        app.state::<Services>(),
+        app.state::<AppState>(),
+        app.state::<Storage>(),
+    )
+    .await
+    {
+        emit_status(&app, "error", &error);
+    }
+}
+
+/// Holds the Esc cancel chord exactly while the lifecycle is busy, so other
+/// apps receive Esc whenever no voice session is starting, recording, or
+/// processing.
+async fn follow_cancel_chord(app: AppHandle) {
+    let mut phases = app.state::<Services>().lifecycle.subscribe_phase();
+    while phases.changed().await.is_ok() {
+        let phase = *phases.borrow_and_update();
+        let services = app.state::<Services>();
+        // Settings saves update routes under the same lock (see
+        // `shortcuts::update_registrations_with_cancel_chord`).
+        let mut registered = services
+            .cancel_chord_registered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let wanted = services
+            .shortcut_routes
+            .lock()
+            .map(|routes| shortcuts::wants_cancel_chord(phase, &routes))
+            .unwrap_or(false);
+        shortcuts::sync_cancel_chord(
+            &mut registered,
+            wanted,
+            |chord| app.global_shortcut().register(chord),
+            |chord| app.global_shortcut().unregister(chord),
+        );
+    }
+}
+
 fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
     let route = app
         .state::<Services>()
@@ -1367,6 +1426,9 @@ fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
         .ok()
         .and_then(|routes| routes.find(shortcut).cloned());
     let Some(route) = route else {
+        if shortcut == shortcuts::cancel_chord() {
+            tauri::async_runtime::spawn(cancel_voice_session(app));
+        }
         return;
     };
     match route.action {
@@ -1516,6 +1578,7 @@ fn setup_app(
         .inactive_shortcuts
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = inactive;
+    tauri::async_runtime::spawn(follow_cancel_chord(app.handle().clone()));
     if cleanup_stale_artifacts(
         &std::env::temp_dir(),
         startup_cleanup_removes_captures(&settings, &repairs),
