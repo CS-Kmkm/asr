@@ -653,6 +653,18 @@ impl SettingsRepairs {
             .any(|repaired| repaired == key || repaired == UNREADABLE_ROW)
     }
 
+    /// Content-free names of the replaced fields, each once: JSON keys,
+    /// `shortcuts.<mode>`, or `unreadable` for the whole row.
+    pub fn fields(&self) -> Vec<String> {
+        let mut fields: Vec<String> = Vec::new();
+        for field in &self.0 {
+            if !fields.contains(field) {
+                fields.push(field.clone());
+            }
+        }
+        fields
+    }
+
     /// Whether exactly this field was replaced.
     fn replaced(&self, key: &str) -> bool {
         self.0.iter().any(|repaired| repaired == key)
@@ -881,11 +893,10 @@ fn repair_shortcut_routes(settings: &mut Settings, repairs: &mut SettingsRepairs
 /// the translation target) does not overwrite a newer build's choice. A
 /// value the user changed away from the fallback is written.
 ///
-/// Known limit: a deliberate choice that equals the fallback (for example
-/// picking `forever` while the stored value is unreadable) cannot be told
-/// apart from an unchanged field, so the stored value is kept. The startup
-/// notice and the skipped stale-WAV cleanup then repeat on every start until
-/// a value other than the fallback is chosen.
+/// A deliberate choice that equals the fallback (for example picking
+/// `forever` while the stored value is unreadable) cannot be told apart from
+/// an unchanged field here, so the stored value is kept. The user persists
+/// such a choice explicitly with `Storage::persist_repaired_settings`.
 fn merged_settings_json(settings: &Settings, stored: Option<&str>) -> Result<String, StorageError> {
     let stored = stored.and_then(|raw| match serde_json::from_str(raw) {
         Ok(serde_json::Value::Object(object)) => Some((raw, object)),
@@ -1193,6 +1204,59 @@ impl Storage {
             return Ok(());
         }
         back_up_settings_row(&connection, &raw, "unreadable_at_startup")
+    }
+
+    /// The fields of the stored settings this build currently replaces in
+    /// memory; empty when the row reads cleanly.
+    pub fn settings_repair_status(&self) -> Result<SettingsRepairs, StorageError> {
+        Ok(self.get_settings_with_repairs()?.1)
+    }
+
+    /// Persists the current in-memory values of exactly the replaced fields,
+    /// bypassing the unchanged-fallback rule of a normal save. Every other
+    /// stored field and every unknown key stays as it is. The previous row is
+    /// backed up first. Returns the settings now stored.
+    pub fn persist_repaired_settings(&self) -> Result<Settings, StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(raw) = stored_settings_row(&transaction)? else {
+            return Ok(Settings::default());
+        };
+        let loaded = load_settings(&raw);
+        if loaded.repairs.is_empty() {
+            return Ok(loaded.settings);
+        }
+        let current = serde_json::to_value(&loaded.settings)?;
+        let whole_row = loaded
+            .repairs
+            .0
+            .iter()
+            .any(|field| field == UNREADABLE_ROW || field == "all_fields");
+        let mut value = if whole_row {
+            current.clone()
+        } else if let Some(migrated) = &loaded.migrated {
+            migrated.clone()
+        } else {
+            serde_json::from_str(&raw)?
+        };
+        for field in loaded.repairs.fields() {
+            if let Some(mode) = field.strip_prefix("shortcuts.") {
+                if !value["shortcuts"].is_object() {
+                    value["shortcuts"] = current["shortcuts"].clone();
+                }
+                value["shortcuts"][mode] = current["shortcuts"][mode].clone();
+            } else if let Some(fallback) = current.get(&field) {
+                value[field.as_str()] = fallback.clone();
+            }
+        }
+        mirror_legacy_shortcut_keys(&mut value, &loaded.settings.shortcuts)?;
+        back_up_settings_row(&transaction, &raw, "repair_persisted")?;
+        transaction.execute(
+            "UPDATE settings SET value = ?1, updated_at = ?2 WHERE key = 'app_settings'",
+            params![serde_json::to_string(&value)?, Utc::now().to_rfc3339()],
+        )?;
+        transaction.commit()?;
+        Ok(loaded.settings)
     }
 
     /// Replaces the stored row `raw` with `migrated`, keeping `raw` in
@@ -3991,6 +4055,74 @@ mod tests {
         storage.update_settings(&Settings::default()).unwrap();
         storage.back_up_unreadable_settings().unwrap();
         assert!(settings_backups(&storage).is_empty());
+    }
+
+    #[test]
+    fn persisting_repaired_fields_writes_exactly_those_fields() {
+        let storage = Storage::in_memory().unwrap();
+        let mut row = newer_build_row();
+        row["futureSetting"] = serde_json::json!({"keep": true});
+        row["shortcuts"]["futureMode"] = serde_json::json!(["Ctrl+Alt+F"]);
+        row["theme"] = "dark".into();
+        let raw = row.to_string();
+        store_raw_settings(&storage, &raw);
+        let before = storage.get_settings().unwrap();
+        let mut repairs = storage.settings_repair_status().unwrap().fields();
+        repairs.sort();
+        assert_eq!(
+            repairs,
+            [
+                "deleteAudioAfterProcessing",
+                "historyRetention",
+                "shortcuts.ask"
+            ]
+        );
+        // A normal save of the same values keeps the unreadable originals.
+        storage.update_settings(&before).unwrap();
+        assert_eq!(
+            stored_settings_value(&storage)["historyRetention"],
+            "three_months"
+        );
+
+        let persisted = storage.persist_repaired_settings().unwrap();
+
+        assert_eq!(persisted, before);
+        let stored = stored_settings_value(&storage);
+        assert_eq!(stored["historyRetention"], "forever");
+        assert_eq!(stored["deleteAudioAfterProcessing"], true);
+        assert_eq!(
+            stored["shortcuts"]["ask"],
+            serde_json::json!(["Ctrl+Shift+A"])
+        );
+        assert_eq!(stored["askHotkey"], "Ctrl+Shift+A");
+        assert_eq!(stored["theme"], "dark");
+        assert_eq!(stored["futureSetting"]["keep"], true);
+        assert_eq!(stored["shortcuts"]["futureMode"][0], "Ctrl+Alt+F");
+        assert!(storage.settings_repair_status().unwrap().is_empty());
+        assert_eq!(storage.get_settings().unwrap(), before);
+        assert!(settings_backups(&storage)
+            .iter()
+            .any(|(value, _)| value.contains("three_months")));
+    }
+
+    #[test]
+    fn persisting_an_unreadable_row_stores_the_current_settings() {
+        let storage = Storage::in_memory().unwrap();
+        store_raw_settings(&storage, "not json");
+        let repairs = storage.settings_repair_status().unwrap();
+        assert_eq!(repairs.fields()[0], "unreadable");
+        assert!(repairs.contains("historyRetention"));
+
+        let persisted = storage.persist_repaired_settings().unwrap();
+
+        assert_eq!(persisted, fallback_settings());
+        assert!(storage.settings_repair_status().unwrap().is_empty());
+        assert_eq!(storage.get_settings().unwrap(), fallback_settings());
+        assert_eq!(settings_backups(&storage)[0].0, "not json");
+        // Nothing left to persist: a second call changes nothing.
+        let stored = stored_settings_raw(&storage);
+        storage.persist_repaired_settings().unwrap();
+        assert_eq!(stored_settings_raw(&storage), stored);
     }
 
     #[test]

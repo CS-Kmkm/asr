@@ -1611,6 +1611,8 @@ pub fn run() {
             commands::get_startup_hotkey_warning,
             commands::get_settings,
             commands::get_shortcut_warning,
+            commands::get_settings_repair_status,
+            commands::persist_repaired_settings,
             commands::get_model_status,
             commands::load_model,
             commands::get_gpu_diagnostics,
