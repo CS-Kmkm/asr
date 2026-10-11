@@ -1348,7 +1348,7 @@ pub(super) mod tests {
         delete_partial: Cell<bool>,
         /// False when SendInput queued none of the deletion.
         delete_accepted: Cell<bool>,
-        text_readable: Cell<bool>,
+        pub(crate) text_readable: Cell<bool>,
         selection_readable: Cell<bool>,
         paste_accepted: Cell<bool>,
         pending: RefCell<Option<String>>,

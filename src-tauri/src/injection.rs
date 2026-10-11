@@ -170,6 +170,67 @@ impl InsertionDetail {
 mod outcome_tests {
     use super::*;
 
+    fn reporting_injector(
+        options: InjectionOptions,
+    ) -> (
+        SystemTextInjector,
+        std::sync::Arc<std::sync::Mutex<test_backend::MockBackend>>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let mock = std::sync::Arc::new(std::sync::Mutex::new(test_backend::MockBackend::new()));
+        let reports = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut injector = SystemTextInjector::with_mock(std::sync::Arc::clone(&mock), options);
+        let counter = std::sync::Arc::clone(&reports);
+        injector.report_clipboard_loss_on_drop(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        (injector, mock, reports)
+    }
+
+    #[test]
+    fn an_early_return_after_a_copy_still_reports_the_lost_clipboard() {
+        // Ask's clarification or a missing translation language copies the
+        // text, then returns without an insertion notice.
+        let (injector, _mock, reports) = reporting_injector(InjectionOptions::default());
+        injector.copy_to_clipboard("clarification").unwrap();
+        drop(injector);
+        assert_eq!(reports.load(Ordering::SeqCst), 1);
+        // A completion that reported the loss itself is not repeated.
+        let (injector, _mock, reports) = reporting_injector(InjectionOptions::default());
+        injector.copy_to_clipboard("result").unwrap();
+        assert!(injector.take_clipboard_not_restored());
+        drop(injector);
+        assert_eq!(reports.load(Ordering::SeqCst), 0);
+        // With Restore clipboard off nothing was lost.
+        let (injector, _mock, reports) = reporting_injector(InjectionOptions {
+            restore_clipboard: false,
+        });
+        injector.copy_to_clipboard("result").unwrap();
+        drop(injector);
+        assert_eq!(reports.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_session_dropped_after_an_unconfirmed_paste_reports_the_lost_clipboard() {
+        // Cancelling or failing after a live or final paste was queued.
+        let (injector, mock, reports) = reporting_injector(InjectionOptions::default());
+        mock.lock().unwrap().text_readable.set(false);
+        assert_eq!(
+            injector.insert("draft", &test_backend::target()),
+            Ok(InsertResult::PasteUnverified)
+        );
+        drop(injector);
+        assert_eq!(reports.load(Ordering::SeqCst), 1);
+        // A confirmed paste that restored the clipboard has nothing to report.
+        let (injector, _mock, reports) = reporting_injector(InjectionOptions::default());
+        assert_eq!(
+            injector.insert("draft", &test_backend::target()),
+            Ok(InsertResult::ClipboardPaste)
+        );
+        drop(injector);
+        assert_eq!(reports.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn every_outcome_notice_names_a_lost_clipboard() {
         for outcome in [
@@ -294,6 +355,8 @@ impl Default for InjectionOptions {
 pub struct SystemTextInjector {
     backend: InjectorBackend,
     options: InjectionOptions,
+    /// Reports a lost user clipboard that no caller took before drop.
+    report_loss: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 #[cfg(not(test))]
@@ -320,6 +383,7 @@ impl SystemTextInjector {
         Self {
             backend: InjectorBackend::new(),
             options,
+            report_loss: None,
         }
     }
     /// Drives the batch mock target, so callers such as `LiveDraft` can be
@@ -335,6 +399,7 @@ impl SystemTextInjector {
                 mock: Some(mock),
             },
             options,
+            report_loss: None,
         }
     }
     /// Only an empty draft has no session. Every insertion outcome is retained
@@ -450,6 +515,17 @@ impl SystemTextInjector {
         self.backend.take_clipboard_not_restored()
     }
 
+    /// Calls `report` on drop if an attempt lost the user's clipboard and no
+    /// caller took that with `take_clipboard_not_restored`. Early returns
+    /// (cancellation, errors, a copy before returning) then cannot forget to
+    /// report it, while completions that report it themselves are not repeated.
+    pub(crate) fn report_clipboard_loss_on_drop(
+        &mut self,
+        report: impl FnOnce() + Send + Sync + 'static,
+    ) {
+        self.report_loss = Some(Box::new(report));
+    }
+
     /// Copies `text` as an outcome. With Restore clipboard on, an
     /// unpreservable clipboard is left untouched (`ClipboardProtected`).
     pub(crate) fn copy_to_clipboard(&self, text: &str) -> Result<(), InjectionError> {
@@ -520,6 +596,15 @@ impl SystemTextInjector {
             checkpoint,
             cancel,
         )
+    }
+}
+impl Drop for SystemTextInjector {
+    fn drop(&mut self) {
+        if let Some(report) = self.report_loss.take() {
+            if self.take_clipboard_not_restored() {
+                report();
+            }
+        }
     }
 }
 impl Default for SystemTextInjector {

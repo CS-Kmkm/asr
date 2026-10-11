@@ -704,16 +704,34 @@ async fn start_recording_mode(
     let mut live_slot = services.live.lock().await;
     let mut edit_slot = services.edit.lock().await;
     let mut ask_slot = services.ask.lock().await;
+    // Every session reports a lost clipboard on drop unless its completion
+    // already did, so cancellation and early returns cannot forget it.
+    let report_loss = || {
+        let app = app.clone();
+        move || report_clipboard_not_restored(&app)
+    };
     let draft = target.as_ref().map(|target| {
-        live_dictation::LiveDraft::new(
+        let mut draft = live_dictation::LiveDraft::new(
             target.clone(),
             &settings,
             active_hotkey,
             mode_shortcuts,
             from_shortcut,
             live_dictation::defers_target_insertion(mode, &settings),
-        )
+        );
+        draft.injector.report_clipboard_loss_on_drop(report_loss());
+        draft
     });
+    if let Some(session) = edit_session.as_mut() {
+        session
+            .injector
+            .report_clipboard_loss_on_drop(report_loss());
+    }
+    if let Some(session) = ask_session.as_mut() {
+        session
+            .injector
+            .report_clipboard_loss_on_drop(report_loss());
+    }
     let cancel = services.lifecycle.cancellation(operation_id)?;
     if let Some(session) = edit_session.as_ref() {
         session.monitor.observe_cancellation(Some(cancel.clone()));
