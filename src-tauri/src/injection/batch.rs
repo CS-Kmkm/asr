@@ -129,10 +129,13 @@ fn select_verified<B: Backend>(
 /// the caret was before Select(), when nothing else has changed the field.
 /// A selected draft left behind would be replaced whole by the user's next
 /// keystroke. Collapsing edits no text, so recent input does not block it.
+/// The empty caret a retracted draft left was never selected, so it is left
+/// alone.
 fn collapse_selected<B: Backend>(backend: &B, target: &TargetWindow, selected: &TargetText) {
-    if backend
-        .target_text(target)
-        .is_ok_and(|actual| actual.same_content(selected))
+    if !selected.selected.is_empty()
+        && backend
+            .target_text(target)
+            .is_ok_and(|actual| actual.same_content(selected))
     {
         let _ = backend.collapse_selection(target, selected);
     }
@@ -2040,6 +2043,31 @@ pub(super) mod tests {
         cancel(&backend, &mut session, &watcher);
         assert!(backend.calls.borrow().ends_with(&["select", "delete"]));
         assert!(!backend.calls.borrow().contains(&"collapse"));
+    }
+
+    #[test]
+    fn an_aborted_revision_after_retraction_does_not_touch_the_unselected_caret() {
+        let monitor = std::sync::Arc::new(monitor());
+        let mut backend = MockBackend::new();
+        let mut session = live_draft(&backend, &monitor, "draft");
+        retract(&backend, &mut session, &monitor).unwrap();
+        // Input arrives after the caret was confirmed, before the paste.
+        let interrupting = std::sync::Arc::clone(&monitor);
+        backend.on_snapshot = Some(Box::new(move |_| interrupting.test_record_input()));
+        assert_eq!(
+            update(
+                &backend,
+                InjectionOptions::default(),
+                &mut session,
+                "next",
+                &monitor,
+                false,
+            )
+            .unwrap(),
+            InsertResult::ClipboardOnly
+        );
+        assert_eq!(backend.content(), "prefix  suffix");
+        assert_eq!(calls(&backend, "collapse"), 0);
     }
 
     #[test]
