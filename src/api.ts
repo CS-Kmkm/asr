@@ -140,6 +140,20 @@ export async function getShortcutWarning(): Promise<string[]> {
   return invoke("get_shortcut_warning");
 }
 
+// Content-free names of stored settings fields this version replaces with
+// fallback values in memory ("unreadable" for the whole row).
+export async function getSettingsRepairStatus(): Promise<string[]> {
+  if (!inTauri) return [];
+  return invoke("get_settings_repair_status");
+}
+
+// Saves the values shown now for those fields; returns the fields still
+// replaced afterwards.
+export async function persistRepairedSettings(): Promise<string[]> {
+  if (!inTauri) return [];
+  return invoke("persist_repaired_settings");
+}
+
 export async function updateSettings(settings: Settings): Promise<Settings> {
   if (!inTauri) return settings;
   return invoke("update_settings", { settings });

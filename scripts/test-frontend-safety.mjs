@@ -158,7 +158,7 @@ async function settingsAlerts(inactive) {
     react: statefulHooks,
     "@tauri-apps/api/event": {},
     "../components/ui": { SettingRow: "row", Toggle: "toggle" },
-    "../components/AiCorrectionSettings": { AiCorrectionSettings: "correction" },
+    "../components/AiCorrectionSettings": { AiCorrectionSettings: "correction" }, "../components/SettingsRepairBanner": { SettingsRepairBanner: "repair-banner" },
     "../types": registries,
     "../api": { getShortcutWarning: async () => inactive },
     "../i18n": { ...i18n, translateAppMessage: (_language, message) => message },

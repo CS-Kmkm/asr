@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { SettingRow, Toggle } from "../components/ui";
 import { AiCorrectionSettings } from "../components/AiCorrectionSettings";
+import { SettingsRepairBanner } from "../components/SettingsRepairBanner";
 import type { AudioDevice, AudioLevel, ScopedStyleProfile, Settings, ShortcutMode, StyleProfile } from "../types";
 import { speechLocaleRegistry, uiLocaleRegistry } from "../types";
 import { getShortcutWarning, startMicrophoneTest, stopMicrophoneTest } from "../api";
@@ -283,6 +284,7 @@ export function SettingsPage({
 
   return (
     <div className="settings-stack">
+      <SettingsRepairBanner />
       <section className="panel">
         <h2>{t("Input settings")}</h2>
         <SettingRow title={t("Language")} detail={t("Choose the language used by the app interface.")}
