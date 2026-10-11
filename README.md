@@ -13,7 +13,13 @@ AI correction, the final text is pasted once into the captured target with the
 clipboard and Ctrl+V. When the target's text can be read through UI Automation,
 the paste is verified and (with **Restore clipboard** on) the previous
 clipboard is restored; otherwise one
-guarded paste is sent unverified. Clicking, scrolling, or typing while you
+guarded paste is sent unverified. With **Restore clipboard** on, the clipboard
+is saved before it is first written; if it holds data that cannot be saved
+(such as a very large image), nothing is pasted or copied and the result stays
+in the app (and History, when on) instead. Whenever the result is left on the clipboard
+(a copy instead of a paste, an unconfirmed paste, or a restore that failed),
+the notice says the previous clipboard was not restored. With it off, the
+clipboard is simply replaced. Clicking, scrolling, or typing while you
 speak or while the text is being recognized does not prevent insertion: before
 pasting, the app waits until input has been quiet for a moment (up to five
 seconds) and the field that was focused when recording started is focused

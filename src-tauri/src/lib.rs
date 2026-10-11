@@ -12,6 +12,7 @@ mod live_dictation;
 mod personalization;
 mod recording_overlay;
 mod shortcuts;
+mod startup_error;
 mod state;
 mod storage;
 mod types;
@@ -42,7 +43,7 @@ use injection::{
 };
 use input_monitor::InputMonitor;
 use state::{AppState, PipelineLifecycle, PipelineMode, PipelinePhase};
-use storage::Storage;
+use storage::{SettingsRepairs, Storage};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
@@ -133,7 +134,7 @@ pub(crate) struct Services {
     app_context: Mutex<Option<types::AppContext>>,
     transcriber: Arc<dyn Transcriber>,
     input_monitor: Arc<InputMonitor>,
-    model: Mutex<ModelStatus>,
+    model: commands::ModelStatusSlot,
     gpu_diagnostics: Mutex<Option<GpuDiagnostics>>,
     lifecycle: PipelineLifecycle,
     initialization: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
@@ -146,6 +147,9 @@ pub(crate) struct Services {
     inactive_shortcuts: Mutex<Vec<String>>,
     settings_update: tokio::sync::Mutex<()>,
     microphone_test: tokio::sync::Mutex<MicrophoneTestState>,
+    /// Whether this app holds the Esc cancel chord. Locked before
+    /// `shortcut_routes` whenever both are needed.
+    cancel_chord_registered: Mutex<bool>,
 }
 
 impl Services {
@@ -165,7 +169,7 @@ impl Services {
                 ASR_MODEL_LOAD_TIMEOUT,
             )),
             input_monitor: Arc::new(InputMonitor::default()),
-            model: Mutex::new(ModelStatus {
+            model: commands::ModelStatusSlot::new(ModelStatus {
                 model_id,
                 installed: false,
                 state: "not_loaded".into(),
@@ -183,6 +187,7 @@ impl Services {
             inactive_shortcuts: Mutex::new(Vec::new()),
             settings_update: tokio::sync::Mutex::new(()),
             microphone_test: tokio::sync::Mutex::new(MicrophoneTestState::default()),
+            cancel_chord_registered: Mutex::new(false),
         }
     }
 
@@ -290,13 +295,11 @@ impl AskSession {
                 AskCapture::Selected(selection)
             }
             Ok(_) => AskCapture::Unavailable,
-            Err(injection::InjectionError::BackendFailure("no text is selected")) => {
-                match injector.capture_target() {
-                    Ok(target) if is_external_ask_target(&target) => AskCapture::Caret(target),
-                    Ok(_) => AskCapture::Unavailable,
-                    Err(_) => AskCapture::Unavailable,
-                }
-            }
+            Err(injection::InjectionError::NoSelection) => match injector.capture_target() {
+                Ok(target) if is_external_ask_target(&target) => AskCapture::Caret(target),
+                Ok(_) => AskCapture::Unavailable,
+                Err(_) => AskCapture::Unavailable,
+            },
             Err(_) => AskCapture::Unavailable,
         };
         let monitor = match &capture {
@@ -525,7 +528,9 @@ fn worker_runtime() -> (OsString, Option<PathBuf>) {
 }
 
 pub(crate) fn emit_state(app: &AppHandle, state: &AppState, phase: AppPhase, message: &str) {
-    recording_overlay::set_phase(app, &phase);
+    // The overlay is the feedback surface while the main window is hidden:
+    // an Error shows its message there instead of only reaching the windows.
+    recording_overlay::publish(app, &phase, message);
     let snapshot = state.transition(phase, Some(message.into()));
     let _ = app.emit("app-state", snapshot);
 }
@@ -1126,6 +1131,36 @@ mod model_configuration_tests {
     }
 
     #[test]
+    fn settings_fallback_notice_is_translated() {
+        let catalog = include_str!("../../src/i18n.tsx");
+        let key = format!("\"{SETTINGS_FALLBACK_MESSAGE}\"");
+        // English and Japanese catalogs plus the backend message list.
+        assert_eq!(catalog.matches(&key).count(), 4);
+    }
+
+    #[test]
+    fn startup_cleanup_keeps_captures_when_the_audio_setting_was_unreadable() {
+        let storage = Storage::in_memory().unwrap();
+        let settings = Settings::default();
+        let (_, clean) = storage.get_settings_with_repairs().unwrap();
+        assert!(startup_cleanup_removes_captures(&settings, &clean));
+        assert!(!startup_cleanup_removes_captures(
+            &Settings {
+                delete_audio_after_processing: false,
+                ..Settings::default()
+            },
+            &clean
+        ));
+
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        value["deleteAudioAfterProcessing"] = "yes".into();
+        storage.store_raw_settings_for_test(&value.to_string());
+        let (repaired, repairs) = storage.get_settings_with_repairs().unwrap();
+        assert!(repaired.delete_audio_after_processing);
+        assert!(!startup_cleanup_removes_captures(&repaired, &repairs));
+    }
+
+    #[test]
     fn stale_artifact_removal_decision_respects_legacy_keep_audio_setting() {
         assert!(removes_stale_artifact(StaleArtifactKind::Capture, true));
         assert!(!removes_stale_artifact(StaleArtifactKind::Capture, false));
@@ -1161,6 +1196,20 @@ enum StaleArtifactKind {
     Capture,
     /// A guarded History Retry copy. It is always cleanup-owned.
     RetryCopy,
+}
+
+/// Status kind and fixed (content-free) text of the startup notice shown
+/// when some stored settings could not be read. Keep the text in sync with
+/// `src/i18n.tsx`.
+const SETTINGS_FALLBACK_STATUS_KIND: &str = "settings_fallback";
+const SETTINGS_FALLBACK_MESSAGE: &str = "Some settings could not be read, so defaults are used for them. The stored settings were not changed.";
+
+/// Whether the startup cleanup may delete stale capture WAVs. Older builds
+/// kept them when "Delete audio after processing" was off, so a stored value
+/// this build could not read (and replaced with the privacy default) must not
+/// delete what may be the only copy of a recording.
+fn startup_cleanup_removes_captures(settings: &Settings, repairs: &SettingsRepairs) -> bool {
+    settings.delete_audio_after_processing && !repairs.contains("deleteAudioAfterProcessing")
 }
 
 fn removes_stale_artifact(kind: StaleArtifactKind, delete_audio_after_processing: bool) -> bool {
@@ -1247,22 +1296,33 @@ fn cleanup_stale_artifacts(
 }
 
 async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode, trigger_chord: String) {
-    let phase = app.state::<Services>().lifecycle.phase();
-    let result = match phase {
-        PipelinePhase::Recording
-            if app.state::<Services>().lifecycle.mode() == Some(requested_mode) =>
-        {
-            commands::stop_recording(
+    let press = {
+        let lifecycle = &app.state::<Services>().inner().lifecycle;
+        shortcuts::press(lifecycle.phase(), lifecycle.mode(), requested_mode)
+    };
+    let result = match press {
+        shortcuts::Press::Stop => commands::stop_recording(
+            app.clone(),
+            app.state::<Services>(),
+            app.state::<AppState>(),
+            app.state::<Storage>(),
+        )
+        .await
+        .map(|_| ()),
+        shortcuts::Press::CancelStart => {
+            commands::cancel_recording(
                 app.clone(),
                 app.state::<Services>(),
                 app.state::<AppState>(),
                 app.state::<Storage>(),
             )
             .await
-            .map(|_| ())
         }
-        PipelinePhase::Recording => Err("another voice mode is already recording".into()),
-        PipelinePhase::Idle => match requested_mode {
+        shortcuts::Press::Busy(error) => {
+            recording_overlay::show_busy(&app, error);
+            Err(error.into())
+        }
+        shortcuts::Press::Start => match requested_mode {
             PipelineMode::Dictate => {
                 commands::start_recording_with_origin(
                     app.clone(),
@@ -1308,7 +1368,7 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode, trigger
                 .await
             }
         },
-        PipelinePhase::Starting | PipelinePhase::Processing => Ok(()),
+        shortcuts::Press::Ignore => Ok(()),
     };
     if let Err(error) = result {
         emit_status(&app, "error", &error);
@@ -1378,34 +1438,127 @@ async fn translate_selection(app: AppHandle) {
     let translated = match translated {
         Ok(text) => text,
         Err(_) => {
-            let copied = injector.copy_to_clipboard(&source).is_ok();
-            let message = if copied {
-                "Translation failed; the selected text remains on the clipboard."
-            } else {
-                "Translation failed and the clipboard is unavailable."
-            };
-            emit_status(&app, "error", message);
+            // The selection is unchanged, so there is nothing to recover and
+            // no reason to overwrite the user's clipboard with its source.
+            emit_status(&app, "error", TRANSLATION_FAILED_SELECTION_UNCHANGED);
             return;
         }
     };
     match injector.replace_selection(&selection, &translated, &monitor, checkpoint) {
-        Ok(InsertResult::ClipboardOnly | InsertResult::PasteUnverified) => {
-            emit_status(
-                &app,
-                "error",
-                "The target changed; the translation remains on the clipboard.",
-            );
+        Ok(result) => {
+            let (kind, message) = selection_translation_status(result);
+            emit_status(&app, kind, message);
         }
         Err(_) => {
-            let copied = injector.copy_to_clipboard(&translated).is_ok();
-            let message = if copied {
-                "The target changed; the translation remains on the clipboard."
+            if injector.copy_to_clipboard(&translated).is_ok() {
+                emit_status(
+                    &app,
+                    "error",
+                    "The target changed; the translation remains on the clipboard.",
+                );
             } else {
-                "The target changed and the clipboard is unavailable."
-            };
-            emit_status(&app, "error", message);
+                // Not inserted, and the clipboard was unavailable or protected
+                // under Restore clipboard: keep the translation in this app.
+                let state = app.state::<AppState>();
+                let _ = app.emit("app-state", state.publish_result(translated));
+                emit_status(&app, "error", TRANSLATION_KEPT_IN_APP);
+            }
         }
-        Ok(InsertResult::ClipboardPaste) => emit_status(&app, "success", "Translation inserted."),
+    }
+    if injector.take_clipboard_not_restored() {
+        commands::report_clipboard_not_restored(&app);
+    }
+}
+
+const TRANSLATION_KEPT_IN_APP: &str =
+    "The translation could not be inserted or copied to the clipboard; it is available in this app.";
+
+const TRANSLATION_FAILED_SELECTION_UNCHANGED: &str =
+    "Translation failed; the selected text was not changed.";
+
+/// Status kind and message for a selected-text translation outcome. A paste
+/// that was sent but not confirmed may already have replaced the selection,
+/// so it must not read as a target change that invites a second paste.
+fn selection_translation_status(result: InsertResult) -> (&'static str, &'static str) {
+    match result {
+        InsertResult::ClipboardPaste => ("success", "Translation inserted."),
+        InsertResult::PasteUnverified => (
+            "paste_unverified",
+            "Translation pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard).",
+        ),
+        InsertResult::ClipboardOnly => (
+            "error",
+            "The target changed; the translation remains on the clipboard.",
+        ),
+    }
+}
+
+#[cfg(test)]
+mod selection_translation_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_translation_does_not_claim_the_clipboard() {
+        assert!(!TRANSLATION_FAILED_SELECTION_UNCHANGED.contains("clipboard"));
+        assert!(TRANSLATION_KEPT_IN_APP.contains("available in this app"));
+    }
+
+    #[test]
+    fn an_unverified_paste_is_not_reported_as_a_target_change() {
+        let (kind, message) = selection_translation_status(InsertResult::PasteUnverified);
+        assert_eq!(kind, "paste_unverified");
+        assert!(!message.contains("target changed"), "{message}");
+        assert!(message.contains("only if the text did not appear"));
+        assert_eq!(
+            selection_translation_status(InsertResult::ClipboardOnly).1,
+            "The target changed; the translation remains on the clipboard."
+        );
+        assert_eq!(
+            selection_translation_status(InsertResult::ClipboardPaste),
+            ("success", "Translation inserted.")
+        );
+    }
+}
+
+/// Esc while a session is active: the same cancel as the windows' button.
+async fn cancel_voice_session(app: AppHandle) {
+    if let Err(error) = commands::cancel_recording(
+        app.clone(),
+        app.state::<Services>(),
+        app.state::<AppState>(),
+        app.state::<Storage>(),
+    )
+    .await
+    {
+        emit_status(&app, "error", &error);
+    }
+}
+
+/// Holds the Esc cancel chord exactly while the lifecycle is busy, so other
+/// apps receive Esc whenever no voice session is starting, recording, or
+/// processing.
+async fn follow_cancel_chord(app: AppHandle) {
+    let mut phases = app.state::<Services>().lifecycle.subscribe_phase();
+    while phases.changed().await.is_ok() {
+        let phase = *phases.borrow_and_update();
+        let services = app.state::<Services>();
+        // Settings saves update routes under the same lock (see
+        // `shortcuts::update_registrations_with_cancel_chord`).
+        let mut registered = services
+            .cancel_chord_registered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let wanted = services
+            .shortcut_routes
+            .lock()
+            .map(|routes| shortcuts::wants_cancel_chord(phase, &routes))
+            .unwrap_or(false);
+        shortcuts::sync_cancel_chord(
+            &mut registered,
+            wanted,
+            |chord| app.global_shortcut().register(chord),
+            |chord| app.global_shortcut().unregister(chord),
+        );
     }
 }
 
@@ -1417,6 +1570,9 @@ fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
         .ok()
         .and_then(|routes| routes.find(shortcut).cloned());
     let Some(route) = route else {
+        if shortcut == shortcuts::cancel_chord() {
+            tauri::async_runtime::spawn(cancel_voice_session(app));
+        }
         return;
     };
     match route.action {
@@ -1491,6 +1647,124 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
+fn setup_app(
+    app: &mut tauri::App,
+    log_dir: Option<&Path>,
+    startup_diagnostics: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Must precede the first worker spawn (initialize_model_runtime).
+    // A missing log directory only loses diagnostics, never startup.
+    if let Some(directory) = log_dir {
+        if worker_log::install(directory).is_ok() {
+            worker_log::record_app_start(startup_diagnostics);
+        }
+    }
+    let storage = Storage::open(&database_path(app.handle())?)?;
+    // Best effort: keep the original of a row this build cannot fully read
+    // before anything else touches it.
+    let _ = storage.back_up_unreadable_settings();
+    storage.enforce_current_history_policy()?;
+    let (settings, repairs) = storage.get_settings_with_repairs()?;
+    if !repairs.is_empty() {
+        // Once per start: later reads use the same in-memory fallbacks.
+        emit_status(
+            app.handle(),
+            SETTINGS_FALLBACK_STATUS_KIND,
+            SETTINGS_FALLBACK_MESSAGE,
+        );
+    }
+    // The autostart plugin registers the currently running executable.
+    // A development executable depends on Vite's dev server and cannot
+    // run on its own at Windows sign-in, so it must never replace the
+    // registration created by an installed/release build.
+    // enable() rewrites the Run entry on every start, which also adds
+    // --autostart to entries registered before the argument existed.
+    // A stored value this build could not read leaves the entry as it is.
+    #[cfg(not(debug_assertions))]
+    if !repairs.contains("autoStart") {
+        let autostart_result = if settings.auto_start {
+            app.autolaunch().enable()
+        } else {
+            app.autolaunch().disable()
+        };
+        if let Err(error) = autostart_result {
+            emit_status(
+                app.handle(),
+                "autostart_update_failed",
+                &format!("Autostart update failed: {error}"),
+            );
+        }
+    }
+    let (routes, shadowed) = shortcuts::Routes::parse_saved_with_shadowed(&settings)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    app.manage(storage);
+    app.manage(AppState::default());
+    app.manage(Services::new(&settings));
+    recording_overlay::create(app.handle())?;
+    answer_panel::create(app.handle())?;
+    // Collision losers stay inactive until reassigned (older action
+    // keeps the chord); the warning names them with refused chords.
+    let mut inactive: Vec<String> = shadowed.iter().map(shortcuts::Route::describe).collect();
+    let (active_routes, failures) =
+        shortcuts::register_available(&routes, |chord| app.global_shortcut().register(chord));
+    *app.state::<Services>()
+        .shortcut_routes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = active_routes;
+    if !failures.is_empty() {
+        emit_status(app.handle(), "shortcut_registration_failed", "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.");
+    }
+    for (route, error) in failures {
+        eprintln!("Shortcut registration failed for {}: {error}", route.text);
+        inactive.push(route.describe());
+    }
+    *app.state::<Services>()
+        .inactive_shortcuts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = inactive;
+    tauri::async_runtime::spawn(follow_cancel_chord(app.handle().clone()));
+    if cleanup_stale_artifacts(
+        &std::env::temp_dir(),
+        removes_stale_captures(
+            startup_cleanup_removes_captures(&settings, &repairs),
+            current_build_uses_release_data(),
+        ),
+    )
+    .is_err()
+    {
+        emit_status(
+            app.handle(),
+            "artifact_cleanup_failed",
+            "Stale temporary audio cleanup failed.",
+        );
+    }
+
+    let show = MenuItem::with_id(app, "show", "Open Local Voice Input", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    TrayIconBuilder::new()
+        .menu(&menu)
+        .tooltip("Local Voice Input")
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => show_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .build(app)?;
+    // The main window is configured hidden so a sign-in launch stays in
+    // the tray; every other launch shows it.
+    if !launched_by_autostart(std::env::args_os()) {
+        show_main_window(app.handle());
+    }
+    let app_handle = app.handle().clone();
+    let initialization =
+        tauri::async_runtime::spawn(initialize_model_runtime(app_handle, settings));
+    if let Ok(mut task) = app.state::<Services>().initialization.lock() {
+        *task = Some(initialization);
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let startup_diagnostics = load_environment_file();
@@ -1524,96 +1798,11 @@ pub fn run() {
                 .build(),
         )
         .setup(move |app| {
-            // Must precede the first worker spawn (initialize_model_runtime).
-            // A missing log directory only loses diagnostics, never startup.
-            if let Ok(directory) = app.path().app_log_dir() {
-                if worker_log::install(&directory).is_ok() {
-                    worker_log::record_app_start(&startup_diagnostics);
-                }
-            }
-            let storage = Storage::open(&database_path(app.handle())?)?;
-            storage.enforce_current_history_policy()?;
-            let settings = storage.get_settings()?;
-            // The autostart plugin registers the currently running executable.
-            // A development executable depends on Vite's dev server and cannot
-            // run on its own at Windows sign-in, so it must never replace the
-            // registration created by an installed/release build.
-            // enable() rewrites the Run entry on every start, which also adds
-            // --autostart to entries registered before the argument existed.
-            #[cfg(not(debug_assertions))]
-            {
-                let autostart_result = if settings.auto_start {
-                    app.autolaunch().enable()
-                } else {
-                    app.autolaunch().disable()
-                };
-                if let Err(error) = autostart_result {
-                    emit_status(
-                        app.handle(),
-                        "autostart_update_failed",
-                        &format!("Autostart update failed: {error}"),
-                    );
-                }
-            }
-            let (routes, shadowed) = shortcuts::Routes::parse_saved_with_shadowed(&settings)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-            app.manage(storage);
-            app.manage(AppState::default());
-            app.manage(Services::new(&settings));
-            recording_overlay::create(app.handle())?;
-            answer_panel::create(app.handle())?;
-            // Collision losers stay inactive until reassigned (older action
-            // keeps the chord); the warning names them with refused chords.
-            let mut inactive: Vec<String> = shadowed.iter().map(shortcuts::Route::describe).collect();
-            let (active_routes, failures) = shortcuts::register_available(&routes, |chord| app.global_shortcut().register(chord));
-            *app.state::<Services>().shortcut_routes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = active_routes;
-            if !failures.is_empty() {
-                emit_status(app.handle(), "shortcut_registration_failed", "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.");
-            }
-            for (route, error) in failures {
-                eprintln!("Shortcut registration failed for {}: {error}", route.text);
-                inactive.push(route.describe());
-            }
-            *app.state::<Services>().inactive_shortcuts.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = inactive;
-            if cleanup_stale_artifacts(
-                &std::env::temp_dir(),
-                removes_stale_captures(
-                    settings.delete_audio_after_processing,
-                    current_build_uses_release_data(),
-                ),
-            )
-            .is_err()
-            {
-                emit_status(
-                    app.handle(),
-                    "artifact_cleanup_failed",
-                    "Stale temporary audio cleanup failed.",
-                );
-            }
-
-            let show =
-                MenuItem::with_id(app, "show", "Open Local Voice Input", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &quit])?;
-            TrayIconBuilder::new()
-                .menu(&menu)
-                .tooltip("Local Voice Input")
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => show_main_window(app),
-                    "quit" => app.exit(0),
-                    _ => {}
-                })
-                .build(app)?;
-            // The main window is configured hidden so a sign-in launch stays in
-            // the tray; every other launch shows it.
-            if !launched_by_autostart(std::env::args_os()) {
-                show_main_window(app.handle());
-            }
-            let app_handle = app.handle().clone();
-            let initialization =
-                tauri::async_runtime::spawn(initialize_model_runtime(app_handle, settings));
-            if let Ok(mut task) = app.state::<Services>().initialization.lock() {
-                *task = Some(initialization);
+            // Tauri runs this inside the event loop and panics on an error,
+            // which would end the tray app without any visible sign.
+            let log_dir = app.path().app_log_dir().ok();
+            if let Err(error) = setup_app(app, log_dir.as_deref(), &startup_diagnostics) {
+                startup_error::report_and_exit(error.as_ref(), log_dir.as_deref());
             }
             Ok(())
         })
@@ -1632,6 +1821,8 @@ pub fn run() {
             commands::get_startup_hotkey_warning,
             commands::get_settings,
             commands::get_shortcut_warning,
+            commands::get_settings_repair_status,
+            commands::persist_repaired_settings,
             commands::get_model_status,
             commands::load_model,
             commands::get_gpu_diagnostics,
@@ -1700,7 +1891,7 @@ pub fn run() {
             }
         })
         .build(tauri::generate_context!())
-        .expect("error while building Local Voice Input")
+        .unwrap_or_else(|error| startup_error::report_and_exit(&error, None))
         .run(|app, event| {
             if let RunEvent::ExitRequested { api, code, .. } = event {
                 let services = app.state::<Services>();

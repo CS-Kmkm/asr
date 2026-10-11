@@ -62,6 +62,7 @@ import {
   I18nProvider,
   insertionDetailLabels,
   insertionOutcomeNotices,
+  isAppMessage,
   translate,
   translateAppMessage,
   useI18n,
@@ -127,6 +128,27 @@ interface InsertionNoticeEvent {
 
 // Matches the backend timer that hides the overlay window.
 const INSERTION_NOTICE_MS = 5_000;
+
+// The Processing message of a hotkey start that waits for the speech model.
+const PREPARING_SPEECH_MODEL = "Preparing the speech model. Recording starts when it is ready.";
+
+// A failure or warning sentence from the backend, shown while the main
+// window may be hidden. The backend chooses how long it stays up.
+interface OverlayMessageEvent {
+  severity: "failure" | "warning";
+  message: string;
+  durationMs: number;
+}
+
+// A refused hotkey press, flashed inside the live view without replacing it.
+interface OverlayHintEvent {
+  message: string;
+  durationMs: number;
+}
+
+type OverlayNotice =
+  | ({ kind: "insertion" } & InsertionNoticeEvent)
+  | ({ kind: "message" } & OverlayMessageEvent);
 
 const translationLanguageKeys: Record<string, MessageKey> = {
   en: "English",
@@ -244,15 +266,29 @@ function RecordingOverlay() {
     mode: "dictate",
     targetLanguage: null,
   });
-  const [notice, setNotice] = useState<InsertionNoticeEvent | null>(null);
+  const [notice, setNotice] = useState<OverlayNotice | null>(null);
   const noticeTimer = useRef<number | undefined>(undefined);
+  const [hint, setHint] = useState<string | null>(null);
+  const hintTimer = useRef<number | undefined>(undefined);
 
   useEffect(() => {
+    // The latest notice replaces any earlier one, like the backend window.
+    const showNotice = (next: OverlayNotice, durationMs: number) => {
+      window.clearTimeout(noticeTimer.current);
+      setNotice(next);
+      noticeTimer.current = window.setTimeout(() => setNotice(null), durationMs);
+    };
     const listeners = Promise.all([
       listen<InsertionNoticeEvent>("insertion-notice", ({ payload }) => {
-        window.clearTimeout(noticeTimer.current);
-        setNotice(payload);
-        noticeTimer.current = window.setTimeout(() => setNotice(null), INSERTION_NOTICE_MS);
+        showNotice({ kind: "insertion", ...payload }, INSERTION_NOTICE_MS);
+      }),
+      listen<OverlayMessageEvent>("overlay-message", ({ payload }) => {
+        showNotice({ kind: "message", ...payload }, payload.durationMs);
+      }),
+      listen<OverlayHintEvent>("overlay-hint", ({ payload }) => {
+        window.clearTimeout(hintTimer.current);
+        setHint(payload.message);
+        hintTimer.current = window.setTimeout(() => setHint(null), payload.durationMs);
       }),
       listen<AudioLevel>("audio-level", ({ payload }) => {
         const rms = Number.isFinite(payload.rms) ? payload.rms : 0;
@@ -273,7 +309,9 @@ function RecordingOverlay() {
           setNotice(null);
         } else if (
           payload.phase === "processing" &&
-          (payload.message?.startsWith("Stopping") || payload.message?.startsWith("Transcribing"))
+          (payload.message === PREPARING_SPEECH_MODEL ||
+            payload.message?.startsWith("Stopping") ||
+            payload.message?.startsWith("Transcribing"))
         ) {
           setPreview(null);
         }
@@ -292,14 +330,34 @@ function RecordingOverlay() {
 
     return () => {
       window.clearTimeout(noticeTimer.current);
+      window.clearTimeout(hintTimer.current);
       void listeners.then((unlisten) => unlisten.forEach((fn) => fn()));
     };
   }, []);
 
-  if (phase !== "recording" && phase !== "processing" && phase !== "injecting" && notice) {
-    const failed = notice.outcome === "insertion_failed";
+  if (phase !== "recording" && phase !== "processing" && phase !== "injecting" && notice?.kind === "message") {
+    const failed = notice.severity === "failure";
+    return (
+      <div className={`recording-overlay notice message${failed ? " failed" : ""}`} role="alert" aria-live="assertive">
+        <span className="notice-mark" aria-hidden="true" />
+        <div className="processing-copy">
+          <span className="recording-overlay-label">{t(failed ? "Not completed" : "Completed with a warning")}</span>
+          <span className="notice-detail">
+            {isAppMessage(notice.message)
+              ? translateAppMessage(language, notice.message)
+              : t("Open the app window for details.")}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  if (phase !== "recording" && phase !== "processing" && phase !== "injecting" && notice?.kind === "insertion") {
+    // A lost previous clipboard does not change how the insertion went.
+    const outcome = notice.outcome.replace(/_not_restored$/, "");
+    const failed = outcome === "insertion_failed";
     // The paste was sent; only its confirmation is unavailable in this field.
-    const sent = notice.outcome === "paste_unverified";
+    const sent = outcome === "paste_unverified";
     const outcomeKey = insertionOutcomeNotices[notice.outcome];
     const detailKey = notice.detail ? insertionDetailLabels[notice.detail] : undefined;
     return (
@@ -313,12 +371,30 @@ function RecordingOverlay() {
     );
   }
 
+  // Cancels like Esc: nothing is inserted. Clicking never focuses the overlay.
+  const cancelButton = (
+    <button
+      className="overlay-cancel"
+      type="button"
+      title={t("Cancel (Esc)")}
+      aria-label={t("Cancel (Esc)")}
+      onClick={() => void cancelRecording().catch(() => undefined)}
+    >
+      ×
+    </button>
+  );
+
   if (phase === "recording") {
     return (
       <div className="recording-overlay recording" role="status" aria-label={t("Recording in progress")}>
         <span className="recording-live-dot" aria-hidden="true" />
-        <span className="recording-overlay-label">
-          {voiceMode.mode === "translate"
+        <span
+          className={`recording-overlay-label${hint ? " overlay-hint" : ""}`}
+          role={hint ? "alert" : undefined}
+        >
+          {hint
+            ? translateAppMessage(language, hint)
+            : voiceMode.mode === "translate"
             ? t("Translating")
             : voiceMode.mode === "edit"
               ? t("Editing")
@@ -347,6 +423,7 @@ function RecordingOverlay() {
             {t(translationLanguageKeys[voiceMode.targetLanguage] ?? "Language")} ↻
           </button>
         )}
+        {cancelButton}
       </div>
     );
   }
@@ -354,7 +431,11 @@ function RecordingOverlay() {
   if (phase !== "processing" && phase !== "injecting") return null;
 
   const compactPreview = compactOverlayPreview(preview?.text ?? "");
-  const label = voiceMode.mode === "ask"
+  // A start waiting for the model has not published its voice mode yet.
+  const preparing = message === PREPARING_SPEECH_MODEL;
+  const label = preparing
+    ? t("Preparing speech model")
+    : voiceMode.mode === "ask"
     ? t("Ask Anything")
     : voiceMode.mode === "edit"
     ? t("Editing")
@@ -379,10 +460,13 @@ function RecordingOverlay() {
       <span className="processing-spinner" aria-hidden="true" />
       <div className="processing-copy">
         <span className="recording-overlay-label">{label}</span>
-        <span className={`correction-preview${compactPreview ? "" : " pending"}`}>
-          {compactPreview || translateAppMessage(language, message) || t("Preparing text…")}
+        <span className={`correction-preview${compactPreview && !preparing ? "" : " pending"}`}>
+          {preparing
+            ? t("Starts when ready")
+            : compactPreview || translateAppMessage(language, message) || t("Preparing text…")}
         </span>
       </div>
+      {phase === "processing" && cancelButton}
     </div>
   );
 }

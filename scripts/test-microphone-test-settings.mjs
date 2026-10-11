@@ -60,7 +60,7 @@ function fixture() {
       },
     },
     "../components/ui": { SettingRow: "row", Toggle: "toggle" },
-    "../components/AiCorrectionSettings": { AiCorrectionSettings: "correction" },
+    "../components/AiCorrectionSettings": { AiCorrectionSettings: "correction" }, "../components/SettingsRepairBanner": { SettingsRepairBanner: "repair-banner" },
     "../types": registries,
     "../api": {
       getShortcutWarning: async () => false,
