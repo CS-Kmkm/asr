@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { getSettingsRepairStatus, persistRepairedSettings } from "../api";
+import type { Settings } from "../types";
 import { useI18n } from "../i18n";
 
 // Marker the backend uses when the whole stored settings row is unreadable.
@@ -8,9 +9,10 @@ const UNREADABLE_ROW = "unreadable";
 // Lists the stored settings fields this version could not read. The backend
 // uses fallback values for them in memory only and never overwrites the
 // stored values on its own; the button saves the values shown now. The
-// status is fetched on mount, so the notice does not depend on the startup
-// status event arriving before the page listens.
-export function SettingsRepairBanner() {
+// status is fetched on mount and again whenever the settings change (a save
+// or the settings-changed event), so a field fixed through the form
+// disappears, and the notice does not depend on the startup status event.
+export function SettingsRepairBanner({ settings }: { settings: Settings }) {
   const { t } = useI18n();
   const [fields, setFields] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
@@ -21,7 +23,7 @@ export function SettingsRepairBanner() {
       .then((next) => { if (active) setFields(next); })
       .catch(() => {});
     return () => { active = false; };
-  }, []);
+  }, [settings]);
   if (fields.length === 0) return null;
   const persist = () => {
     setSaving(true);

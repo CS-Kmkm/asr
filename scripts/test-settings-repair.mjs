@@ -34,10 +34,11 @@ function fixture({ status, persist }) {
       if (!(index in slots)) slots[index] = initial;
       return [slots[index], (next) => { slots[index] = typeof next === "function" ? next(slots[index]) : next; }];
     },
-    // Effects run once, as on mount.
-    useEffect(effect) {
+    // Effects run on mount and whenever a dependency changes identity.
+    useEffect(effect, deps) {
       const index = cursor++;
-      if (!(index in slots)) { slots[index] = true; effects.push(effect); }
+      const previous = slots[index];
+      if (!previous || deps.some((dep, at) => dep !== previous[at])) { slots[index] = deps; effects.push(effect); }
     },
   };
   const calls = { status: 0, persist: 0 };
@@ -49,9 +50,11 @@ function fixture({ status, persist }) {
     },
     "../i18n": { useI18n: () => ({ language: "en", t: (key) => key }) },
   });
-  function render() {
+  let settings = {};
+  function render(nextSettings = settings) {
+    settings = nextSettings;
     cursor = 0;
-    const tree = SettingsRepairBanner();
+    const tree = SettingsRepairBanner({ settings });
     while (effects.length) effects.shift()();
     const nodes = [];
     function visit(node) {
@@ -85,6 +88,21 @@ test("banner fetches the repair status on mount and lists the fields", async () 
   assert.match(text, /fallback values for now/);
   assert.match(text, /historyRetention/);
   assert.match(text, /shortcuts\.ask/);
+});
+
+test("a settings change re-fetches the status, so fixed fields disappear", async () => {
+  const replies = [["historyRetention", "theme"], ["theme"]];
+  const { render, calls } = fixture({ status: async () => replies.shift() ?? [], persist: async () => [] });
+  render();
+  await flush();
+  assert.match(render().text, /historyRetention/);
+  // Saving through the form or a settings-changed event yields new settings.
+  render({ historyRetention: "one_week" });
+  await flush();
+  const { text } = render();
+  assert.equal(calls.status, 2);
+  assert.doesNotMatch(text, /historyRetention/);
+  assert.match(text, /theme/);
 });
 
 test("the whole unreadable row is named in words", async () => {

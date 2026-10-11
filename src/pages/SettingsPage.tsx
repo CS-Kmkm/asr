@@ -284,7 +284,7 @@ export function SettingsPage({
 
   return (
     <div className="settings-stack">
-      <SettingsRepairBanner />
+      <SettingsRepairBanner settings={settings} />
       <section className="panel">
         <h2>{t("Input settings")}</h2>
         <SettingRow title={t("Language")} detail={t("Choose the language used by the app interface.")}
