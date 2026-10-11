@@ -3236,7 +3236,25 @@ mod tests {
             .unwrap()
     }
 
+    /// Lists the History audio files after the deletion queue has settled.
+    /// On Windows a just-written file can be briefly held open (Defender, the
+    /// indexer), so a delete is queued and retried instead of failing; counting
+    /// immediately would then see a file the product has already given up.
     fn history_audio_files(storage: &Storage) -> Vec<PathBuf> {
+        for _ in 0..40 {
+            storage.retry_pending_audio_deletions().unwrap();
+            let pending: i64 = storage
+                .connection()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM pending_audio_deletions", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            if pending == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         match fs::read_dir(&storage.history_audio_dir) {
             Ok(entries) => entries
                 .filter_map(Result::ok)
