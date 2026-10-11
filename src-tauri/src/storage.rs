@@ -967,7 +967,8 @@ fn merge_over_stored(
 }
 
 /// Copies the raw settings row `raw` to `settings_backups`, keeping only the
-/// newest [`MAX_SETTINGS_BACKUPS`] copies.
+/// newest [`MAX_SETTINGS_BACKUPS`] copies. A row whose exact content is
+/// already backed up is not copied again.
 fn back_up_settings_row(
     connection: &Connection,
     raw: &str,
@@ -975,7 +976,10 @@ fn back_up_settings_row(
 ) -> Result<(), StorageError> {
     connection.execute(
         "INSERT INTO settings_backups(key, value, reason, created_at)
-         VALUES ('app_settings', ?1, ?2, ?3)",
+         SELECT 'app_settings', ?1, ?2, ?3
+         WHERE NOT EXISTS (
+           SELECT 1 FROM settings_backups WHERE key = 'app_settings' AND value = ?1
+         )",
         params![raw, reason, Utc::now().to_rfc3339()],
     )?;
     connection.execute(
@@ -1174,6 +1178,21 @@ impl Storage {
             let _ = self.rewrite_settings(&raw, migrated, &loaded.migrations.join(","));
         }
         Ok((loaded.settings, loaded.repairs))
+    }
+
+    /// Copies the stored settings row to `settings_backups` when this build
+    /// cannot read all of it (the whole row or any field). Called at
+    /// startup, so the original is kept from the first start that found it
+    /// unreadable; an identical copy is not added again on later starts.
+    pub fn back_up_unreadable_settings(&self) -> Result<(), StorageError> {
+        let connection = self.connection()?;
+        let Some(raw) = stored_settings_row(&connection)? else {
+            return Ok(());
+        };
+        if load_settings(&raw).repairs.is_empty() {
+            return Ok(());
+        }
+        back_up_settings_row(&connection, &raw, "unreadable_at_startup")
     }
 
     /// Replaces the stored row `raw` with `migrated`, keeping `raw` in
@@ -3937,6 +3956,41 @@ mod tests {
             persist(&storage, &settings).unwrap();
             assert_eq!(settings_backups(&storage).len(), 1);
         }
+    }
+
+    #[test]
+    fn unreadable_rows_are_backed_up_once_at_startup() {
+        for raw in ["not json".to_owned(), {
+            let mut value = serde_json::to_value(Settings::default()).unwrap();
+            value["historyRetention"] = "three_months".into();
+            value.to_string()
+        }] {
+            let storage = Storage::in_memory().unwrap();
+            store_raw_settings(&storage, &raw);
+            for _ in 0..3 {
+                storage.back_up_unreadable_settings().unwrap();
+            }
+            assert_eq!(
+                settings_backups(&storage),
+                [(raw.clone(), "unreadable_at_startup".to_owned())]
+            );
+            // The row itself is left as it is.
+            assert_eq!(stored_settings_raw(&storage), raw);
+            // A later replacement does not duplicate the same content.
+            storage
+                .update_settings(&storage.get_settings().unwrap())
+                .unwrap();
+            assert_eq!(settings_backups(&storage).len(), 1);
+        }
+    }
+
+    #[test]
+    fn readable_rows_are_not_backed_up_at_startup() {
+        let storage = Storage::in_memory().unwrap();
+        storage.back_up_unreadable_settings().unwrap();
+        storage.update_settings(&Settings::default()).unwrap();
+        storage.back_up_unreadable_settings().unwrap();
+        assert!(settings_backups(&storage).is_empty());
     }
 
     #[test]

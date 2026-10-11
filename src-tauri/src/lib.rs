@@ -1454,6 +1454,9 @@ fn setup_app(
         }
     }
     let storage = Storage::open(&database_path(app.handle())?)?;
+    // Best effort: keep the original of a row this build cannot fully read
+    // before anything else touches it.
+    let _ = storage.back_up_unreadable_settings();
     storage.enforce_current_history_policy()?;
     let (settings, repairs) = storage.get_settings_with_repairs()?;
     if !repairs.is_empty() {
