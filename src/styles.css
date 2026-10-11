@@ -132,6 +132,29 @@ button { color: inherit; }
   cursor: pointer;
 }
 .translation-target-button:hover { background: var(--accent-hover); }
+.overlay-cancel {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+.overlay-hint {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--warning);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.overlay-cancel:hover { border-color: var(--error-border); background: var(--error-soft); color: var(--error); }
 .translation-target-settings { min-width: 300px; display: grid; gap: 8px; }
 .translation-target-list { margin: 0; padding: 0; display: grid; gap: 6px; list-style: none; }
 .translation-target-list li { display: grid; grid-template-columns: 1fr auto auto auto; align-items: center; gap: 5px; }
@@ -175,8 +198,26 @@ button { color: inherit; }
 }
 .correction-preview.pending { color: var(--text-muted); }
 .recording-overlay.notice {
+  /* The main window's toast rule (.notice) must not move or restyle the
+     overlay notice, which fills its own small window. */
+  position: static;
+  width: 100vw;
+  padding: 0 15px;
+  border-radius: 18px;
+  background: linear-gradient(135deg, var(--surface-raised), var(--surface-subtle));
+  color: var(--text);
+  animation: none;
   justify-content: flex-start;
   border-color: var(--warning-border);
+}
+.notice.message .notice-detail {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 11px;
+  line-height: 14px;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
 }
 .recording-overlay.notice.failed { border-color: var(--error-border); }
 .notice-mark {
@@ -338,6 +379,8 @@ textarea { width: min(420px, 42vw); resize: vertical; line-height: 1.45; }
 .microphone-level-track { height: 12px; overflow: hidden; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-muted); }
 .microphone-level-track span { display: block; height: 100%; background: var(--accent); transition: width 80ms linear; }
 .settings-error { margin: 8px 0 12px; color: var(--error); font-size: 13px; }
+.shortcut-item:has(.settings-warning) { flex-wrap: wrap; }
+.settings-warning { flex-basis: 100%; margin: 2px 0 4px; color: var(--warning); font-size: 12px; }
 .settings-note { margin: 8px 0 22px; padding: 12px 14px; border-radius: 8px; background: var(--surface-subtle); color: var(--text-muted); font-size: 13px; }
 .ai-correction-panel { background: transparent; }
 .ai-correction-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 32px; padding-bottom: 18px; border-bottom: 1px solid var(--border); }

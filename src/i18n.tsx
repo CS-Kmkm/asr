@@ -301,6 +301,21 @@ const en = {
   "The clipboard was unavailable.": "The clipboard was unavailable.",
   "The insertion backend failed.": "The insertion backend failed.",
   "Translation failed; the transcript was copied.": "Translation failed; the transcript was copied.",
+  "Not completed": "Not completed",
+  "Completed with a warning": "Completed with a warning",
+  "selected-text translation is already active": "selected-text translation is already active",
+  "Preparing speech model": "Preparing speech model",
+  "Preparing the speech model. Recording starts when it is ready.": "Preparing the speech model. Recording starts when it is ready.",
+  "Starts when ready": "Starts when ready",
+  "Cancel (Esc)": "Cancel (Esc)",
+  "Open the app window for details.": "Open the app window for details.",
+  "another voice mode is already recording": "another voice mode is already recording",
+  "No target window was found. Click where the text should go, then try again.": "No target window was found. Click where the text should go, then try again.",
+  "Password and other protected fields cannot receive dictated text.": "Password and other protected fields cannot receive dictated text.",
+  "The target app runs with higher privileges, so this app cannot type into it.": "The target app runs with higher privileges, so this app cannot type into it.",
+  "The selected microphone was not found. Check the microphone in Settings.": "The selected microphone was not found. Check the microphone in Settings.",
+  "The microphone could not be opened. Check the microphone in Settings.": "The microphone could not be opened. Check the microphone in Settings.",
+  "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.": "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.",
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
@@ -603,6 +618,21 @@ const ja: Record<MessageKey, string> = {
   "The clipboard was unavailable.": "クリップボードを使用できませんでした。",
   "The insertion backend failed.": "挿入処理でエラーが発生しました。",
   "Translation failed; the transcript was copied.": "翻訳に失敗したため、原文をコピーしました。",
+  "Not completed": "完了しませんでした",
+  "Completed with a warning": "完了しました（注意あり）",
+  "selected-text translation is already active": "選択テキストの翻訳を実行中です。",
+  "Preparing speech model": "音声認識モデルを準備中",
+  "Preparing the speech model. Recording starts when it is ready.": "音声認識モデルを準備しています。準備ができたら録音を開始します。",
+  "Starts when ready": "準備ができたら開始します",
+  "Cancel (Esc)": "キャンセル (Esc)",
+  "Open the app window for details.": "詳細はアプリのウィンドウで確認してください。",
+  "another voice mode is already recording": "別の音声モードで録音中です。",
+  "No target window was found. Click where the text should go, then try again.": "入力先のウィンドウが見つかりません。入力したい場所をクリックしてから、もう一度お試しください。",
+  "Password and other protected fields cannot receive dictated text.": "パスワードなどの保護された入力欄には音声入力できません。",
+  "The target app runs with higher privileges, so this app cannot type into it.": "入力先のアプリが高い権限で実行されているため、このアプリから入力できません。",
+  "The selected microphone was not found. Check the microphone in Settings.": "選択したマイクが見つかりません。設定でマイクを確認してください。",
+  "The microphone could not be opened. Check the microphone in Settings.": "マイクを開けませんでした。設定でマイクを確認してください。",
+  "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.": "Esc は録音中のキャンセルキーでもあります。この割り当てでは、× ボタンでキャンセルしてください。",
 } satisfies Record<MessageKey, string>;
 
 const catalogs = { en, ja } satisfies Record<UiLanguage, Record<MessageKey, string>>;
@@ -775,11 +805,24 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "The original selection was not changed, and the clipboard is unavailable; the edit is available in this app.",
       "Speak to edit is disabled because its saved hotkey is already used by another action. Change the overlapping hotkeys in Settings.",
       "Speak to edit is disabled because its saved hotkey is already used by another action, and a saved hotkey could not be registered. Change them in Settings.",
+      "selected-text translation is already active",
+      "Preparing the speech model. Recording starts when it is ready.",
+      "another voice mode is already recording",
+      "No target window was found. Click where the text should go, then try again.",
+      "Password and other protected fields cannot receive dictated text.",
+      "The target app runs with higher privileges, so this app cannot type into it.",
+      "The selected microphone was not found. Check the microphone in Settings.",
+      "The microphone could not be opened. Check the microphone in Settings.",
   ] satisfies MessageKey[],
 );
 
 export function translate(language: UiLanguage, key: MessageKey): string {
   return catalogs[language][key];
+}
+
+/** Whether a backend sentence has a translation (fixed or patterned). */
+export function isAppMessage(message: string): boolean {
+  return appMessageKeys.has(message as MessageKey) || translateAppMessage("ja", message) !== message;
 }
 
 export function translateAppMessage(language: UiLanguage, message: string | null): string | null {
