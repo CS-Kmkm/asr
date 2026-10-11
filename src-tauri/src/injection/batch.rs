@@ -732,7 +732,9 @@ fn revision_range<B: Backend>(
 /// ended without text. The draft is selected and deleted under the same
 /// guards as a replacement; a later revision is pasted at the caret it left.
 /// Any failed guard freezes the session as a failed replacement does: the
-/// target is never edited again and finalization only copies the text.
+/// target is never edited again and finalization only copies the text. As
+/// for cancellation, a selection it requested but queued no deletion for is
+/// collapsed back to a caret so the next keystroke cannot replace the draft.
 pub(super) fn retract<B: Backend>(
     backend: &B,
     session: &mut ProvisionalInsertion,
@@ -757,19 +759,28 @@ pub(super) fn retract<B: Backend>(
     // A failure after selecting must not authorize another target edit.
     session.replacement = None;
     session.result = InsertResult::ClipboardOnly;
-    let Selection::Confirmed(selected) = selected else {
-        return Ok(session.result);
+    let selected = match selected {
+        Selection::Confirmed(selected) => selected,
+        // The target may have applied the selection after verification gave up.
+        Selection::Unconfirmed(requested) => {
+            collapse_selected(backend, &session.target, &requested);
+            return Ok(session.result);
+        }
+        Selection::NotRequested => return Ok(session.result),
     };
-    if !safe(
+    let queued = safe(
         backend,
         &session.target,
         activity,
         SafetyPolicy::Destructive,
-    ) || !backend
+    ) && backend
         .target_text(&session.target)
         .is_ok_and(|actual| actual.same_content(&selected))
-        || !backend.delete_selection(&session.target).unwrap_or(false)
-    {
+        // A partially queued deletion may still remove the draft, so only a
+        // deletion that queued nothing leaves the selection to collapse.
+        && backend.delete_selection(&session.target).unwrap_or(false);
+    if !queued {
+        collapse_selected(backend, &session.target, &selected);
         return Ok(session.result);
     }
     let expected = selected.replaced_with("");
@@ -1237,6 +1248,8 @@ pub(super) mod tests {
         /// SendInput queued only part of the deletion; the target has not
         /// processed it yet.
         delete_partial: Cell<bool>,
+        /// False when SendInput queued none of the deletion.
+        delete_accepted: Cell<bool>,
         text_readable: Cell<bool>,
         selection_readable: Cell<bool>,
         paste_accepted: Cell<bool>,
@@ -1277,6 +1290,7 @@ pub(super) mod tests {
                 snapshot_error: RefCell::new(None),
                 not_restored: Cell::new(0),
                 delete_partial: Cell::new(false),
+                delete_accepted: Cell::new(true),
                 text_readable: Cell::new(true),
                 selection_readable: Cell::new(true),
                 paste_accepted: Cell::new(true),
@@ -1431,6 +1445,9 @@ pub(super) mod tests {
         }
         fn delete_selection(&self, _: &TargetWindow) -> Result<bool, InjectionError> {
             self.calls.borrow_mut().push("delete");
+            if !self.delete_accepted.get() {
+                return Ok(false);
+            }
             if !self.delete_partial.get() {
                 self.text.borrow_mut().selected.clear();
             }
@@ -2023,6 +2040,64 @@ pub(super) mod tests {
         cancel(&backend, &mut session, &watcher);
         assert!(backend.calls.borrow().ends_with(&["select", "delete"]));
         assert!(!backend.calls.borrow().contains(&"collapse"));
+    }
+
+    #[test]
+    fn retraction_collapses_only_a_selection_it_requested_and_could_not_delete() {
+        for case in ["input", "ime", "nothing_queued", "partial"] {
+            let monitor = std::sync::Arc::new(monitor());
+            let mut backend = MockBackend::new();
+            let mut session = live_draft(&backend, &monitor, "draft");
+            match case {
+                // The selection settles after a wait, during which the user acts.
+                "input" | "ime" => {
+                    backend.selection_settle_after = 1;
+                    let interrupting = std::sync::Arc::clone(&monitor);
+                    backend.on_selection_wait = Some(Box::new(move |backend| match case {
+                        "input" => interrupting.test_record_input(),
+                        _ => backend.ime.set(Some(true)),
+                    }));
+                }
+                "nothing_queued" => backend.delete_accepted.set(false),
+                "partial" => backend.delete_partial.set(true),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                retract(&backend, &mut session, &monitor).unwrap(),
+                InsertResult::ClipboardOnly,
+                "{case}"
+            );
+            assert_eq!(backend.content(), "prefix draft suffix", "{case}");
+            assert_eq!(
+                calls(&backend, "delete"),
+                usize::from(matches!(case, "nothing_queued" | "partial")),
+                "{case}"
+            );
+            // Moving the caret could disturb an open IME conversion, and a
+            // partially queued deletion may still remove the draft.
+            let collapsed = matches!(case, "input" | "nothing_queued");
+            assert_eq!(
+                calls(&backend, "collapse"),
+                usize::from(collapsed),
+                "{case}"
+            );
+            assert_eq!(
+                backend.text.borrow().selected.is_empty(),
+                collapsed,
+                "{case}"
+            );
+            // The session stays frozen: a later revision never edits the target.
+            update(
+                &backend,
+                InjectionOptions::default(),
+                &mut session,
+                "later",
+                &monitor,
+                false,
+            )
+            .unwrap();
+            assert_eq!(backend.content(), "prefix draft suffix", "{case}");
+        }
     }
 
     #[test]
