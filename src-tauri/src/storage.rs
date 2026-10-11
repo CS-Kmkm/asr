@@ -2968,6 +2968,53 @@ mod tests {
         assert_eq!(audio, None);
     }
 
+    /// The last unversioned build already had every baseline column,
+    /// including `expires_at` for failed takes kept only for Retry; the
+    /// baseline adopts it as is and keeps each row's expiry.
+    #[test]
+    fn unversioned_database_with_failed_take_expiry_adopts_the_baseline() {
+        const AUDIO: &str = "cccccccccccccccccccccccccccccccc.wav";
+        let (_directory, storage) = open_legacy_twice(
+            "CREATE TABLE dictation_history (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               transcript_text TEXT NOT NULL,
+               processed_text TEXT,
+               source_text TEXT,
+               instruction_text TEXT,
+               action_kind TEXT,
+               search_site TEXT,
+               mode TEXT NOT NULL,
+               asr_provider TEXT NOT NULL,
+               llm_provider TEXT,
+               target_language TEXT,
+               app_category TEXT,
+               duration_ms INTEGER,
+               latency_ms INTEGER,
+               created_at TEXT NOT NULL,
+               insertion_result TEXT,
+               insertion_detail TEXT,
+               audio_filename TEXT,
+               expires_at TEXT,
+               retry_of_id INTEGER REFERENCES dictation_history(id) ON DELETE SET NULL
+             );
+             INSERT INTO dictation_history(transcript_text, mode, asr_provider, created_at, audio_filename, expires_at)
+               VALUES ('', 'faithful', 'mock', '2026-10-01T00:00:00+00:00',
+                       'cccccccccccccccccccccccccccccccc.wav', '2999-01-01T00:00:00+00:00');",
+            &[AUDIO],
+        );
+        let connection = storage.connection().unwrap();
+        assert_current_schema(&connection);
+        let (audio, expires_at): (Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT audio_filename, expires_at FROM dictation_history",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(audio.as_deref(), Some(AUDIO));
+        assert_eq!(expires_at.as_deref(), Some("2999-01-01T00:00:00+00:00"));
+    }
+
     /// An unreleased development build created the decisions table without
     /// `created_at`; existing decisions stay and receive no date.
     #[test]
