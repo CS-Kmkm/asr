@@ -41,6 +41,10 @@ pub(crate) struct InputMonitor {
 struct RunningMonitor {
     child: Child,
     stdin: ChildStdin,
+    /// Set once the helper's output ended. The helper exits on its own when
+    /// its hooks are gone, and may still be shutting down when it is next
+    /// started; that process must be replaced, not waited on.
+    closed: Arc<AtomicBool>,
 }
 
 impl Default for InputMonitor {
@@ -137,9 +141,15 @@ impl InputMonitor {
                 return false;
             };
             if let Some(running) = slot.as_mut() {
-                if running.child.try_wait().ok().flatten().is_none() {
+                if !running.closed.load(Ordering::Acquire)
+                    && running.child.try_wait().ok().flatten().is_none()
+                {
                     return self.wait_until_ready();
                 }
+                // The helper exited, or closed its output and is exiting:
+                // reap it and start a fresh one.
+                let _ = running.child.kill();
+                let _ = running.child.wait();
                 *slot = None;
             }
 
@@ -188,6 +198,8 @@ impl InputMonitor {
             let shortcut_pending = Arc::clone(&self.shortcut_pending);
             let ready = Arc::clone(&self.ready);
             let generation = Arc::clone(&self.generation);
+            let closed = Arc::new(AtomicBool::new(false));
+            let output_closed = Arc::clone(&closed);
             std::thread::spawn(move || {
                 for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                     if generation.load(Ordering::Acquire) != generation_id {
@@ -218,11 +230,19 @@ impl InputMonitor {
                         _ => {}
                     }
                 }
+                // End of output: the helper exited (including after it found
+                // its hooks removed) or crashed. Fail closed until a later
+                // start() replaces it.
                 if generation.load(Ordering::Acquire) == generation_id {
                     available.store(false, Ordering::Release);
                 }
+                output_closed.store(true, Ordering::Release);
             });
-            *slot = Some(RunningMonitor { child, stdin });
+            *slot = Some(RunningMonitor {
+                child,
+                stdin,
+                closed,
+            });
             drop(slot);
             return self.wait_until_ready();
         }
@@ -258,9 +278,10 @@ impl InputMonitor {
             && self.sequence.load(Ordering::Acquire) == checkpoint
     }
 
-    /// After our own paste is queued, injected Ctrl may briefly be visible to
-    /// GetAsyncKeyState. The helper ignores marked injected keys but still
-    /// reports physical shortcut activity and increments the input sequence.
+    /// After our own paste is queued, its injected modifier (Ctrl or Shift)
+    /// may briefly be visible to GetAsyncKeyState. The helper ignores marked
+    /// injected keys but still reports physical shortcut activity and
+    /// increments the input sequence.
     pub(crate) fn unchanged_since_injected_paste(&self, checkpoint: u64) -> bool {
         !self.cancelled()
             && self.available.load(Ordering::Acquire)
@@ -315,6 +336,100 @@ impl InputMonitor {
     }
 }
 
+/// Windows removes a low-level hook without notice when its callback misses
+/// the LowLevelHooksTimeout (capped at 1 s since Windows 10 1709), after which
+/// the helper would keep reporting "no input". `GetLastInputInfo` keeps
+/// advancing for keyboard and mouse input, so the helper compares it with the
+/// timestamp of the last event either hook observed. Both are event
+/// timestamps on the same clock; a caller of `SendInput` may set them, so they
+/// are not guaranteed to be monotonic.
+///
+/// The tolerance is twice the longest hook timeout, so a live hook that is
+/// merely slow is never judged removed. It also absorbs input that updates the
+/// session's input time without reaching the hooks (input on the secure
+/// desktop, input another app's hook swallows, possibly some pen or touch
+/// paths) when it comes within the tolerance of hook-visible input, which
+/// later hook-visible input also clears. A false positive
+/// only ends this helper, so the current guard fails closed and the next
+/// `start()` launches a new one.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const HOOK_STALE_TOLERANCE_MS: u32 = 2_000;
+/// How often the helper samples `GetLastInputInfo`.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const HOOK_WATCHDOG_PERIOD_MS: u64 = 250;
+
+/// True when the session's last input is stamped more than `tolerance_ms`
+/// after the last event the hooks observed. Ticks compare across the 49.7-day
+/// wraparound; the input counts as newer only while it is less than half the
+/// tick range ahead.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn hooks_stale(last_system_input_tick: u32, last_hook_tick: u32, tolerance_ms: u32) -> bool {
+    let ahead = last_system_input_tick.wrapping_sub(last_hook_tick);
+    ahead < 1 << 31 && ahead > tolerance_ms
+}
+
+/// One reading of the session's input time and of the hooks' progress.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+struct HookReading {
+    /// `GetTickCount` when the reading was taken.
+    now: u32,
+    /// `GetLastInputInfo().dwTime`.
+    last_system_input_tick: u32,
+    /// Timestamp of the latest event either hook observed (latest, not max).
+    last_hook_tick: u32,
+    /// Number of hook callbacks so far (wrapping).
+    hook_calls: u32,
+}
+
+/// Applies `hooks_stale` to input the hooks have had time to observe.
+///
+/// The session's input time is updated before the hooks run, so a reading
+/// taken in between shows input "ahead" of a live hook. The watchdog therefore
+/// holds each reading for `tolerance_ms`. Any hook callback during that time
+/// proves the hooks were still installed after the reading; only when there
+/// was none does it compare the held input time with the hooks' last event,
+/// which is then unchanged since the reading. So a timestamp out of order (a
+/// `SendInput` caller may set it) cannot make live hooks look removed: an
+/// event the hooks observe after the reading counts as a callback whatever
+/// its timestamp.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+struct HookWatchdog {
+    tolerance_ms: u32,
+    held: Option<HookReading>,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+impl HookWatchdog {
+    fn new(tolerance_ms: u32) -> Self {
+        Self {
+            tolerance_ms,
+            held: None,
+        }
+    }
+
+    /// Takes one reading and returns true when the hooks missed input and
+    /// have not run for at least `tolerance_ms` since.
+    fn poll(&mut self, reading: HookReading) -> bool {
+        if let Some(held) = self.held {
+            if reading.now.wrapping_sub(held.now) < self.tolerance_ms {
+                return false;
+            }
+            if reading.hook_calls == held.hook_calls
+                && hooks_stale(
+                    held.last_system_input_tick,
+                    reading.last_hook_tick,
+                    self.tolerance_ms,
+                )
+            {
+                return true;
+            }
+        }
+        self.held = Some(reading);
+        false
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn run_worker() {
     windows_worker::run();
@@ -329,15 +444,23 @@ mod windows_worker {
         io::{BufRead, Write},
         mem::zeroed,
         sync::{
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicU32, AtomicU64, Ordering},
             mpsc::{channel, Sender},
             OnceLock,
         },
+        time::Duration,
     };
 
     use windows::Win32::{
         Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM},
-        System::Threading::GetCurrentThreadId,
+        System::{
+            SystemInformation::GetTickCount,
+            Threading::{
+                GetCurrentThread, GetCurrentThreadId, SetThreadPriority,
+                THREAD_PRIORITY_TIME_CRITICAL,
+            },
+        },
+        UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
         UI::WindowsAndMessaging::{
             CallNextHookEx, GetMessageW, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
             UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
@@ -353,8 +476,35 @@ mod windows_worker {
     static FILTER: OnceLock<std::sync::Mutex<ShortcutFilters>> = OnceLock::new();
     static EVENTS: OnceLock<Sender<(&'static str, u64, bool)>> = OnceLock::new();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    /// Timestamp of the latest event either hook observed, for every message
+    /// (mouse moves and injected input included) so that any input the
+    /// session sees is matched by a hook call while the hooks are installed.
+    /// It is the event's own `time`, the clock `GetLastInputInfo` reports,
+    /// and is stored as the latest value, not the maximum.
+    static LAST_HOOK_TICK: AtomicU32 = AtomicU32::new(0);
+    /// Hook callbacks so far, so that the watchdog can tell that the hooks ran
+    /// whatever timestamp the event carried.
+    static HOOK_CALLS: AtomicU32 = AtomicU32::new(0);
+
+    fn record_hook_event(time: u32) {
+        LAST_HOOK_TICK.store(time, Ordering::Release);
+        HOOK_CALLS.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn last_system_input_tick() -> Option<u32> {
+        let mut info = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        unsafe { GetLastInputInfo(&mut info) }
+            .as_bool()
+            .then_some(info.dwTime)
+    }
 
     unsafe extern "system" fn keyboard_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code == HC_ACTION as i32 {
+            record_hook_event(unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) }.time);
+        }
         if code == HC_ACTION as i32
             && matches!(
                 wparam.0 as u32,
@@ -383,6 +533,9 @@ mod windows_worker {
     }
 
     unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code == HC_ACTION as i32 {
+            record_hook_event(unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) }.time);
+        }
         if code == HC_ACTION as i32
             && matches!(
                 wparam.0 as u32,
@@ -447,6 +600,21 @@ mod windows_worker {
             }
         });
 
+        // This thread installs the hooks, so Windows calls them on it; a slow
+        // call past LowLevelHooksTimeout gets them removed. It is idle in
+        // GetMessageW except for those short callbacks, which take no lock
+        // that a lower-priority thread holds (the filter lock is only used
+        // here and channel sends never block), so the highest non-realtime
+        // priority cannot starve other threads or invert. HIGHEST (+2) could
+        // still lose to normal-priority threads boosted for foreground input.
+        let _ = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
+        // Input before the hooks predates them and cannot count against them:
+        // start from the session's current input time. Input in the moments
+        // until they are installed stays well within the tolerance.
+        LAST_HOOK_TICK.store(
+            last_system_input_tick().unwrap_or_else(|| unsafe { GetTickCount() }),
+            Ordering::Release,
+        );
         let keyboard = unsafe {
             SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), HINSTANCE::default(), 0)
         };
@@ -467,6 +635,7 @@ mod windows_worker {
             let _ = std::io::stdin().lock().read_line(&mut command);
             let _ = unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
         });
+        std::thread::spawn(move || watch_hooks(thread_id));
         let pending = FILTER
             .get()
             .and_then(|filter| filter.lock().ok())
@@ -480,6 +649,30 @@ mod windows_worker {
         while unsafe { GetMessageW(&mut message, None, 0, 0) }.as_bool() {}
         let _ = unsafe { UnhookWindowsHookEx(keyboard) };
         let _ = unsafe { UnhookWindowsHookEx(mouse) };
+    }
+
+    /// Ends the helper once Windows has evidently removed its hooks. The
+    /// parent sees its output end, reports the monitor unavailable (so guards
+    /// fail closed), and starts a fresh helper on its next `start()`.
+    fn watch_hooks(hook_thread: u32) {
+        let mut watchdog = super::HookWatchdog::new(super::HOOK_STALE_TOLERANCE_MS);
+        loop {
+            std::thread::sleep(Duration::from_millis(super::HOOK_WATCHDOG_PERIOD_MS));
+            let hook_calls = HOOK_CALLS.load(Ordering::Acquire);
+            let Some(last_system_input_tick) = last_system_input_tick() else {
+                continue;
+            };
+            let reading = super::HookReading {
+                now: unsafe { GetTickCount() },
+                last_system_input_tick,
+                last_hook_tick: LAST_HOOK_TICK.load(Ordering::Acquire),
+                hook_calls,
+            };
+            if watchdog.poll(reading) {
+                let _ = unsafe { PostThreadMessageW(hook_thread, WM_QUIT, WPARAM(0), LPARAM(0)) };
+                return;
+            }
+        }
     }
 }
 
@@ -523,5 +716,118 @@ mod tests {
         monitor.test_set_shortcut_pending(false);
         monitor.test_record_input();
         assert!(!monitor.unchanged_since_injected_paste(checkpoint));
+    }
+
+    const TOLERANCE: u32 = HOOK_STALE_TOLERANCE_MS;
+
+    #[test]
+    fn hooks_are_stale_only_when_input_outran_them_beyond_the_tolerance() {
+        // Equal ticks: the hooks saw the latest input.
+        assert!(!hooks_stale(50_000, 50_000, TOLERANCE));
+        // A hook call after the latest input (a mouse move, our own paste).
+        assert!(!hooks_stale(50_000, 50_001, TOLERANCE));
+        assert!(!hooks_stale(50_000, 90_000, TOLERANCE));
+        // Session input ahead of the hooks, within the tolerance.
+        assert!(!hooks_stale(51_500, 50_000, TOLERANCE));
+        assert!(!hooks_stale(50_000 + TOLERANCE, 50_000, TOLERANCE));
+        // Beyond the tolerance.
+        assert!(hooks_stale(50_001 + TOLERANCE, 50_000, TOLERANCE));
+        assert!(hooks_stale(900_000, 50_000, TOLERANCE));
+    }
+
+    #[test]
+    fn hook_staleness_compares_across_the_tick_wraparound() {
+        // Input after the 49.7-day wrap, hooks last seen just before it.
+        assert!(hooks_stale(1_600, u32::MAX - 500, TOLERANCE));
+        assert!(!hooks_stale(1_000, u32::MAX - 500, TOLERANCE));
+        // Hooks seen after the wrap, input just before it.
+        assert!(!hooks_stale(u32::MAX - 100, 100, TOLERANCE));
+    }
+
+    fn reading(now: u32, input: u32, hook: u32, hook_calls: u32) -> HookReading {
+        HookReading {
+            now,
+            last_system_input_tick: input,
+            last_hook_tick: hook,
+            hook_calls,
+        }
+    }
+
+    #[test]
+    fn the_watchdog_waits_for_a_live_hook_to_observe_new_input() {
+        let mut watchdog = HookWatchdog::new(TOLERANCE);
+        // The hooks last ran ten minutes ago; input arrives and the session's
+        // input time is read before the hook callback has run.
+        let (input, idle_hook) = (600_000, 0);
+        assert!(hooks_stale(input, idle_hook, TOLERANCE));
+        assert!(!watchdog.poll(reading(input, input, idle_hook, 7)));
+        // The live hook observes that input right after; nothing is reported.
+        assert!(!watchdog.poll(reading(input + 250, input, input, 8)));
+        assert!(!watchdog.poll(reading(input + TOLERANCE, input, input, 8)));
+        assert!(!watchdog.poll(reading(input + 2 * TOLERANCE, input, input, 8)));
+        assert!(!watchdog.poll(reading(input + 3 * TOLERANCE, input, input, 8)));
+    }
+
+    #[test]
+    fn the_watchdog_reports_input_the_hooks_never_saw() {
+        let mut watchdog = HookWatchdog::new(TOLERANCE);
+        let hook = 100_000;
+        // The hooks were removed; the user keeps typing without a pause.
+        let mut now = 100_000;
+        let mut reported = None;
+        while now < 110_000 {
+            now += 250;
+            if watchdog.poll(reading(now, now - 10, hook, 42)) {
+                reported = Some(now);
+                break;
+            }
+        }
+        let reported = reported.expect("removed hooks are reported");
+        assert!(reported - hook <= 3 * TOLERANCE, "{reported}");
+        // Input that stopped before the hooks were removed is not evidence.
+        let mut watchdog = HookWatchdog::new(TOLERANCE);
+        for step in 1..40 {
+            assert!(!watchdog.poll(reading(hook + step * 250, hook, hook, 42)));
+        }
+    }
+
+    #[test]
+    fn out_of_order_timestamps_do_not_make_live_hooks_look_removed() {
+        // A SendInput caller stamps an event an hour ahead. The session's
+        // input time and the hooks both take that stamp, so they agree.
+        let now = 1_000_000;
+        let ahead = now + 3_600_000;
+        let mut watchdog = HookWatchdog::new(TOLERANCE);
+        assert!(!watchdog.poll(reading(now, ahead, ahead, 1)));
+        // A normally stamped event follows: the hooks' latest stamp moves
+        // back, behind the held input time, but the hooks did run.
+        assert!(hooks_stale(ahead, now + 500, TOLERANCE));
+        assert!(!watchdog.poll(reading(now + 500, now + 500, now + 500, 2)));
+        assert!(!watchdog.poll(reading(now + TOLERANCE, now + 500, now + 500, 2)));
+        assert!(!watchdog.poll(reading(now + 3 * TOLERANCE, now + 500, now + 500, 2)));
+        // An event stamped in the past that the hooks never saw is no
+        // evidence either.
+        let mut watchdog = HookWatchdog::new(TOLERANCE);
+        assert!(!watchdog.poll(reading(now, now - 60_000, now, 5)));
+        assert!(!watchdog.poll(reading(now + TOLERANCE, now - 60_000, now, 5)));
+        // With the hooks gone, a future-stamped input is still reported.
+        let mut watchdog = HookWatchdog::new(TOLERANCE);
+        assert!(!watchdog.poll(reading(now, ahead, now, 5)));
+        assert!(watchdog.poll(reading(now + TOLERANCE, ahead, now, 5)));
+    }
+
+    #[test]
+    fn the_watchdog_ages_samples_across_the_tick_wraparound() {
+        let mut watchdog = HookWatchdog::new(TOLERANCE);
+        let hook = u32::MAX - 3_000;
+        let input = u32::MAX - 100;
+        assert!(!watchdog.poll(reading(input, input, hook, 3)));
+        // 1.25 s later the counter has wrapped; the sample is not old enough.
+        assert!(!watchdog.poll(reading(input.wrapping_add(1_250), input, hook, 3)));
+        assert!(watchdog.poll(reading(input.wrapping_add(TOLERANCE), input, hook, 3)));
+        // A hook call counter that wrapped still shows the hooks ran.
+        let mut watchdog = HookWatchdog::new(TOLERANCE);
+        assert!(!watchdog.poll(reading(input, input, hook, u32::MAX)));
+        assert!(!watchdog.poll(reading(input.wrapping_add(TOLERANCE), input, input, 0)));
     }
 }
