@@ -836,8 +836,11 @@ async fn start_owned_recording(
         });
     // Without a captured target (Ask with no usable context) the overlay
     // keeps the foreground anchor instead of moving to the primary monitor.
+    // A start from this app has no window handle to anchor to, so it keeps
+    // the foreground anchor (the app window) too.
     if let Some(target) = target
         .as_ref()
+        .filter(|target| !target.is_this_app())
         .or_else(|| {
             edit_session
                 .as_ref()
