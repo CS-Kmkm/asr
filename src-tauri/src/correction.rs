@@ -17,6 +17,9 @@ const LOCAL_READ_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_ERROR_BODY_CHARS: usize = 500;
 const ASK_PLAN_MIN_OUTPUT_TOKENS: usize = 512;
 const ASK_TEXT_MIN_OUTPUT_TOKENS: usize = 4096;
+/// Smallest visible-text budget sent to any provider; per-model output
+/// ceilings never reduce a request below it.
+const MIN_VISIBLE_OUTPUT_TOKENS: usize = 128;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CorrectionError {
@@ -30,6 +33,10 @@ pub enum CorrectionError {
     InvalidResponse(String),
     #[error("the local model reached its output token limit")]
     OutputLimit,
+    /// A cloud provider stopped at `max_output_tokens`, which also counts its
+    /// hidden reasoning tokens.
+    #[error("the AI provider reached its output token limit")]
+    ProviderOutputLimit,
     /// The intent-aware fact check rejected an otherwise complete result.
     #[error("intent-aware correction changed protected transcript content")]
     ProtectedContentChanged,
@@ -1319,7 +1326,10 @@ async fn request_text(
             let key = api_key(&settings.openai_api_key_env_var)?;
             let mut body = openai_request(settings, transcript, instruction);
             if let Some(minimum) = minimum_output_tokens {
-                body["max_output_tokens"] = json!(max_output_tokens(transcript).max(minimum));
+                body["max_output_tokens"] = json!(openai_output_budget(
+                    settings,
+                    max_output_tokens(transcript).max(minimum)
+                ));
             }
             client
                 .post(OPENAI_RESPONSES_URL)
@@ -1330,8 +1340,10 @@ async fn request_text(
             let key = api_key(&settings.gemini_api_key_env_var)?;
             let mut body = gemini_request(settings, transcript, instruction);
             if let Some(minimum) = minimum_output_tokens {
-                body["generation_config"]["max_output_tokens"] =
-                    json!(max_output_tokens(transcript).max(minimum));
+                body["generation_config"]["max_output_tokens"] = json!(gemini_output_budget(
+                    settings,
+                    max_output_tokens(transcript).max(minimum)
+                ));
             }
             client
                 .post(GEMINI_INTERACTIONS_URL)
@@ -1508,11 +1520,14 @@ fn openai_request(settings: &Settings, transcript: &str, instruction: &str) -> V
         "model": model,
         "instructions": instruction,
         "input": transcript,
-        "max_output_tokens": request_output_tokens(transcript, instruction),
+        "max_output_tokens": openai_output_budget(
+            settings,
+            request_output_tokens(transcript, instruction)
+        ),
         "store": false,
         "stream": true
     });
-    if effort != "none" || supports_openai_none_reasoning(model) {
+    if sends_openai_reasoning_effort(model, effort) {
         request["reasoning"] = json!({"effort": effort});
     }
     if supports_openai_none_reasoning(model) {
@@ -1527,7 +1542,10 @@ fn gemini_request(settings: &Settings, transcript: &str, instruction: &str) -> V
         "system_instruction": instruction,
         "input": transcript,
         "generation_config": {
-            "max_output_tokens": request_output_tokens(transcript, instruction)
+            "max_output_tokens": gemini_output_budget(
+                settings,
+                request_output_tokens(transcript, instruction)
+            )
         },
         "store": false,
         "stream": true
@@ -1822,7 +1840,8 @@ fn apply_stream_event(
             )))
         }
         ("gemini", Some("interaction.completed")) => Ok(true),
-        ("openai", Some("response.incomplete")) => Err(CorrectionError::InvalidResponse(
+        ("openai", Some("response.incomplete")) => Err(openai_incomplete_error(
+            value.pointer("/response/incomplete_details/reason"),
             incomplete_stream_message(provider, &value),
         )),
         ("gemini", Some("interaction.status_update"))
@@ -1837,6 +1856,15 @@ fn apply_stream_event(
             CorrectionError::InvalidResponse(stream_error_message(&value)),
         ),
         _ => Ok(false),
+    }
+}
+
+/// An OpenAI response cut off by `max_output_tokens` (visible text plus
+/// reasoning) is an output-limit failure, not a malformed response.
+fn openai_incomplete_error(reason: Option<&Value>, message: String) -> CorrectionError {
+    match reason.and_then(Value::as_str) {
+        Some("max_output_tokens") => CorrectionError::ProviderOutputLimit,
+        _ => CorrectionError::InvalidResponse(message),
     }
 }
 
@@ -1930,7 +1958,7 @@ fn max_output_tokens(transcript: &str) -> usize {
         .count()
         .saturating_mul(2)
         .saturating_add(64)
-        .clamp(128, 32_768)
+        .clamp(MIN_VISIBLE_OUTPUT_TOKENS, 32_768)
 }
 
 fn request_output_tokens(input: &str, instruction: &str) -> usize {
@@ -1948,10 +1976,213 @@ fn request_output_tokens(input: &str, instruction: &str) -> usize {
     }
 }
 
+/// Output tokens reserved for hidden reasoning on top of the visible-text
+/// budget. OpenAI counts reasoning tokens against `max_output_tokens`, so a
+/// short utterance (visible budget 128) would otherwise be starved by any
+/// reasoning and end as an incomplete response. The values are deliberately
+/// generous ceilings, not expected usage: the cap only bounds the worst case,
+/// and correction prompts are short, so they stay below OpenAI's general
+/// "reserve about 25k tokens" advice except at the highest efforts. Known
+/// non-reasoning models get no allowance whatever the effort setting, since
+/// it would only push them past their output limit. Unknown models are
+/// treated as possibly reasoning: the user's effort is reserved, and at
+/// "none" (which is not sent) the default-effort allowance keeps a future
+/// reasoning model from starving at the 128-token visible budget.
+fn openai_reasoning_allowance(model: &str, effort: &str) -> usize {
+    match (openai_model_kind(model), effort) {
+        (OpenAiModelKind::NonReasoning, _) => 0,
+        (OpenAiModelKind::Reasoning, "none") if supports_openai_none_reasoning(model) => 0,
+        // o1-mini and o1-preview reason but accept no effort, so they always
+        // run their default effort.
+        (OpenAiModelKind::Reasoning, _) if !accepts_openai_reasoning_effort(model) => 8_192,
+        // The reasoning field is omitted for models that are not known to
+        // accept "none", so they run their default effort (medium for the
+        // GPT-5 and o-series families).
+        (_, "none" | "medium") => 8_192,
+        (_, "low") => 4_096,
+        (_, "high") => 16_384,
+        _ => 32_768,
+    }
+}
+
+/// Whether an OpenAI request carries `reasoning.effort`. Known
+/// non-reasoning models reject the parameter; unknown models get it only
+/// when the user chose an effort other than "none".
+fn sends_openai_reasoning_effort(model: &str, effort: &str) -> bool {
+    match openai_model_kind(model) {
+        OpenAiModelKind::Reasoning => {
+            accepts_openai_reasoning_effort(model)
+                && (effort != "none" || supports_openai_none_reasoning(model))
+        }
+        OpenAiModelKind::Unknown => effort != "none",
+        OpenAiModelKind::NonReasoning => false,
+    }
+}
+
+/// o1-mini and o1-preview reason but reject `reasoning.effort`.
+fn accepts_openai_reasoning_effort(model: &str) -> bool {
+    let base = openai_base_model(model);
+    !base.starts_with("o1-mini") && !base.starts_with("o1-preview")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenAiModelKind {
+    Reasoning,
+    NonReasoning,
+    Unknown,
+}
+
+/// The base model of an OpenAI model name: trimmed, lower-case, and without
+/// a fine-tune wrapper (`ft:gpt-4o-mini:org::id` -> `gpt-4o-mini`).
+fn openai_base_model(model: &str) -> String {
+    let model = model.trim().to_ascii_lowercase();
+    let model = model.strip_prefix("ft:").unwrap_or(&model);
+    model.split(':').next().unwrap_or_default().to_owned()
+}
+
+/// Reasoning: GPT-5 (except the `-chat` variants such as
+/// gpt-5-chat-latest), the o1/o3/o4 series and codex-mini. Non-reasoning:
+/// the GPT-4 family (gpt-4, gpt-4-turbo, gpt-4o, gpt-4.1), chatgpt-4o,
+/// gpt-3.5 and the GPT-5 `-chat` variants. Anything else is unknown.
+fn openai_model_kind(model: &str) -> OpenAiModelKind {
+    let base = openai_base_model(model);
+    let gpt5 = base.starts_with("gpt-5");
+    if (gpt5 && base.contains("-chat"))
+        || ["gpt-4", "chatgpt-4o", "gpt-3.5"]
+            .iter()
+            .any(|prefix| base.starts_with(prefix))
+    {
+        OpenAiModelKind::NonReasoning
+    } else if gpt5
+        || ["o1", "o3", "o4", "codex-mini"]
+            .iter()
+            .any(|prefix| base.starts_with(prefix))
+    {
+        OpenAiModelKind::Reasoning
+    } else {
+        OpenAiModelKind::Unknown
+    }
+}
+
+/// Thinking tokens reserved for Gemini. `thinking_level=minimal` is sent to
+/// models that accept it and keeps thinking negligible. Gemini 2.5 models run
+/// their default (dynamic) thinking, which counts against
+/// `max_output_tokens`, and so may the other `-latest` aliases (such as
+/// gemini-flash-latest), which can resolve to a thinking model. Other models
+/// are not known to think, and some (such as gemini-2.0-flash) cap output at
+/// 8192 tokens, so they get no allowance.
+fn gemini_thinking_allowance(model: &str) -> usize {
+    let may_think = model.starts_with("gemini-2.5")
+        || (model.starts_with("gemini-") && model.ends_with("-latest"));
+    if may_think && !supports_gemini_minimal_thinking(model) {
+        8_192
+    } else {
+        0
+    }
+}
+
+// Documented maximum output tokens per model family, from the providers'
+// public model pages (platform.openai.com/docs/models and
+// ai.google.dev/gemini-api/docs/models) as known when written (2026).
+// A request above a model's limit is rejected outright, so the final budget
+// is clamped to these values. Prefixes are matched in order, so specific
+// snapshots come before their family. Unlisted models are not clamped and
+// keep the visible budget (at most 32,768), as before. These limits are not
+// verified against the live APIs here and may change with new snapshots or
+// alias targets.
+const OPENAI_OUTPUT_CEILINGS: &[(&str, usize)] = &[
+    // gpt-4o-2024-05-13: 4,096; later gpt-4o, gpt-4o-mini and
+    // chatgpt-4o-latest: 16,384.
+    ("gpt-4o-2024-05-13", 4_096),
+    ("gpt-4o", 16_384),
+    ("chatgpt-4o", 16_384),
+    // gpt-4.1, gpt-4.1-mini, gpt-4.1-nano: 32,768.
+    ("gpt-4.1", 32_768),
+    // gpt-4-turbo and gpt-3.5-turbo: 4,096.
+    // Plain gpt-4 snapshots are left unclamped.
+    ("gpt-4-turbo", 4_096),
+    ("gpt-3.5-turbo", 4_096),
+    // o1-preview: 32,768; o1-mini: 65,536; o1, o1-pro, o3, o3-mini, o3-pro,
+    // o4-mini: 100,000. codex-mini-latest (based on o4-mini): 100,000.
+    ("o1-preview", 32_768),
+    ("o1-mini", 65_536),
+    ("o1", 100_000),
+    ("o3", 100_000),
+    ("o4", 100_000),
+    ("codex-mini", 100_000),
+];
+const GEMINI_OUTPUT_CEILINGS: &[(&str, usize)] = &[
+    // gemini-2.5-pro/-flash/-flash-lite and the gemini-3 previews: 65,536.
+    ("gemini-2.5", 65_536),
+    ("gemini-3", 65_536),
+    // gemini-2.0-flash, gemini-2.0-flash-lite and gemini-1.5: 8,192.
+    ("gemini-2.0", 8_192),
+    ("gemini-1.5", 8_192),
+];
+
+/// The documented output limit of an OpenAI model. GPT-5 `-chat` variants
+/// (such as gpt-5-chat-latest) allow 16,384; the reasoning GPT-5 family
+/// allows 128,000. Fine-tuned models share their base model's limit.
+fn openai_output_ceiling(model: &str) -> Option<usize> {
+    let base = openai_base_model(model);
+    if base.starts_with("gpt-5") {
+        return Some(if base.contains("-chat") {
+            16_384
+        } else {
+            128_000
+        });
+    }
+    prefix_ceiling(OPENAI_OUTPUT_CEILINGS, &base)
+}
+
+/// The documented output limit of a Gemini model. An explicit version wins
+/// (gemini-1.5-flash-latest allows 8,192); the unversioned `-latest`
+/// aliases (gemini-flash-latest, gemini-pro-latest,
+/// gemini-flash-lite-latest) currently resolve to Gemini 2.5 or 3 models,
+/// which allow 65,536.
+fn gemini_output_ceiling(model: &str) -> Option<usize> {
+    prefix_ceiling(GEMINI_OUTPUT_CEILINGS, model)
+        .or_else(|| (model.starts_with("gemini-") && model.ends_with("-latest")).then_some(65_536))
+}
+
+fn prefix_ceiling(ceilings: &[(&str, usize)], model: &str) -> Option<usize> {
+    ceilings
+        .iter()
+        .find(|(prefix, _)| model.starts_with(prefix))
+        .map(|&(_, ceiling)| ceiling)
+}
+
+fn clamp_output_budget(budget: usize, ceiling: Option<usize>) -> usize {
+    match ceiling {
+        Some(ceiling) => budget.min(ceiling.max(MIN_VISIBLE_OUTPUT_TOKENS)),
+        None => budget,
+    }
+}
+
+fn openai_output_budget(settings: &Settings, visible_tokens: usize) -> usize {
+    let model = settings.openai_correction_model.trim();
+    clamp_output_budget(
+        visible_tokens.saturating_add(openai_reasoning_allowance(
+            model,
+            settings.openai_reasoning_effort.as_str(),
+        )),
+        openai_output_ceiling(model),
+    )
+}
+
+fn gemini_output_budget(settings: &Settings, visible_tokens: usize) -> usize {
+    let model = settings.gemini_correction_model.trim();
+    clamp_output_budget(
+        visible_tokens.saturating_add(gemini_thinking_allowance(model)),
+        gemini_output_ceiling(model),
+    )
+}
+
 fn supports_openai_none_reasoning(model: &str) -> bool {
+    let base = openai_base_model(model);
     ["gpt-5.4", "gpt-5.5", "gpt-5.6"]
         .iter()
-        .any(|prefix| model.starts_with(prefix))
+        .any(|prefix| base.starts_with(prefix))
 }
 
 fn supports_gemini_minimal_thinking(model: &str) -> bool {
@@ -1959,6 +2190,12 @@ fn supports_gemini_minimal_thinking(model: &str) -> bool {
 }
 
 fn parse_openai_response(value: &Value) -> Result<String, CorrectionError> {
+    if value.get("status").and_then(Value::as_str) == Some("incomplete") {
+        return Err(openai_incomplete_error(
+            value.pointer("/incomplete_details/reason"),
+            "the response was incomplete".into(),
+        ));
+    }
     let text = value
         .get("output")
         .and_then(Value::as_array)
@@ -2418,6 +2655,166 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    // Opt-in check that the output budgets and reasoning parameters sent for
+    // a short utterance are accepted by the live APIs. Each case runs the
+    // production Dictate correction path (conservative mode) independently;
+    // a provider whose key is absent and a model the key cannot use are
+    // skipped. Requires credentials and incurs provider charges. Run with:
+    // cargo test --lib live_short_utterance_budget_matrix -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "live API evaluation; requires OPENAI_API_KEY and/or GEMINI_API_KEY"]
+    async fn live_short_utterance_budget_matrix() {
+        const TEXT: &str = "はい、了解です";
+        // Gemini has no effort setting; its thinking follows the model.
+        let cases = [
+            ("openai", "gpt-5.6-luna", "none"),
+            ("openai", "gpt-5-mini", "none"),
+            ("openai", "gpt-5-mini", "low"),
+            ("openai", "gpt-5-mini", "high"),
+            // gpt-5.4 is in the "none"-capable table; the -mini name is
+            // skipped below if the key cannot use it.
+            ("openai", "gpt-5.4-mini", "none"),
+            ("openai", "gpt-4o-mini", "none"),
+            ("openai", "gpt-4o-mini", "high"),
+            ("openai", "gpt-4.1-mini", "high"),
+            ("gemini", "gemini-flash-lite-latest", "-"),
+            ("gemini", "gemini-2.5-flash", "-"),
+            ("gemini", "gemini-flash-latest", "-"),
+        ];
+
+        fn error_kind(error: &CorrectionError) -> &'static str {
+            match error {
+                CorrectionError::MissingApiKey(_) => "MissingApiKey",
+                CorrectionError::Request(_) => "Request",
+                CorrectionError::Api { .. } => "Api",
+                CorrectionError::InvalidResponse(_) => "InvalidResponse",
+                CorrectionError::OutputLimit => "OutputLimit",
+                CorrectionError::ProviderOutputLimit => "ProviderOutputLimit",
+                CorrectionError::ProtectedContentChanged => "ProtectedContentChanged",
+                CorrectionError::Cancelled => "Cancelled",
+                CorrectionError::InvalidEndpoint(_) => "InvalidEndpoint",
+                CorrectionError::UnsupportedProvider(_) => "UnsupportedProvider",
+                CorrectionError::EmptyEditInstruction => "EmptyEditInstruction",
+            }
+        }
+        fn model_unavailable(error: &CorrectionError) -> bool {
+            let CorrectionError::Api { status, message } = error else {
+                return false;
+            };
+            let message = message.to_lowercase();
+            *status == StatusCode::NOT_FOUND
+                || message.contains("model_not_found")
+                || message.contains("does not exist")
+                || message.contains("do not have access")
+        }
+        // A missing or rejected credential is not a budget problem.
+        fn invalid_key(error: &CorrectionError) -> bool {
+            let CorrectionError::Api { status, message } = error else {
+                return false;
+            };
+            let message = message.to_lowercase();
+            matches!(*status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+                || (*status == StatusCode::BAD_REQUEST
+                    && [
+                        "api key not valid",
+                        "api_key_invalid",
+                        "invalid api key",
+                        "incorrect api key",
+                    ]
+                    .iter()
+                    .any(|cue| message.contains(cue)))
+        }
+        // Provider messages can echo part of a key; never print one.
+        fn redact_keys(message: &str) -> String {
+            message
+                .split(' ')
+                .map(|word| {
+                    if word.contains("sk-") || word.contains("AIza") {
+                        "[redacted]"
+                    } else {
+                        word
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+        // A rejected request (HTTP 400: invalid max_output_tokens or an
+        // unsupported parameter) or a cut-off/unreadable response.
+        fn budget_related(error: &CorrectionError) -> bool {
+            match error {
+                CorrectionError::Api { status, .. } => *status == StatusCode::BAD_REQUEST,
+                CorrectionError::OutputLimit
+                | CorrectionError::ProviderOutputLimit
+                | CorrectionError::InvalidResponse(_) => true,
+                _ => false,
+            }
+        }
+
+        let _ = dotenvy::from_path(concat!(env!("CARGO_MANIFEST_DIR"), "/../.env"));
+        let mut budget_failures = Vec::new();
+        for (provider, model, effort) in cases {
+            let mut settings = Settings {
+                correction_provider: provider.into(),
+                correction_mode: "conservative".into(),
+                ..Settings::default()
+            };
+            let key_variable = if provider == "openai" {
+                settings.openai_correction_model = model.into();
+                settings.openai_reasoning_effort = effort.into();
+                settings.openai_api_key_env_var.clone()
+            } else {
+                settings.gemini_correction_model = model.into();
+                settings.gemini_api_key_env_var.clone()
+            };
+            let mut instruction = build_correction_instruction(&settings, &[], None);
+            append_speech_locale(&mut instruction, &settings);
+            let sent = if provider == "openai" {
+                openai_request(&settings, TEXT, &instruction)["max_output_tokens"].clone()
+            } else {
+                gemini_request(&settings, TEXT, &instruction)["generation_config"]
+                    ["max_output_tokens"]
+                    .clone()
+            };
+            let case = format!("{provider} {model} effort={effort} max_output_tokens={sent}");
+            if api_key(&key_variable).is_err() {
+                eprintln!("{case}: SKIP ({key_variable} is not set)");
+                continue;
+            }
+
+            let (_sender, cancel) = watch::channel(false);
+            match correct_transcript(&settings, TEXT, &[], None, cancel, |_| {}).await {
+                Ok(output) => eprintln!("{case}: ok ({} chars)", output.chars().count()),
+                Err(error) => {
+                    let (status, message) = match &error {
+                        CorrectionError::Api { status, message } => {
+                            (status.as_u16().to_string(), message.clone())
+                        }
+                        other => ("-".into(), other.to_string()),
+                    };
+                    let message: String = redact_keys(&message).chars().take(200).collect();
+                    let kind = error_kind(&error);
+                    if invalid_key(&error) {
+                        eprintln!(
+                            "{case}: SKIP invalid key ({kind} HTTP {status}; check {key_variable})"
+                        );
+                    } else if model_unavailable(&error) {
+                        eprintln!("{case}: SKIP model unavailable ({kind} {status}: {message})");
+                    } else {
+                        eprintln!("{case}: ERROR {kind} HTTP {status}: {message}");
+                        if budget_related(&error) {
+                            budget_failures.push(format!("{case}: {kind} {status}: {message}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            budget_failures.is_empty(),
+            "budget-related failures:\n{}",
+            budget_failures.join("\n")
+        );
+    }
+
     #[test]
     fn builds_provider_requests_without_api_keys() {
         let settings = Settings::default();
@@ -2803,7 +3200,15 @@ mod tests {
             &mut text,
             &mut preview,
         );
-        assert!(matches!(openai, Err(CorrectionError::InvalidResponse(_))));
+        assert!(matches!(openai, Err(CorrectionError::ProviderOutputLimit)));
+
+        let filtered = apply_stream_event(
+            "openai",
+            r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"}}}"#,
+            &mut text,
+            &mut preview,
+        );
+        assert!(matches!(filtered, Err(CorrectionError::InvalidResponse(_))));
 
         let gemini = apply_stream_event(
             "gemini",
@@ -3711,6 +4116,457 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_allowance_scales_with_effort_and_model_support() {
+        for (effort, allowance) in [
+            ("none", 0),
+            ("low", 4_096),
+            ("medium", 8_192),
+            ("high", 16_384),
+            ("xhigh", 32_768),
+            ("max", 32_768),
+        ] {
+            assert_eq!(
+                openai_reasoning_allowance("gpt-5.6-luna", effort),
+                allowance,
+                "{effort}"
+            );
+        }
+        // "none" is omitted for models not known to accept it, so their
+        // default (medium) reasoning still needs room.
+        assert_eq!(openai_reasoning_allowance("gpt-5-mini", "none"), 8_192);
+        assert_eq!(openai_reasoning_allowance("gpt-5-mini", "low"), 4_096);
+        for model in ["o1", "o3-mini", "o4-mini"] {
+            assert_eq!(openai_reasoning_allowance(model, "high"), 16_384, "{model}");
+        }
+        // Models that do not reason never get an allowance, whatever the
+        // effort setting.
+        for model in [
+            "gpt-4o-mini",
+            "gpt-4o",
+            "chatgpt-4o-latest",
+            "gpt-4.1",
+            "gpt-4.1-nano",
+            "gpt-5-chat-latest",
+            "ft:gpt-4o-mini:org::abc123",
+            "GPT-4.1-MINI",
+        ] {
+            for effort in ["none", "low", "medium", "high", "xhigh", "max"] {
+                assert_eq!(
+                    openai_reasoning_allowance(model, effort),
+                    0,
+                    "{model} {effort}"
+                );
+            }
+        }
+
+        assert_eq!(gemini_thinking_allowance("gemini-flash-lite-latest"), 0);
+        assert_eq!(gemini_thinking_allowance("gemini-3-flash-preview"), 0);
+        assert_eq!(gemini_thinking_allowance("gemini-2.5-flash"), 8_192);
+        assert_eq!(gemini_thinking_allowance("gemini-2.5-pro"), 8_192);
+        for alias in ["gemini-flash-latest", "gemini-pro-latest"] {
+            assert_eq!(gemini_thinking_allowance(alias), 8_192, "{alias}");
+        }
+        for model in ["gemini-2.0-flash", "gemini-1.5-pro", "gemma-3-27b-it"] {
+            assert_eq!(gemini_thinking_allowance(model), 0, "{model}");
+        }
+    }
+
+    #[test]
+    fn o1_mini_and_preview_reason_without_an_effort_parameter() {
+        for model in ["o1-mini", "o1-preview-2024-09-12", "ft:o1-mini:org::abc123"] {
+            for effort in ["none", "low", "high", "max"] {
+                let settings = Settings {
+                    openai_correction_model: model.into(),
+                    openai_reasoning_effort: effort.into(),
+                    ..Settings::default()
+                };
+                let request = openai_request(&settings, "はい、了解です", "correct it");
+                assert!(request.get("reasoning").is_none(), "{model} {effort}");
+                assert_eq!(
+                    request["max_output_tokens"],
+                    128 + 8_192,
+                    "{model} {effort}"
+                );
+            }
+        }
+        // Other o1 models still take the effort.
+        let o1 = Settings {
+            openai_correction_model: "o1".into(),
+            openai_reasoning_effort: "low".into(),
+            ..Settings::default()
+        };
+        let request = openai_request(&o1, "はい、了解です", "correct it");
+        assert_eq!(request["reasoning"]["effort"], "low");
+        assert_eq!(request["max_output_tokens"], 128 + 4_096);
+    }
+
+    #[test]
+    fn openai_models_are_classified_after_normalising_the_name() {
+        use OpenAiModelKind::*;
+        for (model, kind) in [
+            ("gpt-5-mini", Reasoning),
+            ("GPT-5-MINI", Reasoning),
+            ("  gpt-5.6-luna  ", Reasoning),
+            ("ft:gpt-5-mini:org::abc123", Reasoning),
+            ("ft:o4-mini:org::abc123", Reasoning),
+            ("O3-MINI", Reasoning),
+            ("o1-mini", Reasoning),
+            ("codex-mini-latest", Reasoning),
+            ("gpt-4o-mini", NonReasoning),
+            ("GPT-4O", NonReasoning),
+            ("ft:gpt-4o-mini:org::abc123", NonReasoning),
+            ("chatgpt-4o-latest", NonReasoning),
+            ("gpt-4.1-nano", NonReasoning),
+            ("gpt-5-chat-latest", NonReasoning),
+            ("ft:gpt-4.1-mini:org:custom:abc123", NonReasoning),
+            ("gpt-4", NonReasoning),
+            ("gpt-4-turbo-2024-04-09", NonReasoning),
+            ("gpt-3.5-turbo", NonReasoning),
+            ("some-future-model", Unknown),
+        ] {
+            assert_eq!(openai_model_kind(model), kind, "{model}");
+        }
+        assert_eq!(openai_base_model(" FT:GPT-4o-mini:org::id "), "gpt-4o-mini");
+        assert_eq!(
+            openai_output_ceiling("ft:gpt-4o-mini:org::id"),
+            Some(16_384)
+        );
+        assert_eq!(openai_output_ceiling("codex-mini-latest"), Some(100_000));
+        assert!(supports_openai_none_reasoning("GPT-5.6-luna"));
+
+        // Reasoning models keep the effort and its allowance however the name
+        // is written.
+        for model in [
+            "ft:o4-mini:org::abc123",
+            "ft:gpt-5-mini:org::abc123",
+            "codex-mini-latest",
+            "GPT-5-MINI",
+        ] {
+            let settings = Settings {
+                openai_correction_model: model.into(),
+                openai_reasoning_effort: "high".into(),
+                ..Settings::default()
+            };
+            let request = openai_request(&settings, "はい、了解です", "correct it");
+            assert_eq!(request["reasoning"]["effort"], "high", "{model}");
+            assert_eq!(request["max_output_tokens"], 128 + 16_384, "{model}");
+        }
+
+        // Unknown models follow the user's choice: a non-"none" effort is
+        // sent with its allowance and no ceiling; "none" is omitted but still
+        // reserves the default-effort allowance.
+        for (effort, budget) in [
+            ("none", 128 + 8_192),
+            ("low", 128 + 4_096),
+            ("high", 128 + 16_384),
+            ("max", 128 + 32_768),
+        ] {
+            let settings = Settings {
+                openai_correction_model: "some-future-model".into(),
+                openai_reasoning_effort: effort.into(),
+                ..Settings::default()
+            };
+            let request = openai_request(&settings, "はい、了解です", "correct it");
+            assert_eq!(request["max_output_tokens"], budget, "{effort}");
+            if effort == "none" {
+                assert!(request.get("reasoning").is_none());
+            } else {
+                assert_eq!(request["reasoning"]["effort"], effort);
+            }
+        }
+        let unknown_max = Settings {
+            openai_correction_model: "some-future-model".into(),
+            openai_reasoning_effort: "max".into(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            openai_request(&unknown_max, &"x".repeat(20_000), "correct it")["max_output_tokens"],
+            32_768 + 32_768
+        );
+    }
+
+    #[test]
+    fn provider_requests_reserve_reasoning_tokens_beyond_the_visible_budget() {
+        for (model, effort, budget, sends_reasoning) in [
+            ("gpt-5.6-luna", "none", 128, true),
+            ("gpt-5.6-luna", "low", 128 + 4_096, true),
+            ("gpt-5.6-luna", "high", 128 + 16_384, true),
+            ("gpt-5.6-luna", "max", 128 + 32_768, true),
+            ("gpt-5-mini", "none", 128 + 8_192, false),
+            ("gpt-5-mini", "medium", 128 + 8_192, true),
+        ] {
+            let settings = Settings {
+                openai_correction_model: model.into(),
+                openai_reasoning_effort: effort.into(),
+                ..Settings::default()
+            };
+            let request = openai_request(&settings, "はい、了解です", "correct it");
+            assert_eq!(request["max_output_tokens"], budget, "{model} {effort}");
+            if sends_reasoning {
+                assert_eq!(request["reasoning"]["effort"], effort, "{model} {effort}");
+            } else {
+                assert!(request.get("reasoning").is_none(), "{model} {effort}");
+            }
+        }
+
+        let edit = Settings {
+            openai_reasoning_effort: "high".into(),
+            gemini_correction_model: "gemini-2.5-flash".into(),
+            ..Settings::default()
+        };
+        let instruction = build_edit_instruction();
+        let input = edit_request_input("short", "expand substantially");
+        assert_eq!(
+            openai_request(&edit, &input, instruction)["max_output_tokens"],
+            2_048 + 16_384
+        );
+        assert_eq!(
+            gemini_request(&edit, &input, instruction)["generation_config"]["max_output_tokens"],
+            2_048 + 8_192
+        );
+        assert_eq!(
+            gemini_request(&edit, "short", "correct it")["generation_config"]["max_output_tokens"],
+            128 + 8_192
+        );
+        let non_thinking = Settings {
+            gemini_correction_model: "gemini-2.0-flash".into(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            gemini_request(&non_thinking, "short", "correct it")["generation_config"]
+                ["max_output_tokens"],
+            128
+        );
+
+        // Ask raises the visible budget to its minimum; the allowance still
+        // applies on top of it.
+        assert_eq!(
+            openai_output_budget(
+                &edit,
+                max_output_tokens("short").max(ASK_PLAN_MIN_OUTPUT_TOKENS)
+            ),
+            512 + 16_384
+        );
+        assert_eq!(
+            openai_output_budget(&Settings::default(), ASK_TEXT_MIN_OUTPUT_TOKENS),
+            4_096
+        );
+        assert_eq!(
+            gemini_output_budget(&Settings::default(), ASK_PLAN_MIN_OUTPUT_TOKENS),
+            512
+        );
+    }
+
+    #[test]
+    fn default_models_keep_their_request_budgets() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.openai_correction_model, "gpt-5.6-luna");
+        assert_eq!(defaults.openai_reasoning_effort, "none");
+        assert_eq!(defaults.gemini_correction_model, "gemini-flash-lite-latest");
+        let input = "はい、了解です";
+        assert_eq!(
+            openai_request(&defaults, input, "correct it")["max_output_tokens"],
+            128
+        );
+        assert_eq!(
+            gemini_request(&defaults, input, "correct it")["generation_config"]
+                ["max_output_tokens"],
+            128
+        );
+
+        let instruction = build_edit_instruction();
+        let edit_input = edit_request_input("short", "expand substantially");
+        assert_eq!(
+            openai_request(&defaults, &edit_input, instruction)["max_output_tokens"],
+            2_048
+        );
+        assert_eq!(
+            gemini_request(&defaults, &edit_input, instruction)["generation_config"]
+                ["max_output_tokens"],
+            2_048
+        );
+
+        for minimum in [ASK_PLAN_MIN_OUTPUT_TOKENS, ASK_TEXT_MIN_OUTPUT_TOKENS] {
+            let visible = max_output_tokens("short").max(minimum);
+            assert_eq!(openai_output_budget(&defaults, visible), minimum);
+            assert_eq!(gemini_output_budget(&defaults, visible), minimum);
+        }
+    }
+
+    #[test]
+    fn non_reasoning_models_stay_within_their_output_ceiling() {
+        let long = "x".repeat(20_000);
+        for (model, ceiling) in [
+            ("gpt-4o-mini", 16_384),
+            ("gpt-4o", 16_384),
+            ("chatgpt-4o-latest", 16_384),
+            ("gpt-4o-2024-05-13", 4_096),
+            ("gpt-4.1", 32_768),
+            ("gpt-4.1-mini", 32_768),
+            ("gpt-5-chat-latest", 16_384),
+            ("gpt-4-turbo", 4_096),
+            ("gpt-3.5-turbo", 4_096),
+        ] {
+            let settings = Settings {
+                openai_correction_model: model.into(),
+                openai_reasoning_effort: "high".into(),
+                ..Settings::default()
+            };
+            // A short utterance gets no reasoning allowance.
+            assert_eq!(
+                openai_request(&settings, "はい、了解です", "correct it")["max_output_tokens"],
+                128,
+                "{model}"
+            );
+            // A long transcript is clamped to the model's ceiling.
+            assert_eq!(
+                openai_request(&settings, &long, "correct it")["max_output_tokens"],
+                32_768.min(ceiling),
+                "{model}"
+            );
+            // Ask budgets keep their minimum even under a low ceiling.
+            assert_eq!(
+                openai_output_budget(&settings, ASK_TEXT_MIN_OUTPUT_TOKENS),
+                ASK_TEXT_MIN_OUTPUT_TOKENS,
+                "{model}"
+            );
+        }
+
+        for model in [
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash-latest",
+        ] {
+            let settings = Settings {
+                gemini_correction_model: model.into(),
+                ..Settings::default()
+            };
+            assert_eq!(
+                gemini_request(&settings, &long, "correct it")["generation_config"]
+                    ["max_output_tokens"],
+                8_192,
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_ceilings_cover_each_known_family() {
+        for (model, ceiling) in [
+            ("gpt-4o-2024-05-13", Some(4_096)),
+            ("gpt-4o-mini", Some(16_384)),
+            ("gpt-4o", Some(16_384)),
+            ("chatgpt-4o-latest", Some(16_384)),
+            ("gpt-4.1", Some(32_768)),
+            ("gpt-4.1-nano", Some(32_768)),
+            ("gpt-5", Some(128_000)),
+            ("gpt-5-mini", Some(128_000)),
+            ("gpt-5.6-luna", Some(128_000)),
+            ("gpt-5-chat-latest", Some(16_384)),
+            ("o1-preview", Some(32_768)),
+            ("o1-mini", Some(65_536)),
+            ("o1", Some(100_000)),
+            ("o3", Some(100_000)),
+            ("o3-mini", Some(100_000)),
+            ("o4-mini", Some(100_000)),
+            ("some-future-model", None),
+        ] {
+            assert_eq!(openai_output_ceiling(model), ceiling, "{model}");
+        }
+        for (model, ceiling) in [
+            ("gemini-2.5-pro", Some(65_536)),
+            ("gemini-2.5-flash", Some(65_536)),
+            ("gemini-2.5-flash-lite", Some(65_536)),
+            ("gemini-3-flash-preview", Some(65_536)),
+            ("gemini-flash-latest", Some(65_536)),
+            ("gemini-flash-lite-latest", Some(65_536)),
+            ("gemini-2.0-flash", Some(8_192)),
+            ("gemini-2.0-flash-lite", Some(8_192)),
+            ("gemini-1.5-flash", Some(8_192)),
+            ("gemini-1.5-flash-latest", Some(8_192)),
+            ("gemini-1.5-pro-latest", Some(8_192)),
+            ("gemini-2.0-flash-latest", Some(8_192)),
+            ("gemini-2.5-flash-latest", Some(65_536)),
+            ("gemini-pro-latest", Some(65_536)),
+            ("gemma-3-27b-it", None),
+        ] {
+            assert_eq!(gemini_output_ceiling(model), ceiling, "{model}");
+        }
+
+        // The clamp binds only when the budget exceeds the ceiling and never
+        // drops below the minimum visible budget.
+        assert_eq!(clamp_output_budget(40_000, Some(8_192)), 8_192);
+        assert_eq!(clamp_output_budget(4_000, Some(8_192)), 4_000);
+        assert_eq!(clamp_output_budget(40_000, None), 40_000);
+        assert_eq!(
+            clamp_output_budget(4_000, Some(64)),
+            MIN_VISIBLE_OUTPUT_TOKENS
+        );
+
+        // Reasoning families: the largest budget (32,768 visible plus the
+        // 32,768 max-effort allowance) fits every reasoning ceiling.
+        let long = "x".repeat(20_000);
+        for model in ["gpt-5-mini", "o3", "o4-mini", "codex-mini-latest"] {
+            let settings = Settings {
+                openai_correction_model: model.into(),
+                openai_reasoning_effort: "max".into(),
+                ..Settings::default()
+            };
+            assert_eq!(
+                openai_request(&settings, &long, "correct it")["max_output_tokens"],
+                65_536,
+                "{model}"
+            );
+        }
+        // o1-mini and o1-preview accept no effort: they always get the
+        // default-effort allowance, and o1-preview is clamped to its limit.
+        for (model, budget) in [("o1-mini", 32_768 + 8_192), ("o1-preview", 32_768)] {
+            let settings = Settings {
+                openai_correction_model: model.into(),
+                openai_reasoning_effort: "max".into(),
+                ..Settings::default()
+            };
+            assert_eq!(
+                openai_request(&settings, &long, "correct it")["max_output_tokens"],
+                budget,
+                "{model}"
+            );
+        }
+        let settings = Settings {
+            gemini_correction_model: "gemini-2.5-pro".into(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            gemini_request(&settings, &long, "correct it")["generation_config"]
+                ["max_output_tokens"],
+            32_768 + 8_192
+        );
+    }
+
+    #[test]
+    fn incomplete_openai_responses_map_output_limit_separately() {
+        let limited = json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "partial"}]}]
+        });
+        assert!(matches!(
+            parse_openai_response(&limited),
+            Err(CorrectionError::ProviderOutputLimit)
+        ));
+        let filtered = json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "content_filter"},
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "partial"}]}]
+        });
+        assert!(matches!(
+            parse_openai_response(&filtered),
+            Err(CorrectionError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
     fn low_reasoning_parameters_are_only_sent_to_supported_models() {
         let openai_settings = Settings {
             openai_correction_model: "gpt-4o-mini".into(),
@@ -3719,6 +4575,46 @@ mod tests {
         let openai = openai_request(&openai_settings, "text", "edit");
         assert!(openai.get("reasoning").is_none());
         assert!(openai.get("text").is_none());
+
+        // Non-reasoning models never receive a reasoning effort, whatever
+        // the setting, and stay within their output ceiling.
+        for model in [
+            "gpt-4o-mini",
+            "chatgpt-4o-latest",
+            "gpt-4.1-mini",
+            "gpt-5-chat-latest",
+            "ft:gpt-4o-mini:org::abc123",
+            "GPT-4O-MINI",
+        ] {
+            for effort in ["low", "medium", "high", "xhigh", "max"] {
+                let settings = Settings {
+                    openai_correction_model: model.into(),
+                    openai_reasoning_effort: effort.into(),
+                    ..Settings::default()
+                };
+                let request = openai_request(&settings, "はい、了解です", "correct it");
+                assert!(request.get("reasoning").is_none(), "{model} {effort}");
+                assert_eq!(request["max_output_tokens"], 128, "{model} {effort}");
+            }
+        }
+        let mini_high = Settings {
+            openai_correction_model: "gpt-4o-mini".into(),
+            openai_reasoning_effort: "high".into(),
+            ..Settings::default()
+        };
+        let long = openai_request(&mini_high, &"x".repeat(20_000), "correct it");
+        assert!(long.get("reasoning").is_none());
+        assert_eq!(long["max_output_tokens"], 16_384);
+
+        // Reasoning models keep the effort and its allowance.
+        let reasoning_high = Settings {
+            openai_correction_model: "gpt-5-mini".into(),
+            openai_reasoning_effort: "high".into(),
+            ..Settings::default()
+        };
+        let request = openai_request(&reasoning_high, "はい、了解です", "correct it");
+        assert_eq!(request["reasoning"]["effort"], "high");
+        assert_eq!(request["max_output_tokens"], 128 + 16_384);
 
         let gemini_settings = Settings {
             gemini_correction_model: "gemini-2.5-flash-lite".into(),

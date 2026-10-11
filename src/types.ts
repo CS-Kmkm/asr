@@ -89,14 +89,17 @@ export type UiLanguage = (typeof uiLocaleRegistry)[number]["tag"];
 export type Theme = "system" | "light" | "dark";
 export type ShortcutMode = "dictate" | "translate" | "ask" | "edit";
 export const speechLocaleRegistry = [
+  { tag: "ja-JP", label: "Japanese (Japan)" },
   { tag: "en-US", label: "English (United States)" },
   { tag: "en-GB", label: "English (United Kingdom)" },
   { tag: "zh-CN", label: "Chinese (Simplified)" },
   { tag: "zh-TW", label: "Chinese (Traditional)" },
+  { tag: "ko-KR", label: "Korean (South Korea)" },
   { tag: "es-ES", label: "Spanish (Spain)" },
   { tag: "es-MX", label: "Spanish (Mexico)" },
   { tag: "fr-FR", label: "French (France)" },
   { tag: "fr-CA", label: "French (Canada)" },
+  { tag: "de-DE", label: "German (Germany)" },
   { tag: "pt-BR", label: "Portuguese (Brazil)" },
   { tag: "pt-PT", label: "Portuguese (Portugal)" },
 ] as const;

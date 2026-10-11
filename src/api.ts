@@ -132,8 +132,10 @@ export async function getSettings(): Promise<Settings> {
   return invoke("get_settings");
 }
 
-export async function getShortcutWarning(): Promise<boolean> {
-  if (!inTauri) return false;
+// Lists the saved shortcuts that are inactive since startup, as
+// "Action (chord)" entries; an empty list means every shortcut registered.
+export async function getShortcutWarning(): Promise<string[]> {
+  if (!inTauri) return [];
   return invoke("get_shortcut_warning");
 }
 
