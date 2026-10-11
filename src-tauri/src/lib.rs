@@ -133,7 +133,7 @@ pub(crate) struct Services {
     app_context: Mutex<Option<types::AppContext>>,
     transcriber: Arc<dyn Transcriber>,
     input_monitor: Arc<InputMonitor>,
-    model: Mutex<ModelStatus>,
+    model: commands::ModelStatusSlot,
     gpu_diagnostics: Mutex<Option<GpuDiagnostics>>,
     lifecycle: PipelineLifecycle,
     initialization: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
@@ -168,7 +168,7 @@ impl Services {
                 ASR_MODEL_LOAD_TIMEOUT,
             )),
             input_monitor: Arc::new(InputMonitor::default()),
-            model: Mutex::new(ModelStatus {
+            model: commands::ModelStatusSlot::new(ModelStatus {
                 model_id,
                 installed: false,
                 state: "not_loaded".into(),

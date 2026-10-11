@@ -61,6 +61,7 @@ const en = {
   "Use the recording hotkey to start or stop dictation:": "Use the recording hotkey to start or stop dictation:",
   "Downloading the speech model files.": "Downloading the speech model files.",
   "Loading the speech model.": "Loading the speech model.",
+  "Speech model loading was cancelled.": "Speech model loading was cancelled.",
   "Checking GPU automatically...": "Checking GPU automatically...",
   "Checked automatically.": "Checked automatically.",
   "Detected automatically:": "Detected automatically:",
@@ -386,6 +387,7 @@ const ja: Record<MessageKey, string> = {
   "Use the recording hotkey to start or stop dictation:": "録音の開始・停止には次のホットキーを使用します:",
   "Downloading the speech model files.": "音声モデルをダウンロードしています。",
   "Loading the speech model.": "音声モデルを読み込んでいます。",
+  "Speech model loading was cancelled.": "音声モデルの読み込みを中止しました。",
   "Checking GPU automatically...": "GPUを自動確認中…",
   "Checked automatically.": "自動確認済み。",
   "Detected automatically:": "自動検出:",
@@ -674,6 +676,7 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
   [
       "Recording from the selected microphone.",
       "Live transcription failed. The full recording will be transcribed after stopping.",
+      "Speech model loading was cancelled.",
       "Live text insertion paused. The final result will remain available in this app.",
       "Insertion failed; the result is available in this app.",
       "The live draft could not be confirmed, so it was not replaced; the final result is available in this app.",
