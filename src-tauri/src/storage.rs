@@ -3257,7 +3257,35 @@ mod tests {
     /// The queue is retried here for up to about a second so most runs see the
     /// physical result; a file still queued after that counts as deleted, as it
     /// does for the product, and is named on stderr for diagnosis.
+    ///
+    /// A delete that succeeds while another process (Defender, the indexer)
+    /// still holds the file open leaves it "delete pending": the name stays in
+    /// the directory until that handle closes, but the file can no longer be
+    /// opened. Such files are waited for, then counted as deleted as well.
     fn history_audio_files(storage: &Storage) -> Vec<PathBuf> {
+        let mut files = kept_history_audio_files(storage);
+        for _ in 0..80 {
+            if files.iter().all(|path| fs::File::open(path).is_ok()) {
+                return files;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            files = kept_history_audio_files(storage);
+        }
+        let (openable, delete_pending): (Vec<_>, Vec<_>) = files
+            .into_iter()
+            .partition(|path| fs::File::open(path).is_ok());
+        eprintln!(
+            "history audio still listed but delete pending: {}",
+            delete_pending
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        openable
+    }
+
+    fn kept_history_audio_files(storage: &Storage) -> Vec<PathBuf> {
         let mut pending = Vec::new();
         for attempt in 0..40 {
             if attempt > 0 {
