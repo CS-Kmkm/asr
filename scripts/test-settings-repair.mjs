@@ -86,8 +86,28 @@ test("banner fetches the repair status on mount and lists the fields", async () 
   const { text } = render();
   assert.equal(calls.status, 1);
   assert.match(text, /fallback values for now/);
-  assert.match(text, /historyRetention/);
-  assert.match(text, /shortcuts\.ask/);
+  // Settings labels, not JSON keys, with the side effect of saving.
+  assert.match(text, /History retention/);
+  assert.match(text, /keeps History indefinitely/);
+  assert.match(text, /Ask Anything shortcuts/);
+  assert.doesNotMatch(text, /historyRetention|shortcuts\.ask/);
+  assert.match(text, /saves only the fallback values the app is currently using/);
+});
+
+test("fields with side effects name what saving the value in use does", async () => {
+  const { render } = fixture({
+    status: async () => ["deleteAudioAfterProcessing", "autoStart", "futureSetting"],
+    persist: async () => [],
+  });
+  render();
+  await flush();
+  const { text } = render();
+  assert.match(text, /Delete audio after processing/);
+  assert.match(text, /delete leftover temporary recordings again/);
+  assert.match(text, /Start with Windows/);
+  assert.match(text, /removes the Windows startup entry/);
+  // A key without a known label is shown as is.
+  assert.match(text, /futureSetting/);
 });
 
 test("a settings change re-fetches the status, so fixed fields disappear", async () => {
@@ -95,14 +115,14 @@ test("a settings change re-fetches the status, so fixed fields disappear", async
   const { render, calls } = fixture({ status: async () => replies.shift() ?? [], persist: async () => [] });
   render();
   await flush();
-  assert.match(render().text, /historyRetention/);
+  assert.match(render().text, /History retention/);
   // Saving through the form or a settings-changed event yields new settings.
   render({ historyRetention: "one_week" });
   await flush();
   const { text } = render();
   assert.equal(calls.status, 2);
-  assert.doesNotMatch(text, /historyRetention/);
-  assert.match(text, /theme/);
+  assert.doesNotMatch(text, /History retention/);
+  assert.match(text, /Appearance/);
 });
 
 test("the whole unreadable row is named in words", async () => {
