@@ -171,8 +171,9 @@ pub const CORRECTION_MODES: [&str; 2] = ["conservative", "intent_aware"];
 pub const OPENAI_REASONING_EFFORTS: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];
 pub const TRANSLATION_TARGET_LANGUAGES: [&str; 8] =
     ["en", "ja", "zh", "es", "fr", "pt", "de", "ko"];
-pub const SPEECH_LOCALES: [&str; 10] = [
-    "en-US", "en-GB", "zh-CN", "zh-TW", "es-ES", "es-MX", "fr-FR", "fr-CA", "pt-BR", "pt-PT",
+pub const SPEECH_LOCALES: [&str; 13] = [
+    "ja-JP", "en-US", "en-GB", "zh-CN", "zh-TW", "ko-KR", "es-ES", "es-MX", "fr-FR", "fr-CA",
+    "de-DE", "pt-BR", "pt-PT",
 ];
 
 fn default_asr_backend() -> String {
@@ -520,6 +521,19 @@ pub struct RecordingResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speech_locales_accept_japanese_korean_and_german() {
+        // update_settings rejects any speech locale outside this allowlist.
+        for locale in ["ja-JP", "ko-KR", "de-DE"] {
+            assert!(
+                SPEECH_LOCALES.contains(&locale),
+                "{locale} must be selectable"
+            );
+        }
+        let unique: std::collections::HashSet<_> = SPEECH_LOCALES.iter().collect();
+        assert_eq!(unique.len(), SPEECH_LOCALES.len());
+    }
 
     #[test]
     fn dictionary_entry_input_accepts_frontend_payload_without_optional_fields() {

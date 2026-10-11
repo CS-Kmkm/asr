@@ -179,6 +179,7 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 | `command` | `"transcribe"` | 必須 | 操作名(`op` でも可)。 |
 | `audio_path` | 文字列(非空) | 必須 | 音声ファイルのパス。非空文字列でなければ `invalid_audio_path`、ファイルが存在しなければ `audio_not_found`。 |
 | `prompt` | 文字列 / 文字列リスト / `null` / 省略 | 任意 | 認識ヒント(辞書語など)。詳細は下記。 |
+| `language` | 文字列(32文字以下) / `null` / 省略 | 任意 | 音声の言語(例 `ja`、`en-GB`)。それ以外の型や長すぎる値は `invalid_request`。faster-whisper と openai-compatible は地域部分を除いたベース言語として渡す。VibeVoice は transformers の `apply_transcription_request` が言語引数を持たないため無視する。 |
 
 **`prompt` の扱い:**
 
@@ -214,9 +215,10 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 | `speaker` | 任意 / `null` | 話者識別子。VibeVoiceは話者番号等を返しうる。faster-whisperおよびエラーフォールバックでは `null`。Rust側では `Option<Value>` として保持され、型を限定しない。 |
 | `text` | 文字列 | セグメントのテキスト。 |
 
-`text` 全文の組み立て規則はバックエンドにより異なる(VibeVoiceは各セグメントを半角空白で連結、
-faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレスポンスでは確定済みの
-`text` フィールドとして返る。
+`text` 全文の組み立て規則はバックエンドにより異なる(VibeVoiceは各セグメントを `strip()` して
+連結し、境界の片側が漢字・かな・全角記号などの空白を置かない文字なら区切りなし、それ以外は
+半角空白1つを挟む。faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレスポンスでは
+確定済みの `text` フィールドとして返る。
 
 **JSON例:**
 
@@ -294,6 +296,7 @@ faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレ�
 | `hf_download_failed` | backends.py(例外マッピング) | Hugging Faceへの接続、名前解決、またはダウンロードが失敗した。 |
 | `model_load_failed` | backends.py(例外マッピング) | `load` 中の予期しない例外(OOM以外)。 |
 | `transcription_failed` | backends.py(例外マッピング) | `transcribe` 中の予期しない例外(OOM以外)。 |
+| `transcript_truncated` | backends.py (`VibeVoiceBackend.transcribe`) | 生成が `max_new_tokens`(音声長からの推定、上限 `VIBEVOICE_MAX_NEW_TOKENS` = (15分の録音上限 + 60秒) × 40 + 128 = 38528、`ASR_MAX_NEW_TOKENS` で上書き可)に達し、終端トークンなしで打ち切られた。途中までの出力は返さない(長尺録音の分割または `ASR_MAX_NEW_TOKENS` の引き上げが必要)。 |
 | `internal_error` | worker.py | 上記のいずれにも該当しない予期しない例外を `handle` が捕捉した場合の包括フォールバック。 |
 
 補足:
@@ -302,7 +305,8 @@ faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレ�
   終了コード2で即時終了する。これはプロトコル上のレスポンスではなく、起動時の失敗である。
 - `BackendError` として送出されたコード(`unsupported_quantization`, `backend_unavailable`,
   `gpu_oom`, `gpu_unsupported`, `hf_auth_required`, `hf_repository_unavailable`,
-  `hf_rate_limited`, `hf_download_failed`, `model_load_failed`, `transcription_failed`)は
+  `hf_rate_limited`, `hf_download_failed`, `model_load_failed`, `transcription_failed`,
+  `transcript_truncated`)は
   `handle` 内で捕捉され、そのコードのままレスポンスに反映される。
 - それ以外の想定外例外はすべて `internal_error` に丸められ、詳細はstderrにのみ出力される
   (`message` には例外の内部詳細を含めない)。

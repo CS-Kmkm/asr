@@ -1307,7 +1307,7 @@ pub(crate) async fn stop_recording_for(
     let mut llm_provider = None;
     let mut correction_failed = false;
     let mut translation_failed = false;
-    let mut correction_output_limited = false;
+    let mut correction_output_limit = None;
     let _ = app.emit("app-state", state.publish_result(transcript.text.clone()));
     // Full-recording recognition reconciles the last live hypothesis before AI correction.
     draft.monitor.wait_for_shortcut_release().await;
@@ -1448,8 +1448,7 @@ pub(crate) async fn stop_recording_for(
             }
             Err(error) => {
                 correction_failed = true;
-                correction_output_limited =
-                    matches!(error, correction::CorrectionError::OutputLimit);
+                correction_output_limit = output_limit_inserted_message(&error);
                 emit_correction_preview(&app, &transcript.text, "fallback");
                 let _ = storage.add_metric(
                     "text_correction",
@@ -1614,8 +1613,8 @@ pub(crate) async fn stop_recording_for(
         "The provisional text could not be safely replaced; the final result remains on the clipboard."
     } else if insertion == InsertResult::ClipboardOnly {
         "Automatic insertion failed; the result remains on the clipboard."
-    } else if correction_output_limited {
-        "AI correction stopped at the local output token limit; the original transcript was inserted. Increase the local output token limit."
+    } else if let Some(message) = correction_output_limit {
+        message
     } else if correction_failed {
         "AI correction failed; the original transcript was inserted."
     } else {
@@ -2235,6 +2234,16 @@ async fn cancel_pipeline_operation(
     Ok(Some(phase))
 }
 
+/// The completion status when AI correction stopped at an output token
+/// limit: the local server's configurable limit or a cloud provider's budget.
+fn output_limit_inserted_message(error: &correction::CorrectionError) -> Option<&'static str> {
+    match error {
+        correction::CorrectionError::OutputLimit => Some("AI correction stopped at the local output token limit; the original transcript was inserted. Increase the local output token limit."),
+        correction::CorrectionError::ProviderOutputLimit => Some("AI correction stopped at the AI provider's output token limit; the original transcript was inserted. Lower the reasoning effort or choose a different model."),
+        _ => None,
+    }
+}
+
 fn correction_failure_status(error: &correction::CorrectionError) -> String {
     let kind = match error {
         correction::CorrectionError::MissingApiKey(_) => "missing_api_key",
@@ -2248,6 +2257,9 @@ fn correction_failure_status(error: &correction::CorrectionError) -> String {
         correction::CorrectionError::InvalidResponse(_) => "invalid_response",
         correction::CorrectionError::OutputLimit => {
             return "AI correction stopped at the local output token limit; using the original transcript. Increase the local output token limit.".into();
+        }
+        correction::CorrectionError::ProviderOutputLimit => {
+            return "AI correction stopped at the AI provider's output token limit; using the original transcript. Lower the reasoning effort or choose a different model.".into();
         }
         correction::CorrectionError::ProtectedContentChanged => "protected_content_changed",
         correction::CorrectionError::Cancelled => "cancelled",
@@ -2283,6 +2295,9 @@ fn edit_failure_message(error: &correction::CorrectionError) -> &'static str {
         }
         CorrectionError::OutputLimit => {
             "Editing stopped at the local output token limit. The original selection was not changed. Increase the local output token limit."
+        }
+        CorrectionError::ProviderOutputLimit => {
+            "Editing stopped at the AI provider's output token limit. The original selection was not changed. Lower the reasoning effort or choose a different model."
         }
         CorrectionError::InvalidResponse(_) | CorrectionError::ProtectedContentChanged => {
             "Editing failed because the AI provider returned an unusable response. The original selection was not changed."
@@ -2347,6 +2362,7 @@ mod tests {
             edit_failure_message(&api(StatusCode::INTERNAL_SERVER_ERROR)),
             edit_failure_message(&CorrectionError::InvalidEndpoint("ftp://".into())),
             edit_failure_message(&CorrectionError::OutputLimit),
+            edit_failure_message(&CorrectionError::ProviderOutputLimit),
             edit_failure_message(&CorrectionError::InvalidResponse("empty".into())),
             edit_failure_message(&CorrectionError::UnsupportedProvider("other".into())),
             edit_failure_message(&CorrectionError::EmptyEditInstruction),
@@ -3206,6 +3222,22 @@ mod tests {
         assert_eq!(
             correction_failure_status(&correction::CorrectionError::OutputLimit),
             "AI correction stopped at the local output token limit; using the original transcript. Increase the local output token limit."
+        );
+        assert_eq!(
+            correction_failure_status(&correction::CorrectionError::ProviderOutputLimit),
+            "AI correction stopped at the AI provider's output token limit; using the original transcript. Lower the reasoning effort or choose a different model."
+        );
+        assert_eq!(
+            output_limit_inserted_message(&correction::CorrectionError::OutputLimit),
+            Some("AI correction stopped at the local output token limit; the original transcript was inserted. Increase the local output token limit.")
+        );
+        assert_eq!(
+            output_limit_inserted_message(&correction::CorrectionError::ProviderOutputLimit),
+            Some("AI correction stopped at the AI provider's output token limit; the original transcript was inserted. Lower the reasoning effort or choose a different model.")
+        );
+        assert_eq!(
+            output_limit_inserted_message(&correction::CorrectionError::Cancelled),
+            None
         );
         assert_eq!(
             correction_failure_status(&correction::CorrectionError::InvalidResponse(
@@ -4231,6 +4263,18 @@ pub(crate) fn delete_history_item(id: i64, storage: State<'_, Storage>) -> Resul
 #[tauri::command]
 pub(crate) fn delete_all_history(storage: State<'_, Storage>) -> Result<u64, String> {
     storage.delete_all_history().map_err(command_error)
+}
+
+/// Read-only count shown in the confirmation before a shorter retention is
+/// saved; saving it purges through the same cutoff and row selection.
+#[tauri::command]
+pub(crate) fn preview_history_retention_purge(
+    retention: types::HistoryRetention,
+    storage: State<'_, Storage>,
+) -> Result<storage::HistoryPurgePreview, String> {
+    storage
+        .history_purge_preview(retention)
+        .map_err(command_error)
 }
 
 #[tauri::command]

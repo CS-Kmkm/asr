@@ -53,9 +53,10 @@ function privacyRows(settings) {
   const patches = [];
   const { PrivacyPage } = load("../src/pages/PrivacyPage.tsx", {
     "../components/ui": { SettingRow: "row", Toggle: "toggle" },
+    "../components/HistoryRetentionSelect": { HistoryRetentionSelect: "retention-select" },
     "../i18n": i18n,
   });
-  const rows = nodes(PrivacyPage({ settings, onSave: (patch) => patches.push(structuredClone(patch)) }))
+  const rows = nodes(PrivacyPage({ settings, settingsLoaded: true, onSave: (patch) => patches.push(structuredClone(patch)) }))
     .filter((node) => node.type === "row");
   return { rows, patches };
 }
@@ -100,11 +101,12 @@ function historyPage(settings, history) {
   const { HistoryPage } = load("../src/pages/HistoryPage.tsx", {
     react: hooks,
     "../components/ui": { Empty: "empty" },
+    "../components/HistoryRetentionSelect": { HistoryRetentionSelect: "retention-select" },
     "../i18n": { ...i18n, insertionDetailLabels: {}, insertionOutcomeLabels: {} },
   });
   const noop = () => {};
   return nodes(HistoryPage({
-    settings, history, filter: "all", onSave: noop, onFilter: noop, onCopyItem: noop,
+    settings, settingsLoaded: true, history, filter: "all", onSave: noop, onFilter: noop, onCopyItem: noop,
     onRetry: noop, onDelete: noop, onDeleteAll: noop, onLoadAudio: async () => ({}),
     onAudioError: noop, retryActive: false, onCancelRetry: noop,
   }));
