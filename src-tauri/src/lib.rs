@@ -15,6 +15,7 @@ mod shortcuts;
 mod state;
 mod storage;
 mod types;
+mod worker_log;
 
 use std::{
     ffi::OsString,
@@ -564,7 +565,12 @@ mod ask_capture_tests {
 fn parse_shortcut(value: &str) -> Result<Shortcut, String> {
     Shortcut::from_str(value.trim()).map_err(|_| "hotkey is invalid".to_string())
 }
-fn load_environment_file() {
+/// Load the first `.env` found and return content-free startup diagnostics
+/// (the chosen worker project root and `.env` path, never any value).
+///
+/// The text is echoed to stderr for debug runs and, because a release build
+/// has no console, written to the worker log once the app installs it.
+fn load_environment_file() -> String {
     let current_dir = std::env::current_dir().ok();
     let executable = std::env::current_exe().ok();
     let project_root = project_root();
@@ -574,23 +580,95 @@ fn load_environment_file() {
         current_dir.as_deref(),
         cfg!(debug_assertions),
     );
-    match &project_root {
-        Some(root) => eprintln!("Worker project root: {}", root.display()),
-        None => eprintln!("Worker project root: none found"),
+    let path = candidates.into_iter().find(|path| path.is_file());
+    let load_error = path.as_deref().and_then(|path| {
+        dotenvy::from_path(path)
+            .err()
+            .map(|error| describe_environment_error(&error))
+    });
+    let diagnostics = startup_diagnostics(
+        project_root.as_deref(),
+        path.as_deref(),
+        load_error.as_deref(),
+    );
+    eprint!("{diagnostics}");
+    diagnostics
+}
+
+/// Describe a `.env` load failure without the offending line or value, which
+/// may hold an API key.
+fn describe_environment_error(error: &dotenvy::Error) -> String {
+    match error {
+        dotenvy::Error::LineParse(_, index) => {
+            format!("a line could not be parsed (at character {index})")
+        }
+        dotenvy::Error::Io(error) => format!("I/O error: {error}"),
+        _ => "an environment variable could not be read".into(),
+    }
+}
+
+fn startup_diagnostics(
+    project_root: Option<&Path>,
+    environment_file: Option<&Path>,
+    load_error: Option<&str>,
+) -> String {
+    let describe = |path: Option<&Path>| {
+        path.map_or_else(
+            || "none found".to_string(),
+            |path| path.display().to_string(),
+        )
+    };
+    let mut text = format!(
+        "Worker project root: {}\nEnvironment file: {}\n",
+        describe(project_root),
+        describe(environment_file)
+    );
+    if let Some(error) = load_error {
+        text.push_str(&format!("Failed to load the environment file: {error}\n"));
+    }
+    text
+}
+
+#[cfg(test)]
+mod startup_diagnostics_tests {
+    use super::*;
+
+    #[test]
+    fn lists_the_chosen_paths_one_per_line() {
+        let root = Path::new("checkout");
+        let file = root.join(".env");
+        assert_eq!(
+            startup_diagnostics(Some(root), Some(&file), None),
+            format!(
+                "Worker project root: checkout\nEnvironment file: {}\n",
+                file.display()
+            )
+        );
+        assert_eq!(
+            startup_diagnostics(None, None, None),
+            "Worker project root: none found\nEnvironment file: none found\n"
+        );
     }
 
-    let path = candidates.into_iter().find(|path| path.is_file());
-    match &path {
-        Some(path) => eprintln!("Environment file: {}", path.display()),
-        None => eprintln!("Environment file: none found"),
+    #[test]
+    fn appends_a_load_failure_after_the_paths() {
+        let text = startup_diagnostics(None, Some(Path::new(".env")), Some("I/O error: denied"));
+        assert!(text.ends_with("Failed to load the environment file: I/O error: denied\n"));
     }
-    if let Some(path) = path {
-        if let Err(error) = dotenvy::from_path(&path) {
-            eprintln!(
-                "Failed to load environment file {}: {error}",
-                path.display()
-            );
-        }
+
+    #[test]
+    fn a_parse_failure_never_echoes_the_offending_line() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".env");
+        std::fs::write(&path, "ASR_API_KEY='sk-secret-value\n").unwrap();
+        let error = dotenvy::from_path_iter(&path)
+            .unwrap()
+            .find_map(Result::err)
+            .expect("an unterminated quote is a parse error");
+        assert!(error.to_string().contains("sk-secret-value"));
+        let description = describe_environment_error(&error);
+        assert!(!description.contains("sk-secret"), "{description}");
+        assert!(!description.contains("ASR_API_KEY"), "{description}");
     }
 }
 
@@ -1290,13 +1368,56 @@ async fn initialize_model_runtime(app: AppHandle, settings: Settings) {
     }
 }
 
+/// Argument the sign-in Run entry passes so the app starts in the tray only.
+const AUTOSTART_ARGUMENT: &str = "--autostart";
+
+/// Whether a command line, program path first, came from the sign-in entry.
+///
+/// The autostart plugin writes the executable path unquoted, so a path with
+/// spaces may arrive split across several leading arguments; only an exact
+/// argument after the first one counts.
+fn launched_by_autostart<I>(arguments: I) -> bool
+where
+    I: IntoIterator,
+    I::Item: AsRef<std::ffi::OsStr>,
+{
+    arguments
+        .into_iter()
+        .skip(1)
+        .any(|argument| argument.as_ref() == AUTOSTART_ARGUMENT)
+}
+
+/// Bring the main window to the front, restoring it from the tray or taskbar.
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    load_environment_file();
-    tauri::Builder::default()
+    let startup_diagnostics = load_environment_file();
+    let builder = tauri::Builder::default();
+    // Must stay the first plugin: a second launch hands over to the running
+    // instance and exits inside this plugin's initialization, before the
+    // database, hotkeys, tray, or ASR worker of the new process start. The
+    // lock is keyed on the bundle identifier, so a development build would
+    // otherwise exit whenever an installed release build is resident.
+    #[cfg(not(debug_assertions))]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(
+        |app, arguments, _cwd| {
+            // A sign-in launch while already running must not pop the window.
+            if !launched_by_autostart(&arguments) {
+                show_main_window(app);
+            }
+        },
+    ));
+    builder
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
+            Some(vec![AUTOSTART_ARGUMENT]),
         ))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -1308,6 +1429,13 @@ pub fn run() {
                 .build(),
         )
         .setup(move |app| {
+            // Must precede the first worker spawn (initialize_model_runtime).
+            // A missing log directory only loses diagnostics, never startup.
+            if let Ok(directory) = app.path().app_log_dir() {
+                if worker_log::install(&directory).is_ok() {
+                    worker_log::record_app_start(&startup_diagnostics);
+                }
+            }
             let storage = Storage::open(&database_path(app.handle())?)?;
             storage.enforce_current_history_policy()?;
             let settings = storage.get_settings()?;
@@ -1315,6 +1443,8 @@ pub fn run() {
             // A development executable depends on Vite's dev server and cannot
             // run on its own at Windows sign-in, so it must never replace the
             // registration created by an installed/release build.
+            // enable() rewrites the Run entry on every start, which also adds
+            // --autostart to entries registered before the argument existed.
             #[cfg(not(debug_assertions))]
             {
                 let autostart_result = if settings.auto_start {
@@ -1371,16 +1501,16 @@ pub fn run() {
                 .menu(&menu)
                 .tooltip("Local Voice Input")
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
+                    "show" => show_main_window(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })
                 .build(app)?;
+            // The main window is configured hidden so a sign-in launch stays in
+            // the tray; every other launch shows it.
+            if !launched_by_autostart(std::env::args_os()) {
+                show_main_window(app.handle());
+            }
             let app_handle = app.handle().clone();
             let initialization =
                 tauri::async_runtime::spawn(initialize_model_runtime(app_handle, settings));
@@ -1435,15 +1565,40 @@ pub fn run() {
                     let _ = window.hide();
                 }
             }
-            if window.label() == "main" && matches!(event, WindowEvent::CloseRequested { .. }) {
-                // A tray icon keeps a Tauri process alive after its last window
-                // is closed. Treat the main window's close button as an actual
-                // application exit, but keep the window alive until RunEvent's
-                // asynchronous shutdown has stopped capture and the ASR worker.
+            if window.label() == "main" {
+                // The app stays resident in the tray: closing the main window
+                // only hides it, so dictation and the loaded model survive.
+                // Tray > Quit exits through RunEvent::ExitRequested, whose
+                // asynchronous shutdown stops capture and the ASR worker.
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
+                    let _ = window.hide();
+                    // Hiding keeps the Settings page mounted, so it would not
+                    // stop a running microphone test and the device would
+                    // stay open with no visible UI. The page is told the test
+                    // ended so it does not still show it running when the
+                    // window is shown again.
+                    let app = window.app_handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        let services = app.state::<Services>();
+                        match commands::release_running_microphone_test(
+                            &services.microphone_test,
+                            &services.audio,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                let _ = app.emit(commands::MICROPHONE_TEST_STOPPED_EVENT, ());
+                            }
+                            Ok(false) => {}
+                            Err(error) => emit_status(
+                                &app,
+                                "microphone_test_failed",
+                                &format!("Microphone test failed. {error}"),
+                            ),
+                        }
+                    });
                 }
-                window.app_handle().exit(0);
             }
         })
         .build(tauri::generate_context!())
@@ -1461,4 +1616,59 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod autostart_launch_tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_launch_is_not_an_autostart_launch() {
+        assert!(!launched_by_autostart(["local-voice-input.exe"]));
+        assert!(!launched_by_autostart(Vec::<String>::new()));
+    }
+
+    #[test]
+    fn the_sign_in_argument_marks_an_autostart_launch() {
+        assert!(launched_by_autostart([
+            "local-voice-input.exe",
+            "--autostart"
+        ]));
+    }
+
+    #[test]
+    fn an_unquoted_program_path_with_spaces_still_counts() {
+        assert!(launched_by_autostart([
+            r"C:\Users\me\AppData\Local\Local",
+            "Voice",
+            r"Input\local-voice-input.exe",
+            "--autostart",
+        ]));
+    }
+
+    #[test]
+    fn only_the_exact_argument_after_the_program_counts() {
+        assert!(!launched_by_autostart(["--autostart"]));
+        assert!(!launched_by_autostart([
+            "local-voice-input.exe",
+            "--autostart=1"
+        ]));
+        assert!(!launched_by_autostart([
+            "local-voice-input.exe",
+            "--AUTOSTART"
+        ]));
+        assert!(!launched_by_autostart([
+            "local-voice-input.exe",
+            "--input-monitor"
+        ]));
+    }
+
+    #[test]
+    fn os_string_arguments_are_accepted() {
+        let arguments = vec![
+            OsString::from("local-voice-input.exe"),
+            OsString::from("--autostart"),
+        ];
+        assert!(launched_by_autostart(arguments));
+    }
 }

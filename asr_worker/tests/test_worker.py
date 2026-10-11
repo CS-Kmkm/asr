@@ -45,6 +45,44 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(response["id"], None)
         self.assertEqual(response["error"]["code"], "invalid_json")
 
+    def test_unexpected_failure_logs_only_its_type_to_stderr(self) -> None:
+        # stderr is persisted to the desktop app's worker log, so an exception
+        # quoting the request or its result must not reach it or the response.
+        private = ("PROMPT-SECRET", "DICT-TERM", "AUDIO-NAME", "TRANSCRIPT-TEXT", "sk-SECRET")
+
+        class LeakyBackend(MockBackend):
+            def transcribe(self, audio_path, prompt, language=None):  # type: ignore[no-untyped-def]
+                raise RuntimeError(f"{audio_path} {prompt} TRANSCRIPT-TEXT sk-SECRET") from ValueError(
+                    "PROMPT-SECRET"
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            audio = Path(directory) / "AUDIO-NAME.wav"
+            audio.write_bytes(b"")
+            requests = [
+                {"id": 1, "command": "load"},
+                {
+                    "id": 2,
+                    "command": "transcribe",
+                    "audio_path": str(audio),
+                    "prompt": ["PROMPT-SECRET", "DICT-TERM"],
+                },
+            ]
+            output = io.StringIO()
+            stderr = io.StringIO()
+            with patch("asr_worker.worker.sys.stderr", stderr):
+                serve(
+                    Worker(LeakyBackend()),
+                    io.StringIO("".join(json.dumps(request) + "\n" for request in requests)),
+                    output,
+                )
+
+        self.assertEqual(stderr.getvalue(), "worker operation failed: RuntimeError\n")
+        response = json.loads(output.getvalue().splitlines()[-1])
+        self.assertEqual(response["error"]["code"], "internal_error")
+        for value in private:
+            self.assertNotIn(value, output.getvalue())
+
     def test_response_replaces_lone_surrogates_with_replacement_character(self) -> None:
         class SurrogateBackend(MockBackend):
             def transcribe(self, audio_path, prompt, language=None):  # type: ignore[no-untyped-def]

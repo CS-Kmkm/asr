@@ -494,11 +494,26 @@ pub(crate) async fn start_microphone_test(
     Ok(())
 }
 
+/// Event emitted when the backend ends a microphone test the Settings page
+/// did not stop itself (the main window was hidden to the tray).
+pub(crate) const MICROPHONE_TEST_STOPPED_EVENT: &str = "microphone-test-stopped";
+
+/// Release a running Settings microphone test; a no-op when none runs.
+///
+/// Also used when the main window is hidden to the tray: the Settings page
+/// stays mounted there, so it would never stop the test itself.
+pub(crate) async fn release_running_microphone_test(
+    test: &tokio::sync::Mutex<MicrophoneTestState>,
+    audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
+) -> Result<bool, audio::AudioError> {
+    let mut test = test.lock().await;
+    let mut audio = audio.lock().await;
+    release_microphone_test(&mut test, audio.as_mut()).await
+}
+
 #[tauri::command]
 pub(crate) async fn stop_microphone_test(services: State<'_, Services>) -> Result<(), String> {
-    let mut test = services.microphone_test.lock().await;
-    let mut audio = services.audio.lock().await;
-    release_microphone_test(&mut test, audio.as_mut())
+    release_running_microphone_test(&services.microphone_test, &services.audio)
         .await
         .map_err(|error| format!("Microphone test could not stop. {error}"))?;
     Ok(())
@@ -2967,6 +2982,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hiding_the_main_window_releases_a_running_microphone_test() {
+        let disarms = Arc::new(AtomicUsize::new(0));
+        let audio: tokio::sync::Mutex<Box<dyn AudioCapture>> =
+            tokio::sync::Mutex::new(Box::new(TestAudio {
+                cancel_error: false,
+                disarm_error: false,
+                disarms: Arc::clone(&disarms),
+                stream_error: None,
+            }));
+        let test = tokio::sync::Mutex::new(MicrophoneTestState::default());
+        let generation = test.lock().await.start();
+        assert!(release_running_microphone_test(&test, &audio)
+            .await
+            .unwrap());
+        // The meter task stops at its next tick once its generation is stale.
+        assert!(!test.lock().await.is_current(generation));
+        // Closing again with no test running leaves the device alone.
+        assert!(!release_running_microphone_test(&test, &audio)
+            .await
+            .unwrap());
+        assert_eq!(disarms.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn failed_microphone_release_keeps_ownership_for_retry() {
         let disarms = Arc::new(AtomicUsize::new(0));
         let mut audio = TestAudio {
@@ -4932,12 +4971,20 @@ fn spawn_load_progress_forwarder(
 }
 
 pub(crate) fn probe_gpu_diagnostics() -> GpuDiagnostics {
-    let output = Command::new("nvidia-smi")
-        .args([
-            "--query-gpu=name,driver_version,memory.total",
-            "--format=csv,noheader,nounits",
-        ])
-        .output();
+    let mut command = Command::new("nvidia-smi");
+    command.args([
+        "--query-gpu=name,driver_version,memory.total",
+        "--format=csv,noheader,nounits",
+    ]);
+    // The release app has no console for this console tool to share, so it
+    // would otherwise open a window of its own.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command.output();
     if let Ok(output) = output {
         if output.status.success() {
             let line = String::from_utf8_lossy(&output.stdout);

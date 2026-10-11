@@ -212,6 +212,40 @@ pub struct JsonlTranscriber {
     progress: broadcast::Sender<LoadProgress>,
 }
 
+/// Build the worker process command: the discovered working directory, no
+/// console window, and stderr routed to the worker log (`log_stderr`),
+/// inherited in debug builds, or discarded in release builds.
+fn worker_process_command(command_spec: &WorkerCommand, log_stderr: bool) -> Command {
+    let mut command = Command::new(&command_spec.program);
+    command
+        .args(&command_spec.args)
+        .envs(command_spec.env.iter().cloned())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(if log_stderr {
+            Stdio::piped()
+        } else if cfg!(debug_assertions) {
+            Stdio::inherit()
+        } else {
+            // A GUI-subsystem parent has no stderr to inherit; Python would
+            // then see sys.stderr as None, and diagnostics written to it
+            // could end up on stdout and corrupt the JSONL protocol.
+            Stdio::null()
+        })
+        .kill_on_drop(true);
+    if let Some(directory) = &command_spec.current_dir {
+        command.current_dir(directory);
+    }
+    // The release app has no console for the Python worker to share, so
+    // it would otherwise open a console window of its own.
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 impl JsonlTranscriber {
     pub fn new(command: WorkerCommand, request_timeout: Duration, load_timeout: Duration) -> Self {
         Self {
@@ -228,18 +262,14 @@ impl JsonlTranscriber {
     }
 
     async fn spawn(&self, command_spec: &WorkerCommand) -> Result<RunningWorker, AsrError> {
-        let mut command = Command::new(&command_spec.program);
-        command
-            .args(&command_spec.args)
-            .envs(command_spec.env.iter().cloned())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        if let Some(directory) = &command_spec.current_dir {
-            command.current_dir(directory);
-        }
+        // stderr carries the worker's internal_error details; persist it to the
+        // rotating worker log when the app installed one.
+        let mut command = worker_process_command(command_spec, crate::worker_log::is_installed());
         let mut child = command.spawn()?;
+        if let Some(stderr) = child.stderr.take() {
+            crate::worker_log::mark_worker_start();
+            tokio::spawn(crate::worker_log::pump(stderr));
+        }
         let stdin = child
             .stdin
             .take()
@@ -719,6 +749,19 @@ mod tests {
             command.with_current_dir("checkout").current_dir,
             Some(PathBuf::from("checkout"))
         );
+    }
+
+    #[test]
+    fn worker_process_keeps_its_directory_with_or_without_the_log_pipe() {
+        let spec = WorkerCommand::python("python").with_current_dir("checkout");
+        for log_stderr in [false, true] {
+            let command = worker_process_command(&spec, log_stderr);
+            let command = command.as_std();
+            assert_eq!(command.get_program(), "python");
+            assert_eq!(command.get_current_dir(), Some(Path::new("checkout")));
+        }
+        let without_directory = worker_process_command(&WorkerCommand::python("python"), true);
+        assert_eq!(without_directory.as_std().get_current_dir(), None);
     }
 
     #[test]
