@@ -783,7 +783,12 @@ fn repair_shortcut_lists(
 /// (see [`SettingsRepairs`]). Known limit: with that field replaced, a failed
 /// take kept only for Retry is not promoted to a normal History row and still
 /// expires after 24 hours, as it would before the user turned audio
-/// retention on. Likewise the autostart registration is left alone when
+/// retention on; and a successful Retry of such a take removes its row and
+/// audio, as it does whenever audio is not retained. Only takes created during
+/// a repaired run are affected. Conversely, with `historyRetention` replaced by
+/// `forever` while audio retention is readable and on, unexpired temporary
+/// takes become permanent rows until a build that can read the stored window
+/// applies it. Likewise the autostart registration is left alone when
 /// `autoStart` was replaced. Every other default only changes behavior for
 /// this run, and the stored row is never rewritten with it.
 fn fallback_settings() -> Settings {
