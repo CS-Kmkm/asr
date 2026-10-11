@@ -660,6 +660,15 @@ pub(crate) mod test_backend {
                 mock: None,
             }
         }
+        pub(super) fn take_clipboard_not_restored(&self) -> bool {
+            match &self.mock {
+                Some(mock) => mock
+                    .lock()
+                    .expect("mock backend lock")
+                    .take_clipboard_not_restored(),
+                None => self.platform.take_clipboard_not_restored(),
+            }
+        }
     }
 
     pub(super) enum Clipboard {
@@ -756,8 +765,18 @@ pub(crate) mod test_backend {
         fn delete_selection(&self, target: &TargetWindow) -> Result<bool, InjectionError> {
             delegate!(self, |b| b.delete_selection(target))
         }
+        fn collapse_selection(
+            &self,
+            target: &TargetWindow,
+            expected: &TargetText,
+        ) -> Result<bool, InjectionError> {
+            delegate!(self, |b| b.collapse_selection(target, expected))
+        }
         fn wait_for_target(&self) {
             delegate!(self, |b| b.wait_for_target())
+        }
+        fn clipboard_not_restored(&self) {
+            delegate!(self, |b| b.clipboard_not_restored())
         }
     }
 }

@@ -1310,6 +1310,10 @@ pub(super) mod tests {
             let text = self.text.borrow();
             format!("{}{}{}", text.before, text.selected, text.after)
         }
+        /// Consumes the unrestored-clipboard record, as the platform backends do.
+        pub(crate) fn take_clipboard_not_restored(&self) -> bool {
+            self.not_restored.replace(0) > 0
+        }
     }
 
     impl Backend for MockBackend {
