@@ -296,7 +296,7 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 | `hf_download_failed` | backends.py(例外マッピング) | Hugging Faceへの接続、名前解決、またはダウンロードが失敗した。 |
 | `model_load_failed` | backends.py(例外マッピング) | `load` 中の予期しない例外(OOM以外)。 |
 | `transcription_failed` | backends.py(例外マッピング) | `transcribe` 中の予期しない例外(OOM以外)。 |
-| `transcript_truncated` | backends.py (`VibeVoiceBackend.transcribe`) | 生成が `max_new_tokens`(音声長からの推定、上限4096、`ASR_MAX_NEW_TOKENS` で上書き可)に達し、終端トークンなしで打ち切られた。途中までの出力は返さない(長尺録音の分割または `ASR_MAX_NEW_TOKENS` の引き上げが必要)。 |
+| `transcript_truncated` | backends.py (`VibeVoiceBackend.transcribe`) | 生成が `max_new_tokens`(音声長からの推定、上限 `VIBEVOICE_MAX_NEW_TOKENS` = (15分の録音上限 + 60秒) × 40 + 128 = 38528、`ASR_MAX_NEW_TOKENS` で上書き可)に達し、終端トークンなしで打ち切られた。途中までの出力は返さない(長尺録音の分割または `ASR_MAX_NEW_TOKENS` の引き上げが必要)。 |
 | `internal_error` | worker.py | 上記のいずれにも該当しない予期しない例外を `handle` が捕捉した場合の包括フォールバック。 |
 
 補足:

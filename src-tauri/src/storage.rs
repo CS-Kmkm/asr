@@ -11,7 +11,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use thiserror::Error;
@@ -118,6 +118,201 @@ fn serialized_settings(settings: &Settings) -> Result<String, StorageError> {
     let mut value = serde_json::to_value(settings)?;
     mirror_legacy_shortcut_keys(&mut value, &settings.shortcuts)?;
     Ok(serde_json::to_string(&value)?)
+}
+
+/// How long a failed take is kept for Retry when the History and audio
+/// settings would not keep it.
+const FAILED_TAKE_RETENTION_HOURS: i64 = 24;
+
+/// When a failed take kept only for Retry, created at `created_at`, expires.
+pub(crate) fn failed_take_expires_at(created_at: DateTime<Utc>) -> DateTime<Utc> {
+    created_at + chrono::Duration::hours(FAILED_TAKE_RETENTION_HOURS)
+}
+
+/// Which History rows a retention setting removes at a given time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HistoryCutoff {
+    KeepAll,
+    RemoveAll,
+    /// Rows created strictly before this RFC 3339 instant are removed.
+    Before(String),
+}
+
+impl HistoryCutoff {
+    fn at(retention: HistoryRetention, now: DateTime<Utc>) -> Self {
+        match retention {
+            HistoryRetention::Never => Self::RemoveAll,
+            HistoryRetention::Forever => Self::KeepAll,
+            retention => match retention.days() {
+                Some(days) => Self::Before((now - chrono::Duration::days(days)).to_rfc3339()),
+                None => Self::KeepAll,
+            },
+        }
+    }
+}
+
+/// How a take whose transcription failed is kept so Retry can transcribe it
+/// again; it is always kept together with its audio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailedTakeRetention {
+    /// The History and audio settings keep it like any other row.
+    Normal,
+    /// Kept only for Retry, outside those settings, for 24 hours.
+    Temporary,
+}
+
+impl FailedTakeRetention {
+    /// `None` when the settings keep no failed take.
+    pub fn for_settings(settings: &Settings) -> Option<Self> {
+        if settings.history_retention != HistoryRetention::Never
+            && !settings.delete_audio_after_processing
+        {
+            Some(Self::Normal)
+        } else if settings.keep_failed_takes {
+            Some(Self::Temporary)
+        } else {
+            None
+        }
+    }
+}
+
+/// Whether `settings` keep History with its audio, so an unexpired failed
+/// take kept only for Retry becomes a normal row under the History window.
+fn promotes_failed_takes(settings: &Settings) -> bool {
+    FailedTakeRetention::for_settings(settings) == Some(FailedTakeRetention::Normal)
+}
+
+/// `(id, audio_filename)` of the History rows that `settings` no longer keep
+/// at `now`. Every retention purge and its preview select rows through this
+/// one query. A failed take kept only for Retry is removed when it expires,
+/// when keeping failed takes is turned off, or when the History window
+/// removes it first; History off does not remove it. Once History keeps
+/// audio, an unexpired one is judged like a normal row.
+fn expired_history_rows(
+    connection: &Connection,
+    settings: &Settings,
+    now: DateTime<Utc>,
+) -> Result<Vec<(i64, Option<String>)>, StorageError> {
+    let (remove_all, before) = match HistoryCutoff::at(settings.history_retention, now) {
+        HistoryCutoff::KeepAll => (false, None),
+        HistoryCutoff::RemoveAll => (true, None),
+        HistoryCutoff::Before(cutoff) => (false, Some(cutoff)),
+    };
+    let mut statement = connection.prepare(
+        "SELECT id, audio_filename FROM dictation_history
+         WHERE CASE
+           WHEN expires_at IS NULL OR (?5 AND expires_at > ?4)
+             THEN (?1 OR created_at < ?2)
+           ELSE (NOT ?3 OR expires_at <= ?4 OR created_at < ?2)
+         END",
+    )?;
+    let rows = statement
+        .query_map(
+            params![
+                remove_all,
+                before,
+                settings.keep_failed_takes,
+                now.to_rfc3339(),
+                promotes_failed_takes(settings),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Removes the History rows that `settings` no longer keep at `now` (see
+/// `expired_history_rows`) and queues their audio for deletion.
+fn purge_history(
+    connection: &Connection,
+    settings: &Settings,
+    now: DateTime<Utc>,
+) -> Result<(), StorageError> {
+    let removed = expired_history_rows(connection, settings, now)?;
+    for (_, filename) in &removed {
+        if let Some(filename) = filename {
+            connection.execute(
+                "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
+                params![filename, now.to_rfc3339()],
+            )?;
+        }
+    }
+    for (id, _) in &removed {
+        connection.execute("DELETE FROM dictation_history WHERE id = ?1", [id])?;
+    }
+    if promotes_failed_takes(settings) {
+        connection.execute(
+            "UPDATE dictation_history SET expires_at = NULL
+             WHERE expires_at IS NOT NULL AND expires_at > ?1",
+            [now.to_rfc3339()],
+        )?;
+    }
+    match HistoryCutoff::at(settings.history_retention, now) {
+        HistoryCutoff::KeepAll => {}
+        HistoryCutoff::RemoveAll => purge_dictionary_candidates_before(connection, None)?,
+        HistoryCutoff::Before(cutoff) => {
+            purge_dictionary_candidates_before(connection, Some(&cutoff))?
+        }
+    }
+    Ok(())
+}
+
+/// Reads the stored settings while the caller holds the connection, so a
+/// privacy decision is serialized with the write that depends on it.
+fn stored_settings(connection: &Connection) -> Result<Settings, StorageError> {
+    let raw: Option<String> = connection
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'app_settings'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(raw
+        .as_deref()
+        .map(serde_json::from_str::<Settings>)
+        .transpose()?
+        .unwrap_or_default())
+}
+
+fn insert_history_row(
+    connection: &Connection,
+    item: &NewHistoryItem<'_>,
+    created_at: &str,
+    audio_filename: Option<&str>,
+    expires_at: Option<&str>,
+) -> Result<(), StorageError> {
+    connection.execute(
+        "INSERT INTO dictation_history(
+           transcript_text, processed_text, source_text, instruction_text, action_kind, search_site, mode,
+           asr_provider, llm_provider, target_language, app_category, duration_ms,
+           latency_ms, created_at, audio_filename, retry_of_id, insertion_result,
+           insertion_detail, expires_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                  CASE WHEN EXISTS (SELECT 1 FROM dictation_history WHERE id = ?16) THEN ?16 ELSE NULL END,
+                  ?17, ?18, ?19)",
+        params![
+            item.transcript_text,
+            item.processed_text,
+            item.source_text,
+            item.instruction_text,
+            item.action_kind,
+            item.search_site,
+            item.mode,
+            item.asr_provider,
+            item.llm_provider,
+            item.target_language,
+            item.app_category,
+            item.duration_ms,
+            item.latency_ms,
+            created_at,
+            audio_filename,
+            item.retry_of_id,
+            item.insertion_result,
+            item.insertion_detail,
+            expires_at,
+        ],
+    )?;
+    Ok(())
 }
 
 struct StagedHistoryAudio<'a> {
@@ -335,6 +530,7 @@ impl Storage {
         }
         for (column, definition) in [
             ("audio_filename", "TEXT"),
+            ("expires_at", "TEXT"),
             (
                 "retry_of_id",
                 "INTEGER REFERENCES dictation_history(id) ON DELETE SET NULL",
@@ -518,34 +714,15 @@ impl Storage {
         settings: &Settings,
     ) -> Result<(), StorageError> {
         let value = serialized_settings(settings)?;
-        let cutoff = match HistoryPurge::for_retention(settings.history_retention) {
-            HistoryPurge::KeepAll => {
-                self.update_settings(settings)?;
-                let _ = self.retry_pending_audio_deletions();
-                return Ok(());
-            }
-            HistoryPurge::Before(cutoff) => cutoff,
-        };
+        let now = Utc::now();
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         transaction.execute(
             "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            params![value, Utc::now().to_rfc3339()],
+            params![value, now.to_rfc3339()],
         )?;
-        let removed = expired_history_rows(&transaction, cutoff.as_deref())?;
-        for (_, filename) in &removed {
-            if let Some(filename) = filename {
-                transaction.execute(
-                    "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
-                    params![filename, Utc::now().to_rfc3339()],
-                )?;
-            }
-        }
-        for (id, _) in &removed {
-            transaction.execute("DELETE FROM dictation_history WHERE id = ?1", [id])?;
-        }
-        purge_dictionary_candidates_before(&transaction, cutoff.as_deref())?;
+        purge_history(&transaction, settings, now)?;
         transaction.commit()?;
         drop(connection);
         let _ = self.retry_pending_audio_deletions();
@@ -556,13 +733,21 @@ impl Storage {
     /// change must use `update_settings_and_apply_history_policy` instead, so
     /// the purge and the settings write cannot be split.
     fn apply_history_policy(&self, settings: &Settings) -> Result<(), StorageError> {
-        match HistoryPurge::for_retention(settings.history_retention) {
-            HistoryPurge::KeepAll => {
-                let _ = self.retry_pending_audio_deletions();
-                Ok(())
-            }
-            HistoryPurge::Before(cutoff) => self.delete_history_before(cutoff.as_deref()),
-        }
+        self.apply_history_policy_at(settings, Utc::now())
+    }
+
+    fn apply_history_policy_at(
+        &self,
+        settings: &Settings,
+        now: DateTime<Utc>,
+    ) -> Result<(), StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        purge_history(&transaction, settings, now)?;
+        transaction.commit()?;
+        drop(connection);
+        let _ = self.retry_pending_audio_deletions();
+        Ok(())
     }
 
     /// Counts what saving `retention` would delete right now, without
@@ -573,11 +758,12 @@ impl Storage {
         &self,
         retention: HistoryRetention,
     ) -> Result<HistoryPurgePreview, StorageError> {
-        let HistoryPurge::Before(cutoff) = HistoryPurge::for_retention(retention) else {
-            return Ok(HistoryPurgePreview::default());
+        let settings = Settings {
+            history_retention: retention,
+            ..self.get_settings()?
         };
         let connection = self.connection()?;
-        let rows = expired_history_rows(&connection, cutoff.as_deref())?;
+        let rows = expired_history_rows(&connection, &settings, Utc::now())?;
         // The purge queues each distinct filename once.
         let recordings = rows
             .iter()
@@ -615,8 +801,98 @@ impl Storage {
         item: &NewHistoryItem<'_>,
         source_audio: Option<&Path>,
     ) -> Result<(bool, bool), StorageError> {
+        self.insert_history(item, source_audio)
+    }
+
+    /// Saves a take whose transcription failed, with its audio, so Retry can
+    /// transcribe it again. Returns how it is kept, or `None` when nothing is
+    /// written: the current settings keep no failed take, or the audio copy
+    /// failed. A text-less row without audio would offer nothing to retry.
+    pub fn add_failed_take(
+        &self,
+        item: &NewHistoryItem<'_>,
+        source_audio: &Path,
+    ) -> Result<Option<FailedTakeRetention>, StorageError> {
+        let settings = self.get_settings()?;
+        if FailedTakeRetention::for_settings(&settings).is_none() {
+            return Ok(None);
+        }
+        self.apply_history_policy(&settings)?;
+        // An unused copy is removed when it drops.
+        let Ok(mut staged_audio) = self.stage_history_audio(source_audio) else {
+            return Ok(None);
+        };
+        let mut connection = self.connection()?;
+        // Settings can change while the WAV is being staged; decide with the
+        // settings committed at the time of the insert.
+        let Some(retention) = FailedTakeRetention::for_settings(&stored_settings(&connection)?)
+        else {
+            return Ok(None);
+        };
+        let now = Utc::now();
+        let expires_at = (retention == FailedTakeRetention::Temporary)
+            .then(|| failed_take_expires_at(now).to_rfc3339());
+        let transaction = connection.transaction()?;
+        insert_history_row(
+            &transaction,
+            item,
+            &now.to_rfc3339(),
+            Some(staged_audio.filename()),
+            expires_at.as_deref(),
+        )?;
+        transaction.commit()?;
+        staged_audio.disarm();
+        Ok(Some(retention))
+    }
+
+    /// After a successful Retry of a failed take kept only for Retry, applies
+    /// the History and audio settings to it: it becomes a normal row where
+    /// they keep recordings, and is otherwise deleted with its audio. Other
+    /// rows are left unchanged.
+    pub fn settle_retried_failed_take(&self, id: i64) -> Result<(), StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let row: Option<(Option<String>, Option<String>)> = transaction
+            .query_row(
+                "SELECT expires_at, audio_filename FROM dictation_history WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((Some(_), filename)) = row else {
+            return Ok(());
+        };
+        if FailedTakeRetention::for_settings(&stored_settings(&transaction)?)
+            == Some(FailedTakeRetention::Normal)
+        {
+            transaction.execute(
+                "UPDATE dictation_history SET expires_at = NULL WHERE id = ?1",
+                [id],
+            )?;
+        } else {
+            if let Some(filename) = &filename {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
+                    params![filename, Utc::now().to_rfc3339()],
+                )?;
+            }
+            transaction.execute("DELETE FROM dictation_history WHERE id = ?1", [id])?;
+        }
+        transaction.commit()?;
+        drop(connection);
+        let _ = self.retry_pending_audio_deletions();
+        Ok(())
+    }
+
+    fn insert_history(
+        &self,
+        item: &NewHistoryItem<'_>,
+        source_audio: Option<&Path>,
+    ) -> Result<(bool, bool), StorageError> {
         let settings = self.get_settings()?;
         if settings.history_retention == HistoryRetention::Never {
+            // Nothing is written, but failed takes kept for Retry still expire.
+            let _ = self.apply_history_policy(&settings);
             return Ok((false, false));
         }
         // Prune before insertion. After a row/file association commits, this
@@ -638,18 +914,7 @@ impl Storage {
         // Serialize the final privacy decision with the insert. Settings can
         // change while the WAV is being staged, so the earlier snapshot alone
         // cannot decide whether this row or its audio may be retained.
-        let current_raw: Option<String> = connection
-            .query_row(
-                "SELECT value FROM settings WHERE key = 'app_settings'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let current_settings = current_raw
-            .as_deref()
-            .map(serde_json::from_str::<Settings>)
-            .transpose()?
-            .unwrap_or_default();
+        let current_settings = stored_settings(&connection)?;
         if current_settings.history_retention == HistoryRetention::Never {
             return Ok((false, false));
         }
@@ -673,42 +938,14 @@ impl Storage {
         };
         let retained_audio = audio_filename.is_some();
         let transaction = connection.transaction()?;
-        let insert = transaction.execute(
-            "INSERT INTO dictation_history(
-               transcript_text, processed_text, source_text, instruction_text, action_kind, search_site, mode,
-               asr_provider, llm_provider, target_language, app_category, duration_ms,
-               latency_ms, created_at, audio_filename, retry_of_id, insertion_result,
-               insertion_detail
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                      CASE WHEN EXISTS (SELECT 1 FROM dictation_history WHERE id = ?16) THEN ?16 ELSE NULL END,
-                      ?17, ?18)",
-            params![
-                item.transcript_text,
-                item.processed_text,
-                item.source_text,
-                item.instruction_text,
-                item.action_kind,
-                item.search_site,
-                item.mode,
-                item.asr_provider,
-                item.llm_provider,
-                item.target_language,
-                item.app_category,
-                item.duration_ms,
-                item.latency_ms,
-                Utc::now().to_rfc3339(),
-                audio_filename,
-                item.retry_of_id,
-                item.insertion_result,
-                item.insertion_detail,
-            ],
-        );
-        if let Err(error) = insert {
-            return Err(error.into());
-        }
-        if let Err(error) = transaction.commit() {
-            return Err(error.into());
-        }
+        insert_history_row(
+            &transaction,
+            item,
+            &Utc::now().to_rfc3339(),
+            audio_filename,
+            None,
+        )?;
+        transaction.commit()?;
         if retained_audio {
             if let Some(audio) = &mut staged_audio {
                 audio.disarm();
@@ -727,22 +964,22 @@ impl Storage {
         limit: u32,
     ) -> Result<Vec<HistoryItem>, StorageError> {
         let settings = self.get_settings()?;
-        if settings.history_retention == HistoryRetention::Never {
-            return Ok(Vec::new());
-        }
         self.apply_history_policy(&settings)?;
+        // With History off, only failed takes kept for Retry remain listed.
+        let history_off = settings.history_retention == HistoryRetention::Never;
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, transcript_text, processed_text, mode, asr_provider, llm_provider,
                     target_language, app_category, duration_ms, latency_ms, created_at,
                     source_text, instruction_text, action_kind, search_site,
-                    audio_filename IS NOT NULL, retry_of_id, insertion_result, insertion_detail
+                    audio_filename IS NOT NULL, retry_of_id, insertion_result, insertion_detail,
+                    expires_at
              FROM dictation_history
-             WHERE ?1 = 'all' OR
+             WHERE (NOT ?3 OR expires_at IS NOT NULL) AND (?1 = 'all' OR
                (?1 = 'dictate' AND mode IN ('faithful', 'ai_corrected', 'faithful_fallback')) OR
                (?1 = 'translate' AND mode = 'translate') OR
                (?1 = 'edit' AND mode = 'edit') OR
-               (?1 = 'ask' AND mode = 'ask')
+               (?1 = 'ask' AND mode = 'ask'))
              ORDER BY created_at DESC LIMIT ?2",
         )?;
         let filter = match filter {
@@ -752,7 +989,7 @@ impl Storage {
             HistoryFilter::Edit => "edit",
             HistoryFilter::Ask => "ask",
         };
-        let rows = statement.query_map(params![filter, limit.min(500)], |row| {
+        let rows = statement.query_map(params![filter, limit.min(500), history_off], |row| {
             Ok(HistoryItem {
                 id: row.get(0)?,
                 transcript_text: row.get(1)?,
@@ -773,6 +1010,7 @@ impl Storage {
                 retry_of_id: row.get(16)?,
                 insertion_result: row.get(17)?,
                 insertion_detail: row.get(18)?,
+                expires_at: row.get(19)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -792,7 +1030,8 @@ impl Storage {
                 "SELECT id, transcript_text, processed_text, mode, asr_provider, llm_provider,
                     target_language, app_category, duration_ms, latency_ms, created_at,
                     source_text, instruction_text, action_kind, search_site,
-                    audio_filename IS NOT NULL, retry_of_id, insertion_result, insertion_detail
+                    audio_filename IS NOT NULL, retry_of_id, insertion_result, insertion_detail,
+                    expires_at
              FROM dictation_history WHERE id = ?1",
                 [id],
                 |row| {
@@ -816,6 +1055,7 @@ impl Storage {
                         retry_of_id: row.get(16)?,
                         insertion_result: row.get(17)?,
                         insertion_detail: row.get(18)?,
+                        expires_at: row.get(19)?,
                     })
                 },
             )
@@ -1096,28 +1336,6 @@ impl Storage {
                 let _ = fs::remove_file(entry.path());
             }
         }
-        Ok(())
-    }
-
-    fn delete_history_before(&self, cutoff: Option<&str>) -> Result<(), StorageError> {
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        let removed = expired_history_rows(&transaction, cutoff)?;
-        for (_, filename) in &removed {
-            if let Some(filename) = filename {
-                transaction.execute(
-                    "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
-                    params![filename, Utc::now().to_rfc3339()],
-                )?;
-            }
-        }
-        for (id, _) in &removed {
-            transaction.execute("DELETE FROM dictation_history WHERE id = ?1", [id])?;
-        }
-        purge_dictionary_candidates_before(&transaction, cutoff)?;
-        transaction.commit()?;
-        drop(connection);
-        let _ = self.retry_pending_audio_deletions();
         Ok(())
     }
 
@@ -1707,32 +1925,6 @@ fn stored_history_is_off(raw: &str) -> Result<bool, StorageError> {
     })
 }
 
-/// What a History retention removes when it is applied now.
-enum HistoryPurge {
-    /// Forever: nothing expires.
-    KeepAll,
-    /// Rows created strictly before the RFC 3339 cutoff expire; `None` (Never)
-    /// expires every row.
-    Before(Option<String>),
-}
-
-impl HistoryPurge {
-    fn for_retention(retention: HistoryRetention) -> Self {
-        match retention {
-            HistoryRetention::Forever => Self::KeepAll,
-            HistoryRetention::Never => Self::Before(None),
-            HistoryRetention::TwentyFourHours
-            | HistoryRetention::OneWeek
-            | HistoryRetention::OneMonth
-            | HistoryRetention::OneYear => Self::Before(
-                retention
-                    .days()
-                    .map(|days| (Utc::now() - chrono::Duration::days(days)).to_rfc3339()),
-            ),
-        }
-    }
-}
-
 /// How many History rows and retained recordings a retention change would
 /// delete; read by the confirmation shown before a shorter retention is saved.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
@@ -1740,21 +1932,6 @@ impl HistoryPurge {
 pub struct HistoryPurgePreview {
     pub history_items: u64,
     pub recordings: u64,
-}
-
-/// `(id, audio_filename)` of the History rows a purge with `cutoff` removes.
-/// Every retention purge and its preview select rows through this one query.
-fn expired_history_rows(
-    connection: &Connection,
-    cutoff: Option<&str>,
-) -> Result<Vec<(i64, Option<String>)>, StorageError> {
-    let mut statement = connection.prepare(
-        "SELECT id, audio_filename FROM dictation_history WHERE ?1 IS NULL OR created_at < ?1",
-    )?;
-    let rows = statement
-        .query_map(params![cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(rows)
 }
 
 /// Candidate spans come from transcripts, so they follow the History
@@ -2974,7 +3151,19 @@ mod tests {
              VALUES ('older', 'faithful', 'test', '2029-12-31T23:59:59+00:00');",
             )
             .unwrap();
-        storage.delete_history_before(Some(cutoff)).unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339(cutoff)
+            .unwrap()
+            .with_timezone(&Utc)
+            + chrono::Duration::days(1);
+        storage
+            .apply_history_policy_at(
+                &Settings {
+                    history_retention: HistoryRetention::TwentyFourHours,
+                    ..Settings::default()
+                },
+                now,
+            )
+            .unwrap();
         let texts = storage
             .list_history(HistoryFilter::All, 10)
             .unwrap()
@@ -3120,6 +3309,411 @@ mod tests {
                 .unwrap();
 
             assert_eq!(history_texts(&storage), vec!["inside"], "{retention:?}");
+        }
+    }
+
+    fn keeping_audio() -> Settings {
+        Settings {
+            history_retention: HistoryRetention::OneMonth,
+            delete_audio_after_processing: false,
+            ..Settings::default()
+        }
+    }
+
+    fn keeping_nothing(keep_failed_takes: bool) -> Settings {
+        Settings {
+            history_retention: HistoryRetention::Never,
+            delete_audio_after_processing: true,
+            keep_failed_takes,
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn a_failed_take_is_written_only_with_its_audio() {
+        let storage = Storage::in_memory().unwrap();
+        storage.update_settings(&keeping_audio()).unwrap();
+        let source = source_wav();
+
+        assert_eq!(
+            storage.add_failed_take(&item(), &source).unwrap(),
+            Some(FailedTakeRetention::Normal)
+        );
+        assert_eq!(stored_row_count(&storage), 1);
+        assert_eq!(history_audio_files(&storage).len(), 1);
+
+        // Audio retention and keeping failed takes are off: no row.
+        storage
+            .update_settings(&Settings {
+                delete_audio_after_processing: true,
+                keep_failed_takes: false,
+                ..keeping_audio()
+            })
+            .unwrap();
+        assert_eq!(storage.add_failed_take(&item(), &source).unwrap(), None);
+        assert_eq!(stored_row_count(&storage), 1);
+        assert_eq!(history_audio_files(&storage).len(), 1);
+
+        assert!(source.exists(), "the caller still owns its temporary audio");
+        let _ = fs::remove_file(source);
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
+    }
+
+    #[test]
+    fn a_failed_take_is_not_written_when_the_audio_copy_fails() {
+        for settings in [keeping_audio(), keeping_nothing(true)] {
+            let storage = Storage::in_memory().unwrap();
+            storage.update_settings(&settings).unwrap();
+            let missing =
+                std::env::temp_dir().join(format!("history-missing-{}.wav", random_audio_stem()));
+
+            assert_eq!(storage.add_failed_take(&item(), &missing).unwrap(), None);
+            assert_eq!(stored_row_count(&storage), 0);
+            assert!(history_audio_files(&storage).is_empty());
+            let _ = fs::remove_dir_all(&storage.history_audio_dir);
+        }
+    }
+
+    #[test]
+    fn retention_cutoffs_and_failed_take_expiry_are_computed_from_one_clock() {
+        let now = chrono::DateTime::parse_from_rfc3339("2030-01-08T12:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            HistoryCutoff::at(HistoryRetention::Never, now),
+            HistoryCutoff::RemoveAll
+        );
+        assert_eq!(
+            HistoryCutoff::at(HistoryRetention::Forever, now),
+            HistoryCutoff::KeepAll
+        );
+        assert_eq!(
+            HistoryCutoff::at(HistoryRetention::TwentyFourHours, now),
+            HistoryCutoff::Before("2030-01-07T12:00:00+00:00".into())
+        );
+        assert_eq!(
+            HistoryCutoff::at(HistoryRetention::OneWeek, now),
+            HistoryCutoff::Before("2030-01-01T12:00:00+00:00".into())
+        );
+        assert_eq!(
+            failed_take_expires_at(now).to_rfc3339(),
+            "2030-01-09T12:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn failed_take_retention_follows_the_settings() {
+        assert_eq!(
+            FailedTakeRetention::for_settings(&keeping_audio()),
+            Some(FailedTakeRetention::Normal)
+        );
+        assert_eq!(
+            FailedTakeRetention::for_settings(&Settings {
+                keep_failed_takes: false,
+                ..keeping_audio()
+            }),
+            Some(FailedTakeRetention::Normal)
+        );
+        for keep_failed_takes in [true, false] {
+            let expected = keep_failed_takes.then_some(FailedTakeRetention::Temporary);
+            for settings in [
+                keeping_nothing(keep_failed_takes),
+                Settings {
+                    delete_audio_after_processing: false,
+                    ..keeping_nothing(keep_failed_takes)
+                },
+                Settings {
+                    history_retention: HistoryRetention::Forever,
+                    ..keeping_nothing(keep_failed_takes)
+                },
+            ] {
+                assert_eq!(
+                    FailedTakeRetention::for_settings(&settings),
+                    expected,
+                    "{settings:?}"
+                );
+            }
+        }
+        // The default settings delete audio, so failed takes are temporary.
+        assert_eq!(
+            FailedTakeRetention::for_settings(&Settings::default()),
+            Some(FailedTakeRetention::Temporary)
+        );
+    }
+
+    #[test]
+    fn settings_without_the_failed_take_switch_keep_failed_takes() {
+        let storage = Storage::in_memory().unwrap();
+        let mut stored = serde_json::to_value(Settings {
+            keep_failed_takes: false,
+            ..Settings::default()
+        })
+        .unwrap();
+        stored.as_object_mut().unwrap().remove("keepFailedTakes");
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, ?2)",
+                params![stored.to_string(), Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        assert!(storage.get_settings().unwrap().keep_failed_takes);
+        assert!(Settings::default().keep_failed_takes);
+    }
+
+    #[test]
+    fn a_failed_take_kept_for_retry_expires_after_24_hours_with_its_audio() {
+        let storage = Storage::in_memory().unwrap();
+        let settings = keeping_nothing(true);
+        storage.update_settings(&settings).unwrap();
+        let source = source_wav();
+        let before = Utc::now();
+        assert_eq!(
+            storage.add_failed_take(&item(), &source).unwrap(),
+            Some(FailedTakeRetention::Temporary)
+        );
+        let _ = fs::remove_file(&source);
+        // History off removes no failed take kept for Retry before it expires.
+        storage.enforce_current_history_policy().unwrap();
+        storage
+            .apply_history_policy_at(&settings, before + chrono::Duration::hours(23))
+            .unwrap();
+        let rows = storage.list_history(HistoryFilter::All, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].has_audio);
+        assert_eq!(history_audio_files(&storage).len(), 1);
+
+        let after_expiry = Utc::now() + chrono::Duration::hours(24);
+        storage
+            .apply_history_policy_at(&settings, after_expiry)
+            .unwrap();
+        assert_eq!(stored_row_count(&storage), 0);
+        assert!(history_audio_files(&storage).is_empty());
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
+    }
+
+    #[test]
+    fn expired_failed_takes_are_removed_by_the_startup_and_listing_purges() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .update_settings(&Settings {
+                history_retention: HistoryRetention::Forever,
+                ..keeping_nothing(true)
+            })
+            .unwrap();
+        let insert = |text: &str, expires_at: Option<chrono::DateTime<Utc>>| {
+            storage
+                .connection()
+                .unwrap()
+                .execute(
+                    "INSERT INTO dictation_history(transcript_text, mode, asr_provider, created_at, expires_at)
+                     VALUES (?1, 'faithful', 'test', ?2, ?3)",
+                    params![
+                        text,
+                        (Utc::now() - chrono::Duration::days(2)).to_rfc3339(),
+                        expires_at.map(|value| value.to_rfc3339())
+                    ],
+                )
+                .unwrap();
+        };
+        insert("normal", None);
+        insert("expired", Some(Utc::now() - chrono::Duration::hours(1)));
+        insert("pending", Some(Utc::now() + chrono::Duration::hours(1)));
+        // The startup hook.
+        storage.enforce_current_history_policy().unwrap();
+        assert_eq!(history_texts(&storage), vec!["pending", "normal"]);
+
+        insert("expired", Some(Utc::now() - chrono::Duration::hours(1)));
+        assert_eq!(history_texts(&storage), vec!["pending", "normal"]);
+    }
+
+    #[test]
+    fn history_off_lists_and_keeps_only_unexpired_failed_takes() {
+        let storage = Storage::in_memory().unwrap();
+        storage.update_settings(&keeping_audio()).unwrap();
+        storage.add_history(&item()).unwrap();
+        storage
+            .update_settings_and_apply_history_policy(&keeping_nothing(true))
+            .unwrap();
+        let source = source_wav();
+        storage.add_failed_take(&item(), &source).unwrap().unwrap();
+        let _ = fs::remove_file(&source);
+        // A successful take with History off writes nothing.
+        assert!(!storage.add_history(&item()).unwrap());
+
+        let rows = storage.list_history(HistoryFilter::All, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].expires_at.is_some());
+        assert_eq!(stored_row_count(&storage), 1);
+        storage.delete_all_history().unwrap();
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
+    }
+
+    #[test]
+    fn turning_off_kept_failed_takes_removes_them_with_their_audio() {
+        let storage = Storage::in_memory().unwrap();
+        storage.update_settings(&keeping_nothing(true)).unwrap();
+        let source = source_wav();
+        storage.add_failed_take(&item(), &source).unwrap().unwrap();
+        let _ = fs::remove_file(&source);
+        assert_eq!(history_audio_files(&storage).len(), 1);
+
+        storage
+            .update_settings_and_apply_history_policy(&keeping_nothing(false))
+            .unwrap();
+        assert_eq!(stored_row_count(&storage), 0);
+        assert!(history_audio_files(&storage).is_empty());
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
+    }
+
+    #[test]
+    fn a_kept_failed_take_follows_normal_retention_once_history_keeps_audio() {
+        let storage = Storage::in_memory().unwrap();
+        storage.update_settings(&keeping_nothing(true)).unwrap();
+        let source = source_wav();
+        storage.add_failed_take(&item(), &source).unwrap().unwrap();
+        let _ = fs::remove_file(&source);
+
+        // Turning History on alone still deletes audio: the take still expires.
+        let history_only = Settings {
+            history_retention: HistoryRetention::OneMonth,
+            ..keeping_nothing(true)
+        };
+        storage
+            .update_settings_and_apply_history_policy(&history_only)
+            .unwrap();
+        assert!(storage.list_history(HistoryFilter::All, 1).unwrap()[0]
+            .expires_at
+            .is_some());
+
+        storage
+            .update_settings_and_apply_history_policy(&keeping_audio())
+            .unwrap();
+        let row = &storage.list_history(HistoryFilter::All, 1).unwrap()[0];
+        assert_eq!(row.expires_at, None);
+        storage
+            .apply_history_policy_at(&keeping_audio(), Utc::now() + chrono::Duration::hours(25))
+            .unwrap();
+        assert_eq!(stored_row_count(&storage), 1);
+        assert_eq!(history_audio_files(&storage).len(), 1);
+        storage.delete_all_history().unwrap();
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
+    }
+
+    #[test]
+    fn settling_a_retried_failed_take_leaves_normal_rows_alone() {
+        let storage = Storage::in_memory().unwrap();
+        storage.update_settings(&keeping_audio()).unwrap();
+        let source = source_wav();
+        storage.add_failed_take(&item(), &source).unwrap().unwrap();
+        let _ = fs::remove_file(&source);
+        let id = storage.list_history(HistoryFilter::All, 1).unwrap()[0].id;
+        storage
+            .update_settings_and_apply_history_policy(&keeping_nothing(true))
+            .unwrap();
+        // History off already removed the normal row; settling a missing row
+        // is a no-op.
+        storage.settle_retried_failed_take(id).unwrap();
+        storage.settle_retried_failed_take(i64::MAX).unwrap();
+        assert_eq!(stored_row_count(&storage), 0);
+
+        storage.update_settings(&keeping_audio()).unwrap();
+        storage.add_history(&item()).unwrap();
+        let id = storage.list_history(HistoryFilter::All, 1).unwrap()[0].id;
+        storage.update_settings(&keeping_nothing(true)).unwrap();
+        storage.settle_retried_failed_take(id).unwrap();
+        assert_eq!(stored_row_count(&storage), 1);
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
+    }
+
+    #[test]
+    fn purge_preview_counts_failed_takes_kept_for_retry_like_the_purge() {
+        // History on, audio deleted: failed takes are kept only for Retry.
+        let base = Settings {
+            history_retention: HistoryRetention::Forever,
+            ..keeping_nothing(true)
+        };
+        for (retention, expected) in [
+            (HistoryRetention::Forever, (1, 1)),
+            (HistoryRetention::OneYear, (1, 1)),
+            (HistoryRetention::OneMonth, (2, 2)),
+            (HistoryRetention::OneWeek, (2, 2)),
+            (HistoryRetention::TwentyFourHours, (2, 2)),
+            (HistoryRetention::Never, (3, 3)),
+        ] {
+            let storage = Storage::in_memory().unwrap();
+            let source = source_wav();
+            storage
+                .update_settings(&Settings {
+                    delete_audio_after_processing: false,
+                    ..base.clone()
+                })
+                .unwrap();
+            let set_last = |column: &str, value: chrono::DateTime<Utc>| {
+                storage
+                    .connection()
+                    .unwrap()
+                    .execute(
+                        &format!(
+                            "UPDATE dictation_history SET {column} = ?1
+                             WHERE id = (SELECT MAX(id) FROM dictation_history)"
+                        ),
+                        [value.to_rfc3339()],
+                    )
+                    .unwrap();
+            };
+            // A normal recording from 40 days ago and a recent one.
+            storage
+                .add_history_with_audio(&item(), Some(&source))
+                .unwrap();
+            set_last("created_at", Utc::now() - chrono::Duration::days(40));
+            storage
+                .add_history_with_audio(&item(), Some(&source))
+                .unwrap();
+            storage.update_settings(&base).unwrap();
+            // An unexpired failed take and an expired one.
+            assert_eq!(
+                storage.add_failed_take(&item(), &source).unwrap(),
+                Some(FailedTakeRetention::Temporary)
+            );
+            storage.add_failed_take(&item(), &source).unwrap().unwrap();
+            set_last("expires_at", Utc::now() - chrono::Duration::minutes(1));
+            let rows_before = stored_row_count(&storage);
+            let files_before = history_audio_files(&storage).len();
+            assert_eq!((rows_before, files_before), (4, 4));
+
+            let preview = storage.history_purge_preview(retention).unwrap();
+            assert_eq!(stored_row_count(&storage), rows_before);
+            storage
+                .update_settings_and_apply_history_policy(&Settings {
+                    history_retention: retention,
+                    ..base.clone()
+                })
+                .unwrap();
+            let deleted = (
+                (rows_before - stored_row_count(&storage)) as u64,
+                (files_before - history_audio_files(&storage).len()) as u64,
+            );
+            assert_eq!(
+                (preview.history_items, preview.recordings),
+                deleted,
+                "{retention:?}"
+            );
+            assert_eq!(deleted, expected, "{retention:?}");
+            // The unexpired failed take survives every retention.
+            let kept = storage
+                .connection()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM dictation_history WHERE expires_at IS NOT NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            assert_eq!(kept, 1, "{retention:?}");
+            let _ = fs::remove_file(source);
+            let _ = fs::remove_dir_all(&storage.history_audio_dir);
         }
     }
 

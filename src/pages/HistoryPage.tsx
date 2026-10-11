@@ -44,7 +44,8 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, onSave,
   const [playingId, setPlayingId] = useState<number | null>(null);
   useEffect(() => () => { if (audioUrl) URL.revokeObjectURL(audioUrl); }, [audioUrl]);
   useEffect(() => {
-    if (playingId !== null && (settings.historyRetention === "never" || !history.some((item) => item.id === playingId))) {
+    // With History off, the list holds only failed takes kept for Retry.
+    if (playingId !== null && !history.some((item) => item.id === playingId)) {
       if (audioUrl) URL.revokeObjectURL(audioUrl);
       setAudioUrl(null);
       setPlayingId(null);
@@ -87,15 +88,19 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, onSave,
       {retryActive && <button onClick={onCancelRetry}>{t("Cancel")}</button>}
     </div>
     {audioUrl && <audio className="history-player" src={audioUrl} controls autoPlay onError={onAudioError} />}
-    {settings.historyRetention === "never" ? <Empty title={t("History is disabled")} detail={t("New transcripts will not be written to SQLite.")} />
+    {settings.historyRetention === "never" && history.length === 0 ? <Empty title={t("History is disabled")} detail={settings.keepFailedTakes
+      ? t("New transcripts are not saved. A failed recording (and, for Edit, the selected text) is kept for 24 hours so you can retry it.")
+      : t("New transcripts will not be written to SQLite.")} />
       : history.length === 0 ? <Empty title={t("No dictations yet")} detail={t("Completed local dictations will appear here.")} />
-      : <div className="history-list">{history.map(item => <article className="history-item" key={item.id}>
+      : <>{settings.historyRetention === "never" && <p className="muted">{t("History is off. Failed recordings (and, for Edit, the selected text) are kept here for 24 hours so you can retry them.")}</p>}
+      <div className="history-list">{history.map(item => <article className="history-item" key={item.id}>
           <div className="history-meta"><time dateTime={item.createdAt}>{new Date(item.createdAt).toLocaleString()}</time>
             <span className="history-mode">{item.mode in modeLabels
               ? t(modeLabels[item.mode as keyof typeof modeLabels])
               : item.mode}{item.targetLanguage ? ` · ${item.targetLanguage}` : ""}</span>
             {item.appCategory && <small>{t("App category")}: {item.appCategory}</small>}
-            {item.insertionResult && <InsertionBadge result={item.insertionResult} detail={item.insertionDetail} />}</div>
+            {item.insertionResult && <InsertionBadge result={item.insertionResult} detail={item.insertionDetail} />}
+            {item.expiresAt && <small>{t("Deleted automatically:")} {new Date(item.expiresAt).toLocaleString()}</small>}</div>
           {item.sourceText && <HistoryText text={item.sourceText} label={t("Selected text")} onCopy={onCopyItem} />}
           {item.instructionText && <HistoryText text={item.instructionText} label={t("Spoken instruction")} onCopy={onCopyItem} />}
           {!item.sourceText && !item.instructionText && <HistoryText text={item.transcriptText} onCopy={onCopyItem} />}
@@ -107,7 +112,7 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, onSave,
             <button disabled={!item.hasAudio} onClick={() => void audio(item, true)}>{t("Download")}</button>
             <button className="danger-button" onClick={() => onDelete(item.id)}>{t("Delete")}</button>
           </div>
-        </article>)}</div>}
+        </article>)}</div></>}
   </section>;
 }
 

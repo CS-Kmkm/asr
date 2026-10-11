@@ -45,6 +45,137 @@ fn report_temp_cleanup(app: &AppHandle, artifact: &mut TempArtifact) {
     }
 }
 
+const TRANSCRIPTION_FAILED_SAVED_TO_HISTORY: &str =
+    "Transcription failed. The recording was saved to History, where you can retry it.";
+
+const TRANSCRIPTION_FAILED_KEPT_FOR_RETRY: &str =
+    "Transcription failed. The recording is kept in History for 24 hours, where you can retry it.";
+
+const TRANSCRIPTION_TOO_LONG_FOR_MODEL: &str = "The recording was too long for this speech model. Retrying with the same model will fail the same way; record shorter clips or switch to faster-whisper.";
+
+const TRANSCRIPTION_TOO_LONG_SAVED_TO_HISTORY: &str = "The recording was too long for this speech model. It was saved to History, but retrying with the same model will fail the same way; switch to faster-whisper before retrying, or record shorter clips.";
+
+/// Worker error code for a transcript cut off at the model's output limit.
+const TRANSCRIPT_TRUNCATED_CODE: &str = "transcript_truncated";
+
+/// Why a take's transcription failed, as far as Retry is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TranscriptionFailure {
+    /// Retrying may succeed, for example after a transient worker failure.
+    Retryable,
+    /// The take exceeds what the speech model can transcribe; Retry with the
+    /// same model fails the same way.
+    TooLongForModel,
+}
+
+impl TranscriptionFailure {
+    fn of(error: &asr::AsrError) -> Self {
+        match error {
+            asr::AsrError::Worker(worker) if worker.code == TRANSCRIPT_TRUNCATED_CODE => {
+                Self::TooLongForModel
+            }
+            _ => Self::Retryable,
+        }
+    }
+
+    /// `insertion_detail` of the failed take's History row.
+    fn history_detail(self) -> Option<&'static str> {
+        match self {
+            Self::Retryable => None,
+            Self::TooLongForModel => Some(TRANSCRIPT_TRUNCATED_CODE),
+        }
+    }
+}
+
+/// `insertion_result` of a History row whose final transcription failed. The
+/// row carries no text, only the audio that Retry transcribes again.
+const TRANSCRIPTION_FAILED_OUTCOME: &str = "transcription_failed";
+
+/// The History row that lets Retry re-run a take whose transcription failed,
+/// or `None` when Retry could not reproduce the request. Ask chooses its
+/// action from the transcript, so a take without one has nothing to retry.
+fn failed_take_history_item<'a>(
+    mode: PipelineMode,
+    asr_provider: &'a str,
+    edit_source: Option<&'a str>,
+    target_language: Option<&'a str>,
+    app_category: Option<&'a str>,
+    duration_ms: u64,
+) -> Option<NewHistoryItem<'a>> {
+    // Edit captures a selection, not a target window, so like a successful
+    // Edit row it records no app category.
+    let (history_mode, source_text, target_language, app_category) = match mode {
+        PipelineMode::Dictate => ("faithful", None, None, app_category),
+        PipelineMode::Translate => ("translate", None, Some(target_language?), app_category),
+        PipelineMode::Edit => ("edit", Some(edit_source?), None, None),
+        PipelineMode::Ask => return None,
+    };
+    Some(NewHistoryItem {
+        transcript_text: "",
+        processed_text: None,
+        source_text,
+        instruction_text: None,
+        action_kind: None,
+        search_site: None,
+        mode: history_mode,
+        asr_provider,
+        llm_provider: None,
+        target_language,
+        app_category,
+        duration_ms: Some(duration_ms as i64),
+        latency_ms: None,
+        retry_of_id: None,
+        insertion_result: Some(TRANSCRIPTION_FAILED_OUTCOME),
+        insertion_detail: None,
+    })
+}
+
+/// Saves a take whose transcription failed, with its audio, to History so
+/// Retry can transcribe it again. A take is kept where History keeps
+/// recordings, or else for 24 hours when keeping failed takes is on. Returns
+/// how it was kept, or `None` when it was not.
+fn preserve_failed_take(
+    storage: &Storage,
+    settings: &Settings,
+    item: Option<NewHistoryItem<'_>>,
+    audio_path: &std::path::Path,
+) -> Option<storage::FailedTakeRetention> {
+    let item = item?;
+    storage::FailedTakeRetention::for_settings(settings)?;
+    // Storage re-checks the current settings and writes the row only with
+    // its audio: a text-less row without audio would offer nothing to retry.
+    storage.add_failed_take(&item, audio_path).ok().flatten()
+}
+
+/// Saves a successful Retry of History row `source_id`. A failed take kept
+/// only for Retry then follows the History and audio settings; if that
+/// cleanup fails, the take still expires with the 24-hour purge.
+fn save_retry_result(
+    storage: &Storage,
+    item: &NewHistoryItem<'_>,
+    audio_path: &std::path::Path,
+    source_id: i64,
+) -> HistorySaveStatus {
+    let status = save_history(storage, item, Some(audio_path));
+    if status != HistorySaveStatus::Failed {
+        let _ = storage.settle_retried_failed_take(source_id);
+    }
+    status
+}
+
+fn failed_take_message(
+    kept: Option<storage::FailedTakeRetention>,
+    failure: TranscriptionFailure,
+) -> &'static str {
+    match (failure, kept) {
+        (TranscriptionFailure::TooLongForModel, Some(_)) => TRANSCRIPTION_TOO_LONG_SAVED_TO_HISTORY,
+        (TranscriptionFailure::TooLongForModel, None) => TRANSCRIPTION_TOO_LONG_FOR_MODEL,
+        (_, Some(storage::FailedTakeRetention::Normal)) => TRANSCRIPTION_FAILED_SAVED_TO_HISTORY,
+        (_, Some(storage::FailedTakeRetention::Temporary)) => TRANSCRIPTION_FAILED_KEPT_FOR_RETRY,
+        (_, None) => "Transcription failed. Check model and GPU diagnostics.",
+    }
+}
+
 fn capture_config(settings: &Settings) -> CaptureConfig {
     let noise_suppression = match settings.noise_suppression.as_str() {
         "off" => NoiseSuppressionLevel::Off,
@@ -506,7 +637,7 @@ async fn start_recording_mode(
     if services.translation_active.load(Ordering::Acquire) {
         return Err("selected-text translation is already active".into());
     }
-    let operation_id = services.lifecycle.begin_start(mode)?;
+    let operation_id = MODEL_CHANGE_GATE.begin_pipeline(|| services.lifecycle.begin_start(mode))?;
     let guard = PipelineGuard {
         lifecycle: &services.lifecycle,
         id: operation_id,
@@ -659,6 +790,7 @@ async fn start_recording_mode(
 
     let app_for_levels = app.clone();
     tauri::async_runtime::spawn(async move {
+        let recording_started = Instant::now();
         loop {
             tokio::time::sleep(Duration::from_millis(80)).await;
             let Some(services) = app_for_levels.try_state::<Services>() else {
@@ -669,14 +801,96 @@ async fn start_recording_mode(
             {
                 break;
             }
-            let level = {
+            let (level, stream_failed) = {
                 let audio = services.audio.lock().await;
-                audio.level()
+                (audio.level(), audio.stream_error().is_some())
             };
+            if let Some(reason) = automatic_stop_reason(
+                stream_failed,
+                recording_started.elapsed(),
+                MAX_RECORDING_DURATION,
+            ) {
+                // The same path as a user stop: the audio captured so far is
+                // transcribed instead of being discarded.
+                let _ = stop_recording_for(
+                    app_for_levels.clone(),
+                    app_for_levels.state::<Services>(),
+                    app_for_levels.state::<AppState>(),
+                    app_for_levels.state::<Storage>(),
+                    reason,
+                )
+                .await;
+                break;
+            }
             let _ = app_for_levels.emit("audio-level", level);
         }
     });
     Ok(())
+}
+
+/// Recordings stop automatically at this length and are transcribed as usual.
+const MAX_RECORDING_DURATION: Duration = Duration::from_secs(15 * 60);
+
+/// Why a recording stopped. Only `User` comes from an explicit request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopReason {
+    User,
+    MicrophoneDisconnected,
+    MaximumDuration,
+}
+
+/// Decides, on each level tick, whether a recording must stop by itself. A
+/// failed input stream delivers no more audio, so it wins over the time limit.
+fn automatic_stop_reason(
+    stream_failed: bool,
+    elapsed: Duration,
+    limit: Duration,
+) -> Option<StopReason> {
+    if stream_failed {
+        Some(StopReason::MicrophoneDisconnected)
+    } else if elapsed >= limit {
+        Some(StopReason::MaximumDuration)
+    } else {
+        None
+    }
+}
+
+/// Whether the input stream failed during this take, either noticed by the
+/// level loop or only by the final capture (a stop within one level tick).
+fn microphone_disconnected(
+    reason: StopReason,
+    artifact: &Result<audio::AudioArtifact, audio::AudioError>,
+) -> bool {
+    reason == StopReason::MicrophoneDisconnected
+        || match artifact {
+            Ok(artifact) => artifact.warning.is_some(),
+            Err(error) => matches!(error, audio::AudioError::StreamFailure(_)),
+        }
+}
+
+const MICROPHONE_DISCONNECTED: &str = "The microphone was disconnected, so recording stopped. The audio captured before the disconnection is being transcribed.";
+const MICROPHONE_DISCONNECTED_WITHOUT_SPEECH: &str = "The microphone was disconnected before usable speech was captured. Check the microphone and start a new recording.";
+const RECORDING_LIMIT_REACHED: &str =
+    "Recording reached the 15-minute limit and stopped. The audio is being transcribed.";
+const MICROPHONE_DISCONNECTED_PROCESSING: &str =
+    "Microphone disconnected. Transcribing what was captured.";
+const RECORDING_LIMIT_PROCESSING: &str = "Recording limit reached. Transcribing.";
+
+/// The Processing message the overlay shows. An automatic stop keeps its
+/// reason visible there (the status notice appears only in the main window);
+/// a user stop shows `default`.
+fn processing_message(
+    reason: StopReason,
+    disconnected: bool,
+    default: &'static str,
+) -> &'static str {
+    if disconnected || reason == StopReason::MicrophoneDisconnected {
+        MICROPHONE_DISCONNECTED_PROCESSING
+    } else if reason == StopReason::MaximumDuration {
+        RECORDING_LIMIT_PROCESSING
+    } else {
+        default
+    }
 }
 
 #[tauri::command]
@@ -686,10 +900,22 @@ pub(crate) async fn stop_recording(
     state: State<'_, AppState>,
     storage: State<'_, Storage>,
 ) -> Result<RecordingResult, String> {
+    stop_recording_for(app, services, state, storage, StopReason::User).await
+}
+
+pub(crate) async fn stop_recording_for(
+    app: AppHandle,
+    services: State<'_, Services>,
+    state: State<'_, AppState>,
+    storage: State<'_, Storage>,
+    reason: StopReason,
+) -> Result<RecordingResult, String> {
     let (operation_id, mode, cancel) = match services.lifecycle.begin_processing() {
         Ok(operation) => operation,
         Err(error) => {
-            if error == "no recording is active" {
+            // An automatic stop that lost a race with the user's own stop must
+            // not overwrite the state that stop publishes.
+            if error == "no recording is active" && reason == StopReason::User {
                 emit_state(
                     &app,
                     &state,
@@ -714,7 +940,7 @@ pub(crate) async fn stop_recording(
         &app,
         &state,
         AppPhase::Processing,
-        "Stopping recording and preparing audio.",
+        processing_message(reason, false, "Stopping recording and preparing audio."),
     );
     let started = Instant::now();
     let (live_task, mut edit_session, mut ask_session, translation_target) =
@@ -748,15 +974,25 @@ pub(crate) async fn stop_recording(
         None => return Err("live dictation session is unavailable".into()),
     };
     let settings = storage.get_settings().map_err(command_error)?;
+    let disconnected = microphone_disconnected(reason, &artifact_result);
     let artifact = artifact_result.map_err(|error| {
         emit_state(
             &app,
             &state,
             AppPhase::Error,
-            "No usable speech was captured. Start a new recording and try again.",
+            if disconnected {
+                MICROPHONE_DISCONNECTED_WITHOUT_SPEECH
+            } else {
+                "No usable speech was captured. Start a new recording and try again."
+            },
         );
         command_error(error)
     })?;
+    if disconnected {
+        emit_status(&app, "microphone_disconnected", MICROPHONE_DISCONNECTED);
+    } else if reason == StopReason::MaximumDuration {
+        emit_status(&app, "recording_limit_reached", RECORDING_LIMIT_REACHED);
+    }
     let duration_ms = artifact.duration.as_millis() as u64;
     let mut artifact_cleanup = artifact_cleanup
         .take()
@@ -768,7 +1004,12 @@ pub(crate) async fn stop_recording(
         emit_state(&app, &state, AppPhase::Idle, cancel_message);
         return Err(cancel_error.into());
     }
-    emit_state(&app, &state, AppPhase::Processing, "Transcribing locally.");
+    emit_state(
+        &app,
+        &state,
+        AppPhase::Processing,
+        processing_message(reason, disconnected, "Transcribing locally."),
+    );
 
     let app_context = services
         .app_context
@@ -779,23 +1020,43 @@ pub(crate) async fn stop_recording(
         .dictionary_asr_prompt_for(app_context.as_ref(), &settings.asr_backend)
         .unwrap_or_default();
     let correction_cancel = cancel.clone();
-    let transcript_result = services
-        .transcriber
-        .transcribe_with_locale(
-            &artifact.path,
-            prompt.as_deref(),
-            settings.speech_locale.as_deref(),
-            cancel,
-        )
-        .await;
+    // Defense in depth: model changes are refused while a recording is
+    // active, but if the model is not marked ready (for example its load
+    // failed), load it as a new recording would. A worker crash keeps the
+    // ready status; the transcriber reloads the model when it respawns.
+    let model_ready = ensure_model_loaded(&app, &services, &settings).await;
+    if services.lifecycle.is_cancelled(operation_id) {
+        report_temp_cleanup(&app, &mut artifact_cleanup);
+        emit_state(&app, &state, AppPhase::Idle, cancel_message);
+        return Err(cancel_error.into());
+    }
+    let transcript_result = match model_ready {
+        Err(error) => Err((error, TranscriptionFailure::Retryable)),
+        Ok(_) => match services
+            .transcriber
+            .transcribe_with_locale(
+                &artifact.path,
+                prompt.as_deref(),
+                settings.speech_locale.as_deref(),
+                cancel,
+            )
+            .await
+        {
+            Ok(value) => Ok(value),
+            Err(asr::AsrError::Cancelled) => {
+                report_temp_cleanup(&app, &mut artifact_cleanup);
+                emit_state(&app, &state, AppPhase::Idle, cancel_message);
+                return Err(cancel_error.into());
+            }
+            Err(error) => {
+                let failure = TranscriptionFailure::of(&error);
+                Err((command_error(error), failure))
+            }
+        },
+    };
     let transcript = match transcript_result {
         Ok(value) => value,
-        Err(asr::AsrError::Cancelled) => {
-            report_temp_cleanup(&app, &mut artifact_cleanup);
-            emit_state(&app, &state, AppPhase::Idle, cancel_message);
-            return Err(cancel_error.into());
-        }
-        Err(error) => {
+        Err((error, failure)) => {
             let _ = storage.add_metric(
                 "asr",
                 Some(settings.asr_backend.as_str()),
@@ -803,14 +1064,37 @@ pub(crate) async fn stop_recording(
                 false,
                 Some("asr_failed"),
             );
+            let asr_provider = model_identity(&settings)
+                .0
+                .unwrap_or_else(|| settings.asr_backend.clone());
+            let preserved = preserve_failed_take(
+                &storage,
+                &settings,
+                failed_take_history_item(
+                    mode,
+                    &asr_provider,
+                    edit_session
+                        .as_ref()
+                        .map(|session| session.selection.text()),
+                    translation_target.as_deref(),
+                    app_context::history_category(app_context.as_ref()),
+                    duration_ms,
+                )
+                .map(|item| NewHistoryItem {
+                    insertion_detail: failure.history_detail(),
+                    ..item
+                }),
+                &artifact.path,
+            );
             emit_state(
                 &app,
                 &state,
                 AppPhase::Error,
-                "Transcription failed. Check model and GPU diagnostics.",
+                failed_take_message(preserved, failure),
             );
+            // History keeps its own copy, so the temporary capture is always removed.
             report_temp_cleanup(&app, &mut artifact_cleanup);
-            return Err(command_error(error));
+            return Err(error);
         }
     };
     if services.lifecycle.is_cancelled(operation_id) {
@@ -2138,6 +2422,7 @@ mod tests {
             retry_of_id: None,
             insertion_result: None,
             insertion_detail: None,
+            expires_at: None,
         };
         let profile = |formality: &str| types::StyleProfile {
             formality: formality.into(),
@@ -2981,6 +3266,619 @@ mod tests {
             "correction_failed"
         );
     }
+
+    #[test]
+    fn a_failed_microphone_or_the_time_limit_stops_the_recording() {
+        let limit = MAX_RECORDING_DURATION;
+        assert_eq!(limit, Duration::from_secs(15 * 60));
+        assert_eq!(
+            automatic_stop_reason(false, Duration::from_secs(60), limit),
+            None
+        );
+        assert_eq!(
+            automatic_stop_reason(true, Duration::from_secs(1), limit),
+            Some(StopReason::MicrophoneDisconnected)
+        );
+        assert_eq!(
+            automatic_stop_reason(false, limit, limit),
+            Some(StopReason::MaximumDuration)
+        );
+        assert_eq!(
+            automatic_stop_reason(true, limit * 2, limit),
+            Some(StopReason::MicrophoneDisconnected)
+        );
+    }
+
+    #[test]
+    fn a_stream_failure_is_reported_even_when_the_user_stopped_first() {
+        let artifact = |warning: Option<&str>| audio::AudioArtifact {
+            path: PathBuf::from("take.wav"),
+            sample_rate: 24_000,
+            channels: 1,
+            sample_count: 24_000,
+            duration: Duration::from_secs(1),
+            peak_level: 0.5,
+            rms_level: 0.1,
+            vad: audio::VadAnalysis::default(),
+            warning: warning.map(str::to_owned),
+        };
+        assert!(!microphone_disconnected(
+            StopReason::User,
+            &Ok(artifact(None))
+        ));
+        assert!(microphone_disconnected(
+            StopReason::User,
+            &Ok(artifact(Some("device disconnected")))
+        ));
+        assert!(microphone_disconnected(
+            StopReason::MicrophoneDisconnected,
+            &Ok(artifact(None))
+        ));
+        assert!(microphone_disconnected(
+            StopReason::User,
+            &Err(audio::AudioError::StreamFailure(
+                "device disconnected".into()
+            ))
+        ));
+        assert!(!microphone_disconnected(
+            StopReason::MaximumDuration,
+            &Err(audio::AudioError::NoVoiceDetected)
+        ));
+    }
+
+    #[test]
+    fn an_automatic_stop_keeps_its_reason_in_the_overlay() {
+        assert_eq!(
+            processing_message(StopReason::User, false, "Transcribing locally."),
+            "Transcribing locally."
+        );
+        assert_eq!(
+            processing_message(StopReason::User, true, "Transcribing locally."),
+            MICROPHONE_DISCONNECTED_PROCESSING
+        );
+        assert_eq!(
+            processing_message(StopReason::MicrophoneDisconnected, false, "Stopping"),
+            MICROPHONE_DISCONNECTED_PROCESSING
+        );
+        assert_eq!(
+            processing_message(StopReason::MaximumDuration, false, "Stopping"),
+            RECORDING_LIMIT_PROCESSING
+        );
+        assert_eq!(
+            processing_message(StopReason::MaximumDuration, true, "Stopping"),
+            MICROPHONE_DISCONNECTED_PROCESSING
+        );
+    }
+
+    fn model_change() -> (Settings, Settings) {
+        let previous = Settings::default();
+        let mut next = previous.clone();
+        next.model_id = Some("custom/model".into());
+        (previous, next)
+    }
+
+    #[test]
+    fn a_recording_cannot_start_between_the_model_check_and_reconfigure() {
+        let gate = ModelChangeGate::new();
+        let lifecycle = PipelineLifecycle::default();
+        let (previous, next) = model_change();
+
+        // update_settings: the Idle check and the mark happen in one step.
+        let change = gate
+            .begin_change(&previous, &next, || lifecycle.phase())
+            .unwrap();
+        assert!(change.is_some());
+        assert_eq!(
+            gate.begin_pipeline(|| lifecycle.begin_start(PipelineMode::Dictate)),
+            Err(MODEL_CHANGE_IN_PROGRESS)
+        );
+        assert_eq!(lifecycle.phase(), PipelinePhase::Idle);
+
+        // After the reconfiguration the start proceeds, and a later model
+        // change observes the claimed pipeline and is refused.
+        drop(change);
+        assert!(gate
+            .begin_pipeline(|| lifecycle.begin_start(PipelineMode::Dictate))
+            .is_ok());
+        assert_eq!(
+            gate.begin_change(&previous, &next, || lifecycle.phase())
+                .err(),
+            Some(MODEL_CHANGE_WHILE_BUSY.to_string())
+        );
+        // Unrelated settings never take the mark, even while recording.
+        assert!(gate
+            .begin_change(&previous, &previous, || lifecycle.phase())
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn overlapping_model_changes_are_refused() {
+        let gate = ModelChangeGate::new();
+        let (previous, next) = model_change();
+        let first = gate
+            .begin_change(&previous, &next, || PipelinePhase::Idle)
+            .unwrap();
+        assert!(first.is_some());
+        // A stale save reverting the model while the first change is pending.
+        assert_eq!(
+            gate.begin_change(&next, &previous, || PipelinePhase::Idle)
+                .err(),
+            Some(MODEL_CHANGE_IN_PROGRESS.to_string())
+        );
+        // The refused change did not clear the first change's mark.
+        assert_eq!(
+            gate.begin_pipeline(|| Ok(())),
+            Err(MODEL_CHANGE_IN_PROGRESS)
+        );
+        drop(first);
+        assert_eq!(gate.begin_pipeline(|| Ok(())), Ok(()));
+        assert!(gate
+            .begin_change(&next, &previous, || PipelinePhase::Idle)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn a_start_during_a_model_change_fails_fast_instead_of_waiting() {
+        let gate = Arc::new(ModelChangeGate::new());
+        let lifecycle = PipelineLifecycle::default();
+        let (previous, next) = model_change();
+        let (marked, wait_marked) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+        // A reconfiguration that is still running (for example behind a
+        // model download that holds the transcriber).
+        let updater = std::thread::spawn({
+            let gate = Arc::clone(&gate);
+            move || {
+                let _change = gate
+                    .begin_change(&previous, &next, || PipelinePhase::Idle)
+                    .unwrap();
+                marked.send(()).unwrap();
+                wait_release.recv().unwrap();
+            }
+        });
+        wait_marked.recv().unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            gate.begin_pipeline(|| lifecycle.begin_retry(PipelineMode::Dictate))
+                .map(|(id, _)| id),
+            Err(MODEL_CHANGE_IN_PROGRESS)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(lifecycle.phase(), PipelinePhase::Idle);
+        release.send(()).unwrap();
+        updater.join().unwrap();
+        // The guard cleared the mark when the update finished.
+        assert!(gate
+            .begin_pipeline(|| lifecycle.begin_retry(PipelineMode::Dictate))
+            .is_ok());
+    }
+
+    #[test]
+    fn model_changes_wait_for_an_idle_pipeline() {
+        let previous = Settings::default();
+        let mut backend = previous.clone();
+        backend.asr_backend = if previous.asr_backend == "mock" {
+            "faster-whisper"
+        } else {
+            "mock"
+        }
+        .into();
+        let mut model = previous.clone();
+        model.model_id = Some("custom/model".into());
+        let mut quantization = previous.clone();
+        quantization.model_quantization = if previous.model_quantization == "4bit" {
+            "8bit"
+        } else {
+            "4bit"
+        }
+        .into();
+        let mut endpoint = previous.clone();
+        endpoint.api_base_url = "https://asr.example.invalid/v1".into();
+        let mut unrelated = previous.clone();
+        unrelated.interaction_sounds = !previous.interaction_sounds;
+        for busy in [
+            PipelinePhase::Starting,
+            PipelinePhase::Recording,
+            PipelinePhase::Processing,
+        ] {
+            for next in [&backend, &model, &quantization, &endpoint] {
+                assert_eq!(
+                    reject_model_change_while_busy(&previous, next, busy),
+                    Err(MODEL_CHANGE_WHILE_BUSY.to_string())
+                );
+                assert_eq!(
+                    reject_model_change_while_busy(&previous, next, PipelinePhase::Idle),
+                    Ok(())
+                );
+            }
+            assert_eq!(
+                reject_model_change_while_busy(&previous, &unrelated, busy),
+                Ok(())
+            );
+        }
+    }
+
+    fn failed_take_storage(settings: Settings) -> (Storage, tempfile::TempDir, PathBuf) {
+        let storage = Storage::in_memory().unwrap();
+        storage.update_settings(&settings).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let take = directory.path().join("failed-take.wav");
+        std::fs::write(&take, b"RIFF failed take").unwrap();
+        (storage, directory, take)
+    }
+
+    /// History and its audio are kept, so a failed take is a normal row.
+    fn keeping_audio() -> Settings {
+        Settings {
+            history_retention: types::HistoryRetention::OneMonth,
+            delete_audio_after_processing: false,
+            ..Settings::default()
+        }
+    }
+
+    /// The most private settings: no History and no audio.
+    fn keeping_nothing(keep_failed_takes: bool) -> Settings {
+        Settings {
+            history_retention: types::HistoryRetention::Never,
+            delete_audio_after_processing: true,
+            keep_failed_takes,
+            ..Settings::default()
+        }
+    }
+
+    fn dictate_failure() -> Option<NewHistoryItem<'static>> {
+        failed_take_history_item(PipelineMode::Dictate, "mock", None, None, None, 1)
+    }
+
+    fn history_audio_count(storage: &Storage) -> usize {
+        storage
+            .list_history(types::HistoryFilter::All, 10)
+            .unwrap()
+            .iter()
+            .filter(|row| row.has_audio)
+            .count()
+    }
+
+    #[test]
+    fn a_failed_transcription_is_kept_in_history_for_retry() {
+        let (storage, _directory, take) = failed_take_storage(keeping_audio());
+        let settings = storage.get_settings().unwrap();
+        let item = failed_take_history_item(
+            PipelineMode::Dictate,
+            "faster-whisper:large-v3-turbo",
+            None,
+            None,
+            Some("messaging"),
+            90_000,
+        );
+        let kept = preserve_failed_take(&storage, &settings, item, &take);
+        assert_eq!(kept, Some(storage::FailedTakeRetention::Normal));
+        assert_eq!(
+            failed_take_message(kept, TranscriptionFailure::Retryable),
+            TRANSCRIPTION_FAILED_SAVED_TO_HISTORY
+        );
+
+        let rows = storage.list_history(types::HistoryFilter::All, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert!(row.has_audio);
+        assert_eq!(row.expires_at, None, "normal History retention applies");
+        assert_eq!(row.transcript_text, "");
+        assert_eq!(
+            row.insertion_result.as_deref(),
+            Some(TRANSCRIPTION_FAILED_OUTCOME)
+        );
+        assert_eq!(row.duration_ms, Some(90_000));
+        assert_eq!(history_pipeline_mode(&row.mode), Ok(PipelineMode::Dictate));
+        let retry_copy = storage.copy_history_audio_for_retry(row.id).unwrap();
+        assert_eq!(std::fs::read(&retry_copy).unwrap(), b"RIFF failed take");
+        std::fs::remove_file(retry_copy).unwrap();
+        // History keeps its own copy; the caller still removes its temporary take.
+        assert!(take.is_file());
+        storage.delete_all_history().unwrap();
+    }
+
+    #[test]
+    fn a_failed_take_is_kept_for_retry_even_when_history_and_audio_are_off() {
+        for settings in [
+            keeping_nothing(true),
+            Settings {
+                delete_audio_after_processing: false,
+                ..keeping_nothing(true)
+            },
+            Settings {
+                history_retention: types::HistoryRetention::OneMonth,
+                ..keeping_nothing(true)
+            },
+        ] {
+            let (storage, _directory, take) = failed_take_storage(settings.clone());
+            let kept = preserve_failed_take(&storage, &settings, dictate_failure(), &take);
+            assert_eq!(kept, Some(storage::FailedTakeRetention::Temporary));
+            assert_eq!(
+                failed_take_message(kept, TranscriptionFailure::Retryable),
+                TRANSCRIPTION_FAILED_KEPT_FOR_RETRY
+            );
+
+            let rows = storage.list_history(types::HistoryFilter::All, 10).unwrap();
+            assert_eq!(rows.len(), 1, "{settings:?}");
+            let row = &rows[0];
+            assert!(row.has_audio);
+            assert!(row.expires_at.is_some());
+            let retry_copy = storage.copy_history_audio_for_retry(row.id).unwrap();
+            assert_eq!(std::fs::read(&retry_copy).unwrap(), b"RIFF failed take");
+            std::fs::remove_file(retry_copy).unwrap();
+            storage.delete_all_history().unwrap();
+        }
+    }
+
+    #[test]
+    fn without_keeping_failed_takes_only_history_with_audio_keeps_them() {
+        for settings in [
+            keeping_nothing(false),
+            Settings {
+                delete_audio_after_processing: false,
+                ..keeping_nothing(false)
+            },
+            Settings {
+                history_retention: types::HistoryRetention::OneMonth,
+                ..keeping_nothing(false)
+            },
+        ] {
+            let (storage, _directory, take) = failed_take_storage(settings.clone());
+            let kept = preserve_failed_take(&storage, &settings, dictate_failure(), &take);
+            assert_eq!(kept, None, "{settings:?}");
+            assert_eq!(
+                failed_take_message(kept, TranscriptionFailure::Retryable),
+                "Transcription failed. Check model and GPU diagnostics."
+            );
+            assert!(storage
+                .list_history(types::HistoryFilter::All, 10)
+                .unwrap()
+                .is_empty());
+        }
+
+        let settings = Settings {
+            keep_failed_takes: false,
+            ..keeping_audio()
+        };
+        let (storage, _directory, take) = failed_take_storage(settings.clone());
+        assert_eq!(
+            preserve_failed_take(&storage, &settings, dictate_failure(), &take),
+            Some(storage::FailedTakeRetention::Normal)
+        );
+        storage.delete_all_history().unwrap();
+    }
+
+    #[test]
+    fn a_failed_take_is_never_saved_without_its_audio() {
+        // Audio retention and keeping failed takes were turned off while the
+        // take was being transcribed.
+        let (storage, _directory, take) = failed_take_storage(Settings {
+            history_retention: types::HistoryRetention::OneMonth,
+            ..keeping_nothing(false)
+        });
+        let snapshot = keeping_audio();
+        assert_eq!(
+            preserve_failed_take(&storage, &snapshot, dictate_failure(), &take),
+            None
+        );
+        assert!(storage
+            .list_history(types::HistoryFilter::All, 10)
+            .unwrap()
+            .is_empty());
+
+        // The audio copy fails (here: the take no longer exists).
+        for settings in [keeping_audio(), keeping_nothing(true)] {
+            let (storage, directory, _take) = failed_take_storage(settings.clone());
+            let missing = directory.path().join("missing.wav");
+            assert_eq!(
+                preserve_failed_take(&storage, &settings, dictate_failure(), &missing),
+                None
+            );
+            assert!(storage
+                .list_history(types::HistoryFilter::All, 10)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    fn retry_result(source_id: i64) -> NewHistoryItem<'static> {
+        NewHistoryItem {
+            transcript_text: "retried",
+            processed_text: None,
+            source_text: None,
+            instruction_text: None,
+            action_kind: None,
+            search_site: None,
+            mode: "faithful",
+            asr_provider: "mock",
+            llm_provider: None,
+            target_language: None,
+            app_category: None,
+            duration_ms: Some(1),
+            latency_ms: Some(1),
+            retry_of_id: Some(source_id),
+            insertion_result: None,
+            insertion_detail: None,
+        }
+    }
+
+    #[test]
+    fn a_successful_retry_applies_the_normal_settings_to_a_failed_take() {
+        // History off: neither the failed take nor the Retry result remains.
+        let (storage, directory, take) = failed_take_storage(keeping_nothing(true));
+        let settings = storage.get_settings().unwrap();
+        preserve_failed_take(&storage, &settings, dictate_failure(), &take).unwrap();
+        let source = storage.list_history(types::HistoryFilter::All, 1).unwrap()[0].id;
+        let retry_audio = storage.copy_history_audio_for_retry(source).unwrap();
+        assert_eq!(
+            save_retry_result(&storage, &retry_result(source), &retry_audio, source),
+            HistorySaveStatus::Complete
+        );
+        std::fs::remove_file(retry_audio).unwrap();
+        assert!(storage.history_item(source).unwrap().is_none());
+        assert!(storage
+            .list_history(types::HistoryFilter::All, 10)
+            .unwrap()
+            .is_empty());
+        drop(directory);
+
+        // History on, audio deleted: the Retry text is kept without audio.
+        let (storage, _directory, take) = failed_take_storage(Settings {
+            history_retention: types::HistoryRetention::OneMonth,
+            ..keeping_nothing(true)
+        });
+        let settings = storage.get_settings().unwrap();
+        preserve_failed_take(&storage, &settings, dictate_failure(), &take).unwrap();
+        let source = storage.list_history(types::HistoryFilter::All, 1).unwrap()[0].id;
+        let retry_audio = storage.copy_history_audio_for_retry(source).unwrap();
+        save_retry_result(&storage, &retry_result(source), &retry_audio, source);
+        std::fs::remove_file(retry_audio).unwrap();
+        assert!(storage.history_item(source).unwrap().is_none());
+        let rows = storage.list_history(types::HistoryFilter::All, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].transcript_text, "retried");
+        assert_eq!(history_audio_count(&storage), 0);
+
+        // History with audio enabled since the failure: the take stays as a
+        // normal row instead of expiring.
+        let (storage, _directory, take) = failed_take_storage(keeping_nothing(true));
+        let settings = storage.get_settings().unwrap();
+        preserve_failed_take(&storage, &settings, dictate_failure(), &take).unwrap();
+        let source = storage.list_history(types::HistoryFilter::All, 1).unwrap()[0].id;
+        storage
+            .update_settings_and_apply_history_policy(&keeping_audio())
+            .unwrap();
+        let retry_audio = storage.copy_history_audio_for_retry(source).unwrap();
+        save_retry_result(&storage, &retry_result(source), &retry_audio, source);
+        std::fs::remove_file(retry_audio).unwrap();
+        let kept = storage.history_item(source).unwrap().unwrap();
+        assert!(kept.has_audio);
+        assert_eq!(kept.expires_at, None);
+        assert_eq!(history_audio_count(&storage), 2);
+        storage.delete_all_history().unwrap();
+    }
+
+    #[test]
+    fn a_truncated_transcript_is_not_presented_as_retryable() {
+        let worker = |code: &str| {
+            asr::AsrError::Worker(asr::WorkerError {
+                code: code.into(),
+                message: "failed".into(),
+            })
+        };
+        assert_eq!(
+            TranscriptionFailure::of(&worker(TRANSCRIPT_TRUNCATED_CODE)),
+            TranscriptionFailure::TooLongForModel
+        );
+        for error in [
+            worker("transcription_failed"),
+            worker("cuda_oom"),
+            asr::AsrError::Timeout,
+            asr::AsrError::Crashed,
+            asr::AsrError::Protocol("transcript_truncated".into()),
+        ] {
+            assert_eq!(
+                TranscriptionFailure::of(&error),
+                TranscriptionFailure::Retryable,
+                "{error}"
+            );
+        }
+
+        let too_long = TranscriptionFailure::TooLongForModel;
+        assert_eq!(too_long.history_detail(), Some("transcript_truncated"));
+        assert_eq!(TranscriptionFailure::Retryable.history_detail(), None);
+        assert_eq!(
+            failed_take_message(None, too_long),
+            TRANSCRIPTION_TOO_LONG_FOR_MODEL
+        );
+        for kept in [
+            storage::FailedTakeRetention::Normal,
+            storage::FailedTakeRetention::Temporary,
+        ] {
+            assert_eq!(
+                failed_take_message(Some(kept), too_long),
+                TRANSCRIPTION_TOO_LONG_SAVED_TO_HISTORY
+            );
+        }
+        for message in [
+            TRANSCRIPTION_TOO_LONG_FOR_MODEL,
+            TRANSCRIPTION_TOO_LONG_SAVED_TO_HISTORY,
+        ] {
+            assert!(message.contains("will fail the same way"));
+            assert!(message.contains("faster-whisper"));
+        }
+    }
+
+    #[test]
+    fn a_truncated_failed_take_records_why_in_history() {
+        let (storage, _directory, take) = failed_take_storage(keeping_nothing(true));
+        let settings = storage.get_settings().unwrap();
+        let item = dictate_failure().map(|item| NewHistoryItem {
+            insertion_detail: TranscriptionFailure::TooLongForModel.history_detail(),
+            ..item
+        });
+        assert!(preserve_failed_take(&storage, &settings, item, &take).is_some());
+        let row = &storage.list_history(types::HistoryFilter::All, 1).unwrap()[0];
+        assert_eq!(
+            row.insertion_result.as_deref(),
+            Some(TRANSCRIPTION_FAILED_OUTCOME)
+        );
+        assert_eq!(
+            row.insertion_detail.as_deref(),
+            Some("transcript_truncated")
+        );
+        storage.delete_all_history().unwrap();
+    }
+
+    #[test]
+    fn failed_takes_keep_what_retry_needs_for_each_mode() {
+        let translate = failed_take_history_item(
+            PipelineMode::Translate,
+            "mock",
+            None,
+            Some("English"),
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(translate.mode, "translate");
+        assert_eq!(translate.target_language, Some("English"));
+        let edit = failed_take_history_item(
+            PipelineMode::Edit,
+            "mock",
+            Some("selected"),
+            None,
+            Some("messaging"),
+            1,
+        )
+        .unwrap();
+        assert_eq!(edit.mode, "edit");
+        assert_eq!(edit.source_text, Some("selected"));
+        assert_eq!(edit.app_category, None);
+        for mode in ["faithful", "translate", "edit"] {
+            assert!(history_pipeline_mode(mode).is_ok());
+        }
+        // Retry could not reproduce these takes, so they are not kept.
+        assert!(
+            failed_take_history_item(PipelineMode::Translate, "mock", None, None, None, 1)
+                .is_none()
+        );
+        assert!(
+            failed_take_history_item(PipelineMode::Edit, "mock", None, None, None, 1).is_none()
+        );
+        assert!(failed_take_history_item(
+            PipelineMode::Ask,
+            "mock",
+            Some("selected"),
+            None,
+            None,
+            1
+        )
+        .is_none());
+    }
 }
 
 #[tauri::command]
@@ -3151,9 +4049,13 @@ pub(crate) async fn update_settings(
     // The command is async, so waiting here never blocks the main thread
     // needed by global-shortcut registration. Keep this guard through the
     // single transactional settings/History persistence step.
-    let previous = {
+    let (previous, _model_change) = {
         let _settings_writes = storage.lock_settings_writes().map_err(command_error)?;
         let previous = storage.get_settings().map_err(command_error)?;
+        // Held until the transcriber is reconfigured and its status reset;
+        // recording starts and Retry fail fast meanwhile instead of waiting.
+        let model_change =
+            MODEL_CHANGE_GATE.begin_change(&previous, &settings, || services.lifecycle.phase())?;
         let old_routes = services
             .shortcut_routes
             .lock()
@@ -3193,7 +4095,7 @@ pub(crate) async fn update_settings(
             .inactive_shortcuts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = inactive;
-        previous
+        (previous, model_change)
     };
     if settings.auto_start != previous.auto_start {
         let result = if settings.auto_start {
@@ -3209,10 +4111,7 @@ pub(crate) async fn update_settings(
             );
         }
     }
-    let model_configuration_changed = settings.asr_backend != previous.asr_backend
-        || settings.model_id != previous.model_id
-        || settings.api_base_url != previous.api_base_url
-        || settings.api_key_env_var != previous.api_key_env_var;
+    let model_configuration_changed = worker_configuration_changed(&previous, &settings);
     if model_configuration_changed {
         services
             .transcriber
@@ -3235,6 +4134,111 @@ pub(crate) async fn update_settings(
     }
     let _ = app.emit("settings-changed", &settings);
     Ok(settings)
+}
+
+/// Settings that require a new worker command (`reconfigure` kills the worker).
+fn worker_configuration_changed(previous: &Settings, next: &Settings) -> bool {
+    next.asr_backend != previous.asr_backend
+        || next.model_id != previous.model_id
+        || next.api_base_url != previous.api_base_url
+        || next.api_key_env_var != previous.api_key_env_var
+}
+
+const MODEL_CHANGE_WHILE_BUSY: &str =
+    "Finish the current recording or processing before changing the speech model.";
+const MODEL_CHANGE_IN_PROGRESS: &str = "The speech model is being changed. Try again in a moment.";
+
+/// Makes a speech-model change atomic with respect to pipeline starts.
+///
+/// `update_settings` checks that the pipeline is idle and marks a change in
+/// progress in one step under this short-lived lock, then reconfigures the
+/// transcriber without it. Recording start and Retry claim the lifecycle
+/// under the same lock and fail fast while the mark is set. A start can
+/// therefore neither slip between the check and the reconfiguration nor wait
+/// behind a model load that holds the transcriber.
+struct ModelChangeGate {
+    changing: Mutex<bool>,
+}
+
+static MODEL_CHANGE_GATE: ModelChangeGate = ModelChangeGate::new();
+
+impl ModelChangeGate {
+    const fn new() -> Self {
+        Self {
+            changing: Mutex::new(false),
+        }
+    }
+
+    fn changing(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.changing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Returns a guard that keeps starts out until it drops, or `None` when
+    /// `next` does not change the speech model.
+    fn begin_change(
+        &self,
+        previous: &Settings,
+        next: &Settings,
+        phase: impl FnOnce() -> PipelinePhase,
+    ) -> Result<Option<ModelChangeGuard<'_>>, String> {
+        let mut changing = self.changing();
+        if !speech_model_changed(previous, next) {
+            return Ok(None);
+        }
+        // A second change while one is pending (for example a stale save
+        // carrying the old model) would let the first guard clear the mark
+        // while its own reconfiguration is still pending.
+        if *changing {
+            return Err(MODEL_CHANGE_IN_PROGRESS.into());
+        }
+        reject_model_change_while_busy(previous, next, phase())?;
+        *changing = true;
+        Ok(Some(ModelChangeGuard { gate: self }))
+    }
+
+    /// Claims the pipeline with `begin` unless a model change is in progress.
+    fn begin_pipeline<T>(
+        &self,
+        begin: impl FnOnce() -> Result<T, &'static str>,
+    ) -> Result<T, &'static str> {
+        let changing = self.changing();
+        if *changing {
+            return Err(MODEL_CHANGE_IN_PROGRESS);
+        }
+        begin()
+    }
+}
+
+/// Clears the model-change mark on every exit path of `update_settings`.
+struct ModelChangeGuard<'a> {
+    gate: &'a ModelChangeGate,
+}
+
+impl Drop for ModelChangeGuard<'_> {
+    fn drop(&mut self) {
+        *self.gate.changing() = false;
+    }
+}
+
+fn speech_model_changed(previous: &Settings, next: &Settings) -> bool {
+    worker_configuration_changed(previous, next)
+        || next.model_quantization != previous.model_quantization
+}
+
+/// A recording or its processing owns the loaded speech model until it
+/// finishes. Reconfiguring or reloading it underneath would fail the final
+/// transcription, so such changes wait until the pipeline is idle.
+fn reject_model_change_while_busy(
+    previous: &Settings,
+    next: &Settings,
+    phase: PipelinePhase,
+) -> Result<(), String> {
+    if speech_model_changed(previous, next) && phase != PipelinePhase::Idle {
+        return Err(MODEL_CHANGE_WHILE_BUSY.into());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -3297,9 +4301,8 @@ pub(crate) async fn retry_history_item(
         .map_err(command_error)?
         .ok_or_else(|| "history item not found".to_string())?;
     let mode = history_pipeline_mode(&source.mode)?;
-    let (operation_id, cancel) = services
-        .lifecycle
-        .begin_retry(mode)
+    let (operation_id, cancel) = MODEL_CHANGE_GATE
+        .begin_pipeline(|| services.lifecycle.begin_retry(mode))
         .map_err(str::to_string)?;
     let _guard = PipelineGuard {
         lifecycle: &services.lifecycle,
@@ -3459,7 +4462,7 @@ pub(crate) async fn retry_history_item(
         let history_save_status = services
             .lifecycle
             .commit_side_effect(operation_id, || {
-                Ok::<HistorySaveStatus, String>(save_history(
+                Ok::<HistorySaveStatus, String>(save_retry_result(
                     &storage,
                     &NewHistoryItem {
                         transcript_text: &transcript.text,
@@ -3487,7 +4490,8 @@ pub(crate) async fn retry_history_item(
                         insertion_result: None,
                         insertion_detail: None,
                     },
-                    Some(&retry_path),
+                    &retry_path,
+                    id,
                 ))
             })
             .map_err(str::to_string)?

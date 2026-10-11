@@ -17,6 +17,46 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Progress notifications are advisory, so a slow subscriber may drop them
 /// rather than delay the load it is reporting on.
 const PROGRESS_CHANNEL_CAPACITY: usize = 32;
+/// The worker reports no progress while it transcribes, so the response
+/// timeout bounds the whole inference. Long recordings (or slow CPU backends)
+/// get this many seconds per second of audio instead of the fixed minimum.
+const TRANSCRIBE_TIMEOUT_PER_AUDIO_SECOND: u32 = 4;
+/// Canonical PCM WAV header size written by the audio pipeline.
+const WAV_HEADER_BYTES: u64 = 44;
+
+/// Response timeout for transcribing `audio` worth of speech: never below the
+/// configured `minimum`, otherwise proportional to the recording length.
+pub(crate) fn transcription_timeout(minimum: Duration, audio: Duration) -> Duration {
+    minimum.max(audio.saturating_mul(TRANSCRIBE_TIMEOUT_PER_AUDIO_SECOND))
+}
+
+/// Audio length of a PCM WAV, from its header byte rate and the file size.
+/// Anything that is not a readable RIFF/WAVE file yields `None`.
+fn wav_duration(header: &[u8], file_len: u64) -> Option<Duration> {
+    if header.len() < WAV_HEADER_BYTES as usize
+        || &header[0..4] != b"RIFF"
+        || &header[8..12] != b"WAVE"
+    {
+        return None;
+    }
+    let byte_rate = u32::from_le_bytes(header[28..32].try_into().ok()?);
+    if byte_rate == 0 {
+        return None;
+    }
+    let audio_bytes = file_len.saturating_sub(WAV_HEADER_BYTES);
+    Some(Duration::from_secs_f64(
+        audio_bytes as f64 / f64::from(byte_rate),
+    ))
+}
+
+fn wav_file_duration(path: &Path) -> Option<Duration> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    let mut header = [0u8; WAV_HEADER_BYTES as usize];
+    file.read_exact(&mut header).ok()?;
+    wav_duration(&header, file_len)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerCommand {
@@ -497,8 +537,12 @@ impl Transcriber for JsonlTranscriber {
             prompt,
             locale,
         );
+        let response_timeout = transcription_timeout(
+            self.request_timeout,
+            wav_file_duration(audio_path).unwrap_or_default(),
+        );
         let response = self
-            .request(request, Some(cancel), self.request_timeout)
+            .request(request, Some(cancel), response_timeout)
             .await?;
         match serde_json::from_value(response) {
             Ok(transcript) => Ok(transcript),
@@ -552,6 +596,72 @@ impl Transcriber for JsonlTranscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcription_timeout_scales_with_long_recordings_only() {
+        let minimum = Duration::from_secs(300);
+        assert_eq!(transcription_timeout(minimum, Duration::ZERO), minimum);
+        assert_eq!(
+            transcription_timeout(minimum, Duration::from_secs(60)),
+            minimum
+        );
+        assert_eq!(
+            transcription_timeout(minimum, Duration::from_secs(75)),
+            minimum
+        );
+        assert_eq!(
+            transcription_timeout(minimum, Duration::from_secs(15 * 60)),
+            Duration::from_secs(60 * 60)
+        );
+        assert_eq!(transcription_timeout(minimum, Duration::MAX), Duration::MAX);
+    }
+
+    fn wav_header(byte_rate: u32) -> Vec<u8> {
+        let mut header = Vec::new();
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header.extend_from_slice(b"WAVEfmt ");
+        header.extend_from_slice(&16u32.to_le_bytes());
+        header.extend_from_slice(&1u16.to_le_bytes());
+        header.extend_from_slice(&1u16.to_le_bytes());
+        header.extend_from_slice(&(byte_rate / 2).to_le_bytes());
+        header.extend_from_slice(&byte_rate.to_le_bytes());
+        header.extend_from_slice(&2u16.to_le_bytes());
+        header.extend_from_slice(&16u16.to_le_bytes());
+        header.extend_from_slice(b"data");
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header
+    }
+
+    #[test]
+    fn wav_duration_reads_the_recording_length() {
+        // 24 kHz mono PCM16: 48,000 bytes per second.
+        let header = wav_header(48_000);
+        assert_eq!(
+            wav_duration(&header, 44 + 48_000 * 600),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(wav_duration(&header, 10), Some(Duration::ZERO));
+        assert_eq!(wav_duration(&wav_header(0), 44 + 48_000), None);
+        assert_eq!(wav_duration(b"not a wav file", 1_000), None);
+        let mut not_wave = header.clone();
+        not_wave[8..12].copy_from_slice(b"AVI ");
+        assert_eq!(wav_duration(&not_wave, 44 + 48_000), None);
+    }
+
+    #[test]
+    fn wav_file_duration_is_unknown_for_missing_files() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            wav_file_duration(&directory.path().join("missing.wav")),
+            None
+        );
+        let path = directory.path().join("take.wav");
+        let mut bytes = wav_header(48_000);
+        bytes.resize(44 + 48_000 * 2, 0);
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(wav_file_duration(&path), Some(Duration::from_secs(2)));
+    }
 
     #[test]
     fn parses_successful_transcript() {

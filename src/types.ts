@@ -45,6 +45,8 @@ export interface Settings {
   microphoneId: string | null;
   historyRetention: HistoryRetention;
   deleteAudioAfterProcessing: boolean;
+  /** Keep a failed take with its audio for 24 hours for Retry, even where History or audio retention is off. */
+  keepFailedTakes: boolean;
   autoStart: boolean;
   clipboardRestore: boolean;
   liveTargetInsertion: boolean;
@@ -139,6 +141,8 @@ export interface HistoryItem {
   retryOfId: number | null;
   insertionResult: string | null;
   insertionDetail: string | null;
+  /** Set only on a failed take kept for Retry outside the History settings: when it is deleted. */
+  expiresAt: string | null;
 }
 
 export interface HistoryAudioPayload {

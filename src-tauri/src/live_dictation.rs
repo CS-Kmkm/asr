@@ -386,16 +386,52 @@ pub(crate) fn start(
             },
         )
         .await;
-        if result.is_err() && !services.lifecycle.is_cancelled(operation_id) {
-            emit_status(
-                &app,
-                "live_transcription_failed",
-                "Live transcription failed. The full recording will be transcribed after stopping.",
-            );
+        if let Err(failure) = result {
+            if !services.lifecycle.is_cancelled(operation_id) {
+                let (kind, message) = failure.status();
+                emit_status(&app, kind, message);
+            }
         }
         draft
     });
     LiveTask { stop, task }
+}
+
+/// Why live recognition ended early. Only a recognition failure leaves the
+/// microphone recording, so only it may promise a full transcription on stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveFailure {
+    /// The microphone stream itself failed (for example a disconnected headset).
+    Capture,
+    /// Preparing or recognizing captured audio failed.
+    Recognition,
+}
+
+impl LiveFailure {
+    fn status(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Capture => (
+                "live_capture_failed",
+                "Live transcription stopped because the microphone input failed.",
+            ),
+            Self::Recognition => (
+                "live_transcription_failed",
+                "Live transcription failed. The full recording will be transcribed after stopping.",
+            ),
+        }
+    }
+}
+
+impl From<String> for LiveFailure {
+    fn from(_: String) -> Self {
+        Self::Recognition
+    }
+}
+
+impl From<&str> for LiveFailure {
+    fn from(_: &str) -> Self {
+        Self::Recognition
+    }
 }
 
 /// Serial snapshot inference provides backpressure: slow models never build a
@@ -410,7 +446,7 @@ async fn run(
     mut stopped: watch::Receiver<bool>,
     interval: Duration,
     mut on_update: impl FnMut(&LiveText),
-) -> Result<(), String> {
+) -> Result<(), LiveFailure> {
     let mut segmentation = Segmentation::default();
     let mut cursor = Duration::ZERO;
     let mut completed = String::new();
@@ -432,7 +468,7 @@ async fn run(
             match audio.snapshot(cursor) {
                 Ok(snapshot) => snapshot,
                 Err(AudioError::NotCapturing) => return Ok(()),
-                Err(error) => return Err(command_error(error)),
+                Err(_) => return Err(LiveFailure::Capture),
             }
         };
         let mut prepared = match tokio::task::spawn_blocking(move || snapshot.prepare())
@@ -441,7 +477,7 @@ async fn run(
         {
             Ok(prepared) => prepared,
             Err(AudioError::TooShort { .. } | AudioError::NoVoiceDetected) => continue,
-            Err(error) => return Err(command_error(error)),
+            Err(_) => return Err(LiveFailure::Recognition),
         };
         let (samples, endpoint, voiced_until) = match segmentation.plan(&prepared) {
             Decision::Skip(silence) => {
@@ -593,6 +629,81 @@ mod tests {
         ] {
             assert!(defers_target_insertion(mode, &settings));
         }
+    }
+
+    /// A microphone whose stream has failed, as after a headset disconnect.
+    struct FailedCapture;
+    impl AudioCapture for FailedCapture {
+        fn snapshot(&self, _: Duration) -> Result<AudioSnapshot, AudioError> {
+            Err(AudioError::StreamFailure("device disconnected".into()))
+        }
+        fn list_devices(&self) -> AudioFuture<'_, Vec<AudioDevice>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn arm(&mut self, _: CaptureConfig) -> AudioFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn disarm(&mut self) -> AudioFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn start(&mut self, _: CaptureConfig) -> AudioFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn stop(&mut self) -> AudioFuture<'_, AudioArtifact> {
+            panic!("live inference must not stop capture")
+        }
+        fn cancel(&mut self) -> AudioFuture<'_, ()> {
+            panic!("live inference must not cancel capture")
+        }
+        fn state(&self) -> CaptureState {
+            CaptureState::Capturing
+        }
+        fn level(&self) -> LevelMeter {
+            LevelMeter::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_microphone_is_reported_as_a_capture_failure() {
+        let audio: tokio::sync::Mutex<Box<dyn AudioCapture>> =
+            tokio::sync::Mutex::new(Box::new(FailedCapture));
+        let recognizer = Recognizer {
+            calls: AtomicUsize::new(0),
+            entered: Notify::new(),
+            release: None,
+        };
+        let (_cancel, cancel) = watch::channel(false);
+        let (_stop, stopped) = watch::channel(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run(
+                &audio,
+                &recognizer,
+                None,
+                None,
+                cancel,
+                stopped,
+                Duration::from_millis(1),
+                |_| panic!("no text without audio"),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Err(LiveFailure::Capture));
+        assert_eq!(recognizer.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn only_a_recognition_failure_promises_a_full_transcription() {
+        let (capture_kind, capture) = LiveFailure::Capture.status();
+        let (recognition_kind, recognition) = LiveFailure::Recognition.status();
+        assert_ne!(capture_kind, recognition_kind);
+        assert!(!capture.contains("full recording"));
+        assert!(recognition.contains("full recording will be transcribed"));
+        assert_eq!(
+            LiveFailure::from(String::from("worker failed")),
+            LiveFailure::Recognition
+        );
     }
 
     // Windows timers can round short sleeps up to ~16 ms; the quiet window

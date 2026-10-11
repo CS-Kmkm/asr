@@ -96,11 +96,35 @@ def faster_whisper_compute_type(quantization: str, *, cuda: bool) -> str:
     raise BackendError("unsupported_quantization", f"Unsupported quantization: {quantization}")
 
 
+# VibeVoice output budget. The length-based estimate assumes about 40 output
+# tokens per second of audio plus a fixed headroom for the structured
+# (speaker/timestamp) wrapper.
+VIBEVOICE_TOKENS_PER_AUDIO_SECOND = 40
+VIBEVOICE_TOKEN_HEADROOM = 128
+# Tied to the app's recording limit (MAX_RECORDING_DURATION, 15 minutes, in
+# src-tauri/src/commands.rs): the ceiling covers a full-length recording plus
+# one minute of margin. When the clip length is known, the per-clip estimate
+# (seconds x VIBEVOICE_TOKENS_PER_AUDIO_SECOND + headroom) is the binding
+# budget, so a full-length take fits only if the speech stays within that
+# unmeasured ~40 tokens/second estimate; denser speech can still end with
+# transcript_truncated. Keep both in step if the recording limit changes.
+#
+# Cost: max_new_tokens is only an upper bound (generation stops at the end of
+# the transcript), but a long recording really does generate tens of thousands
+# of tokens, and the KV cache grows with every one of them. A 15-minute take
+# therefore needs considerably more VRAM than a short one; ASR_MAX_NEW_TOKENS
+# lowers the budget on GPUs that cannot hold it.
+APP_MAX_RECORDING_SECONDS = 15 * 60
+VIBEVOICE_MAX_NEW_TOKENS = (
+    APP_MAX_RECORDING_SECONDS + 60
+) * VIBEVOICE_TOKENS_PER_AUDIO_SECOND + VIBEVOICE_TOKEN_HEADROOM
+
+
 def compute_max_new_tokens(
     audio_seconds: float | None,
     env_override: str | None,
     floor: int = 256,
-    ceiling: int = 4096,
+    ceiling: int = VIBEVOICE_MAX_NEW_TOKENS,
 ) -> int:
     if env_override is not None:
         try:
@@ -111,7 +135,7 @@ def compute_max_new_tokens(
             return override
     if audio_seconds is None:
         return ceiling
-    estimate = int(audio_seconds * 40) + 128
+    estimate = int(audio_seconds * VIBEVOICE_TOKENS_PER_AUDIO_SECOND) + VIBEVOICE_TOKEN_HEADROOM
     return max(floor, min(ceiling, estimate))
 
 

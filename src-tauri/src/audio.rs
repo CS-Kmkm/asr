@@ -129,6 +129,9 @@ pub struct AudioArtifact {
     pub peak_level: f32,
     pub rms_level: f32,
     pub vad: VadAnalysis,
+    /// Set when the input stream failed during the take. The artifact holds
+    /// the audio captured before the failure.
+    pub warning: Option<String>,
 }
 
 pub struct AudioSnapshot {
@@ -516,6 +519,19 @@ impl SharedCapture {
         self.samples = self.preroll.drain();
         self.recording = true;
     }
+
+    /// Ends the take and hands over its samples. A stream failure (for example
+    /// an unplugged or powered-off headset) keeps the audio captured before it
+    /// and is returned alongside as a warning; the take fails only when the
+    /// stream failed before any sample was captured.
+    fn finish_recording(&mut self) -> Result<(Vec<f32>, Option<String>), AudioError> {
+        self.recording = false;
+        let samples = std::mem::take(&mut self.samples);
+        match self.stream_error.clone() {
+            Some(message) if samples.is_empty() => Err(AudioError::StreamFailure(message)),
+            stream_error => Ok((samples, stream_error)),
+        }
+    }
 }
 
 /// An open input stream that is either armed (preroll only) or recording.
@@ -589,14 +605,11 @@ impl CpalAudioCapture {
             .shared
             .lock()
             .map_err(|_| AudioError::StreamFailure("capture buffer lock poisoned".into()))?;
-        if let Some(message) = &shared.stream_error {
-            return Err(AudioError::StreamFailure(message.clone()));
-        }
-
-        shared.recording = false;
-        let mono = std::mem::take(&mut shared.samples);
+        let (mono, stream_error) = shared.finish_recording()?;
         drop(shared);
-        finalize_samples(mono, active.input_sample_rate, &active.config)
+        let mut artifact = finalize_samples(mono, active.input_sample_rate, &active.config)?;
+        artifact.warning = stream_error;
+        Ok(artifact)
     }
 }
 
@@ -803,6 +816,7 @@ fn write_prepared_audio(
         peak_level: levels.peak,
         rms_level: levels.rms,
         vad,
+        warning: None,
     })
 }
 
@@ -1350,6 +1364,75 @@ mod tests {
         assert_ne!(partial.path, complete.path);
         partial.remove().unwrap();
         complete.remove().unwrap();
+    }
+
+    fn recording_capture(shared: &Arc<Mutex<SharedCapture>>, directory: &Path) -> CpalAudioCapture {
+        CpalAudioCapture {
+            recording: true,
+            active: Some(ActiveCapture {
+                config: CaptureConfig {
+                    artifact_directory: Some(directory.to_owned()),
+                    ..CaptureConfig::default()
+                },
+                input_sample_rate: TARGET_SAMPLE_RATE,
+                shared: Arc::clone(shared),
+                #[cfg(target_os = "windows")]
+                stream_worker: StreamWorker {
+                    shutdown: mpsc::channel().0,
+                    thread: None,
+                },
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_failure_keeps_the_audio_captured_before_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let samples: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.1).sin() * 0.2).collect();
+        let shared = Arc::new(Mutex::new(SharedCapture {
+            samples,
+            recording: true,
+            stream_error: Some("device disconnected".into()),
+            ..SharedCapture::default()
+        }));
+        let mut capture = recording_capture(&shared, directory.path());
+        let artifact = capture.stop().await.unwrap();
+        assert_eq!(artifact.sample_count, 24_000);
+        assert_eq!(artifact.warning.as_deref(), Some("device disconnected"));
+        assert!(artifact.path.is_file());
+        assert_eq!(capture.state(), CaptureState::Idle);
+        artifact.remove().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_failure_before_any_audio_still_fails_the_take() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(Mutex::new(SharedCapture {
+            recording: true,
+            stream_error: Some("device disconnected".into()),
+            ..SharedCapture::default()
+        }));
+        let mut capture = recording_capture(&shared, directory.path());
+        assert!(matches!(
+            capture.stop().await,
+            Err(AudioError::StreamFailure(message)) if message == "device disconnected"
+        ));
+        assert_eq!(capture.state(), CaptureState::Idle);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_healthy_take_finishes_without_a_warning() {
+        let mut shared = SharedCapture {
+            samples: vec![0.1; 8],
+            recording: true,
+            ..SharedCapture::default()
+        };
+        let (samples, warning) = shared.finish_recording().unwrap();
+        assert_eq!(samples.len(), 8);
+        assert_eq!(warning, None);
+        assert!(!shared.recording);
+        assert!(shared.samples.is_empty());
     }
 
     #[test]

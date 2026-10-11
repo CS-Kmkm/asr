@@ -35,6 +35,7 @@ export const defaultSettings: Settings = {
   microphoneId: null,
   historyRetention: "one_month",
   deleteAudioAfterProcessing: true,
+  keepFailedTakes: true,
   autoStart: false,
   clipboardRestore: true,
   liveTargetInsertion: false,

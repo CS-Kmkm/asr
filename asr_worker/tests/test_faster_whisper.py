@@ -10,6 +10,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from asr_worker.backends import (
+    APP_MAX_RECORDING_SECONDS,
+    VIBEVOICE_MAX_NEW_TOKENS,
     BackendError,
     FasterWhisperBackend,
     compute_max_new_tokens,
@@ -79,7 +81,27 @@ class MaxNewTokensTests(unittest.TestCase):
         self.assertEqual(compute_max_new_tokens(60.0, None), 2528)
 
     def test_long_audio_clamped_to_ceiling(self) -> None:
-        self.assertEqual(compute_max_new_tokens(10000.0, None), 4096)
+        self.assertEqual(compute_max_new_tokens(10000.0, None), VIBEVOICE_MAX_NEW_TOKENS)
+
+    def test_ceiling_covers_the_app_recording_limit_with_a_minute_of_margin(self) -> None:
+        self.assertEqual(APP_MAX_RECORDING_SECONDS, 15 * 60)
+        # (900 + 60) s * 40 tok/s + 128
+        self.assertEqual(VIBEVOICE_MAX_NEW_TOKENS, 38528)
+
+    def test_full_length_recording_is_not_capped(self) -> None:
+        # 15 min -> 900*40 + 128 = 36128, below the ceiling, so the
+        # length-based estimate applies instead of a truncating cap.
+        full = compute_max_new_tokens(float(APP_MAX_RECORDING_SECONDS), None)
+        self.assertEqual(full, 36128)
+        self.assertLess(full, VIBEVOICE_MAX_NEW_TOKENS)
+        # The previous 4096 cap only fit about 99 s; a 5-minute take now
+        # gets its whole estimate.
+        self.assertEqual(compute_max_new_tokens(300.0, None), 12128)
+
+    def test_override_still_caps_long_recordings(self) -> None:
+        self.assertEqual(
+            compute_max_new_tokens(float(APP_MAX_RECORDING_SECONDS), "4096"), 4096
+        )
 
     def test_env_override_takes_priority(self) -> None:
         self.assertEqual(compute_max_new_tokens(60.0, "512"), 512)
@@ -89,7 +111,7 @@ class MaxNewTokensTests(unittest.TestCase):
         self.assertEqual(compute_max_new_tokens(1.0, "not-a-number"), 256)
 
     def test_none_audio_returns_ceiling(self) -> None:
-        self.assertEqual(compute_max_new_tokens(None, None), 4096)
+        self.assertEqual(compute_max_new_tokens(None, None), VIBEVOICE_MAX_NEW_TOKENS)
 
 
 class WavDurationTests(unittest.TestCase):
