@@ -1289,23 +1289,32 @@ async fn translate_selection(app: AppHandle) {
     };
     match injector.replace_selection(&selection, &translated, &monitor, checkpoint) {
         Ok(result) => {
-            let (kind, message) = selection_translation_status(
-                result,
-                injector.confirmed_paste_detail(result).is_some(),
-            );
+            let (kind, message) = selection_translation_status(result);
             emit_status(&app, kind, message);
         }
         Err(_) => {
-            let copied = injector.copy_to_clipboard(&translated).is_ok();
-            let message = if copied {
-                "The target changed; the translation remains on the clipboard."
+            if injector.copy_to_clipboard(&translated).is_ok() {
+                emit_status(
+                    &app,
+                    "error",
+                    "The target changed; the translation remains on the clipboard.",
+                );
             } else {
-                "The target changed and the clipboard is unavailable."
-            };
-            emit_status(&app, "error", message);
+                // Not inserted, and the clipboard was unavailable or protected
+                // under Restore clipboard: keep the translation in this app.
+                let state = app.state::<AppState>();
+                let _ = app.emit("app-state", state.publish_result(translated));
+                emit_status(&app, "error", TRANSLATION_KEPT_IN_APP);
+            }
         }
     }
+    if injector.take_clipboard_not_restored() {
+        commands::report_clipboard_not_restored(&app);
+    }
 }
+
+const TRANSLATION_KEPT_IN_APP: &str =
+    "The translation could not be inserted or copied to the clipboard; it is available in this app.";
 
 const TRANSLATION_FAILED_SELECTION_UNCHANGED: &str =
     "Translation failed; the selected text was not changed.";
@@ -1313,15 +1322,8 @@ const TRANSLATION_FAILED_SELECTION_UNCHANGED: &str =
 /// Status kind and message for a selected-text translation outcome. A paste
 /// that was sent but not confirmed may already have replaced the selection,
 /// so it must not read as a target change that invites a second paste.
-fn selection_translation_status(
-    result: InsertResult,
-    clipboard_not_restored: bool,
-) -> (&'static str, &'static str) {
+fn selection_translation_status(result: InsertResult) -> (&'static str, &'static str) {
     match result {
-        InsertResult::ClipboardPaste if clipboard_not_restored => (
-            "success",
-            "Translation inserted. The previous clipboard contents could not be restored.",
-        ),
         InsertResult::ClipboardPaste => ("success", "Translation inserted."),
         InsertResult::PasteUnverified => (
             "paste_unverified",
@@ -1341,26 +1343,22 @@ mod selection_translation_tests {
     #[test]
     fn a_failed_translation_does_not_claim_the_clipboard() {
         assert!(!TRANSLATION_FAILED_SELECTION_UNCHANGED.contains("clipboard"));
+        assert!(TRANSLATION_KEPT_IN_APP.contains("available in this app"));
     }
 
     #[test]
     fn an_unverified_paste_is_not_reported_as_a_target_change() {
-        let (kind, message) = selection_translation_status(InsertResult::PasteUnverified, false);
+        let (kind, message) = selection_translation_status(InsertResult::PasteUnverified);
         assert_eq!(kind, "paste_unverified");
         assert!(!message.contains("target changed"), "{message}");
         assert!(message.contains("only if the text did not appear"));
         assert_eq!(
-            selection_translation_status(InsertResult::ClipboardOnly, false).1,
+            selection_translation_status(InsertResult::ClipboardOnly).1,
             "The target changed; the translation remains on the clipboard."
         );
         assert_eq!(
-            selection_translation_status(InsertResult::ClipboardPaste, false),
+            selection_translation_status(InsertResult::ClipboardPaste),
             ("success", "Translation inserted.")
-        );
-        assert!(
-            selection_translation_status(InsertResult::ClipboardPaste, true)
-                .1
-                .contains("could not be restored")
         );
     }
 }

@@ -51,6 +51,25 @@ impl TargetWindow {
 /// button) leaves this app in the foreground, so there is no external field
 /// to insert into and the result is delivered on the clipboard. A hotkey
 /// keeps whatever foreground window it captured.
+/// The overlay notice for an insertion outcome. When Restore clipboard was on
+/// and the attempt left this app's text in place of the user's clipboard, the
+/// notice says the previous clipboard was not restored. With Restore
+/// clipboard off nothing is reported: the user accepted the replacement.
+pub(crate) fn notice_outcome(outcome: &str, clipboard_not_restored: bool) -> &str {
+    if !clipboard_not_restored {
+        return outcome;
+    }
+    match outcome {
+        "clipboard_paste" | "provisional_replace" => "clipboard_not_restored",
+        "clipboard_only" => "clipboard_only_not_restored",
+        "paste_unverified" => "paste_unverified_not_restored",
+        "draft_kept" => "draft_kept_not_restored",
+        "draft_unverified" => "draft_unverified_not_restored",
+        "insertion_failed" => "insertion_failed_not_restored",
+        other => other,
+    }
+}
+
 pub(crate) fn recording_target(captured: TargetWindow, from_shortcut: bool) -> TargetWindow {
     if !from_shortcut && captured.process_id == std::process::id() {
         TargetWindow::this_app()
@@ -87,8 +106,11 @@ pub enum InsertionDetail {
     /// The recording was started from this app's own window.
     NoExternalTarget,
     /// The paste was confirmed, but the previous clipboard could not be
-    /// preserved or restored, so the pasted text replaced it.
+    /// restored, so the pasted text replaced it.
     ClipboardNotRestored,
+    /// Restore clipboard is on and the clipboard could not be saved, so it was
+    /// left untouched and the result was kept in the app.
+    ClipboardProtected,
 }
 
 impl InsertionDetail {
@@ -108,6 +130,7 @@ impl InsertionDetail {
             Self::BackendFailure => "backend_failure",
             Self::NoExternalTarget => "no_external_target",
             Self::ClipboardNotRestored => "clipboard_not_restored",
+            Self::ClipboardProtected => "clipboard_protected",
         }
     }
 
@@ -132,8 +155,9 @@ impl InsertionDetail {
                 Some(Self::TargetProtected)
             }
             InjectionError::ImeCompositionActive => Some(Self::ImeActive),
-            InjectionError::ClipboardUnavailable | InjectionError::ClipboardUnpreservable => {
-                Some(Self::ClipboardUnavailable)
+            InjectionError::ClipboardUnavailable => Some(Self::ClipboardUnavailable),
+            InjectionError::ClipboardUnpreservable | InjectionError::ClipboardProtected => {
+                Some(Self::ClipboardProtected)
             }
             InjectionError::UnsupportedPlatform
             | InjectionError::NoSelection
@@ -145,6 +169,25 @@ impl InsertionDetail {
 #[cfg(test)]
 mod outcome_tests {
     use super::*;
+
+    #[test]
+    fn every_outcome_notice_names_a_lost_clipboard() {
+        for outcome in [
+            "clipboard_paste",
+            "provisional_replace",
+            "clipboard_only",
+            "paste_unverified",
+            "draft_kept",
+            "draft_unverified",
+            "insertion_failed",
+        ] {
+            assert_eq!(notice_outcome(outcome, false), outcome);
+            assert!(
+                notice_outcome(outcome, true).ends_with("not_restored"),
+                "{outcome}"
+            );
+        }
+    }
 
     #[test]
     fn only_a_confirmed_paste_reports_an_unrestored_clipboard() {
@@ -200,6 +243,9 @@ pub enum InjectionError {
     /// (too many or too large formats, private or owner-drawn formats, or a
     /// delay-rendering owner that fails to render).
     ClipboardUnpreservable,
+    /// Restore clipboard is on and the clipboard cannot be snapshotted, so it
+    /// was left untouched: nothing was written or pasted.
+    ClipboardProtected,
     Cancelled,
     /// The focused field is readable but nothing is selected in it.
     NoSelection,
@@ -217,6 +263,9 @@ impl fmt::Display for InjectionError {
             Self::ImeCompositionActive => "an IME composition is in progress",
             Self::ClipboardUnavailable => "the clipboard is unavailable",
             Self::ClipboardUnpreservable => "the clipboard holds data that cannot be preserved",
+            Self::ClipboardProtected => {
+                "the clipboard was left unchanged because it could not be saved for restoring"
+            }
             Self::Cancelled => "text insertion was cancelled",
             Self::NoSelection => "no text is selected",
             Self::BackendFailure(message) => message,
@@ -394,26 +443,17 @@ impl SystemTextInjector {
         )
     }
 
-    /// True once after a confirmed paste whose previous clipboard could not
-    /// be preserved (an unsupported or oversized format) or restored. The
-    /// pasted text then stays on the clipboard.
+    /// True once after an attempt, with Restore clipboard on, left this app's
+    /// text in place of the user's clipboard: a copy-only result, a queued
+    /// but unconfirmed paste, or a restore that failed.
     pub(crate) fn take_clipboard_not_restored(&self) -> bool {
         self.backend.take_clipboard_not_restored()
     }
 
-    /// Detail to record with a confirmed paste, consuming the not-restored
-    /// flag. `None` for every other outcome, which has its own diagnosis.
-    pub(crate) fn confirmed_paste_detail(&self, result: InsertResult) -> Option<InsertionDetail> {
-        if result != InsertResult::ClipboardPaste {
-            return None;
-        }
-        InsertionDetail::for_confirmed_paste(result, self.take_clipboard_not_restored())
-    }
-
+    /// Copies `text` as an outcome. With Restore clipboard on, an
+    /// unpreservable clipboard is left untouched (`ClipboardProtected`).
     pub(crate) fn copy_to_clipboard(&self, text: &str) -> Result<(), InjectionError> {
-        self.backend
-            .clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)
-            .map(|_| ())
+        batch::copy(&self.backend, self.options, text)
     }
 
     pub(crate) fn insert_final(
@@ -623,13 +663,12 @@ trait Backend {
         expected: &TargetText,
     ) -> Result<bool, InjectionError>;
     fn wait_for_target(&self);
-    /// Records that a confirmed paste left its text on the clipboard because
-    /// the previous contents could not be snapshotted or restored.
+    /// Records that, with Restore clipboard on, an attempt left this app's
+    /// text in place of the user's clipboard.
     fn clipboard_not_restored(&self);
 }
 
-/// Remembers a confirmed paste that could not restore the clipboard until
-/// the caller reports it.
+/// Remembers a lost user clipboard until the caller reports it.
 #[derive(Default)]
 struct UnrestoredClipboard(AtomicBool);
 impl UnrestoredClipboard {

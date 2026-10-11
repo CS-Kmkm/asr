@@ -70,9 +70,104 @@ fn safe_after_injected_paste<B: Backend>(
             .is_ok_and(|active| policy.permits_ime(active))
 }
 
-fn copy_only<B: Backend>(backend: &B, text: &str) -> Result<InsertResult, InjectionError> {
-    backend.clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)?;
-    Ok(InsertResult::ClipboardOnly)
+/// The user's clipboard during one insertion attempt.
+///
+/// With Restore clipboard on, the clipboard is snapshotted before the first
+/// write. Data that cannot be snapshotted is never overwritten: the attempt
+/// fails with `ClipboardProtected` before anything is written or pasted, and
+/// the caller keeps the text in the app. A clipboard that stays locked fails
+/// with `ClipboardUnavailable` as well. After a write, the snapshot is put back
+/// once a paste is confirmed, or when the attempt ends before any paste was
+/// queued (cancellation or an error). When the text is left on the clipboard
+/// on purpose (a copy-only result or a queued but unconfirmed paste) or the
+/// restore fails, the user's clipboard is lost and the attempt records
+/// `clipboard_not_restored`. A newer copy made meanwhile is the user's own
+/// and is never replaced.
+///
+/// With Restore clipboard off the user accepts that insertion replaces the
+/// clipboard: nothing is snapshotted, restored or reported.
+struct UserClipboard<'a, B: Backend> {
+    backend: &'a B,
+    restore: bool,
+    previous: Option<B::Clipboard>,
+    /// Sequence of our last write while it replaces the user's clipboard.
+    written: Option<u32>,
+    /// The written text is the outcome and stays on the clipboard.
+    kept: bool,
+}
+
+impl<'a, B: Backend> UserClipboard<'a, B> {
+    fn new(backend: &'a B, options: InjectionOptions) -> Self {
+        Self {
+            backend,
+            restore: options.restore_clipboard,
+            previous: None,
+            written: None,
+            kept: false,
+        }
+    }
+
+    fn write(&mut self, text: &str) -> Result<u32, InjectionError> {
+        if self.restore && self.previous.is_none() {
+            self.previous = Some(match self.backend.clipboard_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(InjectionError::ClipboardUnpreservable) => {
+                    return Err(InjectionError::ClipboardProtected)
+                }
+                Err(error) => return Err(error),
+            });
+        }
+        let sequence = self
+            .backend
+            .clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)?;
+        self.written = Some(sequence);
+        Ok(sequence)
+    }
+
+    /// Leaves `text` on the clipboard as the outcome.
+    fn copy(&mut self, text: &str) -> Result<InsertResult, InjectionError> {
+        self.write(text)?;
+        self.kept = true;
+        Ok(InsertResult::ClipboardOnly)
+    }
+
+    /// A paste was queued: its payload must stay until the target confirms it.
+    fn keep(&mut self) {
+        self.kept = true;
+    }
+
+    /// Puts the user's clipboard back unless a newer copy replaced ours.
+    fn restore(&mut self) {
+        if let (Some(previous), Some(sequence)) = (self.previous.take(), self.written) {
+            if self.backend.clipboard_restore(previous, sequence).is_ok() {
+                self.written = None;
+            }
+        }
+    }
+}
+
+impl<B: Backend> Drop for UserClipboard<'_, B> {
+    fn drop(&mut self) {
+        if !self.restore || self.written.is_none() {
+            return;
+        }
+        if !self.kept {
+            // Nothing was queued, so nothing can still read our text.
+            self.restore();
+        }
+        if self.written.is_some() {
+            self.backend.clipboard_not_restored();
+        }
+    }
+}
+
+/// Copies `text` as an outcome, under the same clipboard policy.
+pub(super) fn copy<B: Backend>(
+    backend: &B,
+    options: InjectionOptions,
+    text: &str,
+) -> Result<(), InjectionError> {
+    UserClipboard::new(backend, options).copy(text).map(|_| ())
 }
 
 enum Selection {
@@ -161,7 +256,7 @@ fn shows_inserted_text(before: &TargetText, actual: &TargetText, text: &str) -> 
 #[allow(clippy::too_many_arguments)]
 fn paste<B: Backend>(
     backend: &B,
-    options: InjectionOptions,
+    clipboard: &mut UserClipboard<'_, B>,
     text: &str,
     target: &TargetWindow,
     before: &TargetText,
@@ -172,24 +267,18 @@ fn paste<B: Backend>(
     if cancel.is_some_and(|receiver| *receiver.borrow()) {
         return Err(InjectionError::Cancelled);
     }
-    let mut unrestored = false;
-    let previous = if options.restore_clipboard {
-        match backend.clipboard_snapshot() {
-            Ok(snapshot) => Some(snapshot),
-            // Data that cannot be preserved must not block insertion: the
-            // copy-only and unreadable-target paths overwrite it as well. The
-            // paste proceeds and the caller reports the unrestored clipboard.
-            Err(InjectionError::ClipboardUnpreservable) => {
-                unrestored = true;
-                None
-            }
-            // A clipboard still locked after retries could have been
-            // preserved later. Never paste over it.
-            Err(error) => return Err(error),
+    if !safe(backend, target, activity, policy)
+        || !backend
+            .target_text(target)
+            .is_ok_and(|actual| actual.same_content(before))
+    {
+        if cancel.is_some_and(|receiver| *receiver.borrow()) {
+            return Err(InjectionError::Cancelled);
         }
-    } else {
-        None
-    };
+        return clipboard.copy(text);
+    }
+    // Snapshots first; an unpreservable or locked clipboard stops here.
+    clipboard.write(text)?;
     if cancel.is_some_and(|receiver| *receiver.borrow()) {
         return Err(InjectionError::Cancelled);
     }
@@ -201,25 +290,12 @@ fn paste<B: Backend>(
         if cancel.is_some_and(|receiver| *receiver.borrow()) {
             return Err(InjectionError::Cancelled);
         }
-        return copy_only(backend, text);
-    }
-    let sequence = backend.clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)?;
-    if cancel.is_some_and(|receiver| *receiver.borrow()) {
-        return Err(InjectionError::Cancelled);
-    }
-    if !safe(backend, target, activity, policy)
-        || !backend
-            .target_text(target)
-            .is_ok_and(|actual| actual.same_content(before))
-    {
-        if cancel.is_some_and(|receiver| *receiver.borrow()) {
-            return Err(InjectionError::Cancelled);
-        }
-        return copy_only(backend, text);
+        return clipboard.copy(text);
     }
     if !backend.paste(target, policy).unwrap_or(false) {
-        return copy_only(backend, text);
+        return clipboard.copy(text);
     }
+    clipboard.keep();
     let expected = before.replaced_with(text);
     for attempt in 0..=VERIFY_ATTEMPTS {
         if attempt > 0 {
@@ -235,14 +311,9 @@ fn paste<B: Backend>(
                 || (policy != SafetyPolicy::Destructive
                     && shows_inserted_text(before, &actual, text))
         }) {
-            if let Some(previous) = previous {
-                // Restoration failure cannot undo a confirmed edit and must
-                // never initiate a second insertion. New clipboard copies win.
-                unrestored |= backend.clipboard_restore(previous, sequence).is_err();
-            }
-            if unrestored {
-                backend.clipboard_not_restored();
-            }
+            // Restoration failure cannot undo a confirmed edit and must never
+            // initiate a second insertion; it is reported instead.
+            clipboard.restore();
             return Ok(InsertResult::ClipboardPaste);
         }
     }
@@ -251,10 +322,12 @@ fn paste<B: Backend>(
 
 fn paste_unverified<B: Backend>(
     backend: &B,
+    clipboard: &mut UserClipboard<'_, B>,
     text: &str,
     target: &TargetWindow,
 ) -> Result<InsertResult, InjectionError> {
-    backend.clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)?;
+    // Either the paste is queued or the text is the copy-only outcome.
+    clipboard.copy(text)?;
     if backend
         .paste(target, SafetyPolicy::Additive)
         .unwrap_or(false)
@@ -271,15 +344,16 @@ pub(super) fn insert<B: Backend>(
     text: &str,
     target: &TargetWindow,
 ) -> Result<InsertResult, InjectionError> {
+    let mut clipboard = UserClipboard::new(backend, options);
     if !safe(backend, target, None, SafetyPolicy::Additive) {
-        return copy_only(backend, text);
+        return clipboard.copy(text);
     }
     let Ok(before) = backend.target_text(target) else {
-        return paste_unverified(backend, text, target);
+        return paste_unverified(backend, &mut clipboard, text, target);
     };
     paste(
         backend,
-        options,
+        &mut clipboard,
         text,
         target,
         &before,
@@ -328,6 +402,7 @@ pub(super) fn insert_final<B: Backend>(
     // Ask insertion keeps its original activity checkpoint and policy.
     let policy = guard.policy();
     let allow_unverified = guard != FinalGuard::Monitored;
+    let mut clipboard = UserClipboard::new(backend, options);
     if cancelled() {
         return Err(InjectionError::Cancelled);
     }
@@ -335,19 +410,21 @@ pub(super) fn insert_final<B: Backend>(
         if cancelled() {
             return Err(InjectionError::Cancelled);
         }
-        return copy_only(backend, text);
+        return clipboard.copy(text);
     }
     let Ok(before) = backend.target_text(target) else {
         if cancelled() {
             return Err(InjectionError::Cancelled);
         }
         if allow_unverified {
-            backend.clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)?;
+            clipboard.write(text)?;
             if cancelled() {
                 return Err(InjectionError::Cancelled);
             }
             // Recheck after clipboard access, before queueing exactly one paste.
             if safe(backend, target, Some((monitor, checkpoint)), policy) {
+                // Queued or not, the text is now the outcome on the clipboard.
+                clipboard.keep();
                 return Ok(if backend.paste(target, policy).unwrap_or(false) {
                     InsertResult::PasteUnverified
                 } else {
@@ -358,11 +435,11 @@ pub(super) fn insert_final<B: Backend>(
                 return Err(InjectionError::Cancelled);
             }
         }
-        return copy_only(backend, text);
+        return clipboard.copy(text);
     };
     paste(
         backend,
-        options,
+        &mut clipboard,
         text,
         target,
         &before,
@@ -457,7 +534,7 @@ pub(super) fn replace_selection<B: Backend>(
 ) -> Result<InsertResult, InjectionError> {
     paste(
         backend,
-        options,
+        &mut UserClipboard::new(backend, options),
         text,
         target,
         before,
@@ -479,7 +556,7 @@ pub(super) fn replace_selection_monitored<B: Backend>(
 ) -> Result<InsertResult, InjectionError> {
     paste(
         backend,
-        options,
+        &mut UserClipboard::new(backend, options),
         text,
         target,
         before,
@@ -549,7 +626,7 @@ fn begin_with_checkpoint<B: Backend>(
     let (result, replacement) = if let Some((checkpoint, before)) = replacement {
         let result = paste(
             backend,
-            options,
+            &mut UserClipboard::new(backend, options),
             draft,
             target,
             &before,
@@ -603,13 +680,14 @@ pub(super) fn update<B: Backend>(
     if session.finished {
         return Ok(session.result);
     }
+    let mut clipboard = UserClipboard::new(backend, options);
     if session.replacement.is_none() {
         if finalizing
             && session.result != InsertResult::PasteUnverified
             && (session.result == InsertResult::ClipboardOnly
                 || normalize_text(&session.displayed) != normalize_text(final_text))
         {
-            session.result = copy_only(backend, final_text)?;
+            session.result = clipboard.copy(final_text)?;
         }
         return Ok(session.result);
     }
@@ -639,7 +717,7 @@ pub(super) fn update<B: Backend>(
     let Some(selected) = selected else {
         session.replacement = None;
         session.result = if finalizing {
-            copy_only(backend, final_text)?
+            clipboard.copy(final_text)?
         } else {
             InsertResult::ClipboardOnly
         };
@@ -650,7 +728,7 @@ pub(super) fn update<B: Backend>(
     session.replacement = None;
     let result = paste(
         backend,
-        options,
+        &mut clipboard,
         final_text,
         &session.target,
         &selected,
@@ -1247,6 +1325,7 @@ pub(super) mod tests {
         pub(crate) ime: Cell<Option<bool>>,
         ime_query_fails: Cell<bool>,
         snapshot_error: RefCell<Option<InjectionError>>,
+        restore_fails: Cell<bool>,
         not_restored: Cell<usize>,
         /// SendInput queued only part of the deletion; the target has not
         /// processed it yet.
@@ -1291,6 +1370,7 @@ pub(super) mod tests {
                 ime: Cell::new(Some(false)),
                 ime_query_fails: Cell::new(false),
                 snapshot_error: RefCell::new(None),
+                restore_fails: Cell::new(false),
                 not_restored: Cell::new(0),
                 delete_partial: Cell::new(false),
                 delete_accepted: Cell::new(true),
@@ -1419,6 +1499,9 @@ pub(super) mod tests {
             expected: u32,
         ) -> Result<bool, InjectionError> {
             self.calls.borrow_mut().push("restore");
+            if self.restore_fails.get() {
+                return Err(InjectionError::ClipboardUnavailable);
+            }
             if self.sequence.get() != expected {
                 return Ok(false);
             }
@@ -1774,60 +1857,188 @@ pub(super) mod tests {
         assert_eq!(recording_target(target(), false), target());
     }
 
-    #[test]
-    fn an_unpreservable_clipboard_does_not_block_a_readable_paste() {
-        // Additive final paste and a destructive selection replacement.
-        let backend = MockBackend::new();
-        *backend.snapshot_error.borrow_mut() = Some(InjectionError::ClipboardUnpreservable);
-        assert_eq!(
-            final_paste(&backend, FinalGuard::Untouched),
-            InsertResult::ClipboardPaste
-        );
-        assert_eq!(backend.content(), "prefix new suffix");
-        assert!(!backend.calls.borrow().contains(&"restore"));
-        assert_eq!(*backend.clipboard.borrow(), "new");
-        assert_eq!(backend.not_restored.get(), 1);
-
-        let backend = MockBackend::new();
-        *backend.snapshot_error.borrow_mut() = Some(InjectionError::ClipboardUnpreservable);
-        *backend.text.borrow_mut() = selected_state();
+    fn restore_on(
+        backend: &MockBackend,
+        guard: FinalGuard,
+    ) -> Result<InsertResult, InjectionError> {
         let monitor = monitor();
-        assert_eq!(
-            replace_selection(
-                &backend,
-                InjectionOptions::default(),
-                &target(),
-                &selected_state(),
-                "edited",
-                &monitor,
-                monitor.checkpoint().unwrap(),
-            )
-            .unwrap(),
-            InsertResult::ClipboardPaste
-        );
-        assert_eq!(backend.not_restored.get(), 1);
-
-        // Nothing to report when restoring is off or the snapshot succeeds.
-        let backend = MockBackend::new();
-        *backend.snapshot_error.borrow_mut() = Some(InjectionError::ClipboardUnpreservable);
         let (_sender, cancel) = watch::channel(false);
         insert_final(
-            &backend,
-            InjectionOptions {
-                restore_clipboard: false,
-            },
+            backend,
+            InjectionOptions::default(),
             "new",
             &target(),
             &monitor,
             monitor.checkpoint().unwrap(),
             &cancel,
-            FinalGuard::Untouched,
+            guard,
         )
-        .unwrap();
-        assert_eq!(backend.not_restored.get(), 0);
+    }
+
+    #[test]
+    fn restore_on_never_overwrites_an_unpreservable_clipboard() {
+        for case in ["readable", "unreadable", "copy_only"] {
+            let backend = MockBackend::new();
+            *backend.snapshot_error.borrow_mut() = Some(InjectionError::ClipboardUnpreservable);
+            match case {
+                "unreadable" => backend.text_readable.set(false),
+                "copy_only" => backend.target_valid.set(false),
+                _ => {}
+            }
+            assert_eq!(
+                restore_on(&backend, FinalGuard::Untouched),
+                Err(InjectionError::ClipboardProtected),
+                "{case}"
+            );
+            assert!(
+                backend.calls.borrow().is_empty(),
+                "{case}: no write or paste"
+            );
+            assert_eq!(
+                *backend.clipboard.borrow(),
+                "original rich clipboard",
+                "{case}"
+            );
+            assert_eq!(backend.content(), "prefix  suffix", "{case}");
+            assert_eq!(backend.not_restored.get(), 0, "{case}");
+        }
+        // A copy requested by the caller follows the same rule.
         let backend = MockBackend::new();
-        final_paste(&backend, FinalGuard::Untouched);
+        *backend.snapshot_error.borrow_mut() = Some(InjectionError::ClipboardUnpreservable);
+        assert_eq!(
+            copy(&backend, InjectionOptions::default(), "result"),
+            Err(InjectionError::ClipboardProtected)
+        );
         assert_eq!(*backend.clipboard.borrow(), "original rich clipboard");
+        assert_eq!(
+            InsertionDetail::from_error(&InjectionError::ClipboardProtected),
+            Some(InsertionDetail::ClipboardProtected)
+        );
+    }
+
+    #[test]
+    fn restore_off_overwrites_without_a_snapshot_or_report() {
+        let backend = MockBackend::new();
+        *backend.snapshot_error.borrow_mut() = Some(InjectionError::ClipboardUnpreservable);
+        let monitor = monitor();
+        let (_sender, cancel) = watch::channel(false);
+        let off = InjectionOptions {
+            restore_clipboard: false,
+        };
+        assert_eq!(
+            insert_final(
+                &backend,
+                off,
+                "new",
+                &target(),
+                &monitor,
+                monitor.checkpoint().unwrap(),
+                &cancel,
+                FinalGuard::Untouched,
+            ),
+            Ok(InsertResult::ClipboardPaste)
+        );
+        assert_eq!(*backend.clipboard.borrow(), "new");
+        backend.target_valid.set(false);
+        copy(&backend, off, "copied").unwrap();
+        assert_eq!(*backend.clipboard.borrow(), "copied");
+        assert_eq!(backend.not_restored.get(), 0);
+    }
+
+    #[test]
+    fn a_clipboard_left_with_our_text_is_reported_unless_restore_is_off() {
+        // A queued paste that is never confirmed keeps its payload.
+        let mut backend = MockBackend::new();
+        backend.settle_after = VERIFY_ATTEMPTS + 5;
+        assert_eq!(
+            restore_on(&backend, FinalGuard::Untouched),
+            Ok(InsertResult::PasteUnverified)
+        );
+        assert!(!backend.calls.borrow().contains(&"restore"));
+        assert_eq!(backend.not_restored.get(), 1);
+        // An unreadable field gets one unverified paste, never restored.
+        let backend = MockBackend::new();
+        backend.text_readable.set(false);
+        assert_eq!(
+            restore_on(&backend, FinalGuard::Untouched),
+            Ok(InsertResult::PasteUnverified)
+        );
+        assert_eq!(backend.not_restored.get(), 1);
+        // A copy-only outcome replaces the clipboard on purpose.
+        let backend = MockBackend::new();
+        backend.target_valid.set(false);
+        assert_eq!(
+            restore_on(&backend, FinalGuard::Untouched),
+            Ok(InsertResult::ClipboardOnly)
+        );
+        assert_eq!(*backend.clipboard.borrow(), "new");
+        assert_eq!(backend.not_restored.get(), 1);
+        // A confirmed paste restores and reports nothing.
+        let backend = MockBackend::new();
+        assert_eq!(
+            restore_on(&backend, FinalGuard::Untouched),
+            Ok(InsertResult::ClipboardPaste)
+        );
+        assert_eq!(*backend.clipboard.borrow(), "original rich clipboard");
+        assert_eq!(backend.not_restored.get(), 0);
+    }
+
+    #[test]
+    fn cancellation_after_the_write_restores_the_clipboard() {
+        for restore_fails in [false, true] {
+            let backend = MockBackend::new();
+            backend.restore_fails.set(restore_fails);
+            backend.text_readable.set(false);
+            let monitor = monitor();
+            let (cancel, cancelled) = watch::channel(false);
+            let mut backend = backend;
+            backend.on_clipboard_write = Some(Box::new(move |_| {
+                cancel.send_replace(true);
+            }));
+            assert_eq!(
+                insert_final(
+                    &backend,
+                    InjectionOptions::default(),
+                    "new",
+                    &target(),
+                    &monitor,
+                    monitor.checkpoint().unwrap(),
+                    &cancelled,
+                    FinalGuard::Untouched,
+                ),
+                Err(InjectionError::Cancelled)
+            );
+            assert_eq!(pastes(&backend), 0);
+            assert!(backend.calls.borrow().ends_with(&["write", "restore"]));
+            if restore_fails {
+                // The user's clipboard is lost: reported.
+                assert_eq!(backend.not_restored.get(), 1);
+            } else {
+                assert_eq!(*backend.clipboard.borrow(), "original rich clipboard");
+                assert_eq!(backend.not_restored.get(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_restore_after_a_confirmed_paste_is_reported() {
+        let backend = MockBackend::new();
+        backend.restore_fails.set(true);
+        assert_eq!(
+            restore_on(&backend, FinalGuard::Untouched),
+            Ok(InsertResult::ClipboardPaste)
+        );
+        assert!(backend.calls.borrow().contains(&"restore"));
+        assert_eq!(*backend.clipboard.borrow(), "new");
+        assert_eq!(backend.not_restored.get(), 1);
+        // A newer copy made meanwhile wins and is the user's own.
+        let mut backend = MockBackend::new();
+        backend.change_clipboard_on_paste = true;
+        assert_eq!(
+            restore_on(&backend, FinalGuard::Untouched),
+            Ok(InsertResult::ClipboardPaste)
+        );
+        assert_eq!(*backend.clipboard.borrow(), "new user copy");
         assert_eq!(backend.not_restored.get(), 0);
     }
 
@@ -1881,7 +2092,7 @@ pub(super) mod tests {
         assert!(backend
             .calls
             .borrow()
-            .ends_with(&["select", "write", "collapse"]));
+            .ends_with(&["select", "write", "write", "collapse"]));
         let text = backend.text.borrow().clone();
         assert_eq!(text.before, "prefix draft");
         assert!(text.selected.is_empty());
