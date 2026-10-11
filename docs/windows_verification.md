@@ -203,11 +203,11 @@ pnpm run tauri dev
     約 155 ms 再試行しても開けない: 中止する（insertion_failed / clipboard_unavailable）
     保存できない形式: 書き込みも貼り付けもしない（insertion_failed / clipboard_protected）
   入力欄の内容を UI Automation (TextPattern) で読む
-    読める:   clipboard_write(ExcludeFromHistory) → ガードを再確認 → Ctrl+V (SendInput)
+    読める:   clipboard_write(ExcludeFromHistory) → ガードを再確認 → 貼り付けキー (SendInput)
               → 内容の変化を最大約 1 秒確認する
               → 確認できた: clipboard_paste（クリップボードを復元する）
               → 確認できない: paste_unverified（貼り付けが処理中の可能性があるため復元しない）
-    読めない: clipboard_write(ExcludeFromHistory) → ガードを再確認 → Ctrl+V を 1 回だけ送る
+    読めない: clipboard_write(ExcludeFromHistory) → ガードを再確認 → 貼り付けキーを 1 回だけ送る
               → paste_unverified（クリップボードは復元しない）
 ```
 
@@ -233,6 +233,10 @@ pnpm run tauri dev
 - **ライブ入力（Settings → 「Live text insertion (experimental)」、既定 OFF）**:
   話している途中の文字を入力欄に書き込み、内容を確認できた範囲だけを置き換える。
   置き換えを中止したときは、前の下書きを選択したままにせず、カーソルを下書きの末尾に戻す。
+- **貼り付けキー**: 通常は Ctrl+V を送る。挿入先の実行ファイル名が `mintty`、
+  `putty`、`emacs` の場合は、Ctrl+V を制御文字として扱うため Shift+Insert を送る。
+  実行ファイルを特定できない場合は Ctrl+V を送る。設定からは変更できない。
+  送るキーにはスキャンコードを付け、Insert には拡張キーのフラグも付ける。
 - **クリップボードへの書き込み**: どの経路でも `ExcludeFromHistory` で書き込む
   （`clipboard_only` のコピーも含む）。
 
@@ -373,6 +377,16 @@ pnpm run tauri dev
 | 3 | 選択テキスト翻訳（`Ctrl+Shift+T`）で `paste_unverified` になった場合 | 「入力対象が変更された」とは表示せず、「Ctrl+V は文字が入っていない場合だけ」と案内する |
 | 4 | 選択テキスト翻訳で翻訳に失敗させる（API キーを一時的に無効にするなど） | 選択したテキストは変わらず、クリップボードも上書きしない。「翻訳に失敗しました。選択したテキストは変更していません。」と表示する |
 
+#### 5.3.11 アプリごとの貼り付けキー（mintty / PuTTY）
+
+| # | 操作 | 期待結果 |
+|---|---|---|
+| 1 | Git Bash（mintty）のプロンプトにフォーカスし、ホットキーから発話・停止する | 認識テキストがプロンプトに入る。`^V` は入らない。結果は `paste_unverified` または `clipboard_paste` |
+| 2 | PuTTY のセッションで同様に試す | 認識テキストが入力される。`^V` は送られない |
+| 3 | Emacs（GUI 版）のバッファで同様に試す | 認識テキストが挿入される（`yank`）。画面がスクロールしない |
+| 4 | Windows Terminal・メモ帳で同様に試す | 従来どおり Ctrl+V で貼り付けられる |
+| 5 | NumLock を ON/OFF の両方で手順 1 を試す | どちらでも `0` などの数字は入らない（Insert を拡張キーとして送っている） |
+
 ---
 
 ## 6. Speak to edit 手動確認
@@ -432,6 +446,7 @@ pnpm run tauri dev
 | &nbsp;&nbsp; 録音中のクリック・入力 | PASS / FAIL |
 | &nbsp;&nbsp; ライブ入力の中断 | PASS / FAIL |
 | &nbsp;&nbsp; 挿入失敗時の通知 | PASS / FAIL |
+| &nbsp;&nbsp; アプリごとの貼り付けキー（mintty / PuTTY / Emacs） | PASS / FAIL |
 | **シナリオ 4: Speak to edit** | PASS / FAIL / SKIP |
 | — 通常選択範囲の置換 | PASS / FAIL |
 | — フォーカス・選択・ユーザー入力ガード | PASS / FAIL |

@@ -15,6 +15,8 @@ mod batch;
 #[cfg(target_os = "windows")]
 mod clipboard;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+mod keys;
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod target;
 
 pub(crate) const INJECTION_MARKER: usize = 0x4C56_494A;
@@ -733,7 +735,8 @@ trait Backend {
         snapshot: Self::Clipboard,
         expected_sequence: u32,
     ) -> Result<bool, InjectionError>;
-    /// Returns true if any input was queued, including a partial SendInput.
+    /// Returns true if the paste key's key-down was queued, including by a
+    /// partial SendInput; a modifier alone does not paste.
     fn paste(&self, target: &TargetWindow, policy: SafetyPolicy) -> Result<bool, InjectionError>;
     /// Returns true if any input was queued, including a partial SendInput.
     fn delete_selection(&self, target: &TargetWindow) -> Result<bool, InjectionError>;
@@ -987,7 +990,7 @@ use windows_backend::PlatformBackend;
 #[cfg(target_os = "windows")]
 mod windows_backend {
     use super::{
-        accessibility, clipboard, target, Backend, ClipboardExclusion, InjectionError,
+        accessibility, clipboard, keys, target, Backend, ClipboardExclusion, InjectionError,
         SafetyPolicy, TargetText, TargetWindow, UnrestoredClipboard, WriteError, INJECTION_MARKER,
     };
     use std::mem::{size_of, zeroed};
@@ -1010,8 +1013,9 @@ mod windows_backend {
         CUIAutomation, IUIAutomation, IUIAutomationTextEditPattern, UIA_TextEditPatternId,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-        VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_MENU, VK_SHIFT, VK_V,
+        GetAsyncKeyState, MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+        KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY,
+        VK_BACK, VK_CONTROL, VK_MENU, VK_SHIFT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         FindWindowExW, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongPtrW,
@@ -1318,19 +1322,24 @@ mod windows_backend {
             if !policy.permits_selection(self, target) {
                 return Ok(false);
             }
+            // Ctrl+V, or Shift+Insert for the few apps that read Ctrl+V as a
+            // control character. A failed process lookup keeps Ctrl+V.
+            let (modifier, key) =
+                keys::paste_chord(crate::app_context::from_target(target).as_ref()).keys();
+            let (modifier, key) = (VIRTUAL_KEY(modifier), VIRTUAL_KEY(key));
             let inputs = [
-                keyboard_input(VK_CONTROL, 0),
-                keyboard_input(VK_V, 0),
-                keyboard_input(VK_V, KEYEVENTF_KEYUP.0),
-                keyboard_input(VK_CONTROL, KEYEVENTF_KEYUP.0),
+                keyboard_input(modifier, false),
+                keyboard_input(key, false),
+                keyboard_input(key, true),
+                keyboard_input(modifier, true),
             ];
             self.validate_target(target)?;
-            let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
-            if sent > 0 && sent < inputs.len() as u32 {
-                // Release only our shortcut keys, never replay the paste.
-                let _ = unsafe { SendInput(&inputs[2..], size_of::<INPUT>() as i32) };
+            let sent = keys::chord_sent(unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) });
+            if let Some(release_from) = sent.release_from {
+                // Release only our chord's keys, never replay the paste.
+                let _ = unsafe { SendInput(&inputs[release_from..], size_of::<INPUT>() as i32) };
             }
-            Ok(sent > 0)
+            Ok(sent.paste_queued)
         }
         fn delete_selection(&self, target: &TargetWindow) -> Result<bool, InjectionError> {
             self.validate_target(target)?;
@@ -1338,8 +1347,8 @@ mod windows_backend {
                 return Ok(false);
             }
             let inputs = [
-                keyboard_input(VK_BACK, 0),
-                keyboard_input(VK_BACK, KEYEVENTF_KEYUP.0),
+                keyboard_input(VK_BACK, false),
+                keyboard_input(VK_BACK, true),
             ];
             let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) };
             if sent > 0 && sent < inputs.len() as u32 {
@@ -1369,14 +1378,27 @@ mod windows_backend {
         }
     }
 
-    fn keyboard_input(vk: VIRTUAL_KEY, flags: u32) -> INPUT {
+    /// A marked key event that carries the key's scan code, as a physical
+    /// keyboard's would, for targets that read the scan code instead of the
+    /// virtual key. The event is still delivered by virtual key.
+    fn keyboard_input(vk: VIRTUAL_KEY, key_up: bool) -> INPUT {
+        let scan = unsafe { MapVirtualKeyW(u32::from(vk.0), MAPVK_VK_TO_VSC) };
+        let mut flags = KEYBD_EVENT_FLAGS(0);
+        if key_up {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        if keys::is_extended_key(vk.0) {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
         INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
                 ki: KEYBDINPUT {
                     wVk: vk,
-                    wScan: 0,
-                    dwFlags: windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(flags),
+                    // A scan code fits in the low byte; MAPVK_VK_TO_VSC
+                    // returns 0 for a key without one.
+                    wScan: (scan & 0xFF) as u16,
+                    dwFlags: flags,
                     time: 0,
                     dwExtraInfo: INJECTION_MARKER,
                 },

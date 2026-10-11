@@ -477,7 +477,8 @@ pub(super) fn diagnose<B: Backend>(
     let Some(checkpoint) = checkpoint.filter(|_| monitor.checkpoint().is_some()) else {
         return InsertionDetail::InputMonitorUnavailable;
     };
-    // Our own queued Ctrl+V may still be visible as a held modifier.
+    // Our own queued paste chord (Ctrl+V or Shift+Insert) may still be
+    // visible as a held modifier.
     let unchanged = if after_paste {
         monitor.unchanged_since_injected_paste(checkpoint)
     } else {
