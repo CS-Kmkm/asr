@@ -4172,10 +4172,8 @@ pub(crate) async fn update_settings(
             state: "not_loaded".into(),
             detail,
         };
-        *services
-            .model
-            .lock()
-            .map_err(|_| "model service is unavailable".to_string())? = status.clone();
+        // A settings save takes the status from any load still running.
+        services.model.replace(status.clone())?;
         let _ = app.emit("model-status", status);
     }
     let _ = app.emit("settings-changed", &settings);
@@ -4842,11 +4840,7 @@ pub(crate) fn dismiss_ask_answer(
 
 #[tauri::command]
 pub(crate) fn get_model_status(services: State<'_, Services>) -> Result<ModelStatus, String> {
-    services
-        .model
-        .lock()
-        .map(|status| status.clone())
-        .map_err(|_| "model service is unavailable".into())
+    services.model.get()
 }
 
 #[tauri::command]
@@ -4905,12 +4899,11 @@ pub(crate) async fn ensure_model_loaded_cancellable(
         .transcriber
         .model_residency()
         .is_none_or(|residency| matches!(*residency.borrow(), asr::ModelResidency::Resident(_)));
-    if let Ok(status) = services.model.lock() {
+    if let Ok(status) = services.model.get() {
         if resident && status.state == "ready" && status.model_id == model_id {
-            return Ok(status.clone());
+            return Ok(status);
         }
     }
-    let load = NEXT_MODEL_LOAD.fetch_add(1, Ordering::Relaxed);
     emit_status(app, "model_loading", "Loading the speech model.");
     let loading = ModelStatus {
         model_id: model_id.clone(),
@@ -4918,8 +4911,7 @@ pub(crate) async fn ensure_model_loaded_cancellable(
         state: "loading".into(),
         detail: detail.clone(),
     };
-    set_model_status(&services.model, load, None, loading.clone())
-        .ok_or_else(|| "model service is unavailable".to_string())?;
+    let load = services.model.begin_load(loading.clone())?;
     let _ = app.emit("model-status", loading.clone());
 
     // Only the worker knows whether the model files are already cached, so the
@@ -4943,11 +4935,12 @@ pub(crate) async fn ensure_model_loaded_cancellable(
         forwarder.abort();
     }
 
+    // Every outcome is shown only while this load still owns the status: a
+    // newer load or a settings save may already show its own.
     if let Err(asr::AsrError::Cancelled) = load_result {
-        // Abandoned for a cancelled recording, a model change or quit. Another
-        // load or a model change may already show its own status.
+        // Abandoned for a cancelled recording, a model change or quit.
         let not_loaded = residency_status(asr::ModelResidency::Absent, &loading, &detail);
-        if let Some(status) = set_model_status(&services.model, load, Some(&loading), not_loaded) {
+        if let Some(status) = services.model.update(load, not_loaded) {
             let _ = app.emit("model-status", status);
         }
         return Err(MODEL_LOAD_CANCELLED.into());
@@ -4960,8 +4953,9 @@ pub(crate) async fn ensure_model_loaded_cancellable(
             state: "error".into(),
             detail: format!("{detail} {message}"),
         };
-        set_model_status(&services.model, load, None, failed.clone());
-        let _ = app.emit("model-status", failed);
+        if let Some(status) = services.model.update(load, failed) {
+            let _ = app.emit("model-status", status);
+        }
         return Err(message);
     }
     let status = ModelStatus {
@@ -4973,45 +4967,87 @@ pub(crate) async fn ensure_model_loaded_cancellable(
             settings.model_quantization
         ),
     };
-    set_model_status(&services.model, load, None, status.clone())
-        .ok_or_else(|| "model service is unavailable".to_string())?;
-    let _ = app.emit("model-status", status.clone());
-    follow_model_residency(app, services, load, &status, detail);
+    if let Some(shown) = services.model.update(load, status.clone()) {
+        let _ = app.emit("model-status", shown);
+        follow_model_residency(app, services, load, &status, detail);
+    }
     Ok(status)
 }
 
-static NEXT_MODEL_LOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-/// The `ensure_model_loaded` call whose status is shown. Statuses of two
-/// loads can be identical, so a stale call is told apart by this, not by
-/// the status value.
-static MODEL_STATUS_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The model status and the load that may change it, under one lock.
+///
+/// A load takes ownership when it starts and may write only while it still
+/// owns the status, so a slow load never overwrites a newer load's status.
+/// Statuses of two loads can be identical, so ownership is an id, not a
+/// value. A settings save takes ownership away from every load.
+pub(crate) struct ModelStatusSlot {
+    inner: Mutex<OwnedModelStatus>,
+}
+
+struct OwnedModelStatus {
+    status: ModelStatus,
+    /// Id of the load that owns `status`; ids of settings saves own none.
+    owner: u64,
+    next_owner: u64,
+}
+
+impl ModelStatusSlot {
+    pub(crate) fn new(status: ModelStatus) -> Self {
+        Self {
+            inner: Mutex::new(OwnedModelStatus {
+                status,
+                owner: 0,
+                next_owner: 1,
+            }),
+        }
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, OwnedModelStatus>, String> {
+        self.inner
+            .lock()
+            .map_err(|_| "model service is unavailable".to_string())
+    }
+
+    pub(crate) fn get(&self) -> Result<ModelStatus, String> {
+        self.lock().map(|inner| inner.status.clone())
+    }
+
+    fn take_ownership(inner: &mut OwnedModelStatus, status: ModelStatus) -> u64 {
+        let owner = inner.next_owner;
+        inner.next_owner += 1;
+        inner.owner = owner;
+        inner.status = status;
+        owner
+    }
+
+    /// Show `status` for a load that starts now; it owns the status from here.
+    pub(crate) fn begin_load(&self, status: ModelStatus) -> Result<u64, String> {
+        let mut inner = self.lock()?;
+        Ok(Self::take_ownership(&mut inner, status))
+    }
+
+    /// Show `status` for a user action (a settings save); no load owns it.
+    pub(crate) fn replace(&self, status: ModelStatus) -> Result<(), String> {
+        let mut inner = self.lock()?;
+        Self::take_ownership(&mut inner, status);
+        Ok(())
+    }
+
+    /// Show `status` for `load`, only while it still owns the status.
+    pub(crate) fn update(&self, load: u64, status: ModelStatus) -> Option<ModelStatus> {
+        let mut inner = self.inner.lock().ok()?;
+        (inner.owner == load).then(|| {
+            inner.status = status.clone();
+            status
+        })
+    }
+}
 
 fn same_model_status(left: &ModelStatus, right: &ModelStatus) -> bool {
     left.state == right.state
         && left.model_id == right.model_id
         && left.installed == right.installed
         && left.detail == right.detail
-}
-
-/// Show `next` on behalf of `load`. With `expected`, only while `load` still
-/// owns the status and nothing (such as a settings save) replaced it since.
-fn set_model_status(
-    model: &Mutex<ModelStatus>,
-    load: u64,
-    expected: Option<&ModelStatus>,
-    next: ModelStatus,
-) -> Option<ModelStatus> {
-    let mut status = model.lock().ok()?;
-    if let Some(expected) = expected {
-        if MODEL_STATUS_OWNER.load(Ordering::Acquire) != load
-            || !same_model_status(&status, expected)
-        {
-            return None;
-        }
-    }
-    MODEL_STATUS_OWNER.store(load, Ordering::Release);
-    *status = next.clone();
-    Some(next)
 }
 
 /// The status a loaded model has while the transcriber reports `residency`.
@@ -5058,8 +5094,7 @@ fn follow_model_residency(
         loop {
             let next = residency_status(current, &ready, &detail);
             if !same_model_status(&next, &shown) {
-                let Some(status) = set_model_status(&services.model, load, Some(&shown), next)
-                else {
+                let Some(status) = services.model.update(load, next) else {
                     break;
                 };
                 if let Some(forwarder) = forwarder.take() {
@@ -5097,32 +5132,61 @@ mod model_status_tests {
     }
 
     #[test]
-    fn a_stale_load_cannot_replace_another_loads_identical_status() {
-        let model = Mutex::new(status("not_loaded", "d"));
-        let loading = status("loading", "d");
-        let first = NEXT_MODEL_LOAD.fetch_add(1, Ordering::Relaxed);
-        let second = NEXT_MODEL_LOAD.fetch_add(1, Ordering::Relaxed);
-        set_model_status(&model, first, None, loading.clone()).unwrap();
-        set_model_status(&model, second, None, loading.clone()).unwrap();
+    fn a_slower_older_load_never_overwrites_a_newer_loads_status() {
+        for (newer_outcome, older_outcome) in [
+            ("ready", "ready"),
+            ("ready", "error"),
+            ("error", "ready"),
+            ("error", "error"),
+        ] {
+            let slot = ModelStatusSlot::new(status("not_loaded", "d"));
+            let older = slot.begin_load(status("loading", "d")).unwrap();
+            let newer = slot.begin_load(status("loading", "d")).unwrap();
 
-        // The first load was cancelled; the second one is still downloading.
-        assert!(
-            set_model_status(&model, first, Some(&loading), status("not_loaded", "d")).is_none()
-        );
-        assert_eq!(model.lock().unwrap().state, "loading");
-        assert!(set_model_status(&model, second, Some(&loading), status("ready", "d")).is_some());
+            // B finishes first, then A's outcome arrives late.
+            assert!(slot.update(newer, status(newer_outcome, "B")).is_some());
+            assert!(slot.update(older, status(older_outcome, "A")).is_none());
+            let shown = slot.get().unwrap();
+            assert_eq!(
+                (shown.state.as_str(), shown.detail.as_str()),
+                (newer_outcome, "B")
+            );
+        }
     }
 
     #[test]
-    fn a_status_replaced_by_a_settings_save_is_left_alone() {
-        let model = Mutex::new(status("not_loaded", "d"));
-        let load = NEXT_MODEL_LOAD.fetch_add(1, Ordering::Relaxed);
-        let ready = status("ready", "d");
-        set_model_status(&model, load, None, ready.clone()).unwrap();
-        *model.lock().unwrap() = status("not_loaded", "other model");
+    fn an_older_load_finishing_first_is_replaced_when_the_newer_one_ends() {
+        let slot = ModelStatusSlot::new(status("not_loaded", "d"));
+        let older = slot.begin_load(status("loading", "d")).unwrap();
+        let newer = slot.begin_load(status("loading", "d")).unwrap();
 
-        assert!(set_model_status(&model, load, Some(&ready), status("not_loaded", "d")).is_none());
-        assert_eq!(model.lock().unwrap().detail, "other model");
+        // Identical "loading" statuses: A's cancel must not touch B's download.
+        assert!(slot.update(older, status("not_loaded", "A")).is_none());
+        assert_eq!(slot.get().unwrap().state, "loading");
+        assert!(slot.update(older, status("ready", "A")).is_none());
+        assert!(slot.update(newer, status("error", "B")).is_some());
+        assert_eq!(slot.get().unwrap().detail, "B");
+    }
+
+    #[test]
+    fn a_settings_save_takes_the_status_from_every_load() {
+        let slot = ModelStatusSlot::new(status("not_loaded", "d"));
+        let load = slot.begin_load(status("loading", "d")).unwrap();
+        slot.replace(status("not_loaded", "other model")).unwrap();
+
+        assert!(slot.update(load, status("ready", "d")).is_none());
+        assert_eq!(slot.get().unwrap().detail, "other model");
+    }
+
+    #[test]
+    fn slots_do_not_share_ownership() {
+        let first = ModelStatusSlot::new(status("not_loaded", "d"));
+        let second = ModelStatusSlot::new(status("not_loaded", "d"));
+        let load = first.begin_load(status("loading", "d")).unwrap();
+        second.begin_load(status("loading", "d")).unwrap();
+        second.begin_load(status("loading", "d")).unwrap();
+
+        assert!(first.update(load, status("ready", "d")).is_some());
     }
 
     #[test]
