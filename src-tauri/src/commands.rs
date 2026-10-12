@@ -1656,7 +1656,22 @@ pub(crate) async fn stop_recording_for(
         let Some(target_language) = translation_target.as_deref() else {
             // Startup publishes the target with the session. If it is missing,
             // keep the speech the same way a translation failure does.
-            let copied = draft.injector.copy_to_clipboard(&transcript.text).is_ok();
+            let copied = match commit_dictation_output(&services.lifecycle, operation_id, || {
+                draft
+                    .injector
+                    .copy_to_clipboard(&transcript.text)
+                    .map(|()| InsertResult::ClipboardOnly)
+            }) {
+                CommittedOutput::Ran(copied) => copied.is_ok(),
+                // Nothing was copied.
+                CommittedOutput::Cancelled => {
+                    emit_state(&app, &state, AppPhase::Idle, cancel_message);
+                    return Err(cancel_error.into());
+                }
+                // Nothing was copied; the phase guard reports the incomplete
+                // translation.
+                CommittedOutput::Refused(error) => return Err(error.into()),
+            };
             emit_correction_preview(&app, &transcript.text, "fallback");
             emit_state(
                 &app,
@@ -1811,15 +1826,30 @@ pub(crate) async fn stop_recording_for(
             "Inserting into the captured target."
         },
     );
-    let insertion_result = if translation_failed {
-        draft
-            .injector
-            .copy_to_clipboard(&final_text)
-            .map(|()| InsertResult::ClipboardOnly)
-    } else {
-        let cancel = services.lifecycle.cancellation(operation_id)?;
+    let cancel = services.lifecycle.cancellation(operation_id)?;
+    // Settling awaits, so it runs before the commit, which must not.
+    if !translation_failed {
         draft.settle_before_final(&cancel).await;
-        draft.finish(&final_text, &cancel)
+    }
+    // A cancel either wins before the paste or copy, or finds the dictation
+    // committed and changes nothing.
+    let insertion_result = match commit_dictation_output(&services.lifecycle, operation_id, || {
+        if translation_failed {
+            draft
+                .injector
+                .copy_to_clipboard(&final_text)
+                .map(|()| InsertResult::ClipboardOnly)
+        } else {
+            draft.finish(&final_text, &cancel)
+        }
+    }) {
+        CommittedOutput::Ran(inserted) => inserted,
+        // Nothing was pasted or copied; ends below as a cancelled insertion,
+        // whose dropped draft removes its provisional text.
+        CommittedOutput::Cancelled => Err(injection::InjectionError::Cancelled),
+        // Nothing was pasted or copied; the phase guard reports the
+        // incomplete dictation.
+        CommittedOutput::Refused(error) => return Err(error.into()),
     };
     // Diagnose before the draft stops its input monitor. Fixed codes only.
     let clipboard_lost = draft.injector.take_clipboard_not_restored();
@@ -2315,6 +2345,23 @@ fn commit_edit_replacement(
             edit_insertion_outcome(replaced, copy_to_clipboard),
             failure_detail,
         ))
+    });
+    committed_output(committed, || lifecycle.is_cancelled(operation_id))
+}
+
+/// Dictation's and voice translation's irreversible step: the final paste or
+/// a clipboard copy. Only an insertion that saw the cancel, which neither
+/// pasted nor copied, leaves the commit unsealed; any other result, an error
+/// included, is committed and completes as before. Finishing a live draft
+/// verifies its selection and then its paste, about two seconds at most.
+fn commit_dictation_output(
+    lifecycle: &PipelineLifecycle,
+    operation_id: u64,
+    output: impl FnOnce() -> Result<InsertResult, injection::InjectionError>,
+) -> CommittedOutput<Result<InsertResult, injection::InjectionError>> {
+    let committed = lifecycle.commit_side_effect(operation_id, || match output() {
+        Err(injection::InjectionError::Cancelled) => Err(OutputCancelled),
+        output => Ok(output),
     });
     committed_output(committed, || lifecycle.is_cancelled(operation_id))
 }
@@ -3780,6 +3827,91 @@ mod tests {
             assert_eq!(lifecycle.cancel().unwrap(), None);
             assert!(!lifecycle.is_cancelled(id));
         }
+    }
+
+    #[test]
+    fn a_dictation_cancelled_before_its_output_neither_pastes_nor_copies() {
+        // Dictate's final paste; voice translation's paste or fallback copy.
+        for mode in [PipelineMode::Dictate, PipelineMode::Translate] {
+            let lifecycle = PipelineLifecycle::default();
+            let id = processing_after_recording(&lifecycle, mode);
+            assert_eq!(
+                lifecycle.cancel().unwrap(),
+                Some((id, PipelinePhase::Processing))
+            );
+            assert_eq!(
+                commit_dictation_output(&lifecycle, id, || {
+                    panic!("a cancelled dictation must neither paste nor copy")
+                }),
+                CommittedOutput::Cancelled
+            );
+            assert!(lifecycle.is_cancelled(id));
+        }
+    }
+
+    #[test]
+    fn a_dictation_output_that_saw_a_cancel_stays_cancellable() {
+        let lifecycle = PipelineLifecycle::default();
+        let id = processing_after_recording(&lifecycle, PipelineMode::Dictate);
+        assert_eq!(
+            commit_dictation_output(&lifecycle, id, || Err(injection::InjectionError::Cancelled)),
+            CommittedOutput::Cancelled
+        );
+        assert_eq!(
+            lifecycle.cancel().unwrap(),
+            Some((id, PipelinePhase::Processing))
+        );
+    }
+
+    #[test]
+    fn a_committed_dictation_output_completes_after_a_later_cancel() {
+        use injection::test_backend::{self, MockBackend};
+        use std::sync::{Arc, Mutex};
+        // An insertion error is committed too: it is saved and reported as before.
+        for output in [
+            Ok(InsertResult::ClipboardPaste),
+            Ok(InsertResult::PasteUnverified),
+            Ok(InsertResult::ClipboardOnly),
+            Err(injection::InjectionError::ClipboardUnavailable),
+        ] {
+            let lifecycle = PipelineLifecycle::default();
+            let id = processing_after_recording(&lifecycle, PipelineMode::Translate);
+            assert_eq!(
+                commit_dictation_output(&lifecycle, id, || output.clone()),
+                CommittedOutput::Ran(output)
+            );
+            assert_eq!(lifecycle.cancel().unwrap(), None);
+            assert!(!lifecycle.is_cancelled(id));
+        }
+        // The final paste observes the same cancel the lifecycle sends.
+        let lifecycle = PipelineLifecycle::default();
+        let id = processing_after_recording(&lifecycle, PipelineMode::Dictate);
+        let cancel = lifecycle.cancellation(id).unwrap();
+        let mock = Arc::new(Mutex::new(MockBackend::new()));
+        let injector =
+            SystemTextInjector::with_mock(Arc::clone(&mock), InjectionOptions::default());
+        let monitor = InputMonitor::default();
+        monitor.test_set_available(true);
+        monitor.observe_cancellation(Some(cancel.clone()));
+        let checkpoint = monitor.checkpoint().unwrap();
+        assert_eq!(
+            commit_dictation_output(&lifecycle, id, || {
+                injector.insert_final(
+                    "final",
+                    &test_backend::target(),
+                    &monitor,
+                    checkpoint,
+                    &cancel,
+                    false,
+                )
+            }),
+            CommittedOutput::Ran(Ok(InsertResult::ClipboardPaste))
+        );
+        assert_eq!(lifecycle.cancel().unwrap(), None);
+        // History and the insertion diagnosis never see a cancelled monitor.
+        assert!(!*cancel.borrow());
+        assert!(monitor.unchanged_since(checkpoint));
+        assert_eq!(mock.lock().unwrap().content(), "prefix final suffix");
     }
 
     #[test]
