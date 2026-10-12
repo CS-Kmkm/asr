@@ -1942,9 +1942,9 @@ pub(crate) async fn stop_recording_for(
     let completion = if translation_failed {
         "Translation failed; the raw transcript remains on the clipboard."
     } else if mode == PipelineMode::Translate && insertion == InsertResult::PasteUnverified {
-        "Translation pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard)."
+        TRANSLATION_PASTE_UNVERIFIED
     } else if mode == PipelineMode::Translate && insertion == InsertResult::ClipboardOnly {
-        "The target changed; the translation remains on the clipboard."
+        TRANSLATION_TARGET_CHANGED
     } else if mode == PipelineMode::Translate {
         "Voice translation inserted."
     } else if insertion == InsertResult::PasteUnverified && streamed_into_target {
@@ -2521,20 +2521,23 @@ fn selected_text_history_item<'a>(
     }
 }
 
+/// A translation paste that was sent but could not be confirmed, for voice
+/// and selected-text translation alike.
+const TRANSLATION_PASTE_UNVERIFIED: &str = "Translation pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard).";
+
+/// A translation left on the clipboard because its target changed, for voice
+/// and selected-text translation alike.
+const TRANSLATION_TARGET_CHANGED: &str =
+    "The target changed; the translation remains on the clipboard.";
+
 /// Status kind and message for a selected-text translation outcome. A paste
 /// that was sent but not confirmed may already have replaced the selection,
 /// so it must not read as a target change that invites a second paste.
 fn selection_translation_status(result: InsertResult) -> (&'static str, &'static str) {
     match result {
         InsertResult::ClipboardPaste => ("success", "Translation inserted."),
-        InsertResult::PasteUnverified => (
-            "paste_unverified",
-            "Translation pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard).",
-        ),
-        InsertResult::ClipboardOnly => (
-            "error",
-            "The target changed; the translation remains on the clipboard.",
-        ),
+        InsertResult::PasteUnverified => ("paste_unverified", TRANSLATION_PASTE_UNVERIFIED),
+        InsertResult::ClipboardOnly => ("error", TRANSLATION_TARGET_CHANGED),
     }
 }
 
