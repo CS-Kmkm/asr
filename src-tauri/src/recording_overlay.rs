@@ -25,6 +25,10 @@ const MESSAGE_NOTICE_HEIGHT: f64 = 84.0;
 const BOTTOM_MARGIN: f64 = 24.0;
 /// A refused hotkey press is flashed inside the live view this long.
 const HINT_DURATION: Duration = Duration::from_secs(3);
+/// A live notice (for example the microphone fallback) widens the live view
+/// so its sentence is readable next to the waveform, for this long.
+const LIVE_NOTICE_WIDTH: f64 = MESSAGE_NOTICE_WIDTH;
+const LIVE_NOTICE_DURATION: Duration = Duration::from_secs(6);
 
 /// Advanced by every phase change and notice. A notice timer hides the window
 /// only if nothing replaced its notice, so it never hides a later recording.
@@ -33,6 +37,9 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 static TRANSLATION_CONTROL: AtomicBool = AtomicBool::new(false);
 /// Whether the live view (not a notice) is showing.
 static LIVE: AtomicBool = AtomicBool::new(false);
+/// Whether the live view is widened for a live notice. Every phase change
+/// ends it.
+static LIVE_NOTICE: AtomicBool = AtomicBool::new(false);
 /// The window handle of the session's captured target (0 for none). The
 /// overlay is placed on that window's monitor.
 static ANCHOR: AtomicI64 = AtomicI64::new(0);
@@ -139,14 +146,12 @@ pub(crate) fn set_phase(app: &AppHandle, phase: &AppPhase) {
 
     let live = phase_view(phase) == PhaseView::Live;
     LIVE.store(live, Ordering::Release);
+    LIVE_NOTICE.store(false, Ordering::Release);
     if live {
         let _ = window.set_ignore_cursor_events(click_through(phase));
         // Recalculate whenever shown in case display layout, DPI, or the
         // recording/processing window size changed.
-        let _ = place(
-            &window,
-            live_size(TRANSLATION_CONTROL.load(Ordering::Acquire)),
-        );
+        let _ = place(&window, current_live_size());
         let _ = window.show();
     } else {
         let _ = window.hide();
@@ -203,14 +208,66 @@ pub(crate) fn show_busy(app: &AppHandle, message: &str) {
     }
 }
 
+/// Shows a sentence inside the showing live view for `LIVE_NOTICE_DURATION`
+/// without replacing it, widening the view so the sentence is readable. The
+/// recording (and its cancel button) stays as is; the next phase change
+/// restores the normal size. Without a live view it is a warning notice.
+pub(crate) fn show_live_notice(app: &AppHandle, message: &str) {
+    if busy_presentation(LIVE.load(Ordering::Acquire)) == BusyPresentation::Notice {
+        show_message_notice(app, NoticeSeverity::Warning, message);
+        return;
+    }
+    let Some(window) = app.get_webview_window(WINDOW_LABEL) else {
+        return;
+    };
+    let generation = GENERATION.load(Ordering::Acquire);
+    LIVE_NOTICE.store(true, Ordering::Release);
+    let _ = place(&window, current_live_size());
+    let _ = app.emit_to(
+        WINDOW_LABEL,
+        "overlay-hint",
+        Hint {
+            message,
+            duration_ms: LIVE_NOTICE_DURATION.as_millis() as u64,
+        },
+    );
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(LIVE_NOTICE_DURATION).await;
+        let handle = app.clone();
+        // Like a notice timer: only the same live phase is shrunk back.
+        let _ = app.run_on_main_thread(move || {
+            if GENERATION.load(Ordering::Acquire) == generation
+                && LIVE_NOTICE.swap(false, Ordering::AcqRel)
+            {
+                if let Some(window) = handle.get_webview_window(WINDOW_LABEL) {
+                    let _ = place(&window, current_live_size());
+                }
+            }
+        });
+    });
+}
+
 /// The live view's logical size.
-fn live_size(translation_control: bool) -> (f64, f64) {
+fn live_size(translation_control: bool, live_notice: bool) -> (f64, f64) {
     let width = if translation_control {
         TRANSLATION_WIDTH
     } else {
         RECORDING_WIDTH
     };
+    let width = if live_notice {
+        width.max(LIVE_NOTICE_WIDTH)
+    } else {
+        width
+    };
     (width, RECORDING_HEIGHT)
+}
+
+fn current_live_size() -> (f64, f64) {
+    live_size(
+        TRANSLATION_CONTROL.load(Ordering::Acquire),
+        LIVE_NOTICE.load(Ordering::Acquire),
+    )
 }
 
 #[derive(Clone, Serialize)]
@@ -304,7 +361,7 @@ pub(crate) fn set_interactive(app: &AppHandle, translation_control: bool) {
         return;
     }
     if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
-        let _ = place(&window, live_size(translation_control));
+        let _ = place(&window, current_live_size());
     }
 }
 
@@ -491,11 +548,23 @@ mod tests {
 
     #[test]
     fn the_live_view_makes_room_for_the_cancel_button_and_language_control() {
-        let (recording, height) = live_size(false);
-        let (translating, _) = live_size(true);
+        let (recording, height) = live_size(false, false);
+        let (translating, _) = live_size(true, false);
         assert_eq!(height, RECORDING_HEIGHT);
         assert!(recording >= 200.0);
         assert!(translating > recording);
+    }
+
+    #[test]
+    fn a_live_notice_widens_the_live_view_without_changing_its_height() {
+        for translation_control in [false, true] {
+            let (normal, height) = live_size(translation_control, false);
+            let (widened, widened_height) = live_size(translation_control, true);
+            assert_eq!(widened_height, height);
+            assert!(widened > normal);
+            assert_eq!(widened, LIVE_NOTICE_WIDTH);
+        }
+        assert!(LIVE_NOTICE_DURATION > HINT_DURATION);
     }
 
     #[test]

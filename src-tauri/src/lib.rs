@@ -139,7 +139,6 @@ pub(crate) struct Services {
     lifecycle: PipelineLifecycle,
     initialization: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     shutdown_started: AtomicBool,
-    translation_active: AtomicBool,
     voice_translation_target: Mutex<Option<String>>,
     shortcut_routes: Mutex<shortcuts::Routes>,
     /// Saved shortcuts not dispatched since startup, named by action and
@@ -179,7 +178,6 @@ impl Services {
             lifecycle: PipelineLifecycle::default(),
             initialization: Mutex::new(None),
             shutdown_started: AtomicBool::new(false),
-            translation_active: AtomicBool::new(false),
             voice_translation_target: Mutex::new(None),
             shortcut_routes: Mutex::new(
                 shortcuts::Routes::parse_saved(settings).expect("validated settings"),
@@ -1404,156 +1402,17 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode, trigger
                 )
                 .await
             }
+            // Its hotkey is routed to `translate_selection` directly; this
+            // keeps a press of it meaning the same thing here.
+            PipelineMode::SelectedText => {
+                commands::translate_selection(app.clone()).await;
+                Ok(())
+            }
         },
         shortcuts::Press::Ignore => Ok(()),
     };
     if let Err(error) = result {
         emit_status(&app, "error", &error);
-    }
-}
-
-async fn translate_selection(app: AppHandle) {
-    let services = app.state::<Services>();
-    if services.lifecycle.phase() != PipelinePhase::Idle {
-        return;
-    }
-    let active = &services.translation_active;
-    if active.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    struct TranslationGuard<'a>(&'a AtomicBool);
-    impl Drop for TranslationGuard<'_> {
-        fn drop(&mut self) {
-            self.0.store(false, Ordering::Release);
-        }
-    }
-    let _guard = TranslationGuard(active);
-    if services.lifecycle.phase() != PipelinePhase::Idle {
-        return;
-    }
-    let settings = match app.state::<Storage>().get_settings() {
-        Ok(settings) => settings,
-        Err(_) => {
-            emit_status(&app, "error", "Translation settings are unavailable.");
-            return;
-        }
-    };
-    let injector = SystemTextInjector::new(InjectionOptions {
-        restore_clipboard: settings.clipboard_restore,
-    });
-    let selection = match injector.capture_selection() {
-        Ok(selection) => selection,
-        Err(_) => {
-            emit_status(
-                &app,
-                "error",
-                "Select text in a supported foreground edit control.",
-            );
-            return;
-        }
-    };
-    let source = selection.text().to_owned();
-    let monitor = Arc::clone(&app.state::<Services>().input_monitor);
-    if !monitor.start() {
-        emit_status(
-            &app,
-            "error",
-            "Translation could not monitor the target safely.",
-        );
-        return;
-    }
-    let Some(checkpoint) = monitor.checkpoint() else {
-        emit_status(
-            &app,
-            "error",
-            "Translation could not monitor the target safely.",
-        );
-        return;
-    };
-    let (_cancel_guard, cancel) = tokio::sync::watch::channel(false);
-    let translated = correction::translate_text(&settings, &source, cancel).await;
-    let translated = match translated {
-        Ok(text) => text,
-        Err(_) => {
-            // The selection is unchanged, so there is nothing to recover and
-            // no reason to overwrite the user's clipboard with its source.
-            emit_status(&app, "error", TRANSLATION_FAILED_SELECTION_UNCHANGED);
-            return;
-        }
-    };
-    match injector.replace_selection(&selection, &translated, &monitor, checkpoint) {
-        Ok(result) => {
-            let (kind, message) = selection_translation_status(result);
-            emit_status(&app, kind, message);
-        }
-        Err(_) => {
-            if injector.copy_to_clipboard(&translated).is_ok() {
-                emit_status(
-                    &app,
-                    "error",
-                    "The target changed; the translation remains on the clipboard.",
-                );
-            } else {
-                // Not inserted, and the clipboard was unavailable or protected
-                // under Restore clipboard: keep the translation in this app.
-                let state = app.state::<AppState>();
-                let _ = app.emit("app-state", state.publish_result(translated));
-                emit_status(&app, "error", TRANSLATION_KEPT_IN_APP);
-            }
-        }
-    }
-    if injector.take_clipboard_not_restored() {
-        commands::report_clipboard_not_restored(&app);
-    }
-}
-
-const TRANSLATION_KEPT_IN_APP: &str =
-    "The translation could not be inserted or copied to the clipboard; it is available in this app.";
-
-const TRANSLATION_FAILED_SELECTION_UNCHANGED: &str =
-    "Translation failed; the selected text was not changed.";
-
-/// Status kind and message for a selected-text translation outcome. A paste
-/// that was sent but not confirmed may already have replaced the selection,
-/// so it must not read as a target change that invites a second paste.
-fn selection_translation_status(result: InsertResult) -> (&'static str, &'static str) {
-    match result {
-        InsertResult::ClipboardPaste => ("success", "Translation inserted."),
-        InsertResult::PasteUnverified => (
-            "paste_unverified",
-            "Translation pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard).",
-        ),
-        InsertResult::ClipboardOnly => (
-            "error",
-            "The target changed; the translation remains on the clipboard.",
-        ),
-    }
-}
-
-#[cfg(test)]
-mod selection_translation_tests {
-    use super::*;
-
-    #[test]
-    fn a_failed_translation_does_not_claim_the_clipboard() {
-        assert!(!TRANSLATION_FAILED_SELECTION_UNCHANGED.contains("clipboard"));
-        assert!(TRANSLATION_KEPT_IN_APP.contains("available in this app"));
-    }
-
-    #[test]
-    fn an_unverified_paste_is_not_reported_as_a_target_change() {
-        let (kind, message) = selection_translation_status(InsertResult::PasteUnverified);
-        assert_eq!(kind, "paste_unverified");
-        assert!(!message.contains("target changed"), "{message}");
-        assert!(message.contains("only if the text did not appear"));
-        assert_eq!(
-            selection_translation_status(InsertResult::ClipboardOnly).1,
-            "The target changed; the translation remains on the clipboard."
-        );
-        assert_eq!(
-            selection_translation_status(InsertResult::ClipboardPaste),
-            ("success", "Translation inserted.")
-        );
     }
 }
 
@@ -1625,7 +1484,9 @@ fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
         shortcuts::Action::Ask => {
             tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Ask, route.text))
         }
-        shortcuts::Action::SelectedText => tauri::async_runtime::spawn(translate_selection(app)),
+        shortcuts::Action::SelectedText => {
+            tauri::async_runtime::spawn(commands::translate_selection(app))
+        }
     };
 }
 

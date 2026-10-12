@@ -328,7 +328,6 @@ const en = {
   "The previous clipboard could not be restored.": "The previous clipboard could not be restored.",
   "Not completed": "Not completed",
   "Completed with a warning": "Completed with a warning",
-  "selected-text translation is already active": "selected-text translation is already active",
   "Preparing speech model": "Preparing speech model",
   "Preparing the speech model. Recording starts when it is ready.": "Preparing the speech model. Recording starts when it is ready.",
   "Starts when ready": "Starts when ready",
@@ -340,6 +339,11 @@ const en = {
   "The target app runs with higher privileges, so this app cannot type into it.": "The target app runs with higher privileges, so this app cannot type into it.",
   "The selected microphone was not found. Check the microphone in Settings.": "The selected microphone was not found. Check the microphone in Settings.",
   "The microphone could not be opened. Check the microphone in Settings.": "The microphone could not be opened. Check the microphone in Settings.",
+  "Selected microphone not found. Using the default.": "Selected microphone not found. Using the default.",
+  "The selected microphone was not found, so this recording uses the default microphone. The saved microphone setting was not changed.": "The selected microphone was not found, so this recording uses the default microphone. The saved microphone setting was not changed.",
+  "Recording from the default microphone.": "Recording from the default microphone.",
+  "Translating the selected text.": "Translating the selected text.",
+  "Selected-text translation cancelled.": "Selected-text translation cancelled.",
   "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.": "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.",
 } as const;
 export type MessageKey = keyof typeof en;
@@ -670,7 +674,6 @@ const ja: Record<MessageKey, string> = {
   "The previous clipboard could not be restored.": "元のクリップボードの内容を復元できませんでした。",
   "Not completed": "完了しませんでした",
   "Completed with a warning": "完了しました（注意あり）",
-  "selected-text translation is already active": "選択テキストの翻訳を実行中です。",
   "Preparing speech model": "音声認識モデルを準備中",
   "Preparing the speech model. Recording starts when it is ready.": "音声認識モデルを準備しています。準備ができたら録音を開始します。",
   "Starts when ready": "準備ができたら開始します",
@@ -682,6 +685,11 @@ const ja: Record<MessageKey, string> = {
   "The target app runs with higher privileges, so this app cannot type into it.": "入力先のアプリが高い権限で実行されているため、このアプリから入力できません。",
   "The selected microphone was not found. Check the microphone in Settings.": "選択したマイクが見つかりません。設定でマイクを確認してください。",
   "The microphone could not be opened. Check the microphone in Settings.": "マイクを開けませんでした。設定でマイクを確認してください。",
+  "Selected microphone not found. Using the default.": "選択したマイクがないため、既定のマイクを使用中",
+  "The selected microphone was not found, so this recording uses the default microphone. The saved microphone setting was not changed.": "選択したマイクが見つからないため、この録音では既定のマイクを使用しています。保存したマイクの設定は変更していません。",
+  "Recording from the default microphone.": "既定のマイクで録音しています。",
+  "Translating the selected text.": "選択したテキストを翻訳しています。",
+  "Selected-text translation cancelled.": "選択テキストの翻訳をキャンセルしました。",
   "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.": "Esc は録音中のキャンセルキーでもあります。この割り当てでは、× ボタンでキャンセルしてください。",
 } satisfies Record<MessageKey, string>;
 
@@ -871,7 +879,6 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "The original selection was not changed, and the clipboard is unavailable; the edit is available in this app.",
       "Speak to edit is disabled because its saved hotkey is already used by another action. Change the overlapping hotkeys in Settings.",
       "Speak to edit is disabled because its saved hotkey is already used by another action, and a saved hotkey could not be registered. Change them in Settings.",
-      "selected-text translation is already active",
       "Preparing the speech model. Recording starts when it is ready.",
       "another voice mode is already recording",
       "No target window was found. Click where the text should go, then try again.",
@@ -879,6 +886,11 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "The target app runs with higher privileges, so this app cannot type into it.",
       "The selected microphone was not found. Check the microphone in Settings.",
       "The microphone could not be opened. Check the microphone in Settings.",
+      "Selected microphone not found. Using the default.",
+      "The selected microphone was not found, so this recording uses the default microphone. The saved microphone setting was not changed.",
+      "Recording from the default microphone.",
+      "Translating the selected text.",
+      "Selected-text translation cancelled.",
   ] satisfies MessageKey[],
 );
 
