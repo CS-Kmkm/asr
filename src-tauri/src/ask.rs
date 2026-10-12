@@ -476,7 +476,9 @@ pub fn validate_action(
 }
 
 /// Re-plan a retained Ask search without granting the planner authority to
-/// change its originally stored fixed site or open anything.
+/// change its originally stored fixed site or open anything. Returns the
+/// query derived from the spoken instruction, which an Ask search saves as
+/// its processed text.
 pub fn validate_fixed_search_retry_plan(
     raw: &str,
     spoken_instruction: &str,
@@ -495,9 +497,9 @@ pub fn validate_fixed_search_retry_plan(
     if site != stored_site {
         return Err(AskError::Policy);
     }
-    let query = spoken_instruction.trim();
-    site.fixed_url(query)?;
-    Ok(query.to_string())
+    // `fixed_url` derives the same query internally and validates it.
+    site.fixed_url(spoken_instruction)?;
+    Ok(site.derive_search_query(spoken_instruction))
 }
 
 pub fn planning_prompt(context: AskContextKind) -> String {
@@ -826,6 +828,7 @@ mod tests {
     #[test]
     fn fixed_search_retry_accepts_only_the_stored_site() {
         let plan = r#"{"version":1,"action":{"kind":"search","site":"github"}}"#;
+        // The derived query, as the original Ask search saved it.
         assert_eq!(
             validate_fixed_search_retry_plan(
                 plan,
@@ -834,7 +837,13 @@ mod tests {
                 &languages()
             )
             .unwrap(),
-            "Search GitHub for Rust"
+            "Rust"
+        );
+        let spoken = " ラストをギットハブで検索して ";
+        assert_eq!(
+            validate_fixed_search_retry_plan(plan, spoken, SearchSite::GitHub, &languages())
+                .unwrap(),
+            SearchSite::GitHub.derive_search_query(spoken)
         );
         assert!(validate_fixed_search_retry_plan(
             plan,
