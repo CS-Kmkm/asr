@@ -214,7 +214,8 @@ pub trait Transcriber: Send + Sync {
     /// Reconfigure the worker command (for example when the ASR backend
     /// setting changes) and tear down any running worker so the next request
     /// spawns with the new command. A request in flight, such as a model
-    /// download, is abandoned instead of delaying the change.
+    /// download, is abandoned instead of delaying the change. Reconfiguring
+    /// with the current command changes nothing and interrupts nothing.
     async fn reconfigure(&self, command: WorkerCommand);
     /// Subscribe to the progress the worker reports during a model load.
     fn load_progress(&self) -> Option<broadcast::Receiver<LoadProgress>> {
@@ -445,6 +446,12 @@ pub struct JsonlTranscriber {
     /// being drained) kills the worker and lets go instead of blocking them.
     interrupt: watch::Sender<u64>,
     residency: watch::Receiver<ModelResidency>,
+    /// The command `State` runs, readable without the state lock. A running
+    /// load holds that lock, so `reconfigure` compares against this copy to
+    /// leave the load alone when the command is unchanged. Held through a
+    /// whole reconfiguration, so concurrent ones apply in order and the copy
+    /// never disagrees with `State::command` once they finish.
+    configured_command: Mutex<WorkerCommand>,
 }
 
 /// Build the worker process command: the discovered working directory, no
@@ -490,6 +497,7 @@ impl JsonlTranscriber {
             cancel_grace: CANCEL_GRACE,
             shutdown_timeout: SHUTDOWN_TIMEOUT,
             next_id: AtomicU64::new(1),
+            configured_command: Mutex::new(command.clone()),
             state: Arc::new(Mutex::new(State {
                 command,
                 running: None,
@@ -999,14 +1007,20 @@ impl Transcriber for JsonlTranscriber {
     }
 
     async fn reconfigure(&self, command: WorkerCommand) {
-        self.interrupt_running_request();
-        let mut state = self.state.lock().await;
-        if state.command == command {
+        let mut configured = self.configured_command.lock().await;
+        // An unchanged command keeps the worker, its loaded model and any
+        // request in flight (such as a model download).
+        if *configured == command {
             return;
         }
-        state.reset().await;
-        state.loaded_quantization = None;
-        state.command = command;
+        self.interrupt_running_request();
+        let mut state = self.state.lock().await;
+        if state.command != command {
+            state.reset().await;
+            state.loaded_quantization = None;
+            state.command = command.clone();
+        }
+        *configured = command;
     }
 }
 
@@ -1259,6 +1273,36 @@ mod tests {
         assert_eq!(response["text"], "bad:\u{FFFD}");
         assert_eq!(response["paired"], "\u{1F600}");
         assert_eq!(response["literal"], r"\udfff");
+    }
+
+    #[tokio::test]
+    async fn reconfigure_interrupts_only_for_a_new_command() {
+        let command = WorkerCommand::python("python").with_backend("mock");
+        let transcriber = JsonlTranscriber::new(
+            command.clone(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let mut interrupt = transcriber.interrupt.subscribe();
+        // Like a model load in progress: the state lock is taken.
+        let load = transcriber.state.clone().lock_owned().await;
+        timeout(
+            Duration::from_secs(1),
+            transcriber.reconfigure(command.clone()),
+        )
+        .await
+        .expect("an unchanged command waited for the running load");
+        assert!(!interrupt.has_changed().unwrap());
+        drop(load);
+
+        let changed = command.with_backend("faster-whisper");
+        transcriber.reconfigure(changed.clone()).await;
+        assert!(interrupt.has_changed().unwrap());
+        interrupt.mark_unchanged();
+        assert_eq!(transcriber.state.lock().await.command, changed);
+
+        transcriber.reconfigure(changed.clone()).await;
+        assert!(!interrupt.has_changed().unwrap());
     }
 
     /// `JsonlTranscriber` against the real `python -m asr_worker --backend
@@ -1715,6 +1759,33 @@ mod tests {
                 "reconfigured"
             );
             assert_eq!(mock.processes(), 2);
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn reconfigure_with_the_current_command_keeps_a_running_load() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = Arc::new(mock.transcriber());
+            mock.hold();
+            let load = tokio::spawn({
+                let transcriber = transcriber.clone();
+                async move { transcriber.load("4bit").await }
+            });
+            mock.wait_for_event("load 4bit", 1).await;
+
+            let started = Instant::now();
+            transcriber.reconfigure(mock.command.clone()).await;
+            assert!(started.elapsed() < BOUNDED);
+            assert!(!load.is_finished());
+
+            mock.release();
+            load.await.unwrap().unwrap();
+            assert_eq!(resident(&transcriber), Some(1));
+            mock.transcribe(&transcriber).await.unwrap();
+            assert_eq!(mock.event_names(), ["load 4bit", "transcribe"]);
+            assert_eq!(mock.processes(), 1);
             transcriber.shutdown().await.unwrap();
         }
 

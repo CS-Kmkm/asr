@@ -5189,8 +5189,15 @@ mod tests {
             "4bit"
         }
         .into();
-        let mut endpoint = previous.clone();
+        assert_ne!(previous.asr_backend, "openai-compatible");
+        let mut api = previous.clone();
+        api.asr_backend = "openai-compatible".into();
+        let mut endpoint = api.clone();
         endpoint.api_base_url = "https://asr.example.invalid/v1".into();
+        // The API fields do not reach a local backend's worker.
+        let mut local_endpoint = previous.clone();
+        local_endpoint.api_base_url = "https://asr.example.invalid/v1".into();
+        local_endpoint.api_key_env_var = "OTHER_ASR_API_KEY".into();
         let mut unrelated = previous.clone();
         unrelated.interaction_sounds = !previous.interaction_sounds;
         for busy in [
@@ -5198,20 +5205,84 @@ mod tests {
             PipelinePhase::Recording,
             PipelinePhase::Processing,
         ] {
-            for next in [&backend, &model, &quantization, &endpoint] {
+            for (from, next) in [
+                (&previous, &backend),
+                (&previous, &model),
+                (&previous, &quantization),
+                (&api, &endpoint),
+            ] {
                 assert_eq!(
-                    reject_model_change_while_busy(&previous, next, busy),
+                    reject_model_change_while_busy(from, next, busy),
                     Err(MODEL_CHANGE_WHILE_BUSY.to_string())
                 );
                 assert_eq!(
-                    reject_model_change_while_busy(&previous, next, PipelinePhase::Idle),
+                    reject_model_change_while_busy(from, next, PipelinePhase::Idle),
                     Ok(())
                 );
             }
+            for next in [&unrelated, &local_endpoint] {
+                assert_eq!(
+                    reject_model_change_while_busy(&previous, next, busy),
+                    Ok(())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_different_worker_command_counts_as_a_worker_change() {
+        let local = Settings::default();
+        assert_ne!(local.asr_backend, "openai-compatible");
+        let mut api = local.clone();
+        api.asr_backend = "openai-compatible".into();
+        let changed = |edit: fn(&mut Settings), from: &Settings| {
+            let mut next = from.clone();
+            edit(&mut next);
+            (from.clone(), next)
+        };
+        let unchanged = [
+            changed(
+                |next| next.api_base_url = "https://asr.example.invalid/v1".into(),
+                &local,
+            ),
+            changed(
+                |next| next.api_key_env_var = "OTHER_ASR_API_KEY".into(),
+                &local,
+            ),
+            changed(|next| next.model_id = Some("  ".into()), &local),
+            changed(
+                |next| next.api_base_url = format!(" {} ", next.api_base_url),
+                &api,
+            ),
+            changed(
+                |next| next.interaction_sounds = !next.interaction_sounds,
+                &api,
+            ),
+        ];
+        for (previous, next) in &unchanged {
+            assert!(!worker_configuration_changed(previous, next));
+            assert!(!speech_model_changed(previous, next));
+            // Skipping reconfigure is sound: the worker command is the same.
             assert_eq!(
-                reject_model_change_while_busy(&previous, &unrelated, busy),
-                Ok(())
+                worker_command_for_settings(previous),
+                worker_command_for_settings(next)
             );
+        }
+        let worker_changes = [
+            changed(|next| next.asr_backend = "openai-compatible".into(), &local),
+            changed(|next| next.model_id = Some("custom/model".into()), &local),
+            changed(
+                |next| next.api_base_url = "https://asr.example.invalid/v1".into(),
+                &api,
+            ),
+            changed(
+                |next| next.api_key_env_var = "OTHER_ASR_API_KEY".into(),
+                &api,
+            ),
+        ];
+        for (previous, next) in &worker_changes {
+            assert!(worker_configuration_changed(previous, next));
+            assert!(speech_model_changed(previous, next));
         }
     }
 
@@ -5906,10 +5977,26 @@ pub(crate) async fn update_settings(
 
 /// Settings that require a new worker command (`reconfigure` kills the worker).
 fn worker_configuration_changed(previous: &Settings, next: &Settings) -> bool {
-    next.asr_backend != previous.asr_backend
-        || next.model_id != previous.model_id
-        || next.api_base_url != previous.api_base_url
-        || next.api_key_env_var != previous.api_key_env_var
+    worker_command_inputs(previous) != worker_command_inputs(next)
+}
+
+/// The settings `worker_command_for_settings` derives the worker command
+/// from, normalized the same way. The API endpoint only reaches the
+/// openai-compatible worker, so editing it for a local backend keeps the
+/// worker and its loaded model.
+fn worker_command_inputs(settings: &Settings) -> (&str, Option<&str>, Option<(&str, &str)>) {
+    let model_id = settings
+        .model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let api_endpoint = (settings.asr_backend == "openai-compatible").then(|| {
+        (
+            settings.api_base_url.trim(),
+            settings.api_key_env_var.trim(),
+        )
+    });
+    (settings.asr_backend.as_str(), model_id, api_endpoint)
 }
 
 const MODEL_CHANGE_WHILE_BUSY: &str =
