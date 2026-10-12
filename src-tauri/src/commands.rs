@@ -3284,6 +3284,47 @@ mod tests {
     }
 
     #[test]
+    fn retry_announces_the_voice_mode_of_its_history_row() {
+        let row = |mode: &str, target_language: Option<&str>| HistoryItem {
+            id: 1,
+            transcript_text: "text".into(),
+            processed_text: None,
+            source_text: None,
+            instruction_text: None,
+            action_kind: None,
+            search_site: None,
+            mode: mode.into(),
+            asr_provider: "mock".into(),
+            llm_provider: None,
+            target_language: target_language.map(str::to_owned),
+            app_category: None,
+            duration_ms: None,
+            latency_ms: None,
+            created_at: String::new(),
+            has_audio: true,
+            retry_of_id: None,
+            insertion_result: None,
+            insertion_detail: None,
+            expires_at: None,
+        };
+        for (mode, target_language, event_mode) in [
+            ("faithful", None, "dictate"),
+            ("ai_corrected", None, "dictate"),
+            ("faithful_fallback", None, "dictate"),
+            ("translate", Some("ja"), "translate"),
+            ("edit", None, "edit"),
+            ("ask", None, "ask"),
+        ] {
+            let pipeline_mode = history_pipeline_mode(mode).unwrap();
+            assert_eq!(
+                retry_voice_mode(pipeline_mode, &row(mode, target_language)),
+                serde_json::json!({"mode": event_mode, "targetLanguage": target_language}),
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
     fn edit_failures_name_their_cause() {
         use correction::CorrectionError;
         use reqwest::StatusCode;
@@ -6171,6 +6212,9 @@ pub(crate) async fn retry_history_item(
     recording_overlay::anchor_to_foreground();
     let mut retry_cleanup = None;
     let result = async {
+        // The overlay labels Processing by the last voice mode; without this
+        // a dictation Retry would show the previous Ask or Edit session's.
+        let _ = app.emit("voice-mode", retry_voice_mode(mode, &source));
         emit_state(
             &app,
             &state,
@@ -6406,6 +6450,16 @@ pub(crate) async fn retry_history_item(
         );
     }
     result
+}
+
+/// The `voice-mode` event of a Retry: the mode of the History row it re-runs.
+fn retry_voice_mode(mode: PipelineMode, source: &HistoryItem) -> serde_json::Value {
+    serde_json::json!({
+        "mode": voice_mode_event_name(mode),
+        "targetLanguage": (mode == PipelineMode::Translate)
+            .then_some(source.target_language.as_deref())
+            .flatten(),
+    })
 }
 
 fn history_pipeline_mode(mode: &str) -> Result<PipelineMode, String> {
