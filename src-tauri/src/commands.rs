@@ -1476,19 +1476,29 @@ pub(crate) async fn stop_recording_for(
             AppPhase::Injecting,
             "Replacing the original selection.",
         );
-        let replaced = session.injector.replace_selection(
-            &session.selection,
-            &edited,
-            &session.monitor,
-            session.checkpoint,
-        );
-        let failure_detail = if replaced == Err(injection::InjectionError::ClipboardProtected) {
-            InsertionDetail::ClipboardProtected
-        } else {
-            InsertionDetail::ClipboardUnavailable
+        let (insertion, failure_detail) = match commit_edit_replacement(
+            &services.lifecycle,
+            operation_id,
+            || {
+                session.injector.replace_selection(
+                    &session.selection,
+                    &edited,
+                    &session.monitor,
+                    session.checkpoint,
+                )
+            },
+            || session.injector.copy_to_clipboard(&edited),
+        ) {
+            CommittedOutput::Ran(outcome) => outcome,
+            // Nothing was pasted or copied.
+            CommittedOutput::Cancelled => {
+                emit_state(&app, &state, AppPhase::Idle, "Editing cancelled.");
+                return Err("editing was cancelled".into());
+            }
+            // Nothing was pasted or copied; the phase guard reports the
+            // incomplete edit.
+            CommittedOutput::Refused(error) => return Err(error.into()),
         };
-        let insertion =
-            edit_insertion_outcome(replaced, || session.injector.copy_to_clipboard(&edited));
         let clipboard_lost = session.injector.take_clipboard_not_restored();
         let restore_detail = insertion
             .and_then(|result| InsertionDetail::for_confirmed_paste(result, clipboard_lost));
@@ -2051,10 +2061,9 @@ async fn finish_ask(
                 .answer_panel
                 .publish(operation_id, clarification.into());
             if !published || !answer_panel::show(app, operation_id, clarification) {
-                session
-                    .injector
-                    .copy_to_clipboard(clarification)
-                    .map_err(command_error)?;
+                commit_ask_copy(&services.lifecycle, operation_id, || {
+                    session.injector.copy_to_clipboard(clarification)
+                })?;
                 let snapshot = state.complete(
                     clarification.into(),
                     "Ask needs clarification; the prompt is on the clipboard.".into(),
@@ -2142,11 +2151,8 @@ async fn finish_ask(
     if services.lifecycle.is_cancelled(operation_id) {
         return Err("ask was cancelled".into());
     }
-    let mut insertion = "panel";
-    if services.lifecycle.is_cancelled(operation_id) {
-        return Err("ask was cancelled".into());
-    }
-    match (&action, &session.capture) {
+    // Every paste or clipboard copy below goes through `commit_ask_output`.
+    let insertion = match (&action, &session.capture) {
         (
             AskAction::Rewrite
             | AskAction::Shorten
@@ -2159,69 +2165,39 @@ async fn finish_ask(
                 .lifecycle
                 .cancellation(operation_id)
                 .map_err(command_error)?;
-            let result =
-                session
-                    .monitor
-                    .as_ref()
-                    .zip(session.checkpoint)
-                    .map(|(monitor, checkpoint)| {
+            commit_ask_output(&services.lifecycle, operation_id, || {
+                let replaced = session.monitor.as_ref().zip(session.checkpoint).map(
+                    |(monitor, checkpoint)| {
                         session.injector.replace_selection_monitored(
                             selection, &output, monitor, checkpoint, &cancel,
                         )
-                    });
-            if *cancel.borrow() {
-                return Err("ask was cancelled".into());
-            }
-            match result {
-                Some(Ok(InsertResult::ClipboardPaste)) => insertion = "selection",
-                Some(Ok(InsertResult::ClipboardOnly)) => {
-                    if *cancel.borrow() {
-                        return Err("ask was cancelled".into());
-                    }
-                    insertion = "clipboard_only";
-                }
-                Some(Ok(InsertResult::PasteUnverified)) => insertion = "paste_unverified",
-                Some(Err(injection::InjectionError::Cancelled)) => {
-                    return Err("ask was cancelled".into())
-                }
-                _ if !*cancel.borrow() => {
-                    let copied = session.injector.copy_to_clipboard(&output);
-                    insertion = ask_fallback_insertion(copied);
-                }
-                _ => return Err("ask was cancelled".into()),
-            }
+                    },
+                );
+                ask_insertion(replaced, "selection", || {
+                    session.injector.copy_to_clipboard(&output)
+                })
+            })?
         }
         (AskAction::Draft, AskCapture::Caret(target)) => {
             let cancel = services
                 .lifecycle
                 .cancellation(operation_id)
                 .map_err(command_error)?;
-            let result = session
-                .monitor
-                .as_ref()
-                .zip(session.checkpoint)
-                .filter(|(monitor, checkpoint)| monitor.unchanged_since(*checkpoint))
-                .and_then(|(monitor, checkpoint)| {
-                    session
-                        .injector
-                        .insert_monitored(&output, target, monitor, checkpoint, &cancel)
-                        .ok()
-                });
-            match result {
-                Some(InsertResult::ClipboardPaste) => insertion = "caret",
-                Some(InsertResult::ClipboardOnly) => {
-                    if *cancel.borrow() {
-                        return Err("ask was cancelled".into());
-                    }
-                    insertion = "clipboard_only";
-                }
-                Some(InsertResult::PasteUnverified) => insertion = "paste_unverified",
-                None if !*cancel.borrow() => {
-                    let copied = session.injector.copy_to_clipboard(&output);
-                    insertion = ask_fallback_insertion(copied);
-                }
-                None => return Err("ask was cancelled".into()),
-            }
+            commit_ask_output(&services.lifecycle, operation_id, || {
+                let inserted = session
+                    .monitor
+                    .as_ref()
+                    .zip(session.checkpoint)
+                    .filter(|(monitor, checkpoint)| monitor.unchanged_since(*checkpoint))
+                    .map(|(monitor, checkpoint)| {
+                        session
+                            .injector
+                            .insert_monitored(&output, target, monitor, checkpoint, &cancel)
+                    });
+                ask_insertion(inserted, "caret", || {
+                    session.injector.copy_to_clipboard(&output)
+                })
+            })?
         }
         _ => {
             if services.lifecycle.is_cancelled(operation_id) {
@@ -2229,11 +2205,18 @@ async fn finish_ask(
             }
             let published = services.answer_panel.publish(operation_id, output.clone());
             if !published || !answer_panel::show(app, operation_id, &output) {
-                let copied = session.injector.copy_to_clipboard(&output);
-                insertion = ask_fallback_insertion(copied);
+                commit_ask_output(&services.lifecycle, operation_id, || {
+                    Ok(ask_fallback_insertion(
+                        session.injector.copy_to_clipboard(&output),
+                    ))
+                })?
+            } else {
+                "panel"
             }
         }
-    }
+    };
+    // A committed paste or copy ignores later cancels, so only an answer
+    // shown in the panel can still be cancelled here.
     if services.lifecycle.is_cancelled(operation_id) {
         return Err("ask was cancelled".into());
     }
@@ -2276,6 +2259,113 @@ async fn finish_ask(
         duration_ms,
         latency_ms,
     })
+}
+
+/// An output step saw the cancel and stopped before it pasted or kept a
+/// copy. The commit stays unsealed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutputCancelled;
+
+/// How an output step (a paste or a clipboard copy) run inside the
+/// lifecycle's commit ended. The commit makes a cancel either win before
+/// anything is pasted or copied, or find the operation committed and do
+/// nothing, so a step that ran always completes normally. The lifecycle lock
+/// is held for the step, which its paste verification bounds to about a
+/// second; lifecycle readers (hotkeys, Esc) wait that long instead of racing
+/// the paste. The step must not use the lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommittedOutput<T> {
+    Ran(T),
+    /// Nothing was pasted or copied.
+    Cancelled,
+    /// Refused for another reason; nothing was pasted or copied.
+    Refused(&'static str),
+}
+
+/// `cancelled` is asked only when the step did not run.
+fn committed_output<T>(
+    committed: Result<Result<T, OutputCancelled>, &'static str>,
+    cancelled: impl FnOnce() -> bool,
+) -> CommittedOutput<T> {
+    match committed {
+        Ok(Ok(output)) => CommittedOutput::Ran(output),
+        Ok(Err(OutputCancelled)) => CommittedOutput::Cancelled,
+        Err(_) if cancelled() => CommittedOutput::Cancelled,
+        Err(error) => CommittedOutput::Refused(error),
+    }
+}
+
+/// Speak to edit's irreversible step: the replacement, or the clipboard copy
+/// when it fails before any paste. Returns the outcome (`None`: neither the
+/// target nor the clipboard received the edit) and the detail for `None`.
+fn commit_edit_replacement(
+    lifecycle: &PipelineLifecycle,
+    operation_id: u64,
+    replace: impl FnOnce() -> Result<InsertResult, injection::InjectionError>,
+    copy_to_clipboard: impl FnOnce() -> Result<(), injection::InjectionError>,
+) -> CommittedOutput<(Option<InsertResult>, InsertionDetail)> {
+    let committed = lifecycle.commit_side_effect(operation_id, || {
+        let replaced = replace();
+        let failure_detail = if replaced == Err(injection::InjectionError::ClipboardProtected) {
+            InsertionDetail::ClipboardProtected
+        } else {
+            InsertionDetail::ClipboardUnavailable
+        };
+        Ok((
+            edit_insertion_outcome(replaced, copy_to_clipboard),
+            failure_detail,
+        ))
+    });
+    committed_output(committed, || lifecycle.is_cancelled(operation_id))
+}
+
+/// Runs an Ask paste or fallback copy as a committed output step. A step
+/// that ran returns its insertion label even if a cancel follows.
+fn commit_ask_output(
+    lifecycle: &PipelineLifecycle,
+    operation_id: u64,
+    output: impl FnOnce() -> Result<&'static str, OutputCancelled>,
+) -> Result<&'static str, String> {
+    match committed_output(lifecycle.commit_side_effect(operation_id, output), || {
+        lifecycle.is_cancelled(operation_id)
+    }) {
+        CommittedOutput::Ran(insertion) => Ok(insertion),
+        CommittedOutput::Cancelled => Err("ask was cancelled".into()),
+        CommittedOutput::Refused(_) => Err(crate::state::OPERATION_INCOMPLETE.into()),
+    }
+}
+
+/// Runs an Ask copy whose failure ends the Ask, such as the clarification
+/// fallback, inside the lifecycle's commit. A failed copy keeps its error and
+/// leaves the operation unsealed.
+fn commit_ask_copy(
+    lifecycle: &PipelineLifecycle,
+    operation_id: u64,
+    copy_to_clipboard: impl FnOnce() -> Result<(), injection::InjectionError>,
+) -> Result<(), String> {
+    match lifecycle.commit_side_effect(operation_id, copy_to_clipboard) {
+        Ok(copied) => copied.map_err(command_error),
+        Err(_) if lifecycle.is_cancelled(operation_id) => Err("ask was cancelled".into()),
+        Err(_) => Err(crate::state::OPERATION_INCOMPLETE.into()),
+    }
+}
+
+/// The insertion label of an Ask selection replacement or caret draft;
+/// `pasted` names a confirmed paste. `None` means the target was not tried.
+/// A failure before any paste falls back to the clipboard; a cancel neither
+/// pastes nor copies.
+fn ask_insertion(
+    inserted: Option<Result<InsertResult, injection::InjectionError>>,
+    pasted: &'static str,
+    copy_to_clipboard: impl FnOnce() -> Result<(), injection::InjectionError>,
+) -> Result<&'static str, OutputCancelled> {
+    match inserted {
+        Some(Ok(InsertResult::ClipboardPaste)) => Ok(pasted),
+        Some(Ok(InsertResult::ClipboardOnly)) => Ok("clipboard_only"),
+        Some(Ok(InsertResult::PasteUnverified)) => Ok("paste_unverified"),
+        Some(Err(injection::InjectionError::Cancelled)) => Err(OutputCancelled),
+        Some(Err(_)) | None => Ok(ask_fallback_insertion(copy_to_clipboard())),
+    }
 }
 
 pub(crate) const CLIPBOARD_NOT_RESTORED: &str =
@@ -3538,6 +3628,284 @@ mod tests {
         assert_eq!(
             edit_insertion_outcome(Err::<InsertResult, _>("replace"), || Err("clipboard")),
             None
+        );
+    }
+
+    /// Speak to edit and Ask deliver their output after `stop_recording_for`
+    /// claimed Processing.
+    fn processing_after_recording(lifecycle: &PipelineLifecycle, mode: PipelineMode) -> u64 {
+        let id = lifecycle.begin_start(mode).unwrap();
+        lifecycle.mark_recording(id).unwrap();
+        lifecycle.begin_processing().unwrap();
+        id
+    }
+
+    #[test]
+    fn only_an_output_step_that_did_not_run_can_end_cancelled() {
+        assert_eq!(
+            committed_output(Ok(Ok("selection")), || -> bool {
+                panic!("a step that ran is committed")
+            }),
+            CommittedOutput::Ran("selection")
+        );
+        assert_eq!(
+            committed_output::<&str>(Ok(Err(OutputCancelled)), || false),
+            CommittedOutput::Cancelled
+        );
+        assert_eq!(
+            committed_output::<&str>(Err("pipeline operation was cancelled"), || true),
+            CommittedOutput::Cancelled
+        );
+        assert_eq!(
+            committed_output::<&str>(Err("pipeline operation was cancelled"), || false),
+            CommittedOutput::Refused("pipeline operation was cancelled")
+        );
+    }
+
+    #[test]
+    fn an_edit_cancelled_before_its_replacement_neither_pastes_nor_copies() {
+        let lifecycle = PipelineLifecycle::default();
+        let id = processing_after_recording(&lifecycle, PipelineMode::Edit);
+        assert_eq!(
+            lifecycle.cancel().unwrap(),
+            Some((id, PipelinePhase::Processing))
+        );
+        assert_eq!(
+            commit_edit_replacement(
+                &lifecycle,
+                id,
+                || panic!("a cancelled edit must not paste"),
+                || panic!("a cancelled edit must not copy"),
+            ),
+            CommittedOutput::Cancelled
+        );
+    }
+
+    #[test]
+    fn a_committed_edit_keeps_its_outcome_after_a_later_cancel() {
+        use injection::InjectionError;
+        // (replacement, fallback copy, committed outcome)
+        let cases = [
+            (
+                Ok(InsertResult::ClipboardPaste),
+                Ok(()),
+                (
+                    Some(InsertResult::ClipboardPaste),
+                    InsertionDetail::ClipboardUnavailable,
+                ),
+            ),
+            (
+                Ok(InsertResult::PasteUnverified),
+                Ok(()),
+                (
+                    Some(InsertResult::PasteUnverified),
+                    InsertionDetail::ClipboardUnavailable,
+                ),
+            ),
+            (
+                Err(InjectionError::ClipboardUnavailable),
+                Ok(()),
+                (
+                    Some(InsertResult::ClipboardOnly),
+                    InsertionDetail::ClipboardUnavailable,
+                ),
+            ),
+            (
+                Err(InjectionError::ClipboardProtected),
+                Err(InjectionError::ClipboardProtected),
+                (None, InsertionDetail::ClipboardProtected),
+            ),
+        ];
+        for (replaced, copied, outcome) in cases {
+            let lifecycle = PipelineLifecycle::default();
+            let id = processing_after_recording(&lifecycle, PipelineMode::Edit);
+            let mut copy_attempted = false;
+            let committed = commit_edit_replacement(
+                &lifecycle,
+                id,
+                || replaced.clone(),
+                || {
+                    copy_attempted = true;
+                    copied
+                },
+            );
+            assert_eq!(committed, CommittedOutput::Ran(outcome));
+            // Only a failure before any paste falls back to the clipboard.
+            assert_eq!(copy_attempted, replaced.is_err());
+            // The edit completes: a later cancel changes nothing.
+            assert_eq!(lifecycle.cancel().unwrap(), None);
+            assert!(!lifecycle.is_cancelled(id));
+        }
+    }
+
+    #[test]
+    fn an_ask_insertion_copies_only_after_a_failure_before_any_paste() {
+        use injection::InjectionError;
+        let no_copy =
+            || -> Result<(), InjectionError> { panic!("a paste result or a cancel must not copy") };
+        for pasted in ["selection", "caret"] {
+            assert_eq!(
+                ask_insertion(Some(Ok(InsertResult::ClipboardPaste)), pasted, no_copy),
+                Ok(pasted)
+            );
+        }
+        assert_eq!(
+            ask_insertion(Some(Ok(InsertResult::ClipboardOnly)), "caret", no_copy),
+            Ok("clipboard_only")
+        );
+        assert_eq!(
+            ask_insertion(
+                Some(Ok(InsertResult::PasteUnverified)),
+                "selection",
+                no_copy
+            ),
+            Ok("paste_unverified")
+        );
+        assert_eq!(
+            ask_insertion(Some(Err(InjectionError::Cancelled)), "selection", no_copy),
+            Err(OutputCancelled)
+        );
+        for inserted in [None, Some(Err(InjectionError::TargetChanged))] {
+            assert_eq!(
+                ask_insertion(inserted.clone(), "selection", || Ok(())),
+                Ok("clipboard_only")
+            );
+            assert_eq!(
+                ask_insertion(inserted.clone(), "caret", || {
+                    Err(InjectionError::ClipboardProtected)
+                }),
+                Ok("clipboard_protected")
+            );
+            assert_eq!(
+                ask_insertion(inserted, "caret", || Err(
+                    InjectionError::ClipboardUnavailable
+                )),
+                Ok("insertion_failed")
+            );
+        }
+    }
+
+    #[test]
+    fn an_ask_cancelled_before_its_output_neither_pastes_nor_copies() {
+        let lifecycle = PipelineLifecycle::default();
+        let id = processing_after_recording(&lifecycle, PipelineMode::Ask);
+        lifecycle.cancel().unwrap();
+        let mut delivered = false;
+        assert_eq!(
+            commit_ask_output(&lifecycle, id, || {
+                delivered = true;
+                Ok("clipboard_only")
+            }),
+            Err("ask was cancelled".to_string())
+        );
+        assert!(!delivered);
+        assert!(lifecycle.is_cancelled(id));
+    }
+
+    #[test]
+    fn an_ask_output_that_saw_a_cancel_stays_cancellable() {
+        let lifecycle = PipelineLifecycle::default();
+        let id = processing_after_recording(&lifecycle, PipelineMode::Ask);
+        assert_eq!(
+            commit_ask_output(&lifecycle, id, || Err(OutputCancelled)),
+            Err("ask was cancelled".to_string())
+        );
+        assert_eq!(
+            lifecycle.cancel().unwrap(),
+            Some((id, PipelinePhase::Processing))
+        );
+    }
+
+    #[test]
+    fn a_refused_ask_output_that_was_not_cancelled_reports_an_incomplete_operation() {
+        let lifecycle = PipelineLifecycle::default();
+        let id = processing_after_recording(&lifecycle, PipelineMode::Ask);
+        assert_eq!(
+            commit_ask_output(&lifecycle, id, || Ok("selection")),
+            Ok("selection")
+        );
+        // The operation is already committed, so a second output is refused.
+        assert_eq!(
+            commit_ask_output(
+                &lifecycle,
+                id,
+                || -> Result<&'static str, OutputCancelled> {
+                    panic!("a refused output must not run")
+                }
+            ),
+            Err(crate::state::OPERATION_INCOMPLETE.to_string())
+        );
+    }
+
+    #[test]
+    fn a_cancel_during_an_ask_paste_waits_and_the_ask_completes() {
+        use std::sync::{mpsc, Arc};
+        let lifecycle = Arc::new(PipelineLifecycle::default());
+        let id = processing_after_recording(&lifecycle, PipelineMode::Ask);
+        let cancel = lifecycle.cancellation(id).unwrap();
+        let (pasting, wait_pasting) = mpsc::channel();
+        let (release, wait_release) = mpsc::channel::<()>();
+        let inserter = {
+            let lifecycle = lifecycle.clone();
+            std::thread::spawn(move || {
+                commit_ask_output(&lifecycle, id, || {
+                    // The paste is queued and still being verified.
+                    pasting.send(()).unwrap();
+                    wait_release.recv().unwrap();
+                    ask_insertion(
+                        Some(Ok(InsertResult::PasteUnverified)),
+                        "selection",
+                        || -> Result<(), injection::InjectionError> {
+                            panic!("a queued paste is never followed by a copy")
+                        },
+                    )
+                })
+            })
+        };
+        wait_pasting.recv().unwrap();
+        let canceller = {
+            let lifecycle = lifecycle.clone();
+            std::thread::spawn(move || lifecycle.cancel().unwrap())
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!canceller.is_finished(), "a cancel must wait for the paste");
+        release.send(()).unwrap();
+        assert_eq!(inserter.join().unwrap(), Ok("paste_unverified"));
+        assert_eq!(canceller.join().unwrap(), None);
+        // `finish_ask` therefore saves History and publishes completion.
+        assert!(!*cancel.borrow());
+        assert!(!lifecycle.is_cancelled(id));
+    }
+
+    #[test]
+    fn an_ask_clarification_cancelled_before_its_copy_does_not_copy() {
+        let lifecycle = PipelineLifecycle::default();
+        let id = processing_after_recording(&lifecycle, PipelineMode::Ask);
+        lifecycle.cancel().unwrap();
+        assert_eq!(
+            commit_ask_copy(&lifecycle, id, || panic!("a cancelled Ask must not copy")),
+            Err("ask was cancelled".to_string())
+        );
+    }
+
+    #[test]
+    fn an_ask_clarification_copy_commits_and_a_failed_copy_stays_cancellable() {
+        use injection::InjectionError;
+        let lifecycle = PipelineLifecycle::default();
+        let id = processing_after_recording(&lifecycle, PipelineMode::Ask);
+        assert_eq!(commit_ask_copy(&lifecycle, id, || Ok(())), Ok(()));
+        assert_eq!(lifecycle.cancel().unwrap(), None);
+        assert!(!lifecycle.is_cancelled(id));
+
+        let lifecycle = PipelineLifecycle::default();
+        let id = processing_after_recording(&lifecycle, PipelineMode::Ask);
+        assert_eq!(
+            commit_ask_copy(&lifecycle, id, || Err(InjectionError::ClipboardUnavailable)),
+            Err(command_error(InjectionError::ClipboardUnavailable))
+        );
+        assert_eq!(
+            lifecycle.cancel().unwrap(),
+            Some((id, PipelinePhase::Processing))
         );
     }
 
