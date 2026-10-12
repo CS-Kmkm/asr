@@ -108,7 +108,9 @@ fn failed_take_history_item<'a>(
         PipelineMode::Dictate => ("faithful", None, None, app_category),
         PipelineMode::Translate => ("translate", None, Some(target_language?), app_category),
         PipelineMode::Edit => ("edit", Some(edit_source?), None, None),
-        PipelineMode::Ask => return None,
+        // Ask chooses its action from the transcript, and a selected-text
+        // translation has no recording to retry.
+        PipelineMode::Ask | PipelineMode::SelectedText => return None,
     };
     Some(NewHistoryItem {
         transcript_text: "",
@@ -203,6 +205,10 @@ fn cancellation_copy(mode: PipelineMode) -> (&'static str, &'static str) {
         PipelineMode::Translate => ("Translation cancelled.", "translation was cancelled"),
         PipelineMode::Edit => ("Editing cancelled.", "editing was cancelled"),
         PipelineMode::Ask => ("Ask cancelled.", "ask was cancelled"),
+        PipelineMode::SelectedText => (
+            SELECTED_TEXT_TRANSLATION_CANCELLED,
+            "selected-text translation was cancelled",
+        ),
     }
 }
 
@@ -735,11 +741,7 @@ async fn start_recording_mode(
     if services.lifecycle.phase() == PipelinePhase::Idle {
         recording_overlay::anchor_to_foreground();
     }
-    let claimed = if services.translation_active.load(Ordering::Acquire) {
-        Err("selected-text translation is already active")
-    } else {
-        MODEL_CHANGE_GATE.begin_pipeline(|| services.lifecycle.begin_start(mode))
-    };
+    let claimed = MODEL_CHANGE_GATE.begin_pipeline(|| services.lifecycle.begin_start(mode));
     let operation_id = match claimed {
         Ok(id) => id,
         Err(error) => {
@@ -791,6 +793,29 @@ async fn start_recording_mode(
     result
 }
 
+/// The saved hotkeys of a recording mode; `None` for selected-text
+/// translation, which records nothing.
+fn voice_mode_shortcuts(settings: &Settings, mode: PipelineMode) -> Option<&Vec<String>> {
+    match mode {
+        PipelineMode::Dictate => Some(&settings.shortcuts.dictate),
+        PipelineMode::Translate => Some(&settings.shortcuts.translate),
+        PipelineMode::Edit => Some(&settings.shortcuts.edit),
+        PipelineMode::Ask => Some(&settings.shortcuts.ask),
+        PipelineMode::SelectedText => None,
+    }
+}
+
+/// The `mode` of the overlay's `voice-mode` event.
+fn voice_mode_event_name(mode: PipelineMode) -> &'static str {
+    match mode {
+        PipelineMode::Dictate => "dictate",
+        PipelineMode::Translate => "translate",
+        PipelineMode::Edit => "edit",
+        PipelineMode::Ask => "ask",
+        PipelineMode::SelectedText => SELECTED_TEXT_HISTORY_MODE,
+    }
+}
+
 /// The part of a start that runs while it owns the lifecycle as Starting.
 #[allow(clippy::too_many_arguments)]
 async fn start_owned_recording(
@@ -804,22 +829,12 @@ async fn start_owned_recording(
     operation_id: u64,
 ) -> Result<(), String> {
     let (cancel_message, cancel_error) = cancellation_copy(mode);
-    if services.translation_active.load(Ordering::Acquire) {
-        return Err("selected-text translation is already active".into());
-    }
     let settings = storage.get_settings().map_err(command_error)?;
-    let active_hotkey = trigger_chord.as_deref().unwrap_or_else(|| match mode {
-        PipelineMode::Dictate => &settings.shortcuts.dictate[0],
-        PipelineMode::Translate => &settings.shortcuts.translate[0],
-        PipelineMode::Edit => &settings.shortcuts.edit[0],
-        PipelineMode::Ask => &settings.shortcuts.ask[0],
-    });
-    let mode_shortcuts = match mode {
-        PipelineMode::Dictate => &settings.shortcuts.dictate,
-        PipelineMode::Translate => &settings.shortcuts.translate,
-        PipelineMode::Edit => &settings.shortcuts.edit,
-        PipelineMode::Ask => &settings.shortcuts.ask,
-    };
+    let mode_shortcuts =
+        voice_mode_shortcuts(&settings, mode).ok_or("selected-text translation does not record")?;
+    let active_hotkey = trigger_chord
+        .as_deref()
+        .unwrap_or_else(|| mode_shortcuts[0].as_str());
     let mut edit_session = (mode == PipelineMode::Edit)
         .then(|| EditSession::new(&settings, active_hotkey, from_shortcut))
         .transpose()?;
@@ -970,12 +985,7 @@ async fn start_owned_recording(
     let _ = app.emit(
         "voice-mode",
         serde_json::json!({
-            "mode": match mode {
-                PipelineMode::Dictate => "dictate",
-                PipelineMode::Translate => "translate",
-                PipelineMode::Edit => "edit",
-                PipelineMode::Ask => "ask",
-            },
+            "mode": voice_mode_event_name(mode),
             "targetLanguage": target_language,
         }),
     );
@@ -1063,7 +1073,9 @@ fn recording_message(mode: PipelineMode, microphone_fell_back: bool) -> &'static
         PipelineMode::Edit => "Recording an edit instruction.",
         PipelineMode::Ask => "Recording an Ask instruction.",
         PipelineMode::Dictate if microphone_fell_back => "Recording from the default microphone.",
-        PipelineMode::Dictate => "Recording from the selected microphone.",
+        PipelineMode::Dictate | PipelineMode::SelectedText => {
+            "Recording from the selected microphone."
+        }
     }
 }
 
@@ -2273,6 +2285,397 @@ pub(crate) const CLIPBOARD_NOT_RESTORED: &str =
 /// selected-text translation, cancellation). Restore clipboard was on.
 pub(crate) fn report_clipboard_not_restored(app: &AppHandle) {
     emit_status(app, "clipboard_not_restored", CLIPBOARD_NOT_RESTORED);
+}
+
+/// `mode` of a selected-text translation's History row (and of its overlay
+/// `voice-mode` event).
+const SELECTED_TEXT_HISTORY_MODE: &str = "selected_translate";
+
+/// `asr_provider` of a History row that involved no speech recognition.
+const NO_ASR_PROVIDER: &str = "none";
+
+/// Metric event recorded once per selected-text translation run.
+const SELECTED_TEXT_METRIC: &str = "selected_text_translation";
+
+/// The Processing message while the selection is translated.
+const SELECTED_TEXT_TRANSLATING: &str = "Translating the selected text.";
+
+/// The Injecting message while the translation replaces the selection.
+const SELECTED_TEXT_REPLACING: &str = "Replacing the original selection.";
+
+const SELECTED_TEXT_TRANSLATION_CANCELLED: &str = "Selected-text translation cancelled.";
+
+const TRANSLATION_KEPT_IN_APP: &str =
+    "The translation could not be inserted or copied to the clipboard; it is available in this app.";
+
+const TRANSLATION_FAILED_SELECTION_UNCHANGED: &str =
+    "Translation failed; the selected text was not changed.";
+
+/// Why a selected-text translation ended without a translation. Each has a
+/// fixed, localized sentence (shown as the overlay's failure notice) and a
+/// fixed metric code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectedTextFailure {
+    SettingsUnavailable,
+    NoSelection,
+    MonitorUnavailable,
+    TranslationFailed,
+    /// The lifecycle refused the replacement without a cancellation.
+    Incomplete,
+}
+
+impl SelectedTextFailure {
+    fn message(self) -> &'static str {
+        match self {
+            Self::SettingsUnavailable => "Translation settings are unavailable.",
+            Self::NoSelection => "Select text in a supported foreground edit control.",
+            Self::MonitorUnavailable => "Translation could not monitor the target safely.",
+            // The selection is unchanged, so there is nothing to recover and
+            // no reason to overwrite the user's clipboard with its source.
+            Self::TranslationFailed => TRANSLATION_FAILED_SELECTION_UNCHANGED,
+            Self::Incomplete => crate::state::OPERATION_INCOMPLETE,
+        }
+    }
+
+    fn metric_code(self) -> &'static str {
+        match self {
+            Self::SettingsUnavailable => "settings_unavailable",
+            Self::NoSelection => "no_selection",
+            Self::MonitorUnavailable => "monitor_unavailable",
+            Self::TranslationFailed => "translation_failed",
+            Self::Incomplete => "operation_incomplete",
+        }
+    }
+}
+
+/// How a selected-text translation ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectedTextEnd {
+    /// A translation was produced. `None`: it reached neither the target nor
+    /// the clipboard and is kept in this app.
+    Delivered(Option<InsertResult>),
+    Failed(SelectedTextFailure),
+    Cancelled,
+}
+
+/// The terminal phase and message a selected-text translation publishes.
+/// The overlay shows Error as a failure notice and hides on Completed/Idle.
+fn selected_text_terminal(end: SelectedTextEnd) -> (AppPhase, &'static str) {
+    match end {
+        SelectedTextEnd::Delivered(Some(result)) => {
+            (AppPhase::Completed, selection_translation_status(result).1)
+        }
+        SelectedTextEnd::Delivered(None) => (AppPhase::Error, TRANSLATION_KEPT_IN_APP),
+        SelectedTextEnd::Failed(failure) => (AppPhase::Error, failure.message()),
+        SelectedTextEnd::Cancelled => (AppPhase::Idle, SELECTED_TEXT_TRANSLATION_CANCELLED),
+    }
+}
+
+/// `insertion_result` of a selected-text translation, with the same codes
+/// as Speak to edit's replacement.
+fn selected_text_insertion_label(insertion: Option<InsertResult>) -> &'static str {
+    match insertion {
+        Some(InsertResult::ClipboardPaste) => "clipboard_paste",
+        Some(InsertResult::ClipboardOnly) => "clipboard_only",
+        Some(InsertResult::PasteUnverified) => "paste_unverified",
+        None => "insertion_failed",
+    }
+}
+
+/// The metric `(success, error_code)` of a run that was not cancelled. Like
+/// the voice modes' insertion metric, only a confirmed replacement succeeds;
+/// any other end records its outcome or failure code. A cancelled run
+/// records no metric, as in the other modes.
+fn selected_text_metric(end: SelectedTextEnd) -> Option<(bool, Option<&'static str>)> {
+    match end {
+        SelectedTextEnd::Delivered(Some(InsertResult::ClipboardPaste)) => Some((true, None)),
+        SelectedTextEnd::Delivered(insertion) => {
+            Some((false, Some(selected_text_insertion_label(insertion))))
+        }
+        SelectedTextEnd::Failed(failure) => Some((false, Some(failure.metric_code()))),
+        SelectedTextEnd::Cancelled => None,
+    }
+}
+
+/// The History row of a produced translation: the selection is the source,
+/// the translation the processed text. There is no speech, transcript,
+/// recording, or duration, so Retry is never offered for it.
+#[allow(clippy::too_many_arguments)]
+fn selected_text_history_item<'a>(
+    source_text: &'a str,
+    translation: &'a str,
+    llm_provider: &'a str,
+    target_language: &'a str,
+    app_category: Option<&'a str>,
+    latency_ms: u64,
+    insertion_result: &'a str,
+    insertion_detail: Option<&'a str>,
+) -> NewHistoryItem<'a> {
+    NewHistoryItem {
+        transcript_text: "",
+        processed_text: Some(translation),
+        source_text: Some(source_text),
+        instruction_text: None,
+        action_kind: None,
+        search_site: None,
+        mode: SELECTED_TEXT_HISTORY_MODE,
+        asr_provider: NO_ASR_PROVIDER,
+        llm_provider: Some(llm_provider),
+        target_language: Some(target_language),
+        app_category,
+        duration_ms: None,
+        latency_ms: Some(latency_ms as i64),
+        retry_of_id: None,
+        insertion_result: Some(insertion_result),
+        insertion_detail,
+    }
+}
+
+/// Status kind and message for a selected-text translation outcome. A paste
+/// that was sent but not confirmed may already have replaced the selection,
+/// so it must not read as a target change that invites a second paste.
+fn selection_translation_status(result: InsertResult) -> (&'static str, &'static str) {
+    match result {
+        InsertResult::ClipboardPaste => ("success", "Translation inserted."),
+        InsertResult::PasteUnverified => (
+            "paste_unverified",
+            "Translation pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard).",
+        ),
+        InsertResult::ClipboardOnly => (
+            "error",
+            "The target changed; the translation remains on the clipboard.",
+        ),
+    }
+}
+
+/// Ctrl+Shift+T: translates the selection in the foreground app and replaces
+/// it. It owns the lifecycle as a non-recording operation, so voice modes
+/// and this translation exclude each other, and Esc, the overlay's cancel
+/// button, and `cancel_recording` cancel it. A press while another operation
+/// runs is ignored.
+pub(crate) async fn translate_selection(app: AppHandle) {
+    let services = app.state::<Services>();
+    let state = app.state::<AppState>();
+    let storage = app.state::<Storage>();
+    // Until the selection is captured, the overlay follows the window the
+    // user is working in. Never move a running session's overlay.
+    if services.lifecycle.phase() == PipelinePhase::Idle {
+        recording_overlay::anchor_to_foreground();
+    }
+    let claimed = MODEL_CHANGE_GATE.begin_pipeline(|| {
+        services
+            .lifecycle
+            .begin_non_recording(PipelineMode::SelectedText)
+    });
+    let (operation_id, cancel) = match claimed {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            // As for a voice start, only a press that finds the overlay idle
+            // (a speech model change) reports why; otherwise it is ignored.
+            if services.lifecycle.phase() == PipelinePhase::Idle {
+                recording_overlay::show_message_notice(
+                    &app,
+                    recording_overlay::NoticeSeverity::Failure,
+                    error,
+                );
+                emit_status(&app, "error", error);
+            }
+            return;
+        }
+    };
+    let _guard = PipelineGuard {
+        lifecycle: &services.lifecycle,
+        id: operation_id,
+    };
+    // Declared after `_guard`: no exit (a panic included) leaves a busy phase.
+    let _phase_guard = crate::state::TerminalPhaseGuard::new(
+        &state,
+        &services.lifecycle,
+        operation_id,
+        SELECTED_TEXT_TRANSLATION_CANCELLED,
+        |phase, message| emit_state(&app, &state, phase, message),
+    );
+    let started = Instant::now();
+    let mut provider = None;
+    let end = run_selected_text_translation(
+        &app,
+        &services,
+        &state,
+        &storage,
+        operation_id,
+        cancel,
+        started,
+        &mut provider,
+    )
+    .await;
+    if let Some((success, error_code)) = selected_text_metric(end) {
+        let _ = storage.add_metric(
+            SELECTED_TEXT_METRIC,
+            provider.as_deref(),
+            Some(started.elapsed().as_millis() as i64),
+            success,
+            error_code,
+        );
+    }
+    // A delivered translation already published its outcome.
+    if !matches!(end, SelectedTextEnd::Delivered(_)) {
+        let (phase, message) = selected_text_terminal(end);
+        emit_state(&app, &state, phase, message);
+    }
+}
+
+/// The owned part of `translate_selection`. The caller publishes every end
+/// except a delivered translation, which publishes its own outcome.
+#[allow(clippy::too_many_arguments)]
+async fn run_selected_text_translation(
+    app: &AppHandle,
+    services: &Services,
+    state: &AppState,
+    storage: &Storage,
+    operation_id: u64,
+    cancel: tokio::sync::watch::Receiver<bool>,
+    started: Instant,
+    provider: &mut Option<String>,
+) -> SelectedTextEnd {
+    let Ok(settings) = storage.get_settings() else {
+        return SelectedTextEnd::Failed(SelectedTextFailure::SettingsUnavailable);
+    };
+    *provider = Some(settings.correction_provider.clone());
+    let mut injector = SystemTextInjector::new(InjectionOptions {
+        restore_clipboard: settings.clipboard_restore,
+    });
+    // A lost clipboard is reported on every exit unless the outcome below
+    // takes it first.
+    let app_for_loss = app.clone();
+    injector.report_clipboard_loss_on_drop(move || report_clipboard_not_restored(&app_for_loss));
+    let selection = injector.capture_selection();
+    if services.lifecycle.is_cancelled(operation_id) {
+        return SelectedTextEnd::Cancelled;
+    }
+    let Ok(selection) = selection else {
+        return SelectedTextEnd::Failed(SelectedTextFailure::NoSelection);
+    };
+    // The overlay appears on the monitor of the window that holds the text.
+    recording_overlay::set_anchor(selection.target().window_handle);
+    let source = selection.text().to_owned();
+    let app_context = app_context::from_target(selection.target());
+    let _ = app.emit(
+        "voice-mode",
+        serde_json::json!({
+            "mode": voice_mode_event_name(PipelineMode::SelectedText),
+            "targetLanguage": settings.translation_target_language,
+        }),
+    );
+    state.clear_result();
+    emit_state(app, state, AppPhase::Processing, SELECTED_TEXT_TRANSLATING);
+    let monitor = &services.input_monitor;
+    if !monitor.start() {
+        return SelectedTextEnd::Failed(SelectedTextFailure::MonitorUnavailable);
+    }
+    let Some(checkpoint) = monitor.checkpoint() else {
+        return SelectedTextEnd::Failed(SelectedTextFailure::MonitorUnavailable);
+    };
+    if services.lifecycle.is_cancelled(operation_id) {
+        return SelectedTextEnd::Cancelled;
+    }
+    let translated = match correction::translate_text(&settings, &source, cancel).await {
+        Ok(translated) => translated,
+        Err(_) if services.lifecycle.is_cancelled(operation_id) => {
+            return SelectedTextEnd::Cancelled
+        }
+        Err(correction::CorrectionError::Cancelled) => return SelectedTextEnd::Cancelled,
+        Err(_) => return SelectedTextEnd::Failed(SelectedTextFailure::TranslationFailed),
+    };
+    if services.lifecycle.is_cancelled(operation_id) {
+        return SelectedTextEnd::Cancelled;
+    }
+    emit_state(app, state, AppPhase::Injecting, SELECTED_TEXT_REPLACING);
+    // The replacement is the irreversible step. Running it inside the
+    // lifecycle's commit makes a cancel either win before anything is pasted
+    // or copied, or find the operation committed and do nothing. The
+    // lifecycle lock is held for the replacement, which its paste
+    // verification bounds to about a second; lifecycle readers (hotkeys,
+    // Esc) wait that long instead of racing the paste.
+    let committed = services.lifecycle.commit_side_effect(operation_id, || {
+        let replaced = injector.replace_selection(&selection, &translated, monitor, checkpoint);
+        // A replacement error happens before any paste, so the selection is
+        // unchanged and the clipboard is the fallback.
+        let failure_detail = if replaced == Err(injection::InjectionError::ClipboardProtected) {
+            InsertionDetail::ClipboardProtected
+        } else {
+            InsertionDetail::ClipboardUnavailable
+        };
+        let insertion =
+            edit_insertion_outcome(replaced, || injector.copy_to_clipboard(&translated));
+        Ok::<_, std::convert::Infallible>((insertion, failure_detail))
+    });
+    let (insertion, failure_detail) = match committed {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(never)) => match never {},
+        // Nothing was pasted or copied.
+        Err(_) if services.lifecycle.is_cancelled(operation_id) => {
+            return SelectedTextEnd::Cancelled
+        }
+        Err(_) => return SelectedTextEnd::Failed(SelectedTextFailure::Incomplete),
+    };
+    let clipboard_lost = injector.take_clipboard_not_restored();
+    let restore_detail =
+        insertion.and_then(|result| InsertionDetail::for_confirmed_paste(result, clipboard_lost));
+    // Insertion has returned; persistence is not insertion.
+    recording_overlay::set_phase(app, &AppPhase::Completed);
+    let insertion_label = selected_text_insertion_label(insertion);
+    let insertion_detail = insertion
+        .is_none()
+        .then_some(failure_detail)
+        .or(restore_detail)
+        .map(InsertionDetail::code);
+    let history_status = save_history(
+        storage,
+        &selected_text_history_item(
+            &source,
+            &translated,
+            settings.correction_provider.as_str(),
+            settings.translation_target_language.as_str(),
+            app_context::history_category(app_context.as_ref()),
+            started.elapsed().as_millis() as u64,
+            insertion_label,
+            insertion_detail,
+        ),
+        None,
+    );
+    let end = SelectedTextEnd::Delivered(insertion);
+    let (phase, message) = selected_text_terminal(end);
+    match insertion {
+        Some(result) => {
+            let snapshot = state.complete(translated, message.into());
+            let _ = app.emit("app-state", snapshot);
+            let (kind, message) = selection_translation_status(result);
+            emit_status(app, kind, message);
+            if result != InsertResult::ClipboardPaste || clipboard_lost {
+                recording_overlay::show_insertion_notice(
+                    app,
+                    injection::notice_outcome(insertion_label, clipboard_lost),
+                    None,
+                );
+            }
+        }
+        None => {
+            // Not inserted, and the clipboard was unavailable or protected
+            // under Restore clipboard: keep the translation in this app.
+            let _ = app.emit("app-state", state.publish_result(translated));
+            emit_state(app, state, phase, message);
+            recording_overlay::show_insertion_notice(
+                app,
+                injection::notice_outcome(insertion_label, clipboard_lost),
+                insertion_detail,
+            );
+        }
+    }
+    report_history_save_warning(app, history_status);
+    if clipboard_lost {
+        report_clipboard_not_restored(app);
+    }
+    end
 }
 
 /// Where an answer goes when it was neither inserted nor shown in the answer
@@ -3648,6 +4051,249 @@ mod tests {
         assert!(lifecycle.begin_start(PipelineMode::Translate).is_ok());
     }
 
+    #[tokio::test]
+    async fn a_selected_text_translation_cancel_is_left_to_its_owner() {
+        let lifecycle = PipelineLifecycle::default();
+        let (id, cancel) = MODEL_CHANGE_GATE
+            .begin_pipeline(|| lifecycle.begin_non_recording(PipelineMode::SelectedText))
+            .unwrap();
+        assert_eq!(lifecycle.mode(), Some(PipelineMode::SelectedText));
+        let result = cancel_pipeline_operation(
+            &lifecycle,
+            &test_audio(false),
+            &Mutex::new(None),
+            &Mutex::new(None),
+            &tokio::sync::Mutex::new(None),
+            &tokio::sync::Mutex::new(None),
+            &tokio::sync::Mutex::new(None),
+            || panic!("the translation publishes its own Idle phase"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Some(PipelinePhase::Processing));
+        // The request sees the cancel, the replacement is refused, and no
+        // voice mode starts until the owner finishes.
+        assert!(*cancel.borrow());
+        assert!(lifecycle.is_cancelled(id));
+        let mut replaced = false;
+        assert!(lifecycle
+            .commit_side_effect(id, || {
+                replaced = true;
+                Ok::<(), ()>(())
+            })
+            .is_err());
+        assert!(!replaced);
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_err());
+        lifecycle.finish(id);
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_ok());
+    }
+
+    #[test]
+    fn a_failed_translation_does_not_claim_the_clipboard() {
+        assert!(!TRANSLATION_FAILED_SELECTION_UNCHANGED.contains("clipboard"));
+        assert!(TRANSLATION_KEPT_IN_APP.contains("available in this app"));
+    }
+
+    #[test]
+    fn an_unverified_paste_is_not_reported_as_a_target_change() {
+        let (kind, message) = selection_translation_status(InsertResult::PasteUnverified);
+        assert_eq!(kind, "paste_unverified");
+        assert!(!message.contains("target changed"), "{message}");
+        assert!(message.contains("only if the text did not appear"));
+        assert_eq!(
+            selection_translation_status(InsertResult::ClipboardOnly).1,
+            "The target changed; the translation remains on the clipboard."
+        );
+        assert_eq!(
+            selection_translation_status(InsertResult::ClipboardPaste),
+            ("success", "Translation inserted.")
+        );
+    }
+
+    #[test]
+    fn selected_text_translation_ends_in_a_terminal_phase() {
+        for result in [
+            InsertResult::ClipboardPaste,
+            InsertResult::PasteUnverified,
+            InsertResult::ClipboardOnly,
+        ] {
+            assert_eq!(
+                selected_text_terminal(SelectedTextEnd::Delivered(Some(result))),
+                (AppPhase::Completed, selection_translation_status(result).1)
+            );
+        }
+        assert_eq!(
+            selected_text_terminal(SelectedTextEnd::Delivered(None)),
+            (AppPhase::Error, TRANSLATION_KEPT_IN_APP)
+        );
+        // Every failure is a fixed sentence the overlay shows as a notice.
+        for (failure, message) in [
+            (
+                SelectedTextFailure::SettingsUnavailable,
+                "Translation settings are unavailable.",
+            ),
+            (
+                SelectedTextFailure::NoSelection,
+                "Select text in a supported foreground edit control.",
+            ),
+            (
+                SelectedTextFailure::MonitorUnavailable,
+                "Translation could not monitor the target safely.",
+            ),
+            (
+                SelectedTextFailure::TranslationFailed,
+                TRANSLATION_FAILED_SELECTION_UNCHANGED,
+            ),
+            (
+                SelectedTextFailure::Incomplete,
+                crate::state::OPERATION_INCOMPLETE,
+            ),
+        ] {
+            let (phase, published) = selected_text_terminal(SelectedTextEnd::Failed(failure));
+            assert_eq!((phase.clone(), published), (AppPhase::Error, message));
+            assert_eq!(
+                recording_overlay::phase_view(&phase),
+                recording_overlay::PhaseView::Notice(recording_overlay::NoticeSeverity::Failure)
+            );
+        }
+        assert_eq!(
+            selected_text_terminal(SelectedTextEnd::Cancelled),
+            (AppPhase::Idle, SELECTED_TEXT_TRANSLATION_CANCELLED)
+        );
+        assert_eq!(
+            cancellation_copy(PipelineMode::SelectedText).0,
+            SELECTED_TEXT_TRANSLATION_CANCELLED
+        );
+        // An early exit after a cancel publishes the same Idle message.
+        assert_eq!(
+            crate::state::unfinished_exit_phase(
+                &AppPhase::Processing,
+                true,
+                cancellation_copy(PipelineMode::SelectedText).0
+            ),
+            Some((AppPhase::Idle, SELECTED_TEXT_TRANSLATION_CANCELLED))
+        );
+    }
+
+    #[test]
+    fn selected_text_translation_records_one_metric_unless_cancelled() {
+        assert_eq!(
+            selected_text_metric(SelectedTextEnd::Delivered(Some(
+                InsertResult::ClipboardPaste
+            ))),
+            Some((true, None))
+        );
+        assert_eq!(
+            selected_text_metric(SelectedTextEnd::Delivered(Some(
+                InsertResult::PasteUnverified
+            ))),
+            Some((false, Some("paste_unverified")))
+        );
+        assert_eq!(
+            selected_text_metric(SelectedTextEnd::Delivered(Some(
+                InsertResult::ClipboardOnly
+            ))),
+            Some((false, Some("clipboard_only")))
+        );
+        assert_eq!(
+            selected_text_metric(SelectedTextEnd::Delivered(None)),
+            Some((false, Some("insertion_failed")))
+        );
+        assert_eq!(
+            selected_text_metric(SelectedTextEnd::Failed(SelectedTextFailure::NoSelection)),
+            Some((false, Some("no_selection")))
+        );
+        assert_eq!(
+            selected_text_metric(SelectedTextEnd::Failed(
+                SelectedTextFailure::TranslationFailed
+            )),
+            Some((false, Some("translation_failed")))
+        );
+        assert_eq!(selected_text_metric(SelectedTextEnd::Cancelled), None);
+    }
+
+    #[test]
+    fn selected_text_history_rows_hold_the_selection_and_its_translation() {
+        let storage = Storage::in_memory().unwrap();
+        let item = selected_text_history_item(
+            "Guten Morgen",
+            "Good morning",
+            "openai",
+            "en",
+            Some("browser"),
+            1234,
+            selected_text_insertion_label(Some(InsertResult::ClipboardOnly)),
+            Some("user_activity"),
+        );
+        assert_eq!(
+            save_history(&storage, &item, None),
+            HistorySaveStatus::Complete
+        );
+        let row = storage
+            .list_history(types::HistoryFilter::Translate, 10)
+            .unwrap()
+            .remove(0);
+        assert_eq!(row.mode, "selected_translate");
+        assert_eq!(row.source_text.as_deref(), Some("Guten Morgen"));
+        assert_eq!(row.processed_text.as_deref(), Some("Good morning"));
+        assert_eq!(row.transcript_text, "");
+        assert_eq!(row.instruction_text, None);
+        assert_eq!(row.asr_provider, NO_ASR_PROVIDER);
+        assert_eq!(row.llm_provider.as_deref(), Some("openai"));
+        assert_eq!(row.target_language.as_deref(), Some("en"));
+        assert_eq!(row.app_category.as_deref(), Some("browser"));
+        assert_eq!(row.duration_ms, None);
+        assert_eq!(row.latency_ms, Some(1234));
+        assert_eq!(row.insertion_result.as_deref(), Some("clipboard_only"));
+        assert_eq!(row.insertion_detail.as_deref(), Some("user_activity"));
+        assert!(!row.has_audio);
+        // It has no recording, so Retry refuses it.
+        assert_eq!(
+            history_pipeline_mode(&row.mode),
+            Err("history mode is not retryable".to_string())
+        );
+        assert!(
+            failed_take_history_item(PipelineMode::SelectedText, "mock", None, None, None, 1)
+                .is_none()
+        );
+        assert_eq!(
+            selected_text_insertion_label(None),
+            "insertion_failed",
+            "the same code Speak to edit stores"
+        );
+    }
+
+    #[test]
+    fn selected_text_history_honours_history_off() {
+        let storage = Storage::in_memory().unwrap();
+        persist_settings(
+            &storage,
+            &Settings {
+                history_retention: types::HistoryRetention::Never,
+                ..Settings::default()
+            },
+        )
+        .unwrap();
+        let item = selected_text_history_item(
+            "source",
+            "translation",
+            "local",
+            "ja",
+            None,
+            1,
+            "clipboard_paste",
+            None,
+        );
+        assert_eq!(
+            save_history(&storage, &item, None),
+            HistorySaveStatus::Complete
+        );
+        assert!(storage
+            .list_history(types::HistoryFilter::All, 10)
+            .unwrap()
+            .is_empty());
+    }
+
     #[test]
     fn only_recordings_fall_back_to_the_default_microphone() {
         let settings = Settings {
@@ -3685,6 +4331,20 @@ mod tests {
         }
         assert!(!MICROPHONE_FALLBACK_HINT.is_empty());
         assert!(MICROPHONE_FALLBACK_STATUS.contains("was not changed"));
+    }
+
+    #[test]
+    fn selected_text_translation_has_no_recording_shortcuts() {
+        let settings = Settings::default();
+        assert!(voice_mode_shortcuts(&settings, PipelineMode::SelectedText).is_none());
+        assert_eq!(
+            voice_mode_shortcuts(&settings, PipelineMode::Ask),
+            Some(&settings.shortcuts.ask)
+        );
+        assert_eq!(
+            voice_mode_event_name(PipelineMode::SelectedText),
+            SELECTED_TEXT_HISTORY_MODE
+        );
     }
 
     #[tokio::test]
@@ -4128,7 +4788,7 @@ mod tests {
         wait_marked.recv().unwrap();
         let started = Instant::now();
         assert_eq!(
-            gate.begin_pipeline(|| lifecycle.begin_retry(PipelineMode::Dictate))
+            gate.begin_pipeline(|| lifecycle.begin_non_recording(PipelineMode::Dictate))
                 .map(|(id, _)| id),
             Err(MODEL_CHANGE_IN_PROGRESS)
         );
@@ -4138,7 +4798,7 @@ mod tests {
         updater.join().unwrap();
         // The guard cleared the mark when the update finished.
         assert!(gate
-            .begin_pipeline(|| lifecycle.begin_retry(PipelineMode::Dictate))
+            .begin_pipeline(|| lifecycle.begin_non_recording(PipelineMode::Dictate))
             .is_ok());
     }
 
@@ -5042,7 +5702,7 @@ pub(crate) async fn retry_history_item(
         .ok_or_else(|| "history item not found".to_string())?;
     let mode = history_pipeline_mode(&source.mode)?;
     let (operation_id, cancel) = MODEL_CHANGE_GATE
-        .begin_pipeline(|| services.lifecycle.begin_retry(mode))
+        .begin_pipeline(|| services.lifecycle.begin_non_recording(mode))
         .map_err(str::to_string)?;
     let _guard = PipelineGuard {
         lifecycle: &services.lifecycle,

@@ -21,6 +21,7 @@ const modeLabels = {
   translate: "Voice Translate",
   edit: "Edit",
   ask: "Ask Anything",
+  selected_translate: "Selected-text translation",
 } as const;
 
 export function HistoryPage({ settings, settingsLoaded, history, filter, onSave, onFilter, onCopyItem, onRetry, onDelete, onDeleteAll, onLoadAudio, onAudioError, retryActive, onCancelRetry }: {

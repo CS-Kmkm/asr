@@ -116,7 +116,8 @@ interface CorrectionPreview {
 }
 
 interface VoiceModeEvent {
-  mode: "dictate" | "translate" | "edit" | "ask";
+  // "selected_translate" is the selected-text translation, which has no recording.
+  mode: "dictate" | "translate" | "edit" | "ask" | "selected_translate";
   targetLanguage: string | null;
 }
 
@@ -131,6 +132,9 @@ const INSERTION_NOTICE_MS = 5_000;
 
 // The Processing message of a hotkey start that waits for the speech model.
 const PREPARING_SPEECH_MODEL = "Preparing the speech model. Recording starts when it is ready.";
+
+// The Processing message of a selected-text translation.
+const TRANSLATING_SELECTED_TEXT = "Translating the selected text.";
 
 // A failure or warning sentence from the backend, shown while the main
 // window may be hidden. The backend chooses how long it stays up.
@@ -311,6 +315,7 @@ function RecordingOverlay() {
         } else if (
           payload.phase === "processing" &&
           (payload.message === PREPARING_SPEECH_MODEL ||
+            payload.message === TRANSLATING_SELECTED_TEXT ||
             payload.message?.startsWith("Stopping") ||
             payload.message?.startsWith("Transcribing"))
         ) {
@@ -436,6 +441,8 @@ function RecordingOverlay() {
   const preparing = message === PREPARING_SPEECH_MODEL;
   const label = preparing
     ? t("Preparing speech model")
+    : voiceMode.mode === "selected_translate"
+    ? t("Selected-text translation")
     : voiceMode.mode === "ask"
     ? t("Ask Anything")
     : voiceMode.mode === "edit"

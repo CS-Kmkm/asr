@@ -1567,7 +1567,7 @@ impl Storage {
              FROM dictation_history
              WHERE (NOT ?3 OR expires_at IS NOT NULL) AND (?1 = 'all' OR
                (?1 = 'dictate' AND mode IN ('faithful', 'ai_corrected', 'faithful_fallback')) OR
-               (?1 = 'translate' AND mode = 'translate') OR
+               (?1 = 'translate' AND mode IN ('translate', 'selected_translate')) OR
                (?1 = 'edit' AND mode = 'edit') OR
                (?1 = 'ask' AND mode = 'ask'))
              ORDER BY created_at DESC LIMIT ?2",
@@ -3378,6 +3378,34 @@ mod tests {
             .remove(0);
         assert_eq!(stored.mode, "translate");
         assert_eq!(stored.target_language.as_deref(), Some("ja"));
+    }
+
+    #[test]
+    fn the_translate_filter_lists_voice_and_selected_text_translations() {
+        let storage = Storage::in_memory().unwrap();
+        for mode in ["faithful", "translate", "selected_translate", "edit", "ask"] {
+            let mut row = item();
+            row.mode = mode;
+            storage.add_history(&row).unwrap();
+        }
+        let modes = |filter| {
+            let mut modes: Vec<String> = storage
+                .list_history(filter, 10)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.mode)
+                .collect();
+            modes.sort();
+            modes
+        };
+        assert_eq!(
+            modes(HistoryFilter::Translate),
+            ["selected_translate", "translate"]
+        );
+        assert_eq!(modes(HistoryFilter::Dictate), ["faithful"]);
+        assert_eq!(modes(HistoryFilter::Edit), ["edit"]);
+        assert_eq!(modes(HistoryFilter::Ask), ["ask"]);
+        assert_eq!(modes(HistoryFilter::All).len(), 5);
     }
 
     #[test]

@@ -19,6 +19,8 @@ pub enum PipelineMode {
     Translate,
     Edit,
     Ask,
+    /// Selected-text translation: no recording, it begins in Processing.
+    SelectedText,
 }
 
 struct PipelineOperation {
@@ -69,7 +71,11 @@ impl PipelineLifecycle {
         });
     }
 
-    pub fn begin_retry(
+    /// Claims the lifecycle for an operation that records nothing (a History
+    /// Retry or a selected-text translation): it begins in Processing, so a
+    /// voice start is refused and a cancel is left to this owner, which
+    /// publishes the terminal phase and calls `finish`.
+    pub fn begin_non_recording(
         &self,
         mode: PipelineMode,
     ) -> Result<(u64, watch::Receiver<bool>), &'static str> {
@@ -610,7 +616,7 @@ mod tests {
     #[test]
     fn retry_claims_processing_and_releases_after_cancellation() {
         let lifecycle = PipelineLifecycle::default();
-        let (id, cancel) = lifecycle.begin_retry(PipelineMode::Ask).unwrap();
+        let (id, cancel) = lifecycle.begin_non_recording(PipelineMode::Ask).unwrap();
         assert_eq!(lifecycle.phase(), PipelinePhase::Processing);
         assert!(lifecycle.begin_start(PipelineMode::Dictate).is_err());
         assert_eq!(
@@ -623,9 +629,90 @@ mod tests {
     }
 
     #[test]
+    fn selected_text_translation_and_voice_modes_exclude_each_other() {
+        let lifecycle = PipelineLifecycle::default();
+        let (id, cancel) = lifecycle
+            .begin_non_recording(PipelineMode::SelectedText)
+            .unwrap();
+        assert_eq!(lifecycle.phase(), PipelinePhase::Processing);
+        assert_eq!(lifecycle.mode(), Some(PipelineMode::SelectedText));
+        for mode in [
+            PipelineMode::Dictate,
+            PipelineMode::Translate,
+            PipelineMode::Edit,
+            PipelineMode::Ask,
+        ] {
+            assert!(lifecycle.begin_start(mode).is_err());
+        }
+        assert!(lifecycle
+            .begin_non_recording(PipelineMode::SelectedText)
+            .is_err());
+        // It records nothing, so a stop cannot claim it.
+        assert!(lifecycle.begin_processing().is_err());
+        assert!(!*cancel.borrow());
+        lifecycle.finish(id);
+
+        let voice = lifecycle.begin_start(PipelineMode::Dictate).unwrap();
+        assert!(lifecycle
+            .begin_non_recording(PipelineMode::SelectedText)
+            .is_err());
+        lifecycle.mark_recording(voice).unwrap();
+        assert!(lifecycle
+            .begin_non_recording(PipelineMode::SelectedText)
+            .is_err());
+        lifecycle.finish(voice);
+        assert!(lifecycle
+            .begin_non_recording(PipelineMode::SelectedText)
+            .is_ok());
+    }
+
+    #[test]
+    fn a_cancelled_selected_text_translation_cannot_replace_the_selection() {
+        let lifecycle = PipelineLifecycle::default();
+        let (id, cancel) = lifecycle
+            .begin_non_recording(PipelineMode::SelectedText)
+            .unwrap();
+        assert_eq!(
+            lifecycle.cancel().unwrap(),
+            Some((id, PipelinePhase::Processing))
+        );
+        assert!(*cancel.borrow());
+        assert!(lifecycle.is_cancelled(id));
+        let mut replaced = false;
+        assert!(lifecycle
+            .commit_side_effect(id, || {
+                replaced = true;
+                Ok::<(), ()>(())
+            })
+            .is_err());
+        assert!(!replaced);
+        // The owner still holds the lifecycle until it publishes Idle.
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_err());
+        lifecycle.finish(id);
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_ok());
+    }
+
+    #[test]
+    fn a_committed_selected_text_replacement_ignores_a_later_cancel() {
+        let lifecycle = PipelineLifecycle::default();
+        let (id, cancel) = lifecycle
+            .begin_non_recording(PipelineMode::SelectedText)
+            .unwrap();
+        assert!(lifecycle
+            .commit_side_effect(id, || Ok::<_, std::convert::Infallible>(()))
+            .unwrap()
+            .is_ok());
+        assert_eq!(lifecycle.cancel().unwrap(), None);
+        assert!(!*cancel.borrow());
+        assert!(!lifecycle.is_cancelled(id));
+    }
+
+    #[test]
     fn retry_commit_rejects_prior_cancellation() {
         let lifecycle = PipelineLifecycle::default();
-        let (id, _) = lifecycle.begin_retry(PipelineMode::Dictate).unwrap();
+        let (id, _) = lifecycle
+            .begin_non_recording(PipelineMode::Dictate)
+            .unwrap();
         lifecycle.cancel().unwrap();
         assert!(lifecycle
             .commit_side_effect(id, || Ok::<(), ()>(()))
@@ -635,7 +722,9 @@ mod tests {
     #[test]
     fn retry_commit_seals_the_operation_before_a_waiting_cancel_can_win() {
         let lifecycle = PipelineLifecycle::default();
-        let (id, cancel) = lifecycle.begin_retry(PipelineMode::Dictate).unwrap();
+        let (id, cancel) = lifecycle
+            .begin_non_recording(PipelineMode::Dictate)
+            .unwrap();
         assert!(lifecycle
             .commit_side_effect(id, || Ok::<(), ()>(()))
             .unwrap()
@@ -651,7 +740,7 @@ mod tests {
     #[test]
     fn committed_retry_keeps_the_lifecycle_until_completion_is_published() {
         let lifecycle = PipelineLifecycle::default();
-        let (id, _) = lifecycle.begin_retry(PipelineMode::Ask).unwrap();
+        let (id, _) = lifecycle.begin_non_recording(PipelineMode::Ask).unwrap();
         assert!(lifecycle
             .commit_side_effect(id, || Ok::<(), ()>(()))
             .unwrap()
@@ -661,7 +750,9 @@ mod tests {
         // may start in that window and later be overwritten by it.
         assert_eq!(lifecycle.phase(), PipelinePhase::Processing);
         assert!(lifecycle.begin_start(PipelineMode::Dictate).is_err());
-        assert!(lifecycle.begin_retry(PipelineMode::Dictate).is_err());
+        assert!(lifecycle
+            .begin_non_recording(PipelineMode::Dictate)
+            .is_err());
         lifecycle.finish(id);
         assert_eq!(lifecycle.phase(), PipelinePhase::Idle);
         assert!(lifecycle.begin_start(PipelineMode::Dictate).is_ok());
@@ -684,7 +775,7 @@ mod tests {
         assert!(!phases.has_changed().unwrap());
         lifecycle.finish(id);
         assert_eq!(*phases.borrow_and_update(), PipelinePhase::Idle);
-        let (retry, _) = lifecycle.begin_retry(PipelineMode::Ask).unwrap();
+        let (retry, _) = lifecycle.begin_non_recording(PipelineMode::Ask).unwrap();
         assert_eq!(*phases.borrow_and_update(), PipelinePhase::Processing);
         lifecycle.finish(retry);
         assert_eq!(*phases.borrow_and_update(), PipelinePhase::Idle);
@@ -790,7 +881,9 @@ mod tests {
     #[test]
     fn failed_retry_commit_stays_cancellable() {
         let lifecycle = PipelineLifecycle::default();
-        let (id, _) = lifecycle.begin_retry(PipelineMode::Dictate).unwrap();
+        let (id, _) = lifecycle
+            .begin_non_recording(PipelineMode::Dictate)
+            .unwrap();
         assert!(lifecycle
             .commit_side_effect(id, || Err::<(), ()>(()))
             .unwrap()
