@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { SettingRow, Toggle } from "../components/ui";
 import { AiCorrectionSettings } from "../components/AiCorrectionSettings";
@@ -117,6 +117,12 @@ export function SettingsPage({
         new Set(next.map((item) => item.scope)).size === next.length) {
       onSave({ scopedStyleProfiles: next });
     }
+  }
+
+  // Scope and guidance text stays a local draft until its field loses focus,
+  // like the translation instruction, so typing does not save per keystroke.
+  function commitProfiles() {
+    if (!sameProfiles(profiles, savedProfilesRef.current)) saveProfiles(profiles);
   }
 
   const profileDraftIsInvalid = profiles.some((item) => !isValidProfileScope(item.scope)) ||
@@ -421,7 +427,7 @@ export function SettingsPage({
         <SettingRow title={t("Input gain")} detail={t("Adjusts the processed microphone level from 25% to 400%.")}
           control={<label className="range-control"><input type="range" min="25" max="400" step="5" value={settings.inputGainPercent} onChange={(event) => onSave({ inputGainPercent: Number(event.target.value) })} /><output>{settings.inputGainPercent}%</output></label>} />
       </section>
-      <PersonalizationProfiles settings={settings} profiles={profiles} profileDraftIsInvalid={profileDraftIsInvalid} onSaveGlobal={saveGlobalProfile} onSaveProfiles={saveProfiles} />
+      <PersonalizationProfiles settings={settings} profiles={profiles} profileDraftIsInvalid={profileDraftIsInvalid} onSaveGlobal={saveGlobalProfile} onSaveProfiles={saveProfiles} onEditProfiles={setProfiles} onCommitProfiles={commitProfiles} />
       <AiCorrectionSettings settings={settings} onSave={onSave} />
     </div>
   );
@@ -433,17 +439,42 @@ function PersonalizationProfiles({
   profileDraftIsInvalid,
   onSaveGlobal,
   onSaveProfiles,
+  onEditProfiles,
+  onCommitProfiles,
 }: {
   settings: Settings;
   profiles: ScopedStyleProfile[];
   profileDraftIsInvalid: boolean;
   onSaveGlobal: (profile: StyleProfile | null) => void;
   onSaveProfiles: (profiles: ScopedStyleProfile[]) => void;
+  /** Updates the scoped-profile draft without saving it. */
+  onEditProfiles: (profiles: ScopedStyleProfile[]) => void;
+  /** Saves the scoped-profile draft when it differs from the saved profiles. */
+  onCommitProfiles: () => void;
 }) {
   const { t } = useI18n();
   const global = settings.globalStyleProfile;
   const defaultGlobal: StyleProfile = { formality: "formal", detail: "concise", guidance: "" };
   const updateGlobal = (patch: Partial<StyleProfile>) => onSaveGlobal({ ...(global ?? defaultGlobal), ...patch });
+  // The guidance text is a local draft saved on blur or Enter, like the
+  // translation instruction: a save per keystroke lets an older save's
+  // acknowledgement re-render the field with stale text.
+  const savedGuidance = global?.guidance ?? "";
+  const [guidance, setGuidance] = useState(savedGuidance);
+  const savedGuidanceRef = useRef(savedGuidance);
+  const suppressGuidanceBlurRef = useRef(false);
+  useEffect(() => {
+    const previous = savedGuidanceRef.current;
+    savedGuidanceRef.current = savedGuidance;
+    // Adopt a saved change only while the draft has no unsaved edit.
+    setGuidance((draft) => (draft === previous ? savedGuidance : draft));
+  }, [savedGuidance]);
+  const commitGuidance = () => {
+    if (global && guidance !== savedGuidance) updateGlobal({ guidance });
+  };
+  const commitOnEnter = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Enter") { event.preventDefault(); event.currentTarget.blur(); }
+  };
   return (
     <section className="panel">
       <h2>{t("Personalization profiles")}</h2>
@@ -455,7 +486,13 @@ function PersonalizationProfiles({
           {global ? <>
             <select value={global.formality} onChange={(e) => updateGlobal({ formality: e.target.value as StyleProfile["formality"] })}><option value="formal">{t("Formal")}</option><option value="casual">{t("Casual")}</option></select>
             <select value={global.detail} onChange={(e) => updateGlobal({ detail: e.target.value as StyleProfile["detail"] })}><option value="concise">{t("Concise")}</option><option value="detailed">{t("Detailed")}</option></select>
-            <input maxLength={300} placeholder={t("Optional guidance")} value={global.guidance ?? ""} onChange={(e) => updateGlobal({ guidance: e.target.value })} />
+            <input maxLength={300} placeholder={t("Optional guidance")} value={guidance} onChange={(e) => setGuidance(e.target.value)} onBlur={() => {
+              if (suppressGuidanceBlurRef.current) { suppressGuidanceBlurRef.current = false; return; }
+              commitGuidance();
+            }} onKeyDown={(event) => {
+              if (event.key === "Enter") { event.preventDefault(); commitGuidance(); suppressGuidanceBlurRef.current = true; event.currentTarget.blur(); }
+              if (event.key === "Escape") { setGuidance(savedGuidance); suppressGuidanceBlurRef.current = true; event.currentTarget.blur(); }
+            }} />
             <button className="secondary" onClick={() => onSaveGlobal(null)}>{t("Clear")}</button>
           </> : <>
             <span>{t("Not configured")}</span>
@@ -469,10 +506,10 @@ function PersonalizationProfiles({
         {profileDraftIsInvalid && <p role="alert">{t("Profile scopes must be valid and unique before changes are saved.")}</p>}
         {profiles.map((item, index) => (
           <div className="setting-row" key={index}>
-            <input value={item.scope} maxLength={80} placeholder={t("app:code or category:development")} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, scope: e.target.value }; onSaveProfiles(next); }} />
+            <input value={item.scope} maxLength={80} placeholder={t("app:code or category:development")} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, scope: e.target.value }; onEditProfiles(next); }} onBlur={onCommitProfiles} onKeyDown={commitOnEnter} />
             <select value={item.profile.formality} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, formality: e.target.value as StyleProfile["formality"] } }; onSaveProfiles(next); }}><option value="formal">{t("Formal")}</option><option value="casual">{t("Casual")}</option></select>
             <select value={item.profile.detail} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, detail: e.target.value as StyleProfile["detail"] } }; onSaveProfiles(next); }}><option value="concise">{t("Concise")}</option><option value="detailed">{t("Detailed")}</option></select>
-            <input maxLength={300} placeholder={t("Optional guidance")} value={item.profile.guidance ?? ""} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, guidance: e.target.value } }; onSaveProfiles(next); }} />
+            <input maxLength={300} placeholder={t("Optional guidance")} value={item.profile.guidance ?? ""} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, guidance: e.target.value } }; onEditProfiles(next); }} onBlur={onCommitProfiles} onKeyDown={commitOnEnter} />
             <button className="secondary" onClick={() => onSaveProfiles(profiles.filter((_, i) => i !== index))}>{t("Remove")}</button>
           </div>
         ))}

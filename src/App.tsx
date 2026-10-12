@@ -546,6 +546,18 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   // the latest settings, or it would revert changes made in the meantime.
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  // Saves can follow each other quickly (a select saves at once, text on
+  // blur). They are sent one at a time; only the latest save's
+  // acknowledgement or rollback may replace the settings, and settings-changed
+  // echoes are ignored while a save is queued or in flight, so an older
+  // save's answer cannot revert text committed after it.
+  const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const latestSaveRef = useRef(0);
+  const pendingSavesRef = useRef(0);
+  // The settings the backend last confirmed, and the fields saves changed
+  // since then, which a failed latest save returns to their stored values.
+  const confirmedSettingsRef = useRef(settings);
+  const unconfirmedKeysRef = useRef(new Set<keyof Settings>());
   // Saves send the whole Settings object, and a shorter history retention
   // purges data, so nothing is saved until the stored settings are known.
   const [settingsLoaded, setSettingsLoaded] = useState(false);
@@ -619,7 +631,13 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       }),
       listen<ModelProgress>("model-progress", (event) => setModelProgress(event.payload)),
       listen<GpuDiagnostics>("gpu-diagnostics", (event) => setGpu(event.payload)),
-      listen<Settings>("settings-changed", (event) => applyBackendSettings(event.payload)),
+      listen<Settings>("settings-changed", (event) => {
+        // While saves are queued or in flight, the latest one's
+        // acknowledgement decides. Known limitation: a change made elsewhere
+        // (tray, hotkey) in that window is dropped here and then overwritten
+        // by the queued whole-object save; fixing it needs backend versions.
+        if (pendingSavesRef.current === 0) applyBackendSettings(event.payload);
+      }),
       listen<{ kind: string; message: string }>("status", (event) =>
         setNotice({
           message: event.payload.message,
@@ -715,6 +733,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   function applyBackendSettings(nextSettings: Settings) {
     const first = !settingsLoadedRef.current;
     settingsLoadedRef.current = true;
+    confirmedSettingsRef.current = nextSettings;
     setSettings(nextSettings);
     setSettingsLoaded(true);
     onLanguageChange(nextSettings.uiLanguage);
@@ -745,36 +764,70 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
 
   async function saveSettings(patch: Partial<Settings>): Promise<boolean> {
     if (!settingsReady()) return false;
-    const previous = settingsRef.current;
-    const next = { ...previous, ...patch };
+    const next = { ...settingsRef.current, ...patch };
     settingsRef.current = next;
     setSettings(next);
+    for (const key of Object.keys(patch) as Array<keyof Settings>) unconfirmedKeysRef.current.add(key);
+    const save = ++latestSaveRef.current;
+    pendingSavesRef.current += 1;
+    // update_settings writes the whole Settings object, so saves are sent one
+    // at a time in the order they were made, each with the settings shown
+    // when its turn comes: the backend's last write is the newest state.
+    const turn = saveQueueRef.current;
+    let endTurn = () => {};
+    saveQueueRef.current = new Promise<void>((resolve) => { endTurn = resolve; });
+    await turn;
+    let saved: Settings;
     try {
-      const saved = await updateSettings(next);
-      setSettings(saved);
-      let hotkeyWarnings: string[] = [];
-      try {
-        hotkeyWarnings = await getStartupHotkeyWarning();
-        setStartupHotkeyWarnings(hotkeyWarnings);
-      } catch {
-        // Keep the known warning if diagnostics cannot be refreshed.
-      }
-      onLanguageChange(saved.uiLanguage);
-      // A saved hotkey that still cannot be registered does not fail the save,
-      // but the notice names the action that stays unavailable.
-      showNotice(
-        [
-          translate(saved.uiLanguage, "Settings saved locally."),
-          ...hotkeyWarnings.map((message) => translateAppMessage(saved.uiLanguage, message)),
-        ].join(" "),
-        hotkeyWarnings.length > 0 ? "warning" : "success",
-      );
+      saved = await updateSettings(settingsRef.current);
     } catch (error) {
-      settingsRef.current = previous;
-      setSettings(previous);
+      pendingSavesRef.current -= 1;
+      endTurn();
+      // A later queued save sends the whole settings object and decides.
+      // Otherwise every field a save changed since the last confirmation
+      // returns to its stored value; unsaved local edits (Setup) stay.
+      if (save === latestSaveRef.current) {
+        const confirmed = confirmedSettingsRef.current;
+        const restored = {
+          ...settingsRef.current,
+          ...Object.fromEntries(Array.from(unconfirmedKeysRef.current, (key) => [key, confirmed[key]])),
+        };
+        unconfirmedKeysRef.current.clear();
+        settingsRef.current = restored;
+        setSettings(restored);
+      }
       showNotice(String(error), "error");
       return false;
     }
+    pendingSavesRef.current -= 1;
+    endTurn();
+    confirmedSettingsRef.current = saved;
+    // An older save's acknowledgement predates the queued newer save, so only
+    // the latest save's acknowledgement replaces the shown settings.
+    if (save === latestSaveRef.current) {
+      unconfirmedKeysRef.current.clear();
+      settingsRef.current = saved;
+      setSettings(saved);
+    }
+    let hotkeyWarnings: string[] = [];
+    try {
+      hotkeyWarnings = await getStartupHotkeyWarning();
+      setStartupHotkeyWarnings(hotkeyWarnings);
+    } catch {
+      // Keep the known warning if diagnostics cannot be refreshed.
+    }
+    // The same holds for the UI language: an older acknowledgement must not
+    // switch back a language chosen by a newer save.
+    if (save === latestSaveRef.current) onLanguageChange(saved.uiLanguage);
+    // A saved hotkey that still cannot be registered does not fail the save,
+    // but the notice names the action that stays unavailable.
+    showNotice(
+      [
+        translate(saved.uiLanguage, "Settings saved locally."),
+        ...hotkeyWarnings.map((message) => translateAppMessage(saved.uiLanguage, message)),
+      ].join(" "),
+      hotkeyWarnings.length > 0 ? "warning" : "success",
+    );
     if (patch.historyRetention !== undefined || patch.deleteAudioAfterProcessing !== undefined) {
       // The optimistic render can read before the settings transaction has
       // purged old rows. Refresh again after its acknowledgement so that read
@@ -847,6 +900,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     try {
       const next = configuration ? { ...settings, ...configuration } : settings;
       const saved = configuration ? await updateSettings(next) : next;
+      if (configuration) confirmedSettingsRef.current = saved;
       setSettings(saved);
       setModel(await loadModel(saved.modelId, saved.modelQuantization));
       showNotice(t("Model loaded and ready."), "success");
@@ -874,6 +928,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     };
     try {
       const saved = await updateSettings(next);
+      confirmedSettingsRef.current = saved;
       setSettings(saved);
       showNotice(t("Custom model saved locally."), "success");
       return true;
