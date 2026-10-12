@@ -10,7 +10,7 @@ again to stop. The Windows capture backend converts input to a temporary 24 kHz
 mono PCM WAV, and sends it to the persistent JSONL worker. While you speak,
 partial text appears only in the recording overlay. After transcription and any
 AI correction, the final text is pasted once into the captured target with the
-clipboard and Ctrl+V. When the target's text can be read through UI Automation,
+clipboard and Ctrl+V (Shift+Insert in mintty, PuTTY, and Emacs). When the target's text can be read through UI Automation,
 the paste is verified and (with **Restore clipboard** on) the previous
 clipboard is restored; otherwise one
 guarded paste is sent unverified. With **Restore clipboard** on, the clipboard
