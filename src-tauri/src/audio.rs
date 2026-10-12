@@ -47,6 +47,14 @@ pub trait AudioCapture: Send {
     fn cancel(&mut self) -> AudioFuture<'_, ()>;
     fn state(&self) -> CaptureState;
     fn level(&self) -> LevelMeter;
+    fn stream_error(&self) -> Option<String> {
+        None
+    }
+    /// Whether the open stream uses the default input device because the
+    /// requested one was missing (see `CaptureConfig::fallback_to_default`).
+    fn uses_fallback_device(&self) -> bool {
+        false
+    }
 }
 
 /// Boundary for replacing the deterministic fallback with WebRTC VAD later.
@@ -66,6 +74,11 @@ pub struct AudioDevice {
 #[derive(Clone, Debug)]
 pub struct CaptureConfig {
     pub device_id: Option<String>,
+    /// Open the default input device when `device_id` names a device that is
+    /// not present (for example a disconnected Bluetooth headset). Recordings
+    /// opt in; the Settings microphone test does not, because it tests the
+    /// chosen device. The saved selection is never changed.
+    pub fallback_to_default: bool,
     pub target_sample_rate: u32,
     pub minimum_duration: Duration,
     /// Amount of pre-press audio retained in the preroll ring. `Duration::ZERO`
@@ -80,6 +93,7 @@ impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
             device_id: None,
+            fallback_to_default: false,
             target_sample_rate: TARGET_SAMPLE_RATE,
             minimum_duration: Duration::from_millis(250),
             preroll: DEFAULT_PREROLL,
@@ -126,6 +140,9 @@ pub struct AudioArtifact {
     pub peak_level: f32,
     pub rms_level: f32,
     pub vad: VadAnalysis,
+    /// Set when the input stream failed during the take. The artifact holds
+    /// the audio captured before the failure.
+    pub warning: Option<String>,
 }
 
 pub struct AudioSnapshot {
@@ -513,12 +530,27 @@ impl SharedCapture {
         self.samples = self.preroll.drain();
         self.recording = true;
     }
+
+    /// Ends the take and hands over its samples. A stream failure (for example
+    /// an unplugged or powered-off headset) keeps the audio captured before it
+    /// and is returned alongside as a warning; the take fails only when the
+    /// stream failed before any sample was captured.
+    fn finish_recording(&mut self) -> Result<(Vec<f32>, Option<String>), AudioError> {
+        self.recording = false;
+        let samples = std::mem::take(&mut self.samples);
+        match self.stream_error.clone() {
+            Some(message) if samples.is_empty() => Err(AudioError::StreamFailure(message)),
+            stream_error => Ok((samples, stream_error)),
+        }
+    }
 }
 
 /// An open input stream that is either armed (preroll only) or recording.
 struct ActiveCapture {
     config: CaptureConfig,
     input_sample_rate: u32,
+    /// The stream uses the default device in place of a missing one.
+    fell_back_to_default: bool,
     shared: Arc<Mutex<SharedCapture>>,
     #[cfg(target_os = "windows")]
     stream_worker: StreamWorker,
@@ -586,14 +618,11 @@ impl CpalAudioCapture {
             .shared
             .lock()
             .map_err(|_| AudioError::StreamFailure("capture buffer lock poisoned".into()))?;
-        if let Some(message) = &shared.stream_error {
-            return Err(AudioError::StreamFailure(message.clone()));
-        }
-
-        shared.recording = false;
-        let mono = std::mem::take(&mut shared.samples);
+        let (mono, stream_error) = shared.finish_recording()?;
         drop(shared);
-        finalize_samples(mono, active.input_sample_rate, &active.config)
+        let mut artifact = finalize_samples(mono, active.input_sample_rate, &active.config)?;
+        artifact.warning = stream_error;
+        Ok(artifact)
     }
 }
 
@@ -710,6 +739,22 @@ impl AudioCapture for CpalAudioCapture {
             .and_then(|active| active.shared.lock().ok().map(|shared| shared.level))
             .unwrap_or_default()
     }
+
+    fn uses_fallback_device(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| active.fell_back_to_default)
+    }
+
+    fn stream_error(&self) -> Option<String> {
+        self.active.as_ref().and_then(|active| {
+            active
+                .shared
+                .lock()
+                .ok()
+                .and_then(|shared| shared.stream_error.clone())
+        })
+    }
 }
 
 fn validate_config(config: &CaptureConfig) -> Result<(), AudioError> {
@@ -790,6 +835,7 @@ fn write_prepared_audio(
         peak_level: levels.peak,
         rms_level: levels.rms,
         vad,
+        warning: None,
     })
 }
 
@@ -1064,6 +1110,50 @@ fn device_name_from_id(id: &str) -> Option<&str> {
         .then_some(name)
 }
 
+/// The input device a capture opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+enum InputDeviceChoice<'a> {
+    /// The present device with this friendly name.
+    Named(&'a str),
+    /// The system default input device. `fell_back` is set when it replaces
+    /// a requested device that is not present.
+    Default { fell_back: bool },
+}
+
+/// Chooses the input device for `requested_id` among the present devices'
+/// friendly names. No request means the default device. A request that is
+/// absent (or not a device id) uses the default device only when
+/// `fallback_to_default` allows it; otherwise, and when there is no default
+/// device, it is `DeviceNotFound`.
+fn choose_input_device<'a>(
+    requested_id: Option<&str>,
+    available_names: &[&'a str],
+    has_default: bool,
+    fallback_to_default: bool,
+) -> Result<InputDeviceChoice<'a>, AudioError> {
+    let Some(requested_id) = requested_id else {
+        return if has_default {
+            Ok(InputDeviceChoice::Default { fell_back: false })
+        } else {
+            Err(AudioError::DeviceNotFound("default".into()))
+        };
+    };
+    if let Some(name) = device_name_from_id(requested_id).and_then(|requested| {
+        available_names
+            .iter()
+            .copied()
+            .find(|name| *name == requested)
+    }) {
+        return Ok(InputDeviceChoice::Named(name));
+    }
+    if fallback_to_default && has_default {
+        Ok(InputDeviceChoice::Default { fell_back: true })
+    } else {
+        Err(AudioError::DeviceNotFound(requested_id.to_owned()))
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn list_cpal_devices() -> Result<Vec<AudioDevice>, AudioError> {
     use cpal::traits::{DeviceTrait, HostTrait};
@@ -1105,8 +1195,16 @@ fn start_cpal_capture(config: CaptureConfig) -> Result<ActiveCapture, AudioError
         .spawn(move || {
             let startup = start_cpal_stream(config);
             match startup {
-                Ok((input_sample_rate, shared, stream)) => {
-                    if startup_tx.send(Ok((input_sample_rate, shared))).is_err() {
+                Ok(CpalStartup {
+                    input_sample_rate,
+                    fell_back_to_default,
+                    shared,
+                    stream,
+                }) => {
+                    if startup_tx
+                        .send(Ok((input_sample_rate, fell_back_to_default, shared)))
+                        .is_err()
+                    {
                         return;
                     }
                     let _ = shutdown_rx.recv();
@@ -1120,7 +1218,7 @@ fn start_cpal_capture(config: CaptureConfig) -> Result<ActiveCapture, AudioError
         })
         .map_err(|error| AudioError::StreamBuild(error.to_string()))?;
 
-    let (input_sample_rate, shared) = match startup_rx.recv() {
+    let (input_sample_rate, fell_back_to_default, shared) = match startup_rx.recv() {
         Ok(Ok(startup)) => startup,
         Ok(Err(error)) => {
             let _ = thread.join();
@@ -1137,6 +1235,7 @@ fn start_cpal_capture(config: CaptureConfig) -> Result<ActiveCapture, AudioError
     Ok(ActiveCapture {
         config: active_config,
         input_sample_rate,
+        fell_back_to_default,
         shared,
         stream_worker: StreamWorker {
             shutdown: shutdown_tx,
@@ -1145,26 +1244,49 @@ fn start_cpal_capture(config: CaptureConfig) -> Result<ActiveCapture, AudioError
     })
 }
 
+/// What the stream thread reports once the input stream plays.
 #[cfg(target_os = "windows")]
-fn start_cpal_stream(
-    config: CaptureConfig,
-) -> Result<(u32, Arc<Mutex<SharedCapture>>, cpal::Stream), AudioError> {
+struct CpalStartup {
+    input_sample_rate: u32,
+    fell_back_to_default: bool,
+    shared: Arc<Mutex<SharedCapture>>,
+    stream: cpal::Stream,
+}
+
+#[cfg(target_os = "windows")]
+fn start_cpal_stream(config: CaptureConfig) -> Result<CpalStartup, AudioError> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     let host = cpal::default_host();
-    let device = if let Some(requested_id) = config.device_id.as_deref() {
-        let requested_name = device_name_from_id(requested_id)
-            .ok_or_else(|| AudioError::DeviceNotFound(requested_id.to_owned()))?;
+    let default_device = host.default_input_device();
+    // Only a named request needs the device list.
+    let mut devices: Vec<(String, cpal::Device)> = if config.device_id.is_some() {
         host.input_devices()
             .map_err(|error| AudioError::DeviceEnumeration(error.to_string()))?
-            .find_map(|device| {
-                let name = device.name().ok()?;
-                (name == requested_name).then_some(device)
-            })
-            .ok_or_else(|| AudioError::DeviceNotFound(requested_id.to_owned()))?
+            .filter_map(|device| Some((device.name().ok()?, device)))
+            .collect()
     } else {
-        host.default_input_device()
-            .ok_or_else(|| AudioError::DeviceNotFound("default".into()))?
+        Vec::new()
+    };
+    let names: Vec<&str> = devices.iter().map(|(name, _)| name.as_str()).collect();
+    let choice = choose_input_device(
+        config.device_id.as_deref(),
+        &names,
+        default_device.is_some(),
+        config.fallback_to_default,
+    )?;
+    let (device, fell_back_to_default) = match choice {
+        InputDeviceChoice::Named(name) => {
+            let index = names
+                .iter()
+                .position(|candidate| *candidate == name)
+                .expect("the chosen name is one of the listed devices");
+            (devices.swap_remove(index).1, false)
+        }
+        InputDeviceChoice::Default { fell_back } => (
+            default_device.ok_or_else(|| AudioError::DeviceNotFound("default".into()))?,
+            fell_back,
+        ),
     };
     let supported = device
         .default_input_config()
@@ -1213,7 +1335,12 @@ fn start_cpal_stream(
         .play()
         .map_err(|error| AudioError::StreamPlay(error.to_string()))?;
 
-    Ok((input_sample_rate, shared, stream))
+    Ok(CpalStartup {
+        input_sample_rate,
+        fell_back_to_default,
+        shared,
+        stream,
+    })
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1309,6 +1436,7 @@ mod tests {
             active: Some(ActiveCapture {
                 config,
                 input_sample_rate: TARGET_SAMPLE_RATE,
+                fell_back_to_default: false,
                 shared: Arc::clone(&shared),
                 #[cfg(target_os = "windows")]
                 stream_worker: StreamWorker {
@@ -1339,6 +1467,76 @@ mod tests {
         complete.remove().unwrap();
     }
 
+    fn recording_capture(shared: &Arc<Mutex<SharedCapture>>, directory: &Path) -> CpalAudioCapture {
+        CpalAudioCapture {
+            recording: true,
+            active: Some(ActiveCapture {
+                config: CaptureConfig {
+                    artifact_directory: Some(directory.to_owned()),
+                    ..CaptureConfig::default()
+                },
+                input_sample_rate: TARGET_SAMPLE_RATE,
+                fell_back_to_default: false,
+                shared: Arc::clone(shared),
+                #[cfg(target_os = "windows")]
+                stream_worker: StreamWorker {
+                    shutdown: mpsc::channel().0,
+                    thread: None,
+                },
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_failure_keeps_the_audio_captured_before_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let samples: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.1).sin() * 0.2).collect();
+        let shared = Arc::new(Mutex::new(SharedCapture {
+            samples,
+            recording: true,
+            stream_error: Some("device disconnected".into()),
+            ..SharedCapture::default()
+        }));
+        let mut capture = recording_capture(&shared, directory.path());
+        let artifact = capture.stop().await.unwrap();
+        assert_eq!(artifact.sample_count, 24_000);
+        assert_eq!(artifact.warning.as_deref(), Some("device disconnected"));
+        assert!(artifact.path.is_file());
+        assert_eq!(capture.state(), CaptureState::Idle);
+        artifact.remove().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_failure_before_any_audio_still_fails_the_take() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(Mutex::new(SharedCapture {
+            recording: true,
+            stream_error: Some("device disconnected".into()),
+            ..SharedCapture::default()
+        }));
+        let mut capture = recording_capture(&shared, directory.path());
+        assert!(matches!(
+            capture.stop().await,
+            Err(AudioError::StreamFailure(message)) if message == "device disconnected"
+        ));
+        assert_eq!(capture.state(), CaptureState::Idle);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_healthy_take_finishes_without_a_warning() {
+        let mut shared = SharedCapture {
+            samples: vec![0.1; 8],
+            recording: true,
+            ..SharedCapture::default()
+        };
+        let (samples, warning) = shared.finish_recording().unwrap();
+        assert_eq!(samples.len(), 8);
+        assert_eq!(warning, None);
+        assert!(!shared.recording);
+        assert!(shared.samples.is_empty());
+    }
+
     #[test]
     fn device_ids_do_not_depend_on_enumeration_order() {
         assert_eq!(
@@ -1358,6 +1556,93 @@ mod tests {
             Some("Microphone: USB")
         );
         assert_eq!(device_name_from_id("not-an-id"), None);
+    }
+
+    #[test]
+    fn no_saved_microphone_opens_the_default_device() {
+        let present = ["USB Microphone"];
+        for fallback in [false, true] {
+            assert_eq!(
+                choose_input_device(None, &present, true, fallback).unwrap(),
+                InputDeviceChoice::Default { fell_back: false }
+            );
+        }
+    }
+
+    #[test]
+    fn a_present_saved_microphone_is_used() {
+        let present = ["USB Microphone", "ヘッドセット (SOUNDPEATS Air5 Pro)"];
+        for fallback in [false, true] {
+            assert_eq!(
+                choose_input_device(
+                    Some("name:ヘッドセット (SOUNDPEATS Air5 Pro)"),
+                    &present,
+                    true,
+                    fallback,
+                )
+                .unwrap(),
+                InputDeviceChoice::Named("ヘッドセット (SOUNDPEATS Air5 Pro)")
+            );
+            // A legacy index-based id resolves by name too.
+            assert_eq!(
+                choose_input_device(Some("7:USB Microphone"), &present, false, fallback).unwrap(),
+                InputDeviceChoice::Named("USB Microphone")
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_saved_microphone_falls_back_to_the_default_when_allowed() {
+        let present = ["USB Microphone"];
+        for missing in [
+            "name:ヘッドセット (SOUNDPEATS Air5 Pro)",
+            "not-an-id",
+            "name:",
+        ] {
+            assert_eq!(
+                choose_input_device(Some(missing), &present, true, true).unwrap(),
+                InputDeviceChoice::Default { fell_back: true },
+                "{missing}"
+            );
+        }
+        assert_eq!(
+            choose_input_device(Some("name:Headset"), &[], true, true).unwrap(),
+            InputDeviceChoice::Default { fell_back: true }
+        );
+    }
+
+    #[test]
+    fn without_fallback_a_missing_saved_microphone_is_not_found() {
+        // The Settings microphone test tests the chosen device; it must not
+        // silently measure another one.
+        let present = ["USB Microphone"];
+        for missing in ["name:Headset", "not-an-id"] {
+            let error = choose_input_device(Some(missing), &present, true, false).unwrap_err();
+            assert!(matches!(&error, AudioError::DeviceNotFound(id) if id == missing));
+            assert!(error
+                .to_string()
+                .starts_with("audio input device not found"));
+        }
+    }
+
+    #[test]
+    fn no_default_device_is_not_found_even_with_fallback() {
+        let present = ["USB Microphone"];
+        assert!(matches!(
+            choose_input_device(None, &present, false, true),
+            Err(AudioError::DeviceNotFound(id)) if id == "default"
+        ));
+        assert!(matches!(
+            choose_input_device(Some("name:Headset"), &present, false, true),
+            Err(AudioError::DeviceNotFound(id)) if id == "name:Headset"
+        ));
+    }
+
+    #[test]
+    fn captures_do_not_fall_back_unless_they_opt_in() {
+        assert!(!CaptureConfig::default().fallback_to_default);
+        let capture = CpalAudioCapture::new();
+        assert!(!capture.uses_fallback_device());
     }
 
     #[test]
@@ -1515,6 +1800,7 @@ mod tests {
             active: Some(ActiveCapture {
                 config: CaptureConfig::default(),
                 input_sample_rate: TARGET_SAMPLE_RATE,
+                fell_back_to_default: false,
                 shared,
             }),
             recording: true,
@@ -1534,6 +1820,7 @@ mod tests {
             active: Some(ActiveCapture {
                 config: CaptureConfig::default(),
                 input_sample_rate: TARGET_SAMPLE_RATE,
+                fell_back_to_default: false,
                 shared,
             }),
             recording: false,

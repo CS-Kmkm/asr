@@ -67,8 +67,8 @@ export function SetupPage({
           detail={t("Default recording toggle.")}
           control={
             <input
-              value={settings.hotkey}
-              onChange={(e) => onSettingsChange({ ...settings, hotkey: e.target.value })}
+              value={settings.shortcuts.dictate[0]}
+              onChange={(e) => onSettingsChange({ ...settings, shortcuts: { ...settings.shortcuts, dictate: [e.target.value, ...settings.shortcuts.dictate.slice(1)] } })}
             />
           }
         />

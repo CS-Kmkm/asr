@@ -10,6 +10,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from asr_worker.backends import (
+    APP_MAX_RECORDING_SECONDS,
+    VIBEVOICE_MAX_NEW_TOKENS,
     BackendError,
     FasterWhisperBackend,
     compute_max_new_tokens,
@@ -17,6 +19,7 @@ from asr_worker.backends import (
     faster_whisper_compute_type,
     wav_duration_seconds,
 )
+from asr_worker.download import FASTER_WHISPER_ALLOW_PATTERNS
 
 
 class CreateBackendTests(unittest.TestCase):
@@ -78,7 +81,27 @@ class MaxNewTokensTests(unittest.TestCase):
         self.assertEqual(compute_max_new_tokens(60.0, None), 2528)
 
     def test_long_audio_clamped_to_ceiling(self) -> None:
-        self.assertEqual(compute_max_new_tokens(10000.0, None), 4096)
+        self.assertEqual(compute_max_new_tokens(10000.0, None), VIBEVOICE_MAX_NEW_TOKENS)
+
+    def test_ceiling_covers_the_app_recording_limit_with_a_minute_of_margin(self) -> None:
+        self.assertEqual(APP_MAX_RECORDING_SECONDS, 15 * 60)
+        # (900 + 60) s * 40 tok/s + 128
+        self.assertEqual(VIBEVOICE_MAX_NEW_TOKENS, 38528)
+
+    def test_full_length_recording_is_not_capped(self) -> None:
+        # 15 min -> 900*40 + 128 = 36128, below the ceiling, so the
+        # length-based estimate applies instead of a truncating cap.
+        full = compute_max_new_tokens(float(APP_MAX_RECORDING_SECONDS), None)
+        self.assertEqual(full, 36128)
+        self.assertLess(full, VIBEVOICE_MAX_NEW_TOKENS)
+        # The previous 4096 cap only fit about 99 s; a 5-minute take now
+        # gets its whole estimate.
+        self.assertEqual(compute_max_new_tokens(300.0, None), 12128)
+
+    def test_override_still_caps_long_recordings(self) -> None:
+        self.assertEqual(
+            compute_max_new_tokens(float(APP_MAX_RECORDING_SECONDS), "4096"), 4096
+        )
 
     def test_env_override_takes_priority(self) -> None:
         self.assertEqual(compute_max_new_tokens(60.0, "512"), 512)
@@ -88,7 +111,7 @@ class MaxNewTokensTests(unittest.TestCase):
         self.assertEqual(compute_max_new_tokens(1.0, "not-a-number"), 256)
 
     def test_none_audio_returns_ceiling(self) -> None:
-        self.assertEqual(compute_max_new_tokens(None, None), 4096)
+        self.assertEqual(compute_max_new_tokens(None, None), VIBEVOICE_MAX_NEW_TOKENS)
 
 
 class WavDurationTests(unittest.TestCase):
@@ -151,6 +174,9 @@ def _install_fake_faster_whisper() -> dict[str, types.ModuleType]:
     return {"faster_whisper": fake_fw, "ctranslate2": fake_ct2}
 
 
+BUILTIN_REPO = "Systran/faster-whisper-tiny"
+
+
 class ResolveModelFilesTests(unittest.TestCase):
     def test_cached_model_is_loaded_without_downloading(self) -> None:
         backend = FasterWhisperBackend()
@@ -193,6 +219,90 @@ class ResolveModelFilesTests(unittest.TestCase):
             ],
         )
 
+    def resolve_with_cached_files(
+        self, files: list[str], repo_id: str = "org/repo"
+    ) -> tuple[str, list[dict], list[dict]]:
+        """Resolve against a fake hub cache whose snapshot folder holds ``files``.
+
+        ``BUILTIN_REPO`` is the only repository faster-whisper maps a name to.
+        """
+        backend = FasterWhisperBackend()
+        events: list[dict] = []
+        backend.progress = events.append
+        downloads: list[dict] = []
+
+        def fake_download(repo_id, allow_patterns, progress):  # noqa: ANN001
+            downloads.append({"repo_id": repo_id, "allow_patterns": allow_patterns})
+            return "/downloaded/repo"
+
+        with TemporaryDirectory() as tmp:
+            snapshot = Path(tmp)
+            for name in files:
+                (snapshot / name).write_bytes(b"x")
+            hub = types.ModuleType("huggingface_hub")
+            hub.snapshot_download = lambda repo_id, **kwargs: str(snapshot)  # type: ignore[attr-defined]
+            fw_utils = types.ModuleType("faster_whisper.utils")
+            fw_utils._MODELS = {"tiny": BUILTIN_REPO}  # type: ignore[attr-defined]
+            fake_modules = {
+                "huggingface_hub": hub,
+                "faster_whisper": types.ModuleType("faster_whisper"),
+                "faster_whisper.utils": fw_utils,
+            }
+            with patch.dict(sys.modules, fake_modules), patch(
+                "asr_worker.backends.faster_whisper_repo_id", return_value=repo_id
+            ), patch("asr_worker.backends.download_snapshot", fake_download):
+                source = backend._resolve_model_files()
+                if source == str(snapshot):
+                    source = "<cached snapshot>"
+        return source, events, downloads
+
+    def test_interrupted_first_download_is_downloaded_again(self) -> None:
+        source, events, downloads = self.resolve_with_cached_files(
+            ["config.json", "tokenizer.json", "vocabulary.json"]
+        )
+
+        self.assertEqual(source, "/downloaded/repo")
+        self.assertEqual(downloads, [{"repo_id": "org/repo", "allow_patterns": FASTER_WHISPER_ALLOW_PATTERNS}])
+        self.assertEqual(events, [{"stage": "download", "model": "org/repo"}])
+
+    def test_complete_cached_snapshot_is_loaded_without_downloading(self) -> None:
+        source, events, downloads = self.resolve_with_cached_files(
+            ["config.json", "model.bin", "tokenizer.json", "vocabulary.json", "preprocessor_config.json"]
+        )
+
+        self.assertEqual(source, "<cached snapshot>")
+        self.assertEqual(downloads, [])
+        self.assertEqual(events, [])
+
+    def test_builtin_model_without_tokenizer_is_downloaded_again(self) -> None:
+        source, events, downloads = self.resolve_with_cached_files(
+            ["config.json", "model.bin", "vocabulary.json"], BUILTIN_REPO
+        )
+
+        self.assertEqual(source, "/downloaded/repo")
+        self.assertEqual(len(downloads), 1)
+        self.assertEqual(events, [{"stage": "download", "model": BUILTIN_REPO}])
+
+    def test_complete_builtin_snapshot_is_loaded_without_downloading(self) -> None:
+        source, events, downloads = self.resolve_with_cached_files(
+            ["config.json", "model.bin", "tokenizer.json", "vocabulary.txt"], BUILTIN_REPO
+        )
+
+        self.assertEqual(source, "<cached snapshot>")
+        self.assertEqual(downloads, [])
+        self.assertEqual(events, [])
+
+    def test_custom_repository_without_tokenizer_counts_as_cached(self) -> None:
+        # faster-whisper falls back to another tokenizer for such repositories,
+        # so a missing tokenizer.json must not re-download on every load.
+        source, events, downloads = self.resolve_with_cached_files(
+            ["config.json", "model.bin", "vocabulary.json"], "org/custom-whisper"
+        )
+
+        self.assertEqual(source, "<cached snapshot>")
+        self.assertEqual(downloads, [])
+        self.assertEqual(events, [])
+
     def test_unresolvable_model_is_left_to_faster_whisper(self) -> None:
         backend = FasterWhisperBackend()
         events: list[dict] = []
@@ -230,6 +340,13 @@ class TranscribeWithFakeModuleTests(unittest.TestCase):
             backend.load("4bit")
             backend.transcribe(Path("audio.wav"), None)
         self.assertIsNone(_FakeWhisperModel.last_transcribe_kwargs["hotwords"])
+
+    def test_regional_locale_uses_supported_base_language(self) -> None:
+        backend = FasterWhisperBackend()
+        with patch.dict(sys.modules, _install_fake_faster_whisper()):
+            backend.load("4bit")
+            backend.transcribe(Path("audio.wav"), None, "en-GB")
+        self.assertEqual(_FakeWhisperModel.last_transcribe_kwargs["language"], "en")
 
     def test_unload_releases_model_reference(self) -> None:
         backend = FasterWhisperBackend()

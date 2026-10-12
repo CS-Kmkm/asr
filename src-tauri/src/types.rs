@@ -26,17 +26,37 @@ pub struct Settings {
     #[serde(default = "default_ui_language")]
     pub ui_language: String,
     pub setup_complete: bool,
-    pub hotkey: String,
+    #[serde(default)]
+    pub shortcuts: VoiceShortcuts,
     #[serde(default = "default_translation_hotkey")]
     pub translation_hotkey: String,
     #[serde(default)]
     pub translation_instruction: String,
+    #[serde(default = "default_theme")]
+    pub theme: String,
+    #[serde(default)]
+    pub interaction_sounds: bool,
+    #[serde(default)]
+    pub speech_locale: Option<String>,
+    #[serde(default = "default_translation_target_languages")]
+    pub translation_target_languages: Vec<String>,
+    #[serde(default = "default_translation_target_language")]
+    pub translation_target_language: String,
     pub microphone_id: Option<String>,
-    pub history_enabled: bool,
-    pub history_retention_days: u32,
+    #[serde(default)]
+    pub history_retention: HistoryRetention,
     pub delete_audio_after_processing: bool,
+    /// On by default: a take whose transcription failed is kept with its
+    /// audio for 24 hours so it can be retried, even where the History and
+    /// audio settings above would not keep it.
+    #[serde(default = "default_keep_failed_takes")]
+    pub keep_failed_takes: bool,
     pub auto_start: bool,
     pub clipboard_restore: bool,
+    /// Off by default: Dictate pastes only the final text once. On restores
+    /// live provisional insertion and replacement in the captured target.
+    #[serde(default)]
+    pub live_target_insertion: bool,
     #[serde(default = "default_noise_suppression")]
     pub noise_suppression: String,
     #[serde(default = "default_input_gain_percent")]
@@ -66,8 +86,16 @@ pub struct Settings {
     pub gemini_correction_model: String,
     #[serde(default = "default_gemini_api_key_env_var")]
     pub gemini_api_key_env_var: String,
+    #[serde(default = "default_local_correction_base_url")]
+    pub local_correction_base_url: String,
+    #[serde(default = "default_local_correction_model")]
+    pub local_correction_model: String,
+    #[serde(default = "default_local_correction_max_tokens")]
+    pub local_correction_max_tokens: usize,
     #[serde(default = "default_correction_instruction")]
     pub correction_instruction: String,
+    #[serde(default = "default_correction_mode")]
+    pub correction_mode: String,
     #[serde(default = "default_enabled_correction_feature")]
     pub correction_remove_fillers: bool,
     #[serde(default = "default_enabled_correction_feature")]
@@ -80,6 +108,45 @@ pub struct Settings {
     pub correction_improve_clarity: bool,
     #[serde(default)]
     pub custom_models: Vec<CustomModel>,
+    #[serde(default)]
+    pub personalization_enabled: bool,
+    #[serde(default)]
+    pub global_style_profile: Option<StyleProfile>,
+    #[serde(default)]
+    pub scoped_style_profiles: Vec<ScopedStyleProfile>,
+}
+
+/// Stored settings with the in-process revision of the write that stored
+/// them. Revisions only grow, so a reader can order snapshots that arrive
+/// out of order (command results and `settings-changed` events).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsSnapshot {
+    pub settings: Settings,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AppContext {
+    pub app_key: Option<String>,
+    pub category: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleProfile {
+    pub formality: String,
+    pub detail: String,
+    #[serde(default)]
+    pub guidance: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScopedStyleProfile {
+    pub scope: String,
+    pub profile: StyleProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,9 +156,35 @@ pub struct CustomModel {
     pub model_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VoiceShortcuts {
+    pub dictate: Vec<String>,
+    pub translate: Vec<String>,
+    pub ask: Vec<String>,
+    pub edit: Vec<String>,
+}
+
+impl Default for VoiceShortcuts {
+    fn default() -> Self {
+        Self {
+            dictate: vec!["Ctrl+Shift+Space".into()],
+            translate: vec!["Ctrl+Shift+Y".into()],
+            ask: vec!["Ctrl+Shift+A".into()],
+            edit: vec!["Ctrl+Shift+E".into()],
+        }
+    }
+}
+
 pub const ASR_BACKENDS: [&str; 4] = ["vibevoice", "faster-whisper", "openai-compatible", "mock"];
-pub const CORRECTION_PROVIDERS: [&str; 2] = ["openai", "gemini"];
+pub const CORRECTION_PROVIDERS: [&str; 3] = ["openai", "gemini", "local"];
+pub const CORRECTION_MODES: [&str; 2] = ["conservative", "intent_aware"];
 pub const OPENAI_REASONING_EFFORTS: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];
+pub const TRANSLATION_TARGET_LANGUAGES: [&str; 8] =
+    ["en", "ja", "zh", "es", "fr", "pt", "de", "ko"];
+pub const SPEECH_LOCALES: [&str; 13] = [
+    "ja-JP", "en-US", "en-GB", "zh-CN", "zh-TW", "ko-KR", "es-ES", "es-MX", "fr-FR", "fr-CA",
+    "de-DE", "pt-BR", "pt-PT",
+];
 
 fn default_asr_backend() -> String {
     "faster-whisper".into()
@@ -141,15 +234,47 @@ fn default_gemini_api_key_env_var() -> String {
     "GEMINI_API_KEY".into()
 }
 
+fn default_local_correction_base_url() -> String {
+    "http://127.0.0.1:11434/v1".into()
+}
+
+fn default_local_correction_model() -> String {
+    "qwen3:8b".into()
+}
+
+fn default_local_correction_max_tokens() -> usize {
+    4096
+}
+
 fn default_correction_instruction() -> String {
     String::new()
+}
+
+fn default_correction_mode() -> String {
+    "conservative".into()
 }
 
 fn default_translation_hotkey() -> String {
     "Ctrl+Shift+T".into()
 }
 
+fn default_theme() -> String {
+    "system".into()
+}
+
+fn default_translation_target_languages() -> Vec<String> {
+    vec!["en".into(), "ja".into()]
+}
+
+fn default_translation_target_language() -> String {
+    "en".into()
+}
+
 fn default_enabled_correction_feature() -> bool {
+    true
+}
+
+fn default_keep_failed_takes() -> bool {
     true
 }
 
@@ -166,15 +291,21 @@ impl Default for Settings {
         Self {
             ui_language: default_ui_language(),
             setup_complete: false,
-            hotkey: "Ctrl+Shift+Space".into(),
+            shortcuts: VoiceShortcuts::default(),
             translation_hotkey: default_translation_hotkey(),
             translation_instruction: String::new(),
+            theme: default_theme(),
+            interaction_sounds: false,
+            speech_locale: None,
+            translation_target_languages: default_translation_target_languages(),
+            translation_target_language: default_translation_target_language(),
             microphone_id: None,
-            history_enabled: true,
-            history_retention_days: 30,
+            history_retention: HistoryRetention::OneMonth,
             delete_audio_after_processing: true,
+            keep_failed_takes: default_keep_failed_takes(),
             auto_start: false,
             clipboard_restore: true,
+            live_target_insertion: false,
             noise_suppression: default_noise_suppression(),
             input_gain_percent: default_input_gain_percent(),
             automatic_gain: default_automatic_gain(),
@@ -190,13 +321,20 @@ impl Default for Settings {
             openai_api_key_env_var: default_openai_api_key_env_var(),
             gemini_correction_model: default_gemini_correction_model(),
             gemini_api_key_env_var: default_gemini_api_key_env_var(),
+            local_correction_base_url: default_local_correction_base_url(),
+            local_correction_model: default_local_correction_model(),
+            local_correction_max_tokens: default_local_correction_max_tokens(),
             correction_instruction: default_correction_instruction(),
+            correction_mode: default_correction_mode(),
             correction_remove_fillers: true,
             correction_remove_repetitions: true,
             correction_resolve_self_corrections: true,
             correction_auto_format: true,
             correction_improve_clarity: true,
             custom_models: Vec::new(),
+            personalization_enabled: false,
+            global_style_profile: None,
+            scoped_style_profiles: Vec::new(),
         }
     }
 }
@@ -214,25 +352,88 @@ pub struct HistoryItem {
     pub id: i64,
     pub transcript_text: String,
     pub processed_text: Option<String>,
+    pub source_text: Option<String>,
+    pub instruction_text: Option<String>,
+    pub action_kind: Option<String>,
+    pub search_site: Option<String>,
     pub mode: String,
     pub asr_provider: String,
     pub llm_provider: Option<String>,
+    pub target_language: Option<String>,
     pub app_category: Option<String>,
     pub duration_ms: Option<i64>,
     pub latency_ms: Option<i64>,
     pub created_at: String,
+    pub has_audio: bool,
+    pub retry_of_id: Option<i64>,
+    /// Fixed outcome code such as `clipboard_paste` or `clipboard_only`.
+    #[serde(default)]
+    pub insertion_result: Option<String>,
+    /// Fixed reason code for a non-confirmed outcome, never text content.
+    #[serde(default)]
+    pub insertion_detail: Option<String>,
+    /// Set only on a failed take kept for Retry outside the History and
+    /// audio settings: when it and its audio are deleted (RFC 3339, UTC).
+    #[serde(default)]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryFilter {
+    All,
+    Dictate,
+    Translate,
+    Edit,
+    Ask,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryRetention {
+    Never,
+    #[serde(rename = "24_hours")]
+    TwentyFourHours,
+    OneWeek,
+    #[default]
+    OneMonth,
+    ThreeMonths,
+    OneYear,
+    Forever,
+}
+
+impl HistoryRetention {
+    pub fn days(self) -> Option<i64> {
+        match self {
+            Self::Never => Some(0),
+            Self::TwentyFourHours => Some(1),
+            Self::OneWeek => Some(7),
+            Self::OneMonth => Some(30),
+            Self::ThreeMonths => Some(90),
+            Self::OneYear => Some(365),
+            Self::Forever => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct NewHistoryItem<'a> {
     pub transcript_text: &'a str,
     pub processed_text: Option<&'a str>,
+    pub source_text: Option<&'a str>,
+    pub instruction_text: Option<&'a str>,
+    pub action_kind: Option<&'a str>,
+    pub search_site: Option<&'a str>,
     pub mode: &'a str,
     pub asr_provider: &'a str,
     pub llm_provider: Option<&'a str>,
+    pub target_language: Option<&'a str>,
     pub app_category: Option<&'a str>,
     pub duration_ms: Option<i64>,
     pub latency_ms: Option<i64>,
+    pub retry_of_id: Option<i64>,
+    pub insertion_result: Option<&'a str>,
+    pub insertion_detail: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -245,6 +446,7 @@ pub struct DictionaryEntry {
     pub aliases: Vec<String>,
     pub priority: i64,
     pub app_scope: Option<String>,
+    pub source: String,
     pub created_at: String,
 }
 
@@ -271,6 +473,25 @@ pub struct DictionaryEntryInput {
     pub priority: i64,
     #[serde(default)]
     pub app_scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DictionaryCandidate {
+    pub id: i64,
+    pub original_span: String,
+    pub preferred_span: String,
+    /// Fixed marker of the narrow rule-based detector, not a measured
+    /// probability; it must not be presented as one.
+    pub confidence: f64,
+    pub history_id: Option<i64>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DictionaryImportInput {
+    pub csv: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -304,6 +525,19 @@ pub struct RecordingResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speech_locales_accept_japanese_korean_and_german() {
+        // update_settings rejects any speech locale outside this allowlist.
+        for locale in ["ja-JP", "ko-KR", "de-DE"] {
+            assert!(
+                SPEECH_LOCALES.contains(&locale),
+                "{locale} must be selectable"
+            );
+        }
+        let unique: std::collections::HashSet<_> = SPEECH_LOCALES.iter().collect();
+        assert_eq!(unique.len(), SPEECH_LOCALES.len());
+    }
 
     #[test]
     fn dictionary_entry_input_accepts_frontend_payload_without_optional_fields() {
@@ -343,6 +577,10 @@ mod tests {
         assert_eq!(settings.model_quantization, "4bit");
         assert_eq!(settings.api_base_url, "https://api.openai.com/v1");
         assert_eq!(settings.api_key_env_var, "OPENAI_API_KEY");
+        assert_eq!(settings.shortcuts.translate, ["Ctrl+Shift+Y"]);
+        assert_eq!(settings.shortcuts.edit, ["Ctrl+Shift+E"]);
+        assert_eq!(settings.translation_target_languages, ["en", "ja"]);
+        assert_eq!(settings.translation_target_language, "en");
         assert!(!settings.text_correction_enabled);
         assert_eq!(settings.correction_provider, "openai");
         assert_eq!(settings.openai_correction_model, "gpt-5.6-luna");
@@ -350,12 +588,38 @@ mod tests {
         assert_eq!(settings.openai_api_key_env_var, "OPENAI_API_KEY");
         assert_eq!(settings.gemini_correction_model, "gemini-flash-lite-latest");
         assert_eq!(settings.gemini_api_key_env_var, "GEMINI_API_KEY");
+        assert_eq!(
+            settings.local_correction_base_url,
+            "http://127.0.0.1:11434/v1"
+        );
+        assert_eq!(settings.local_correction_model, "qwen3:8b");
+        assert_eq!(settings.local_correction_max_tokens, 4096);
         assert!(settings.correction_instruction.is_empty());
+        assert_eq!(settings.correction_mode, "conservative");
         assert!(settings.correction_remove_fillers);
         assert!(settings.correction_remove_repetitions);
         assert!(settings.correction_resolve_self_corrections);
         assert!(settings.correction_auto_format);
         assert!(settings.correction_improve_clarity);
         assert!(settings.custom_models.is_empty());
+        assert!(!settings.live_target_insertion);
+    }
+
+    #[test]
+    fn default_settings_serialize_canonical_shortcut_arrays() {
+        let value = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(value["shortcuts"]["dictate"][0], "Ctrl+Shift+Space");
+        assert_eq!(value["shortcuts"]["translate"][0], "Ctrl+Shift+Y");
+        assert_eq!(value["theme"], "system");
+        assert_eq!(value["interactionSounds"], false);
+        assert!(value["speechLocale"].is_null());
+        for legacy in [
+            "hotkey",
+            "voiceTranslateHotkey",
+            "askHotkey",
+            "speakToEditHotkey",
+        ] {
+            assert!(value.get(legacy).is_none());
+        }
     }
 }

@@ -4,7 +4,7 @@
 //! handles are copied while the clipboard is open, then transferred one by
 //! one only after `SetClipboardData` succeeds.
 
-use super::{ClipboardExclusion, InjectionError};
+use super::{ClipboardExclusion, InjectionError, WriteError};
 use std::mem::size_of;
 use std::ptr;
 use std::thread;
@@ -43,7 +43,10 @@ const CF_PRIVATEFIRST: u32 = 0x0200;
 const CF_PRIVATELAST: u32 = 0x02ff;
 const MAX_FORMATS: usize = 128;
 const MAX_HGLOBAL: usize = 64 * 1024 * 1024;
-const RETRIES: usize = 10;
+/// Waits between attempts to open a clipboard that another process (a
+/// clipboard manager, rdpclip) holds open. About 155 ms in total, so a brief
+/// lock is not mistaken for a clipboard that cannot be preserved.
+const OPEN_BACKOFF_MS: [u64; 6] = [5, 10, 20, 30, 40, 50];
 
 #[derive(Debug)]
 pub(super) struct Snapshot {
@@ -186,11 +189,13 @@ fn owner_window() -> Result<HWND, InjectionError> {
 
 fn open_clipboard() -> Result<ClipboardGuard, InjectionError> {
     let owner = owner_window()?;
-    for _ in 0..RETRIES {
+    for delay in std::iter::once(0).chain(OPEN_BACKOFF_MS) {
+        if delay > 0 {
+            thread::sleep(Duration::from_millis(delay));
+        }
         if unsafe { OpenClipboard(owner) }.is_ok() {
             return Ok(ClipboardGuard { _owner: owner });
         }
-        thread::sleep(Duration::from_millis(10));
     }
     unsafe {
         let _ = DestroyWindow(owner);
@@ -379,6 +384,8 @@ fn apply_history_exclusion() -> bool {
     ok
 }
 
+/// A clipboard that stays locked is `ClipboardUnavailable`; one that opens
+/// but cannot be copied is `ClipboardUnpreservable`.
 pub(super) fn snapshot() -> Result<Snapshot, InjectionError> {
     let _guard = open_clipboard()?;
     let mut entries = Vec::new();
@@ -388,21 +395,41 @@ pub(super) fn snapshot() -> Result<Snapshot, InjectionError> {
             || format == CF_OWNERDISPLAY
             || (CF_PRIVATEFIRST..=CF_PRIVATELAST).contains(&format)
         {
-            return Err(InjectionError::ClipboardUnavailable);
+            return Err(InjectionError::ClipboardUnpreservable);
         }
         let handle = unsafe { GetClipboardData(format) }
-            .map_err(|_| InjectionError::ClipboardUnavailable)?;
-        let data = duplicate_entry(format, handle)?;
+            .map_err(|_| InjectionError::ClipboardUnpreservable)?;
+        let data =
+            duplicate_entry(format, handle).map_err(|_| InjectionError::ClipboardUnpreservable)?;
         entries.push(Entry { format, data });
         format = unsafe { EnumClipboardFormats(format) };
     }
     Ok(Snapshot { entries })
 }
 
-pub(super) fn write(text: &str, exclusion: ClipboardExclusion) -> Result<u32, InjectionError> {
+/// Only a failure after EmptyClipboard changed the clipboard; failing to open
+/// it (another process holds it, perhaps while placing a newer copy) did not.
+pub(super) fn write(text: &str, exclusion: ClipboardExclusion) -> Result<u32, WriteError> {
+    let mut emptied = false;
+    let result = write_opened(text, exclusion, &mut emptied);
+    // Closing materializes synthesized formats and advances the sequence.
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    match result {
+        Ok(()) => Ok(sequence),
+        Err(error) if emptied => Err(WriteError::AfterEmpty { error, sequence }),
+        Err(error) => Err(WriteError::Untouched(error)),
+    }
+}
+
+fn write_opened(
+    text: &str,
+    exclusion: ClipboardExclusion,
+    emptied: &mut bool,
+) -> Result<(), InjectionError> {
     {
         let _guard = open_clipboard()?;
         unsafe { EmptyClipboard() }.map_err(|_| InjectionError::ClipboardUnavailable)?;
+        *emptied = true;
         if exclusion == ClipboardExclusion::ExcludeFromHistory && !apply_history_exclusion() {
             return Err(InjectionError::ClipboardUnavailable);
         }
@@ -427,13 +454,19 @@ pub(super) fn write(text: &str, exclusion: ClipboardExclusion) -> Result<u32, In
             InjectionError::ClipboardUnavailable
         })?;
     }
-    // Closing materializes synthesized formats and advances the sequence.
-    Ok(unsafe { GetClipboardSequenceNumber() })
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_locked_clipboard_is_retried_for_a_bounded_time() {
+        let total: u64 = OPEN_BACKOFF_MS.iter().sum();
+        assert!((100..=200).contains(&total), "{total} ms");
+        assert!(OPEN_BACKOFF_MS.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
 
     #[test]
     #[ignore = "changes the real clipboard and requires an interactive Windows desktop"]

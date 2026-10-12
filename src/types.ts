@@ -33,16 +33,23 @@ export interface RecordingResult {
 
 export interface Settings {
   uiLanguage: UiLanguage;
+  theme: Theme;
+  interactionSounds: boolean;
+  speechLocale: SpeechLocale | null;
   setupComplete: boolean;
-  hotkey: string;
+  shortcuts: Record<ShortcutMode, string[]>;
   translationHotkey: string;
   translationInstruction: string;
+  translationTargetLanguages: string[];
+  translationTargetLanguage: string;
   microphoneId: string | null;
-  historyEnabled: boolean;
-  historyRetentionDays: number;
+  historyRetention: HistoryRetention;
   deleteAudioAfterProcessing: boolean;
+  /** Keep a failed take with its audio for 24 hours for Retry, even where History or audio retention is off. */
+  keepFailedTakes: boolean;
   autoStart: boolean;
   clipboardRestore: boolean;
+  liveTargetInsertion: boolean;
   noiseSuppression: NoiseSuppression;
   inputGainPercent: number;
   automaticGain: boolean;
@@ -58,21 +65,60 @@ export interface Settings {
   openaiApiKeyEnvVar: string;
   geminiCorrectionModel: string;
   geminiApiKeyEnvVar: string;
+  localCorrectionBaseUrl: string;
+  localCorrectionModel: string;
+  localCorrectionMaxTokens: number;
   correctionInstruction: string;
+  correctionMode: CorrectionMode;
   correctionRemoveFillers: boolean;
   correctionRemoveRepetitions: boolean;
   correctionResolveSelfCorrections: boolean;
   correctionAutoFormat: boolean;
   correctionImproveClarity: boolean;
   customModels: CustomModel[];
+  personalizationEnabled: boolean;
+  globalStyleProfile: StyleProfile | null;
+  scopedStyleProfiles: ScopedStyleProfile[];
 }
+/**
+ * Stored settings with the backend revision of the write that stored them.
+ * Revisions only grow, so a newer snapshot is one with a higher revision.
+ */
+export interface SettingsSnapshot { settings: Settings; revision: number; }
+export interface StyleProfile { formality: "formal" | "casual"; detail: "concise" | "detailed"; guidance?: string | null; }
+export interface ScopedStyleProfile { scope: string; profile: StyleProfile; }
 
-export type UiLanguage = "en" | "ja";
+export const uiLocaleRegistry = [
+  { tag: "en", label: "English" },
+  { tag: "ja", label: "Japanese" },
+] as const;
+export type UiLanguage = (typeof uiLocaleRegistry)[number]["tag"];
+export type Theme = "system" | "light" | "dark";
+export type ShortcutMode = "dictate" | "translate" | "ask" | "edit";
+export const speechLocaleRegistry = [
+  { tag: "ja-JP", label: "Japanese (Japan)" },
+  { tag: "en-US", label: "English (United States)" },
+  { tag: "en-GB", label: "English (United Kingdom)" },
+  { tag: "zh-CN", label: "Chinese (Simplified)" },
+  { tag: "zh-TW", label: "Chinese (Traditional)" },
+  { tag: "ko-KR", label: "Korean (South Korea)" },
+  { tag: "es-ES", label: "Spanish (Spain)" },
+  { tag: "es-MX", label: "Spanish (Mexico)" },
+  { tag: "fr-FR", label: "French (France)" },
+  { tag: "fr-CA", label: "French (Canada)" },
+  { tag: "de-DE", label: "German (Germany)" },
+  { tag: "pt-BR", label: "Portuguese (Brazil)" },
+  { tag: "pt-PT", label: "Portuguese (Portugal)" },
+] as const;
+export type SpeechLocale = (typeof speechLocaleRegistry)[number]["tag"];
+export type HistoryRetention = "never" | "24_hours" | "one_week" | "one_month" | "three_months" | "one_year" | "forever";
+export type HistoryFilter = "all" | "dictate" | "translate" | "edit" | "ask";
 
 export type AsrBackend = "vibevoice" | "faster-whisper" | "openai-compatible";
 export type ModelQuantization = "4bit" | "8bit" | "bf16";
 export type NoiseSuppression = "off" | "low" | "medium" | "high";
-export type CorrectionProvider = "openai" | "gemini";
+export type CorrectionProvider = "openai" | "gemini" | "local";
+export type CorrectionMode = "conservative" | "intent_aware";
 export type OpenAIReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface CustomModel {
@@ -84,13 +130,30 @@ export interface HistoryItem {
   id: number;
   transcriptText: string;
   processedText: string | null;
+  sourceText: string | null;
+  instructionText: string | null;
+  actionKind: string | null;
+  searchSite: string | null;
   mode: string;
   asrProvider: string;
   llmProvider: string | null;
+  targetLanguage: string | null;
   appCategory: string | null;
   durationMs: number | null;
   latencyMs: number | null;
   createdAt: string;
+  hasAudio: boolean;
+  retryOfId: number | null;
+  insertionResult: string | null;
+  insertionDetail: string | null;
+  /** Set only on a failed take kept for Retry outside the History settings: when it is deleted. */
+  expiresAt: string | null;
+}
+
+export interface HistoryAudioPayload {
+  bytes: ArrayBuffer;
+  filename: string;
+  mimeType: string;
 }
 
 export interface ModelStatus {
@@ -126,6 +189,7 @@ export interface DictionaryEntry {
   aliases: string[];
   priority: number;
   appScope: string | null;
+  source: "manual" | "auto";
   createdAt: string;
 }
 
@@ -136,4 +200,14 @@ export interface DictionaryEntryInput {
   aliases?: string[];
   priority?: number;
   appScope?: string | null;
+}
+
+export interface DictionaryCandidate {
+  id: number;
+  originalSpan: string;
+  preferredSpan: string;
+  /** Fixed marker of the rule-based detector, not a measured probability; do not display it as one. */
+  confidence: number;
+  historyId: number | null;
+  createdAt: string;
 }

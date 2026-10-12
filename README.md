@@ -7,10 +7,58 @@ Python ASR worker (VibeVoice, faster-whisper, or an OpenAI-compatible API).
 
 `Ctrl+Shift+Space` captures the foreground target and starts recording. Press it
 again to stop. The Windows capture backend converts input to a temporary 24 kHz
-mono PCM WAV, sends it to the persistent JSONL worker, and inserts the transcript
-using clipboard paste, Unicode input, or the available UI Automation path. If
-automatic insertion fails after the clipboard is populated, the transcript
-remains on the clipboard.
+mono PCM WAV, and sends it to the persistent JSONL worker. While you speak,
+partial text appears only in the recording overlay. After transcription and any
+AI correction, the final text is pasted once into the captured target with the
+clipboard and Ctrl+V (Shift+Insert in mintty, PuTTY, and Emacs). When the target's text can be read through UI Automation,
+the paste is verified and (with **Restore clipboard** on) the previous
+clipboard is restored; otherwise one
+guarded paste is sent unverified. With **Restore clipboard** on, the clipboard
+is saved before it is first written; if it holds data that cannot be saved
+(such as a very large image), nothing is pasted or copied and the result stays
+in the app (and History, when on) instead. Whenever the result is left on the clipboard
+(a copy instead of a paste, an unconfirmed paste, or a restore that failed),
+the notice says the previous clipboard was not restored. With it off, the
+clipboard is simply replaced. Clicking, scrolling, or typing while you
+speak or while the text is being recognized does not prevent insertion: before
+pasting, the app waits until input has been quiet for a moment (up to five
+seconds) and the field that was focused when recording started is focused
+again, then pastes at its current caret. In browsers and apps such as VS Code,
+where every field shares one window, the field is identified through UI
+Automation, so a click on another chat, panel, or the terminal never receives
+the text. If you clicked, scrolled, or typed after recording started, the paste
+also requires an empty selection and an IME confirmed to be inactive, so text
+you selected or an unfinished IME conversion is never overwritten; fields that
+cannot report either state get the clipboard instead. Without such input the
+field is as you left it when recording started, so text selected beforehand is
+replaced by the dictation as before. If a guard still fails (input does not
+settle, the original field is not focused again, an IME conversion, or a
+protected field), the text is copied to the clipboard instead. When History is
+on, it stores the outcome of each Dictate, Translate, and Edit insertion, with
+a fixed reason code for Dictate and Translate outcomes that were not confirmed.
+The recording overlay shows non-confirmed outcomes for a few seconds. Typing partial text into the target
+while speaking is an experimental opt-in (**Settings → Live text insertion**).
+
+`Ctrl+Shift+Y` starts the independent voice **Translate** mode. Press it again
+to stop, transcribe, translate into the configured target language, and insert
+only the translated result. Settings stores an ordered target-language list
+and the current target. The recording overlay shows that target and can cycle
+the list for the current recording.
+`Ctrl+Shift+T` remains the separate selected-text translation action.
+If saved hotkeys overlap, for example when an older selected-text translation
+hotkey is `Ctrl+Shift+Y`, the older action keeps the chord: recording, then
+selected-text translation, then voice Translate. The overlapped action stays off
+until it is assigned a different hotkey, and the main window names it.
+
+`Ctrl+Shift+E` starts **Speak to edit** for the text selected at that moment.
+Speak an instruction such as “make this concise” or “translate this to
+Japanese,” then press the shortcut again. The provider receives the immutable
+selected text and spoken instruction as separate untrusted fields and may only
+return replacement text. The replacement keeps the selection's leading and
+trailing spaces and line breaks. Deleting the selection is not an Edit result:
+an empty provider response is rejected and the selection is left unchanged. If
+focus, selection, user input, shortcut release, or IME safety checks fail, the
+original text is left alone and the generated edit remains on the clipboard.
 
 Audio is deleted after processing by default. Transcript history is optional and
 stored in the application SQLite database. Logs and status events must never
@@ -65,6 +113,39 @@ pnpm run tauri dev
 See [docs/adr/0004-default-asr-backend.md](docs/adr/0004-default-asr-backend.md)
 for the rationale behind the default backend choice.
 
+### Development data
+
+Debug builds (`pnpm run tauri dev`, `cargo build` without `--release`) keep
+their SQLite database and `history-audio` folder in a `dev` subfolder of the
+app data directory (`%APPDATA%\org.localvoice.input\dev\` on Windows), so
+development and destructive testing never touch the History, settings, or
+recordings of an installed release build. Release builds keep using the app
+data directory itself. Release data is never copied or migrated into `dev`;
+a fresh debug build starts with empty data. Worker logs stay in the shared
+app log directory.
+
+Debug builds also leave other release state alone. They never register or
+remove startup at Windows sign-in: toggling **Start with Windows** in a debug
+build only saves the setting and shows a notice. They also skip the startup
+cleanup of stale capture WAVs in the shared temporary folder, because those
+files cannot be told apart from ones a release instance keeps; delete old
+`local-ai-voice-*.wav` files there by hand if a debug build leaves any.
+
+To inspect release data from a debug build, opt in explicitly:
+
+```powershell
+$env:LVI_USE_RELEASE_DATA = "1"
+pnpm run tauri dev
+```
+
+Only the exact value `1` opts in. While it is set, the debug build opens and
+migrates the release database and recordings directly, so destructive tests
+and unreleased migrations then affect your real data. Quit any running
+release app first: the single-instance guard exists only in release builds,
+so nothing stops both from opening the same database and `history-audio`
+folder at once. Remove the variable (`Remove-Item Env:LVI_USE_RELEASE_DATA`)
+when you are done.
+
 ## Backends
 
 Three ASR backends are supported. The backend is selected via the `--backend`
@@ -94,8 +175,24 @@ can use OpenAI or a compatible local server. In **Models**, select
 **OpenAI-compatible API**, then configure the base URL and model ID. API secrets
 are not stored in application settings. The desktop app loads a local `.env`
 file at startup and reads the environment variable named in the UI (by default
-`OPENAI_API_KEY`). The `.env` file may be placed in the project directory during
-development or next to the desktop executable. Existing process/system
+`OPENAI_API_KEY`). Only the first existing `.env` is loaded (files are not
+merged), checked in this order:
+
+1. next to the desktop executable;
+2. the project directory: the nearest ancestor of the executable that
+   contains `asr_worker/__main__.py` (this is how autostart finds it);
+3. debug builds (`pnpm run tauri dev`) only: the working directory, then the
+   workspace above `src-tauri`.
+
+A `.env` at a drive root is never read. The Python worker is located the same
+way (working directory in debug builds only) and runs with the project
+directory (or, if none is found, the executable's folder) as its working
+directory, so relative paths passed to the worker, such as `PYTHONPATH`
+entries or local model paths, resolve against that directory rather than the
+directory the app was started from. The chosen project directory and `.env`
+path are printed to stderr at startup; they are visible only when the app is
+started from a console (for example `pnpm run tauri dev`), not from release
+builds started from a shortcut or autostart. Existing process/system
 environment variables take precedence over values from `.env`.
 
 ```powershell
@@ -113,7 +210,7 @@ For another compatible endpoint, set its `/v1` base URL. An unauthenticated
 local endpoint does not require the configured key environment variable to
 exist.
 
-### AI transcript correction (OpenAI or Gemini)
+### AI transcript correction (OpenAI, Gemini, or local)
 
 The optional correction stage runs after transcription and before text
 insertion. Its dedicated **AI text correction** card in **Settings** has a
@@ -124,6 +221,27 @@ enabled. The transcript text and preferred dictionary spellings are sent to
 the selected provider; recorded audio is not. If correction fails, the
 original transcript is inserted instead.
 
+For fully local correction, select **Local (OpenAI-compatible)** and configure
+the model ID and a numeric loopback base URL such as
+`http://127.0.0.1:11434/v1`. The app calls the Chat Completions endpoint,
+requires no API key, bypasses system proxies, rejects redirects, and refuses
+non-loopback hosts so transcript text cannot be sent to an obvious remote
+endpoint through this provider. The local model server itself is not bundled
+or started by the app. The endpoint URL and model ID are saved when the field
+loses focus or Enter is pressed (Escape reverts the draft), so they can be
+edited from an empty draft.
+The local output token limit defaults to 4096 and can be set from 128 to
+32768; some servers count thinking tokens toward this limit. When a response
+stops at this limit (`finish_reason: "length"`), the original transcript is
+used and the notice says that the local output token limit was reached;
+increase it, subject to the server's context and memory limits.
+A leading `<think>...</think>` block in the response text is removed before it
+reaches the preview or the inserted result; a response whose leading think
+block never closes falls back to the original transcript.
+Local requests use a 10-second connect timeout and fail when no data arrives
+for 90 seconds, with no total deadline, so a long generation that keeps
+streaming is not cut off.
+
 The automatic editor has independent switches for:
 
 - filler removal, while retaining hesitation or discourse markers that carry meaning;
@@ -131,6 +249,20 @@ The automatic editor has independent switches for:
 - resolving explicit spoken self-corrections to the speaker's final revision;
 - formatting spoken lists, steps, action items, and key points;
 - light clarity and grammar repair without changing meaning, tone, or formality.
+
+Correction mode defaults to **Conservative**, which keeps the spoken order. The
+optional **Intent-aware** mode may organize the current transcript across its
+utterance order, apply a later explicit correction consistently, merge duplicate
+information, and select paragraph or list structure. The provider is instructed
+not to add details; the mode does not learn automatically or use context beyond
+the current transcript and selected profile. Only intent-aware results are
+checked after correction: a result that drops or adds URLs, digit-bearing
+tokens, backtick code, or listed explicit uncertainty markers is discarded and
+the original transcript is used. This check is syntactic, so it cannot detect
+changed names, spelled-out numbers, unquoted code, domains without a scheme, or
+other invented details; review important text before relying on it.
+Conservative results are inserted without this additional check, exactly as
+before the mode switch existed.
 
 For OpenAI correction, reasoning effort can be set to `none`, `low`, `medium`,
 `high`, `xhigh`, or `max`. Higher values can improve difficult corrections at
@@ -147,18 +279,20 @@ only dictionary aliases actually found in the transcript, caps optional style
 guidance at 500 characters, requests minimal/no reasoning on supported models,
 and sets an output-token limit based on the transcript length.
 
-Correction responses are consumed as server-sent events from both the OpenAI
-Responses API and Gemini Interactions API. As soon as ASR finishes, the
-raw transcript is inserted into the captured target as provisional text. The
-first correction delta replaces that draft and later deltas are appended while
-the API is still generating; the always-on-top status overlay mirrors the same
-progress. A short-lived helper process observes keyboard and pointer activity
-during this replacement session. It reports only activity counters (never key
-values or typed text), ignores this application's tagged input, and never
-suppresses an event. If the user types, clicks, changes focus, starts IME
-composition, or the monitor becomes unavailable, live replacement stops and
-the completed result is left on the clipboard instead of modifying the target
-again.
+Correction responses are consumed as server-sent events from the OpenAI
+Responses API, Gemini Interactions API, and compatible local Chat Completions
+servers; non-streaming local responses are also accepted. Correction deltas
+stream into the always-on-top recording overlay, and the corrected text is
+inserted once when correction completes. With the experimental **Live text
+insertion** setting on, the raw transcript is first inserted as provisional
+text and the corrected result replaces it. A short-lived helper process observes
+keyboard and pointer activity from the start of recording until insertion. It
+reports only activity counters (never key values or typed text), ignores this
+application's tagged input, and never suppresses an event. The default final
+paste only waits for that activity to settle. With live text insertion on, any
+typing, click, focus change, or IME composition after recording starts, or an
+unavailable monitor, leaves the result on the clipboard instead of modifying
+the target.
 
 All fixed prompt text and prompt-size limits are centralized in
 `src-tauri/src/correction_prompt.rs` under the `Prompt tuning` block. Edit that
@@ -177,6 +311,13 @@ GEMINI_API_KEY=...
 
 Correction is disabled by default. The default model IDs can be changed in the
 UI without rebuilding the application.
+
+Manual provider quality check: with an explicitly configured OpenAI or Gemini
+credential, test conservative and intent-aware correction on Japanese and
+English dictation containing a name, URL, number, code span, and uncertainty.
+Confirm that intent-aware organization improves only the current transcript and
+never adds a concrete fact. This check is intentionally opt-in because it sends
+the sample text to the selected provider and may incur charges.
 
 ## Serve a local model through the OpenAI API shape
 
@@ -208,8 +349,20 @@ with open("sample.wav", "rb") as audio:
 print(result.text)
 ```
 
-The local server currently provides non-streaming transcription and does not
-provide diarization or token log probabilities.
+With `stream=true` (and the `json` or `text` response format) the server sends
+OpenAI-style server-sent events: one `transcript.text.delta` per decoded
+segment, then `transcript.text.done` with the whole text. faster-whisper
+streams segments as they are decoded; the other backends send their transcript
+as a single delta.
+
+```python
+stream = client.audio.transcriptions.create(model="local-asr", file=audio, stream=True)
+for event in stream:
+    if event.type == "transcript.text.delta":
+        print(event.delta, end="", flush=True)
+```
+
+The local server does not provide diarization or token log probabilities.
 
 ## Checks
 
@@ -245,15 +398,36 @@ Full usage and Phase 0 gate criteria are documented in
 
 - Local processing remains the default. Cloud/API processing is used only when
   the OpenAI-compatible backend is explicitly selected.
-- History can be disabled; when disabled, transcript rows are not written.
-- Temporary WAV deletion defaults to enabled.
+- History can be disabled; when disabled, transcript rows are not written
+  (failed recordings kept for Retry are the exception described below).
+- Usage metrics (event type, provider, duration, success, and error code; no
+  text) follow History: they are not recorded while History is off, are
+  deleted with the History retention window, and are removed by Delete all.
+- Temporary WAV deletion defaults to enabled. When History is on and "Delete
+  audio after processing" is off, History keeps a copy of each new recording
+  for playback, download, and Retry. Turning it on stops keeping new recordings
+  but does not delete recordings already in History; delete them there or let
+  History retention remove them.
+- "Keep failed recordings for 24 hours" (Privacy, on by default) is the one
+  exception to these settings. When transcription fails (Dictate, Translate,
+  or Edit), the recording is kept with its audio as a History item for Retry,
+  even if History is set to Never or "Delete audio after processing" is on;
+  for Edit, the selected text is kept with it, because Retry needs it. Unless
+  History with audio keeps it (including when you turn that on later), it is
+  deleted, recording and selected text alike, 24 hours after the failure (checked at startup and whenever History is
+  listed or written), or as soon as a Retry succeeds; the Retry result follows
+  the normal History and audio settings. Turning the setting off deletes such
+  recordings; failed recordings are then kept only when History keeps audio.
 - The captured target must still be foreground and non-secure at insertion time.
 - UI Automation security inspection exists and is used to avoid secure targets.
-  Direct UI Automation insertion is available where supported, but some controls
-  may still fall back to clipboard paste, Unicode input, or clipboard-only
-  behavior.
+  Text is entered by clipboard paste only; UI Automation reads the target to
+  verify the paste. Controls that cannot be read back (for example some browser
+  and code-editor fields) receive one unverified paste, and live text insertion
+  in them may keep only the first fragment.
 - Elevated applications, password controls, and secure controls are not forced.
 - Model download progress/resume UI and checksum verification remain future model
   management work; Transformers manages the current cache download.
 - The default shortcut is registered at startup, and persisted custom shortcuts
-  are re-registered on launch.
+  are re-registered on launch. If another app holds a saved hotkey, the app
+  names the action that stays unavailable; saving other settings still works,
+  while choosing a new hotkey that cannot be registered is rejected.
