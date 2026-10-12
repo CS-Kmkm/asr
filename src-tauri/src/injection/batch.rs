@@ -193,6 +193,22 @@ pub(super) fn insert_monitored<B: Backend>(
     checkpoint: u64,
     cancel: &watch::Receiver<bool>,
 ) -> Result<InsertResult, InjectionError> {
+    insert_final(
+        backend, options, text, target, monitor, checkpoint, cancel, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn insert_final<B: Backend>(
+    backend: &B,
+    options: InjectionOptions,
+    text: &str,
+    target: &TargetWindow,
+    monitor: &InputMonitor,
+    checkpoint: u64,
+    cancel: &watch::Receiver<bool>,
+    allow_unverified: bool,
+) -> Result<InsertResult, InjectionError> {
     if *cancel.borrow() {
         return Err(InjectionError::Cancelled);
     }
@@ -205,6 +221,30 @@ pub(super) fn insert_monitored<B: Backend>(
         return copy_only(backend, text);
     }
     let Ok(before) = backend.target_text(target) else {
+        if allow_unverified {
+            backend.clipboard_write(text, ClipboardExclusion::ExcludeFromHistory)?;
+            if *cancel.borrow() {
+                return Err(InjectionError::Cancelled);
+            }
+            // Recheck after clipboard access, before queueing exactly one paste.
+            if safe(
+                backend,
+                target,
+                Some((monitor, checkpoint)),
+                SafetyPolicy::Additive,
+            ) {
+                return Ok(
+                    if backend
+                        .paste(target, SafetyPolicy::Additive)
+                        .unwrap_or(false)
+                    {
+                        InsertResult::PasteUnverified
+                    } else {
+                        InsertResult::ClipboardOnly
+                    },
+                );
+            }
+        }
         return copy_only(backend, text);
     };
     paste(
@@ -873,6 +913,89 @@ mod tests {
         let monitor = InputMonitor::default();
         monitor.test_set_available(true);
         monitor
+    }
+
+    #[test]
+    fn final_text_pastes_once_after_an_unreadable_live_target() {
+        let backend = MockBackend::new();
+        backend.text_readable.set(false);
+        let monitor = monitor();
+        let checkpoint = monitor.checkpoint().unwrap();
+        let session = begin_live(
+            &backend,
+            InjectionOptions::default(),
+            "draft",
+            &target(),
+            &monitor,
+            checkpoint,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!session.paste_was_queued());
+        assert!(!backend.calls.borrow().contains(&"paste"));
+        let (_sender, cancel) = watch::channel(false);
+        assert_eq!(
+            insert_final(
+                &backend,
+                InjectionOptions::default(),
+                "final",
+                &target(),
+                &monitor,
+                checkpoint,
+                &cancel,
+                true
+            )
+            .unwrap(),
+            InsertResult::PasteUnverified
+        );
+        assert_eq!(backend.content(), "prefix final suffix");
+        assert_eq!(
+            backend
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| **call == "paste")
+                .count(),
+            1
+        );
+        assert!(!backend.calls.borrow().contains(&"restore"));
+    }
+
+    #[test]
+    fn final_unverified_paste_respects_target_activity_modifiers_and_cancel() {
+        for reason in ["target", "input", "modifiers", "cancel", "ime"] {
+            let backend = MockBackend::new();
+            backend.text_readable.set(false);
+            let monitor = monitor();
+            let checkpoint = monitor.checkpoint().unwrap();
+            let (sender, cancel) = watch::channel(false);
+            match reason {
+                "target" => backend.target_valid.set(false),
+                "input" => monitor.test_record_input(),
+                "modifiers" => monitor.test_set_async_modifier_pending(true),
+                "cancel" => {
+                    sender.send_replace(true);
+                }
+                "ime" => backend.ime.set(Some(true)),
+                _ => unreachable!(),
+            }
+            let result = insert_final(
+                &backend,
+                InjectionOptions::default(),
+                "final",
+                &target(),
+                &monitor,
+                checkpoint,
+                &cancel,
+                true,
+            );
+            if reason == "cancel" {
+                assert_eq!(result, Err(InjectionError::Cancelled));
+            } else {
+                assert_eq!(result.unwrap(), InsertResult::ClipboardOnly);
+            }
+            assert!(!backend.calls.borrow().contains(&"paste"), "{reason}");
+        }
     }
 
     #[test]

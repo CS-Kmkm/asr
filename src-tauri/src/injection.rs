@@ -234,6 +234,26 @@ impl SystemTextInjector {
             .map(|_| ())
     }
 
+    pub(crate) fn insert_final(
+        &self,
+        text: &str,
+        target: &TargetWindow,
+        monitor: &InputMonitor,
+        checkpoint: u64,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<InsertResult, InjectionError> {
+        batch::insert_final(
+            &self.backend,
+            self.options,
+            text,
+            target,
+            monitor,
+            checkpoint,
+            cancel,
+            true,
+        )
+    }
+
     pub(crate) fn insert_monitored(
         &self,
         text: &str,

@@ -6,6 +6,7 @@ mod audio;
 mod commands;
 mod correction;
 mod correction_prompt;
+mod decision;
 mod injection;
 mod input_monitor;
 mod live_dictation;
@@ -267,6 +268,7 @@ fn is_external_ask_target(target: &TargetWindow) -> bool {
 }
 
 pub(crate) struct AskSession {
+    decision_ready: bool,
     pub(crate) capture: AskCapture,
     pub(crate) injector: SystemTextInjector,
     pub(crate) monitor: Option<Arc<InputMonitor>>,
@@ -275,6 +277,20 @@ pub(crate) struct AskSession {
 
 impl AskSession {
     fn new(settings: &Settings, active_hotkey: &str, from_shortcut: bool) -> Self {
+        Self::capture(
+            settings,
+            active_hotkey,
+            from_shortcut,
+            &settings.shortcuts.ask,
+        )
+    }
+
+    fn capture(
+        settings: &Settings,
+        active_hotkey: &str,
+        from_shortcut: bool,
+        shortcuts: &[String],
+    ) -> Self {
         let injector = SystemTextInjector::new(InjectionOptions {
             restore_clipboard: settings.clipboard_restore,
         });
@@ -298,11 +314,7 @@ impl AskSession {
         let monitor = match &capture {
             AskCapture::Selected(_) | AskCapture::Caret(_) => {
                 let monitor = Arc::new(InputMonitor::default());
-                if monitor.start_for_recording(
-                    active_hotkey,
-                    &settings.shortcuts.ask,
-                    from_shortcut,
-                ) {
+                if monitor.start_for_recording(active_hotkey, shortcuts, from_shortcut) {
                     Some(monitor)
                 } else {
                     None
@@ -321,7 +333,31 @@ impl AskSession {
             injector,
             monitor,
             checkpoint,
+            decision_ready: true,
         }
+    }
+
+    fn take_edit(&mut self, settings: &Settings) -> Result<EditSession, String> {
+        let capture = std::mem::replace(&mut self.capture, AskCapture::Unavailable);
+        let AskCapture::Selected(selection) = capture else {
+            return Err("Select text before recording an edit instruction.".into());
+        };
+        let monitor = self
+            .monitor
+            .take()
+            .ok_or("The original selection could not be monitored safely.")?;
+        let checkpoint = self
+            .checkpoint
+            .take()
+            .ok_or("The original selection could not be monitored safely.")?;
+        Ok(EditSession {
+            selection,
+            injector: SystemTextInjector::new(InjectionOptions {
+                restore_clipboard: settings.clipboard_restore,
+            }),
+            monitor,
+            checkpoint,
+        })
     }
 
     pub(crate) fn kind(&self) -> AskContextKind {

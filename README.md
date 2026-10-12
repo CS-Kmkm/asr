@@ -54,16 +54,34 @@ intentionally disabled for VibeVoice. A current NVIDIA driver with
 
 ## Setup
 
+### ローカル音声モード判定
+
+`Ctrl+Shift+Space` の自動判定には、アプリ内の常駐Pythonワーカーで
+Clef-Flash（9B）を実行します。判定に外部APIや別サーバーは使いません。
+編集・翻訳・回答の生成には、既存のAIプロバイダー設定を使います。
+
+```powershell
+uv sync --extra decision
+# HTTP ASRサーバーも使う場合は --extra serve を追加
+```
+
+設定の「音声モードの自動判定」を有効にして、モデルを読み込んでください。
+初回は公式リリースの重みをHugging Faceキャッシュへ取得します。
+Clef-Flashの重みは約19GBです。取得用の一時領域も必要で、4-bitでもダウンロード容量は減りません。
+既定はClef-Flash / 4-bitです。4-bitと8-bitはCUDA GPUが必要です。
+GPUを使わない場合は自動判定を無効にするか、十分なメモリを用意してBF16を選びます。
+対象の文章を編集・翻訳する場合は、録音開始前に文章を選択します。
+判定が不明確な場合、選択の有無を確認できない入力欄も含め、原文は変更しません。
+各モード専用のショートカットは従来どおり使えます。
+
 ```powershell
 pnpm install
-py -3.10 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -e .
+uv sync --extra decision
 $env:ASR_PYTHON = "$PWD\.venv\Scripts\python.exe"
 pnpm run tauri dev
 ```
 
-`pip install -e .` installs the default faster-whisper stack (CPU-capable, no
+`uv sync` installs the default faster-whisper stack (CPU-capable, no
 GPU required). Select **Load ASR model** before the first dictation. The worker
 downloads `large-v3-turbo` from Hugging Face on first load and uses the normal
 Hugging Face cache. The model is not bundled with the app.
@@ -72,7 +90,7 @@ To use the optional VibeVoice backend (GPU required, long-form/high-accuracy),
 install its extra dependencies and select it in Settings:
 
 ```powershell
-pip install -e ".[vibevoice]"
+uv sync --extra decision --extra vibevoice
 # then: Settings → ASR backend → VibeVoice (GPU)
 ```
 

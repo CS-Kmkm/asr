@@ -47,6 +47,9 @@ export interface Settings {
   deleteAudioAfterProcessing: boolean;
   autoStart: boolean;
   clipboardRestore: boolean;
+  automaticVoiceMode: boolean;
+  decisionModel: string;
+  decisionQuantization: "4bit" | "8bit" | "bf16";
   noiseSuppression: NoiseSuppression;
   inputGainPercent: number;
   automaticGain: boolean;

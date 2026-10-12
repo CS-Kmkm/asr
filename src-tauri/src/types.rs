@@ -48,6 +48,12 @@ pub struct Settings {
     pub delete_audio_after_processing: bool,
     pub auto_start: bool,
     pub clipboard_restore: bool,
+    #[serde(default = "default_enabled_correction_feature")]
+    pub automatic_voice_mode: bool,
+    #[serde(default = "default_decision_model")]
+    pub decision_model: String,
+    #[serde(default = "default_decision_quantization")]
+    pub decision_quantization: String,
     #[serde(default = "default_noise_suppression")]
     pub noise_suppression: String,
     #[serde(default = "default_input_gain_percent")]
@@ -190,6 +196,13 @@ fn default_noise_suppression() -> String {
     "medium".into()
 }
 
+fn default_decision_model() -> String {
+    "Cloudflare/clef-flash".into()
+}
+fn default_decision_quantization() -> String {
+    "4bit".into()
+}
+
 fn default_correction_provider() -> String {
     "openai".into()
 }
@@ -280,6 +293,9 @@ impl Default for Settings {
             delete_audio_after_processing: true,
             auto_start: false,
             clipboard_restore: true,
+            automatic_voice_mode: true,
+            decision_model: default_decision_model(),
+            decision_quantization: default_decision_quantization(),
             noise_suppression: default_noise_suppression(),
             input_gain_percent: default_input_gain_percent(),
             automatic_gain: default_automatic_gain(),
@@ -527,6 +543,9 @@ mod tests {
             "modelId": null
         }"#;
         let settings: Settings = serde_json::from_str(stored).unwrap();
+        assert!(settings.automatic_voice_mode);
+        assert_eq!(settings.decision_model, "Cloudflare/clef-flash");
+        assert_eq!(settings.decision_quantization, "4bit");
         assert_eq!(settings.asr_backend, "faster-whisper");
         assert_eq!(settings.ui_language, "ja");
         assert_eq!(settings.model_quantization, "4bit");

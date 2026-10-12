@@ -100,6 +100,11 @@ impl LiveDraft {
             }
             self.pasted |= self.session.as_ref().is_some_and(|s| s.paste_was_queued());
             if !self.pasted {
+                // Live text requires a readable range; a final additive paste
+                // is still allowed if no input was queued and guards hold.
+                self.session.take();
+            }
+            if !self.pasted {
                 return Err(injection::InjectionError::BackendFailure(
                     "live insertion could not be verified",
                 ));
@@ -109,21 +114,22 @@ impl LiveDraft {
         Ok(())
     }
 
-    pub(crate) fn finish(&mut self, text: &str) -> Result<InsertResult, injection::InjectionError> {
-        if self.defer_insertion && self.session.is_none() && !self.attempted {
+    pub(crate) fn finish(
+        &mut self,
+        text: &str,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<InsertResult, injection::InjectionError> {
+        if self.session.is_none() && !self.pasted && self.can_insert_final(text) {
             self.attempted = true;
-            if self.can_insert_final(text) {
-                self.session = self.injector.begin_live_provisional(
-                    text,
-                    &self.target,
-                    &self.monitor,
-                    self.checkpoint.expect("checkpoint was verified"),
-                )?;
-                self.pasted |= self
-                    .session
-                    .as_ref()
-                    .is_some_and(|session| session.paste_was_queued());
-            }
+            let result = self.injector.insert_final(
+                text,
+                &self.target,
+                &self.monitor,
+                self.checkpoint.expect("checkpoint was verified"),
+                cancel,
+            )?;
+            self.pasted |= result != InsertResult::ClipboardOnly;
+            return Ok(result);
         }
         if let Some(session) = self.session.as_mut() {
             self.injector

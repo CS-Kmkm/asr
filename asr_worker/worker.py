@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, TextIO
 
 from .backends import Backend, BackendError, create_backend
+from .decision import DecisionModel
 
 
 def _configure_protocol_stdio() -> None:
@@ -75,6 +76,7 @@ class Worker:
     ) -> None:
         self.backend = backend
         self.loaded = False
+        self.decision = DecisionModel()
         # Assigned by serve() so a load can report progress before its response.
         self.notify = notify
 
@@ -91,6 +93,18 @@ class Worker:
             return error_response(None, "invalid_request", "Request id is required"), False
         operation = request.get("command", request.get("op"))
         try:
+            if operation == "load_decision":
+                model = request.get("model")
+                quantization = request.get("quantization", "4bit")
+                if not isinstance(model, str) or not isinstance(quantization, str):
+                    return error_response(request_id, "invalid_request", "Decision model and quantization must be strings"), False
+                self.decision.load(model, quantization, lambda update: self._emit_progress(request_id, update))
+                return {"id": request_id, "ok": True, "model": model}, False
+
+            if operation == "classify_decision":
+                result = self.decision.classify(request.get("input"))
+                return {**result, "id": request_id, "ok": True}, False
+
             if operation == "load":
                 quantization = request.get("quantization", "4bit")
                 if not isinstance(quantization, str):
@@ -154,10 +168,11 @@ class Worker:
                 }, False
 
             if operation == "shutdown":
+                self.decision.unload()
                 self.backend.unload()
                 self.loaded = False
                 return {"id": request_id, "ok": True}, True
-            return error_response(request_id, "unsupported_operation", "Supported operations: load, transcribe, shutdown"), False
+            return error_response(request_id, "unsupported_operation", "Supported operations: load, transcribe, load_decision, classify_decision, shutdown"), False
         except BackendError as exc:
             return error_response(request_id, exc.code, exc.message), operation == "shutdown"
         except BaseException as exc:

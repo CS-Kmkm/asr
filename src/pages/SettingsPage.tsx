@@ -311,6 +311,17 @@ export function SettingsPage({
         <p className="settings-note">{t("Muting or pausing other applications is unavailable because this app cannot safely control their audio.")}</p>
 
         <h3>{t("Voice mode shortcuts")}</h3>
+        <SettingRow title={t("Automatic voice mode")} detail={t("The Dictation shortcut chooses Dictate, Translate, Edit or Ask from your speech. Select text before asking to edit or translate it. Insertion waits until the decision is complete. Other mode shortcuts stay fixed.")}
+          control={<Toggle checked={settings.automaticVoiceMode} onChange={(value) => onSave({ automaticVoiceMode: value })} />} />
+        <SettingRow title={t("Decision model")} detail={t("Voice mode detection runs locally. Model files download on first load and stay cached. Editing, translation and answers still use the configured AI provider.")}
+          control={<select value={settings.decisionModel} onChange={(event) => onSave({ decisionModel: event.target.value })}>
+            <option value="Cloudflare/clef-flash">Clef-Flash (9B)</option>
+            <option value="Cloudflare/clef">Clef (27B)</option>
+          </select>} />
+        <SettingRow title={t("Decision model quantization")} detail={t("4-bit uses less GPU memory. Load models again after changing the decision model or quantization.")}
+          control={<select value={settings.decisionQuantization} onChange={(event) => onSave({ decisionQuantization: event.target.value as Settings["decisionQuantization"] })}>
+            <option value="4bit">4-bit</option><option value="8bit">8-bit</option><option value="bf16">BF16</option>
+          </select>} />
         <p>{t("Add one to four keyboard shortcuts for each voice mode. A shortcut must be unique across all actions.")}</p>
         {shortcutModes.map(({ mode, label }) => (
           <SettingRow key={mode} title={t(label)} detail={`${t("Enter a shortcut chord such as Ctrl+Shift+Space.")} ${mode === "edit"

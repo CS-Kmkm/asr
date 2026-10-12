@@ -140,6 +140,8 @@ const MODEL_PREPARATION_KINDS = ["model_loading", "model_downloading"];
 
 const WARNING_STATUS_KINDS = new Set([
   "artifact_cleanup_failed",
+  "decision_model_unavailable",
+  "voice_mode_fallback",
   "history_audio_unavailable",
   "history_audio_and_metric_save_failed",
   "history_save_failed",

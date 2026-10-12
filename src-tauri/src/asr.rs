@@ -116,6 +116,25 @@ pub enum AsrError {
 #[async_trait]
 pub trait Transcriber: Send + Sync {
     async fn load(&self, quantization: &str) -> Result<(), AsrError>;
+    async fn load_decision(
+        &self,
+        _model: &str,
+        _quantization: &str,
+        _cancel: Option<watch::Receiver<bool>>,
+    ) -> Result<(), AsrError> {
+        Err(AsrError::Protocol(
+            "local decision model is unavailable".into(),
+        ))
+    }
+    async fn classify_decision(
+        &self,
+        _input: Value,
+        _cancel: watch::Receiver<bool>,
+    ) -> Result<Value, AsrError> {
+        Err(AsrError::Protocol(
+            "local decision model is unavailable".into(),
+        ))
+    }
     async fn transcribe(
         &self,
         audio_path: &Path,
@@ -451,6 +470,23 @@ fn transcribe_request(
 
 #[async_trait]
 impl Transcriber for JsonlTranscriber {
+    async fn load_decision(
+        &self,
+        model: &str,
+        quantization: &str,
+        cancel: Option<watch::Receiver<bool>>,
+    ) -> Result<(), AsrError> {
+        self.request(json!({"id":self.next_id.fetch_add(1, Ordering::Relaxed),"command":"load_decision","model":model,"quantization":quantization}),cancel,self.load_timeout).await?;
+        Ok(())
+    }
+
+    async fn classify_decision(
+        &self,
+        input: Value,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Value, AsrError> {
+        self.request(json!({"id":self.next_id.fetch_add(1, Ordering::Relaxed),"command":"classify_decision","input":input}),Some(cancel),Duration::from_secs(30)).await
+    }
     async fn load(&self, quantization: &str) -> Result<(), AsrError> {
         let request = json!({
             "id": self.next_id.fetch_add(1, Ordering::Relaxed),

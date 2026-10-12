@@ -13,6 +13,27 @@ from asr_worker.worker import Worker, _configure_protocol_stdio, serve
 
 
 class WorkerTests(unittest.TestCase):
+    def test_local_decision_commands_share_the_persistent_worker(self) -> None:
+        worker = Worker(MockBackend())
+        with patch.object(worker.decision, "load") as load, patch.object(worker.decision, "classify", return_value={"answers": {"mode": {"choice": "dictate"}}}) as classify:
+            response, stop = worker.handle({"id": 3, "command": "load_decision", "model": "Cloudflare/clef-flash", "quantization": "4bit"})
+            self.assertTrue(response["ok"])
+            self.assertFalse(stop)
+            load.assert_called_once()
+            response, _ = worker.handle({"id": 4, "command": "classify_decision", "input": {"state": "synthetic"}})
+            self.assertTrue(response["ok"])
+            self.assertEqual(response["answers"]["mode"]["choice"], "dictate")
+            classify.assert_called_once_with({"state": "synthetic"})
+
+    def test_local_decision_rejects_missing_model_and_invalid_load_without_breaking_asr(self) -> None:
+        worker = Worker(MockBackend())
+        response, _ = worker.handle({"id": 1, "command": "classify_decision", "input": {}})
+        self.assertEqual(response["error"]["code"], "decision_not_loaded")
+        response, _ = worker.handle({"id": 2, "command": "load_decision", "model": "untrusted/repo"})
+        self.assertEqual(response["error"]["code"], "invalid_decision_model")
+        response, _ = worker.handle({"id": 3, "command": "load"})
+        self.assertTrue(response["ok"])
+
     def test_protocol_stdio_is_forced_to_utf8(self) -> None:
         input_bytes = io.BytesIO()
         output_bytes = io.BytesIO()

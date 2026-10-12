@@ -2,6 +2,18 @@ import { createContext, useContext, useMemo, type ReactNode } from "react";
 import type { UiLanguage } from "./types";
 
 const en = {
+  "The local voice decision model is unavailable. Automatic mode detection will be skipped.": "The local voice decision model is unavailable. Automatic mode detection will be skipped.",
+  "Automatic voice mode": "Automatic voice mode",
+  "Decision model": "Decision model",
+  "Decision model quantization": "Decision model quantization",
+  "Voice mode detection runs locally. Model files download on first load and stay cached. Editing, translation and answers still use the configured AI provider.": "Voice mode detection runs locally. Model files download on first load and stay cached. Editing, translation and answers still use the configured AI provider.",
+  "4-bit uses less GPU memory. Load models again after changing the decision model or quantization.": "4-bit uses less GPU memory. Load models again after changing the decision model or quantization.",
+  "The Dictation shortcut chooses Dictate, Translate, Edit or Ask from your speech. Select text before asking to edit or translate it. Insertion waits until the decision is complete. Other mode shortcuts stay fixed.": "The Dictation shortcut chooses Dictate, Translate, Edit or Ask from your speech. Select text before asking to edit or translate it. Insertion waits until the decision is complete. Other mode shortcuts stay fixed.",
+  "Loading the local voice decision model.": "Loading the local voice decision model.",
+  "Downloading the local voice decision model. Later starts use the local cache.": "Downloading the local voice decision model. Later starts use the local cache.",
+  "Choosing a voice mode from your instruction.": "Choosing a voice mode from your instruction.",
+  "Voice mode detection was unavailable or uncertain; using Dictate.": "Voice mode detection was unavailable or uncertain; using Dictate.",
+  "Voice mode was uncertain; the selected text was not changed. Use a mode shortcut or a clearer instruction.": "Voice mode was uncertain; the selected text was not changed. Use a mode shortcut or a clearer instruction.",
   "Ask Anything": "Ask Anything",
   "Dictation": "Dictation",
   "Selected-text translation": "Selected-text translation",
@@ -242,6 +254,18 @@ const en = {
 } as const;
 export type MessageKey = keyof typeof en;
 const ja: Record<MessageKey, string> = {
+  "The local voice decision model is unavailable. Automatic mode detection will be skipped.": "ローカルの音声判断モデルを読み込めませんでした。音声モードの自動判定を見送ります。",
+  "Automatic voice mode": "音声モードの自動判定",
+  "Decision model": "判断モデル",
+  "Decision model quantization": "判断モデルの量子化",
+  "Voice mode detection runs locally. Model files download on first load and stay cached. Editing, translation and answers still use the configured AI provider.": "音声モードはローカルモデルで判定します。初回読み込み時にモデルを取得し、以後はキャッシュを使います。編集・翻訳・回答の生成は、設定したAIプロバイダーを使います。",
+  "4-bit uses less GPU memory. Load models again after changing the decision model or quantization.": "4-bitはGPUメモリの使用量を抑えます。モデルや量子化を変更したら、モデルを再読み込みしてください。",
+  "The Dictation shortcut chooses Dictate, Translate, Edit or Ask from your speech. Select text before asking to edit or translate it. Insertion waits until the decision is complete. Other mode shortcuts stay fixed.": "Dictationのショートカットで、発話から文字入力・翻訳・編集・質問を選びます。文章の編集や翻訳は、先に対象を選択してください。判定が終わってから挿入します。各モード専用のショートカットも使えます。",
+  "Loading the local voice decision model.": "ローカルの音声判断モデルを読み込んでいます。",
+  "Downloading the local voice decision model. Later starts use the local cache.": "ローカルの音声判断モデルを取得しています。次回からはキャッシュを使います。",
+  "Choosing a voice mode from your instruction.": "発話から音声モードを判定しています。",
+  "Voice mode detection was unavailable or uncertain; using Dictate.": "音声モードを判定できなかったため、文字入力として処理します。",
+  "Voice mode was uncertain; the selected text was not changed. Use a mode shortcut or a clearer instruction.": "音声モードが不明確なため、選択した文章は変更しませんでした。専用ショートカットを使うか、指示を明確にして録音してください。",
   "Correction mode": "修正モード", "Conservative": "保守的", "Intent-aware": "意図認識", "Conservative keeps utterance order. Intent-aware may reorganize phrasing within this transcript; it is instructed not to add details, does not learn automatically, and uses no context beyond the current transcript and profile. Only intent-aware results are checked for changed numbers, URLs, backtick code, and uncertainty markers; a failed check inserts the original transcript. Names and other details are not checked.": "保守的モードは発話順を維持します。意図認識モードはこの文字起こし内で表現を整理できます。詳細を追加しないよう指示されており、自動学習せず、現在の文字起こしとプロファイル以外の文脈を使いません。数値・URL・バッククォートのコード・不確かさの表現の変化は意図認識モードの結果だけを検査し、検査に失敗した場合は元の文字起こしを挿入します。名前などその他の詳細は検査しません。",
   "The result completed, but History could not be saved.": "結果は完了しましたが、履歴を保存できませんでした。",
   "History text was saved, but the recording could not be retained.": "履歴のテキストは保存しましたが、録音は保存できませんでした。",
@@ -485,6 +509,12 @@ const catalogs = { en, ja } satisfies Record<UiLanguage, Record<MessageKey, stri
 
 const appMessageKeys: ReadonlySet<MessageKey> = new Set(
   [
+      "The local voice decision model is unavailable. Automatic mode detection will be skipped.",
+      "Loading the local voice decision model.",
+      "Downloading the local voice decision model. Later starts use the local cache.",
+      "Choosing a voice mode from your instruction.",
+      "Voice mode detection was unavailable or uncertain; using Dictate.",
+      "Voice mode was uncertain; the selected text was not changed. Use a mode shortcut or a clearer instruction.",
       "Recording from the selected microphone.",
       "Live transcription failed. The full recording will be transcribed after stopping.",
       "Live text insertion paused. The final result will remain available in this app.",

@@ -529,10 +529,14 @@ async fn start_recording_mode(
         .transpose()?;
     let mut ask_session = (mode == PipelineMode::Ask)
         .then(|| AskSession::new(&settings, active_hotkey, from_shortcut));
-    ensure_model_loaded(&app, &services, &settings).await?;
-    if services.lifecycle.is_cancelled(operation_id) {
-        emit_state(&app, &state, AppPhase::Idle, cancel_message);
-        return Err(cancel_error.into());
+    let automatic = mode == PipelineMode::Dictate && settings.automatic_voice_mode;
+    if automatic {
+        ask_session = Some(AskSession::capture(
+            &settings,
+            active_hotkey,
+            from_shortcut,
+            mode_shortcuts,
+        ));
     }
     let target = (mode != PipelineMode::Edit && mode != PipelineMode::Ask)
         .then(|| {
@@ -541,6 +545,40 @@ async fn start_recording_mode(
                 .map_err(command_error)
         })
         .transpose()?;
+    let draft = target.as_ref().map(|target| {
+        live_dictation::LiveDraft::new(
+            target.clone(),
+            &settings,
+            active_hotkey,
+            mode_shortcuts,
+            from_shortcut,
+            automatic || mode == PipelineMode::Translate || mode == PipelineMode::Ask,
+        )
+    });
+    ensure_model_loaded(&app, &services, &settings).await?;
+    if automatic {
+        if ensure_decision_model_loaded(
+            &app,
+            &services,
+            &settings,
+            Some(services.lifecycle.cancellation(operation_id)?),
+        )
+        .await
+        .is_err()
+        {
+            if services.lifecycle.is_cancelled(operation_id) {
+                return Err(cancel_error.into());
+            }
+            if let Some(session) = ask_session.as_mut() {
+                session.decision_ready = false;
+            }
+            emit_status(&app, "decision_model_unavailable", "The local voice decision model is unavailable. Automatic mode detection will be skipped.");
+        }
+    }
+    if services.lifecycle.is_cancelled(operation_id) {
+        emit_state(&app, &state, AppPhase::Idle, cancel_message);
+        return Err(cancel_error.into());
+    }
     // The start cue finishes before the microphone opens (`arm` below), so it
     // is neither recorded nor detected as speech by the live draft.
     play_start_cue_before_capture(settings.interaction_sounds, play_start_cue_to_completion).await;
@@ -554,16 +592,6 @@ async fn start_recording_mode(
     let mut live_slot = services.live.lock().await;
     let mut edit_slot = services.edit.lock().await;
     let mut ask_slot = services.ask.lock().await;
-    let draft = target.as_ref().map(|target| {
-        live_dictation::LiveDraft::new(
-            target.clone(),
-            &settings,
-            active_hotkey,
-            mode_shortcuts,
-            from_shortcut,
-            mode == PipelineMode::Translate || mode == PipelineMode::Ask,
-        )
-    });
     let cancel = services.lifecycle.cancellation(operation_id)?;
     if let Some(session) = edit_session.as_ref() {
         session.monitor.observe_cancellation(Some(cancel.clone()));
@@ -714,7 +742,7 @@ pub(crate) async fn stop_recording(
         "Stopping recording and preparing audio.",
     );
     let started = Instant::now();
-    let (live_task, mut edit_session, mut ask_session, translation_target) =
+    let (live_task, mut edit_session, mut ask_session, mut translation_target) =
         take_published_sessions(
             &services.live,
             &services.edit,
@@ -812,6 +840,81 @@ pub(crate) async fn stop_recording(
     };
     if services.lifecycle.is_cancelled(operation_id) {
         emit_state(&app, &state, AppPhase::Idle, cancel_message);
+        return Err(cancel_error.into());
+    }
+
+    // The startup session, rather than settings changed during recording, owns
+    // the automatic-mode decision and original selection.
+    let automatic = mode == PipelineMode::Dictate && ask_session.is_some();
+    let mut mode = mode;
+    let mut automatic_selected_translation = false;
+    if automatic {
+        let session = ask_session.as_mut().expect("automatic capture exists");
+        let selected = session.selected_source().is_some();
+        let _ = app.emit("app-state", state.publish_result(transcript.text.clone()));
+        emit_state(
+            &app,
+            &state,
+            AppPhase::Processing,
+            "Choosing a voice mode from your instruction.",
+        );
+        let decision = if session.decision_ready {
+            decision::classify(
+                services.transcriber.as_ref(),
+                &settings,
+                &transcript.text,
+                selected,
+                correction_cancel.clone(),
+            )
+            .await
+        } else {
+            Err("local decision model was not loaded".into())
+        };
+        mode = match decision {
+            Ok(mode) => mode,
+            Err(_) if services.lifecycle.is_cancelled(operation_id) => {
+                return Err(cancel_error.into())
+            }
+            Err(_) if !decision::permits_dictation_fallback(session.kind()) => {
+                session
+                    .injector
+                    .copy_to_clipboard(&transcript.text)
+                    .map_err(command_error)?;
+                emit_state(&app, &state, AppPhase::Error, "Voice mode was uncertain; the selected text was not changed. Use a mode shortcut or a clearer instruction.");
+                return Err("voice mode was uncertain; selection unchanged".into());
+            }
+            Err(_) => {
+                emit_status(
+                    &app,
+                    "voice_mode_fallback",
+                    "Voice mode detection was unavailable or uncertain; using Dictate.",
+                );
+                PipelineMode::Dictate
+            }
+        };
+        let detected = mode;
+        if mode == PipelineMode::Edit {
+            edit_session = Some(session.take_edit(&settings)?);
+        } else if mode == PipelineMode::Translate && selected {
+            // Reuse Ask's language policy and verified selection replacement.
+            mode = PipelineMode::Ask;
+            automatic_selected_translation = true;
+        } else if mode == PipelineMode::Translate {
+            translation_target = Some(
+                settings
+                    .translation_target_languages
+                    .iter()
+                    .find(|language| ask::translation_language_named_in(language, &transcript.text))
+                    .cloned()
+                    .unwrap_or_else(|| settings.translation_target_language.clone()),
+            );
+        }
+        let _ = app.emit("voice-mode", serde_json::json!({"mode": match detected { PipelineMode::Dictate => "dictate", PipelineMode::Translate => "translate", PipelineMode::Edit => "edit", PipelineMode::Ask => "ask" }, "targetLanguage": translation_target}));
+        if mode != PipelineMode::Ask {
+            ask_session.take();
+        }
+    }
+    if services.lifecycle.is_cancelled(operation_id) {
         return Err(cancel_error.into());
     }
 
@@ -980,6 +1083,7 @@ pub(crate) async fn stop_recording(
             duration_ms,
             started,
             Some(&artifact.path),
+            automatic_selected_translation,
         )
         .await;
         if result.is_ok() {
@@ -1049,10 +1153,11 @@ pub(crate) async fn stop_recording(
         );
         let translation_started = Instant::now();
         llm_provider = Some(settings.correction_provider.clone());
-        match correction::translate_transcript(
+        match correction::translate_voice_request(
             &settings,
             &transcript.text,
             target_language,
+            automatic,
             correction_cancel,
             |delta| emit_correction_preview(&app, delta, "streaming"),
         )
@@ -1186,7 +1291,7 @@ pub(crate) async fn stop_recording(
             .copy_to_clipboard(&final_text)
             .map(|()| InsertResult::ClipboardOnly)
     } else {
-        draft.finish(&final_text)
+        draft.finish(&final_text, &services.lifecycle.cancellation(operation_id)?)
     };
     // Insertion has returned; helper shutdown and persistence are not insertion.
     // This only hides the overlay. The result below still determines success.
@@ -1309,6 +1414,7 @@ async fn finish_ask(
     duration_ms: u64,
     started: Instant,
     audio_path: Option<&std::path::Path>,
+    selected_translation: bool,
 ) -> Result<RecordingResult, String> {
     use ask::{AskAction, AskError};
     if services.lifecycle.is_cancelled(operation_id) {
@@ -1323,22 +1429,32 @@ async fn finish_ask(
         "Choosing a safe Ask action.",
     );
     // Planning receives spoken text and context only. It never receives source.
-    let plan = correction::generate_ask_plan(
-        &settings,
-        spoken,
-        &ask::planning_prompt(session.kind()),
-        services
-            .lifecycle
-            .cancellation(operation_id)
-            .map_err(command_error)?,
-    )
-    .await
-    .map_err(|_| "Ask planning failed without taking an action".to_string())?;
-    if services.lifecycle.is_cancelled(operation_id) {
-        return Err("ask was cancelled".into());
-    }
-    let parsed =
-        ask::parse_plan(&plan).map_err(|_| "Ask planner returned an invalid action".to_string())?;
+    let parsed = if selected_translation {
+        ask::AskAction::Translate {
+            target_language: settings
+                .translation_target_languages
+                .iter()
+                .find(|language| ask::translation_language_named_in(language, spoken))
+                .cloned()
+                .unwrap_or_else(|| settings.translation_target_language.clone()),
+        }
+    } else {
+        let plan = correction::generate_ask_plan(
+            &settings,
+            spoken,
+            &ask::planning_prompt(session.kind()),
+            services
+                .lifecycle
+                .cancellation(operation_id)
+                .map_err(command_error)?,
+        )
+        .await
+        .map_err(|_| "Ask planning failed without taking an action".to_string())?;
+        if services.lifecycle.is_cancelled(operation_id) {
+            return Err("ask was cancelled".into());
+        }
+        ask::parse_plan(&plan).map_err(|_| "Ask planner returned an invalid action".to_string())?
+    };
     let action = match ask::validate_action(
         parsed,
         session.kind(),
@@ -1446,6 +1562,12 @@ async fn finish_ask(
         return Err("ask was cancelled".into());
     }
     let mut insertion = "panel";
+    if services.lifecycle.is_cancelled(operation_id) {
+        return Err("ask was cancelled".into());
+    }
+    if let Some(monitor) = &session.monitor {
+        monitor.wait_for_shortcut_release().await;
+    }
     if services.lifecycle.is_cancelled(operation_id) {
         return Err("ask was cancelled".into());
     }
@@ -2843,6 +2965,18 @@ pub(crate) async fn update_settings(
     }
     correction::local_chat_completions_url(&settings.local_correction_base_url)
         .map_err(|error| error.to_string())?;
+    if !matches!(
+        settings.decision_model.as_str(),
+        "Cloudflare/clef-flash" | "Cloudflare/clef"
+    ) {
+        return Err("unsupported local decision model".into());
+    }
+    if !matches!(
+        settings.decision_quantization.as_str(),
+        "4bit" | "8bit" | "bf16"
+    ) {
+        return Err("unsupported decision quantization".into());
+    }
     if !(128..=32768).contains(&settings.local_correction_max_tokens) {
         return Err("local correction max tokens must be between 128 and 32768".into());
     }
@@ -3510,7 +3644,38 @@ pub(crate) async fn load_model(
             return Err("model settings changed; save them before loading".into());
         }
     }
-    ensure_model_loaded(&app, &services, &settings).await
+    let status = ensure_model_loaded(&app, &services, &settings).await?;
+    if settings.automatic_voice_mode {
+        ensure_decision_model_loaded(&app, &services, &settings, None).await?;
+    }
+    Ok(status)
+}
+
+async fn ensure_decision_model_loaded(
+    app: &AppHandle,
+    services: &Services,
+    settings: &Settings,
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), String> {
+    emit_status(
+        app,
+        "decision_model_loading",
+        "Loading the local voice decision model.",
+    );
+    let progress_forwarder = spawn_model_progress_forwarder(app, services, true);
+    let result = services
+        .transcriber
+        .load_decision(
+            &settings.decision_model,
+            &settings.decision_quantization,
+            cancel,
+        )
+        .await;
+    if let Some(forwarder) = progress_forwarder {
+        forwarder.abort();
+    }
+    result.map_err(command_error)?;
+    Ok(())
 }
 
 pub(crate) async fn ensure_model_loaded(
@@ -3587,6 +3752,14 @@ fn spawn_load_progress_forwarder(
     app: &AppHandle,
     services: &Services,
 ) -> Option<tauri::async_runtime::JoinHandle<()>> {
+    spawn_model_progress_forwarder(app, services, false)
+}
+
+fn spawn_model_progress_forwarder(
+    app: &AppHandle,
+    services: &Services,
+    decision: bool,
+) -> Option<tauri::async_runtime::JoinHandle<()>> {
     let mut receiver = services.transcriber.load_progress()?;
     let app = app.clone();
     Some(tauri::async_runtime::spawn(async move {
@@ -3599,7 +3772,11 @@ fn spawn_load_progress_forwarder(
                         emit_status(
                             &app,
                             "model_downloading",
-                            "Downloading the speech model files. This runs once; later starts use the local cache.",
+                            if decision {
+                                "Downloading the local voice decision model. Later starts use the local cache."
+                            } else {
+                                "Downloading the speech model files. This runs once; later starts use the local cache."
+                            },
                         );
                     }
                     let _ = app.emit("model-progress", progress);
