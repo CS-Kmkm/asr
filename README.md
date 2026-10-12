@@ -400,6 +400,9 @@ Full usage and Phase 0 gate criteria are documented in
   the OpenAI-compatible backend is explicitly selected.
 - History can be disabled; when disabled, transcript rows are not written
   (failed recordings kept for Retry are the exception described below).
+- Usage metrics (event type, provider, duration, success, and error code; no
+  text) follow History: they are not recorded while History is off, are
+  deleted with the History retention window, and are removed by Delete all.
 - Temporary WAV deletion defaults to enabled. When History is on and "Delete
   audio after processing" is off, History keeps a copy of each new recording
   for playback, download, and Retry. Turning it on stops keeping new recordings

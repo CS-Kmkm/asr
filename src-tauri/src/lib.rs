@@ -596,9 +596,46 @@ fn database_path(app: &AppHandle) -> Result<PathBuf, Box<dyn std::error::Error>>
     Ok(directory.join(DATABASE_FILE_NAME))
 }
 
+/// The startup log line naming the database this build opened, so a debug
+/// build's separate data is visible without a debugger.
+fn database_diagnostics(path: &Path, uses_release_data: bool) -> String {
+    let data = if uses_release_data {
+        "release data"
+    } else {
+        "debug build data"
+    };
+    format!(
+        "Database: {} ({data})
+",
+        path.display()
+    )
+}
+
 #[cfg(test)]
 mod data_directory_tests {
     use super::*;
+
+    #[test]
+    fn startup_log_names_the_database_and_whose_data_it_is() {
+        let path = Path::new("app-data").join("dev").join(DATABASE_FILE_NAME);
+        assert_eq!(
+            database_diagnostics(&path, false),
+            format!(
+                "Database: {} (debug build data)
+",
+                path.display()
+            )
+        );
+        let path = Path::new("app-data").join(DATABASE_FILE_NAME);
+        assert_eq!(
+            database_diagnostics(&path, true),
+            format!(
+                "Database: {} (release data)
+",
+                path.display()
+            )
+        );
+    }
 
     #[test]
     fn release_build_keeps_the_app_data_directory() {
@@ -1659,7 +1696,11 @@ fn setup_app(
             worker_log::record_app_start(startup_diagnostics);
         }
     }
-    let storage = Storage::open(&database_path(app.handle())?)?;
+    let database = database_path(app.handle())?;
+    let database_line = database_diagnostics(&database, current_build_uses_release_data());
+    eprint!("{database_line}");
+    worker_log::record_startup_detail(&database_line);
+    let storage = Storage::open(&database)?;
     // Best effort: keep the original of a row this build cannot fully read
     // before anything else touches it.
     let _ = storage.back_up_unreadable_settings();

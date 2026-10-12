@@ -249,13 +249,13 @@ fn purge_history(
             [now.to_rfc3339()],
         )?;
     }
-    match HistoryCutoff::at(settings.history_retention, now) {
-        HistoryCutoff::KeepAll => {}
-        HistoryCutoff::RemoveAll => purge_dictionary_candidates_before(connection, None)?,
-        HistoryCutoff::Before(cutoff) => {
-            purge_dictionary_candidates_before(connection, Some(&cutoff))?
-        }
-    }
+    let cutoff = match HistoryCutoff::at(settings.history_retention, now) {
+        HistoryCutoff::KeepAll => return Ok(()),
+        HistoryCutoff::RemoveAll => None,
+        HistoryCutoff::Before(cutoff) => Some(cutoff),
+    };
+    purge_dictionary_candidates_before(connection, cutoff.as_deref())?;
+    purge_metrics_before(connection, cutoff.as_deref())?;
     Ok(())
 }
 
@@ -1700,6 +1700,7 @@ impl Storage {
         // Candidate spans and decisions are transcript text, so removing all
         // History removes them too. Confirmed dictionary entries are kept.
         purge_dictionary_candidates_before(&transaction, None)?;
+        purge_metrics_before(&transaction, None)?;
         transaction.commit()?;
         drop(connection);
         let _ = self.retry_pending_audio_deletions();
@@ -2343,6 +2344,8 @@ impl Storage {
             .collect())
     }
 
+    /// Records one usage metric. Metrics follow the History retention, so
+    /// nothing is written while History is off.
     pub fn add_metric(
         &self,
         event_type: &str,
@@ -2351,7 +2354,11 @@ impl Storage {
         success: bool,
         error_code: Option<&str>,
     ) -> Result<(), StorageError> {
-        self.connection()?.execute(
+        let connection = self.connection()?;
+        if stored_settings(&connection)?.history_retention == HistoryRetention::Never {
+            return Ok(());
+        }
+        connection.execute(
             "INSERT INTO metrics(event_type, provider, duration_ms, success, error_code, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -2516,6 +2523,16 @@ fn purge_dictionary_candidates_before(
     connection.execute(
         "DELETE FROM dictionary_candidate_decisions
          WHERE ?1 IS NULL OR created_at IS NULL OR created_at < ?1",
+        params![cutoff],
+    )?;
+    Ok(())
+}
+
+/// Usage metrics record when the app was used, so they follow the History
+/// retention too; `None` removes every metric.
+fn purge_metrics_before(connection: &Connection, cutoff: Option<&str>) -> Result<(), StorageError> {
+    connection.execute(
+        "DELETE FROM metrics WHERE ?1 IS NULL OR created_at < ?1",
         params![cutoff],
     )?;
     Ok(())
@@ -4905,6 +4922,130 @@ mod tests {
 
             assert_eq!(history_texts(&storage), vec!["inside"], "{retention:?}");
         }
+    }
+
+    fn insert_metric_at(storage: &Storage, code: &str, created_at: chrono::DateTime<Utc>) {
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO metrics(event_type, success, error_code, created_at)
+                 VALUES ('test', 1, ?1, ?2)",
+                params![code, created_at.to_rfc3339()],
+            )
+            .unwrap();
+    }
+
+    fn metric_codes(storage: &Storage) -> Vec<String> {
+        let connection = storage.connection().unwrap();
+        let mut statement = connection
+            .prepare("SELECT error_code FROM metrics ORDER BY id")
+            .unwrap();
+        let codes = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        codes
+    }
+
+    #[test]
+    fn finite_retention_purges_metrics_outside_the_window() {
+        for retention in [
+            HistoryRetention::TwentyFourHours,
+            HistoryRetention::OneWeek,
+            HistoryRetention::OneMonth,
+            HistoryRetention::OneYear,
+        ] {
+            let storage = Storage::in_memory().unwrap();
+            let window = chrono::Duration::days(retention.days().unwrap());
+            insert_metric_at(
+                &storage,
+                "inside",
+                Utc::now() - window + chrono::Duration::hours(1),
+            );
+            insert_metric_at(
+                &storage,
+                "outside",
+                Utc::now() - window - chrono::Duration::hours(1),
+            );
+
+            storage
+                .update_settings_and_apply_history_policy(&Settings {
+                    history_retention: retention,
+                    ..Settings::default()
+                })
+                .unwrap();
+
+            assert_eq!(metric_codes(&storage), vec!["inside"], "{retention:?}");
+        }
+    }
+
+    #[test]
+    fn startup_purges_expired_metrics_and_forever_keeps_them() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .update_settings(&Settings {
+                history_retention: HistoryRetention::OneWeek,
+                ..Settings::default()
+            })
+            .unwrap();
+        insert_metric_at(&storage, "recent", Utc::now());
+        insert_metric_at(&storage, "old", Utc::now() - chrono::Duration::days(8));
+
+        storage.enforce_current_history_policy().unwrap();
+        assert_eq!(metric_codes(&storage), vec!["recent"]);
+
+        insert_metric_at(
+            &storage,
+            "ancient",
+            Utc::now() - chrono::Duration::days(400),
+        );
+        storage
+            .update_settings_and_apply_history_policy(&Settings {
+                history_retention: HistoryRetention::Forever,
+                ..Settings::default()
+            })
+            .unwrap();
+        storage.enforce_current_history_policy().unwrap();
+        assert_eq!(metric_codes(&storage), vec!["recent", "ancient"]);
+    }
+
+    #[test]
+    fn history_off_removes_metrics_and_records_no_new_ones() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .add_metric("dictation", Some("test"), Some(10), true, Some("kept"))
+            .unwrap();
+        assert_eq!(metric_codes(&storage), vec!["kept"]);
+
+        storage
+            .update_settings_and_apply_history_policy(&Settings {
+                history_retention: HistoryRetention::Never,
+                ..Settings::default()
+            })
+            .unwrap();
+        assert!(metric_codes(&storage).is_empty());
+
+        storage
+            .add_metric("dictation", Some("test"), Some(10), true, Some("skipped"))
+            .unwrap();
+        assert!(metric_codes(&storage).is_empty());
+    }
+
+    #[test]
+    fn delete_all_history_removes_metrics() {
+        let storage = Storage::in_memory().unwrap();
+        storage.add_history(&item()).unwrap();
+        storage
+            .add_metric("dictation", Some("test"), Some(10), true, Some("one"))
+            .unwrap();
+        insert_metric_at(&storage, "two", Utc::now() - chrono::Duration::days(3));
+
+        storage.delete_all_history().unwrap();
+
+        assert!(metric_codes(&storage).is_empty());
+        assert_eq!(stored_row_count(&storage), 0);
     }
 
     fn keeping_audio() -> Settings {

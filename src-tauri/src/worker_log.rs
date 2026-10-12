@@ -4,9 +4,9 @@
 //! has no console to inherit, so the stream is piped into a log file that is
 //! rotated once it would exceed [`MAX_LOG_BYTES`], keeping one previous file.
 //! Only the worker's own diagnostics, content-free process markers, and the
-//! app's startup paths (worker project root and `.env` location) are written
-//! here; the Rust side never adds transcript, audio, window-title, clipboard,
-//! or environment-variable content.
+//! app's startup paths (worker project root, `.env` location, and database)
+//! are written here; the Rust side never adds transcript, audio, window-title,
+//! clipboard, or environment-variable content.
 
 use std::{
     fs::{self, File, OpenOptions},
@@ -160,6 +160,12 @@ fn timestamp() -> String {
 pub(crate) fn record_app_start(diagnostics: &str) {
     let record = format!("--- app started {} ---\n{diagnostics}", timestamp());
     append(record.as_bytes());
+}
+
+/// Append a content-free startup detail (such as the database path) that is
+/// known only after the app start was recorded.
+pub(crate) fn record_startup_detail(detail: &str) {
+    append(detail.as_bytes());
 }
 
 /// Record that a new worker process started, without any content.
