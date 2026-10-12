@@ -7,7 +7,7 @@ import { runInNewContext } from "node:vm";
 import ts from "typescript";
 
 const require = createRequire(import.meta.url);
-function load(path, mocks = {}, exposeMain = false) {
+function load(path, mocks = {}, exposeMain = false, runtimeWindow = {}) {
   let source = readFileSync(new URL(path, import.meta.url), "utf8");
   if (exposeMain) source = source.replace("function MainAppContent(", "export function MainAppContent(");
   const output = ts.transpileModule(source, {
@@ -15,12 +15,31 @@ function load(path, mocks = {}, exposeMain = false) {
   }).outputText;
   const module = { exports: {} };
   runInNewContext(output, {
-    module, exports: module.exports, window: {},
+    module, exports: module.exports, window: runtimeWindow,
     require: (name) => name in mocks ? mocks[name] : require(name),
   });
   return module.exports;
 }
 const { defaultSettings } = load("../src/api.ts");
+function startupWarningApi(response) {
+  return load("../src/api.ts", {
+    "@tauri-apps/api/core": { invoke: async (command) => {
+      assert.equal(command, "get_startup_hotkey_warning");
+      return response;
+    } },
+  }, false, { __TAURI_INTERNALS__: {} });
+}
+
+test("No native startup shortcut warning becomes an empty warning list", async () => {
+  const api = startupWarningApi(null);
+  assert.deepEqual(Array.from(await api.getStartupHotkeyWarning()), []);
+});
+
+test("Native startup shortcut warning text is retained as one warning", async () => {
+  const warning = "Some saved hotkeys overlap or could not be registered. Change them in Settings. Inactive: Ask Anything (Ctrl+Shift+A)";
+  const api = startupWarningApi(warning);
+  assert.deepEqual(Array.from(await api.getStartupHotkeyWarning()), [warning]);
+});
 const candidate = (id) => ({ id, originalSpan: "open ai", preferredSpan: `OpenAI ${id}` });
 function deferred() {
   let resolve;
@@ -28,7 +47,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-function fixture(initialCandidates = []) {
+function fixture(initialCandidates = [], startupWarning = null) {
   const slots = [];
   const effects = [];
   const listeners = new Map();
@@ -70,7 +89,7 @@ function fixture(initialCandidates = []) {
   };
   const api = {
     defaultSettings,
-    getStartupHotkeyWarning: async () => [],
+    getStartupHotkeyWarning: startupWarningApi(startupWarning).getStartupHotkeyWarning,
     getAppState: async () => ({ phase: "idle", message: null }),
     getSettings: async () => settings,
     getModelStatus: async () => ({ state: "ready" }),
@@ -136,6 +155,18 @@ function fixture(initialCandidates = []) {
     deferSettings() { const pending = deferred(); pendingSettings.push(pending); return pending; },
   };
 }
+
+test("The main interface renders after a null native startup warning", async () => {
+  const app = fixture();
+  await app.settle();
+  assert.ok(app.props("Dashboard"));
+});
+
+test("The main interface renders after a native startup warning string", async () => {
+  const app = fixture([], "Some saved hotkeys overlap or could not be registered.");
+  await app.settle();
+  assert.ok(app.props("Dashboard"));
+});
 
 test("Dictionary page entry and shortcut completion load current candidates", async () => {
   const app = fixture();
