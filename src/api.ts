@@ -186,8 +186,17 @@ export async function previewHistoryRetentionPurge(retention: HistoryRetention):
   return invoke("preview_history_retention_purge", { retention });
 }
 
+// The recording crosses IPC as a raw body (an ArrayBuffer). Tauri's
+// postMessage fallback, used where the IPC protocol is blocked, can deliver it
+// as a number array instead. History audio is always stored as WAV, so its
+// name and type follow from the id.
 export async function getHistoryAudio(id: number): Promise<HistoryAudioPayload> {
-  return invoke("get_history_audio", { id });
+  const body = await invoke<ArrayBuffer | number[]>("get_history_audio", { id });
+  return {
+    bytes: Array.isArray(body) ? new Uint8Array(body).buffer : body,
+    filename: `local-voice-history-${id}.wav`,
+    mimeType: "audio/wav",
+  };
 }
 
 export async function retryHistoryItem(id: number): Promise<RecordingResult> {

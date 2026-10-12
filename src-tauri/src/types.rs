@@ -378,14 +378,6 @@ pub enum HistoryFilter {
     Ask,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct HistoryAudioPayload {
-    pub bytes: Vec<u8>,
-    pub filename: String,
-    pub mime_type: String,
-}
-
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryRetention {

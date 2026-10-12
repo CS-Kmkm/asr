@@ -58,7 +58,7 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, onSave,
     let filename: string;
     try {
       const payload = await onLoadAudio(item.id);
-      url = URL.createObjectURL(new Blob([new Uint8Array(payload.bytes)], { type: payload.mimeType }));
+      url = URL.createObjectURL(new Blob([payload.bytes], { type: payload.mimeType }));
       filename = payload.filename;
     } catch {
       // A missing or unreadable recording clears its association on the

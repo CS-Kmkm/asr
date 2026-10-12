@@ -5677,14 +5677,17 @@ pub(crate) fn preview_history_retention_purge(
         .map_err(command_error)
 }
 
+/// The recording's WAV bytes as a raw IPC body (an `ArrayBuffer` in the
+/// webview), not a JSON number array; the frontend names the file from `id`.
 #[tauri::command]
 pub(crate) fn get_history_audio(
     id: i64,
     storage: State<'_, Storage>,
-) -> Result<types::HistoryAudioPayload, String> {
+) -> Result<tauri::ipc::Response, String> {
     storage
         .history_audio(id)
         .map_err(command_error)?
+        .map(tauri::ipc::Response::new)
         .ok_or_else(|| "history audio is unavailable".into())
 }
 

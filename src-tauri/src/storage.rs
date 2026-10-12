@@ -17,8 +17,8 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::types::{
-    DictionaryCandidate, DictionaryEntry, HistoryAudioPayload, HistoryFilter, HistoryItem,
-    HistoryRetention, NewDictionaryEntry, NewHistoryItem, Settings, VoiceShortcuts,
+    DictionaryCandidate, DictionaryEntry, HistoryFilter, HistoryItem, HistoryRetention,
+    NewDictionaryEntry, NewHistoryItem, Settings, VoiceShortcuts,
 };
 
 const MAX_HISTORY_AUDIO_BYTES: u64 = 50 * 1024 * 1024;
@@ -1711,7 +1711,9 @@ impl Storage {
         Ok(changed)
     }
 
-    pub fn history_audio(&self, id: i64) -> Result<Option<HistoryAudioPayload>, StorageError> {
+    /// The retained WAV recording of History row `id`, or `None` when the row
+    /// has none (a missing file also clears the row's association).
+    pub fn history_audio(&self, id: i64) -> Result<Option<Vec<u8>>, StorageError> {
         let filename: Option<String> = self
             .connection()?
             .query_row(
@@ -1743,11 +1745,7 @@ impl Storage {
         if bytes.len() as u64 > MAX_HISTORY_AUDIO_BYTES {
             return Err(StorageError::AudioTooLarge);
         }
-        Ok(Some(HistoryAudioPayload {
-            bytes,
-            filename: format!("local-voice-history-{id}.wav"),
-            mime_type: "audio/wav".into(),
-        }))
+        Ok(Some(bytes))
     }
 
     pub fn copy_history_audio_for_retry(&self, id: i64) -> Result<PathBuf, StorageError> {
@@ -5869,13 +5867,10 @@ mod tests {
             .list_history(HistoryFilter::All, 1)
             .unwrap()
             .remove(0);
-        let payload = storage.history_audio(row.id).unwrap().unwrap();
         assert_eq!(
-            payload.filename,
-            format!("local-voice-history-{}.wav", row.id)
+            storage.history_audio(row.id).unwrap().unwrap(),
+            b"RIFF test wav"
         );
-        assert_eq!(payload.mime_type, "audio/wav");
-        assert_eq!(payload.bytes, b"RIFF test wav");
         let owned_audio: String = storage
             .connection()
             .unwrap()
@@ -5891,6 +5886,45 @@ mod tests {
         assert!(storage.history_audio(row.id).unwrap().is_none());
         assert!(!owned_path.exists());
         let _ = fs::remove_file(source);
+        let _ = fs::remove_dir_all(&storage.history_audio_dir);
+    }
+
+    #[test]
+    fn history_audio_rejects_oversized_files_and_forgets_missing_ones() {
+        let storage = Storage::in_memory().unwrap();
+        storage.update_settings(&keeping_audio()).unwrap();
+        let source = source_wav();
+        storage
+            .add_history_with_audio(&item(), Some(&source))
+            .unwrap();
+        let _ = fs::remove_file(&source);
+        let id = storage.list_history(HistoryFilter::All, 1).unwrap()[0].id;
+        let owned = history_audio_files(&storage).remove(0);
+
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&owned)
+            .unwrap()
+            .set_len(MAX_HISTORY_AUDIO_BYTES + 1)
+            .unwrap();
+        assert!(matches!(
+            storage.history_audio(id),
+            Err(StorageError::AudioTooLarge)
+        ));
+        assert!(storage.list_history(HistoryFilter::All, 1).unwrap()[0].has_audio);
+
+        let missing = format!("{}.wav", random_history_audio_stem().unwrap());
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE dictation_history SET audio_filename = ?1 WHERE id = ?2",
+                params![missing, id],
+            )
+            .unwrap();
+        assert!(storage.history_audio(id).unwrap().is_none());
+        assert!(!storage.list_history(HistoryFilter::All, 1).unwrap()[0].has_audio);
+        assert!(storage.history_audio(i64::MAX).unwrap().is_none());
         let _ = fs::remove_dir_all(&storage.history_audio_dir);
     }
 

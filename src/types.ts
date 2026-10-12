@@ -146,7 +146,7 @@ export interface HistoryItem {
 }
 
 export interface HistoryAudioPayload {
-  bytes: number[];
+  bytes: ArrayBuffer;
   filename: string;
   mimeType: string;
 }
