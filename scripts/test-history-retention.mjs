@@ -332,8 +332,32 @@ test("confirming after a slow count keeps settings changed while it was pending"
 test("retention order treats every move toward Never as shortening", () => {
   const { historyRetentionOptions, shortensHistoryRetention } = retentionSelect();
   const values = Array.from(historyRetentionOptions, ({ value }) => value);
-  assert.deepEqual(values, ["never", "24_hours", "one_week", "one_month", "one_year", "forever"]);
+  assert.deepEqual(values, ["never", "24_hours", "one_week", "one_month", "three_months", "one_year", "forever"]);
   for (const [i, current] of values.entries()) {
     for (const [j, next] of values.entries()) assert.equal(shortensHistoryRetention(current, next), j < i, `${current} -> ${next}`);
   }
+});
+
+test("3 months sits between 1 month and 1 year", async () => {
+  const { shortensHistoryRetention } = retentionSelect();
+  assert.equal(shortensHistoryRetention("one_year", "three_months"), true);
+  assert.equal(shortensHistoryRetention("three_months", "one_month"), true);
+  assert.equal(shortensHistoryRetention("one_month", "three_months"), false);
+  assert.equal(shortensHistoryRetention("three_months", "one_year"), false);
+
+  // Moving from 1 year to 3 months asks before the purge.
+  const component = retentionSelect(false, { historyItems: 5, recordings: 2 });
+  const changes = [];
+  retentionChange({ type: component.HistoryRetentionSelect, props: { value: "one_year", onChange: (value) => changes.push(value) } }, "three_months");
+  await settle();
+  assert.deepEqual(component.previews, ["three_months"]);
+  assert.equal(component.prompts.length, 1);
+  assert.match(component.prompts[0], /^History retention: 1 year → 3 months/);
+  assert.deepEqual(changes, []);
+});
+
+test("the 3 months label is translated", () => {
+  const { translate } = load("../src/i18n.tsx");
+  assert.equal(translate("en", "3 months"), "3 months");
+  assert.equal(translate("ja", "3 months"), "3か月");
 });

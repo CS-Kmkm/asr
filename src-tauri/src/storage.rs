@@ -705,13 +705,17 @@ fn load_settings(raw: &str) -> LoadedSettings {
             .remove("historyRetentionDays")
             .and_then(|value| value.as_u64());
         // An explicit "off" is the user's choice; without a readable window
-        // (an unreadable row also lands here) keep everything.
+        // (an unreadable row also lands here) keep everything. Otherwise use
+        // the longest finite preset that does not exceed the old window: the
+        // released 7/30/90-day choices map exactly, so the first startup
+        // purge deletes nothing they kept, and no window is lengthened.
         let retention = match (enabled, days) {
             (Some(false), _) => "never",
             (_, None) => "forever",
             (_, Some(days)) if days < 7 => "24_hours",
             (_, Some(days)) if days < 30 => "one_week",
-            (_, Some(days)) if days < 365 => "one_month",
+            (_, Some(days)) if days < 90 => "one_month",
+            (_, Some(days)) if days < 365 => "three_months",
             (_, Some(_)) => "one_year",
         };
         object.insert("historyRetention".into(), retention.into());
@@ -3751,7 +3755,7 @@ mod tests {
         let mut value = serde_json::to_value(Settings::default()).unwrap();
         value["setupComplete"] = true.into();
         value["interactionSounds"] = true.into();
-        value["historyRetention"] = "three_months".into();
+        value["historyRetention"] = "six_months".into();
         value["theme"] = 42.into();
         value["inputGainPercent"] = 70_000.into();
         value["futureSetting"] = serde_json::json!({"keep": true});
@@ -3871,7 +3875,7 @@ mod tests {
             ..Settings::default()
         })
         .unwrap();
-        value["historyRetention"] = "three_months".into();
+        value["historyRetention"] = "six_months".into();
         value["deleteAudioAfterProcessing"] = "yes".into();
         store_raw_settings(&storage, &value.to_string());
 
@@ -3890,7 +3894,7 @@ mod tests {
     fn history_inserts_succeed_while_the_row_holds_newer_values() {
         let storage = Storage::in_memory().unwrap();
         let mut value = serde_json::to_value(Settings::default()).unwrap();
-        value["historyRetention"] = "three_months".into();
+        value["historyRetention"] = "six_months".into();
         store_raw_settings(&storage, &value.to_string());
 
         assert!(storage.add_history(&item()).unwrap());
@@ -3975,7 +3979,7 @@ mod tests {
             ..Settings::default()
         })
         .unwrap();
-        value["historyRetention"] = "three_months".into();
+        value["historyRetention"] = "six_months".into();
         value["deleteAudioAfterProcessing"] = "sometimes".into();
         value["shortcuts"]["ask"] = serde_json::json!([
             "Ctrl+Alt+1",
@@ -4005,7 +4009,7 @@ mod tests {
 
             let stored = stored_settings_value(&storage);
             assert_eq!(stored["translationTargetLanguage"], "ja");
-            assert_eq!(stored["historyRetention"], "three_months");
+            assert_eq!(stored["historyRetention"], "six_months");
             assert_eq!(stored["deleteAudioAfterProcessing"], "sometimes");
             assert_eq!(stored["shortcuts"]["ask"], row["shortcuts"]["ask"]);
             assert_eq!(stored["askHotkey"], "Ctrl+Alt+1");
@@ -4071,7 +4075,7 @@ mod tests {
     fn unreadable_rows_are_backed_up_once_at_startup() {
         for raw in ["not json".to_owned(), {
             let mut value = serde_json::to_value(Settings::default()).unwrap();
-            value["historyRetention"] = "three_months".into();
+            value["historyRetention"] = "six_months".into();
             value.to_string()
         }] {
             let storage = Storage::in_memory().unwrap();
@@ -4126,7 +4130,7 @@ mod tests {
         storage.update_settings(&before).unwrap();
         assert_eq!(
             stored_settings_value(&storage)["historyRetention"],
-            "three_months"
+            "six_months"
         );
 
         let persisted = storage.persist_repaired_settings().unwrap();
@@ -4147,7 +4151,7 @@ mod tests {
         assert_eq!(storage.get_settings().unwrap(), before);
         assert!(settings_backups(&storage)
             .iter()
-            .any(|(value, _)| value.contains("three_months")));
+            .any(|(value, _)| value.contains("six_months")));
     }
 
     #[test]
@@ -4200,6 +4204,61 @@ mod tests {
                 "{legacy}"
             );
         }
+    }
+
+    fn legacy_row(days: u64) -> String {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("historyRetention");
+        object.insert("historyEnabled".into(), true.into());
+        object.insert("historyRetentionDays".into(), days.into());
+        value.to_string()
+    }
+
+    #[test]
+    fn legacy_history_windows_map_to_the_longest_preset_not_exceeding_them() {
+        for (days, expected) in [
+            (0, HistoryRetention::TwentyFourHours),
+            (6, HistoryRetention::TwentyFourHours),
+            (7, HistoryRetention::OneWeek),
+            (29, HistoryRetention::OneWeek),
+            (30, HistoryRetention::OneMonth),
+            (89, HistoryRetention::OneMonth),
+            (90, HistoryRetention::ThreeMonths),
+            (364, HistoryRetention::ThreeMonths),
+            (365, HistoryRetention::OneYear),
+            (3650, HistoryRetention::OneYear),
+        ] {
+            let retention = load_settings(&legacy_row(days)).settings.history_retention;
+            assert_eq!(retention, expected, "{days} days");
+            // Below a week the shortest preset applies; otherwise History is
+            // never kept longer than the old window allowed.
+            assert!(retention.days().unwrap() <= days.max(1) as i64, "{days}");
+        }
+    }
+
+    #[test]
+    fn upgrading_a_released_90_day_window_keeps_its_history() {
+        let storage = Storage::in_memory().unwrap();
+        insert_history_at(&storage, "60 days", Utc::now() - chrono::Duration::days(60));
+        insert_history_at(
+            &storage,
+            "100 days",
+            Utc::now() - chrono::Duration::days(100),
+        );
+        store_raw_settings(&storage, &legacy_row(90));
+
+        storage.enforce_current_history_policy().unwrap();
+
+        assert_eq!(
+            storage.get_settings().unwrap().history_retention,
+            HistoryRetention::ThreeMonths
+        );
+        assert_eq!(
+            stored_settings_value(&storage)["historyRetention"],
+            "three_months"
+        );
+        assert_eq!(history_texts(&storage), vec!["60 days"]);
     }
 
     #[test]
@@ -4745,6 +4804,7 @@ mod tests {
             (HistoryRetention::TwentyFourHours, 1),
             (HistoryRetention::OneWeek, 7),
             (HistoryRetention::OneMonth, 30),
+            (HistoryRetention::ThreeMonths, 90),
             (HistoryRetention::OneYear, 365),
         ] {
             let storage = Storage::in_memory().unwrap();
@@ -4926,6 +4986,7 @@ mod tests {
             HistoryRetention::TwentyFourHours,
             HistoryRetention::OneWeek,
             HistoryRetention::OneMonth,
+            HistoryRetention::ThreeMonths,
             HistoryRetention::OneYear,
         ] {
             let storage = Storage::in_memory().unwrap();
@@ -4983,6 +5044,7 @@ mod tests {
             HistoryRetention::TwentyFourHours,
             HistoryRetention::OneWeek,
             HistoryRetention::OneMonth,
+            HistoryRetention::ThreeMonths,
             HistoryRetention::OneYear,
         ] {
             let storage = Storage::in_memory().unwrap();
@@ -5158,6 +5220,10 @@ mod tests {
         assert_eq!(
             HistoryCutoff::at(HistoryRetention::OneWeek, now),
             HistoryCutoff::Before("2030-01-01T12:00:00+00:00".into())
+        );
+        assert_eq!(
+            HistoryCutoff::at(HistoryRetention::ThreeMonths, now),
+            HistoryCutoff::Before("2029-10-10T12:00:00+00:00".into())
         );
         assert_eq!(
             failed_take_expires_at(now).to_rfc3339(),
@@ -5401,6 +5467,7 @@ mod tests {
         for (retention, expected) in [
             (HistoryRetention::Forever, (1, 1)),
             (HistoryRetention::OneYear, (1, 1)),
+            (HistoryRetention::ThreeMonths, (1, 1)),
             (HistoryRetention::OneMonth, (2, 2)),
             (HistoryRetention::OneWeek, (2, 2)),
             (HistoryRetention::TwentyFourHours, (2, 2)),
@@ -5496,6 +5563,7 @@ mod tests {
         for (retention, expected) in [
             (HistoryRetention::Forever, (0, 0)),
             (HistoryRetention::OneYear, (2, 1)),
+            (HistoryRetention::ThreeMonths, (2, 1)),
             (HistoryRetention::OneMonth, (3, 2)),
             (HistoryRetention::OneWeek, (4, 2)),
             (HistoryRetention::TwentyFourHours, (5, 3)),

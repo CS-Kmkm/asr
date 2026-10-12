@@ -7,7 +7,8 @@ import { useI18n, type MessageKey } from "../i18n";
 export const historyRetentionOptions = [
   { value: "never", label: "Never" }, { value: "24_hours", label: "24 hours" },
   { value: "one_week", label: "1 week" }, { value: "one_month", label: "1 month" },
-  { value: "one_year", label: "1 year" }, { value: "forever", label: "Forever" },
+  { value: "three_months", label: "3 months" }, { value: "one_year", label: "1 year" },
+  { value: "forever", label: "Forever" },
 ] as const satisfies readonly { value: HistoryRetention; label: MessageKey }[];
 
 const rank = (value: HistoryRetention) => historyRetentionOptions.findIndex((option) => option.value === value);

@@ -395,6 +395,7 @@ pub enum HistoryRetention {
     OneWeek,
     #[default]
     OneMonth,
+    ThreeMonths,
     OneYear,
     Forever,
 }
@@ -406,6 +407,7 @@ impl HistoryRetention {
             Self::TwentyFourHours => Some(1),
             Self::OneWeek => Some(7),
             Self::OneMonth => Some(30),
+            Self::ThreeMonths => Some(90),
             Self::OneYear => Some(365),
             Self::Forever => None,
         }

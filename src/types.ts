@@ -106,7 +106,7 @@ export const speechLocaleRegistry = [
   { tag: "pt-PT", label: "Portuguese (Portugal)" },
 ] as const;
 export type SpeechLocale = (typeof speechLocaleRegistry)[number]["tag"];
-export type HistoryRetention = "never" | "24_hours" | "one_week" | "one_month" | "one_year" | "forever";
+export type HistoryRetention = "never" | "24_hours" | "one_week" | "one_month" | "three_months" | "one_year" | "forever";
 export type HistoryFilter = "all" | "dictate" | "translate" | "edit" | "ask";
 
 export type AsrBackend = "vibevoice" | "faster-whisper" | "openai-compatible";
