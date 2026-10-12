@@ -185,6 +185,9 @@ fn capture_config(settings: &Settings) -> CaptureConfig {
     };
     CaptureConfig {
         device_id: settings.microphone_id.clone(),
+        // A recording must not fail because a saved device (for example a
+        // Bluetooth headset) is away; the saved choice stays unchanged.
+        fallback_to_default: true,
         enhancement: AudioEnhancementConfig {
             noise_suppression,
             gain: f32::from(settings.input_gain_percent) / 100.0,
@@ -397,6 +400,17 @@ fn dispatch_interaction_sound(enabled: bool, dispatch: impl FnOnce()) {
     }
 }
 
+/// The Settings microphone test opens exactly the chosen device: a silent
+/// fallback to the default device would report another microphone's level.
+fn microphone_test_config(device_id: Option<String>) -> CaptureConfig {
+    CaptureConfig {
+        device_id,
+        fallback_to_default: false,
+        preroll: Duration::ZERO,
+        ..CaptureConfig::default()
+    }
+}
+
 async fn release_microphone_test(
     test: &mut MicrophoneTestState,
     audio: &mut dyn AudioCapture,
@@ -429,13 +443,8 @@ pub(crate) async fn start_microphone_test(
             .await
             .map_err(|error| format!("Microphone test could not start. {error}"))?;
     }
-    let config = CaptureConfig {
-        device_id,
-        preroll: Duration::ZERO,
-        ..CaptureConfig::default()
-    };
     audio
-        .arm(config)
+        .arm(microphone_test_config(device_id))
         .await
         .map_err(|error| format!("Microphone test could not start. {error}"))?;
     if services.lifecycle.phase() != PipelinePhase::Idle {
@@ -941,6 +950,7 @@ async fn start_owned_recording(
         audio.cancel().await.map_err(command_error)?;
         return Err(error.into());
     }
+    let microphone_fell_back = audio.uses_fallback_device();
     drop(audio);
     *services
         .target
@@ -974,14 +984,14 @@ async fn start_owned_recording(
         &app,
         &state,
         AppPhase::Recording,
-        match mode {
-            PipelineMode::Translate => "Recording speech to translate.",
-            PipelineMode::Edit => "Recording an edit instruction.",
-            PipelineMode::Ask => "Recording an Ask instruction.",
-            PipelineMode::Dictate => "Recording from the selected microphone.",
-        },
+        recording_message(mode, microphone_fell_back),
     );
     recording_overlay::set_interactive(&app, mode == PipelineMode::Translate);
+    if microphone_fell_back {
+        // Shown inside the live view: the recording runs, on another device.
+        recording_overlay::show_live_notice(&app, MICROPHONE_FALLBACK_HINT);
+        emit_status(&app, "microphone_fallback", MICROPHONE_FALLBACK_STATUS);
+    }
     *live_slot = draft.map(|draft| {
         live_dictation::start(
             app.clone(),
@@ -1036,6 +1046,25 @@ async fn start_owned_recording(
         }
     });
     Ok(())
+}
+
+/// Flashed in the overlay's live view when a recording uses the default
+/// microphone because the saved one is missing. Short enough for that view.
+const MICROPHONE_FALLBACK_HINT: &str = "Selected microphone not found. Using the default.";
+
+/// The main window's status for the same fallback.
+const MICROPHONE_FALLBACK_STATUS: &str = "The selected microphone was not found, so this recording uses the default microphone. The saved microphone setting was not changed.";
+
+/// The Recording phase message. Dictation names the microphone it records
+/// from, which is the default one after a fallback.
+fn recording_message(mode: PipelineMode, microphone_fell_back: bool) -> &'static str {
+    match mode {
+        PipelineMode::Translate => "Recording speech to translate.",
+        PipelineMode::Edit => "Recording an edit instruction.",
+        PipelineMode::Ask => "Recording an Ask instruction.",
+        PipelineMode::Dictate if microphone_fell_back => "Recording from the default microphone.",
+        PipelineMode::Dictate => "Recording from the selected microphone.",
+    }
 }
 
 /// Shown on the overlay while a start waits for the speech model.
@@ -3617,6 +3646,45 @@ mod tests {
         assert!(lifecycle.begin_start(PipelineMode::Translate).is_err());
         lifecycle.finish(id);
         assert!(lifecycle.begin_start(PipelineMode::Translate).is_ok());
+    }
+
+    #[test]
+    fn only_recordings_fall_back_to_the_default_microphone() {
+        let settings = Settings {
+            microphone_id: Some("name:Headset".into()),
+            ..Settings::default()
+        };
+        let recording = capture_config(&settings);
+        assert_eq!(recording.device_id.as_deref(), Some("name:Headset"));
+        assert!(recording.fallback_to_default);
+        let test = microphone_test_config(Some("name:Headset".into()));
+        assert_eq!(test.device_id.as_deref(), Some("name:Headset"));
+        assert!(!test.fallback_to_default);
+        assert_eq!(test.preroll, Duration::ZERO);
+    }
+
+    #[test]
+    fn a_fallback_recording_names_the_default_microphone() {
+        assert_eq!(
+            recording_message(PipelineMode::Dictate, false),
+            "Recording from the selected microphone."
+        );
+        assert_eq!(
+            recording_message(PipelineMode::Dictate, true),
+            "Recording from the default microphone."
+        );
+        for mode in [
+            PipelineMode::Translate,
+            PipelineMode::Edit,
+            PipelineMode::Ask,
+        ] {
+            assert_eq!(
+                recording_message(mode, true),
+                recording_message(mode, false)
+            );
+        }
+        assert!(!MICROPHONE_FALLBACK_HINT.is_empty());
+        assert!(MICROPHONE_FALLBACK_STATUS.contains("was not changed"));
     }
 
     #[tokio::test]

@@ -340,6 +340,9 @@ const en = {
   "The target app runs with higher privileges, so this app cannot type into it.": "The target app runs with higher privileges, so this app cannot type into it.",
   "The selected microphone was not found. Check the microphone in Settings.": "The selected microphone was not found. Check the microphone in Settings.",
   "The microphone could not be opened. Check the microphone in Settings.": "The microphone could not be opened. Check the microphone in Settings.",
+  "Selected microphone not found. Using the default.": "Selected microphone not found. Using the default.",
+  "The selected microphone was not found, so this recording uses the default microphone. The saved microphone setting was not changed.": "The selected microphone was not found, so this recording uses the default microphone. The saved microphone setting was not changed.",
+  "Recording from the default microphone.": "Recording from the default microphone.",
   "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.": "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.",
 } as const;
 export type MessageKey = keyof typeof en;
@@ -682,6 +685,9 @@ const ja: Record<MessageKey, string> = {
   "The target app runs with higher privileges, so this app cannot type into it.": "入力先のアプリが高い権限で実行されているため、このアプリから入力できません。",
   "The selected microphone was not found. Check the microphone in Settings.": "選択したマイクが見つかりません。設定でマイクを確認してください。",
   "The microphone could not be opened. Check the microphone in Settings.": "マイクを開けませんでした。設定でマイクを確認してください。",
+  "Selected microphone not found. Using the default.": "選択したマイクがないため、既定のマイクを使用中",
+  "The selected microphone was not found, so this recording uses the default microphone. The saved microphone setting was not changed.": "選択したマイクが見つからないため、この録音では既定のマイクを使用しています。保存したマイクの設定は変更していません。",
+  "Recording from the default microphone.": "既定のマイクで録音しています。",
   "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.": "Esc は録音中のキャンセルキーでもあります。この割り当てでは、× ボタンでキャンセルしてください。",
 } satisfies Record<MessageKey, string>;
 
@@ -879,6 +885,9 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "The target app runs with higher privileges, so this app cannot type into it.",
       "The selected microphone was not found. Check the microphone in Settings.",
       "The microphone could not be opened. Check the microphone in Settings.",
+      "Selected microphone not found. Using the default.",
+      "The selected microphone was not found, so this recording uses the default microphone. The saved microphone setting was not changed.",
+      "Recording from the default microphone.",
   ] satisfies MessageKey[],
 );
 

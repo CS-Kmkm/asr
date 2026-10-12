@@ -183,6 +183,7 @@ const WARNING_STATUS_KINDS = new Set([
   "history_metric_save_failed",
   "hotkey_unavailable",
   "metric_save_failed",
+  "microphone_fallback",
   "streaming_insertion_unavailable",
   "text_correction_failed",
   "voice_translation_failed",
