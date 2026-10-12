@@ -2,14 +2,14 @@ use std::{
     collections::HashSet,
     fs, io,
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, MutexGuard,
+    },
 };
 
 #[cfg(test)]
-use std::{
-    sync::atomic::{AtomicU64, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -18,7 +18,7 @@ use thiserror::Error;
 
 use crate::types::{
     DictionaryCandidate, DictionaryEntry, HistoryFilter, HistoryItem, HistoryRetention,
-    NewDictionaryEntry, NewHistoryItem, Settings, VoiceShortcuts,
+    NewDictionaryEntry, NewHistoryItem, Settings, SettingsSnapshot, VoiceShortcuts,
 };
 
 const MAX_HISTORY_AUDIO_BYTES: u64 = 50 * 1024 * 1024;
@@ -72,6 +72,11 @@ pub struct Storage {
     connection: Mutex<Connection>,
     history_audio_dir: PathBuf,
     settings_writes: Mutex<()>,
+    /// In-process revision of the settings row, advanced by every committed
+    /// write of it. It changes only while the connection is held, so a read
+    /// that holds the connection pairs the row with the revision that wrote
+    /// it.
+    settings_revision: AtomicU64,
 }
 
 /// Builds without the V2 `shortcuts` field read one scalar chord per mode.
@@ -1133,14 +1138,15 @@ impl Storage {
     /// Stores `raw` as the settings row as is, as another build might.
     #[cfg(test)]
     pub(crate) fn store_raw_settings_for_test(&self, raw: &str) {
-        self.connection()
-            .unwrap()
+        let connection = self.connection().unwrap();
+        connection
             .execute(
                 "INSERT INTO settings(key, value, updated_at) VALUES('app_settings', ?1, 'now')
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 [raw],
             )
             .unwrap();
+        self.advance_settings_revision(&connection);
     }
 
     fn with_connection(connection: Connection, history_audio_dir: PathBuf) -> Self {
@@ -1148,11 +1154,20 @@ impl Storage {
             connection: Mutex::new(connection),
             history_audio_dir,
             settings_writes: Mutex::new(()),
+            settings_revision: AtomicU64::new(0),
         }
     }
 
     fn connection(&self) -> Result<MutexGuard<'_, Connection>, StorageError> {
         self.connection.lock().map_err(|_| StorageError::Lock)
+    }
+
+    /// Advances the settings revision after a committed write of the
+    /// settings row and returns the new revision. `_held` is the connection
+    /// the write used, still held, so no reader sees the row without its
+    /// revision.
+    fn advance_settings_revision(&self, _held: &Connection) -> u64 {
+        self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// Serializes settings read-modify-write sequences. Every writer holds this
@@ -1183,8 +1198,28 @@ impl Storage {
 
     /// Like `get_settings`, also naming the fields replaced in memory.
     pub fn get_settings_with_repairs(&self) -> Result<(Settings, SettingsRepairs), StorageError> {
-        let Some(raw) = stored_settings_row(&*self.connection()?)? else {
-            return Ok((Settings::default(), SettingsRepairs::default()));
+        let (settings, repairs, _) = self.read_settings()?;
+        Ok((settings, repairs))
+    }
+
+    /// Like `get_settings`, with the revision of the write that stored them.
+    pub fn get_settings_snapshot(&self) -> Result<SettingsSnapshot, StorageError> {
+        let (settings, _, revision) = self.read_settings()?;
+        Ok(SettingsSnapshot { settings, revision })
+    }
+
+    /// Reads the row and the settings revision under one hold of the
+    /// connection, so the revision is the one that wrote the row. A
+    /// legacy-layout migration persisted afterwards advances the revision
+    /// without changing the settings returned.
+    fn read_settings(&self) -> Result<(Settings, SettingsRepairs, u64), StorageError> {
+        let (raw, revision) = {
+            let connection = self.connection()?;
+            let raw = stored_settings_row(&connection)?;
+            (raw, self.settings_revision.load(Ordering::SeqCst))
+        };
+        let Some(raw) = raw else {
+            return Ok((Settings::default(), SettingsRepairs::default(), revision));
         };
         let loaded = load_settings(&raw);
         if let Some(migrated) = &loaded.migrated {
@@ -1192,7 +1227,7 @@ impl Storage {
             // they cannot be persisted, and the next read migrates again.
             let _ = self.rewrite_settings(&raw, migrated, &loaded.migrations.join(","));
         }
-        Ok((loaded.settings, loaded.repairs))
+        Ok((loaded.settings, loaded.repairs, revision))
     }
 
     /// Copies the stored settings row to `settings_backups` when this build
@@ -1219,16 +1254,23 @@ impl Storage {
     /// Persists the current in-memory values of exactly the replaced fields,
     /// bypassing the unchanged-fallback rule of a normal save. Every other
     /// stored field and every unknown key stays as it is. The previous row is
-    /// backed up first. Returns the settings now stored.
-    pub fn persist_repaired_settings(&self) -> Result<Settings, StorageError> {
+    /// backed up first. Returns the settings now stored with their revision.
+    pub fn persist_repaired_settings(&self) -> Result<SettingsSnapshot, StorageError> {
         let mut connection = self.connection()?;
+        let revision = self.settings_revision.load(Ordering::SeqCst);
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let Some(raw) = stored_settings_row(&transaction)? else {
-            return Ok(Settings::default());
+            return Ok(SettingsSnapshot {
+                settings: Settings::default(),
+                revision,
+            });
         };
         let loaded = load_settings(&raw);
         if loaded.repairs.is_empty() {
-            return Ok(loaded.settings);
+            return Ok(SettingsSnapshot {
+                settings: loaded.settings,
+                revision,
+            });
         }
         let current = serde_json::to_value(&loaded.settings)?;
         let whole_row = loaded
@@ -1260,7 +1302,10 @@ impl Storage {
             params![serde_json::to_string(&value)?, Utc::now().to_rfc3339()],
         )?;
         transaction.commit()?;
-        Ok(loaded.settings)
+        Ok(SettingsSnapshot {
+            settings: loaded.settings,
+            revision: self.advance_settings_revision(&connection),
+        })
     }
 
     /// Replaces the stored row `raw` with `migrated`, keeping `raw` in
@@ -1286,12 +1331,13 @@ impl Storage {
             return Ok(());
         }
         transaction.commit()?;
+        self.advance_settings_revision(&connection);
         Ok(())
     }
 
     /// Saves `settings` over the stored row, keeping keys this build does
-    /// not know.
-    pub fn update_settings(&self, settings: &Settings) -> Result<(), StorageError> {
+    /// not know. Returns the new settings revision.
+    pub fn update_settings(&self, settings: &Settings) -> Result<u64, StorageError> {
         let mut connection = self.connection()?;
         // IMMEDIATE takes the write lock before the read, so a concurrent
         // writer makes this wait (busy timeout) instead of failing the
@@ -1299,16 +1345,17 @@ impl Storage {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         save_settings_row(&transaction, settings)?;
         transaction.commit()?;
-        Ok(())
+        Ok(self.advance_settings_revision(&connection))
     }
 
     /// Persist settings and apply their retention policy as one database
     /// transaction. Files are handled only after the commit, so a settings
-    /// write failure cannot erase existing History.
+    /// write failure cannot erase existing History. Returns the new settings
+    /// revision.
     pub fn update_settings_and_apply_history_policy(
         &self,
         settings: &Settings,
-    ) -> Result<(), StorageError> {
+    ) -> Result<u64, StorageError> {
         let now = Utc::now();
         let mut connection = self.connection()?;
         // IMMEDIATE takes the write lock before the read, so a concurrent
@@ -1318,9 +1365,10 @@ impl Storage {
         save_settings_row(&transaction, settings)?;
         purge_history(&transaction, settings, now)?;
         transaction.commit()?;
+        let revision = self.advance_settings_revision(&connection);
         drop(connection);
         let _ = self.retry_pending_audio_deletions();
-        Ok(())
+        Ok(revision)
     }
 
     /// Enforce the stored retention without writing settings. A settings
@@ -3519,6 +3567,94 @@ mod tests {
     }
 
     #[test]
+    fn every_settings_write_advances_the_revision() {
+        let storage = Storage::in_memory().unwrap();
+        let start = storage.get_settings_snapshot().unwrap().revision;
+        let mut settings = Settings {
+            interaction_sounds: true,
+            ..Settings::default()
+        };
+        assert_eq!(storage.update_settings(&settings).unwrap(), start + 1);
+        let snapshot = storage.get_settings_snapshot().unwrap();
+        assert_eq!(snapshot.revision, start + 1);
+        assert_eq!(snapshot.settings, settings);
+
+        settings.history_retention = HistoryRetention::Never;
+        assert_eq!(
+            storage
+                .update_settings_and_apply_history_policy(&settings)
+                .unwrap(),
+            start + 2
+        );
+        assert_eq!(storage.get_settings_snapshot().unwrap().revision, start + 2);
+
+        // A rejected write leaves the revision and the row as they were.
+        storage
+            .connection()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_settings_insert BEFORE INSERT ON settings
+                 BEGIN SELECT RAISE(ABORT, 'settings write rejected'); END;
+                 CREATE TRIGGER reject_settings_update BEFORE UPDATE ON settings
+                 BEGIN SELECT RAISE(ABORT, 'settings write rejected'); END;",
+            )
+            .unwrap();
+        settings.interaction_sounds = false;
+        assert!(storage.update_settings(&settings).is_err());
+        let snapshot = storage.get_settings_snapshot().unwrap();
+        assert_eq!(snapshot.revision, start + 2);
+        assert!(snapshot.settings.interaction_sounds);
+    }
+
+    #[test]
+    fn a_persisted_legacy_migration_advances_the_revision() {
+        let storage = Storage::in_memory().unwrap();
+        let mut legacy = serde_json::to_value(Settings::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("shortcuts");
+        store_raw_settings(&storage, &legacy.to_string());
+        let read = storage.get_settings_snapshot().unwrap();
+        // The read returns the revision of the row it read; the migration it
+        // persisted is a newer write with the same settings.
+        let after = storage.get_settings_snapshot().unwrap();
+        assert_eq!(after.revision, read.revision + 1);
+        assert_eq!(after.settings, read.settings);
+        assert!(stored_settings_value(&storage)["shortcuts"].is_object());
+    }
+
+    #[test]
+    fn a_settings_snapshot_pairs_the_settings_with_the_revision_that_wrote_them() {
+        let storage = std::sync::Arc::new(Storage::in_memory().unwrap());
+        let start = storage.get_settings_snapshot().unwrap();
+        let writer = {
+            let storage = std::sync::Arc::clone(&storage);
+            std::thread::spawn(move || {
+                let mut written = std::collections::HashMap::new();
+                for gain in 25..225 {
+                    let settings = Settings {
+                        input_gain_percent: gain,
+                        ..Settings::default()
+                    };
+                    written.insert(storage.update_settings(&settings).unwrap(), gain);
+                }
+                written
+            })
+        };
+        let mut read = Vec::new();
+        while !writer.is_finished() {
+            read.push(storage.get_settings_snapshot().unwrap());
+        }
+        let written = writer.join().unwrap();
+        read.push(storage.get_settings_snapshot().unwrap());
+        for snapshot in read {
+            let expected = written
+                .get(&snapshot.revision)
+                .copied()
+                .unwrap_or(start.settings.input_gain_percent);
+            assert_eq!(snapshot.settings.input_gain_percent, expected);
+        }
+    }
+
+    #[test]
     fn scalar_shortcuts_migrate_once_without_losing_unrelated_json() {
         let storage = Storage::in_memory().unwrap();
         let mut value = serde_json::to_value(Settings::default()).unwrap();
@@ -3661,7 +3797,7 @@ mod tests {
             serde_json::from_str(&raw).unwrap()
         };
         for persist in [
-            Storage::update_settings as fn(&Storage, &Settings) -> Result<(), StorageError>,
+            Storage::update_settings as fn(&Storage, &Settings) -> Result<u64, StorageError>,
             Storage::update_settings_and_apply_history_policy,
         ] {
             persist(&storage, &settings).unwrap();
@@ -3955,7 +4091,7 @@ mod tests {
         settings.shortcuts.dictate = vec!["Ctrl+Alt+V".into()];
 
         for persist in [
-            Storage::update_settings as fn(&Storage, &Settings) -> Result<(), StorageError>,
+            Storage::update_settings as fn(&Storage, &Settings) -> Result<u64, StorageError>,
             Storage::update_settings_and_apply_history_policy,
         ] {
             persist(&storage, &settings).unwrap();
@@ -3993,7 +4129,7 @@ mod tests {
     #[test]
     fn unrelated_saves_keep_values_this_build_could_not_read() {
         for persist in [
-            Storage::update_settings as fn(&Storage, &Settings) -> Result<(), StorageError>,
+            Storage::update_settings as fn(&Storage, &Settings) -> Result<u64, StorageError>,
             Storage::update_settings_and_apply_history_policy,
         ] {
             let storage = Storage::in_memory().unwrap();
@@ -4045,7 +4181,7 @@ mod tests {
     #[test]
     fn saving_over_an_unreadable_row_backs_it_up_first() {
         for persist in [
-            Storage::update_settings as fn(&Storage, &Settings) -> Result<(), StorageError>,
+            Storage::update_settings as fn(&Storage, &Settings) -> Result<u64, StorageError>,
             Storage::update_settings_and_apply_history_policy,
         ] {
             let storage = Storage::in_memory().unwrap();
@@ -4131,9 +4267,11 @@ mod tests {
             "six_months"
         );
 
+        let revision = storage.get_settings_snapshot().unwrap().revision;
         let persisted = storage.persist_repaired_settings().unwrap();
 
-        assert_eq!(persisted, before);
+        assert_eq!(persisted.settings, before);
+        assert_eq!(persisted.revision, revision + 1);
         let stored = stored_settings_value(&storage);
         assert_eq!(stored["historyRetention"], "forever");
         assert_eq!(stored["deleteAudioAfterProcessing"], true);
@@ -4162,13 +4300,16 @@ mod tests {
 
         let persisted = storage.persist_repaired_settings().unwrap();
 
-        assert_eq!(persisted, fallback_settings());
+        assert_eq!(persisted.settings, fallback_settings());
         assert!(storage.settings_repair_status().unwrap().is_empty());
         assert_eq!(storage.get_settings().unwrap(), fallback_settings());
         assert_eq!(settings_backups(&storage)[0].0, "not json");
         // Nothing left to persist: a second call changes nothing.
         let stored = stored_settings_raw(&storage);
-        storage.persist_repaired_settings().unwrap();
+        assert_eq!(
+            storage.persist_repaired_settings().unwrap().revision,
+            persisted.revision
+        );
         assert_eq!(stored_settings_raw(&storage), stored);
     }
 

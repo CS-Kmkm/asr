@@ -227,20 +227,29 @@ async function appWithStoredRetention(historyRetention, updateSettings, preview)
     },
   };
   const { defaultSettings } = load("../src/api.ts");
-  const stored = { ...structuredClone(defaultSettings), setupComplete: true, historyRetention };
+  let stored = { ...structuredClone(defaultSettings), setupComplete: true, historyRetention };
+  let revision = 1;
   const calls = { update: 0, saved: [] };
   const api = {
     defaultSettings,
     getStartupHotkeyWarning: async () => [],
     getAppState: async () => ({ phase: "idle", message: null }),
-    getSettings: async () => stored,
+    getSettings: async () => ({ settings: stored, revision }),
     getModelStatus: async () => ({ state: "ready" }),
     getGpuDiagnostics: async () => ({}),
     listAudioDevices: async () => [],
     listDictionary: async () => [],
     listHistory: async () => [],
     listDictionaryCandidates: async () => [],
-    updateSettings: async (next) => { calls.update++; calls.saved.push(next); return updateSettings(next); },
+    // `updateSettings` decides whether the save fails; a save stores its patch.
+    updateSettings: async (patch) => {
+      calls.update++;
+      calls.saved.push(structuredClone(patch));
+      await updateSettings(patch);
+      stored = { ...stored, ...patch };
+      revision += 1;
+      return { settings: stored, revision };
+    },
   };
   const component = retentionSelect(true, preview);
   const historyModule = load("../src/pages/HistoryPage.tsx", {
@@ -278,6 +287,7 @@ async function appWithStoredRetention(historyRetention, updateSettings, preview)
   navigate("History");
   return {
     calls, component, navigate, settle: settleApp,
+    stored: () => stored,
     props: (name) => all().find((node) => node.type === `${name}Page`).props,
     // The retention select element as the History page currently renders it.
     retentionSelect() {
@@ -324,8 +334,11 @@ test("confirming after a slow count keeps settings changed while it was pending"
   await app.settle();
   assert.equal(app.component.prompts.length, 1);
   assert.equal(app.calls.update, 2);
-  assert.equal(app.calls.saved[1].historyRetention, "24_hours");
-  assert.equal(app.calls.saved[1].deleteAudioAfterProcessing, !audio);
+  // The retention save sends only its own key, so it cannot revert the
+  // audio change confirmed while the count was pending.
+  assert.deepEqual(app.calls.saved[1], { historyRetention: "24_hours" });
+  assert.equal(app.stored().historyRetention, "24_hours");
+  assert.equal(app.stored().deleteAudioAfterProcessing, !audio);
   assert.equal(app.props("Privacy").settings.deleteAudioAfterProcessing, !audio);
 });
 

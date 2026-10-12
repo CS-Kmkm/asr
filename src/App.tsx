@@ -48,6 +48,7 @@ import type {
   ModelProgress,
   ModelStatus,
   Settings,
+  SettingsSnapshot,
 } from "./types";
 import { ModelProgressBar } from "./components/ui";
 import { DashboardPage } from "./pages/DashboardPage";
@@ -170,6 +171,37 @@ interface Notice {
   severity: "info" | "success" | "warning" | "error";
   // Kind of the backend status event, when the notice came from one.
   kind?: string;
+}
+
+// A settings key shown with a value changed in this window that the backend
+// has not confirmed yet.
+interface LocalEdit {
+  // Taken anew by every change, so a save confirms only the value it sent.
+  generation: number;
+  // An unsaved Setup choice: sent with the next save, but kept rather than
+  // reverted when that save fails.
+  draft: boolean;
+}
+
+// How a queued settings save ended.
+type SettingsSaveOutcome =
+  | { saved: true; settings: Settings }
+  | { saved: false; error: unknown };
+
+// `target` with the values of `keys` taken from `source`.
+function withKeys(target: Settings, source: Settings, keys: ReadonlyArray<keyof Settings>): Settings {
+  const result = { ...target };
+  const copy = <K extends keyof Settings>(key: K) => { result[key] = source[key]; };
+  keys.forEach(copy);
+  return result;
+}
+
+// Only the values of `keys` from `source`.
+function pickKeys(source: Settings, keys: ReadonlyArray<keyof Settings>): Partial<Settings> {
+  const picked: Partial<Settings> = {};
+  const copy = <K extends keyof Settings>(key: K) => { picked[key] = source[key]; };
+  keys.forEach(copy);
+  return picked;
 }
 
 // Notices that only describe model preparation and are cleared once it ends.
@@ -484,18 +516,21 @@ export default function App() {
   const [theme, setTheme] = useState<Settings["theme"]>(defaultSettings.theme);
 
   useEffect(() => {
+    // The load and settings-changed events can arrive in any order; only a
+    // snapshot newer than the last one applied changes the language or theme.
+    let revision = -1;
+    const apply = (snapshot: SettingsSnapshot) => {
+      if (snapshot.revision <= revision) return;
+      revision = snapshot.revision;
+      setLanguage(snapshot.settings.uiLanguage);
+      setTheme(snapshot.settings.theme);
+    };
     getSettings()
-      .then((settings) => {
-        setLanguage(settings.uiLanguage);
-        setTheme(settings.theme);
-      })
+      .then(apply)
       .catch(() => setLanguage(defaultSettings.uiLanguage));
     let unlisten: (() => void) | undefined;
     let active = true;
-    void listen<Settings>("settings-changed", ({ payload }) => {
-      setLanguage(payload.uiLanguage);
-      setTheme(payload.theme);
-    }).then((stop) => {
+    void listen<SettingsSnapshot>("settings-changed", ({ payload }) => apply(payload)).then((stop) => {
       if (active) unlisten = stop;
       else stop();
     });
@@ -547,19 +582,23 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
   // Saves can follow each other quickly (a select saves at once, text on
-  // blur). They are sent one at a time; only the latest save's
-  // acknowledgement or rollback may replace the settings, and settings-changed
-  // echoes are ignored while a save is queued or in flight, so an older
-  // save's answer cannot revert text committed after it.
+  // blur). They are sent one at a time, and each sends only the keys changed
+  // here that the backend has not confirmed yet, so a save never rewrites a
+  // key changed elsewhere (such as a voice translation's target).
   const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const latestSaveRef = useRef(0);
   const pendingSavesRef = useRef(0);
-  // The settings the backend last confirmed, and the fields saves changed
-  // since then, which a failed latest save returns to their stored values.
+  // The newest backend snapshot applied. Acknowledgements and settings-changed
+  // events can arrive in any order; the revision decides which is newer.
+  const settingsRevisionRef = useRef(-1);
   const confirmedSettingsRef = useRef(settings);
-  const unconfirmedKeysRef = useRef(new Set<keyof Settings>());
-  // Saves send the whole Settings object, and a shorter history retention
-  // purges data, so nothing is saved until the stored settings are known.
+  // Keys shown with their local value instead of the confirmed one, until a
+  // save confirms that value; a failed latest save returns them to the
+  // confirmed values.
+  const localEditsRef = useRef(new Map<keyof Settings, LocalEdit>());
+  const editGenerationRef = useRef(0);
+  // A shorter history retention purges data, so nothing is saved until the
+  // stored settings are known.
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const settingsLoadedRef = useRef(false);
   const settingsRequestRef = useRef(0);
@@ -631,13 +670,9 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       }),
       listen<ModelProgress>("model-progress", (event) => setModelProgress(event.payload)),
       listen<GpuDiagnostics>("gpu-diagnostics", (event) => setGpu(event.payload)),
-      listen<Settings>("settings-changed", (event) => {
-        // While saves are queued or in flight, the latest one's
-        // acknowledgement decides. Known limitation: a change made elsewhere
-        // (tray, hotkey) in that window is dropped here and then overwritten
-        // by the queued whole-object save; fixing it needs backend versions.
-        if (pendingSavesRef.current === 0) applyBackendSettings(event.payload);
-      }),
+      // Applied in revision order, also while saves are pending: keys changed
+      // here keep their local values until a save confirms them.
+      listen<SettingsSnapshot>("settings-changed", (event) => applyReadSnapshot(event.payload)),
       listen<{ kind: string; message: string }>("status", (event) =>
         setNotice({
           message: event.payload.message,
@@ -728,29 +763,70 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     };
   }, [page, state.phase, settings.historyRetention]);
 
-  // Applies settings known to come from the backend; the first of them also
-  // decides whether onboarding is still needed.
-  function applyBackendSettings(nextSettings: Settings) {
+  // Shows the confirmed settings with every key changed here keeping its
+  // local value.
+  function showConfirmedWithLocalEdits() {
+    const shown = withKeys(confirmedSettingsRef.current, settingsRef.current, Array.from(localEditsRef.current.keys()));
+    settingsRef.current = shown;
+    setSettings(shown);
+  }
+
+  // Records that `keys` now show local values not yet confirmed.
+  function recordLocalEdits(keys: ReadonlyArray<keyof Settings>, draft: boolean) {
+    for (const key of keys) {
+      const previous = localEditsRef.current.get(key);
+      localEditsRef.current.set(key, {
+        generation: ++editGenerationRef.current,
+        // A key a save already changed stays one to revert on failure.
+        draft: draft && (previous?.draft ?? true),
+      });
+    }
+  }
+
+  // Applies a backend snapshot (the load, a save's acknowledgement or
+  // settings-changed) unless a newer one is applied already, keeping local
+  // values of unconfirmed keys. The first one also decides whether
+  // onboarding is still needed.
+  function applyBackendSnapshot(snapshot: SettingsSnapshot): boolean {
+    if (snapshot.revision <= settingsRevisionRef.current) return false;
+    settingsRevisionRef.current = snapshot.revision;
     const first = !settingsLoadedRef.current;
     settingsLoadedRef.current = true;
-    confirmedSettingsRef.current = nextSettings;
-    setSettings(nextSettings);
+    confirmedSettingsRef.current = snapshot.settings;
+    showConfirmedWithLocalEdits();
     setSettingsLoaded(true);
-    onLanguageChange(nextSettings.uiLanguage);
-    if (first && !nextSettings.setupComplete) setPage("setup");
+    if (first && !snapshot.settings.setupComplete) setPage("setup");
+    return true;
+  }
+
+  // Applies a snapshot that is not a save's acknowledgement. While saves are
+  // pending, the latest one's acknowledgement switches the UI language.
+  function applyReadSnapshot(snapshot: SettingsSnapshot) {
+    if (applyBackendSnapshot(snapshot) && pendingSavesRef.current === 0) {
+      onLanguageChange(snapshot.settings.uiLanguage);
+    }
   }
 
   async function loadSettings() {
     const request = ++settingsRequestRef.current;
     try {
-      const nextSettings = await getSettings();
-      // A slower or superseded read must not replace settings that are
-      // already known (for example from settings-changed after a save).
-      if (request !== settingsRequestRef.current || settingsLoadedRef.current) return;
-      applyBackendSettings(nextSettings);
+      const snapshot = await getSettings();
+      // A superseded read is dropped, and an older one cannot replace newer
+      // settings (for example from settings-changed after a save).
+      if (request !== settingsRequestRef.current) return;
+      applyReadSnapshot(snapshot);
     } catch (error) {
       if (request === settingsRequestRef.current && !settingsLoadedRef.current) showNotice(String(error), "error");
     }
+  }
+
+  // Setup changes choices locally and saves them with Finish. They go with
+  // whichever save comes next, and a failed save keeps them.
+  function editSettingsLocally(next: Settings) {
+    const keys = Object.keys(next) as Array<keyof Settings>;
+    recordLocalEdits(keys.filter((key) => !Object.is(next[key], settingsRef.current[key])), true);
+    settingsRef.current = next;
+    setSettings(next);
   }
 
   // Refuses a save while only the defaults are known, and retries the load so
@@ -762,53 +838,72 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     return false;
   }
 
-  async function saveSettings(patch: Partial<Settings>): Promise<boolean> {
-    if (!settingsReady()) return false;
+  // Shows `patch` at once and queues its save. Saves are sent one at a time
+  // in the order they were made; when its turn comes, a save sends every key
+  // still unconfirmed with the value shown then, or nothing at all when an
+  // earlier save already confirmed them. The outcome carries the settings
+  // the backend stored.
+  async function queueSettingsSave(patch: Partial<Settings>): Promise<SettingsSaveOutcome> {
+    recordLocalEdits(Object.keys(patch) as Array<keyof Settings>, false);
     const next = { ...settingsRef.current, ...patch };
     settingsRef.current = next;
     setSettings(next);
-    for (const key of Object.keys(patch) as Array<keyof Settings>) unconfirmedKeysRef.current.add(key);
     const save = ++latestSaveRef.current;
     pendingSavesRef.current += 1;
-    // update_settings writes the whole Settings object, so saves are sent one
-    // at a time in the order they were made, each with the settings shown
-    // when its turn comes: the backend's last write is the newest state.
     const turn = saveQueueRef.current;
     let endTurn = () => {};
     saveQueueRef.current = new Promise<void>((resolve) => { endTurn = resolve; });
     await turn;
-    let saved: Settings;
+    const sent = Array.from(localEditsRef.current, ([key, edit]) => ({ key, generation: edit.generation }));
+    let snapshot: SettingsSnapshot | null = null;
     try {
-      saved = await updateSettings(settingsRef.current);
+      if (sent.length > 0) {
+        snapshot = await updateSettings(pickKeys(settingsRef.current, sent.map(({ key }) => key)));
+      }
     } catch (error) {
-      pendingSavesRef.current -= 1;
-      endTurn();
-      // A later queued save sends the whole settings object and decides.
-      // Otherwise every field a save changed since the last confirmation
-      // returns to its stored value; unsaved local edits (Setup) stay.
+      // A later queued save sends the unconfirmed keys again and decides.
+      // Otherwise each of them returns to its confirmed value; unsaved Setup
+      // choices stay.
       if (save === latestSaveRef.current) {
-        const confirmed = confirmedSettingsRef.current;
-        const restored = {
-          ...settingsRef.current,
-          ...Object.fromEntries(Array.from(unconfirmedKeysRef.current, (key) => [key, confirmed[key]])),
-        };
-        unconfirmedKeysRef.current.clear();
+        const reverted = Array.from(localEditsRef.current)
+          .filter(([, edit]) => !edit.draft)
+          .map(([key]) => key);
+        for (const key of reverted) localEditsRef.current.delete(key);
+        const restored = withKeys(settingsRef.current, confirmedSettingsRef.current, reverted);
         settingsRef.current = restored;
         setSettings(restored);
+        // A save can fail after its settings were stored (a later step of the
+        // command failed) without a settings-changed; a newer stored revision
+        // then replaces the restored values.
+        void loadSettings();
       }
-      showNotice(String(error), "error");
-      return false;
+      pendingSavesRef.current -= 1;
+      endTurn();
+      return { saved: false, error };
     }
+    // A key changed again after it was sent stays unconfirmed for the next save.
+    for (const { key, generation } of sent) {
+      if (localEditsRef.current.get(key)?.generation === generation) localEditsRef.current.delete(key);
+    }
+    // An acknowledgement older than an applied settings-changed only
+    // confirms keys; the newer snapshot stays shown.
+    if (!snapshot || !applyBackendSnapshot(snapshot)) showConfirmedWithLocalEdits();
     pendingSavesRef.current -= 1;
     endTurn();
-    confirmedSettingsRef.current = saved;
-    // An older save's acknowledgement predates the queued newer save, so only
-    // the latest save's acknowledgement replaces the shown settings.
-    if (save === latestSaveRef.current) {
-      unconfirmedKeysRef.current.clear();
-      settingsRef.current = saved;
-      setSettings(saved);
+    // An older acknowledgement must not switch back a language chosen by a
+    // newer save, so only the latest save switches the UI language.
+    if (save === latestSaveRef.current) onLanguageChange(settingsRef.current.uiLanguage);
+    return { saved: true, settings: snapshot?.settings ?? confirmedSettingsRef.current };
+  }
+
+  async function saveSettings(patch: Partial<Settings>): Promise<boolean> {
+    if (!settingsReady()) return false;
+    const outcome = await queueSettingsSave(patch);
+    if (!outcome.saved) {
+      showNotice(String(outcome.error), "error");
+      return false;
     }
+    const saved = outcome.settings;
     let hotkeyWarnings: string[] = [];
     try {
       hotkeyWarnings = await getStartupHotkeyWarning();
@@ -816,9 +911,6 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     } catch {
       // Keep the known warning if diagnostics cannot be refreshed.
     }
-    // The same holds for the UI language: an older acknowledgement must not
-    // switch back a language chosen by a newer save.
-    if (save === latestSaveRef.current) onLanguageChange(saved.uiLanguage);
     // A saved hotkey that still cannot be registered does not fail the save,
     // but the notice names the action that stays unavailable.
     showNotice(
@@ -898,10 +990,13 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     setModelLoading(true);
     showNotice(t("Saving ASR settings and preparing the selected model..."));
     try {
-      const next = configuration ? { ...settings, ...configuration } : settings;
-      const saved = configuration ? await updateSettings(next) : next;
-      if (configuration) confirmedSettingsRef.current = saved;
-      setSettings(saved);
+      let saved = settingsRef.current;
+      if (configuration) {
+        // Saved in turn with the other settings saves.
+        const outcome = await queueSettingsSave(configuration);
+        if (!outcome.saved) throw outcome.error;
+        saved = outcome.settings;
+      }
       setModel(await loadModel(saved.modelId, saved.modelQuantization));
       showNotice(t("Model loaded and ready."), "success");
     } catch (error) {
@@ -914,28 +1009,23 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   async function saveCustomModel(customModel: CustomModel): Promise<boolean> {
     if (!settingsReady()) return false;
     const customModels = [
-      ...settings.customModels.filter(
+      ...settingsRef.current.customModels.filter(
         (saved) =>
           saved.asrBackend !== customModel.asrBackend || saved.modelId !== customModel.modelId,
       ),
       customModel,
     ];
-    const next = {
-      ...settings,
+    const outcome = await queueSettingsSave({
       asrBackend: customModel.asrBackend,
       modelId: customModel.modelId,
       customModels,
-    };
-    try {
-      const saved = await updateSettings(next);
-      confirmedSettingsRef.current = saved;
-      setSettings(saved);
-      showNotice(t("Custom model saved locally."), "success");
-      return true;
-    } catch (error) {
-      showNotice(String(error), "error");
+    });
+    if (!outcome.saved) {
+      showNotice(String(outcome.error), "error");
       return false;
     }
+    showNotice(t("Custom model saved locally."), "success");
+    return true;
   }
 
   async function addDictionary(entry: DictionaryEntryInput): Promise<boolean> {
@@ -1082,7 +1172,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             devices={devices}
             gpu={gpu}
             gpuChecking={gpuChecking}
-            onSettingsChange={setSettings}
+            onSettingsChange={editSettingsLocally}
             onConfigureModel={() => setPage("models")}
             onDiagnoseGpu={() => void diagnoseGpu()}
             onFinish={() => {

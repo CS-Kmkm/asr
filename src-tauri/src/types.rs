@@ -116,6 +116,16 @@ pub struct Settings {
     pub scoped_style_profiles: Vec<ScopedStyleProfile>,
 }
 
+/// Stored settings with the in-process revision of the write that stored
+/// them. Revisions only grow, so a reader can order snapshots that arrive
+/// out of order (command results and `settings-changed` events).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsSnapshot {
+    pub settings: Settings,
+    pub revision: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppContext {

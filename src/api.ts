@@ -6,6 +6,7 @@ import type {
   HistoryItem,
   ModelStatus,
   Settings,
+  SettingsSnapshot,
   RecordingResult,
   DictionaryCandidate, DictionaryEntry,
   DictionaryEntryInput,
@@ -128,8 +129,11 @@ export async function cancelRecording(): Promise<void> {
   return invoke("cancel_recording");
 }
 
-export async function getSettings(): Promise<Settings> {
-  if (!inTauri) return defaultSettings;
+// Outside Tauri (a browser preview) saves are kept in memory for the page.
+let browserSettings: SettingsSnapshot = { settings: defaultSettings, revision: 0 };
+
+export async function getSettings(): Promise<SettingsSnapshot> {
+  if (!inTauri) return browserSettings;
   return invoke("get_settings");
 }
 
@@ -154,9 +158,17 @@ export async function persistRepairedSettings(): Promise<string[]> {
   return invoke("persist_repaired_settings");
 }
 
-export async function updateSettings(settings: Settings): Promise<Settings> {
-  if (!inTauri) return settings;
-  return invoke("update_settings", { settings });
+// Saves only the top-level keys in `patch` over the stored settings; the
+// backend keeps every other key as stored, including changes made elsewhere.
+export async function updateSettings(patch: Partial<Settings>): Promise<SettingsSnapshot> {
+  if (!inTauri) {
+    browserSettings = {
+      settings: { ...browserSettings.settings, ...patch },
+      revision: browserSettings.revision + 1,
+    };
+    return browserSettings;
+  }
+  return invoke("update_settings", { patch });
 }
 
 export async function listHistory(filter: HistoryFilter = "all"): Promise<HistoryItem[]> {

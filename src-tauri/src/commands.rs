@@ -3007,7 +3007,8 @@ fn autostart_update(previous: bool, desired: bool, debug_build: bool) -> Autosta
 /// transaction, so a failed settings write cannot erase History and an insert
 /// cannot observe the old settings after the purge. Shortcut registrations are
 /// rolled back by `shortcuts::update_registrations` when this fails.
-fn persist_settings(storage: &Storage, settings: &Settings) -> Result<(), String> {
+/// Returns the new settings revision.
+fn persist_settings(storage: &Storage, settings: &Settings) -> Result<u64, String> {
     storage
         .update_settings_and_apply_history_policy(settings)
         .map_err(command_error)
@@ -3057,15 +3058,15 @@ fn next_translation_target(languages: &[String], current: &str) -> Option<String
 fn store_next_translation_target(
     storage: &Storage,
     active: Option<&str>,
-) -> Result<Settings, String> {
+) -> Result<types::SettingsSnapshot, String> {
     let _settings_writes = storage.lock_settings_writes().map_err(command_error)?;
     let mut settings = storage.get_settings().map_err(command_error)?;
     let current = active.unwrap_or(settings.translation_target_language.as_str());
     settings.translation_target_language =
         next_translation_target(&settings.translation_target_languages, current)
             .ok_or("at least one translation target language is required")?;
-    storage.update_settings(&settings).map_err(command_error)?;
-    Ok(settings)
+    let revision = storage.update_settings(&settings).map_err(command_error)?;
+    Ok(types::SettingsSnapshot { settings, revision })
 }
 
 #[tauri::command]
@@ -3087,10 +3088,10 @@ pub(crate) async fn cycle_voice_translation_target(
     {
         return Err("voice translation is not recording".into());
     }
-    let settings = store_next_translation_target(&storage, active.as_deref())?;
-    let next = settings.translation_target_language.clone();
+    let snapshot = store_next_translation_target(&storage, active.as_deref())?;
+    let next = snapshot.settings.translation_target_language.clone();
     *active = Some(next.clone());
-    let _ = app.emit("settings-changed", settings);
+    let _ = app.emit("settings-changed", snapshot);
     let _ = app.emit(
         "voice-mode",
         serde_json::json!({ "mode": "translate", "targetLanguage": next }),
@@ -3607,7 +3608,7 @@ mod tests {
             &desired,
             |_| -> Result<(), &str> { panic!("swapping existing chords needs no registration") },
             |_| -> Result<(), &str> { panic!("swapping existing chords needs no removal") },
-            || persist_settings(&storage, &settings),
+            || persist_settings(&storage, &settings).map(drop),
         )
         .unwrap();
         let saved = storage.get_settings().unwrap();
@@ -4249,10 +4250,112 @@ mod tests {
         drop(settings_save);
 
         let cycled = cycling.join().unwrap().unwrap();
-        assert_eq!(cycled.translation_target_language, "ja");
-        let stored = storage.get_settings().unwrap();
-        assert_eq!(stored.history_retention, types::HistoryRetention::Never);
-        assert_eq!(stored.translation_target_language, "ja");
+        assert_eq!(cycled.settings.translation_target_language, "ja");
+        let stored = storage.get_settings_snapshot().unwrap();
+        assert_eq!(stored, cycled);
+        assert_eq!(
+            stored.settings.history_retention,
+            types::HistoryRetention::Never
+        );
+    }
+
+    #[test]
+    fn cycling_the_target_advances_the_settings_revision() {
+        let storage = Storage::in_memory().unwrap();
+        let before = storage.get_settings_snapshot().unwrap();
+        let cycled = store_next_translation_target(&storage, None).unwrap();
+        assert_eq!(cycled.revision, before.revision + 1);
+        assert_eq!(cycled.settings.translation_target_language, "ja");
+        assert_eq!(storage.get_settings_snapshot().unwrap(), cycled);
+    }
+
+    /// The storage steps of `update_settings`: under the settings-write lock,
+    /// apply the patch to the stored settings, validate, and persist.
+    fn save_settings_patch(
+        storage: &Storage,
+        patch: serde_json::Value,
+    ) -> Result<types::SettingsSnapshot, String> {
+        let _settings_writes = storage.lock_settings_writes().unwrap();
+        let previous = storage.get_settings().unwrap();
+        let serde_json::Value::Object(patch) = patch else {
+            panic!("a patch is a JSON object");
+        };
+        let settings = apply_settings_patch(&previous, patch)?;
+        validate_settings(&settings)?;
+        let revision = persist_settings(storage, &settings)?;
+        Ok(types::SettingsSnapshot { settings, revision })
+    }
+
+    #[test]
+    fn a_settings_patch_advances_the_revision_and_returns_the_stored_settings() {
+        let storage = Storage::in_memory().unwrap();
+        let before = storage.get_settings_snapshot().unwrap();
+        let saved = save_settings_patch(&storage, serde_json::json!({ "interactionSounds": true }))
+            .unwrap();
+        assert_eq!(saved.revision, before.revision + 1);
+        assert_eq!(
+            saved.settings,
+            Settings {
+                interaction_sounds: true,
+                ..before.settings
+            }
+        );
+        assert_eq!(storage.get_settings_snapshot().unwrap(), saved);
+    }
+
+    #[test]
+    fn a_settings_patch_keeps_a_target_cycled_after_the_window_read_its_settings() {
+        let storage = Storage::in_memory().unwrap();
+        // The window shows these settings, then a voice translation cycles
+        // the target before the window's queued save is sent.
+        let shown = storage.get_settings_snapshot().unwrap();
+        let cycled = store_next_translation_target(&storage, None).unwrap();
+        assert_ne!(
+            cycled.settings.translation_target_language,
+            shown.settings.translation_target_language
+        );
+        let saved = save_settings_patch(
+            &storage,
+            serde_json::json!({ "historyRetention": "never", "theme": "dark" }),
+        )
+        .unwrap();
+        assert_eq!(saved.revision, cycled.revision + 1);
+        assert_eq!(
+            saved.settings.translation_target_language,
+            cycled.settings.translation_target_language
+        );
+        assert_eq!(
+            saved.settings.history_retention,
+            types::HistoryRetention::Never
+        );
+        assert_eq!(saved.settings.theme, "dark");
+        assert_eq!(storage.get_settings_snapshot().unwrap(), saved);
+    }
+
+    #[test]
+    fn a_settings_patch_with_an_unknown_key_or_invalid_value_writes_nothing() {
+        let storage = Storage::in_memory().unwrap();
+        let before = storage.get_settings_snapshot().unwrap();
+        for patch in [
+            // A key that is not a settings field, even beside a valid one.
+            serde_json::json!({ "theme": "dark", "futureSetting": true }),
+            // Legacy scalar mirrors are not settings fields either.
+            serde_json::json!({ "hotkey": "Ctrl+Alt+V" }),
+            // Values that do not decode.
+            serde_json::json!({ "interactionSounds": "yes" }),
+            serde_json::json!({ "historyRetention": null }),
+            serde_json::json!({ "shortcuts": { "dictate": ["Ctrl+Alt+V"] } }),
+            // Values that decode but fail validation.
+            serde_json::json!({ "theme": "sepia" }),
+            serde_json::json!({ "inputGainPercent": 10 }),
+            serde_json::json!({ "translationTargetLanguage": "xx" }),
+        ] {
+            assert!(
+                save_settings_patch(&storage, patch.clone()).is_err(),
+                "{patch} was accepted"
+            );
+            assert_eq!(storage.get_settings_snapshot().unwrap(), before);
+        }
     }
 
     struct TestAudio {
@@ -5844,8 +5947,8 @@ mod tests {
 }
 
 #[tauri::command]
-pub(crate) fn get_settings(storage: State<'_, Storage>) -> Result<Settings, String> {
-    storage.get_settings().map_err(command_error)
+pub(crate) fn get_settings(storage: State<'_, Storage>) -> Result<types::SettingsSnapshot, String> {
+    storage.get_settings_snapshot().map_err(command_error)
 }
 
 #[tauri::command]
@@ -5887,15 +5990,31 @@ pub(crate) async fn persist_repaired_settings(
         .map_err(command_error)
 }
 
-#[tauri::command]
-pub(crate) async fn update_settings(
-    app: AppHandle,
-    settings: Settings,
-    services: State<'_, Services>,
-    storage: State<'_, Storage>,
+/// Applies `patch`, the changed top-level settings keys in their JSON form,
+/// to `stored`, so a save never rewrites keys it does not name. A key that is
+/// not a settings field, or a value that does not decode, rejects the patch.
+fn apply_settings_patch(
+    stored: &Settings,
+    patch: serde_json::Map<String, serde_json::Value>,
 ) -> Result<Settings, String> {
-    let _update_guard = services.settings_update.lock().await;
-    personalization::validate_settings_profiles(&settings).map_err(str::to_owned)?;
+    let serde_json::Value::Object(mut merged) =
+        serde_json::to_value(stored).map_err(|error| error.to_string())?
+    else {
+        return Err("stored settings are not an object".into());
+    };
+    for (key, value) in patch {
+        let Some(field) = merged.get_mut(&key) else {
+            return Err(format!("unknown settings field: {key}"));
+        };
+        *field = value;
+    }
+    serde_json::from_value(serde_json::Value::Object(merged))
+        .map_err(|error| format!("invalid settings value: {error}"))
+}
+
+/// The checks of a settings save that depend only on the saved values.
+fn validate_settings(settings: &Settings) -> Result<(), String> {
+    personalization::validate_settings_profiles(settings).map_err(str::to_owned)?;
     if !["en", "ja"].contains(&settings.ui_language.as_str()) {
         return Err("ui language must be en or ja".into());
     }
@@ -5909,7 +6028,7 @@ pub(crate) async fn update_settings(
     {
         return Err("speech locale is unsupported".into());
     }
-    validate_translation_targets(&settings)?;
+    validate_translation_targets(settings)?;
     if !["off", "low", "medium", "high"].contains(&settings.noise_suppression.as_str()) {
         return Err("noise suppression must be off, low, medium, or high".into());
     }
@@ -6038,12 +6157,29 @@ pub(crate) async fn update_settings(
             );
         }
     }
+    Ok(())
+}
+
+/// Saves `patch` (see `apply_settings_patch`) over the stored settings and
+/// returns them with their new revision, which `settings-changed` carries
+/// too.
+#[tauri::command]
+pub(crate) async fn update_settings(
+    app: AppHandle,
+    patch: serde_json::Map<String, serde_json::Value>,
+    services: State<'_, Services>,
+    storage: State<'_, Storage>,
+) -> Result<types::SettingsSnapshot, String> {
+    let _update_guard = services.settings_update.lock().await;
     // The command is async, so waiting here never blocks the main thread
-    // needed by global-shortcut registration. Keep this guard through the
-    // single transactional settings/History persistence step.
-    let (previous, _model_change) = {
+    // needed by global-shortcut registration. Keep this guard from reading
+    // the settings the patch applies to through the single transactional
+    // settings/History persistence step.
+    let (previous, settings, revision, _model_change) = {
         let _settings_writes = storage.lock_settings_writes().map_err(command_error)?;
         let previous = storage.get_settings().map_err(command_error)?;
+        let settings = apply_settings_patch(&previous, patch)?;
+        validate_settings(&settings)?;
         // Held until the transcriber is reconfigured and its status reset;
         // recording starts and Retry fail fast meanwhile instead of waiting.
         let model_change =
@@ -6078,6 +6214,7 @@ pub(crate) async fn update_settings(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let phase = services.lifecycle.phase();
+        let mut revision = None;
         let registration = shortcuts::update_registrations_with_cancel_chord(
             &mut cancel_chord,
             phase,
@@ -6085,9 +6222,14 @@ pub(crate) async fn update_settings(
             &desired_routes,
             |chord| app.global_shortcut().register(chord),
             |chord| app.global_shortcut().unregister(chord),
-            || persist_settings(&storage, &settings),
+            || {
+                revision = Some(persist_settings(&storage, &settings)?);
+                Ok(())
+            },
         );
         registration?;
+        // Registration succeeds only after the settings were persisted.
+        let revision = revision.ok_or("settings were not saved")?;
         let inactive = shortcuts::inactive_descriptions(&settings, &desired_routes)?;
         *services
             .shortcut_routes
@@ -6098,7 +6240,7 @@ pub(crate) async fn update_settings(
             .inactive_shortcuts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = inactive;
-        (previous, model_change)
+        (previous, settings, revision, model_change)
     };
     match autostart_update(
         previous.auto_start,
@@ -6147,8 +6289,9 @@ pub(crate) async fn update_settings(
         services.model.replace(status.clone())?;
         let _ = app.emit("model-status", status);
     }
-    let _ = app.emit("settings-changed", &settings);
-    Ok(settings)
+    let snapshot = types::SettingsSnapshot { settings, revision };
+    let _ = app.emit("settings-changed", &snapshot);
+    Ok(snapshot)
 }
 
 /// Settings that require a new worker command (`reconfigure` kills the worker).

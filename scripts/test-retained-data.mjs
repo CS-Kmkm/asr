@@ -56,6 +56,8 @@ function fixture(initialCandidates = [], startupWarning = null, startup = {}) {
   let dirty = false;
   let tree;
   let settings = { ...structuredClone(defaultSettings), setupComplete: true, ...startup.stored };
+  // The backend's settings revision, advanced by every stored change.
+  let revision = 1;
   let candidates = initialCandidates;
   let history = [];
   const pendingCandidates = [];
@@ -91,7 +93,13 @@ function fixture(initialCandidates = [], startupWarning = null, startup = {}) {
     defaultSettings,
     getStartupHotkeyWarning: startupWarningApi(startupWarning).getStartupHotkeyWarning,
     getAppState: async () => ({ phase: "idle", message: null }),
-    getSettings: async () => { calls.settings++; if (startup.settings) await startup.settings(); return settings; },
+    // The read happens at the call; a slow answer delivers that snapshot late.
+    getSettings: async () => {
+      calls.settings++;
+      const snapshot = { settings, revision };
+      if (startup.settings) await startup.settings();
+      return snapshot;
+    },
     getModelStatus: async () => ({ state: "ready" }),
     getGpuDiagnostics: async () => { if (startup.gpuFails) throw new Error("GPU probe failed"); return {}; },
     listAudioDevices: async () => [],
@@ -101,12 +109,13 @@ function fixture(initialCandidates = [], startupWarning = null, startup = {}) {
       calls.candidates++;
       return pendingCandidates.length ? pendingCandidates.shift().promise : candidates;
     },
-    updateSettings: async (next) => {
+    updateSettings: async (patch) => {
       calls.update++;
       if (startup.updateFails) throw new Error("save failed");
       if (pendingSettings.length) await pendingSettings.shift().promise;
-      settings = next;
-      return next;
+      settings = { ...settings, ...patch };
+      revision += 1;
+      return { settings, revision };
     },
     stopRecording: async () => { calls.stop++; },
   };
@@ -151,6 +160,13 @@ function fixture(initialCandidates = [], startupWarning = null, startup = {}) {
     navigate(label) { nodes().find((node) => node.type === "button" && node.props.children === label).props.onClick(); render(); },
     props(name) { return nodes().find((node) => node.type === `${name}Page`).props; },
     emit(name, payload) { listeners.get(name)({ payload }); render(); },
+    // Stores `next` as a change made elsewhere and emits its settings-changed.
+    changeElsewhere(next) {
+      settings = next;
+      revision += 1;
+      listeners.get("settings-changed")({ payload: { settings, revision } });
+      render();
+    },
     shows(name) { return nodes().some((node) => node.type === `${name}Page`); },
     event(phase) { listeners.get("app-state")({ payload: { phase, message: null } }); render(); },
     candidates(value) { candidates = value; },
@@ -309,8 +325,8 @@ test("A late settings load cannot replace settings already reported by settings-
   app.props("Privacy").onSave({ historyRetention: "one_year" });
   await app.settle();
   assert.equal(next, 2, "the refused save retries the load");
-  const current = { ...app.stored(), historyRetention: "one_week" };
-  app.emit("settings-changed", current);
+  // Both reads happened before this change; their answers arrive after it.
+  app.changeElsewhere({ ...app.stored(), historyRetention: "one_week" });
   assert.equal(app.props("Privacy").settingsLoaded, true);
   loads[1].resolve();
   loads[0].resolve();
@@ -333,13 +349,14 @@ test("Settings first obtained by a retry or settings-changed still route an unfi
 
   const evented = fixture([], null, { stored: { setupComplete: false }, settings: () => new Promise(() => {}) });
   await evented.settle();
-  evented.emit("settings-changed", { ...evented.stored() });
+  evented.changeElsewhere({ ...evented.stored() });
   await evented.settle();
   assert.ok(evented.shows("Setup"));
   evented.navigate("Status");
-  evented.emit("settings-changed", { ...evented.stored() });
+  evented.changeElsewhere({ ...evented.stored(), theme: "dark" });
   await evented.settle();
   assert.ok(evented.shows("Dashboard"));
+  assert.equal(evented.props("Dashboard").settings.theme, "dark");
 });
 
 test("Finishing setup leaves the Setup page only after the save succeeds", async () => {

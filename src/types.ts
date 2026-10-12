@@ -80,6 +80,11 @@ export interface Settings {
   globalStyleProfile: StyleProfile | null;
   scopedStyleProfiles: ScopedStyleProfile[];
 }
+/**
+ * Stored settings with the backend revision of the write that stored them.
+ * Revisions only grow, so a newer snapshot is one with a higher revision.
+ */
+export interface SettingsSnapshot { settings: Settings; revision: number; }
 export interface StyleProfile { formality: "formal" | "casual"; detail: "concise" | "detailed"; guidance?: string | null; }
 export interface ScopedStyleProfile { scope: string; profile: StyleProfile; }
 
