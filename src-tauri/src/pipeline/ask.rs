@@ -13,8 +13,9 @@ use crate::{
     types::{self, AppPhase, NewHistoryItem, RecordingResult},
     AskCapture, AskSession,
 };
+use std::sync::Arc;
 use std::time::Instant;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 pub(crate) async fn finish(
     context: PipelineContext<'_>,
@@ -45,7 +46,7 @@ pub(crate) async fn finish(
     };
     let result = finish_ask(
         &context,
-        &session,
+        Arc::new(session),
         &transcript.text,
         &transcript.model,
         duration_ms,
@@ -72,7 +73,7 @@ pub(crate) async fn finish(
 
 async fn finish_ask(
     context: &PipelineContext<'_>,
-    session: &AskSession,
+    session: Arc<AskSession>,
     spoken: &str,
     asr_provider: &str,
     duration_ms: u64,
@@ -223,69 +224,83 @@ async fn finish_ask(
         return Err("ask was cancelled".into());
     }
     // Every paste or clipboard copy below goes through `commit_ask_output`.
-    let insertion = match (&action, &session.capture) {
-        (
-            AskAction::Rewrite
-            | AskAction::Shorten
-            | AskAction::Expand
-            | AskAction::ChangeTone
-            | AskAction::Translate { .. },
-            AskCapture::Selected(selection),
-        ) => {
-            let cancel = services
-                .lifecycle
-                .cancellation(operation_id)
-                .map_err(command_error)?;
-            commit_ask_output(&services.lifecycle, operation_id, || {
-                let replaced = session.monitor.as_ref().zip(session.checkpoint).map(
-                    |(monitor, checkpoint)| {
-                        session.injector.replace_selection_monitored(
-                            selection, &output, monitor, checkpoint, &cancel,
-                        )
-                    },
-                );
-                ask_insertion(replaced, "selection", || {
-                    session.injector.copy_to_clipboard(&output)
-                })
-            })?
-        }
-        (AskAction::Draft, AskCapture::Caret(target)) => {
-            let cancel = services
-                .lifecycle
-                .cancellation(operation_id)
-                .map_err(command_error)?;
-            commit_ask_output(&services.lifecycle, operation_id, || {
-                let inserted = session
-                    .monitor
-                    .as_ref()
-                    .zip(session.checkpoint)
-                    .filter(|(monitor, checkpoint)| monitor.unchanged_since(*checkpoint))
-                    .map(|(monitor, checkpoint)| {
-                        session
-                            .injector
-                            .insert_monitored(&output, target, monitor, checkpoint, &cancel)
-                    });
-                ask_insertion(inserted, "caret", || {
-                    session.injector.copy_to_clipboard(&output)
-                })
-            })?
-        }
-        _ => {
-            if services.lifecycle.is_cancelled(operation_id) {
-                return Err("ask was cancelled".into());
-            }
-            let published = services.answer_panel.publish(operation_id, output.clone());
-            if !published || !answer_panel::show(app, operation_id, &output) {
+    let app_for_insertion = app.clone();
+    let session_for_insertion = Arc::clone(&session);
+    let output_for_insertion = output.clone();
+    let action_for_insertion = action.clone();
+    let insertion = tokio::task::spawn_blocking(move || {
+        let app = &app_for_insertion;
+        let services = app.state::<crate::Services>();
+        let session = session_for_insertion;
+        let output = output_for_insertion;
+        let action = action_for_insertion;
+        let insertion = match (&action, &session.capture) {
+            (
+                AskAction::Rewrite
+                | AskAction::Shorten
+                | AskAction::Expand
+                | AskAction::ChangeTone
+                | AskAction::Translate { .. },
+                AskCapture::Selected(selection),
+            ) => {
+                let cancel = services
+                    .lifecycle
+                    .cancellation(operation_id)
+                    .map_err(command_error)?;
                 commit_ask_output(&services.lifecycle, operation_id, || {
-                    Ok(ask_fallback_insertion(
-                        session.injector.copy_to_clipboard(&output),
-                    ))
+                    let replaced = session.monitor.as_ref().zip(session.checkpoint).map(
+                        |(monitor, checkpoint)| {
+                            session.injector.replace_selection_monitored(
+                                selection, &output, monitor, checkpoint, &cancel,
+                            )
+                        },
+                    );
+                    ask_insertion(replaced, "selection", || {
+                        session.injector.copy_to_clipboard(&output)
+                    })
                 })?
-            } else {
-                "panel"
             }
-        }
-    };
+            (AskAction::Draft, AskCapture::Caret(target)) => {
+                let cancel = services
+                    .lifecycle
+                    .cancellation(operation_id)
+                    .map_err(command_error)?;
+                commit_ask_output(&services.lifecycle, operation_id, || {
+                    let inserted = session
+                        .monitor
+                        .as_ref()
+                        .zip(session.checkpoint)
+                        .filter(|(monitor, checkpoint)| monitor.unchanged_since(*checkpoint))
+                        .map(|(monitor, checkpoint)| {
+                            session
+                                .injector
+                                .insert_monitored(&output, target, monitor, checkpoint, &cancel)
+                        });
+                    ask_insertion(inserted, "caret", || {
+                        session.injector.copy_to_clipboard(&output)
+                    })
+                })?
+            }
+            _ => {
+                if services.lifecycle.is_cancelled(operation_id) {
+                    return Err("ask was cancelled".into());
+                }
+                let published = services.answer_panel.publish(operation_id, output.clone());
+                if !published || !answer_panel::show(app, operation_id, &output) {
+                    commit_ask_output(&services.lifecycle, operation_id, || {
+                        Ok(ask_fallback_insertion(
+                            session.injector.copy_to_clipboard(&output),
+                        ))
+                    })?
+                } else {
+                    "panel"
+                }
+            }
+        };
+        Ok::<_, String>(insertion)
+    })
+    .await
+    .map_err(|_| "Ask insertion task failed".to_owned())??;
     // A committed paste or copy ignores later cancels, so only an answer
     // shown in the panel can still be cancelled here.
     if services.lifecycle.is_cancelled(operation_id) {

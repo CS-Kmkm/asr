@@ -173,6 +173,13 @@ fn capture_config(settings: &Settings) -> CaptureConfig {
     };
     CaptureConfig {
         device_id: settings.microphone_id.clone(),
+        // Whisper consumes 16 kHz internally. Avoid a larger intermediate WAV
+        // and a second resampling pass for that backend.
+        target_sample_rate: if settings.asr_backend == "faster-whisper" {
+            16_000
+        } else {
+            crate::audio::TARGET_SAMPLE_RATE
+        },
         // A recording must not fail because a saved device (for example a
         // Bluetooth headset) is away; the saved choice stays unchanged.
         fallback_to_default: true,
@@ -798,11 +805,23 @@ async fn start_owned_recording(
     let active_hotkey = trigger_chord
         .as_deref()
         .unwrap_or_else(|| mode_shortcuts[0].as_str());
-    let mut edit_session = (mode == PipelineMode::Edit)
-        .then(|| EditSession::new(&settings, active_hotkey, from_shortcut))
-        .transpose()?;
-    let mut ask_session = (mode == PipelineMode::Ask)
-        .then(|| AskSession::new(&settings, active_hotkey, from_shortcut));
+    let (mut edit_session, mut ask_session) =
+        if matches!(mode, PipelineMode::Edit | PipelineMode::Ask) {
+            let settings = settings.clone();
+            let active_hotkey = active_hotkey.to_owned();
+            tokio::task::spawn_blocking(move || {
+                let edit = (mode == PipelineMode::Edit)
+                    .then(|| EditSession::new(&settings, &active_hotkey, from_shortcut))
+                    .transpose()?;
+                let ask = (mode == PipelineMode::Ask)
+                    .then(|| AskSession::new(&settings, &active_hotkey, from_shortcut));
+                Ok::<_, String>((edit, ask))
+            })
+            .await
+            .map_err(|_| "recording session task failed".to_owned())??
+        } else {
+            (None, None)
+        };
     // Capture the target at the press: a model load may take minutes, and
     // the foreground window by then is not necessarily the one meant.
     let target = (mode != PipelineMode::Edit && mode != PipelineMode::Ask)
@@ -860,13 +879,6 @@ async fn start_owned_recording(
         emit_state(&app, &state, AppPhase::Idle, cancel_message);
         return Err(cancel_error.into());
     }
-    // The start cue finishes before the microphone opens (`arm` below), so it
-    // is neither recorded nor detected as speech by the live draft.
-    play_start_cue_before_capture(settings.interaction_sounds, play_start_cue_to_completion).await;
-    if services.lifecycle.is_cancelled(operation_id) {
-        emit_state(&app, &state, AppPhase::Idle, cancel_message);
-        return Err(cancel_error.into());
-    }
     // Edit and Ask capture a selection instead of a target window, so their
     // ASR hints use global dictionary entries only; they apply no style profile.
     let app_context = target.as_ref().and_then(app_context::from_target);
@@ -879,18 +891,38 @@ async fn start_owned_recording(
         let app = app.clone();
         move || report_clipboard_not_restored(&app)
     };
-    let draft = target.as_ref().map(|target| {
-        let mut draft = live_dictation::LiveDraft::new(
-            target.clone(),
-            &settings,
-            active_hotkey,
-            mode_shortcuts,
-            from_shortcut,
-            live_dictation::defers_target_insertion(mode, &settings),
-        );
-        draft.injector.report_clipboard_loss_on_drop(report_loss());
-        draft
-    });
+    let draft = if let Some(target) = target.as_ref() {
+        let target = target.clone();
+        let settings = settings.clone();
+        let active_hotkey = active_hotkey.to_owned();
+        let mode_shortcuts = mode_shortcuts.clone();
+        let report = report_loss();
+        Some(
+            tokio::task::spawn_blocking(move || {
+                let mut draft = live_dictation::LiveDraft::new(
+                    target,
+                    &settings,
+                    &active_hotkey,
+                    &mode_shortcuts,
+                    from_shortcut,
+                    live_dictation::defers_target_insertion(mode, &settings),
+                );
+                draft.injector.report_clipboard_loss_on_drop(report);
+                draft
+            })
+            .await
+            .map_err(|_| "recording session task failed".to_owned())?,
+        )
+    } else {
+        None
+    };
+    // Start input monitoring before the cue. Keep the microphone closed until
+    // the cue ends, preserving the no-idle-recording/no-postroll policy.
+    play_start_cue_before_capture(settings.interaction_sounds, play_start_cue_to_completion).await;
+    if services.lifecycle.is_cancelled(operation_id) {
+        emit_state(&app, &state, AppPhase::Idle, cancel_message);
+        return Err(cancel_error.into());
+    }
     if let Some(session) = edit_session.as_mut() {
         session
             .injector
@@ -3833,6 +3865,21 @@ mod tests {
     }
 
     #[test]
+    fn capture_rate_matches_the_local_decoder() {
+        for (backend, rate) in [
+            ("faster-whisper", 16_000),
+            ("vibevoice", 24_000),
+            ("openai-compatible", 24_000),
+        ] {
+            let settings = Settings {
+                asr_backend: backend.into(),
+                ..Settings::default()
+            };
+            assert_eq!(capture_config(&settings).target_sample_rate, rate);
+        }
+    }
+
+    #[test]
     fn a_fallback_recording_names_the_default_microphone() {
         assert_eq!(
             recording_message(PipelineMode::Dictate, false),
@@ -4833,19 +4880,36 @@ mod tests {
     }
 }
 
-#[tauri::command]
-pub(crate) fn get_settings(storage: State<'_, Storage>) -> Result<types::SettingsSnapshot, String> {
-    storage.get_settings_snapshot().map_err(command_error)
+async fn storage_task<T: Send + 'static>(
+    run: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(run)
+        .await
+        .map_err(|_| "storage task failed".to_string())?
 }
 
 #[tauri::command]
-pub(crate) fn get_ui_preferences(storage: State<'_, Storage>) -> Result<serde_json::Value, String> {
-    let snapshot = storage.get_settings_snapshot().map_err(command_error)?;
-    Ok(
-        serde_json::json!({"revision": snapshot.revision, "settings": {
-            "uiLanguage": snapshot.settings.ui_language, "theme": snapshot.settings.theme
-        }}),
-    )
+pub(crate) async fn get_settings(
+    storage: State<'_, Storage>,
+) -> Result<types::SettingsSnapshot, String> {
+    let storage = storage.inner().clone();
+    storage_task(move || storage.get_settings_snapshot().map_err(command_error)).await
+}
+
+#[tauri::command]
+pub(crate) async fn get_ui_preferences(
+    storage: State<'_, Storage>,
+) -> Result<serde_json::Value, String> {
+    let storage = storage.inner().clone();
+    storage_task(move || {
+        let snapshot = storage.get_settings_snapshot().map_err(command_error)?;
+        Ok(
+            serde_json::json!({"revision": snapshot.revision, "settings": {
+                "uiLanguage": snapshot.settings.ui_language, "theme": snapshot.settings.theme
+            }}),
+        )
+    })
+    .await
 }
 
 #[tauri::command]
@@ -4880,13 +4944,17 @@ pub(crate) fn set_shortcut_capture(
 /// `shortcuts.ask`, or `unreadable` for the whole row). The Settings page
 /// fetches this on mount, so the notice does not depend on a startup event.
 #[tauri::command]
-pub(crate) fn get_settings_repair_status(
+pub(crate) async fn get_settings_repair_status(
     storage: State<'_, Storage>,
 ) -> Result<Vec<String>, String> {
-    storage
-        .settings_repair_status()
-        .map(|repairs| repairs.fields())
-        .map_err(command_error)
+    let storage = storage.inner().clone();
+    storage_task(move || {
+        storage
+            .settings_repair_status()
+            .map(|repairs| repairs.fields())
+            .map_err(command_error)
+    })
+    .await
 }
 
 /// Saves the current values of the replaced fields, so a user who wants the
@@ -5203,53 +5271,70 @@ fn reject_model_change_while_busy(
 }
 
 #[tauri::command]
-pub(crate) fn list_history(
+pub(crate) async fn list_history(
     filter: Option<types::HistoryFilter>,
     limit: Option<u32>,
     storage: State<'_, Storage>,
 ) -> Result<Vec<HistoryItem>, String> {
-    storage
-        .list_history(
-            filter.unwrap_or(types::HistoryFilter::All),
-            limit.unwrap_or(100),
-        )
-        .map_err(command_error)
+    let storage = storage.inner().clone();
+    storage_task(move || {
+        storage
+            .list_history(
+                filter.unwrap_or(types::HistoryFilter::All),
+                limit.unwrap_or(100),
+            )
+            .map_err(command_error)
+    })
+    .await
 }
 
 #[tauri::command]
-pub(crate) fn delete_history_item(id: i64, storage: State<'_, Storage>) -> Result<bool, String> {
-    storage.delete_history(id).map_err(command_error)
+pub(crate) async fn delete_history_item(
+    id: i64,
+    storage: State<'_, Storage>,
+) -> Result<bool, String> {
+    let storage = storage.inner().clone();
+    storage_task(move || storage.delete_history(id).map_err(command_error)).await
 }
 
 #[tauri::command]
-pub(crate) fn delete_all_history(storage: State<'_, Storage>) -> Result<u64, String> {
-    storage.delete_all_history().map_err(command_error)
+pub(crate) async fn delete_all_history(storage: State<'_, Storage>) -> Result<u64, String> {
+    let storage = storage.inner().clone();
+    storage_task(move || storage.delete_all_history().map_err(command_error)).await
 }
 
 /// Read-only count shown in the confirmation before a shorter retention is
 /// saved; saving it purges through the same cutoff and row selection.
 #[tauri::command]
-pub(crate) fn preview_history_retention_purge(
+pub(crate) async fn preview_history_retention_purge(
     retention: types::HistoryRetention,
     storage: State<'_, Storage>,
 ) -> Result<storage::HistoryPurgePreview, String> {
-    storage
-        .history_purge_preview(retention)
-        .map_err(command_error)
+    let storage = storage.inner().clone();
+    storage_task(move || {
+        storage
+            .history_purge_preview(retention)
+            .map_err(command_error)
+    })
+    .await
 }
 
 /// The recording's WAV bytes as a raw IPC body (an `ArrayBuffer` in the
 /// webview), not a JSON number array; the frontend names the file from `id`.
 #[tauri::command]
-pub(crate) fn get_history_audio(
+pub(crate) async fn get_history_audio(
     id: i64,
     storage: State<'_, Storage>,
 ) -> Result<tauri::ipc::Response, String> {
-    storage
-        .history_audio(id)
-        .map_err(command_error)?
-        .map(tauri::ipc::Response::new)
-        .ok_or_else(|| "history audio is unavailable".into())
+    let storage = storage.inner().clone();
+    storage_task(move || {
+        storage
+            .history_audio(id)
+            .map_err(command_error)?
+            .map(tauri::ipc::Response::new)
+            .ok_or_else(|| "history audio is unavailable".into())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -5334,123 +5419,155 @@ pub(crate) fn stored_search_site(item: &HistoryItem) -> Result<ask::SearchSite, 
 }
 
 #[tauri::command]
-pub(crate) fn list_dictionary(
+pub(crate) async fn list_dictionary(
     query: Option<String>,
     source: Option<String>,
     storage: State<'_, Storage>,
 ) -> Result<Vec<DictionaryEntry>, String> {
-    storage
-        .search_dictionary(query.as_deref(), source.as_deref())
-        .map_err(command_error)
+    let storage = storage.inner().clone();
+    storage_task(move || {
+        storage
+            .search_dictionary(query.as_deref(), source.as_deref())
+            .map_err(command_error)
+    })
+    .await
 }
 
 #[tauri::command]
-pub(crate) fn update_dictionary_entry(
+pub(crate) async fn update_dictionary_entry(
     id: i64,
     entry: DictionaryEntryInput,
     storage: State<'_, Storage>,
 ) -> Result<DictionaryEntry, String> {
-    personalization::validate_dictionary_scope(entry.app_scope.as_deref())
-        .map_err(str::to_owned)?;
-    if !storage
-        .update_dictionary_entry(
-            id,
-            &NewDictionaryEntry {
+    let storage = storage.inner().clone();
+    storage_task(move || {
+        personalization::validate_dictionary_scope(entry.app_scope.as_deref())
+            .map_err(str::to_owned)?;
+        if !storage
+            .update_dictionary_entry(
+                id,
+                &NewDictionaryEntry {
+                    reading: &entry.reading,
+                    surface: &entry.surface,
+                    category: entry.category.as_deref(),
+                    aliases: &entry.aliases,
+                    priority: entry.priority,
+                    app_scope: entry.app_scope.as_deref(),
+                },
+            )
+            .map_err(command_error)?
+        {
+            return Err("dictionary entry not found".into());
+        }
+        storage
+            .list_dictionary()
+            .map_err(command_error)?
+            .into_iter()
+            .find(|item| item.id == id)
+            .ok_or_else(|| "dictionary entry not found".into())
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn add_dictionary_entry(
+    entry: DictionaryEntryInput,
+    storage: State<'_, Storage>,
+) -> Result<DictionaryEntry, String> {
+    let storage = storage.inner().clone();
+    storage_task(move || {
+        personalization::validate_dictionary_scope(entry.app_scope.as_deref())
+            .map_err(str::to_owned)?;
+        let id = storage
+            .add_dictionary_entry(&NewDictionaryEntry {
                 reading: &entry.reading,
                 surface: &entry.surface,
                 category: entry.category.as_deref(),
                 aliases: &entry.aliases,
                 priority: entry.priority,
                 app_scope: entry.app_scope.as_deref(),
-            },
-        )
-        .map_err(command_error)?
-    {
-        return Err("dictionary entry not found".into());
-    }
-    storage
-        .list_dictionary()
-        .map_err(command_error)?
-        .into_iter()
-        .find(|item| item.id == id)
-        .ok_or_else(|| "dictionary entry not found".into())
+            })
+            .map_err(command_error)?;
+        storage
+            .list_dictionary()
+            .map_err(command_error)?
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| "dictionary entry not found".to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub(crate) fn add_dictionary_entry(
-    entry: DictionaryEntryInput,
-    storage: State<'_, Storage>,
-) -> Result<DictionaryEntry, String> {
-    personalization::validate_dictionary_scope(entry.app_scope.as_deref())
-        .map_err(str::to_owned)?;
-    let id = storage
-        .add_dictionary_entry(&NewDictionaryEntry {
-            reading: &entry.reading,
-            surface: &entry.surface,
-            category: entry.category.as_deref(),
-            aliases: &entry.aliases,
-            priority: entry.priority,
-            app_scope: entry.app_scope.as_deref(),
-        })
-        .map_err(command_error)?;
-    storage
-        .list_dictionary()
-        .map_err(command_error)?
-        .into_iter()
-        .find(|entry| entry.id == id)
-        .ok_or_else(|| "dictionary entry not found".to_string())
-}
-
-#[tauri::command]
-pub(crate) fn delete_dictionary_entry(id: i64, storage: State<'_, Storage>) -> Result<(), String> {
-    if storage.delete_dictionary_entry(id).map_err(command_error)? {
-        Ok(())
-    } else {
-        Err("dictionary entry not found".into())
-    }
-}
-
-#[tauri::command]
-pub(crate) fn import_dictionary_csv(
-    input: DictionaryImportInput,
-    storage: State<'_, Storage>,
-) -> Result<usize, String> {
-    storage
-        .import_dictionary_csv(&input.csv)
-        .map_err(command_error)
-}
-
-#[tauri::command]
-pub(crate) fn list_dictionary_candidates(
-    storage: State<'_, Storage>,
-) -> Result<Vec<DictionaryCandidate>, String> {
-    storage.list_dictionary_candidates().map_err(command_error)
-}
-
-#[tauri::command]
-pub(crate) fn confirm_dictionary_candidate(
-    id: i64,
-    storage: State<'_, Storage>,
-) -> Result<DictionaryEntry, String> {
-    storage
-        .confirm_dictionary_candidate(id)
-        .map_err(command_error)?
-        .ok_or_else(|| "dictionary candidate not found".into())
-}
-
-#[tauri::command]
-pub(crate) fn reject_dictionary_candidate(
+pub(crate) async fn delete_dictionary_entry(
     id: i64,
     storage: State<'_, Storage>,
 ) -> Result<(), String> {
-    if storage
-        .reject_dictionary_candidate(id)
-        .map_err(command_error)?
-    {
-        Ok(())
-    } else {
-        Err("dictionary candidate not found".into())
-    }
+    let storage = storage.inner().clone();
+    storage_task(move || {
+        if storage.delete_dictionary_entry(id).map_err(command_error)? {
+            Ok(())
+        } else {
+            Err("dictionary entry not found".into())
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn import_dictionary_csv(
+    input: DictionaryImportInput,
+    storage: State<'_, Storage>,
+) -> Result<usize, String> {
+    let storage = storage.inner().clone();
+    storage_task(move || {
+        storage
+            .import_dictionary_csv(&input.csv)
+            .map_err(command_error)
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn list_dictionary_candidates(
+    storage: State<'_, Storage>,
+) -> Result<Vec<DictionaryCandidate>, String> {
+    let storage = storage.inner().clone();
+    storage_task(move || storage.list_dictionary_candidates().map_err(command_error)).await
+}
+
+#[tauri::command]
+pub(crate) async fn confirm_dictionary_candidate(
+    id: i64,
+    storage: State<'_, Storage>,
+) -> Result<DictionaryEntry, String> {
+    let storage = storage.inner().clone();
+    storage_task(move || {
+        storage
+            .confirm_dictionary_candidate(id)
+            .map_err(command_error)?
+            .ok_or_else(|| "dictionary candidate not found".into())
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn reject_dictionary_candidate(
+    id: i64,
+    storage: State<'_, Storage>,
+) -> Result<(), String> {
+    let storage = storage.inner().clone();
+    storage_task(move || {
+        if storage
+            .reject_dictionary_candidate(id)
+            .map_err(command_error)?
+        {
+            Ok(())
+        } else {
+            Err("dictionary candidate not found".into())
+        }
+    })
+    .await
 }
 
 #[tauri::command]

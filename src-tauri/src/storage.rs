@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard,
     },
 };
 
@@ -93,15 +93,16 @@ pub enum StorageError {
     },
 }
 
+#[derive(Clone)]
 pub struct Storage {
-    connection: Mutex<Connection>,
+    connection: Arc<Mutex<Connection>>,
     history_audio_dir: PathBuf,
-    settings_writes: Mutex<()>,
+    settings_writes: Arc<Mutex<()>>,
     /// In-process revision of the settings row, advanced by every committed
     /// write of it. It changes only while the connection is held, so a read
     /// that holds the connection pairs the row with the revision that wrote
     /// it.
-    settings_revision: AtomicU64,
+    settings_revision: Arc<AtomicU64>,
 }
 
 /// Builds without the V2 `shortcuts` field read one scalar chord per mode.
@@ -880,10 +881,10 @@ impl Storage {
 
     fn with_connection(connection: Connection, history_audio_dir: PathBuf) -> Self {
         Self {
-            connection: Mutex::new(connection),
+            connection: Arc::new(Mutex::new(connection)),
             history_audio_dir,
-            settings_writes: Mutex::new(()),
-            settings_revision: AtomicU64::new(0),
+            settings_writes: Arc::new(Mutex::new(())),
+            settings_revision: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -2432,6 +2433,24 @@ fn is_sentence_start_capitalization(original: &str, preferred: &str, before: &[c
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloned_handles_share_database_and_settings_revision() {
+        let storage = Storage::in_memory().unwrap();
+        let clone = storage.clone();
+        let before = clone.get_settings_snapshot().unwrap();
+        let mut settings = before.settings;
+        settings.ui_language = "ja".into();
+        storage.update_settings(&settings).unwrap();
+        let after = clone.get_settings_snapshot().unwrap();
+        assert_eq!(after.settings.ui_language, "ja");
+        assert!(after.revision > before.revision);
+        assert!(Arc::ptr_eq(&storage.connection, &clone.connection));
+        assert!(Arc::ptr_eq(
+            &storage.settings_writes,
+            &clone.settings_writes
+        ));
+    }
 
     fn item<'a>() -> NewHistoryItem<'a> {
         NewHistoryItem {

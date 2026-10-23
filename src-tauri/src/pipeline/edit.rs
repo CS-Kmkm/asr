@@ -15,7 +15,7 @@ use crate::{
     types::{self, AppPhase, NewHistoryItem, RecordingResult},
 };
 use std::time::Instant;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 pub(crate) async fn finish(
     context: PipelineContext<'_>,
@@ -105,19 +105,28 @@ pub(crate) async fn finish(
         AppPhase::Injecting,
         "Replacing the original selection.",
     );
-    let (insertion, failure_detail) = match commit_edit_replacement(
-        &services.lifecycle,
-        operation_id,
-        || {
-            session.injector.replace_selection(
-                &session.selection,
-                &edited,
-                &session.monitor,
-                session.checkpoint,
-            )
-        },
-        || session.injector.copy_to_clipboard(&edited),
-    ) {
+    let app_for_insertion = app.clone();
+    let edited_for_insertion = edited.clone();
+    let (session, committed) = tokio::task::spawn_blocking(move || {
+        let services = app_for_insertion.state::<crate::Services>();
+        let committed = commit_edit_replacement(
+            &services.lifecycle,
+            operation_id,
+            || {
+                session.injector.replace_selection(
+                    &session.selection,
+                    &edited_for_insertion,
+                    &session.monitor,
+                    session.checkpoint,
+                )
+            },
+            || session.injector.copy_to_clipboard(&edited_for_insertion),
+        );
+        (session, committed)
+    })
+    .await
+    .map_err(|_| "edit insertion task failed".to_owned())?;
+    let (insertion, failure_detail) = match committed {
         CommittedOutput::Ran(outcome) => outcome,
         // Nothing was pasted or copied.
         CommittedOutput::Cancelled => {

@@ -7,8 +7,10 @@ mod dsp;
 mod vad;
 mod wav;
 
+#[cfg(test)]
+pub use dsp::enhance_audio;
+pub use dsp::meter;
 use dsp::resample_linear_owned;
-pub use dsp::{enhance_audio, meter};
 #[cfg(test)]
 pub use dsp::{interleaved_to_mono, resample_linear};
 #[cfg(test)]
@@ -516,6 +518,18 @@ pub struct CpalAudioCapture {
     recording: bool,
 }
 
+/// A blocking task can outlive its awaiting future. Remove an unclaimed WAV
+/// instead of leaving microphone audio behind when the caller is cancelled.
+struct PendingArtifact(Option<Result<AudioArtifact, AudioError>>);
+
+impl Drop for PendingArtifact {
+    fn drop(&mut self) {
+        if let Some(Ok(artifact)) = &self.0 {
+            let _ = fs::remove_file(&artifact.path);
+        }
+    }
+}
+
 impl CpalAudioCapture {
     pub fn new() -> Self {
         Self::default()
@@ -636,12 +650,25 @@ impl AudioCapture for CpalAudioCapture {
     }
 
     fn stop(&mut self) -> AudioFuture<'_, AudioArtifact> {
-        Box::pin(async move { self.finish(false) })
+        Box::pin(async move {
+            let mut capture = std::mem::take(self);
+            let mut pending =
+                tokio::task::spawn_blocking(move || PendingArtifact(Some(capture.finish(false))))
+                    .await
+                    .map_err(|_| {
+                        AudioError::StreamFailure("audio finalization task failed".into())
+                    })?;
+            pending.0.take().unwrap_or(Err(AudioError::Cancelled))
+        })
     }
 
     fn cancel(&mut self) -> AudioFuture<'_, ()> {
         Box::pin(async move {
-            match self.finish(true) {
+            let mut capture = std::mem::take(self);
+            let result = tokio::task::spawn_blocking(move || capture.finish(true))
+                .await
+                .map_err(|_| AudioError::StreamFailure("audio cancellation task failed".into()))?;
+            match result {
                 Err(AudioError::Cancelled) => Ok(()),
                 Err(error) => Err(error),
                 Ok(_) => Ok(()),
@@ -724,7 +751,12 @@ fn prepare_samples(
         });
     }
 
-    enhance_audio(&mut samples, config.target_sample_rate, config.enhancement);
+    dsp::enhance_audio_with_vad(
+        &mut samples,
+        config.target_sample_rate,
+        config.enhancement,
+        config.vad,
+    );
     Ok(PreparedAudio { samples, config })
 }
 
@@ -1101,6 +1133,57 @@ fn drop_active_stream(active: &mut ActiveCapture) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abandoned_finalization_removes_only_its_unclaimed_wav() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = CaptureConfig {
+            artifact_directory: Some(directory.path().to_owned()),
+            ..CaptureConfig::default()
+        };
+        let samples: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.1).sin() * 0.2).collect();
+        let artifact = finalize_samples(samples, TARGET_SAMPLE_RATE, &config).unwrap();
+        let path = artifact.path.clone();
+        let retained = directory.path().join("unrelated.wav");
+        fs::write(&retained, b"retained").unwrap();
+        drop(PendingArtifact(Some(Ok(artifact))));
+        assert!(!path.exists());
+        assert!(retained.exists());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopping_a_stream_does_not_block_the_async_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(Mutex::new(SharedCapture {
+            samples: (0..24_000).map(|i| (i as f32 * 0.1).sin() * 0.2).collect(),
+            recording: true,
+            ..SharedCapture::default()
+        }));
+        let mut capture = recording_capture(&shared, directory.path());
+        let (shutdown, shutdown_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        capture.active.as_mut().unwrap().stream_worker = StreamWorker {
+            shutdown,
+            thread: Some(thread::spawn(move || {
+                shutdown_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            })),
+        };
+        let started = std::time::Instant::now();
+        let release_stream = async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let elapsed = started.elapsed();
+            let _ = release.send(());
+            elapsed
+        };
+        let (result, timer_elapsed) = tokio::join!(capture.stop(), release_stream);
+        result.unwrap().remove().unwrap();
+        assert!(
+            timer_elapsed < Duration::from_secs(1),
+            "runtime blocked for {timer_elapsed:?}"
+        );
+    }
 
     #[tokio::test]
     async fn snapshot_keeps_capture_active_and_final_audio_complete() {

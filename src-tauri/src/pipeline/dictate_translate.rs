@@ -17,7 +17,7 @@ use crate::{
     types::{self, AppPhase, NewHistoryItem, RecordingResult},
 };
 use std::time::Instant;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 pub(crate) async fn finish(
     context: PipelineContext<'_>,
@@ -258,16 +258,25 @@ pub(crate) async fn finish(
     }
     // A cancel either wins before the paste or copy, or finds the dictation
     // committed and changes nothing.
-    let insertion_result = match commit_dictation_output(&services.lifecycle, operation_id, || {
-        if translation_failed {
-            draft
-                .injector
-                .copy_to_clipboard(&final_text)
-                .map(|()| InsertResult::ClipboardOnly)
-        } else {
-            draft.finish(&final_text, &cancel)
-        }
-    }) {
+    let app_for_insertion = app.clone();
+    let text_for_insertion = final_text.clone();
+    let (draft, committed) = tokio::task::spawn_blocking(move || {
+        let services = app_for_insertion.state::<crate::Services>();
+        let committed = commit_dictation_output(&services.lifecycle, operation_id, || {
+            if translation_failed {
+                draft
+                    .injector
+                    .copy_to_clipboard(&text_for_insertion)
+                    .map(|()| InsertResult::ClipboardOnly)
+            } else {
+                draft.finish(&text_for_insertion, &cancel)
+            }
+        });
+        (draft, committed)
+    })
+    .await
+    .map_err(|_| "dictation insertion task failed".to_owned())?;
+    let insertion_result = match committed {
         CommittedOutput::Ran(inserted) => inserted,
         // Nothing was pasted or copied; ends below as a cancelled insertion,
         // whose dropped draft removes its provisional text.
