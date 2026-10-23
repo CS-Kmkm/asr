@@ -12,7 +12,7 @@ mod shortcut;
 use std::{
     io::{BufRead, BufReader, Write},
     os::windows::process::CommandExt,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Stdio},
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
@@ -65,6 +65,12 @@ impl Default for InputMonitor {
             #[cfg(all(target_os = "windows", not(test)))]
             child: Mutex::new(None),
         }
+    }
+}
+
+impl Drop for InputMonitor {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -156,7 +162,7 @@ impl InputMonitor {
             let Ok(executable) = std::env::current_exe() else {
                 return false;
             };
-            let mut command = Command::new(executable);
+            let mut command = crate::environment::helper_command(executable);
             command
                 .arg("--input-monitor")
                 .stdin(Stdio::piped())

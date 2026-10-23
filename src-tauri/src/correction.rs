@@ -1453,8 +1453,7 @@ fn local_client_with(
 }
 
 fn api_key(environment_variable: &str) -> Result<String, CorrectionError> {
-    env::var(environment_variable)
-        .ok()
+    crate::environment::value(environment_variable)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| CorrectionError::MissingApiKey(environment_variable.into()))
 }

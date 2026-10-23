@@ -6182,6 +6182,7 @@ pub(crate) async fn update_settings(
         let previous = storage.get_settings().map_err(command_error)?;
         let settings = apply_settings_patch(&previous, patch)?;
         validate_settings(&settings)?;
+        crate::environment::register_provider_keys(&settings);
         // Held until the transcriber is reconfigured and its status reset;
         // recording starts and Retry fail fast meanwhile instead of waiting.
         let model_change =
@@ -7618,7 +7619,7 @@ fn spawn_load_progress_forwarder(
 }
 
 pub(crate) fn probe_gpu_diagnostics() -> GpuDiagnostics {
-    let mut command = Command::new("nvidia-smi");
+    let mut command = crate::environment::helper_command("nvidia-smi");
     command.args([
         "--query-gpu=name,driver_version,memory.total",
         "--format=csv,noheader,nounits",

@@ -463,8 +463,25 @@ pub struct JsonlTranscriber {
 fn worker_process_command(command_spec: &WorkerCommand, log_stderr: bool) -> Command {
     let mut command = Command::new(&command_spec.program);
     command
+        .env_clear()
+        .envs(crate::environment::worker_environment())
         .args(&command_spec.args)
-        .envs(command_spec.env.iter().cloned())
+        .envs(
+            command_spec
+                .env
+                .iter()
+                .filter(|(name, _)| {
+                    if name == "ASR_API_KEY" {
+                        command_spec
+                            .args
+                            .windows(2)
+                            .any(|pair| pair == ["--backend", "openai-compatible"])
+                    } else {
+                        !crate::environment::is_provider_key(name)
+                    }
+                })
+                .cloned(),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(if log_stderr {
@@ -1039,6 +1056,30 @@ impl Transcriber for JsonlTranscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_commands_never_inherit_text_provider_secrets() {
+        for backend in ["mock", "faster-whisper", "vibevoice", "openai-compatible"] {
+            let mut spec = WorkerCommand::python("python").with_backend(backend);
+            for name in ["OPENAI_API_KEY", "GEMINI_API_KEY", "ASR_API_KEY"] {
+                spec.env.push((name.into(), "synthetic-test-secret".into()));
+            }
+            let command = worker_process_command(&spec, false);
+            let keys = command
+                .as_std()
+                .get_envs()
+                .filter(|(_, value)| value.is_some())
+                .map(|(key, _)| key.to_string_lossy().to_string())
+                .collect::<Vec<_>>();
+            assert!(!keys
+                .iter()
+                .any(|key| key == "OPENAI_API_KEY" || key == "GEMINI_API_KEY"));
+            assert_eq!(
+                keys.iter().any(|key| key == "ASR_API_KEY"),
+                backend == "openai-compatible"
+            );
+        }
+    }
 
     #[test]
     fn transcription_timeout_scales_with_long_recordings_only() {

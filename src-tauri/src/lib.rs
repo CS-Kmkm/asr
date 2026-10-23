@@ -6,6 +6,7 @@ mod audio;
 mod commands;
 mod correction;
 mod correction_prompt;
+mod environment;
 mod injection;
 mod input_monitor;
 mod live_dictation;
@@ -424,7 +425,7 @@ pub(crate) fn worker_command_for_settings(settings: &Settings) -> WorkerCommand 
             "ASR_API_BASE_URL".into(),
             settings.api_base_url.trim().into(),
         ));
-        if let Ok(api_key) = std::env::var(settings.api_key_env_var.trim()) {
+        if let Some(api_key) = environment::value(settings.api_key_env_var.trim()) {
             command.env.push(("ASR_API_KEY".into(), api_key));
         }
     }
@@ -511,7 +512,7 @@ fn worker_directory(project_root: Option<&Path>, executable: Option<&Path>) -> O
 fn worker_runtime() -> (OsString, Option<PathBuf>) {
     let project_root = project_root();
 
-    if let Some(python) = std::env::var_os("ASR_PYTHON") {
+    if let Some(python) = environment::value_os("ASR_PYTHON") {
         return (python, project_root);
     }
     if let Some(root) = project_root.as_ref() {
@@ -719,7 +720,7 @@ fn load_environment_file() -> String {
     );
     let path = candidates.into_iter().find(|path| path.is_file());
     let load_error = path.as_deref().and_then(|path| {
-        dotenvy::from_path(path)
+        environment::load(path)
             .err()
             .map(|error| describe_environment_error(&error))
     });
@@ -1603,6 +1604,7 @@ fn setup_app(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     app.manage(storage);
     app.manage(AppState::default());
+    environment::register_provider_keys(&settings);
     app.manage(Services::new(&settings));
     recording_overlay::create(app.handle())?;
     answer_panel::create(app.handle())?;
