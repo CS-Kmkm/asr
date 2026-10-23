@@ -15,8 +15,10 @@ async fn compare_segmentation_on_reference_audio() {
     let bytes = fs::read(directory.join("speech.f32")).unwrap();
     assert_eq!(bytes.len() % 4, 0);
     let samples: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect();
     let config = CaptureConfig {
         artifact_directory: Some(directory.clone()),

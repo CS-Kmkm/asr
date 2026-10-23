@@ -41,7 +41,7 @@ pub(super) fn write_pcm16_wav(
     const SAMPLES_PER_CHUNK: usize = 4096;
     let mut encoded = [0u8; SAMPLES_PER_CHUNK * 2];
     for chunk in samples.chunks(SAMPLES_PER_CHUNK) {
-        for (sample, bytes) in chunk.iter().zip(encoded.chunks_exact_mut(2)) {
+        for (sample, bytes) in chunk.iter().zip(encoded.as_chunks_mut::<2>().0.iter_mut()) {
             let normalized = if sample.is_finite() {
                 sample.clamp(-1.0, 1.0)
             } else {

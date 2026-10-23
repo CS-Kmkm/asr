@@ -176,6 +176,10 @@ pub enum AsrError {
 }
 
 #[async_trait]
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed futures; required on its generated methods on newer Clippy."
+)]
 pub trait Transcriber: Send + Sync {
     async fn load(&self, quantization: &str) -> Result<(), AsrError>;
     /// `load` that gives up with `AsrError::Cancelled` once `cancel` turns
