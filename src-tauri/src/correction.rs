@@ -2263,10 +2263,18 @@ fn parse_local_response(value: &Value) -> Result<String, CorrectionError> {
         .ok_or_else(|| CorrectionError::InvalidResponse("missing output text".into()))
 }
 
+fn error_object(value: &Value) -> Option<&Value> {
+    value
+        .as_array()
+        .and_then(|items| items.first())
+        .unwrap_or(value)
+        .get("error")
+}
+
 fn compact_error_body(body: &str) -> String {
     let Some(message) = serde_json::from_str::<Value>(body).ok().and_then(|value| {
-        value
-            .pointer("/error/message")
+        error_object(&value)?
+            .get("message")
             .and_then(Value::as_str)
             .map(str::to_owned)
     }) else {
@@ -4937,6 +4945,18 @@ mod tests {
             compact_error_body(r#"{"error":{"message":"invalid key"}}"#),
             "invalid key"
         );
+        assert_eq!(
+            compact_error_body(
+                r#"[{"error":{"message":"quota exceeded","status":"RESOURCE_EXHAUSTED"}}]"#
+            ),
+            "quota exceeded"
+        );
+        for body in ["[]", "{}", "null", r#"[{"error":{"message":42}}]"#] {
+            assert_eq!(compact_error_body(body), "unrecognized error response");
+        }
+        let long = "あ".repeat(MAX_ERROR_BODY_CHARS + 1);
+        let message = compact_error_body(&json!([{"error": {"message": long}}]).to_string());
+        assert_eq!(message.chars().count(), MAX_ERROR_BODY_CHARS + 1);
     }
 
     #[test]
