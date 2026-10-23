@@ -1,4 +1,6 @@
 #[cfg(test)]
+use crate::pipeline::{classify_ai_stage, AiStageResult};
+#[cfg(test)]
 use crate::settings::validate_translation_targets;
 use crate::{
     answer_panel, app_context, ask,
@@ -15,9 +17,7 @@ use crate::{
         TextInjector,
     },
     input_monitor::InputMonitor,
-    live_dictation, model_identity, personalization,
-    pipeline::{classify_ai_stage, AiStageResult},
-    recording_overlay,
+    live_dictation, model_identity, personalization, recording_overlay,
     services::MicrophoneTestState,
     shortcuts,
     state::{AppState, PipelineLifecycle, PipelineMode, PipelinePhase},
@@ -28,61 +28,24 @@ use crate::{
         ModelStatus, NewDictionaryEntry, NewHistoryItem, RecordingResult, Settings,
     },
     worker_command_for_settings, AskCapture, AskSession, EditSession, PipelineGuard, Services,
-    TempArtifact,
 };
+#[cfg(test)]
 use std::{
     path::{Path, PathBuf},
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{atomic::Ordering, Arc},
+};
+use std::{
+    sync::Mutex,
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
-fn save_history(
-    storage: &Storage,
-    item: &NewHistoryItem<'_>,
-    audio_path: Option<&std::path::Path>,
-) -> HistorySaveStatus {
-    match storage.add_history_with_audio_report(item, audio_path) {
-        Ok((_, true)) => HistorySaveStatus::AudioUnavailable,
-        Ok((_, false)) => HistorySaveStatus::Complete,
-        Err(_) => HistorySaveStatus::Failed,
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HistorySaveStatus {
-    Complete,
-    AudioUnavailable,
-    Failed,
-}
-
-fn report_history_save_warning(app: &AppHandle, status: HistorySaveStatus) {
-    match status {
-        HistorySaveStatus::Complete => {}
-        HistorySaveStatus::AudioUnavailable => emit_status(
-            app,
-            "history_audio_unavailable",
-            "History text was saved, but the recording could not be retained.",
-        ),
-        HistorySaveStatus::Failed => emit_status(
-            app,
-            "history_save_failed",
-            "The result completed, but History could not be saved.",
-        ),
-    }
-}
-
-fn report_temp_cleanup(app: &AppHandle, artifact: &mut TempArtifact) {
-    if artifact.cleanup().is_err() {
-        emit_status(
-            app,
-            "artifact_cleanup_failed",
-            "Temporary audio cleanup failed.",
-        );
-    }
-}
+pub(crate) use crate::pipeline::finish::{
+    report_history_save_warning, report_temp_cleanup, save_history, save_retry_result,
+    HistorySaveStatus,
+};
 
 const TRANSCRIPTION_FAILED_SAVED_TO_HISTORY: &str =
     "Transcription failed. The recording was saved to History, where you can retry it.";
@@ -99,7 +62,7 @@ const TRANSCRIPT_TRUNCATED_CODE: &str = "transcript_truncated";
 
 /// Why a take's transcription failed, as far as Retry is concerned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TranscriptionFailure {
+pub(crate) enum TranscriptionFailure {
     /// Retrying may succeed, for example after a transient worker failure.
     Retryable,
     /// The take exceeds what the speech model can transcribe; Retry with the
@@ -108,7 +71,7 @@ enum TranscriptionFailure {
 }
 
 impl TranscriptionFailure {
-    fn of(error: &asr::AsrError) -> Self {
+    pub(crate) fn of(error: &asr::AsrError) -> Self {
         match error {
             asr::AsrError::Worker(worker) if worker.code == TRANSCRIPT_TRUNCATED_CODE => {
                 Self::TooLongForModel
@@ -118,7 +81,7 @@ impl TranscriptionFailure {
     }
 
     /// `insertion_detail` of the failed take's History row.
-    fn history_detail(self) -> Option<&'static str> {
+    pub(crate) fn history_detail(self) -> Option<&'static str> {
         match self {
             Self::Retryable => None,
             Self::TooLongForModel => Some(TRANSCRIPT_TRUNCATED_CODE),
@@ -133,7 +96,7 @@ const TRANSCRIPTION_FAILED_OUTCOME: &str = "transcription_failed";
 /// The History row that lets Retry re-run a take whose transcription failed,
 /// or `None` when Retry could not reproduce the request. Ask chooses its
 /// action from the transcript, so a take without one has nothing to retry.
-fn failed_take_history_item<'a>(
+pub(crate) fn failed_take_history_item<'a>(
     mode: PipelineMode,
     asr_provider: &'a str,
     edit_source: Option<&'a str>,
@@ -175,7 +138,7 @@ fn failed_take_history_item<'a>(
 /// Retry can transcribe it again. A take is kept where History keeps
 /// recordings, or else for 24 hours when keeping failed takes is on. Returns
 /// how it was kept, or `None` when it was not.
-fn preserve_failed_take(
+pub(crate) fn preserve_failed_take(
     storage: &Storage,
     settings: &Settings,
     item: Option<NewHistoryItem<'_>>,
@@ -188,23 +151,7 @@ fn preserve_failed_take(
     storage.add_failed_take(&item, audio_path).ok().flatten()
 }
 
-/// Saves a successful Retry of History row `source_id`. A failed take kept
-/// only for Retry then follows the History and audio settings; if that
-/// cleanup fails, the take still expires with the 24-hour purge.
-fn save_retry_result(
-    storage: &Storage,
-    item: &NewHistoryItem<'_>,
-    audio_path: &std::path::Path,
-    source_id: i64,
-) -> HistorySaveStatus {
-    let status = save_history(storage, item, Some(audio_path));
-    if status != HistorySaveStatus::Failed {
-        let _ = storage.settle_retried_failed_take(source_id);
-    }
-    status
-}
-
-fn failed_take_message(
+pub(crate) fn failed_take_message(
     kept: Option<storage::FailedTakeRetention>,
     failure: TranscriptionFailure,
 ) -> &'static str {
@@ -238,7 +185,7 @@ fn capture_config(settings: &Settings) -> CaptureConfig {
     }
 }
 
-fn cancellation_copy(mode: PipelineMode) -> (&'static str, &'static str) {
+pub(crate) fn cancellation_copy(mode: PipelineMode) -> (&'static str, &'static str) {
     match mode {
         PipelineMode::Dictate => ("Dictation cancelled.", "dictation was cancelled"),
         PipelineMode::Translate => ("Translation cancelled.", "translation was cancelled"),
@@ -251,10 +198,10 @@ fn cancellation_copy(mode: PipelineMode) -> (&'static str, &'static str) {
     }
 }
 
-const EDIT_CLIPBOARD_UNAVAILABLE: &str =
+pub(crate) const EDIT_CLIPBOARD_UNAVAILABLE: &str =
     "The original selection was not changed, and the clipboard is unavailable; the edit is available in this app.";
 
-const INSERTION_FAILED: &str = "Insertion failed; the result is available in this app.";
+pub(crate) const INSERTION_FAILED: &str = "Insertion failed; the result is available in this app.";
 
 /// A replacement error happens before any paste, so the original selection is
 /// unchanged and the clipboard is the fallback. `None` means the edit reached
@@ -271,7 +218,7 @@ fn edit_insertion_outcome<E, F>(
     }
 }
 
-fn persist_edit_completion(
+pub(crate) fn persist_edit_completion(
     storage: &Storage,
     item: &NewHistoryItem<'_>,
     audio_path: Option<&std::path::Path>,
@@ -296,7 +243,7 @@ fn persist_edit_completion(
 
 /// This warning follows, and visually replaces, the completion notice. Only a
 /// confirmed paste may be described as a completed edit.
-fn edit_persistence_warning(
+pub(crate) fn edit_persistence_warning(
     insertion: InsertResult,
     history_failed: bool,
     metric_failed: bool,
@@ -332,7 +279,7 @@ fn edit_persistence_warning(
     Some(warning)
 }
 
-async fn take_published_sessions<T, U>(
+pub(crate) async fn take_published_sessions<T, U>(
     live: &tokio::sync::Mutex<Option<T>>,
     edit: &tokio::sync::Mutex<Option<U>>,
     ask: &tokio::sync::Mutex<Option<AskSession>>,
@@ -401,7 +348,7 @@ async fn play_start_cue_to_completion() {
 }
 
 /// Stop and cancel cues play after capture has closed, so they need not block.
-fn play_stop_cue(enabled: bool) {
+pub(crate) fn play_stop_cue(enabled: bool) {
     dispatch_interaction_sound(enabled, || {
         tauri::async_runtime::spawn_blocking(|| {
             #[cfg(target_os = "windows")]
@@ -1176,7 +1123,7 @@ fn automatic_stop_reason(
 
 /// Whether the input stream failed during this take, either noticed by the
 /// level loop or only by the final capture (a stop within one level tick).
-fn microphone_disconnected(
+pub(crate) fn microphone_disconnected(
     reason: StopReason,
     artifact: &Result<audio::AudioArtifact, audio::AudioError>,
 ) -> bool {
@@ -1187,9 +1134,9 @@ fn microphone_disconnected(
         }
 }
 
-const MICROPHONE_DISCONNECTED: &str = "The microphone was disconnected, so recording stopped. The audio captured before the disconnection is being transcribed.";
-const MICROPHONE_DISCONNECTED_WITHOUT_SPEECH: &str = "The microphone was disconnected before usable speech was captured. Check the microphone and start a new recording.";
-const RECORDING_LIMIT_REACHED: &str =
+pub(crate) const MICROPHONE_DISCONNECTED: &str = "The microphone was disconnected, so recording stopped. The audio captured before the disconnection is being transcribed.";
+pub(crate) const MICROPHONE_DISCONNECTED_WITHOUT_SPEECH: &str = "The microphone was disconnected before usable speech was captured. Check the microphone and start a new recording.";
+pub(crate) const RECORDING_LIMIT_REACHED: &str =
     "Recording reached the 15-minute limit and stopped. The audio is being transcribed.";
 const MICROPHONE_DISCONNECTED_PROCESSING: &str =
     "Microphone disconnected. Transcribing what was captured.";
@@ -1198,7 +1145,7 @@ const RECORDING_LIMIT_PROCESSING: &str = "Recording limit reached. Transcribing.
 /// The Processing message the overlay shows. An automatic stop keeps its
 /// reason visible there (the status notice appears only in the main window);
 /// a user stop shows `default`.
-fn processing_message(
+pub(crate) fn processing_message(
     reason: StopReason,
     disconnected: bool,
     default: &'static str,
@@ -1229,1115 +1176,13 @@ pub(crate) async fn stop_recording_for(
     storage: State<'_, Storage>,
     reason: StopReason,
 ) -> Result<RecordingResult, String> {
-    let (operation_id, mode, cancel) = match services.lifecycle.begin_processing() {
-        Ok(operation) => operation,
-        Err(error) => {
-            // An automatic stop that lost a race with the user's own stop must
-            // not overwrite the state that stop publishes.
-            if error == "no recording is active" && reason == StopReason::User {
-                emit_state(
-                    &app,
-                    &state,
-                    AppPhase::Idle,
-                    "No recording is active. Start a new recording.",
-                );
-            }
-            return Err(error.into());
-        }
-    };
-    let _guard = PipelineGuard {
-        lifecycle: &services.lifecycle,
-        id: operation_id,
-    };
-    let (cancel_message, cancel_error) = cancellation_copy(mode);
-    // Every exit below, `?` returns included, leaves a terminal phase, so
-    // the windows and the overlay never stay in Processing.
-    let _phase_guard = crate::state::TerminalPhaseGuard::new(
-        &state,
-        &services.lifecycle,
-        operation_id,
-        cancel_message,
-        |phase, message| emit_state(&app, &state, phase, message),
-    );
-    recording_overlay::set_interactive(&app, false);
-    // Publish the lifecycle transition immediately. Previously the UI stayed
-    // in Recording until audio finalization completed; if finalization failed
-    // (for example for a short or silent take), the lifecycle returned to Idle
-    // while the UI incorrectly continued to offer "Stop and transcribe".
-    emit_stage(
-        &app,
-        &state,
-        types::AppStage::FinishingAudio,
-        processing_message(reason, false, "Stopping recording and preparing audio."),
-    );
-    let started = Instant::now();
-    let (live_task, mut edit_session, mut ask_session, translation_target) =
-        take_published_sessions(
-            &services.live,
-            &services.edit,
-            &services.ask,
-            &services.voice_translation_target,
-        )
-        .await?;
-    let mut audio = services.audio.lock().await;
-    let artifact_result = audio.stop().await;
-    // `stop` closes the input stream. Do not re-arm it while transcription is
-    // running: on Bluetooth headsets an open microphone selects the low-quality
-    // HFP playback profile until the stream is released.
-    drop(audio);
-    play_stop_cue(
-        storage
-            .get_settings()
-            .map(|settings| settings.interaction_sounds)
-            .unwrap_or(false),
-    );
-    // Keep the full artifact owned even if joining live work or loading settings fails.
-    let mut artifact_cleanup = artifact_result
-        .as_ref()
-        .ok()
-        .map(|artifact| TempArtifact::new(artifact.path.clone(), false));
-    let mut draft = match live_task {
-        Some(task) => Some(task.finish().await?),
-        None if mode == PipelineMode::Edit || mode == PipelineMode::Ask => None,
-        None => return Err("live dictation session is unavailable".into()),
-    };
-    let settings = storage.get_settings().map_err(command_error)?;
-    let disconnected = microphone_disconnected(reason, &artifact_result);
-    let artifact = artifact_result.map_err(|error| {
-        emit_state(
-            &app,
-            &state,
-            AppPhase::Error,
-            if disconnected {
-                MICROPHONE_DISCONNECTED_WITHOUT_SPEECH
-            } else {
-                "No usable speech was captured. Start a new recording and try again."
-            },
-        );
-        command_error(error)
-    })?;
-    if disconnected {
-        emit_status(&app, "microphone_disconnected", MICROPHONE_DISCONNECTED);
-    } else if reason == StopReason::MaximumDuration {
-        emit_status(&app, "recording_limit_reached", RECORDING_LIMIT_REACHED);
-    }
-    let duration_ms = artifact.duration.as_millis() as u64;
-    let mut artifact_cleanup = artifact_cleanup
-        .take()
-        .expect("successful audio has cleanup ownership");
-    // The temporary capture remains cleanup-owned until any retained History
-    // copy has committed. History never takes ownership of this path.
-    artifact_cleanup.retain = false;
-    if services.lifecycle.is_cancelled(operation_id) {
-        emit_state(&app, &state, AppPhase::Idle, cancel_message);
-        return Err(cancel_error.into());
-    }
-    emit_state(
-        &app,
-        &state,
-        AppPhase::Processing,
-        processing_message(
-            reason,
-            disconnected,
-            if settings.asr_backend == "openai-compatible" {
-                "Transcribing with the configured speech provider."
-            } else {
-                "Transcribing locally."
-            },
-        ),
-    );
-
-    let app_context = services
-        .app_context
-        .lock()
-        .map_err(|_| "target service is unavailable".to_string())?
-        .clone();
-    let prompt = storage
-        .dictionary_asr_prompt_for(app_context.as_ref(), &settings.asr_backend)
-        .unwrap_or_default();
-    let correction_cancel = cancel.clone();
-    // Defense in depth: model changes are refused while a recording is
-    // active, but if the model is not marked ready (for example its load
-    // failed, or a worker crash lost it), load it as a new recording would.
-    let model_ready =
-        ensure_model_loaded_cancellable(&app, &services, &settings, Some(cancel.clone())).await;
-    if services.lifecycle.is_cancelled(operation_id) {
-        report_temp_cleanup(&app, &mut artifact_cleanup);
-        emit_state(&app, &state, AppPhase::Idle, cancel_message);
-        return Err(cancel_error.into());
-    }
-    let transcript_result = match model_ready {
-        Err(error) => Err((error, TranscriptionFailure::Retryable)),
-        Ok(_) => match services
-            .transcriber
-            .transcribe_with_locale(
-                &artifact.path,
-                prompt.as_deref(),
-                settings.speech_locale.as_deref(),
-                cancel,
-            )
-            .await
-        {
-            Ok(value) => Ok(value),
-            Err(asr::AsrError::Cancelled) => {
-                report_temp_cleanup(&app, &mut artifact_cleanup);
-                emit_state(&app, &state, AppPhase::Idle, cancel_message);
-                return Err(cancel_error.into());
-            }
-            Err(error) => {
-                let failure = TranscriptionFailure::of(&error);
-                Err((command_error(error), failure))
-            }
-        },
-    };
-    let transcript = match transcript_result {
-        Ok(value) => value,
-        Err((error, failure)) => {
-            let _ = storage.add_metric(
-                "asr",
-                Some(settings.asr_backend.as_str()),
-                None,
-                false,
-                Some("asr_failed"),
-            );
-            let asr_provider = model_identity(&settings)
-                .0
-                .unwrap_or_else(|| settings.asr_backend.clone());
-            let preserved = preserve_failed_take(
-                &storage,
-                &settings,
-                failed_take_history_item(
-                    mode,
-                    &asr_provider,
-                    edit_session
-                        .as_ref()
-                        .map(|session| session.selection.text()),
-                    translation_target.as_deref(),
-                    app_context::history_category(app_context.as_ref()),
-                    duration_ms,
-                )
-                .map(|item| NewHistoryItem {
-                    insertion_detail: failure.history_detail(),
-                    ..item
-                }),
-                &artifact.path,
-            );
-            emit_state(
-                &app,
-                &state,
-                AppPhase::Error,
-                failed_take_message(preserved, failure),
-            );
-            // History keeps its own copy, so the temporary capture is always removed.
-            report_temp_cleanup(&app, &mut artifact_cleanup);
-            return Err(error);
-        }
-    };
-    if services.lifecycle.is_cancelled(operation_id) {
-        emit_state(&app, &state, AppPhase::Idle, cancel_message);
-        return Err(cancel_error.into());
-    }
-
-    services
-        .target
-        .lock()
-        .map_err(|_| "target service is unavailable".to_string())?
-        .take();
-    if mode == PipelineMode::Edit {
-        let session = edit_session.take().ok_or("edit session is unavailable")?;
-        let instruction_text = transcript.text.clone();
-        let source_text = session.selection.text().to_owned();
-        if instruction_text.trim().is_empty() {
-            emit_state(
-                &app,
-                &state,
-                AppPhase::Error,
-                "No edit instruction was captured; the original selection was not changed.",
-            );
-            return Err("no edit instruction was captured".into());
-        }
-        emit_correction_preview(&app, &instruction_text, "draft");
-        emit_stage(
-            &app,
-            &state,
-            types::AppStage::Correcting,
-            "Applying the spoken edit instruction.",
-        );
-        let edit_started = Instant::now();
-        let edited = match correction::edit_selected_text(
-            &settings,
-            &source_text,
-            &instruction_text,
-            correction_cancel,
-            |delta| emit_correction_preview(&app, delta, "streaming"),
-        )
-        .await
-        {
-            Ok(edited) => edited,
-            Err(correction::CorrectionError::Cancelled) => {
-                emit_state(&app, &state, AppPhase::Idle, "Editing cancelled.");
-                return Err("editing was cancelled".into());
-            }
-            Err(error) => {
-                let _ = storage.add_metric(
-                    "speak_to_edit",
-                    Some(settings.correction_provider.as_str()),
-                    Some(edit_started.elapsed().as_millis() as i64),
-                    false,
-                    Some("edit_failed"),
-                );
-                emit_state(&app, &state, AppPhase::Error, &edit_failure_message(&error));
-                return Err(ai_command_error(
-                    &app,
-                    &error,
-                    FailureOutcome::UnchangedSelection,
-                ));
-            }
-        };
-        emit_correction_preview(&app, &edited, "final");
-        if services.lifecycle.is_cancelled(operation_id) {
-            emit_state(&app, &state, AppPhase::Idle, "Editing cancelled.");
-            return Err("editing was cancelled".into());
-        }
-        session.monitor.wait_for_shortcut_release().await;
-        if services.lifecycle.is_cancelled(operation_id) {
-            emit_state(&app, &state, AppPhase::Idle, "Editing cancelled.");
-            return Err("editing was cancelled".into());
-        }
-        emit_state(
-            &app,
-            &state,
-            AppPhase::Injecting,
-            "Replacing the original selection.",
-        );
-        let (insertion, failure_detail) = match commit_edit_replacement(
-            &services.lifecycle,
-            operation_id,
-            || {
-                session.injector.replace_selection(
-                    &session.selection,
-                    &edited,
-                    &session.monitor,
-                    session.checkpoint,
-                )
-            },
-            || session.injector.copy_to_clipboard(&edited),
-        ) {
-            CommittedOutput::Ran(outcome) => outcome,
-            // Nothing was pasted or copied.
-            CommittedOutput::Cancelled => {
-                emit_state(&app, &state, AppPhase::Idle, "Editing cancelled.");
-                return Err("editing was cancelled".into());
-            }
-            // Nothing was pasted or copied; the phase guard reports the
-            // incomplete edit.
-            CommittedOutput::Refused(error) => return Err(error.into()),
-        };
-        let clipboard_lost = session.injector.take_clipboard_not_restored();
-        let restore_detail = insertion
-            .and_then(|result| InsertionDetail::for_confirmed_paste(result, clipboard_lost));
-        recording_overlay::set_phase(&app, &AppPhase::Completed);
-        let (insertion_label, completion) = match insertion {
-            Some(InsertResult::ClipboardPaste) => ("clipboard_paste", "Selected text updated."),
-            Some(InsertResult::ClipboardOnly) => (
-                "clipboard_only",
-                "Automatic replacement was skipped; the edit remains on the clipboard.",
-            ),
-            Some(InsertResult::PasteUnverified) => (
-                "paste_unverified",
-                "The edit paste could not be confirmed; the result remains on the clipboard.",
-            ),
-            None => ("insertion_failed", EDIT_CLIPBOARD_UNAVAILABLE),
-        };
-        let latency_ms = started.elapsed().as_millis() as u64;
-        let (history_save_status, metric_failed) = persist_edit_completion(
-            &storage,
-            &NewHistoryItem {
-                transcript_text: &instruction_text,
-                processed_text: Some(&edited),
-                source_text: Some(&source_text),
-                instruction_text: Some(&instruction_text),
-                action_kind: None,
-                search_site: None,
-                mode: "edit",
-                asr_provider: &transcript.model,
-                llm_provider: Some(settings.correction_provider.as_str()),
-                target_language: None,
-                app_category: None,
-                duration_ms: Some(duration_ms as i64),
-                latency_ms: Some(latency_ms as i64),
-                retry_of_id: None,
-                insertion_result: Some(insertion_label),
-                insertion_detail: insertion
-                    .is_none()
-                    .then_some(failure_detail)
-                    .or(restore_detail)
-                    .map(InsertionDetail::code),
-            },
-            Some(&artifact.path),
-            settings.correction_provider.as_str(),
-            edit_started.elapsed().as_millis() as i64,
-        );
-        let Some(insertion) = insertion else {
-            // Persist before returning: neither the target nor the clipboard
-            // received the edit, and closing the app must not lose the result.
-            state.publish_result(edited.clone());
-            emit_state(&app, &state, AppPhase::Error, EDIT_CLIPBOARD_UNAVAILABLE);
-            if let Some((kind, message)) =
-                completion_persistence_warning(history_save_status, metric_failed)
-            {
-                emit_status(&app, kind, message);
-            }
-            recording_overlay::show_insertion_notice(
-                &app,
-                injection::notice_outcome(insertion_label, clipboard_lost),
-                Some(failure_detail.code()),
-            );
-            report_temp_cleanup(&app, &mut artifact_cleanup);
-            return Err(EDIT_CLIPBOARD_UNAVAILABLE.into());
-        };
-        let snapshot = state.complete(edited.clone(), completion.into());
-        let _ = app.emit("app-state", snapshot);
-        emit_status(&app, insertion_label, completion);
-        if insertion != InsertResult::ClipboardPaste || clipboard_lost {
-            recording_overlay::show_insertion_notice(
-                &app,
-                injection::notice_outcome(insertion_label, clipboard_lost),
-                None,
-            );
-        }
-        let warning = if history_save_status == HistorySaveStatus::AudioUnavailable {
-            completion_persistence_warning(history_save_status, metric_failed)
-        } else {
-            edit_persistence_warning(
-                insertion,
-                history_save_status == HistorySaveStatus::Failed,
-                metric_failed,
-            )
-        };
-        if let Some((kind, message)) = warning {
-            emit_status(&app, kind, message);
-        }
-        report_temp_cleanup(&app, &mut artifact_cleanup);
-        return Ok(RecordingResult {
-            text: edited,
-            insertion: insertion_label.into(),
-            duration_ms,
-            latency_ms,
-        });
-    }
-    if mode == PipelineMode::Ask {
-        let Some(session) = ask_session.take() else {
-            recording_overlay::set_phase(&app, &AppPhase::Error);
-            emit_state(&app, &state, AppPhase::Error, "Ask session is unavailable.");
-            return Err("Ask session is unavailable".into());
-        };
-        let result = finish_ask(
-            &app,
-            &services,
-            &state,
-            &storage,
-            operation_id,
-            &session,
-            &transcript.text,
-            &transcript.model,
-            duration_ms,
-            started,
-            Some(&artifact.path),
-        )
-        .await;
-        if result.is_ok() {
-            recording_overlay::set_phase(&app, &AppPhase::Completed);
-        }
-        if let Err(error) = &result {
-            recording_overlay::set_interactive(&app, false);
-            if services.lifecycle.is_cancelled(operation_id) {
-                recording_overlay::set_phase(&app, &AppPhase::Idle);
-                emit_state(&app, &state, AppPhase::Idle, cancel_message);
-            } else {
-                recording_overlay::set_phase(&app, &AppPhase::Error);
-                emit_state(&app, &state, AppPhase::Error, error);
-            }
-        }
-        report_temp_cleanup(&app, &mut artifact_cleanup);
-        return result;
-    }
-    let mut draft = draft
-        .take()
-        .expect("non-edit recording has a live dictation session");
-    let mut final_text = transcript.text.clone();
-    let mut processed_text = None;
-    let mut llm_provider = None;
-    let mut correction_failed = false;
-    let mut translation_failed = false;
-    let mut correction_output_limit = None;
-    let _ = app.emit("app-state", state.publish_result(transcript.text.clone()));
-    // Full-recording recognition reconciles the last live hypothesis before AI correction.
-    draft.monitor.wait_for_shortcut_release().await;
-    if services.lifecycle.is_cancelled(operation_id) {
-        emit_state(&app, &state, AppPhase::Idle, cancel_message);
-        return Err(cancel_error.into());
-    }
-    if let Err(error) = draft.update(&transcript.text) {
-        emit_status(
-            &app,
-            "streaming_insertion_unavailable",
-            &format!("Draft insertion failed; the transcript is available in this app. {error}"),
-        );
-    }
-    let streamed_into_target = draft.pasted;
-    if mode == PipelineMode::Translate {
-        let Some(target_language) = translation_target.as_deref() else {
-            // Startup publishes the target with the session. If it is missing,
-            // keep the speech the same way a translation failure does.
-            let copied = match commit_dictation_output(&services.lifecycle, operation_id, || {
-                draft
-                    .injector
-                    .copy_to_clipboard(&transcript.text)
-                    .map(|()| InsertResult::ClipboardOnly)
-            }) {
-                CommittedOutput::Ran(copied) => copied.is_ok(),
-                // Nothing was copied.
-                CommittedOutput::Cancelled => {
-                    emit_state(&app, &state, AppPhase::Idle, cancel_message);
-                    return Err(cancel_error.into());
-                }
-                // Nothing was copied; the phase guard reports the incomplete
-                // translation.
-                CommittedOutput::Refused(error) => return Err(error.into()),
-            };
-            emit_correction_preview(&app, &transcript.text, "fallback");
-            emit_state(
-                &app,
-                &state,
-                AppPhase::Error,
-                if copied {
-                    "The translation target language was unavailable; the raw transcript remains on the clipboard."
-                } else {
-                    "The translation target language was unavailable and the clipboard could not be updated; the raw transcript remains available in this app."
-                },
-            );
-            return Err("translation target language is unavailable".into());
-        };
-        emit_correction_preview(&app, &transcript.text, "draft");
-        emit_stage(
-            &app,
-            &state,
-            types::AppStage::Translating,
-            "Translating speech to the selected language.",
-        );
-        let translation_started = Instant::now();
-        llm_provider = Some(settings.correction_provider.clone());
-        match classify_ai_stage(
-            correction::translate_transcript(
-                &settings,
-                &transcript.text,
-                target_language,
-                correction_cancel,
-                |delta| emit_correction_preview(&app, delta, "streaming"),
-            )
-            .await,
-        ) {
-            AiStageResult::Corrected(translated) => {
-                final_text = translated;
-                processed_text = Some(final_text.clone());
-                // Publish before insertion so an insertion error cannot lose
-                // the completed translation.
-                let _ = app.emit("app-state", state.publish_result(final_text.clone()));
-                emit_correction_preview(&app, &final_text, "final");
-                let _ = storage.add_metric(
-                    "voice_translation",
-                    Some(settings.correction_provider.as_str()),
-                    Some(translation_started.elapsed().as_millis() as i64),
-                    true,
-                    None,
-                );
-            }
-            AiStageResult::Cancelled => {
-                emit_state(&app, &state, AppPhase::Idle, "Translation cancelled.");
-                return Err("translation was cancelled".into());
-            }
-            AiStageResult::Fallback(error) => {
-                translation_failed = true;
-                emit_correction_preview(&app, &transcript.text, "fallback");
-                let _ = storage.add_metric(
-                    "voice_translation",
-                    Some(settings.correction_provider.as_str()),
-                    Some(translation_started.elapsed().as_millis() as i64),
-                    false,
-                    Some(error.failure_code()),
-                );
-                emit_ai_failure(
-                    &app,
-                    "voice_translation_failed",
-                    &error,
-                    FailureOutcome::UsingTranscript,
-                    &correction::failure_message(&error, FailureOutcome::UsingTranscript),
-                );
-            }
-        }
-    } else if settings.text_correction_enabled {
-        let correction_hints = storage
-            .dictionary_correction_terms(&transcript.text, app_context.as_ref())
-            .unwrap_or_default();
-        emit_correction_preview(&app, &transcript.text, "draft");
-        if streamed_into_target {
-            emit_state(
-                &app,
-                &state,
-                AppPhase::Injecting,
-                "Inserting the provisional transcript into the captured target.",
-            );
-        }
-        emit_stage(
-            &app,
-            &state,
-            types::AppStage::Correcting,
-            "Correcting the transcript with the configured AI provider.",
-        );
-        let correction_started = Instant::now();
-        match correction::correct_transcript(
-            &settings,
-            &transcript.text,
-            &correction_hints,
-            personalization::resolve_profile(&settings, app_context.as_ref())
-                .map(|profile| personalization::guidance(&profile))
-                .as_deref(),
-            correction_cancel,
-            |delta| {
-                emit_correction_preview(&app, delta, "streaming");
-            },
-        )
-        .await
-        {
-            Ok(corrected) => {
-                final_text = corrected;
-                emit_correction_preview(&app, &final_text, "final");
-                processed_text = Some(final_text.clone());
-                llm_provider = Some(settings.correction_provider.clone());
-                let _ = storage.add_metric(
-                    "text_correction",
-                    Some(settings.correction_provider.as_str()),
-                    Some(correction_started.elapsed().as_millis() as i64),
-                    true,
-                    None,
-                );
-            }
-            Err(correction::CorrectionError::Cancelled) => {
-                emit_state(&app, &state, AppPhase::Idle, "Dictation cancelled.");
-                return Err("dictation was cancelled".into());
-            }
-            Err(error) => {
-                correction_failed = true;
-                correction_output_limit = output_limit_inserted_message(&error);
-                emit_correction_preview(&app, &transcript.text, "fallback");
-                let _ = storage.add_metric(
-                    "text_correction",
-                    Some(settings.correction_provider.as_str()),
-                    Some(correction_started.elapsed().as_millis() as i64),
-                    false,
-                    Some(correction_failure_metric_code(&error)),
-                );
-                emit_ai_failure(
-                    &app,
-                    "text_correction_failed",
-                    &error,
-                    FailureOutcome::UsingTranscript,
-                    &correction_failure_status(&error),
-                );
-            }
-        }
-    } else {
-        emit_correction_preview(&app, &transcript.text, "final");
-    }
-    if services.lifecycle.is_cancelled(operation_id) {
-        emit_state(&app, &state, AppPhase::Idle, cancel_message);
-        return Err(cancel_error.into());
-    }
-
-    emit_stage(
-        &app,
-        &state,
-        if streamed_into_target {
-            types::AppStage::UpdatingText
-        } else {
-            types::AppStage::Inserting
-        },
-        if streamed_into_target {
-            "Finalizing the provisional text in the captured target."
-        } else {
-            "Inserting into the captured target."
-        },
-    );
-    let cancel = services.lifecycle.cancellation(operation_id)?;
-    // Settling awaits, so it runs before the commit, which must not.
-    if !translation_failed {
-        draft.settle_before_final(&cancel).await;
-    }
-    // A cancel either wins before the paste or copy, or finds the dictation
-    // committed and changes nothing.
-    let insertion_result = match commit_dictation_output(&services.lifecycle, operation_id, || {
-        if translation_failed {
-            draft
-                .injector
-                .copy_to_clipboard(&final_text)
-                .map(|()| InsertResult::ClipboardOnly)
-        } else {
-            draft.finish(&final_text, &cancel)
-        }
-    }) {
-        CommittedOutput::Ran(inserted) => inserted,
-        // Nothing was pasted or copied; ends below as a cancelled insertion,
-        // whose dropped draft removes its provisional text.
-        CommittedOutput::Cancelled => Err(injection::InjectionError::Cancelled),
-        // Nothing was pasted or copied; the phase guard reports the
-        // incomplete dictation.
-        CommittedOutput::Refused(error) => return Err(error.into()),
-    };
-    // Diagnose before the draft stops its input monitor. Fixed codes only.
-    let clipboard_lost = draft.injector.take_clipboard_not_restored();
-    let insertion_detail = match &insertion_result {
-        Ok(_) if translation_failed => Some("translation_failed"),
-        Ok(result) => draft
-            .diagnose(*result)
-            .or(InsertionDetail::for_confirmed_paste(
-                *result,
-                clipboard_lost,
-            ))
-            .map(InsertionDetail::code),
-        Err(error) => InsertionDetail::from_error(error).map(InsertionDetail::code),
-    };
-    // Insertion has returned; helper shutdown and persistence are not insertion.
-    // This only hides the overlay. The result below still determines success.
-    recording_overlay::set_phase(&app, &AppPhase::Completed);
-    // The helper observes input only while a provisional replacement session
-    // can still mutate the target. Stop it before persisting the result.
-    drop(draft);
-    if insertion_result == Err(injection::InjectionError::Cancelled) {
-        emit_state(&app, &state, AppPhase::Idle, cancel_message);
-        if clipboard_lost {
-            report_clipboard_not_restored(&app);
-        }
-        return Err(cancel_error.into());
-    }
-    let latency_ms = started.elapsed().as_millis() as u64;
-    let insertion_label = match insertion_result {
-        Err(_) => "insertion_failed",
-        Ok(InsertResult::ClipboardPaste) if streamed_into_target => "provisional_replace",
-        Ok(InsertResult::ClipboardPaste) => "clipboard_paste",
-        Ok(InsertResult::ClipboardOnly) => "clipboard_only",
-        Ok(InsertResult::PasteUnverified) => "paste_unverified",
-    };
-    let inserted = insertion_result == Ok(InsertResult::ClipboardPaste);
-    let history_save_status = save_history(
-        &storage,
-        &NewHistoryItem {
-            transcript_text: &transcript.text,
-            processed_text: processed_text.as_deref(),
-            source_text: None,
-            instruction_text: None,
-            action_kind: None,
-            search_site: None,
-            mode: if mode == PipelineMode::Translate {
-                "translate"
-            } else if processed_text.is_some() {
-                "ai_corrected"
-            } else if correction_failed {
-                "faithful_fallback"
-            } else {
-                "faithful"
-            },
-            asr_provider: &transcript.model,
-            llm_provider: llm_provider.as_deref(),
-            target_language: translation_target.as_deref(),
-            app_category: app_context::history_category(app_context.as_ref()),
-            duration_ms: Some(duration_ms as i64),
-            latency_ms: Some(latency_ms as i64),
-            retry_of_id: None,
-            insertion_result: Some(insertion_label),
-            insertion_detail,
-        },
-        Some(&artifact.path),
-    );
-    // Only an AI correction of a Dictate transcript proposes a spelling; a
-    // translation is a different text, not a correction of the transcript.
-    if mode == PipelineMode::Dictate && processed_text.is_some() {
-        let _ =
-            storage.add_dictionary_candidate_from_correction(&transcript.text, &final_text, None);
-    }
-    let mode_metric = if mode == PipelineMode::Translate {
-        "voice_translate"
-    } else {
-        "dictation"
-    };
-    let metric_result = storage.add_metric(
-        mode_metric,
-        Some(&transcript.model),
-        Some(latency_ms as i64),
-        !translation_failed,
-        translation_failed.then_some("translation_failed"),
-    );
-    // The pipeline metric above records recognition; this one records whether
-    // the text reached the target, as `outcome` or `outcome:reason` codes.
-    let insertion_code = insertion_detail.map_or_else(
-        || insertion_label.to_owned(),
-        |detail| format!("{insertion_label}:{detail}"),
-    );
-    let insertion_metric = storage.add_metric(
-        "insertion",
-        Some(mode_metric),
-        Some(latency_ms as i64),
-        inserted,
-        (!inserted).then_some(insertion_code.as_str()),
-    );
-    let metric_failed = metric_result.is_err() || insertion_metric.is_err();
-    let insertion = match insertion_result {
-        Ok(insertion) => insertion,
-        Err(error) => {
-            // The clipboard is not overwritten after an insertion error (it
-            // may hold data that could not be preserved); keep the text here.
-            let _ = app.emit("app-state", state.publish_result(final_text.clone()));
-            emit_state(&app, &state, AppPhase::Error, INSERTION_FAILED);
-            if let Some((kind, message)) =
-                completion_persistence_warning(history_save_status, metric_failed)
-            {
-                emit_status(&app, kind, message);
-            }
-            recording_overlay::show_insertion_notice(
-                &app,
-                injection::notice_outcome(insertion_label, clipboard_lost),
-                insertion_detail,
-            );
-            report_temp_cleanup(&app, &mut artifact_cleanup);
-            return Err(command_error(error));
-        }
-    };
-    let completion = if translation_failed {
-        "Translation failed; the raw transcript remains on the clipboard."
-    } else if mode == PipelineMode::Translate && insertion == InsertResult::PasteUnverified {
-        TRANSLATION_PASTE_UNVERIFIED
-    } else if mode == PipelineMode::Translate && insertion == InsertResult::ClipboardOnly {
-        TRANSLATION_TARGET_CHANGED
-    } else if mode == PipelineMode::Translate {
-        "Voice translation inserted."
-    } else if insertion == InsertResult::PasteUnverified && streamed_into_target {
-        // The clipboard may still hold the first live fragment, not the result.
-        "The live draft could not be confirmed, so it was not replaced; the final result is available in this app."
-    } else if insertion == InsertResult::PasteUnverified {
-        "Pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard)."
-    } else if insertion == InsertResult::ClipboardOnly && streamed_into_target {
-        "The provisional text could not be safely replaced; the final result remains on the clipboard."
-    } else if insertion == InsertResult::ClipboardOnly {
-        "Automatic insertion failed; the result remains on the clipboard."
-    } else if let Some(message) = correction_output_limit {
-        message
-    } else if correction_failed {
-        "AI correction failed; the original transcript was inserted."
-    } else {
-        "Dictation inserted successfully."
-    };
-    let snapshot = state.complete(final_text.clone(), completion.into());
-    let _ = app.emit("app-state", snapshot);
-    emit_status(&app, insertion_label, completion);
-    if let Some((kind, message)) =
-        completion_persistence_warning(history_save_status, metric_failed)
-    {
-        emit_status(&app, kind, message);
-    }
-    if !inserted {
-        // With opt-in live insertion the raw draft may already be in the field.
-        let notice = match insertion {
-            InsertResult::ClipboardOnly if streamed_into_target => "draft_kept",
-            InsertResult::PasteUnverified if streamed_into_target => "draft_unverified",
-            _ => insertion_label,
-        };
-        let notice = injection::notice_outcome(notice, clipboard_lost);
-        recording_overlay::show_insertion_notice(&app, notice, insertion_detail);
-    } else if clipboard_lost {
-        // A confirmed paste that could not restore the previous clipboard.
-        let notice = injection::notice_outcome(insertion_label, true);
-        recording_overlay::show_insertion_notice(&app, notice, None);
-    } else if correction_failed {
-        // The text arrived uncorrected; say why where the user is looking.
-        recording_overlay::show_message_notice(
-            &app,
-            recording_overlay::NoticeSeverity::Warning,
-            completion,
-        );
-    }
-    report_temp_cleanup(&app, &mut artifact_cleanup);
-    Ok(RecordingResult {
-        text: final_text,
-        insertion: insertion_label.into(),
-        duration_ms,
-        latency_ms,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn finish_ask(
-    app: &AppHandle,
-    services: &Services,
-    state: &AppState,
-    storage: &Storage,
-    operation_id: u64,
-    session: &AskSession,
-    spoken: &str,
-    asr_provider: &str,
-    duration_ms: u64,
-    started: Instant,
-    audio_path: Option<&std::path::Path>,
-) -> Result<RecordingResult, String> {
-    use ask::{AskAction, AskError};
-    if services.lifecycle.is_cancelled(operation_id) {
-        return Err("ask was cancelled".into());
-    }
-    require_ask_spoken_input(spoken)?;
-    let settings = storage.get_settings().map_err(command_error)?;
-    emit_stage(
-        app,
-        state,
-        types::AppStage::Planning,
-        "Choosing a safe Ask action.",
-    );
-    // Planning receives spoken text and context only. It never receives source.
-    let plan = correction::generate_ask_plan(
-        &settings,
-        spoken,
-        &ask::planning_prompt(session.kind()),
-        services
-            .lifecycle
-            .cancellation(operation_id)
-            .map_err(command_error)?,
-    )
-    .await
-    .map_err(|error| ai_command_error(app, &error, FailureOutcome::NoAction))?;
-    if services.lifecycle.is_cancelled(operation_id) {
-        return Err("ask was cancelled".into());
-    }
-    let parsed =
-        ask::parse_plan(&plan).map_err(|_| "Ask planner returned an invalid action".to_string())?;
-    let action = match ask::validate_action(
-        parsed,
-        session.kind(),
-        spoken,
-        &settings.translation_target_languages,
-    ) {
-        Ok(action) => action,
-        Err(AskError::Clarification(_)) => {
-            let clarification =
-                "Please name the target language, for example: translate to English.";
-            if services.lifecycle.is_cancelled(operation_id) {
-                return Err("ask was cancelled".into());
-            }
-            let published = services
-                .answer_panel
-                .publish_notice(operation_id, clarification.into());
-            if !published || !answer_panel::show_notice(app, operation_id, clarification) {
-                commit_ask_copy(&services.lifecycle, operation_id, || {
-                    session.injector.copy_to_clipboard(clarification)
-                })?;
-                let snapshot = state.complete(
-                    clarification.into(),
-                    "Ask needs clarification; the prompt is on the clipboard.".into(),
-                );
-                let _ = app.emit("app-state", snapshot);
-                return Ok(RecordingResult {
-                    text: clarification.into(),
-                    insertion: "clipboard_only".into(),
-                    duration_ms,
-                    latency_ms: started.elapsed().as_millis() as u64,
-                });
-            }
-            let snapshot = state.complete(clarification.into(), "Ask needs clarification.".into());
-            let _ = app.emit("app-state", snapshot);
-            return Ok(RecordingResult {
-                text: clarification.into(),
-                insertion: "panel".into(),
-                duration_ms,
-                latency_ms: started.elapsed().as_millis() as u64,
-            });
-        }
-        Err(AskError::Policy) => {
-            return Err("Ask action was blocked by context policy".into());
-        }
-        Err(_) => return Err("Ask planner returned an invalid action".into()),
-    };
-    if let AskAction::Search { site } = &action {
-        // The planner may choose a fixed site, but never the external payload.
-        let query = site.derive_search_query(spoken);
-        let url = site
-            .fixed_url(spoken)
-            .map_err(|_| "Ask search query was invalid".to_string())?;
-        // Browser launch is irreversible. Cancellation either wins before
-        // launch or observes a committed search; History and completion remain
-        // owned by this operation until the outer PipelineGuard finishes it.
-        services
-            .lifecycle
-            .commit_side_effect(operation_id, || open_fixed_search(&url))
-            .map_err(|_| "ask was cancelled".to_string())??;
-        let latency_ms = started.elapsed().as_millis() as u64;
-        let history_save_status = save_history(
-            storage,
-            &NewHistoryItem {
-                transcript_text: spoken,
-                processed_text: Some(&query),
-                source_text: session.selected_source(),
-                instruction_text: Some(spoken),
-                mode: "ask",
-                asr_provider,
-                llm_provider: Some(settings.correction_provider.as_str()),
-                target_language: None,
-                action_kind: Some("search"),
-                search_site: Some(search_site_name(*site)),
-                app_category: None,
-                duration_ms: Some(duration_ms as i64),
-                latency_ms: Some(latency_ms as i64),
-                retry_of_id: None,
-                insertion_result: None,
-                insertion_detail: None,
-            },
-            audio_path,
-        );
-        let snapshot = state.complete(query.clone(), "Opening the requested fixed search.".into());
-        let _ = app.emit("app-state", snapshot);
-        report_history_save_warning(app, history_save_status);
-        return Ok(RecordingResult {
-            text: query,
-            insertion: "search".into(),
-            duration_ms,
-            latency_ms,
-        });
-    }
-    let input = ask::generation_input(session.selected_source(), spoken);
-    let output = correction::generate_ask_text(
-        &settings,
-        &input,
-        &ask::generation_prompt_with_target(&action),
-        services
-            .lifecycle
-            .cancellation(operation_id)
-            .map_err(command_error)?,
-    )
-    .await
-    .map_err(|error| ai_command_error(app, &error, FailureOutcome::NoAction))?;
-    if services.lifecycle.is_cancelled(operation_id) {
-        return Err("ask was cancelled".into());
-    }
-    // Every paste or clipboard copy below goes through `commit_ask_output`.
-    let insertion = match (&action, &session.capture) {
-        (
-            AskAction::Rewrite
-            | AskAction::Shorten
-            | AskAction::Expand
-            | AskAction::ChangeTone
-            | AskAction::Translate { .. },
-            AskCapture::Selected(selection),
-        ) => {
-            let cancel = services
-                .lifecycle
-                .cancellation(operation_id)
-                .map_err(command_error)?;
-            commit_ask_output(&services.lifecycle, operation_id, || {
-                let replaced = session.monitor.as_ref().zip(session.checkpoint).map(
-                    |(monitor, checkpoint)| {
-                        session.injector.replace_selection_monitored(
-                            selection, &output, monitor, checkpoint, &cancel,
-                        )
-                    },
-                );
-                ask_insertion(replaced, "selection", || {
-                    session.injector.copy_to_clipboard(&output)
-                })
-            })?
-        }
-        (AskAction::Draft, AskCapture::Caret(target)) => {
-            let cancel = services
-                .lifecycle
-                .cancellation(operation_id)
-                .map_err(command_error)?;
-            commit_ask_output(&services.lifecycle, operation_id, || {
-                let inserted = session
-                    .monitor
-                    .as_ref()
-                    .zip(session.checkpoint)
-                    .filter(|(monitor, checkpoint)| monitor.unchanged_since(*checkpoint))
-                    .map(|(monitor, checkpoint)| {
-                        session
-                            .injector
-                            .insert_monitored(&output, target, monitor, checkpoint, &cancel)
-                    });
-                ask_insertion(inserted, "caret", || {
-                    session.injector.copy_to_clipboard(&output)
-                })
-            })?
-        }
-        _ => {
-            if services.lifecycle.is_cancelled(operation_id) {
-                return Err("ask was cancelled".into());
-            }
-            let published = services.answer_panel.publish(operation_id, output.clone());
-            if !published || !answer_panel::show(app, operation_id, &output) {
-                commit_ask_output(&services.lifecycle, operation_id, || {
-                    Ok(ask_fallback_insertion(
-                        session.injector.copy_to_clipboard(&output),
-                    ))
-                })?
-            } else {
-                "panel"
-            }
-        }
-    };
-    // A committed paste or copy ignores later cancels, so only an answer
-    // shown in the panel can still be cancelled here.
-    if services.lifecycle.is_cancelled(operation_id) {
-        return Err("ask was cancelled".into());
-    }
-    let latency_ms = started.elapsed().as_millis() as u64;
-    let history_save_status = save_history(
-        storage,
-        &NewHistoryItem {
-            transcript_text: spoken,
-            processed_text: Some(&output),
-            source_text: session.selected_source(),
-            instruction_text: Some(spoken),
-            mode: "ask",
-            asr_provider,
-            llm_provider: Some(settings.correction_provider.as_str()),
-            target_language: match &action {
-                AskAction::Translate { target_language } => Some(target_language.as_str()),
-                _ => None,
-            },
-            action_kind: Some(action_name(&action)),
-            search_site: None,
-            app_category: None,
-            duration_ms: Some(duration_ms as i64),
-            latency_ms: Some(latency_ms as i64),
-            retry_of_id: None,
-            insertion_result: None,
-            insertion_detail: None,
-        },
-        audio_path,
-    );
-    let message = ask_completion_message(insertion);
-    let snapshot = state.complete(output.clone(), message.into());
-    let _ = app.emit("app-state", snapshot);
-    if session.injector.take_clipboard_not_restored() {
-        report_clipboard_not_restored(app);
-    }
-    report_history_save_warning(app, history_save_status);
-    Ok(RecordingResult {
-        text: output,
-        insertion: insertion.into(),
-        duration_ms,
-        latency_ms,
-    })
+    crate::pipeline::stop::run(&app, &services, &state, &storage, reason).await
 }
 
 /// An output step saw the cancel and stopped before it pasted or kept a
 /// copy. The commit stays unsealed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct OutputCancelled;
+pub(crate) struct OutputCancelled;
 
 /// How an output step (a paste or a clipboard copy) run inside the
 /// lifecycle's commit ended. The commit makes a cancel either win before
@@ -2347,7 +1192,7 @@ struct OutputCancelled;
 /// second; lifecycle readers (hotkeys, Esc) wait that long instead of racing
 /// the paste. The step must not use the lifecycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CommittedOutput<T> {
+pub(crate) enum CommittedOutput<T> {
     Ran(T),
     /// Nothing was pasted or copied.
     Cancelled,
@@ -2371,7 +1216,7 @@ fn committed_output<T>(
 /// Speak to edit's irreversible step: the replacement, or the clipboard copy
 /// when it fails before any paste. Returns the outcome (`None`: neither the
 /// target nor the clipboard received the edit) and the detail for `None`.
-fn commit_edit_replacement(
+pub(crate) fn commit_edit_replacement(
     lifecycle: &PipelineLifecycle,
     operation_id: u64,
     replace: impl FnOnce() -> Result<InsertResult, injection::InjectionError>,
@@ -2397,7 +1242,7 @@ fn commit_edit_replacement(
 /// pasted nor copied, leaves the commit unsealed; any other result, an error
 /// included, is committed and completes as before. Finishing a live draft
 /// verifies its selection and then its paste, about two seconds at most.
-fn commit_dictation_output(
+pub(crate) fn commit_dictation_output(
     lifecycle: &PipelineLifecycle,
     operation_id: u64,
     output: impl FnOnce() -> Result<InsertResult, injection::InjectionError>,
@@ -2411,7 +1256,7 @@ fn commit_dictation_output(
 
 /// Runs an Ask paste or fallback copy as a committed output step. A step
 /// that ran returns its insertion label even if a cancel follows.
-fn commit_ask_output(
+pub(crate) fn commit_ask_output(
     lifecycle: &PipelineLifecycle,
     operation_id: u64,
     output: impl FnOnce() -> Result<&'static str, OutputCancelled>,
@@ -2428,7 +1273,7 @@ fn commit_ask_output(
 /// Runs an Ask copy whose failure ends the Ask, such as the clarification
 /// fallback, inside the lifecycle's commit. A failed copy keeps its error and
 /// leaves the operation unsealed.
-fn commit_ask_copy(
+pub(crate) fn commit_ask_copy(
     lifecycle: &PipelineLifecycle,
     operation_id: u64,
     copy_to_clipboard: impl FnOnce() -> Result<(), injection::InjectionError>,
@@ -2444,7 +1289,7 @@ fn commit_ask_copy(
 /// `pasted` names a confirmed paste. `None` means the target was not tried.
 /// A failure before any paste falls back to the clipboard; a cancel neither
 /// pastes nor copies.
-fn ask_insertion(
+pub(crate) fn ask_insertion(
     inserted: Option<Result<InsertResult, injection::InjectionError>>,
     pasted: &'static str,
     copy_to_clipboard: impl FnOnce() -> Result<(), injection::InjectionError>,
@@ -2616,11 +1461,11 @@ fn selected_text_history_item<'a>(
 
 /// A translation paste that was sent but could not be confirmed, for voice
 /// and selected-text translation alike.
-const TRANSLATION_PASTE_UNVERIFIED: &str = "Translation pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard).";
+pub(crate) const TRANSLATION_PASTE_UNVERIFIED: &str = "Translation pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard).";
 
 /// A translation left on the clipboard because its target changed, for voice
 /// and selected-text translation alike.
-const TRANSLATION_TARGET_CHANGED: &str =
+pub(crate) const TRANSLATION_TARGET_CHANGED: &str =
     "The target changed; the translation remains on the clipboard.";
 
 /// Status kind and message for a selected-text translation outcome. A paste
@@ -2877,7 +1722,9 @@ async fn run_selected_text_translation(
 /// Where an answer goes when it was neither inserted nor shown in the answer
 /// panel. A copy that failed, or was refused because Restore clipboard could
 /// not save the user's clipboard, leaves the result only in this app's window.
-fn ask_fallback_insertion(copied: Result<(), injection::InjectionError>) -> &'static str {
+pub(crate) fn ask_fallback_insertion(
+    copied: Result<(), injection::InjectionError>,
+) -> &'static str {
     match copied {
         Ok(()) => "clipboard_only",
         Err(injection::InjectionError::ClipboardProtected) => "clipboard_protected",
@@ -2885,7 +1732,7 @@ fn ask_fallback_insertion(copied: Result<(), injection::InjectionError>) -> &'st
     }
 }
 
-fn ask_completion_message(insertion: &str) -> &'static str {
+pub(crate) fn ask_completion_message(insertion: &str) -> &'static str {
     match insertion {
         "paste_unverified" => {
             "Ask insertion could not be confirmed; the result remains on the clipboard."
@@ -2929,7 +1776,7 @@ mod ask_outcome_tests {
     }
 }
 
-fn require_ask_spoken_input(spoken: &str) -> Result<(), String> {
+pub(crate) fn require_ask_spoken_input(spoken: &str) -> Result<(), String> {
     if spoken.trim().is_empty() {
         Err("No Ask instruction was captured.".into())
     } else {
@@ -2937,7 +1784,7 @@ fn require_ask_spoken_input(spoken: &str) -> Result<(), String> {
     }
 }
 
-fn action_name(action: &ask::AskAction) -> &'static str {
+pub(crate) fn action_name(action: &ask::AskAction) -> &'static str {
     match action {
         ask::AskAction::Rewrite => "rewrite",
         ask::AskAction::Shorten => "shorten",
@@ -2951,7 +1798,7 @@ fn action_name(action: &ask::AskAction) -> &'static str {
         ask::AskAction::Search { .. } => "search",
     }
 }
-fn search_site_name(site: ask::SearchSite) -> &'static str {
+pub(crate) fn search_site_name(site: ask::SearchSite) -> &'static str {
     match site {
         ask::SearchSite::Google => "google",
         ask::SearchSite::YouTube => "youtube",
@@ -2961,7 +1808,7 @@ fn search_site_name(site: ask::SearchSite) -> &'static str {
 }
 
 #[cfg(target_os = "windows")]
-fn open_fixed_search(url: &str) -> Result<(), String> {
+pub(crate) fn open_fixed_search(url: &str) -> Result<(), String> {
     use windows::{
         core::{HSTRING, PCWSTR},
         Win32::{
@@ -3012,7 +1859,7 @@ fn persistence_warning(
     }
 }
 
-fn completion_persistence_warning(
+pub(crate) fn completion_persistence_warning(
     history_status: HistorySaveStatus,
     metric_failed: bool,
 ) -> Option<(&'static str, &'static str)> {
@@ -3091,7 +1938,7 @@ pub(crate) fn get_startup_hotkey_warning(services: State<'_, Services>) -> Optio
     )
 }
 
-fn emit_correction_preview(app: &AppHandle, text: &str, stage: &str) {
+pub(crate) fn emit_correction_preview(app: &AppHandle, text: &str, stage: &str) {
     let _ = app.emit(
         "correction-preview",
         serde_json::json!({ "text": text, "stage": stage }),
@@ -3257,7 +2104,9 @@ async fn cancel_pipeline_operation(
 
 /// The completion status when AI correction stopped at an output token
 /// limit: the local server's configurable limit or a cloud provider's budget.
-fn output_limit_inserted_message(error: &correction::CorrectionError) -> Option<&'static str> {
+pub(crate) fn output_limit_inserted_message(
+    error: &correction::CorrectionError,
+) -> Option<&'static str> {
     match error {
         correction::CorrectionError::OutputLimit => Some("AI correction stopped at the local output token limit; the original transcript was inserted. Increase the local output token limit."),
         correction::CorrectionError::ProviderOutputLimit => Some("AI correction stopped at the AI provider's output token limit; the original transcript was inserted. Lower the reasoning effort or choose a different model."),
@@ -3265,7 +2114,7 @@ fn output_limit_inserted_message(error: &correction::CorrectionError) -> Option<
     }
 }
 
-fn ai_command_error(
+pub(crate) fn ai_command_error(
     app: &AppHandle,
     error: &correction::CorrectionError,
     outcome: FailureOutcome,
@@ -3275,15 +2124,15 @@ fn ai_command_error(
     message
 }
 
-fn correction_failure_status(error: &correction::CorrectionError) -> String {
+pub(crate) fn correction_failure_status(error: &correction::CorrectionError) -> String {
     correction::failure_message(error, FailureOutcome::UsingTranscript)
 }
 
-fn edit_failure_message(error: &correction::CorrectionError) -> String {
+pub(crate) fn edit_failure_message(error: &correction::CorrectionError) -> String {
     correction::failure_message(error, FailureOutcome::UnchangedSelection)
 }
 /// Metric code for a failed correction; validator rejects stay countable.
-fn correction_failure_metric_code(error: &correction::CorrectionError) -> &'static str {
+pub(crate) fn correction_failure_metric_code(error: &correction::CorrectionError) -> &'static str {
     match error {
         correction::CorrectionError::ProtectedContentChanged => "protected_content_changed",
         _ => error.failure_code(),
@@ -6246,6 +5095,15 @@ struct ModelChangeGate {
     changing: Mutex<bool>,
 }
 
+pub(crate) fn begin_history_retry(
+    services: &Services,
+    mode: PipelineMode,
+) -> Result<(u64, tokio::sync::watch::Receiver<bool>), String> {
+    MODEL_CHANGE_GATE
+        .begin_pipeline(|| services.lifecycle.begin_non_recording(mode))
+        .map_err(str::to_string)
+}
+
 static MODEL_CHANGE_GATE: ModelChangeGate = ModelChangeGate::new();
 
 impl ModelChangeGate {
@@ -6384,331 +5242,11 @@ pub(crate) async fn retry_history_item(
     state: State<'_, AppState>,
     storage: State<'_, Storage>,
 ) -> Result<RecordingResult, String> {
-    let source = storage
-        .history_item(id)
-        .map_err(command_error)?
-        .ok_or_else(|| "history item not found".to_string())?;
-    let mode = history_pipeline_mode(&source.mode)?;
-    let (operation_id, cancel) = MODEL_CHANGE_GATE
-        .begin_pipeline(|| services.lifecycle.begin_non_recording(mode))
-        .map_err(str::to_string)?;
-    let _guard = PipelineGuard {
-        lifecycle: &services.lifecycle,
-        id: operation_id,
-    };
-    // Retry has no target window; show its overlay where the user started it,
-    // not on the last take's monitor.
-    recording_overlay::anchor_to_foreground();
-    let mut retry_cleanup = None;
-    let result = async {
-        // The overlay labels Processing by the last voice mode; without this
-        // a dictation Retry would show the previous Ask or Edit session's.
-        let _ = app.emit("voice-mode", retry_voice_mode(mode, &source));
-        state.set_operation(types::OperationKind::Retry, operation_id);
-        emit_stage(
-            &app,
-            &state,
-            types::AppStage::Retrying,
-            "Retrying the saved recording.",
-        );
-        let retry_path = storage
-            .copy_history_audio_for_retry(id)
-            .map_err(command_error)?;
-        retry_cleanup = Some(TempArtifact::new(retry_path.clone(), false));
-        if services.lifecycle.is_cancelled(operation_id) {
-            return Err("history retry was cancelled".into());
-        }
-        let started = Instant::now();
-        let settings = storage.get_settings().map_err(command_error)?;
-        // Retry uses the current ASR settings, so it loads the selected model
-        // first, as a new recording does; a backend or model change resets it.
-        let model_ready =
-            ensure_model_loaded_cancellable(&app, &services, &settings, Some(cancel.clone())).await;
-        if services.lifecycle.is_cancelled(operation_id) {
-            return Err("history retry was cancelled".into());
-        }
-        model_ready?;
-        emit_stage(
-            &app,
-            &state,
-            types::AppStage::Transcribing,
-            if settings.asr_backend == "openai-compatible" {
-                "Transcribing with the configured speech provider."
-            } else {
-                "Transcribing locally."
-            },
-        );
-        // History keeps only the captured category, so Retry routes to
-        // category-scoped and global dictionary entries and profiles.
-        let retry_context = retry_app_context(&source);
-        let prompt = storage
-            .dictionary_asr_prompt_for(retry_context.as_ref(), &settings.asr_backend)
-            .unwrap_or_default();
-        let transcript = services
-            .transcriber
-            .transcribe_with_locale(
-                &retry_path,
-                prompt.as_deref(),
-                settings.speech_locale.as_deref(),
-                cancel.clone(),
-            )
-            .await
-            .map_err(command_error)?;
-        if services.lifecycle.is_cancelled(operation_id) {
-            return Err("history retry was cancelled".into());
-        }
-        let mut output = transcript.text.clone();
-        let mut llm_provider = None;
-        let mut correction_failed = false;
-        if mode == PipelineMode::Translate {
-            let target = source
-                .target_language
-                .as_deref()
-                .ok_or("saved translation target is unavailable")?;
-            emit_stage(
-                &app,
-                &state,
-                types::AppStage::Translating,
-                "Translating speech to the selected language.",
-            );
-            let translation_started = Instant::now();
-            let result = correction::translate_transcript(
-                &settings,
-                &transcript.text,
-                target,
-                cancel.clone(),
-                |_| {},
-            )
-            .await;
-            match classify_ai_stage(result) {
-                AiStageResult::Corrected(translated) => {
-                    output = translated;
-                    llm_provider = Some(settings.correction_provider.as_str());
-                    let _ = storage.add_metric(
-                        "voice_translation",
-                        llm_provider,
-                        Some(translation_started.elapsed().as_millis() as i64),
-                        true,
-                        None,
-                    );
-                }
-                AiStageResult::Cancelled => return Err("history retry was cancelled".into()),
-                AiStageResult::Fallback(error) => {
-                    emit_ai_failure(
-                        &app,
-                        "voice_translation_failed",
-                        &error,
-                        FailureOutcome::UsingTranscript,
-                        &correction::failure_message(&error, FailureOutcome::UsingTranscript),
-                    );
-                    let _ = storage.add_metric(
-                        "voice_translation",
-                        Some(settings.correction_provider.as_str()),
-                        Some(translation_started.elapsed().as_millis() as i64),
-                        false,
-                        Some(error.failure_code()),
-                    );
-                }
-            }
-        } else if mode == PipelineMode::Edit {
-            let selected = source
-                .source_text
-                .as_deref()
-                .ok_or("saved edit source is unavailable")?;
-            emit_stage(
-                &app,
-                &state,
-                types::AppStage::Correcting,
-                "Applying the spoken edit instruction.",
-            );
-            output = correction::edit_selected_text(
-                &settings,
-                selected,
-                &transcript.text,
-                cancel.clone(),
-                |_| {},
-            )
-            .await
-            .map_err(|error| ai_command_error(&app, &error, FailureOutcome::NoAction))?;
-            llm_provider = Some(settings.correction_provider.as_str());
-        } else if mode == PipelineMode::Ask {
-            emit_stage(
-                &app,
-                &state,
-                types::AppStage::Planning,
-                "Choosing a safe Ask action.",
-            );
-            if source.action_kind.as_deref() == Some("search") {
-                let stored_site = stored_search_site(&source)?;
-                let plan = correction::generate_ask_plan(
-                    &settings,
-                    &transcript.text,
-                    &ask::planning_prompt(ask::AskContextKind::Caret),
-                    cancel.clone(),
-                )
-                .await
-                .map_err(|error| ai_command_error(&app, &error, FailureOutcome::NoAction))?;
-                output = ask::validate_fixed_search_retry_plan(
-                    &plan,
-                    &transcript.text,
-                    stored_site,
-                    &settings.translation_target_languages,
-                )
-                .map_err(|_| "Ask search retry plan was blocked".to_string())?;
-            } else {
-                let action = stored_ask_action(&source)?;
-                let input = ask::generation_input(source.source_text.as_deref(), &transcript.text);
-                output = correction::generate_ask_text(
-                    &settings,
-                    &input,
-                    &ask::generation_prompt_with_target(&action),
-                    cancel.clone(),
-                )
-                .await
-                .map_err(|error| ai_command_error(&app, &error, FailureOutcome::NoAction))?;
-            }
-            llm_provider = Some(settings.correction_provider.as_str());
-        } else if settings.text_correction_enabled {
-            emit_stage(
-                &app,
-                &state,
-                types::AppStage::Correcting,
-                "Correcting the transcript with the configured AI provider.",
-            );
-            let hints = storage
-                .dictionary_correction_terms(&transcript.text, retry_context.as_ref())
-                .unwrap_or_default();
-            let correction_started = Instant::now();
-            let result = correction::correct_transcript(
-                &settings,
-                &transcript.text,
-                &hints,
-                personalization::resolve_profile(&settings, retry_context.as_ref())
-                    .map(|profile| personalization::guidance(&profile))
-                    .as_deref(),
-                cancel.clone(),
-                |_| {},
-            )
-            .await;
-            match classify_ai_stage(result) {
-                AiStageResult::Corrected(corrected) => {
-                    output = corrected;
-                    llm_provider = Some(settings.correction_provider.as_str());
-                }
-                AiStageResult::Cancelled => return Err("history retry was cancelled".into()),
-                AiStageResult::Fallback(error) => {
-                    // Like a new recording, a failed correction keeps the new
-                    // transcript instead of failing the whole Retry.
-                    correction_failed = true;
-                    emit_ai_failure(
-                        &app,
-                        "text_correction_failed",
-                        &error,
-                        FailureOutcome::UsingTranscript,
-                        &correction_failure_status(&error),
-                    );
-                    let _ = storage.add_metric(
-                        "text_correction",
-                        Some(settings.correction_provider.as_str()),
-                        Some(correction_started.elapsed().as_millis() as i64),
-                        false,
-                        Some(correction_failure_metric_code(&error)),
-                    );
-                }
-            }
-        }
-        if services.lifecycle.is_cancelled(operation_id) {
-            return Err("history retry was cancelled".into());
-        }
-        let latency_ms = started.elapsed().as_millis() as i64;
-        let history_save_status = services
-            .lifecycle
-            .commit_side_effect(operation_id, || {
-                Ok::<HistorySaveStatus, String>(save_retry_result(
-                    &storage,
-                    &NewHistoryItem {
-                        transcript_text: &transcript.text,
-                        processed_text: (output != transcript.text).then_some(output.as_str()),
-                        source_text: source.source_text.as_deref(),
-                        instruction_text: if source.mode == "edit" || source.mode == "ask" {
-                            Some(transcript.text.as_str())
-                        } else {
-                            None
-                        },
-                        action_kind: source.action_kind.as_deref(),
-                        search_site: source.search_site.as_deref(),
-                        mode: if mode == PipelineMode::Dictate {
-                            retry_dictate_history_mode(llm_provider, correction_failed)
-                        } else {
-                            &source.mode
-                        },
-                        asr_provider: &transcript.model,
-                        llm_provider,
-                        target_language: source.target_language.as_deref(),
-                        app_category: source.app_category.as_deref(),
-                        duration_ms: source.duration_ms,
-                        latency_ms: Some(latency_ms),
-                        retry_of_id: Some(id),
-                        insertion_result: None,
-                        insertion_detail: None,
-                    },
-                    &retry_path,
-                    id,
-                ))
-            })
-            .map_err(str::to_string)?
-            .map_err(command_error)?;
-        // The committed Retry still owns the lifecycle. Publish its completion
-        // before releasing it, so a recording started afterwards cannot have
-        // its state overwritten by this completion.
-        recording_overlay::set_phase(&app, &AppPhase::Completed);
-        let snapshot = state.complete(
-            output.clone(),
-            "History retry completed without inserting text.".into(),
-        );
-        let _ = app.emit("app-state", snapshot);
-        services.lifecycle.finish(operation_id);
-        report_history_save_warning(&app, history_save_status);
-        Ok(RecordingResult {
-            text: output,
-            insertion: "history_only".into(),
-            duration_ms: source.duration_ms.unwrap_or_default() as u64,
-            latency_ms: latency_ms as u64,
-        })
-    }
-    .await;
-    if retry_cleanup
-        .as_mut()
-        .is_some_and(|artifact: &mut TempArtifact| artifact.cleanup().is_err())
-    {
-        emit_status(
-            &app,
-            "artifact_cleanup_failed",
-            "Temporary retry audio cleanup failed.",
-        );
-    }
-    if result.is_err() {
-        let message = if services.lifecycle.is_cancelled(operation_id) {
-            "History retry cancelled."
-        } else {
-            "History retry failed."
-        };
-        emit_state(
-            &app,
-            &state,
-            if services.lifecycle.is_cancelled(operation_id) {
-                AppPhase::Idle
-            } else {
-                AppPhase::Error
-            },
-            message,
-        );
-    }
-    result
+    crate::pipeline::retry::run(id, &app, &services, &state, &storage).await
 }
 
 /// The `voice-mode` event of a Retry: the mode of the History row it re-runs.
-fn retry_voice_mode(mode: PipelineMode, source: &HistoryItem) -> serde_json::Value {
+pub(crate) fn retry_voice_mode(mode: PipelineMode, source: &HistoryItem) -> serde_json::Value {
     serde_json::json!({
         "mode": voice_mode_event_name(mode),
         "targetLanguage": (mode == PipelineMode::Translate)
@@ -6717,7 +5255,7 @@ fn retry_voice_mode(mode: PipelineMode, source: &HistoryItem) -> serde_json::Val
     })
 }
 
-fn history_pipeline_mode(mode: &str) -> Result<PipelineMode, String> {
+pub(crate) fn history_pipeline_mode(mode: &str) -> Result<PipelineMode, String> {
     match mode {
         "translate" => Ok(PipelineMode::Translate),
         "edit" => Ok(PipelineMode::Edit),
@@ -6727,7 +5265,10 @@ fn history_pipeline_mode(mode: &str) -> Result<PipelineMode, String> {
     }
 }
 
-fn retry_dictate_history_mode(llm_provider: Option<&str>, correction_failed: bool) -> &'static str {
+pub(crate) fn retry_dictate_history_mode(
+    llm_provider: Option<&str>,
+    correction_failed: bool,
+) -> &'static str {
     if llm_provider.is_some() {
         "ai_corrected"
     } else if correction_failed {
@@ -6737,14 +5278,14 @@ fn retry_dictate_history_mode(llm_provider: Option<&str>, correction_failed: boo
     }
 }
 
-fn retry_app_context(item: &HistoryItem) -> Option<types::AppContext> {
+pub(crate) fn retry_app_context(item: &HistoryItem) -> Option<types::AppContext> {
     item.app_category.clone().map(|category| types::AppContext {
         app_key: None,
         category,
     })
 }
 
-fn stored_ask_action(item: &HistoryItem) -> Result<ask::AskAction, String> {
+pub(crate) fn stored_ask_action(item: &HistoryItem) -> Result<ask::AskAction, String> {
     Ok(match item.action_kind.as_deref() {
         Some("rewrite") => ask::AskAction::Rewrite,
         Some("shorten") => ask::AskAction::Shorten,
@@ -6764,7 +5305,7 @@ fn stored_ask_action(item: &HistoryItem) -> Result<ask::AskAction, String> {
     })
 }
 
-fn stored_search_site(item: &HistoryItem) -> Result<ask::SearchSite, String> {
+pub(crate) fn stored_search_site(item: &HistoryItem) -> Result<ask::SearchSite, String> {
     match item.search_site.as_deref() {
         Some("google") => Ok(ask::SearchSite::Google),
         Some("youtube") => Ok(ask::SearchSite::YouTube),

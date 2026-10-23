@@ -164,6 +164,7 @@ impl<'ast> Visit<'ast> for SourceMessages {
             || node.method == "transition"
             || node.method == "transition_stage"
             || node.method == "publish_notice"
+            || node.method == "stage"
         {
             if let Some(message) = node.args.iter().nth(1) {
                 self.expressions.push(message.clone());
@@ -252,6 +253,9 @@ fn production_status_and_state_literals_have_both_languages() {
     let mut values = BTreeSet::new();
     for path in files {
         let ast = syn::parse_file(&std::fs::read_to_string(path).unwrap()).unwrap();
+        if test_only(&ast.attrs) {
+            continue;
+        }
         // Constants are file-scoped: identical identifiers in separate modules
         // must never overwrite one another in the validator.
         let mut messages = SourceMessages::default();

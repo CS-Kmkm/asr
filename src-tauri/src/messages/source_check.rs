@@ -24,6 +24,7 @@ struct Index {
     file: String,
     functions: Vec<Function>,
     constants: BTreeMap<(String, String), Expr>,
+    imports: BTreeMap<(String, String), String>,
 }
 
 fn names(pattern: &Pat, result: &mut Vec<String>) {
@@ -112,7 +113,7 @@ impl<'ast> Visit<'ast> for Body<'_> {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         if matches!(
             node.method.to_string().as_str(),
-            "complete" | "transition" | "transition_stage" | "publish_notice"
+            "complete" | "transition" | "transition_stage" | "publish_notice" | "stage"
         ) {
             if let Some(expr) = node.args.iter().nth(1) {
                 self.0.sinks.push(expr.clone());
@@ -136,6 +137,32 @@ impl Index {
     }
 }
 impl<'ast> Visit<'ast> for Index {
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        fn collect(index: &mut Index, tree: &syn::UseTree, prefix: &[String]) {
+            match tree {
+                syn::UseTree::Path(path) => {
+                    let mut prefix = prefix.to_vec();
+                    prefix.push(path.ident.to_string());
+                    collect(index, &path.tree, &prefix);
+                }
+                syn::UseTree::Group(group) => {
+                    for tree in &group.items {
+                        collect(index, tree, prefix);
+                    }
+                }
+                syn::UseTree::Name(name) if prefix.first().is_some_and(|part| part == "crate") => {
+                    let file = format!("{}.rs", prefix[1..].join("/"));
+                    index
+                        .imports
+                        .insert((index.file.clone(), name.ident.to_string()), file);
+                }
+                _ => {}
+            }
+        }
+        if !test_only(&node.attrs) {
+            collect(self, &node.tree, &[]);
+        }
+    }
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
         if !test_only(&node.attrs) {
             visit::visit_item_mod(self, node);
@@ -173,6 +200,10 @@ impl Resolver<'_> {
         matches!(
             (context.file.as_str(), context.name.as_str(), value),
             ("lib.rs", "emit_state" | "emit_stage", "message")
+                | ("pipeline/stop.rs", "run", "message")
+                | ("pipeline/stop.rs", "stage", "message")
+                | ("pipeline/orchestration.rs", "run", "message")
+                | ("pipeline/ask.rs", "finish", "error")
                 | ("commands.rs", "processing_message", "default")
                 | ("commands.rs", "start_failure_message", "error")
                 | (
@@ -286,6 +317,14 @@ impl Resolver<'_> {
                     .index
                     .constants
                     .get(&(context.file.clone(), name.clone()))
+                    .or_else(|| {
+                        self.index
+                            .imports
+                            .get(&(context.file.clone(), name.clone()))
+                            .and_then(|file| {
+                                self.index.constants.get(&(file.clone(), name.clone()))
+                            })
+                    })
                     .or_else(|| {
                         module_file.as_ref().and_then(|file| {
                             self.index.constants.get(&(file.clone(), name.clone()))
@@ -459,6 +498,9 @@ fn ui_message_sources_do_not_silently_skip_unresolved_expressions() {
             .to_string_lossy()
             .replace('\\', "/");
         let ast = syn::parse_file(&std::fs::read_to_string(path).unwrap()).unwrap();
+        if test_only(&ast.attrs) {
+            continue;
+        }
         index.visit_file(&ast);
     }
     let mut resolver = Resolver {
@@ -495,5 +537,48 @@ fn ui_message_sources_do_not_silently_skip_unresolved_expressions() {
     assert!(
         missing.is_empty(),
         "Unregistered resolved UI text: {missing:#?}"
+    );
+}
+
+#[test]
+fn imported_message_constants_are_resolved_only_from_the_named_module() {
+    let mut index = Index::default();
+    for (file, source) in [
+        (
+            "commands.rs",
+            r#"const COPY: &str = "The intended message.";"#,
+        ),
+        (
+            "unrelated.rs",
+            r#"const COPY: &str = "An unrelated message.";"#,
+        ),
+        (
+            "pipeline/fixture.rs",
+            r#"use crate::commands::COPY; fn publish() { emit_status(app, "notice", COPY); }"#,
+        ),
+        (
+            "pipeline/unknown.rs",
+            r#"fn publish_unknown() { emit_status(app, "notice", COPY); }"#,
+        ),
+    ] {
+        index.file = file.into();
+        index.visit_file(&syn::parse_file(source).unwrap());
+    }
+    let mut resolver = Resolver {
+        index: &index,
+        active: BTreeSet::new(),
+        unresolved: BTreeSet::new(),
+        values: BTreeSet::new(),
+    };
+    for function in &index.functions {
+        for sink in &function.sinks {
+            resolver.resolve(function, sink);
+        }
+    }
+    assert!(resolver.values.contains("The intended message."));
+    assert!(!resolver.values.contains("An unrelated message."));
+    assert_eq!(
+        resolver.unresolved,
+        BTreeSet::from(["pipeline/unknown.rs::publish_unknown: COPY".into()])
     );
 }
