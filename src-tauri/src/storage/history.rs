@@ -1,0 +1,144 @@
+//! History queries and transactional deletion. Column order has one owner.
+use super::{
+    checkpoint_deleted_history, purge_dictionary_candidates_before, purge_metrics_before,
+    queue_audio_deletion, Storage, StorageError,
+};
+use crate::types::{HistoryFilter, HistoryItem, HistoryRetention};
+use chrono::Utc;
+use rusqlite::{params, OptionalExtension, Row};
+
+const HISTORY_SELECT: &str =
+    "SELECT id, transcript_text, processed_text, mode, asr_provider, llm_provider,
+    target_language, app_category, duration_ms, latency_ms, created_at,
+    source_text, instruction_text, action_kind, search_site,
+    audio_filename IS NOT NULL, retry_of_id, insertion_result, insertion_detail, expires_at
+    FROM dictation_history";
+
+fn row_to_history_item(row: &Row<'_>) -> rusqlite::Result<HistoryItem> {
+    Ok(HistoryItem {
+        id: row.get(0)?,
+        transcript_text: row.get(1)?,
+        processed_text: row.get(2)?,
+        mode: row.get(3)?,
+        asr_provider: row.get(4)?,
+        llm_provider: row.get(5)?,
+        target_language: row.get(6)?,
+        app_category: row.get(7)?,
+        duration_ms: row.get(8)?,
+        latency_ms: row.get(9)?,
+        created_at: row.get(10)?,
+        source_text: row.get(11)?,
+        instruction_text: row.get(12)?,
+        action_kind: row.get(13)?,
+        search_site: row.get(14)?,
+        has_audio: row.get(15)?,
+        retry_of_id: row.get(16)?,
+        insertion_result: row.get(17)?,
+        insertion_detail: row.get(18)?,
+        expires_at: row.get(19)?,
+    })
+}
+
+impl Storage {
+    pub fn list_history(
+        &self,
+        filter: HistoryFilter,
+        limit: u32,
+    ) -> Result<Vec<HistoryItem>, StorageError> {
+        let settings = self.get_settings()?;
+        self.apply_history_policy(&settings)?;
+        // With History off, only failed takes kept for Retry remain listed.
+        let history_off = settings.history_retention == HistoryRetention::Never;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(&format!(
+            "{HISTORY_SELECT}
+             WHERE (NOT ?3 OR expires_at IS NOT NULL) AND (?1 = 'all' OR
+               (?1 = 'dictate' AND mode IN ('faithful', 'ai_corrected', 'faithful_fallback')) OR
+               (?1 = 'translate' AND mode IN ('translate', 'selected_translate')) OR
+               (?1 = 'edit' AND mode = 'edit') OR
+               (?1 = 'ask' AND mode = 'ask'))
+             ORDER BY created_at DESC LIMIT ?2"
+        ))?;
+        let filter = match filter {
+            HistoryFilter::All => "all",
+            HistoryFilter::Dictate => "dictate",
+            HistoryFilter::Translate => "translate",
+            HistoryFilter::Edit => "edit",
+            HistoryFilter::Ask => "ask",
+        };
+        let rows = statement.query_map(
+            params![filter, limit.min(500), history_off],
+            row_to_history_item,
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn history_text(&self, id: i64) -> Result<Option<String>, StorageError> {
+        self.connection()?.query_row(
+            "SELECT COALESCE(processed_text, transcript_text) FROM dictation_history WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        ).optional().map_err(Into::into)
+    }
+
+    pub fn history_item(&self, id: i64) -> Result<Option<HistoryItem>, StorageError> {
+        self.connection()?
+            .query_row(
+                &format!("{HISTORY_SELECT} WHERE id = ?1"),
+                [id],
+                row_to_history_item,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn delete_history(&self, id: i64) -> Result<bool, StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let filename: Option<String> = transaction
+            .query_row(
+                "SELECT audio_filename FROM dictation_history WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(filename) = &filename {
+            queue_audio_deletion(&transaction, &filename, &Utc::now().to_rfc3339())?;
+        }
+        let changed =
+            transaction.execute("DELETE FROM dictation_history WHERE id = ?1", [id])? != 0;
+        transaction.commit()?;
+        checkpoint_deleted_history(&connection);
+        drop(connection);
+        let _ = self.retry_pending_audio_deletions();
+        Ok(changed)
+    }
+
+    pub fn delete_all_history(&self) -> Result<u64, StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let filenames = {
+            let mut statement = transaction.prepare(
+                "SELECT audio_filename FROM dictation_history WHERE audio_filename IS NOT NULL",
+            )?;
+            let values = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            values
+        };
+        for filename in &filenames {
+            queue_audio_deletion(&transaction, &filename, &Utc::now().to_rfc3339())?;
+        }
+        let changed = transaction.execute("DELETE FROM dictation_history", [])? as u64;
+        // Candidate spans and decisions are transcript text, so removing all
+        // History removes them too. Confirmed dictionary entries are kept.
+        purge_dictionary_candidates_before(&transaction, None)?;
+        purge_metrics_before(&transaction, None)?;
+        transaction.commit()?;
+        checkpoint_deleted_history(&connection);
+        drop(connection);
+        let _ = self.retry_pending_audio_deletions();
+        Ok(changed)
+    }
+}

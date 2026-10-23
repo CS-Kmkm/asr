@@ -1,3 +1,11 @@
+mod history;
+mod history_audio;
+mod schema;
+use history_audio::queue_audio_deletion;
+use schema::{run_migrations, MIGRATIONS};
+#[cfg(test)]
+use schema::{stored_min_reader_version, Migration, MIN_READER_VERSION_KEY};
+
 use std::{
     collections::HashSet,
     fs, io,
@@ -16,9 +24,11 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use thiserror::Error;
 
+#[cfg(test)]
+use crate::types::HistoryFilter;
 use crate::types::{
-    DictionaryCandidate, DictionaryEntry, HistoryFilter, HistoryItem, HistoryRetention,
-    NewDictionaryEntry, NewHistoryItem, Settings, SettingsSnapshot, VoiceShortcuts,
+    DictionaryCandidate, DictionaryEntry, HistoryRetention, NewDictionaryEntry, NewHistoryItem,
+    Settings, SettingsSnapshot, VoiceShortcuts,
 };
 
 const MAX_HISTORY_AUDIO_BYTES: u64 = 50 * 1024 * 1024;
@@ -28,6 +38,21 @@ const MAX_DICTIONARY_TEXT_CHARS: usize = 200;
 const MAX_CANDIDATE_CHARS: usize = 80;
 const MAX_CSV_BYTES: usize = 1024 * 1024;
 const MAX_CSV_ROWS: usize = 1000;
+
+/// Remove old WAL frames after privacy deletions; secure_delete scrubs the
+/// database pages, but an earlier WAL frame can still contain the old text.
+fn checkpoint_deleted_history(connection: &Connection) {
+    // This runs after commit: a busy reader or I/O failure must not report a
+    // failed settings save, or skip cleanup of retained audio. A later policy
+    // pass retries the checkpoint. No user content belongs in this diagnostic.
+    match connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        row.get::<_, i64>(0)
+    }) {
+        Ok(0) => {}
+        Ok(_) => eprintln!("History WAL checkpoint deferred: database reader is active."),
+        Err(_) => eprintln!("History WAL checkpoint deferred: database operation failed."),
+    }
+}
 
 fn scope_matches(scope: Option<&str>, context: Option<&crate::types::AppContext>) -> bool {
     let Some(scope) = scope.filter(|value| !value.is_empty() && *value != "global") else {
@@ -238,10 +263,7 @@ fn purge_history(
     let removed = expired_history_rows(connection, settings, now)?;
     for (_, filename) in &removed {
         if let Some(filename) = filename {
-            connection.execute(
-                "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
-                params![filename, now.to_rfc3339()],
-            )?;
+            queue_audio_deletion(&connection, &filename, &now.to_rfc3339())?;
         }
     }
     for (id, _) in &removed {
@@ -312,300 +334,6 @@ fn insert_history_row(
             item.insertion_detail,
             expires_at,
         ],
-    )?;
-    Ok(())
-}
-
-/// One schema step. It runs inside the transaction that also advances
-/// `PRAGMA user_version`, so a failed step leaves the previous version.
-struct Migration {
-    apply: fn(&Connection) -> Result<(), StorageError>,
-    /// Lowest schema version a build must support to keep using the
-    /// database after this step. An additive step (new tables or nullable
-    /// columns that older code ignores) keeps 1, so older builds still open
-    /// it; only a step that breaks older readers raises it.
-    min_reader_version: i64,
-}
-
-/// Ordered schema steps; step `n` (0-based) upgrades `user_version` `n` to
-/// `n + 1`. Append new steps; never edit or reorder released ones.
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        apply: migrate_v1_baseline,
-        min_reader_version: 1,
-    },
-    Migration {
-        apply: migrate_v2_settings_backups,
-        min_reader_version: 1,
-    },
-];
-
-/// Key in `schema_meta` holding the highest `min_reader_version` of every
-/// applied step.
-const MIN_READER_VERSION_KEY: &str = "min_reader_version";
-
-/// The compatibility marker a database declares; 1 when it has none.
-fn stored_min_reader_version(connection: &Connection) -> Result<i64, StorageError> {
-    let has_meta: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_meta {
-        return Ok(1);
-    }
-    Ok(connection
-        .query_row(
-            "SELECT value FROM schema_meta WHERE key = ?1",
-            [MIN_READER_VERSION_KEY],
-            |row| row.get(0),
-        )
-        .optional()?
-        .unwrap_or(1))
-}
-
-/// Applies every step above the stored `user_version`, one transaction per
-/// step, and records the steps' compatibility marker with it.
-///
-/// A database from a newer build (a higher `user_version`) is opened as is
-/// when its marker says this build can still use it: no unknown step runs
-/// and `user_version` is never lowered. It is refused only when the marker
-/// exceeds this build's version.
-fn run_migrations(
-    connection: &mut Connection,
-    migrations: &[Migration],
-) -> Result<(), StorageError> {
-    let supported = i64::try_from(migrations.len()).unwrap_or(i64::MAX);
-    loop {
-        // IMMEDIATE takes the write lock before the version is read, so two
-        // processes cannot both apply the same step.
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let version: i64 =
-            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version == supported {
-            return Ok(());
-        }
-        let Some(step) = usize::try_from(version)
-            .ok()
-            .and_then(|index| migrations.get(index))
-        else {
-            let min_reader_version = stored_min_reader_version(&transaction)?;
-            if version < 0 || min_reader_version > supported {
-                return Err(StorageError::IncompatibleSchema {
-                    version,
-                    min_reader_version,
-                    supported,
-                });
-            }
-            eprintln!(
-                "Database schema version {version} is newer than this build's {supported}; opening it because it remains compatible with version {min_reader_version}."
-            );
-            return Ok(());
-        };
-        (step.apply)(&transaction)?;
-        transaction.execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_meta (
-               key TEXT PRIMARY KEY NOT NULL,
-               value INTEGER NOT NULL
-             );",
-        )?;
-        let min_reader_version =
-            stored_min_reader_version(&transaction)?.max(step.min_reader_version);
-        transaction.execute(
-            "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![MIN_READER_VERSION_KEY, min_reader_version],
-        )?;
-        transaction.pragma_update(None, "user_version", version + 1)?;
-        transaction.commit()?;
-    }
-}
-
-/// Version 1: the schema as it stood before versioning. Databases from
-/// earlier builds have `user_version` 0 and any earlier additive shape, so
-/// every step probes and is idempotent.
-fn migrate_v1_baseline(connection: &Connection) -> Result<(), StorageError> {
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS settings (
-           key TEXT PRIMARY KEY NOT NULL,
-           value TEXT NOT NULL,
-           updated_at TEXT NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS dictionary_entries (
-           id INTEGER PRIMARY KEY AUTOINCREMENT,
-           reading TEXT NOT NULL,
-           surface TEXT NOT NULL,
-           category TEXT,
-           aliases TEXT NOT NULL DEFAULT '[]',
-           priority INTEGER NOT NULL DEFAULT 0,
-           app_scope TEXT,
-           source TEXT NOT NULL DEFAULT 'manual',
-           created_at TEXT NOT NULL,
-           updated_at TEXT NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS dictionary_candidates (
-           id INTEGER PRIMARY KEY AUTOINCREMENT,
-           original_span TEXT NOT NULL,
-           preferred_span TEXT NOT NULL,
-           confidence REAL NOT NULL,
-           history_id INTEGER,
-           created_at TEXT NOT NULL,
-           updated_at TEXT NOT NULL,
-           FOREIGN KEY(history_id) REFERENCES dictation_history(id) ON DELETE SET NULL
-         );
-         CREATE INDEX IF NOT EXISTS idx_dictionary_candidates_created_at ON dictionary_candidates(created_at DESC);
-         CREATE TABLE IF NOT EXISTS dictionary_candidate_decisions (
-           original_span TEXT NOT NULL,
-           preferred_span TEXT NOT NULL,
-           created_at TEXT NOT NULL,
-           PRIMARY KEY(original_span, preferred_span)
-         );
-         CREATE TABLE IF NOT EXISTS dictation_history (
-           id INTEGER PRIMARY KEY AUTOINCREMENT,
-           transcript_text TEXT NOT NULL,
-           processed_text TEXT,
-           source_text TEXT,
-           instruction_text TEXT,
-           action_kind TEXT,
-           search_site TEXT,
-           mode TEXT NOT NULL,
-           asr_provider TEXT NOT NULL,
-           llm_provider TEXT,
-           target_language TEXT,
-           app_category TEXT,
-           duration_ms INTEGER,
-           latency_ms INTEGER,
-           created_at TEXT NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS idx_history_created_at ON dictation_history(created_at DESC);
-         CREATE TABLE IF NOT EXISTS pending_audio_deletions (
-           filename TEXT PRIMARY KEY NOT NULL,
-           created_at TEXT NOT NULL
-         );
-         CREATE TABLE IF NOT EXISTS metrics (
-           id INTEGER PRIMARY KEY AUTOINCREMENT,
-           event_type TEXT NOT NULL,
-           provider TEXT,
-           duration_ms INTEGER,
-           success INTEGER NOT NULL,
-           error_code TEXT,
-           created_at TEXT NOT NULL
-         );",
-    )?;
-    let has_target_language: bool = connection.query_row(
-        "SELECT EXISTS(
-           SELECT 1 FROM pragma_table_info('dictation_history')
-           WHERE name = 'target_language'
-         )",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_target_language {
-        connection.execute(
-            "ALTER TABLE dictation_history ADD COLUMN target_language TEXT",
-            [],
-        )?;
-    }
-    for column in [
-        "source_text",
-        "instruction_text",
-        "action_kind",
-        "search_site",
-        "insertion_result",
-        "insertion_detail",
-    ] {
-        let exists: bool = connection.query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM pragma_table_info('dictation_history')
-               WHERE name = ?1
-             )",
-            [column],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            connection.execute(
-                &format!("ALTER TABLE dictation_history ADD COLUMN {column} TEXT"),
-                [],
-            )?;
-        }
-    }
-    for (column, definition) in [
-        ("audio_filename", "TEXT"),
-        ("expires_at", "TEXT"),
-        (
-            "retry_of_id",
-            "INTEGER REFERENCES dictation_history(id) ON DELETE SET NULL",
-        ),
-    ] {
-        let exists: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('dictation_history') WHERE name = ?1)",
-            [column],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            connection.execute(
-                &format!("ALTER TABLE dictation_history ADD COLUMN {column} {definition}"),
-                [],
-            )?;
-        }
-    }
-    // A legacy/corrupt database may have shared a filename before this
-    // ownership invariant existed. Preserve the oldest association and
-    // clear later duplicates so the new partial unique index can migrate.
-    connection.execute(
-        "UPDATE dictation_history SET audio_filename = NULL
-         WHERE audio_filename IS NOT NULL AND id NOT IN (
-           SELECT MIN(id) FROM dictation_history
-           WHERE audio_filename IS NOT NULL GROUP BY audio_filename
-         )",
-        [],
-    )?;
-    connection.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_history_audio_filename
-         ON dictation_history(audio_filename) WHERE audio_filename IS NOT NULL",
-        [],
-    )?;
-    let columns = {
-        let mut statement = connection.prepare("PRAGMA table_info(dictionary_entries)")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
-        rows.collect::<Result<Vec<_>, _>>()?
-    };
-    let has_source = columns.iter().any(|column| column == "source");
-    if !has_source {
-        connection.execute(
-            "ALTER TABLE dictionary_entries ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
-            [],
-        )?;
-    }
-    connection.execute("UPDATE dictionary_entries SET source = 'manual' WHERE source IS NULL OR source NOT IN ('manual', 'auto')", [])?;
-    let decision_columns = {
-        let mut statement =
-            connection.prepare("PRAGMA table_info(dictionary_candidate_decisions)")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
-        rows.collect::<Result<Vec<_>, _>>()?
-    };
-    if !decision_columns.iter().any(|column| column == "created_at") {
-        // An unreleased development database may have the old table. Its
-        // undated private spans cannot be retained under a time policy.
-        connection.execute(
-            "ALTER TABLE dictionary_candidate_decisions ADD COLUMN created_at TEXT",
-            [],
-        )?;
-    }
-    Ok(())
-}
-
-/// Version 2: raw settings rows kept before a repair rewrites them, so a
-/// value this build could not read is never lost.
-fn migrate_v2_settings_backups(connection: &Connection) -> Result<(), StorageError> {
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS settings_backups (
-           id INTEGER PRIMARY KEY AUTOINCREMENT,
-           key TEXT NOT NULL,
-           value TEXT NOT NULL,
-           reason TEXT NOT NULL,
-           created_at TEXT NOT NULL
-         );",
     )?;
     Ok(())
 }
@@ -1078,9 +806,10 @@ impl Drop for StagedHistoryAudio<'_> {
                     // or taking another long-lived lock during unwinding.
                     if self.storage.audio_path(&self.filename).is_ok() {
                         if let Ok(connection) = self.storage.connection() {
-                            let _ = connection.execute(
-                                "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
-                                params![self.filename, Utc::now().to_rfc3339()],
+                            let _ = queue_audio_deletion(
+                                &connection,
+                                &self.filename,
+                                &Utc::now().to_rfc3339(),
                             );
                         }
                     }
@@ -1183,7 +912,8 @@ impl Storage {
         // before the versioned steps.
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA foreign_keys = ON;",
+             PRAGMA foreign_keys = ON;
+             PRAGMA secure_delete = ON;",
         )?;
         run_migrations(&mut connection, MIGRATIONS)
     }
@@ -1366,6 +1096,7 @@ impl Storage {
         purge_history(&transaction, settings, now)?;
         transaction.commit()?;
         let revision = self.advance_settings_revision(&connection);
+        checkpoint_deleted_history(&connection);
         drop(connection);
         let _ = self.retry_pending_audio_deletions();
         Ok(revision)
@@ -1387,6 +1118,7 @@ impl Storage {
         let transaction = connection.transaction()?;
         purge_history(&transaction, settings, now)?;
         transaction.commit()?;
+        checkpoint_deleted_history(&connection);
         drop(connection);
         let _ = self.retry_pending_audio_deletions();
         Ok(())
@@ -1513,10 +1245,7 @@ impl Storage {
             )?;
         } else {
             if let Some(filename) = &filename {
-                transaction.execute(
-                    "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
-                    params![filename, Utc::now().to_rfc3339()],
-                )?;
+                queue_audio_deletion(&transaction, &filename, &Utc::now().to_rfc3339())?;
             }
             transaction.execute("DELETE FROM dictation_history WHERE id = ?1", [id])?;
         }
@@ -1598,165 +1327,6 @@ impl Storage {
             true,
             audio_stage_failed && !current_settings.delete_audio_after_processing,
         ))
-    }
-
-    pub fn list_history(
-        &self,
-        filter: HistoryFilter,
-        limit: u32,
-    ) -> Result<Vec<HistoryItem>, StorageError> {
-        let settings = self.get_settings()?;
-        self.apply_history_policy(&settings)?;
-        // With History off, only failed takes kept for Retry remain listed.
-        let history_off = settings.history_retention == HistoryRetention::Never;
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT id, transcript_text, processed_text, mode, asr_provider, llm_provider,
-                    target_language, app_category, duration_ms, latency_ms, created_at,
-                    source_text, instruction_text, action_kind, search_site,
-                    audio_filename IS NOT NULL, retry_of_id, insertion_result, insertion_detail,
-                    expires_at
-             FROM dictation_history
-             WHERE (NOT ?3 OR expires_at IS NOT NULL) AND (?1 = 'all' OR
-               (?1 = 'dictate' AND mode IN ('faithful', 'ai_corrected', 'faithful_fallback')) OR
-               (?1 = 'translate' AND mode IN ('translate', 'selected_translate')) OR
-               (?1 = 'edit' AND mode = 'edit') OR
-               (?1 = 'ask' AND mode = 'ask'))
-             ORDER BY created_at DESC LIMIT ?2",
-        )?;
-        let filter = match filter {
-            HistoryFilter::All => "all",
-            HistoryFilter::Dictate => "dictate",
-            HistoryFilter::Translate => "translate",
-            HistoryFilter::Edit => "edit",
-            HistoryFilter::Ask => "ask",
-        };
-        let rows = statement.query_map(params![filter, limit.min(500), history_off], |row| {
-            Ok(HistoryItem {
-                id: row.get(0)?,
-                transcript_text: row.get(1)?,
-                processed_text: row.get(2)?,
-                source_text: row.get(11)?,
-                instruction_text: row.get(12)?,
-                action_kind: row.get(13)?,
-                search_site: row.get(14)?,
-                mode: row.get(3)?,
-                asr_provider: row.get(4)?,
-                llm_provider: row.get(5)?,
-                target_language: row.get(6)?,
-                app_category: row.get(7)?,
-                duration_ms: row.get(8)?,
-                latency_ms: row.get(9)?,
-                created_at: row.get(10)?,
-                has_audio: row.get(15)?,
-                retry_of_id: row.get(16)?,
-                insertion_result: row.get(17)?,
-                insertion_detail: row.get(18)?,
-                expires_at: row.get(19)?,
-            })
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
-
-    pub fn history_text(&self, id: i64) -> Result<Option<String>, StorageError> {
-        self.connection()?.query_row(
-            "SELECT COALESCE(processed_text, transcript_text) FROM dictation_history WHERE id = ?1",
-            [id],
-            |row| row.get(0),
-        ).optional().map_err(Into::into)
-    }
-
-    pub fn history_item(&self, id: i64) -> Result<Option<HistoryItem>, StorageError> {
-        self.connection()?
-            .query_row(
-                "SELECT id, transcript_text, processed_text, mode, asr_provider, llm_provider,
-                    target_language, app_category, duration_ms, latency_ms, created_at,
-                    source_text, instruction_text, action_kind, search_site,
-                    audio_filename IS NOT NULL, retry_of_id, insertion_result, insertion_detail,
-                    expires_at
-             FROM dictation_history WHERE id = ?1",
-                [id],
-                |row| {
-                    Ok(HistoryItem {
-                        id: row.get(0)?,
-                        transcript_text: row.get(1)?,
-                        processed_text: row.get(2)?,
-                        mode: row.get(3)?,
-                        asr_provider: row.get(4)?,
-                        llm_provider: row.get(5)?,
-                        target_language: row.get(6)?,
-                        app_category: row.get(7)?,
-                        duration_ms: row.get(8)?,
-                        latency_ms: row.get(9)?,
-                        created_at: row.get(10)?,
-                        source_text: row.get(11)?,
-                        instruction_text: row.get(12)?,
-                        action_kind: row.get(13)?,
-                        search_site: row.get(14)?,
-                        has_audio: row.get(15)?,
-                        retry_of_id: row.get(16)?,
-                        insertion_result: row.get(17)?,
-                        insertion_detail: row.get(18)?,
-                        expires_at: row.get(19)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
-    pub fn delete_history(&self, id: i64) -> Result<bool, StorageError> {
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        let filename: Option<String> = transaction
-            .query_row(
-                "SELECT audio_filename FROM dictation_history WHERE id = ?1",
-                [id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-        if let Some(filename) = &filename {
-            transaction.execute(
-                "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
-                params![filename, Utc::now().to_rfc3339()],
-            )?;
-        }
-        let changed =
-            transaction.execute("DELETE FROM dictation_history WHERE id = ?1", [id])? != 0;
-        transaction.commit()?;
-        drop(connection);
-        let _ = self.retry_pending_audio_deletions();
-        Ok(changed)
-    }
-
-    pub fn delete_all_history(&self) -> Result<u64, StorageError> {
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        let filenames = {
-            let mut statement = transaction.prepare(
-                "SELECT audio_filename FROM dictation_history WHERE audio_filename IS NOT NULL",
-            )?;
-            let values = statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            values
-        };
-        for filename in &filenames {
-            transaction.execute(
-                "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
-                params![filename, Utc::now().to_rfc3339()],
-            )?;
-        }
-        let changed = transaction.execute("DELETE FROM dictation_history", [])? as u64;
-        // Candidate spans and decisions are transcript text, so removing all
-        // History removes them too. Confirmed dictionary entries are kept.
-        purge_dictionary_candidates_before(&transaction, None)?;
-        purge_metrics_before(&transaction, None)?;
-        transaction.commit()?;
-        drop(connection);
-        let _ = self.retry_pending_audio_deletions();
-        Ok(changed)
     }
 
     /// The retained WAV recording of History row `id`, or `None` when the row
@@ -1898,10 +1468,7 @@ impl Storage {
                 )?;
             }
             Err(_) => {
-                self.connection()?.execute(
-                "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
-                params![filename, Utc::now().to_rfc3339()],
-            )?;
+                queue_audio_deletion(&*self.connection()?, &filename, &Utc::now().to_rfc3339())?;
             }
         }
         Ok(())
@@ -1968,9 +1535,10 @@ impl Storage {
                 // so a malformed orphan cannot turn startup into a path-validation
                 // failure or escape the owned directory.
                 if fs::remove_file(entry.path()).is_err() && self.audio_path(&filename).is_ok() {
-                    let _ = self.connection()?.execute(
-                        "INSERT OR IGNORE INTO pending_audio_deletions(filename, created_at) VALUES (?1, ?2)",
-                        params![filename, Utc::now().to_rfc3339()],
+                    let _ = queue_audio_deletion(
+                        &*self.connection()?,
+                        &filename,
+                        &Utc::now().to_rfc3339(),
                     );
                 }
             } else if filename.ends_with(".stage") {
@@ -2867,6 +2435,43 @@ mod tests {
             retry_of_id: None,
             insertion_result: None,
             insertion_detail: None,
+        }
+    }
+
+    #[test]
+    fn privacy_deletions_remove_text_from_database_and_wal_bytes() {
+        for delete_all in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("privacy.sqlite3");
+            let storage = Storage::open(&path).unwrap();
+            let sentinel = "privacy-sentinel-transcript-8f4f347a";
+            let mut row = item();
+            row.transcript_text = sentinel;
+            row.processed_text = Some(sentinel);
+            storage.add_history(&row).unwrap();
+            let files = [path.clone(), directory.path().join("privacy.sqlite3-wal")];
+            let contains = |bytes: &[u8]| {
+                bytes
+                    .windows(sentinel.len())
+                    .any(|part| part == sentinel.as_bytes())
+            };
+            assert!(files
+                .iter()
+                .any(|file| fs::read(file).is_ok_and(|bytes| contains(&bytes))));
+            if delete_all {
+                storage.delete_all_history().unwrap();
+            } else {
+                let settings = Settings {
+                    history_retention: HistoryRetention::Never,
+                    ..Settings::default()
+                };
+                storage
+                    .update_settings_and_apply_history_policy(&settings)
+                    .unwrap();
+            }
+            for file in files {
+                assert!(!fs::read(file).is_ok_and(|bytes| contains(&bytes)));
+            }
         }
     }
 
