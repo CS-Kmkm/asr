@@ -263,7 +263,7 @@ fn purge_history(
     let removed = expired_history_rows(connection, settings, now)?;
     for (_, filename) in &removed {
         if let Some(filename) = filename {
-            queue_audio_deletion(&connection, &filename, &now.to_rfc3339())?;
+            queue_audio_deletion(connection, filename, &now.to_rfc3339())?;
         }
     }
     for (id, _) in &removed {
@@ -1245,7 +1245,7 @@ impl Storage {
             )?;
         } else {
             if let Some(filename) = &filename {
-                queue_audio_deletion(&transaction, &filename, &Utc::now().to_rfc3339())?;
+                queue_audio_deletion(&transaction, filename, &Utc::now().to_rfc3339())?;
             }
             transaction.execute("DELETE FROM dictation_history WHERE id = ?1", [id])?;
         }
@@ -1468,7 +1468,7 @@ impl Storage {
                 )?;
             }
             Err(_) => {
-                queue_audio_deletion(&*self.connection()?, &filename, &Utc::now().to_rfc3339())?;
+                queue_audio_deletion(&*self.connection()?, filename, &Utc::now().to_rfc3339())?;
             }
         }
         Ok(())
@@ -4145,8 +4145,10 @@ mod tests {
     #[test]
     fn asr_backend_round_trips() {
         let storage = Storage::in_memory().unwrap();
-        let mut settings = Settings::default();
-        settings.asr_backend = "faster-whisper".into();
+        let settings = Settings {
+            asr_backend: "faster-whisper".into(),
+            ..Settings::default()
+        };
         storage.update_settings(&settings).unwrap();
         assert_eq!(
             storage.get_settings().unwrap().asr_backend,
@@ -4157,8 +4159,10 @@ mod tests {
     #[test]
     fn history_disabled_never_stores_transcript() {
         let storage = Storage::in_memory().unwrap();
-        let mut settings = Settings::default();
-        settings.history_retention = HistoryRetention::Never;
+        let settings = Settings {
+            history_retention: HistoryRetention::Never,
+            ..Settings::default()
+        };
         storage.update_settings(&settings).unwrap();
 
         let mut private_edit = item();

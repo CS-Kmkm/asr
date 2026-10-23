@@ -192,7 +192,8 @@ mod tests {
             surface: "ACME; Labs<=v2|Beta".into(),
             readings: vec!["old|project<=first; value".into()],
         };
-        let context = build_correction_context(&Settings::default(), &[term.clone()], None);
+        let context =
+            build_correction_context(&Settings::default(), std::slice::from_ref(&term), None);
         assert_eq!(context.terms, [term]);
         let terms = (0..20)
             .map(|index| CorrectionTerm {

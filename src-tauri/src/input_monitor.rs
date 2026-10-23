@@ -250,7 +250,7 @@ impl InputMonitor {
                 closed,
             });
             drop(slot);
-            return self.wait_until_ready();
+            self.wait_until_ready()
         }
         #[cfg(any(not(target_os = "windows"), test))]
         self.available.load(Ordering::Acquire)

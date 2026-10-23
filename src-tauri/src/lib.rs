@@ -26,6 +26,9 @@ mod storage;
 mod types;
 mod worker_log;
 
+#[cfg(not(debug_assertions))]
+use tauri_plugin_autostart::ManagerExt;
+
 use std::{
     ffi::OsString,
     fs, io,

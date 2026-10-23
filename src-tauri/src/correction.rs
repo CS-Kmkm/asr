@@ -3083,7 +3083,8 @@ mod tests {
             ..Settings::default()
         };
         let hint = "GPT-4<=GPT four".to_owned();
-        let instruction = build_correction_instruction(&settings, &[hint.clone()], None);
+        let instruction =
+            build_correction_instruction(&settings, std::slice::from_ref(&hint), None);
         assert!(instruction
             .lines()
             .any(|line| line == "Terms: GPT-4<=GPT four"));
@@ -3092,7 +3093,7 @@ mod tests {
             &settings,
             "GPT fourを使う",
             "GPT-4を使う",
-            &[hint.clone()],
+            std::slice::from_ref(&hint),
         )
         .is_ok());
         assert!(validate_correction_output_with_hints(

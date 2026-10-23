@@ -1,4 +1,6 @@
-use crate::types::{AppContext, ScopedStyleProfile, Settings, StyleProfile};
+#[cfg(test)]
+use crate::types::ScopedStyleProfile;
+use crate::types::{AppContext, Settings, StyleProfile};
 
 pub(crate) const MAX_GUIDANCE_CHARS: usize = 300;
 pub(crate) const MAX_SCOPE_CHARS: usize = 80;
@@ -252,25 +254,27 @@ mod tests {
 
     #[test]
     fn settings_profile_validation_rejects_duplicate_scopes() {
-        let mut settings = Settings::default();
-        settings.scoped_style_profiles = vec![
-            ScopedStyleProfile {
-                scope: "app:code".into(),
-                profile: StyleProfile {
-                    formality: "formal".into(),
-                    detail: "concise".into(),
-                    guidance: None,
+        let settings = Settings {
+            scoped_style_profiles: vec![
+                ScopedStyleProfile {
+                    scope: "app:code".into(),
+                    profile: StyleProfile {
+                        formality: "formal".into(),
+                        detail: "concise".into(),
+                        guidance: None,
+                    },
                 },
-            },
-            ScopedStyleProfile {
-                scope: "app:code".into(),
-                profile: StyleProfile {
-                    formality: "casual".into(),
-                    detail: "detailed".into(),
-                    guidance: None,
+                ScopedStyleProfile {
+                    scope: "app:code".into(),
+                    profile: StyleProfile {
+                        formality: "casual".into(),
+                        detail: "detailed".into(),
+                        guidance: None,
+                    },
                 },
-            },
-        ];
+            ],
+            ..Settings::default()
+        };
         assert!(validate_settings_profiles(&settings).is_err());
     }
 }

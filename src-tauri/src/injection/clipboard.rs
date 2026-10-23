@@ -457,6 +457,21 @@ fn write_opened(
     Ok(())
 }
 
+pub(super) fn restore(
+    mut snapshot: Snapshot,
+    expected_sequence: u32,
+) -> Result<bool, InjectionError> {
+    let _guard = open_clipboard()?;
+    if unsafe { GetClipboardSequenceNumber() } != expected_sequence {
+        return Ok(false);
+    }
+    unsafe { EmptyClipboard() }.map_err(|_| InjectionError::ClipboardUnavailable)?;
+    for entry in &mut snapshot.entries {
+        set_entry(entry)?;
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,19 +503,4 @@ mod tests {
             panic!("clipboard sequence changed between write and restore");
         }
     }
-}
-
-pub(super) fn restore(
-    mut snapshot: Snapshot,
-    expected_sequence: u32,
-) -> Result<bool, InjectionError> {
-    let _guard = open_clipboard()?;
-    if unsafe { GetClipboardSequenceNumber() } != expected_sequence {
-        return Ok(false);
-    }
-    unsafe { EmptyClipboard() }.map_err(|_| InjectionError::ClipboardUnavailable)?;
-    for entry in &mut snapshot.entries {
-        set_entry(entry)?;
-    }
-    Ok(true)
 }

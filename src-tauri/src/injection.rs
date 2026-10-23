@@ -156,7 +156,6 @@ impl InsertionDetail {
             InjectionError::SecureTarget | InjectionError::PrivilegeMismatch => {
                 Some(Self::TargetProtected)
             }
-            InjectionError::ImeCompositionActive => Some(Self::ImeActive),
             InjectionError::ClipboardUnavailable => Some(Self::ClipboardUnavailable),
             InjectionError::ClipboardUnpreservable | InjectionError::ClipboardProtected => {
                 Some(Self::ClipboardProtected)
@@ -294,12 +293,13 @@ impl ProvisionalInsertion {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InjectionError {
+    // Non-Windows builds return this from their platform backend.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     UnsupportedPlatform,
     NoForegroundWindow,
     TargetChanged,
     SecureTarget,
     PrivilegeMismatch,
-    ImeCompositionActive,
     /// The clipboard is locked by another process.
     ClipboardUnavailable,
     /// The clipboard could be opened, but holds data that cannot be copied
@@ -323,7 +323,6 @@ impl fmt::Display for InjectionError {
             Self::TargetChanged => "the foreground target changed before insertion",
             Self::SecureTarget => "text insertion into secure controls is disabled",
             Self::PrivilegeMismatch => "the target cannot be accessed at this privilege level",
-            Self::ImeCompositionActive => "an IME composition is in progress",
             Self::ClipboardUnavailable => "the clipboard is unavailable",
             Self::ClipboardUnpreservable => "the clipboard holds data that cannot be preserved",
             Self::ClipboardProtected => {
@@ -339,6 +338,7 @@ impl std::error::Error for InjectionError {}
 
 pub trait TextInjector: Send + Sync {
     fn capture_target(&self) -> Result<TargetWindow, InjectionError>;
+    #[cfg(test)]
     fn insert(&self, text: &str, target: &TargetWindow) -> Result<InsertResult, InjectionError>;
 }
 
@@ -493,8 +493,7 @@ impl SystemTextInjector {
             &selection.target,
             &selection.state,
             text,
-            monitor,
-            checkpoint,
+            (monitor, checkpoint),
             cancel,
         )
     }
@@ -607,6 +606,7 @@ impl TextInjector for SystemTextInjector {
     fn capture_target(&self) -> Result<TargetWindow, InjectionError> {
         self.backend.capture_target()
     }
+    #[cfg(test)]
     fn insert(&self, text: &str, target: &TargetWindow) -> Result<InsertResult, InjectionError> {
         batch::insert(&self.backend, self.options, text, target)
     }

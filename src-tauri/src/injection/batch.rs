@@ -619,8 +619,7 @@ pub(super) fn replace_selection_monitored<B: Backend>(
     target: &TargetWindow,
     before: &TargetText,
     text: &str,
-    monitor: &InputMonitor,
-    checkpoint: u64,
+    activity: (&InputMonitor, u64),
     cancel: &watch::Receiver<bool>,
 ) -> Result<InsertResult, InjectionError> {
     paste(
@@ -629,7 +628,7 @@ pub(super) fn replace_selection_monitored<B: Backend>(
         text,
         target,
         before,
-        Some((monitor, checkpoint)),
+        Some(activity),
         SafetyPolicy::Destructive,
         Some(cancel),
     )
@@ -680,21 +679,21 @@ fn begin_with_checkpoint<B: Backend>(
     if draft.is_empty() {
         return Ok(None);
     }
-    let replacement = checkpoint
-        .filter(|checkpoint| {
-            safe(
-                backend,
-                target,
-                Some((monitor, *checkpoint)),
-                SafetyPolicy::Destructive,
-            )
-        })
-        .and_then(|checkpoint| {
-            backend
-                .target_text(target)
-                .ok()
-                .map(|before| (checkpoint, before))
-        });
+    // UIA text reads can block: do not inspect a field after its guard fails.
+    let replacement = match checkpoint.filter(|checkpoint| {
+        safe(
+            backend,
+            target,
+            Some((monitor, *checkpoint)),
+            SafetyPolicy::Destructive,
+        )
+    }) {
+        Some(checkpoint) => backend
+            .target_text(target)
+            .ok()
+            .map(|text| (checkpoint, text)),
+        None => None,
+    };
     let (result, replacement) = if let Some((checkpoint, before)) = replacement {
         let result = paste(
             backend,
@@ -1410,13 +1409,14 @@ pub(super) mod tests {
         /// False when SendInput queued none of the deletion.
         delete_accepted: Cell<bool>,
         pub(crate) text_readable: Cell<bool>,
+        text_reads: Cell<usize>,
         selection_readable: Cell<bool>,
         paste_accepted: Cell<bool>,
         pending: RefCell<Option<String>>,
         pending_selection: RefCell<Option<TargetText>>,
         selection_settle_after: usize,
         selection_waits: Cell<usize>,
-        on_selection_wait: Option<Box<dyn Fn(&MockBackend) + Send>>,
+        on_selection_wait: Option<MockHook>,
         exclusions: RefCell<Vec<ClipboardExclusion>>,
         settle_after: usize,
         waits: Cell<usize>,
@@ -1424,7 +1424,7 @@ pub(super) mod tests {
         change_identity_on_paste: bool,
         on_paste: Option<Box<dyn Fn() + Send>>,
         on_validate: Option<Box<dyn Fn() + Send>>,
-        on_clipboard_write: Option<Box<dyn Fn(&MockBackend) + Send>>,
+        on_clipboard_write: Option<MockHook>,
         on_snapshot: Option<MockHook>,
         /// What the target exposes after processing a paste, for editors
         /// whose readable text is a proxy or a window of the document.
@@ -1454,6 +1454,7 @@ pub(super) mod tests {
                 delete_partial: Cell::new(false),
                 delete_accepted: Cell::new(true),
                 text_readable: Cell::new(true),
+                text_reads: Cell::new(0),
                 selection_readable: Cell::new(true),
                 paste_accepted: Cell::new(true),
                 pending: RefCell::new(None),
@@ -1525,6 +1526,7 @@ pub(super) mod tests {
             Ok(self.text.borrow().identity.clone())
         }
         fn target_text(&self, _: &TargetWindow) -> Result<TargetText, InjectionError> {
+            self.text_reads.set(self.text_reads.get() + 1);
             if self.text_readable.get() {
                 Ok(self.text.borrow().clone())
             } else {
@@ -1685,6 +1687,28 @@ pub(super) mod tests {
         let monitor = InputMonitor::default();
         monitor.test_set_available(true);
         monitor
+    }
+
+    #[test]
+    fn rejected_provisional_guard_never_reads_target_text() {
+        for tracked in [false, true] {
+            let backend = MockBackend::new();
+            backend.target_valid.set(false);
+            let monitor = monitor();
+            let checkpoint = tracked.then(|| monitor.checkpoint().unwrap());
+            begin_with_checkpoint(
+                &backend,
+                InjectionOptions::default(),
+                "draft",
+                &target(),
+                &monitor,
+                checkpoint,
+                false,
+            )
+            .unwrap();
+            assert_eq!(backend.text_reads.get(), 0);
+            assert!(!backend.calls.borrow().contains(&"paste"));
+        }
     }
 
     #[test]
@@ -2962,8 +2986,7 @@ pub(super) mod tests {
             &target(),
             &before,
             "answer",
-            &monitor,
-            monitor.checkpoint().unwrap(),
+            (&monitor, monitor.checkpoint().unwrap()),
             &cancel,
         );
         assert_eq!(result, Err(InjectionError::Cancelled));

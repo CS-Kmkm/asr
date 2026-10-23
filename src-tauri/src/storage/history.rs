@@ -104,7 +104,7 @@ impl Storage {
             .optional()?
             .flatten();
         if let Some(filename) = &filename {
-            queue_audio_deletion(&transaction, &filename, &Utc::now().to_rfc3339())?;
+            queue_audio_deletion(&transaction, filename, &Utc::now().to_rfc3339())?;
         }
         let changed =
             transaction.execute("DELETE FROM dictation_history WHERE id = ?1", [id])? != 0;
@@ -128,7 +128,7 @@ impl Storage {
             values
         };
         for filename in &filenames {
-            queue_audio_deletion(&transaction, &filename, &Utc::now().to_rfc3339())?;
+            queue_audio_deletion(&transaction, filename, &Utc::now().to_rfc3339())?;
         }
         let changed = transaction.execute("DELETE FROM dictation_history", [])? as u64;
         // Candidate spans and decisions are transcript text, so removing all

@@ -459,6 +459,10 @@ impl From<&str> for LiveFailure {
 /// while the transcriber cancels the request in the worker, which keeps
 /// the loaded model for the next recording. A late result is never
 /// published.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The replay seam keeps independent stop/cancel channels and borrowed recognition inputs explicit."
+)]
 async fn run(
     audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
     transcriber: &dyn Transcriber,

@@ -152,6 +152,7 @@ impl Route {
 pub(crate) struct Routes(pub(crate) Vec<Route>);
 
 impl Routes {
+    #[cfg(test)]
     pub(crate) fn parse(settings: &Settings) -> Result<Self, String> {
         Self::parse_with_collisions(settings, false).map(|(routes, _)| routes)
     }
@@ -236,6 +237,7 @@ impl Routes {
         self.0.iter().find(|route| route.chord == chord)
     }
 
+    #[cfg(test)]
     pub(crate) fn chords(&self) -> Vec<Shortcut> {
         self.0.iter().map(|route| route.chord).collect()
     }

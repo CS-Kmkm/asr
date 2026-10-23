@@ -8,8 +8,12 @@ mod vad;
 mod wav;
 
 use dsp::resample_linear_owned;
-pub use dsp::{enhance_audio, interleaved_to_mono, meter, resample_linear};
-pub use vad::{EnergyVad, EnergyVadConfig, VadAnalysis, VoiceActivityDetector};
+pub use dsp::{enhance_audio, meter};
+#[cfg(test)]
+pub use dsp::{interleaved_to_mono, resample_linear};
+#[cfg(test)]
+pub use vad::VoiceActivityDetector;
+pub use vad::{EnergyVad, EnergyVadConfig, VadAnalysis};
 use wav::{temporary_wav_path, write_pcm16_wav};
 
 use serde::Serialize;
@@ -17,7 +21,9 @@ use std::fmt;
 use std::fs;
 use std::future::Future;
 use std::io;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 #[cfg(target_os = "windows")]
 use std::sync::mpsc;
@@ -54,6 +60,7 @@ pub trait AudioCapture: Send {
     fn snapshot(&self, since: Duration) -> Result<AudioSnapshot, AudioError>;
     fn stop(&mut self) -> AudioFuture<'_, AudioArtifact>;
     fn cancel(&mut self) -> AudioFuture<'_, ()>;
+    #[cfg(test)]
     fn state(&self) -> CaptureState;
     fn level(&self) -> LevelMeter;
     fn stream_error(&self) -> Option<String> {
@@ -157,6 +164,7 @@ pub struct AudioSnapshot {
 
 impl AudioSnapshot {
     /// Processing and disk I/O run outside the capture lock and callback.
+    #[cfg(test)]
     pub fn into_artifact(self) -> Result<AudioArtifact, AudioError> {
         self.prepare()?.into_artifact()
     }
@@ -194,6 +202,7 @@ impl PreparedAudio {
 
 impl AudioArtifact {
     /// Explicit cleanup helper; artifacts are not deleted automatically on drop.
+    #[cfg(test)]
     pub fn remove(self) -> Result<(), AudioError> {
         match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
@@ -212,6 +221,7 @@ pub struct LevelMeter {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub enum CaptureState {
     Idle,
     Capturing,
@@ -252,11 +262,13 @@ impl PrerollBuffer {
         }
     }
 
+    #[cfg(test)]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
     /// Number of samples currently retained, never exceeding `capacity`.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         if self.full {
             self.capacity
@@ -265,6 +277,7 @@ impl PrerollBuffer {
         }
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -311,6 +324,7 @@ impl PrerollBuffer {
     }
 
     /// Returns the retained samples in oldest-first order without clearing them.
+    #[cfg(test)]
     pub fn snapshot(&self) -> Vec<f32> {
         if !self.full {
             return self.buffer.clone();
@@ -331,12 +345,6 @@ impl PrerollBuffer {
         self.full = false;
         out
     }
-
-    pub fn clear(&mut self) {
-        self.buffer.clear();
-        self.head = 0;
-        self.full = false;
-    }
 }
 
 #[derive(Debug)]
@@ -344,6 +352,8 @@ pub enum AudioError {
     AlreadyCapturing,
     NotCapturing,
     Cancelled,
+    // The portable backend constructs this; WASAPI builds do not.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     UnsupportedPlatform,
     DeviceNotFound(String),
     DeviceEnumeration(String),
@@ -352,7 +362,10 @@ pub enum AudioError {
     StreamPlay(String),
     StreamFailure(String),
     InvalidConfiguration(&'static str),
-    TooShort { actual: Duration, minimum: Duration },
+    TooShort {
+        actual: Duration,
+        minimum: Duration,
+    },
     NoVoiceDetected,
     Io(io::Error),
 }
@@ -636,6 +649,7 @@ impl AudioCapture for CpalAudioCapture {
         })
     }
 
+    #[cfg(test)]
     fn state(&self) -> CaptureState {
         if self.is_recording() {
             CaptureState::Capturing

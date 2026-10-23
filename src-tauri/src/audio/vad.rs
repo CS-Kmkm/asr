@@ -3,6 +3,7 @@ use super::{duration_to_samples, samples_to_duration, LevelMeter};
 use std::time::Duration;
 
 /// Boundary for replacing the deterministic fallback with WebRTC VAD later.
+#[cfg(test)]
 pub trait VoiceActivityDetector: Send + Sync {
     fn analyze(&self, samples: &[f32], sample_rate: u32) -> VadAnalysis;
 }
@@ -42,6 +43,7 @@ impl EnergyVad {
     }
 }
 
+#[cfg(test)]
 impl VoiceActivityDetector for EnergyVad {
     fn analyze(&self, samples: &[f32], sample_rate: u32) -> VadAnalysis {
         self.analyze_with_meter(samples, sample_rate).0

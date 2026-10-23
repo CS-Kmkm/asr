@@ -97,6 +97,7 @@ fn soft_limit(value: f32) -> f32 {
 }
 
 /// Averages complete interleaved frames into normalized mono samples.
+#[cfg(test)]
 pub fn interleaved_to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
     let channels = channels as usize;
     if channels == 0 {

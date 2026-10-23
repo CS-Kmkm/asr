@@ -49,6 +49,7 @@ impl AnswerPanelState {
         });
         true
     }
+    #[cfg(test)]
     pub(crate) fn dismiss(&self, operation_id: u64) -> bool {
         self.dismiss_with(operation_id, || true)
     }
