@@ -429,6 +429,10 @@ Full usage and Phase 0 gate criteria are documented in
 - [docs/adr/](docs/adr/) — architecture decision records
 - [docs/benchmarks.md](docs/benchmarks.md) — benchmark protocol and Phase 0 gate
 
+- [docs/worker_protocol.md](docs/worker_protocol.md) — ワーカープロトコル
+- [docs/tasks/README.md](docs/tasks/README.md) — 現在の作業と過去の契約
+- [docs/incidents/](docs/incidents/) — 障害調査と根拠
+
 ## Privacy and limitations
 
 - Speech recognition is local by default. The OpenAI-compatible ASR backend

@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   frontend:
     runs-on: ubuntu-latest
@@ -20,6 +23,7 @@ jobs:
       - run: pnpm exec tsc --noEmit
       - run: pnpm test
       - run: node --test scripts/test-*.mjs
+      - run: pnpm build
 
   rust:
     runs-on: windows-latest
@@ -32,7 +36,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --lib
       - name: Repeat storage tests (Windows file-deletion timing)
         shell: pwsh
@@ -54,3 +58,18 @@ jobs:
           version: latest
       - run: uv sync --extra serve
       - run: uv run --with pytest pytest asr_worker/tests -q
+
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.17.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec tauri build --no-bundle
