@@ -70,6 +70,8 @@ pub struct WorkerCommand {
     /// Working directory for the worker. `python -m` puts it first on
     /// `sys.path`, so it must not be the inherited working directory.
     pub current_dir: Option<PathBuf>,
+    /// Model configuration identity, even though quantization is sent by JSONL.
+    pub quantization: Option<String>,
 }
 
 impl WorkerCommand {
@@ -90,6 +92,7 @@ impl WorkerCommand {
                 ("ASR_WORKER_PROGRESS".into(), "1".into()),
             ],
             current_dir: None,
+            quantization: None,
         }
     }
 
@@ -760,6 +763,15 @@ impl JsonlTranscriber {
     ) -> Result<(), AsrError> {
         let mut interrupt = self.interrupt.subscribe();
         let mut state = self.lock_state(&mut cancel, &mut interrupt).await?;
+        // A queued load may carry settings from before a reconfiguration.
+        if state
+            .command
+            .quantization
+            .as_deref()
+            .is_some_and(|configured| configured != quantization)
+        {
+            return Err(AsrError::Cancelled);
+        }
         if let Some(started) = started {
             started();
         }
@@ -1759,6 +1771,49 @@ mod tests {
                 "reconfigured"
             );
             assert_eq!(mock.processes(), 2);
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn quantization_change_interrupts_a_load_and_rejects_stale_requests() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let mut initial = mock.command.clone();
+            initial.quantization = Some("4bit".into());
+            let transcriber = Arc::new(mock.transcriber());
+            transcriber.reconfigure(initial).await;
+            mock.hold();
+            let load = tokio::spawn({
+                let transcriber = transcriber.clone();
+                async move { transcriber.load("4bit").await }
+            });
+            mock.wait_for_event("load 4bit", 1).await;
+            let mut changed = mock.command.clone();
+            changed.quantization = Some("8bit".into());
+            transcriber.reconfigure(changed).await;
+            assert!(matches!(load.await.unwrap(), Err(AsrError::Cancelled)));
+            mock.release();
+            transcriber.load("8bit").await.unwrap();
+            mock.wait_for_event("load 8bit", 1).await;
+            let started = std::sync::atomic::AtomicBool::new(false);
+            let stale = transcriber
+                .load_when_started("4bit", None, &|| {
+                    started.store(true, Ordering::SeqCst);
+                })
+                .await;
+            assert!(matches!(stale, Err(AsrError::Cancelled)));
+            assert!(!started.load(Ordering::SeqCst));
+            assert_eq!(
+                transcriber
+                    .state
+                    .lock()
+                    .await
+                    .loaded_quantization
+                    .as_deref(),
+                Some("8bit")
+            );
+            mock.transcribe(&transcriber).await.unwrap();
             transcriber.shutdown().await.unwrap();
         }
 

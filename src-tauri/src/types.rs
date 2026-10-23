@@ -498,6 +498,7 @@ pub struct DictionaryImportInput {
 #[serde(rename_all = "camelCase")]
 pub struct ModelStatus {
     pub model_id: Option<String>,
+    pub quantization: String,
     pub installed: bool,
     pub state: String,
     pub detail: String,

@@ -5234,6 +5234,7 @@ mod tests {
     fn only_a_start_that_must_load_the_model_shows_the_preparing_state() {
         let status = |state: &str, model: &str| ModelStatus {
             model_id: Some(model.into()),
+            quantization: "4bit".into(),
             installed: true,
             state: state.into(),
             detail: String::new(),
@@ -5548,6 +5549,7 @@ mod tests {
             );
         }
         let worker_changes = [
+            changed(|next| next.model_quantization = "8bit".into(), &local),
             changed(|next| next.asr_backend = "openai-compatible".into(), &local),
             changed(|next| next.model_id = Some("custom/model".into()), &local),
             changed(
@@ -6277,10 +6279,11 @@ pub(crate) async fn update_settings(
             .reconfigure(worker_command_for_settings(&settings))
             .await;
     }
-    if model_configuration_changed || settings.model_quantization != previous.model_quantization {
+    if model_configuration_changed {
         let (model_id, detail) = model_identity(&settings);
         let status = ModelStatus {
             model_id,
+            quantization: settings.model_quantization.clone(),
             installed: false,
             state: "not_loaded".into(),
             detail,
@@ -6297,6 +6300,7 @@ pub(crate) async fn update_settings(
 /// Settings that require a new worker command (`reconfigure` kills the worker).
 fn worker_configuration_changed(previous: &Settings, next: &Settings) -> bool {
     worker_command_inputs(previous) != worker_command_inputs(next)
+        || previous.model_quantization != next.model_quantization
 }
 
 /// The settings `worker_command_for_settings` derives the worker command
@@ -6398,7 +6402,6 @@ impl Drop for ModelChangeGuard<'_> {
 
 fn speech_model_changed(previous: &Settings, next: &Settings) -> bool {
     worker_configuration_changed(previous, next)
-        || next.model_quantization != previous.model_quantization
 }
 
 /// A recording or its processing owns the loaded speech model until it
@@ -7033,6 +7036,13 @@ pub(crate) async fn ensure_model_loaded(
 
 pub(crate) const MODEL_LOAD_CANCELLED: &str = "Speech model loading was cancelled.";
 
+fn is_prepared_model(status: &ModelStatus, settings: &Settings) -> bool {
+    status.installed
+        && status.state == "ready"
+        && status.model_id == model_identity(settings).0
+        && status.quantization == settings.model_quantization
+}
+
 /// `ensure_model_loaded` for a pipeline operation: cancelling the operation
 /// abandons a load (or first-use download) that nobody waits for any more.
 pub(crate) async fn ensure_model_loaded_cancellable(
@@ -7049,19 +7059,21 @@ pub(crate) async fn ensure_model_loaded_cancellable(
         .model_residency()
         .is_none_or(|residency| matches!(*residency.borrow(), asr::ModelResidency::Resident(_)));
     if let Ok(status) = services.model.get() {
-        if resident && status.state == "ready" && status.model_id == model_id {
+        if resident && is_prepared_model(&status, settings) {
             return Ok(status);
         }
     }
     emit_status(app, "model_loading", "Loading the speech model.");
     let loading = ModelStatus {
         model_id: model_id.clone(),
+        quantization: settings.model_quantization.clone(),
         installed: false,
         state: "loading".into(),
         detail: detail.clone(),
     };
     let ready = ModelStatus {
         model_id,
+        quantization: settings.model_quantization.clone(),
         installed: true,
         state: "ready".into(),
         detail: format!(
@@ -7164,6 +7176,7 @@ async fn load_and_publish_status(
             let message = command_error(&error);
             show(ModelStatus {
                 model_id: statuses.loading.model_id.clone(),
+                quantization: statuses.loading.quantization.clone(),
                 installed: false,
                 state: "error".into(),
                 detail: format!("{} {message}", statuses.detail),
@@ -7245,6 +7258,7 @@ impl ModelStatusSlot {
 fn same_model_status(left: &ModelStatus, right: &ModelStatus) -> bool {
     left.state == right.state
         && left.model_id == right.model_id
+        && left.quantization == right.quantization
         && left.installed == right.installed
         && left.detail == right.detail
 }
@@ -7262,6 +7276,7 @@ fn residency_status(
     };
     ModelStatus {
         model_id: ready.model_id.clone(),
+        quantization: ready.quantization.clone(),
         installed,
         state: state.into(),
         detail: detail.to_owned(),
@@ -7321,9 +7336,28 @@ fn follow_model_residency(
 mod model_status_tests {
     use super::*;
 
+    #[test]
+    fn prepared_model_must_match_the_selected_model_and_quantization() {
+        let settings = Settings::default();
+        let mut current = ModelStatus {
+            model_id: model_identity(&settings).0,
+            quantization: settings.model_quantization.clone(),
+            installed: true,
+            state: "ready".into(),
+            detail: String::new(),
+        };
+        assert!(is_prepared_model(&current, &settings));
+        current.quantization = "8bit".into();
+        assert!(!is_prepared_model(&current, &settings));
+        current.quantization = settings.model_quantization.clone();
+        current.state = "loading".into();
+        assert!(!is_prepared_model(&current, &settings));
+    }
+
     fn status(state: &str, detail: &str) -> ModelStatus {
         ModelStatus {
             model_id: Some("model".into()),
+            quantization: "4bit".into(),
             installed: state == "ready",
             state: state.into(),
             detail: detail.into(),
@@ -7502,6 +7536,19 @@ mod model_status_tests {
             .update(first.unwrap(), status("error", "late"))
             .is_none());
         drop(release_tx);
+    }
+
+    #[test]
+    fn quantization_save_takes_status_away_from_an_old_load() {
+        let slot = ModelStatusSlot::new(status("not_loaded", "d"));
+        let old = slot.begin_load(status("loading", "d")).unwrap();
+        let mut changed = status("not_loaded", "new quantization");
+        changed.quantization = "8bit".into();
+        slot.replace(changed.clone()).unwrap();
+        assert!(slot
+            .update(old, status("ready", "old quantization"))
+            .is_none());
+        assert!(same_model_status(&slot.get().unwrap(), &changed));
     }
 
     #[test]

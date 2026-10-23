@@ -170,6 +170,7 @@ impl Services {
             input_monitor: Arc::new(InputMonitor::default()),
             model: commands::ModelStatusSlot::new(ModelStatus {
                 model_id,
+                quantization: settings.model_quantization.clone(),
                 installed: false,
                 state: "not_loaded".into(),
                 detail,
@@ -405,6 +406,7 @@ pub(crate) fn command_error(error: impl std::fmt::Display) -> String {
 pub(crate) fn worker_command_for_settings(settings: &Settings) -> WorkerCommand {
     let (python, project_root) = worker_runtime();
     let mut command = WorkerCommand::python(python).with_backend(&settings.asr_backend);
+    command.quantization = Some(settings.model_quantization.clone());
     let executable = std::env::current_exe().ok();
     if let Some(directory) = worker_directory(project_root.as_deref(), executable.as_deref()) {
         command = command.with_current_dir(directory);

@@ -244,6 +244,7 @@ export async function getModelStatus(): Promise<ModelStatus> {
   if (!inTauri) {
     return {
       modelId: null,
+      quantization: "",
       installed: false,
       state: "not_loaded",
       detail: "Choose a local ASR model during setup.",

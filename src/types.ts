@@ -158,6 +158,7 @@ export interface HistoryAudioPayload {
 
 export interface ModelStatus {
   modelId: string | null;
+  quantization: string;
   installed: boolean;
   state: "not_configured" | "not_installed" | "not_loaded" | "loading" | "ready" | "error";
   detail: string;
