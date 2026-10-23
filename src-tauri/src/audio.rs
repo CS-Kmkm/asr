@@ -3,11 +3,20 @@
 //! The CPAL backend is intentionally Windows-only. This lets non-Windows CI exercise
 //! the DSP and lifecycle code without requiring native ALSA development packages.
 
+mod dsp;
+mod vad;
+mod wav;
+
+use dsp::resample_linear_owned;
+pub use dsp::{enhance_audio, interleaved_to_mono, meter, resample_linear};
+pub use vad::{EnergyVad, EnergyVadConfig, VadAnalysis, VoiceActivityDetector};
+use wav::{temporary_wav_path, write_pcm16_wav};
+
 use serde::Serialize;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs;
 use std::future::Future;
-use std::io::{self, BufWriter, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 #[cfg(target_os = "windows")]
@@ -15,7 +24,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "windows")]
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 pub const TARGET_SAMPLE_RATE: u32 = 24_000;
 
@@ -55,11 +64,6 @@ pub trait AudioCapture: Send {
     fn uses_fallback_device(&self) -> bool {
         false
     }
-}
-
-/// Boundary for replacing the deterministic fallback with WebRTC VAD later.
-pub trait VoiceActivityDetector: Send + Sync {
-    fn analyze(&self, samples: &[f32], sample_rate: u32) -> VadAnalysis;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -211,99 +215,6 @@ pub struct LevelMeter {
 pub enum CaptureState {
     Idle,
     Capturing,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct EnergyVadConfig {
-    pub frame_duration: Duration,
-    pub rms_threshold: f32,
-    pub minimum_voice_duration: Duration,
-}
-
-impl Default for EnergyVadConfig {
-    fn default() -> Self {
-        Self {
-            frame_duration: Duration::from_millis(20),
-            rms_threshold: 0.01,
-            minimum_voice_duration: Duration::from_millis(100),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct VadAnalysis {
-    pub contains_voice: bool,
-    pub voiced_duration: Duration,
-    pub trailing_silence: Duration,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct EnergyVad {
-    config: EnergyVadConfig,
-}
-
-impl EnergyVad {
-    pub fn new(config: EnergyVadConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl VoiceActivityDetector for EnergyVad {
-    fn analyze(&self, samples: &[f32], sample_rate: u32) -> VadAnalysis {
-        self.analyze_with_meter(samples, sample_rate).0
-    }
-}
-
-impl EnergyVad {
-    /// Computes VAD and the whole-recording meter in one pass over the audio.
-    fn analyze_with_meter(&self, samples: &[f32], sample_rate: u32) -> (VadAnalysis, LevelMeter) {
-        if samples.is_empty() || sample_rate == 0 {
-            return (VadAnalysis::default(), LevelMeter::default());
-        }
-
-        let frame_len = duration_to_samples(self.config.frame_duration, sample_rate).max(1);
-        let mut voiced_samples = 0usize;
-        let mut trailing_silent_samples = 0usize;
-        let mut seen_voice = false;
-        let mut peak = 0.0f32;
-        let mut total_sum_squares = 0.0f64;
-
-        for frame in samples.chunks(frame_len) {
-            let mut frame_sum_squares = 0.0f64;
-            for &sample in frame {
-                let value = if sample.is_finite() {
-                    sample.clamp(-1.0, 1.0)
-                } else {
-                    0.0
-                };
-                peak = peak.max(value.abs());
-                let square = f64::from(value) * f64::from(value);
-                frame_sum_squares += square;
-                total_sum_squares += square;
-            }
-            let frame_rms = (frame_sum_squares / frame.len() as f64).sqrt() as f32;
-            if frame_rms >= self.config.rms_threshold {
-                voiced_samples += frame.len();
-                trailing_silent_samples = 0;
-                seen_voice = true;
-            } else if seen_voice {
-                trailing_silent_samples += frame.len();
-            }
-        }
-
-        let voiced_duration = samples_to_duration(voiced_samples, sample_rate);
-        (
-            VadAnalysis {
-                contains_voice: voiced_duration >= self.config.minimum_voice_duration,
-                voiced_duration,
-                trailing_silence: samples_to_duration(trailing_silent_samples, sample_rate),
-            },
-            LevelMeter {
-                rms: (total_sum_squares / samples.len() as f64).sqrt() as f32,
-                peak,
-            },
-        )
-    }
 }
 
 /// Fixed-capacity ring of the most recent mono samples.
@@ -837,247 +748,6 @@ fn write_prepared_audio(
         vad,
         warning: None,
     })
-}
-
-/// Applies inexpensive, deterministic post-capture processing. Keeping this out
-/// of the CPAL callback prevents audio cleanup from competing with foreground
-/// typing while the microphone is active.
-pub fn enhance_audio(samples: &mut [f32], sample_rate: u32, config: AudioEnhancementConfig) {
-    if samples.is_empty() || sample_rate == 0 {
-        return;
-    }
-
-    sanitize_and_high_pass(samples, sample_rate);
-    suppress_stationary_noise(samples, sample_rate, config.noise_suppression);
-
-    let measured_rms = meter(samples).rms;
-    let automatic_gain = if config.automatic_gain && measured_rms > 0.000_1 {
-        // -20 dBFS is a conservative speech target. The cap prevents quiet
-        // recordings from turning residual background noise into loud audio.
-        (0.1 / measured_rms).clamp(0.5, 4.0)
-    } else {
-        1.0
-    };
-    let gain = config.gain * automatic_gain;
-    for sample in samples {
-        // A smooth limiter avoids hard clipping while preserving small signals.
-        *sample = soft_limit(*sample * gain);
-    }
-}
-
-fn sanitize_and_high_pass(samples: &mut [f32], sample_rate: u32) {
-    let cutoff_hz = 70.0f32;
-    let dt = 1.0 / sample_rate as f32;
-    let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff_hz);
-    let alpha = rc / (rc + dt);
-    let mut previous_input = 0.0f32;
-    let mut previous_output = 0.0f32;
-    for sample in samples {
-        let input = if sample.is_finite() { *sample } else { 0.0 };
-        let output = alpha * (previous_output + input - previous_input);
-        previous_input = input;
-        previous_output = output;
-        *sample = output;
-    }
-}
-
-fn suppress_stationary_noise(samples: &mut [f32], sample_rate: u32, level: NoiseSuppressionLevel) {
-    let strength = match level {
-        NoiseSuppressionLevel::Off => return,
-        NoiseSuppressionLevel::Low => 1.5,
-        NoiseSuppressionLevel::Medium => 2.0,
-        NoiseSuppressionLevel::High => 2.8,
-    };
-    let frame_len = (sample_rate as usize / 100).max(1); // 10 ms
-    let mut frame_levels: Vec<f32> = samples
-        .chunks(frame_len)
-        .map(|frame| meter(frame).rms)
-        .collect();
-    if frame_levels.is_empty() {
-        return;
-    }
-    frame_levels.sort_by(f32::total_cmp);
-    let noise_floor = frame_levels[frame_levels.len() / 4].max(0.000_5);
-    let threshold = noise_floor * strength;
-    let minimum_gain = match level {
-        NoiseSuppressionLevel::Low => 0.45,
-        NoiseSuppressionLevel::Medium => 0.2,
-        NoiseSuppressionLevel::High => 0.08,
-        NoiseSuppressionLevel::Off => 1.0,
-    };
-    let mut smoothed_gain = 1.0f32;
-    for frame in samples.chunks_mut(frame_len) {
-        let rms = meter(frame).rms;
-        let target_gain = if rms >= threshold {
-            1.0
-        } else {
-            (rms / threshold).clamp(minimum_gain, 1.0)
-        };
-        // Open quickly for speech, close gradually to avoid audible pumping.
-        let smoothing = if target_gain > smoothed_gain {
-            0.65
-        } else {
-            0.18
-        };
-        smoothed_gain += (target_gain - smoothed_gain) * smoothing;
-        for sample in frame {
-            *sample *= smoothed_gain;
-        }
-    }
-}
-
-fn soft_limit(value: f32) -> f32 {
-    if value.abs() <= 0.95 {
-        value
-    } else {
-        value.signum() * (0.95 + 0.05 * ((value.abs() - 0.95) / 0.05).tanh())
-    }
-}
-
-/// Averages complete interleaved frames into normalized mono samples.
-pub fn interleaved_to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
-    let channels = channels as usize;
-    if channels == 0 {
-        return Vec::new();
-    }
-    samples
-        .chunks_exact(channels)
-        .map(|frame| frame.iter().copied().sum::<f32>() / channels as f32)
-        .collect()
-}
-
-/// Deterministic linear interpolation resampler suitable for ASR preprocessing.
-pub fn resample_linear(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
-    if samples.is_empty() || source_rate == 0 || target_rate == 0 {
-        return Vec::new();
-    }
-    if source_rate == target_rate {
-        return samples.to_vec();
-    }
-
-    let output_len = ((samples.len() as u64 * target_rate as u64) / source_rate as u64) as usize;
-    if output_len == 0 {
-        return Vec::new();
-    }
-
-    let scale = source_rate as f64 / target_rate as f64;
-    (0..output_len)
-        .map(|index| {
-            let position = index as f64 * scale;
-            let left = position.floor() as usize;
-            let right = (left + 1).min(samples.len() - 1);
-            let fraction = (position - left as f64) as f32;
-            samples[left] + (samples[right] - samples[left]) * fraction
-        })
-        .collect()
-}
-
-/// Owned variant used by the recording pipeline. Downsampling is performed in
-/// place, which avoids holding both the full input and output recordings at once.
-fn resample_linear_owned(mut samples: Vec<f32>, source_rate: u32, target_rate: u32) -> Vec<f32> {
-    if samples.is_empty() || source_rate == 0 || target_rate == 0 {
-        samples.clear();
-        return samples;
-    }
-    if source_rate == target_rate {
-        return samples;
-    }
-    if target_rate > source_rate {
-        return resample_linear(&samples, source_rate, target_rate);
-    }
-
-    let output_len = ((samples.len() as u64 * target_rate as u64) / source_rate as u64) as usize;
-    let scale = source_rate as f64 / target_rate as f64;
-    for index in 0..output_len {
-        let position = index as f64 * scale;
-        let left = position.floor() as usize;
-        let right = (left + 1).min(samples.len() - 1);
-        let fraction = (position - left as f64) as f32;
-        samples[index] = samples[left] + (samples[right] - samples[left]) * fraction;
-    }
-    samples.truncate(output_len);
-    samples
-}
-
-pub fn meter(samples: &[f32]) -> LevelMeter {
-    if samples.is_empty() {
-        return LevelMeter::default();
-    }
-    let mut peak = 0.0f32;
-    let mut sum_squares = 0.0f64;
-    for sample in samples {
-        let value = if sample.is_finite() {
-            sample.clamp(-1.0, 1.0)
-        } else {
-            0.0
-        };
-        peak = peak.max(value.abs());
-        sum_squares += f64::from(value) * f64::from(value);
-    }
-    LevelMeter {
-        rms: (sum_squares / samples.len() as f64).sqrt() as f32,
-        peak,
-    }
-}
-
-fn write_pcm16_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<(), AudioError> {
-    let data_size = samples
-        .len()
-        .checked_mul(2)
-        .and_then(|size| u32::try_from(size).ok())
-        .ok_or(AudioError::InvalidConfiguration(
-            "WAV artifact is too large",
-        ))?;
-    let riff_size = 36u32
-        .checked_add(data_size)
-        .ok_or(AudioError::InvalidConfiguration(
-            "WAV artifact is too large",
-        ))?;
-    let mut writer = BufWriter::new(File::create(path)?);
-
-    writer.write_all(b"RIFF")?;
-    writer.write_all(&riff_size.to_le_bytes())?;
-    writer.write_all(b"WAVEfmt ")?;
-    writer.write_all(&16u32.to_le_bytes())?;
-    writer.write_all(&1u16.to_le_bytes())?;
-    writer.write_all(&1u16.to_le_bytes())?;
-    writer.write_all(&sample_rate.to_le_bytes())?;
-    writer.write_all(&(sample_rate * 2).to_le_bytes())?;
-    writer.write_all(&2u16.to_le_bytes())?;
-    writer.write_all(&16u16.to_le_bytes())?;
-    writer.write_all(b"data")?;
-    writer.write_all(&data_size.to_le_bytes())?;
-    const SAMPLES_PER_CHUNK: usize = 4096;
-    let mut encoded = [0u8; SAMPLES_PER_CHUNK * 2];
-    for chunk in samples.chunks(SAMPLES_PER_CHUNK) {
-        for (sample, bytes) in chunk.iter().zip(encoded.chunks_exact_mut(2)) {
-            let normalized = if sample.is_finite() {
-                sample.clamp(-1.0, 1.0)
-            } else {
-                0.0
-            };
-            bytes.copy_from_slice(&((normalized * i16::MAX as f32).round() as i16).to_le_bytes());
-        }
-        writer.write_all(&encoded[..chunk.len() * 2])?;
-    }
-    writer.flush()?;
-    Ok(())
-}
-
-fn temporary_wav_path(directory: Option<&Path>) -> PathBuf {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let nonce = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    directory
-        .map(Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(format!(
-            "local-ai-voice-{}-{timestamp}-{nonce}.wav",
-            std::process::id()
-        ))
 }
 
 fn duration_to_samples(duration: Duration, sample_rate: u32) -> usize {
