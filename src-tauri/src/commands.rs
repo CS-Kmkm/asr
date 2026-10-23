@@ -6097,6 +6097,9 @@ fn spawn_load_progress_forwarder(
         loop {
             match receiver.recv().await {
                 Ok(progress) => {
+                    if progress.stage == "setup" {
+                        emit_status(&app, "worker_setup", "Preparing the speech worker environment. Dependencies are downloaded on first setup.");
+                    }
                     if progress.stage == "download" && !download_announced {
                         download_announced = true;
                         emit_status(

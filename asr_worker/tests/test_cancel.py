@@ -115,7 +115,7 @@ class CancelOperationTests(IsolatedWorkerTestCase):
         self.assertFalse(stop)
 
     def test_unsupported_operation_lists_cancel(self) -> None:
-        response, _ = Worker(MockBackend()).handle({"id": 1, "command": "hello"})
+        response, _ = Worker(MockBackend()).handle({"id": 1, "command": "unknown-operation"})
         self.assertEqual(response["error"]["code"], "unsupported_operation")
         self.assertIn("cancel", response["error"]["message"])
 

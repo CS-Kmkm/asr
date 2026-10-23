@@ -48,7 +48,7 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
   Rust側 (`JsonlTranscriber`) が最後に成功した `load` の量子化設定 (`loaded_quantization`) を
   保持しており、再spawn時 (`ensure_running`) に自動的に `load` を再送してモデルロード状態を
   再現する。この再ロードも、それを必要とした `transcribe` のキャンセル信号で中断できる。
-  ワーカープロトコルにはハンドシェイクや状態問い合わせの仕組みは存在しない(§5.1)。
+  ワーカー起動時には `hello`（§2.6）でバージョンを確認する。モデル状態の問い合わせは実装していない。
 - `load` が失敗した場合、ワーカーは以前のモデルを解放済みである(ロード前に `unload` する)
   ため、Rust側は `loaded_quantization` を消去する。同じ量子化のモデルがすでに常駐している
   ワーカーへの `load` は送らずに成功とする(再spawn時の自動再ロード後に、UIの読み込み操作が
@@ -112,6 +112,11 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
 - faster-whisper: `"faster-whisper:<モデルID>"`(既定モデルID `large-v3-turbo`、
   環境変数 `ASR_FASTER_WHISPER_MODEL` で変更可)
 - mock: `"microsoft/VibeVoice-ASR-HF:mock"`
+- openai-compatible: `openai-compatible:<ASR_MODEL_ID>`（既定は `gpt-4o-mini-transcribe`）。
+
+ローカルバックエンドでも `ASR_MODEL_ID` が既定モデルより優先される。
+faster-whisper は `ASR_MODEL_ID`、`ASR_FASTER_WHISPER_MODEL`、
+`large-v3-turbo` の順で選択する。
 
 **JSON例:**
 
@@ -203,6 +208,7 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 
 - VibeVoice: 認識リクエストの `prompt` として処理に渡される。
 - faster-whisper: 非空のときのみ `hotwords` として渡される(空文字列は `hotwords=None` 扱い)。
+- openai-compatible: 非空のとき `POST /audio/transcriptions` の `prompt` フォーム項目として渡される。
 
 **成功レスポンスフィールド:**
 
@@ -344,6 +350,23 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 
 ---
 
+### 2.6 hello 操作（実装済み）
+
+Rust はワーカー起動直後、モデルを読み込む前に次の要求を送る。
+
+```json
+→ {"id": 1, "command": "hello"}
+← {"id": 1, "ok": true, "protocol_version": 1, "worker_version": "0.1.0"}
+```
+
+`hello` はモデルを読み込まない。デスクトップは protocol_version=1 と
+アプリの package version に一致する worker_version を要求する。不一致・欠落・
+旧ワーカーの unsupported_operation はモデルのロード前にエラーとなる。
+応答待ちは10秒に制限し、キャンセル・設定変更・終了時にはワーカーを停止する。
+
+配布版は起動前に uv で環境を準備する。この間 Rust が `stage: "setup"` の
+model-progress を発行する。これは Python の JSONL 通知ではない。
+
 ## 3. エラーコード一覧
 
 `error.code` は実装上の文字列定数であり、以下が全コードである。`message` は人間可読の
@@ -351,16 +374,16 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 
 | コード | 発生箇所 | 発生条件 |
 |---|---|---|
-| `invalid_request` | worker.py | リクエストがJSONオブジェクトでない / `id` が欠落 / `quantization` が文字列でない / `prompt` の型が不正(非文字列要素を含むリスト、文字列・リスト・null以外)。 |
+| `invalid_request` | worker.py | リクエストがJSONオブジェクトでない / `id` が欠落 / `quantization` が文字列でない / `prompt` の型が不正(非文字列要素を含むリスト、文字列・リスト・null以外) / `language` が文字列・null 以外、または32文字超。 |
 | `invalid_json` | worker.py (`serve`) | 受信行がJSONとして解釈できない(`JSONDecodeError`)。`id` は `null`。 |
 | `model_not_loaded` | worker.py | `load` 成功前に `transcribe` を要求した。 |
 | `invalid_audio_path` | worker.py | `audio_path` が非空文字列でない。 |
 | `audio_not_found` | worker.py | `audio_path` が示すパスが存在しない、またはファイルでない。 |
-| `unsupported_operation` | worker.py | `command`/`op` が `load`/`transcribe`/`cancel`/`shutdown` のいずれでもない。 |
+| `unsupported_operation` | worker.py | `command`/`op` が `hello`/`load`/`transcribe`/`cancel`/`shutdown` のいずれでもない。 |
 | `cancelled` | worker.py / backends.py | `cancel`(§2.5)で中断された `transcribe`。中断できずに完了した場合も結果を破棄してこのコードを返す。 |
 | `unsupported_quantization` | backends.py(各バックエンドの `load` / `faster_whisper_compute_type`) | `quantization` が許容集合 `{4bit, 8bit, bf16}` 外。 |
 | `unsupported_backend` | backends.py (`create_backend`) | 未知のバックエンド名。プロセス起動時 (`main`) に発生し、終了コード2でワーカーが起動失敗する(この場合プロトコル応答ではなくstderr出力)。 |
-| `backend_unavailable` | backends.py (`FasterWhisperBackend.load`) | `faster_whisper` パッケージが未インストール(ImportError)。 |
+| `backend_unavailable` | backends.py | faster-whisper、VibeVoice、HTTP バックエンドの必要パッケージがない。 |
 | `gpu_oom` | backends.py(例外マッピング / mock) | 例外メッセージに "out of memory" または "cuda oom" を含む(load/transcribe両方で発生しうる)。 |
 | `gpu_unsupported` | backends.py (`VibeVoiceBackend.load`) | CUDA GPUが利用不可、またはモデルがCUDAに配置されなかった(CPUフォールバック無効)。 |
 | `hf_auth_required` | backends.py(例外マッピング) | Hugging Faceのgatedモデル、無効なトークン、または401/403応答によりモデルを取得できない。 |
@@ -370,6 +393,11 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 | `model_load_failed` | backends.py(例外マッピング) | `load` 中の予期しない例外(OOM以外)。 |
 | `transcription_failed` | backends.py(例外マッピング) | `transcribe` 中の予期しない例外(OOM以外)。 |
 | `transcript_truncated` | backends.py (`VibeVoiceBackend.transcribe`) | 生成が `max_new_tokens`(音声長からの推定、上限 `VIBEVOICE_MAX_NEW_TOKENS` = (15分の録音上限 + 60秒) × 40 + 128 = 38528、`ASR_MAX_NEW_TOKENS` で上書き可)に達し、終端トークンなしで打ち切られた。途中までの出力は返さない(長尺録音の分割または `ASR_MAX_NEW_TOKENS` の引き上げが必要)。 |
+| `missing_api_key` | backends.py | HTTP バックエンドの API キーが未設定。 |
+| `invalid_api_config` | backends.py | API の URL、タイムアウトなどの設定が不正。 |
+| `api_request_failed` | backends.py | HTTP 接続または API のステータスが失敗。 |
+| `invalid_api_response` | backends.py | API 応答に有効な text がない。 |
+| `serve_dependencies_missing` | api.py | HTTP サーバー用の追加依存が未インストール。 |
 | `internal_error` | worker.py | 上記のいずれにも該当しない予期しない例外を `handle` が捕捉した場合の包括フォールバック。 |
 
 補足:
@@ -381,7 +409,7 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
   `hf_rate_limited`, `hf_download_failed`, `model_load_failed`, `transcription_failed`,
   `transcript_truncated`)は
   `handle` 内で捕捉され、そのコードのままレスポンスに反映される。
-- それ以外の想定外例外はすべて `internal_error` に丸められ、詳細はstderrにのみ出力される
+- それ以外の想定外例外はすべて `internal_error` に丸められ、例外の型名のみがstderrに出力される
   (`message` には例外の内部詳細を含めない)。
 
 ---
@@ -500,7 +528,10 @@ Rust側はモデルの常駐状態を `Transcriber::model_residency`(`watch` チ
 
 ---
 
-## 5. v2拡張提案(未実装)
+## 5. 過去の v2 拡張案
+
+以下は当初の設計案の記録。現在は hello（§2.6）、進捗通知（§2.2.1）、
+cancel（§2.5）を v1 の追加操作として実装している。実装上の仕様は §1〜4 を優先する。
 
 > 本節は設計レビューで指摘された3点
 > (バージョンハンドシェイクなし / 進捗イベントなし / キャンセル不能)への対応案を記す。

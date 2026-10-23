@@ -177,7 +177,7 @@ export interface ModelStatus {
 // absent until the download size is known, and for backends that cannot
 // measure it.
 export interface ModelProgress {
-  stage: "download" | "load";
+  stage: "setup" | "download" | "load";
   model: string | null;
   completedBytes: number | null;
   totalBytes: number | null;

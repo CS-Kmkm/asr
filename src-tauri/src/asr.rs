@@ -13,6 +13,8 @@ use tokio::sync::{broadcast, watch, Mutex, OwnedMutexGuard};
 use tokio::time::timeout;
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const PROTOCOL_VERSION: u64 = 1;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a cancelled transcription may take to confirm a protocol
 /// `cancel` before its worker is killed instead (which costs a model reload
@@ -72,6 +74,8 @@ pub struct WorkerCommand {
     pub current_dir: Option<PathBuf>,
     /// Model configuration identity, even though quantization is sent by JSONL.
     pub quantization: Option<String>,
+    pub(crate) provision: Option<crate::worker_setup::Provision>,
+    pub(crate) source_required: bool,
 }
 
 impl WorkerCommand {
@@ -93,6 +97,8 @@ impl WorkerCommand {
             ],
             current_dir: None,
             quantization: None,
+            provision: None,
+            source_required: false,
         }
     }
 
@@ -547,7 +553,39 @@ impl JsonlTranscriber {
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
-    async fn spawn(&self, command_spec: &WorkerCommand) -> Result<RunningWorker, AsrError> {
+    async fn spawn(
+        &self,
+        command_spec: &WorkerCommand,
+        cancel: &mut Option<watch::Receiver<bool>>,
+        interrupt: &mut watch::Receiver<u64>,
+    ) -> Result<RunningWorker, AsrError> {
+        if command_spec.source_required
+            && !command_spec
+                .current_dir
+                .as_ref()
+                .is_some_and(|root| root.join("asr_worker/__main__.py").is_file())
+        {
+            return Err(AsrError::Worker(WorkerError {
+                code: "worker_source_missing".into(),
+                message: "Speech worker resources are missing".into(),
+            }));
+        }
+        if let Some(provision) = &command_spec.provision {
+            let _ = self.progress.send(LoadProgress {
+                stage: "setup".into(),
+                model: None,
+                completed_bytes: None,
+                total_bytes: None,
+            });
+            until_cancelled(
+                timeout(self.load_timeout, provision.prepare()),
+                cancel,
+                interrupt,
+            )
+            .await
+            .map_err(|_| AsrError::Cancelled)?
+            .map_err(|_| AsrError::Timeout)??;
+        }
         // stderr carries the worker's internal_error details; persist it to the
         // rotating worker log when the app installed one.
         let mut command = worker_process_command(command_spec, crate::worker_log::is_installed());
@@ -564,13 +602,45 @@ impl JsonlTranscriber {
             .stdout
             .take()
             .ok_or_else(|| AsrError::Protocol("worker stdout unavailable".into()))?;
-        Ok(RunningWorker {
+        let mut worker = RunningWorker {
             child,
             stdin,
             stdout: BufReader::new(stdout),
             partial_line: Vec::new(),
             in_flight: false,
-        })
+        };
+        let id = self.next_id();
+        let hello = async {
+            worker.send(&json!({"id": id, "command": "hello"})).await?;
+            let response = self
+                .read_response(&mut worker, &json!(id), HANDSHAKE_TIMEOUT)
+                .await?;
+            Self::validate_hello(&response)
+        };
+        let result =
+            match until_cancelled(timeout(HANDSHAKE_TIMEOUT, hello), cancel, interrupt).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(AsrError::Timeout),
+                Err(_) => Err(AsrError::Cancelled),
+            };
+        if let Err(error) = result {
+            worker.kill().await;
+            return Err(error);
+        }
+        Ok(worker)
+    }
+
+    fn validate_hello(response: &Value) -> Result<(), AsrError> {
+        if response.get("protocol_version").and_then(Value::as_u64) != Some(PROTOCOL_VERSION)
+            || response.get("worker_version").and_then(Value::as_str)
+                != Some(env!("CARGO_PKG_VERSION"))
+        {
+            return Err(AsrError::Worker(WorkerError {
+                code: "worker_version_mismatch".into(),
+                message: "Speech worker and app versions do not match".into(),
+            }));
+        }
+        Ok(())
     }
 
     /// Read the response to `expected_id`, relaying the progress
@@ -746,7 +816,7 @@ impl JsonlTranscriber {
         if state.running.is_some() {
             return Ok(());
         }
-        let mut worker = self.spawn(&state.command).await?;
+        let mut worker = self.spawn(&state.command, cancel, interrupt).await?;
         if let Some(quantization) = state.loaded_quantization.clone() {
             // The desktop shows this restore like a load, with its progress.
             state.residency.send_replace(ModelResidency::Restoring);
@@ -798,7 +868,10 @@ impl JsonlTranscriber {
         }
         if state.running.is_none() {
             // This load replaces whatever a respawn would have restored.
-            state.running = Some(self.spawn(&state.command).await?);
+            state.running = Some(
+                self.spawn(&state.command, &mut cancel, &mut interrupt)
+                    .await?,
+            );
         }
         let id = self.next_id();
         let worker = state.running.as_mut().expect("worker was spawned");
@@ -1176,6 +1249,21 @@ mod tests {
             .get("language")
             .unwrap()
             .is_null());
+    }
+
+    #[test]
+    fn worker_handshake_requires_matching_protocol_and_application_versions() {
+        let good = json!({"protocol_version": 1, "worker_version": env!("CARGO_PKG_VERSION")});
+        assert!(JsonlTranscriber::validate_hello(&good).is_ok());
+        for bad in [
+            json!({}),
+            json!({"protocol_version": 2, "worker_version": env!("CARGO_PKG_VERSION")}),
+            json!({"protocol_version": 1, "worker_version": "old"}),
+        ] {
+            assert!(
+                matches!(JsonlTranscriber::validate_hello(&bad), Err(AsrError::Worker(error)) if error.code == "worker_version_mismatch")
+            );
+        }
     }
 
     #[test]
@@ -1560,6 +1648,8 @@ mod tests {
             );
 
             let mut residency = transcriber.model_residency().unwrap();
+            // Clones retain unseen changes from before subscription.
+            assert_eq!(*residency.borrow_and_update(), ModelResidency::Absent);
             let observed = tokio::spawn(async move {
                 let mut seen = Vec::new();
                 while residency.changed().await.is_ok() {
@@ -1951,6 +2041,28 @@ for line in sys.stdin:
     sys.stdout.write(json.dumps(response) + "\n")
     sys.stdout.flush()
 "#;
+
+        #[tokio::test]
+        async fn incompatible_worker_is_rejected_before_model_load_and_not_retained() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let mut command = mock.command.clone();
+            command.args = vec!["-c".into(), r#"
+import json, sys
+request = json.loads(sys.stdin.readline())
+assert request['command'] == 'hello'
+print(json.dumps({'id': request['id'], 'ok': True, 'protocol_version': 999, 'worker_version': 'old'}), flush=True)
+sys.stdin.read()
+"#.into()];
+            let transcriber =
+                JsonlTranscriber::new(command, Duration::from_secs(20), Duration::from_secs(20));
+            assert!(
+                matches!(transcriber.load("4bit").await, Err(AsrError::Worker(error)) if error.code == "worker_version_mismatch")
+            );
+            assert!(transcriber.state.lock().await.running.is_none());
+            assert!(resident(&transcriber).is_none());
+        }
 
         #[tokio::test]
         async fn a_legacy_worker_answering_cancel_last_is_drained_and_kept() {

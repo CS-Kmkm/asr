@@ -9,6 +9,10 @@ pub(crate) fn model_load_failure_message(error: &AsrError) -> &'static str {
         AsrError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => "The speech worker could not be found. Run worker setup, then try loading again.",
         AsrError::Io(_) | AsrError::Protocol(_) => "The speech worker could not communicate correctly. Restart the app, then try loading again.",
         AsrError::Worker(error) => match error.code.as_str() {
+            "worker_source_missing" => "Speech worker files are missing. Reinstall the app, or run uv sync from the development checkout.",
+            "worker_setup_unavailable" => "Worker setup requires uv. Install uv or set ASR_UV to its executable, then load the model again.",
+            "worker_setup_failed" => "Worker setup failed. Check the network, free disk space and write permission, then load the model again.",
+            "worker_version_mismatch" | "unsupported_operation" => "The speech worker and app versions do not match. Update the app and run worker setup again.",
             "gpu_oom" | "cuda_oom" => "There is not enough GPU memory to load this model. Choose a smaller model or use faster-whisper on CPU.",
             "gpu_unsupported" => "This model requires a supported CUDA GPU. Choose faster-whisper to use the CPU.",
             "backend_unavailable" => "The speech worker is missing required packages. Run worker setup, then try loading again.",
@@ -56,6 +60,11 @@ mod tests {
                 "hf_repository_unavailable",
                 "hf_download_failed",
                 "invalid_api_config",
+                "worker_version_mismatch",
+                "worker_source_missing",
+                "worker_setup_unavailable",
+                "worker_setup_failed",
+                "unsupported_operation",
                 "unknown",
             ]
             .map(|code| {

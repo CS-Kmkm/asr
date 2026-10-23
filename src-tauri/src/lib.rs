@@ -25,6 +25,7 @@ mod state;
 mod storage;
 mod types;
 mod worker_log;
+mod worker_setup;
 
 #[cfg(not(debug_assertions))]
 use tauri_plugin_autostart::ManagerExt;
@@ -149,6 +150,17 @@ pub(crate) fn command_error(error: impl std::fmt::Display) -> String {
 pub(crate) fn worker_command_for_settings(settings: &Settings) -> WorkerCommand {
     let (python, project_root) = worker_runtime();
     let mut command = WorkerCommand::python(python).with_backend(&settings.asr_backend);
+    command.source_required = environment::value_os("ASR_PYTHON").is_none();
+    if environment::value_os("ASR_PYTHON").is_none() {
+        if let Some(bundled) =
+            worker_setup::bundled().filter(|bundled| project_root.as_ref() == Some(&bundled.source))
+        {
+            let mut provision = bundled.clone();
+            provision.vibevoice = settings.asr_backend == "vibevoice";
+            command.program = provision.python();
+            command.provision = Some(provision);
+        }
+    }
     command.quantization = Some(settings.model_quantization.clone());
     let executable = std::env::current_exe().ok();
     if let Some(directory) = worker_directory(project_root.as_deref(), executable.as_deref()) {
@@ -191,6 +203,9 @@ pub(crate) fn worker_command_for_settings(settings: &Settings) -> WorkerCommand 
 /// The checkout that holds the Python worker. See [`project_root_candidates`]
 /// for the search order.
 fn project_root() -> Option<PathBuf> {
+    if let Some(bundled) = worker_setup::bundled() {
+        return Some(bundled.source.clone());
+    }
     let executable = std::env::current_exe().ok();
     let current_dir = std::env::current_dir().ok();
     find_project_root(
@@ -1321,12 +1336,24 @@ fn setup_app(
     log_dir: Option<&Path>,
     startup_diagnostics: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if !cfg!(debug_assertions) {
+        worker_setup::install(
+            &app.path().resource_dir()?,
+            &app.path().app_local_data_dir()?,
+        );
+    }
     // Must precede the first worker spawn (initialize_model_runtime).
     // A missing log directory only loses diagnostics, never startup.
     if let Some(directory) = log_dir {
         if worker_log::install(directory).is_ok() {
             worker_log::record_app_start(startup_diagnostics);
         }
+    }
+    if let Some(bundled) = worker_setup::bundled() {
+        worker_log::record_startup_detail(&format!(
+            "Bundled worker root: {}\n",
+            bundled.source.display()
+        ));
     }
     let database = database_path(app.handle())?;
     let database_line = database_diagnostics(&database, current_build_uses_release_data());

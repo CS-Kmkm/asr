@@ -12,7 +12,9 @@ from typing import Any, Callable, Iterable, Iterator, TextIO
 
 from .backends import Backend, BackendError, CancelCheck, cancelled_error, create_backend
 
-SUPPORTED_OPERATIONS = "load, transcribe, cancel, shutdown"
+PROTOCOL_VERSION = 1
+WORKER_VERSION = "0.1.0"
+SUPPORTED_OPERATIONS = "hello, load, transcribe, cancel, shutdown"
 
 
 def _configure_protocol_stdio() -> None:
@@ -101,6 +103,13 @@ class Worker:
             return error_response(None, "invalid_request", "Request id is required"), False
         operation = request.get("command", request.get("op"))
         try:
+            if operation == "hello":
+                return {
+                    "id": request_id,
+                    "ok": True,
+                    "protocol_version": PROTOCOL_VERSION,
+                    "worker_version": WORKER_VERSION,
+                }, False
             if operation == "load":
                 quantization = request.get("quantization", "4bit")
                 if not isinstance(quantization, str):

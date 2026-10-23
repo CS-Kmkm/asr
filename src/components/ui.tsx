@@ -19,6 +19,8 @@ export function ModelProgressBar({ progress }: { progress: ModelProgress }) {
   const label =
     progress.stage === "load"
       ? t("Loading into memory")
+      : progress.stage === "setup"
+        ? t("Preparing worker environment")
       : ratio !== null && completedBytes !== null && totalBytes !== null
         ? `${Math.round(ratio * 100)}% (${formatBytes(completedBytes)} / ${formatBytes(totalBytes)})`
         : t("Starting download");

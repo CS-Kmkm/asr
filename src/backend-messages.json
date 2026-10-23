@@ -862,5 +862,25 @@
   "The speech model could not be loaded. Check worker setup and the model configuration, then try again.": {
     "code": "model_load_failed",
     "ja": "音声モデルを読み込めませんでした。ワーカーのセットアップとモデル設定を確認し、再試行してください。"
+  },
+  "The speech worker and app versions do not match. Update the app and run worker setup again.": {
+    "code": "model_load_worker_version_mismatch",
+    "ja": "音声ワーカーとアプリのバージョンが一致しません。アプリを更新し、ワーカーのセットアップをやり直してください。"
+  },
+  "Worker setup requires uv. Install uv or set ASR_UV to its executable, then load the model again.": {
+    "code": "worker_setup_unavailable",
+    "ja": "ワーカーのセットアップには uv が必要です。uv をインストールするか ASR_UV に実行ファイルを指定し、モデルを再読み込みしてください。"
+  },
+  "Worker setup failed. Check the network, free disk space and write permission, then load the model again.": {
+    "code": "worker_setup_failed",
+    "ja": "ワーカーのセットアップに失敗しました。ネットワーク、ディスクの空き容量と書き込み権限を確認し、モデルを再読み込みしてください。"
+  },
+  "Preparing the speech worker environment. Dependencies are downloaded on first setup.": {
+    "code": "worker_setup_preparing",
+    "ja": "音声ワーカーの環境を準備しています。初回セットアップでは依存パッケージをダウンロードします。"
+  },
+  "Speech worker files are missing. Reinstall the app, or run uv sync from the development checkout.": {
+    "code": "worker_source_missing",
+    "ja": "音声ワーカーのファイルがありません。アプリを再インストールするか、開発用チェックアウトで uv sync を実行してください。"
   }
 }

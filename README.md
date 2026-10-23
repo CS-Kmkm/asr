@@ -69,7 +69,7 @@ contain transcript, audio, window-title, or clipboard content.
 - Windows 11 and WebView2
 - Rust stable with the MSVC target and Visual Studio 2022 Build Tools
 - Node.js 20 or newer
-- Python 3.10 through 3.13
+- uv（開発環境は `.python-version` の Python 3.12 を使用）
 - NVIDIA CUDA-capable GPU with 12 GB VRAM or more — **required only for the
   optional VibeVoice backend**; the default faster-whisper backend runs on CPU
   and needs no GPU (GPU optional for speed)
@@ -78,18 +78,31 @@ VibeVoice 4-bit and 8-bit modes require `bitsandbytes`. CPU fallback is
 intentionally disabled for VibeVoice. A current NVIDIA driver with
 `nvidia-smi` available is required when using VibeVoice.
 
+## 配布版のセットアップ
+
+配布版にはワーカーのソースと依存ロックを同梱します。uv を事前にインストールし、
+PATH に追加するか `ASR_UV` へ実行ファイルを指定してください。Rust、Node、Python の
+開発環境は配布版の実行には不要です。Setup でモデルを読み込むと、uv が Python 3.12 と
+必要なパッケージをユーザーデータ内へ構築します。初回はネットワークと空き容量が必要です。
+GPU 用の VibeVoice は追加依存を取得します。構築に失敗した場合は表示された案内に従い、
+再度モデルを読み込んでください。
+
+インストーラーの新規ユーザー環境での受け入れ確認は進行中です。開発用 release exe は
+チェックアウト内でも実行できます。配布リソースがある場合はそちらが優先されます。
+
 ## Setup
+
+開発用の手順です。uv が管理する `.venv` は自動検出されます。別の Python を
+使うときだけ `ASR_PYTHON` を指定してください。配布方式は
+[ADR-0003](docs/adr/0003-python-sidecar-distribution.md) を参照してください。
 
 ```powershell
 pnpm install
-py -3.10 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -e .
-$env:ASR_PYTHON = "$PWD\.venv\Scripts\python.exe"
+uv sync
 pnpm run tauri dev
 ```
 
-`pip install -e .` installs the default faster-whisper stack (CPU-capable, no
+`uv sync` installs the default faster-whisper stack (CPU-capable, no
 GPU required). On first setup, select **Download and load speech model**, or use
 **Load Model** on the Models page. Startup does not download a model before
 setup is complete. Later dictations prepare the selected model before recording. The worker
@@ -100,7 +113,7 @@ To use the optional VibeVoice backend (GPU required, long-form/high-accuracy),
 install its extra dependencies and select it in Settings:
 
 ```powershell
-pip install -e ".[vibevoice]"
+uv sync --extra vibevoice
 # then: Settings → ASR backend → VibeVoice (GPU)
 ```
 
@@ -156,7 +169,7 @@ argument to the worker or the `ASR_WORKER_BACKEND` environment variable.
 ### faster-whisper (default, CPU-capable)
 
 The default backend. Runs on CPU (int8) or CUDA (int8/fp16). No NVIDIA GPU
-required. Installed by `pip install -e .`.
+required. Installed by `uv sync`.
 
 The Whisper model is configured via `ASR_FASTER_WHISPER_MODEL` (default:
 `large-v3-turbo`). The model is downloaded from Hugging Face on first load.

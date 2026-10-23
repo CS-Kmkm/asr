@@ -15,6 +15,16 @@ from asr_worker.worker import Worker, _configure_protocol_stdio, serve
 
 
 class WorkerTests(IsolatedWorkerTestCase):
+    def test_hello_reports_version_without_loading_the_model(self) -> None:
+        worker = Worker(MockBackend())
+        response, stop = worker.handle({"id": "handshake", "command": "hello"})
+        self.assertEqual(response, {
+            "id": "handshake", "ok": True,
+            "protocol_version": 1, "worker_version": "0.1.0",
+        })
+        self.assertFalse(worker.loaded)
+        self.assertFalse(stop)
+
     def test_protocol_stdio_is_forced_to_utf8(self) -> None:
         input_bytes = io.BytesIO()
         output_bytes = io.BytesIO()
