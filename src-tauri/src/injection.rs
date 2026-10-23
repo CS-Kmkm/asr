@@ -404,17 +404,6 @@ impl SystemTextInjector {
             report_loss: None,
         }
     }
-    /// Only an empty draft has no session. Every insertion outcome is retained
-    /// so correction completion cannot retry an initial paste. Errors occur
-    /// before any target input is queued (the clipboard may have changed).
-    pub(crate) fn begin_provisional(
-        &self,
-        draft: &str,
-        target: &TargetWindow,
-        monitor: &InputMonitor,
-    ) -> Result<Option<ProvisionalInsertion>, InjectionError> {
-        batch::begin(&self.backend, self.options, draft, target, monitor)
-    }
     pub(crate) fn begin_live_provisional(
         &self,
         draft: &str,
@@ -674,7 +663,6 @@ impl TargetText {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClipboardExclusion {
     ExcludeFromHistory,
-    AllowHistory,
 }
 
 /// A deferred final paste is strict only after input since recording started.

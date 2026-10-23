@@ -3,19 +3,86 @@ use tokio::sync::watch;
 
 const VERIFY_ATTEMPTS: usize = 50;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuardMoment {
+    BeforePaste,
+    VerifyPaste,
+    /// A queued paste can no longer be undone. An unavailable IME query on
+    /// an additive target does not explain whether that paste was applied.
+    ExplainQueued,
+}
+
+/// The ordered safety checks shared by insertion and its diagnostic report.
+/// Reading clipboard state and sending input remain outside this evaluator.
+fn evaluate_guard<B: Backend>(
+    backend: &B,
+    target: &TargetWindow,
+    activity: Option<(&InputMonitor, u64)>,
+    policy: SafetyPolicy,
+    moment: GuardMoment,
+    expected: Option<&TargetText>,
+) -> Result<(), InsertionDetail> {
+    if target.is_this_app() {
+        return Err(InsertionDetail::NoExternalTarget);
+    }
+    if let Some((monitor, checkpoint)) = activity {
+        let unchanged = if moment == GuardMoment::BeforePaste {
+            monitor.unchanged_since(checkpoint)
+        } else {
+            monitor.unchanged_since_injected_paste(checkpoint)
+        };
+        if !unchanged {
+            return Err(InsertionDetail::UserActivity);
+        }
+    }
+    backend
+        .validate_target(target)
+        .map_err(|error| match error {
+            InjectionError::SecureTarget | InjectionError::PrivilegeMismatch => {
+                InsertionDetail::TargetProtected
+            }
+            _ => InsertionDetail::TargetChanged,
+        })?;
+    match backend.ime_composition_active(target) {
+        Ok(Some(true)) => return Err(InsertionDetail::ImeActive),
+        Ok(active) if !policy.permits_ime(active) => return Err(InsertionDetail::ImeUnknown),
+        Err(_) if moment != GuardMoment::ExplainQueued || policy != SafetyPolicy::Additive => {
+            return Err(InsertionDetail::ImeUnknown)
+        }
+        _ => {}
+    }
+    if moment == GuardMoment::BeforePaste && policy == SafetyPolicy::FinalAdditive {
+        match backend.selection_is_empty(target) {
+            Ok(true) => {}
+            Ok(false) => return Err(InsertionDetail::SelectionActive),
+            Err(_) => return Err(InsertionDetail::SelectionUnknown),
+        }
+    }
+    if let Some(expected) = expected {
+        match backend.target_text(target) {
+            Ok(actual) if actual.same_content(expected) => {}
+            Ok(_) => return Err(InsertionDetail::TargetChanged),
+            Err(_) => return Err(InsertionDetail::TargetUnreadable),
+        }
+    }
+    Ok(())
+}
+
 fn safe<B: Backend>(
     backend: &B,
     target: &TargetWindow,
     activity: Option<(&InputMonitor, u64)>,
     policy: SafetyPolicy,
 ) -> bool {
-    !target.is_this_app()
-        && activity.is_none_or(|(monitor, checkpoint)| monitor.unchanged_since(checkpoint))
-        && backend.validate_target(target).is_ok()
-        && backend
-            .ime_composition_active(target)
-            .is_ok_and(|active| policy.permits_ime(active))
-        && policy.permits_selection(backend, target)
+    evaluate_guard(
+        backend,
+        target,
+        activity,
+        policy,
+        GuardMoment::BeforePaste,
+        None,
+    )
+    .is_ok()
 }
 
 /// Waiting longer could not change the paste decision: the captured target is
@@ -63,11 +130,15 @@ fn safe_after_injected_paste<B: Backend>(
     activity: Option<(&InputMonitor, u64)>,
     policy: SafetyPolicy,
 ) -> bool {
-    activity.is_none_or(|(monitor, checkpoint)| monitor.unchanged_since_injected_paste(checkpoint))
-        && backend.validate_target(target).is_ok()
-        && backend
-            .ime_composition_active(target)
-            .is_ok_and(|active| policy.permits_ime(active))
+    evaluate_guard(
+        backend,
+        target,
+        activity,
+        policy,
+        GuardMoment::VerifyPaste,
+        None,
+    )
+    .is_ok()
 }
 
 /// The user's clipboard during one insertion attempt.
@@ -278,10 +349,15 @@ fn paste<B: Backend>(
     if cancel.is_some_and(|receiver| *receiver.borrow()) {
         return Err(InjectionError::Cancelled);
     }
-    if !safe(backend, target, activity, policy)
-        || !backend
-            .target_text(target)
-            .is_ok_and(|actual| actual.same_content(before))
+    if evaluate_guard(
+        backend,
+        target,
+        activity,
+        policy,
+        GuardMoment::BeforePaste,
+        Some(before),
+    )
+    .is_err()
     {
         if cancel.is_some_and(|receiver| *receiver.borrow()) {
             return Err(InjectionError::Cancelled);
@@ -293,10 +369,15 @@ fn paste<B: Backend>(
     if cancel.is_some_and(|receiver| *receiver.borrow()) {
         return Err(InjectionError::Cancelled);
     }
-    if !safe(backend, target, activity, policy)
-        || !backend
-            .target_text(target)
-            .is_ok_and(|actual| actual.same_content(before))
+    if evaluate_guard(
+        backend,
+        target,
+        activity,
+        policy,
+        GuardMoment::BeforePaste,
+        Some(before),
+    )
+    .is_err()
     {
         if cancel.is_some_and(|receiver| *receiver.borrow()) {
             return Err(InjectionError::Cancelled);
@@ -470,50 +551,26 @@ pub(super) fn diagnose<B: Backend>(
     after_paste: bool,
     guard: FinalGuard,
 ) -> InsertionDetail {
-    let strict = guard == FinalGuard::AfterInput;
     if target.is_this_app() {
         return InsertionDetail::NoExternalTarget;
     }
     let Some(checkpoint) = checkpoint.filter(|_| monitor.checkpoint().is_some()) else {
         return InsertionDetail::InputMonitorUnavailable;
     };
-    // Our own queued paste chord (Ctrl+V or Shift+Insert) may still be
-    // visible as a held modifier.
-    let unchanged = if after_paste {
-        monitor.unchanged_since_injected_paste(checkpoint)
+    let moment = if after_paste {
+        GuardMoment::ExplainQueued
     } else {
-        monitor.unchanged_since(checkpoint)
+        GuardMoment::BeforePaste
     };
-    if !unchanged {
-        return InsertionDetail::UserActivity;
-    }
-    match backend.validate_target(target) {
-        Err(InjectionError::SecureTarget | InjectionError::PrivilegeMismatch) => {
-            return InsertionDetail::TargetProtected;
-        }
-        Err(_) => return InsertionDetail::TargetChanged,
-        Ok(()) => {}
-    }
-    match backend.ime_composition_active(target) {
-        Ok(Some(true)) => return InsertionDetail::ImeActive,
-        Ok(Some(false)) => {}
-        // Only a paste after input requires an explicitly inactive IME.
-        _ if strict => return InsertionDetail::ImeUnknown,
-        Ok(None) => {}
-        // Every paste guard requires an answer, so a failed query blocked a
-        // paste that was never sent. It says nothing about readability.
-        Err(_) if !after_paste => return InsertionDetail::ImeUnknown,
-        Err(_) => {}
-    }
-    // A queued paste's payload remains intact even if the selection later
-    // changes. These reasons describe only a paste that was never sent, and
-    // only a paste after input is refused for a selection.
-    if strict && !after_paste {
-        match backend.selection_is_empty(target) {
-            Ok(true) => {}
-            Ok(false) => return InsertionDetail::SelectionActive,
-            Err(_) => return InsertionDetail::SelectionUnknown,
-        }
+    if let Err(detail) = evaluate_guard(
+        backend,
+        target,
+        Some((monitor, checkpoint)),
+        guard.policy(),
+        moment,
+        None,
+    ) {
+        return detail;
     }
     if backend.target_text(target).is_err() {
         return InsertionDetail::TargetUnreadable;
@@ -578,6 +635,9 @@ pub(super) fn replace_selection_monitored<B: Backend>(
     )
 }
 
+/// Legacy additive-draft entry used to verify fallback behavior. Production
+/// live sessions always use begin_live with a recording-start checkpoint.
+#[cfg(test)]
 pub(super) fn begin<B: Backend>(
     backend: &B,
     options: InjectionOptions,
@@ -652,8 +712,8 @@ fn begin_with_checkpoint<B: Backend>(
         });
         (result, range)
     } else if allow_untracked {
-        // Inserting the local result does not require permission to replace it
-        // later. Reuse ordinary insertion guards, and never retry on completion.
+        // Only the test-only legacy begin entry enables this branch. The
+        // production begin_live path never pastes an untracked hypothesis.
         (insert(backend, options, draft, target)?, None)
     } else {
         // A live hypothesis must remain replaceable. Do not paste a fragment
@@ -1425,6 +1485,12 @@ pub(super) mod tests {
         pub(crate) fn content(&self) -> String {
             let text = self.text.borrow();
             format!("{}{}{}", text.before, text.selected, text.after)
+        }
+        pub(crate) fn set_selected_text(&self, selected: &str) {
+            self.text.borrow_mut().selected = selected.into();
+        }
+        pub(crate) fn set_text_readable(&self, readable: bool) {
+            self.text_readable.set(readable);
         }
         /// Consumes the unrestored-clipboard record, as the platform backends do.
         pub(crate) fn take_clipboard_not_restored(&self) -> bool {
