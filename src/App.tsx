@@ -30,6 +30,7 @@ import {
   listDictionary,
   listHistory,
   runGpuDiagnostics,
+  openDiagnosticsFolder,
   loadModel,
   startRecording,
   stopRecording,
@@ -753,6 +754,11 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     return true;
   }
 
+  async function openLogs() {
+    try { await openDiagnosticsFolder(); }
+    catch { showNotice(t("The diagnostics folder could not be opened."), "error"); }
+  }
+
   async function diagnoseGpu() {
     if (gpuChecking) return;
     setGpuChecking(true);
@@ -1016,6 +1022,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
 
         {page === "models" && (
           <ModelsPage
+            onOpenLogs={() => void openLogs()}
             gpu={gpu}
             settings={settings}
             asrBackendOptions={asrBackendOptions}
@@ -1070,6 +1077,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
 
         {page === "diagnostics" && (
           <DiagnosticsPage
+            onOpenLogs={() => void openLogs()}
             state={localizedState}
             gpu={gpu}
             statusLabel={statusLabel}

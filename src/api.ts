@@ -17,6 +17,10 @@ import type {
 
 const inTauri = "__TAURI_INTERNALS__" in window;
 
+export async function openDiagnosticsFolder(): Promise<void> {
+  if (inTauri) await invoke("open_diagnostics_folder");
+}
+
 export async function setShortcutCapture(captureId: number, active: boolean): Promise<void> {
   if (inTauri) await invoke("set_shortcut_capture", { captureId, active });
 }

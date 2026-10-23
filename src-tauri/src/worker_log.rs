@@ -174,13 +174,141 @@ pub(crate) fn mark_worker_start() {
     append(marker.as_bytes());
 }
 
-/// Copy a worker's stderr into the installed sink until the stream closes.
+/// Third-party libraries may write paths, request bodies or keys to stderr.
+/// Persist only structured, allowlisted diagnostics and fixed native hints.
+fn filtered_worker_line(line: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(line).ok()?.trim();
+    let raw = match text.strip_prefix("ASR_DIAGNOSTIC ") {
+        Some(raw) => raw,
+        None => {
+            if text.to_ascii_lowercase().contains("cublas64_12.dll") {
+                return Some(
+                    b"worker diagnostic: cuBLAS 12 library could not be loaded\n".to_vec(),
+                );
+            }
+            return None;
+        }
+    };
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let operation = value.get("operation")?.as_str()?;
+    if value.get("event")?.as_str()? != "exception"
+        || !matches!(operation, "load" | "transcribe" | "startup" | "internal")
+    {
+        return None;
+    }
+    let chain = value.get("chain")?.as_array()?;
+    if chain.len() > 8 {
+        return None;
+    }
+    let mut safe_chain = Vec::new();
+    for cause in chain {
+        let kind = cause.get("type")?.as_str()?;
+        let kind = if matches!(
+            kind,
+            "RuntimeError"
+                | "ValueError"
+                | "TypeError"
+                | "OSError"
+                | "FileNotFoundError"
+                | "PermissionError"
+                | "ModuleNotFoundError"
+                | "ImportError"
+                | "MemoryError"
+                | "BackendError"
+                | "HTTPError"
+                | "ReadTimeout"
+                | "ConnectTimeout"
+                | "Exception"
+        ) {
+            kind
+        } else {
+            "Exception"
+        };
+        let hint = cause.get("hint")?.as_str()?;
+        let hint = if matches!(
+            hint,
+            "missing_cublas12"
+                | "missing_cudnn9"
+                | "out_of_memory"
+                | "tokenizer_configuration"
+                | "model_file"
+                | "invalid_device"
+                | "invalid_api_config"
+                | "unsupported_backend"
+                | "serve_auth_required"
+                | "serve_dependencies_missing"
+        ) {
+            hint
+        } else {
+            "details_redacted"
+        };
+        let frames = cause.get("frames")?.as_array()?;
+        if frames.len() > 24 {
+            return None;
+        }
+        let safe_frames: Vec<_> = frames
+            .iter()
+            .filter_map(|frame| {
+                let module = frame.get("module")?.as_str()?;
+                let module = if matches!(
+                    module,
+                    "asr_worker.backends"
+                        | "asr_worker.worker"
+                        | "asr_worker.api"
+                        | "asr_worker.download"
+                ) {
+                    module
+                } else {
+                    "dependency"
+                };
+                let line = frame.get("line")?.as_u64()?.min(100_000);
+                Some(serde_json::json!({"module": module, "line": line}))
+            })
+            .collect();
+        safe_chain.push(serde_json::json!({"type": kind, "hint": hint, "frames": safe_frames}));
+    }
+    Some(
+        format!(
+            "ASR_DIAGNOSTIC {}\n",
+            serde_json::json!({"event": "exception", "operation": operation, "chain": safe_chain})
+        )
+        .into_bytes(),
+    )
+}
+
+/// Copy safe worker diagnostics, bounding an unterminated line as well as disk.
 pub(crate) async fn pump<R: AsyncRead + Unpin>(mut stderr: R) {
     let mut buffer = [0_u8; 8 * 1024];
+    let mut line = Vec::new();
+    let mut oversized = false;
     loop {
         match stderr.read(&mut buffer).await {
             Ok(0) | Err(_) => break,
-            Ok(read) => append(&buffer[..read]),
+            Ok(read) => {
+                for byte in &buffer[..read] {
+                    if *byte == b'\n' {
+                        if !oversized {
+                            if let Some(safe) = filtered_worker_line(&line) {
+                                append(&safe);
+                            }
+                        }
+                        line.clear();
+                        oversized = false;
+                    } else if !oversized {
+                        if line.len() < 64 * 1024 {
+                            line.push(*byte);
+                        } else {
+                            line.clear();
+                            oversized = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if !oversized {
+        if let Some(safe) = filtered_worker_line(&line) {
+            append(&safe);
         }
     }
 }
@@ -188,6 +316,24 @@ pub(crate) async fn pump<R: AsyncRead + Unpin>(mut stderr: R) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_diagnostics_keep_stack_locations_without_arbitrary_text() {
+        let raw = br#"ASR_DIAGNOSTIC {"event":"exception","operation":"transcribe","secret":"private transcript","chain":[{"type":"RuntimeError","hint":"missing_cublas12","message":"hf_secret C:/private/audio.wav private transcript","frames":[{"module":"asr_worker.backends","function":"private transcript","line":123}]}]}"#;
+        let filtered = String::from_utf8(filtered_worker_line(raw).unwrap()).unwrap();
+        assert!(filtered.contains("asr_worker.backends"));
+        assert!(filtered.contains("123"));
+        assert!(filtered.contains("missing_cublas12"));
+        for secret in ["private", "hf_secret", "audio.wav", "C:/"] {
+            assert!(!filtered.contains(secret));
+        }
+        assert!(filtered_worker_line(
+            b"unstructured library message containing private transcript"
+        )
+        .is_none());
+        let hint = filtered_worker_line(b"C:/private/key CUDA failed cublas64_12.dll").unwrap();
+        assert!(!String::from_utf8(hint).unwrap().contains("private"));
+    }
 
     fn read(path: &Path) -> Vec<u8> {
         fs::read(path).unwrap_or_default()

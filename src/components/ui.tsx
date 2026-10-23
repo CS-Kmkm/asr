@@ -17,7 +17,11 @@ export function ModelProgressBar({ progress }: { progress: ModelProgress }) {
       ? Math.min(1, completedBytes / totalBytes)
       : null;
   const label =
-    progress.stage === "load"
+    progress.stage === "cpu_fallback"
+      ? t("CUDA initialization failed. Preparing CPU fallback")
+      : progress.stage === "warmup"
+      ? t("Warming up speech model")
+      : progress.stage === "load"
       ? t("Loading into memory")
       : progress.stage === "setup"
         ? t("Preparing worker environment")

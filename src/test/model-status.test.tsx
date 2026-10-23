@@ -1,4 +1,5 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { ModelProgressBar } from "../components/ui";
 import { expect, test, vi } from "vitest";
 import { defaultSettings } from "../api";
 import { I18nProvider } from "../i18n";
@@ -27,4 +28,15 @@ test("Models distinguishes loading, ready, error and not loaded and offers Retry
     expect(screen.getByText(label)).toBeTruthy();
     if (state === "error") expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
   }
+});
+
+test("model errors can open diagnostics and CPU preparation stays localized", async () => {
+  const open = vi.fn();
+  const props = { settings: defaultSettings, gpu: null, asrBackendOptions: [], modelLoading: false, onConfigureModel: vi.fn(), onSaveCustomModel: async () => true, onDiagnoseGpu: vi.fn(), onOpenLogs: open };
+  const model: ModelStatus = { modelId: "mock", quantization: "4bit", installed: false, state: "error", detail: "" };
+  const view = render(<I18nProvider language="ja"><ModelsPage {...props} model={model} /></I18nProvider>);
+  fireEvent.click(screen.getByRole("button", { name: "診断ログを開く" }));
+  expect(open).toHaveBeenCalledOnce();
+  view.rerender(<I18nProvider language="ja"><ModelProgressBar progress={{ stage: "cpu_fallback", model: null, completedBytes: null, totalBytes: null }} /></I18nProvider>);
+  expect(screen.getByRole("progressbar").textContent).toContain("CPUを準備中");
 });

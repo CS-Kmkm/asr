@@ -18,6 +18,8 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
 
 - 通信路はワーカープロセスの **stdin / stdout** である。stderrは診断ログ専用であり、
   プロトコルメッセージを含まない。
+- JSONL用に元のstdoutのfdを複製し、通常のPython出力とネイティブのfd 1はstderrへ向ける。
+  応答・進捗・キャンセル応答は同じロック付きwriterから出力する。
 - **1行に1メッセージ**(JSON Lines)。リクエスト・レスポンスはいずれも単一のJSONオブジェクトで、
   末尾に改行 (`\n`) を付与して送出する。
 - 文字エンコーディングは **UTF-8** である。ワーカーは `ensure_ascii=False` で応答を直列化するため、
@@ -154,7 +156,7 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 |---|---|---|---|
 | `id` | リクエストと同一 | 必須 | 対象リクエストのエコーバック。 |
 | `event` | `"progress"` | 必須 | 通知行であることの識別子。 |
-| `stage` | `"download"` / `"load"` | 必須 | `download` はモデルファイル取得中、`load` はローカルのファイルをメモリへ読み込む段階。 |
+| `stage` | `"download"` / `"load"` / `"warmup"` / `"cpu_fallback"` | 必須 | ファイル取得、メモリ読み込み、ダミー音声での初期推論、CUDA失敗後のCPU準備を示す。 |
 | `model` | 文字列 | 任意 | ダウンロード対象のHugging Faceリポジトリ。 |
 | `completed_bytes` | 整数 | 任意 | ダウンロード済みバイト数(全ファイルの合計)。 |
 | `total_bytes` | 整数 / `null` | 任意 | 総バイト数。Hugging Faceがファイルメタデータを返すまでは不明であり `null` になる。 |
@@ -395,6 +397,7 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
 | `transcript_truncated` | backends.py (`VibeVoiceBackend.transcribe`) | 生成が `max_new_tokens`(音声長からの推定、上限 `VIBEVOICE_MAX_NEW_TOKENS` = (15分の録音上限 + 60秒) × 40 + 128 = 38528、`ASR_MAX_NEW_TOKENS` で上書き可)に達し、終端トークンなしで打ち切られた。途中までの出力は返さない(長尺録音の分割または `ASR_MAX_NEW_TOKENS` の引き上げが必要)。 |
 | `missing_api_key` | backends.py | HTTP バックエンドの API キーが未設定。 |
 | `invalid_api_config` | backends.py | API の URL、タイムアウトなどの設定が不正。 |
+| `invalid_device` | backends.py | `ASR_DEVICE` が不正。`auto`・`cpu`・`cuda` のいずれかを指定する。 |
 | `api_request_failed` | backends.py | HTTP 接続または API のステータスが失敗。 |
 | `invalid_api_response` | backends.py | API 応答に有効な text がない。 |
 | `serve_dependencies_missing` | api.py | HTTP サーバー用の追加依存が未インストール。 |
@@ -409,8 +412,23 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
   `hf_rate_limited`, `hf_download_failed`, `model_load_failed`, `transcription_failed`,
   `transcript_truncated`)は
   `handle` 内で捕捉され、そのコードのままレスポンスに反映される。
-- それ以外の想定外例外はすべて `internal_error` に丸められ、例外の型名のみがstderrに出力される
-  (`message` には例外の内部詳細を含めない)。
+- それ以外の想定外例外は `internal_error` に丸める。stderrには `ASR_DIAGNOSTIC` で始まる
+  構造化された例外チェーンとスタック位置を出力する。任意の例外メッセージ、ソース行、ローカル変数、
+  例外に含まれるユーザーのパスは保存せず、cuBLAS不足など既知の原因だけを固定のhintで示す。
+  Rustはこの形式を検証・再構成し、任意のライブラリ出力を破棄する。ログはアプリのログディレクトリの
+  `asr-worker.log` に保存し、1MiBで1世代ローテーションする。Modelsのエラー表示とDiagnosticsから
+  フォルダーを開ける。プロトコルの `message` に内部例外の詳細は含めない。
+  同じログには起動時のworkerルート・設定ファイル・データベースのパスも記録するため、
+  ログ共有時にはこの起動メタデータが含まれる点を確認する。
+
+### 3.1 デバイス準備
+
+faster-whisperの `ASR_DEVICE=auto|cpu|cuda` は既定で `auto`。
+ロード後に0.5秒の無音を実際にデコードし、結果を破棄する。`auto` でCUDAの生成・ウォームアップが
+Python例外として失敗した場合はCPU/int8で1回再試行する。`cpu` はCUDAを照会せず、`cuda` は
+CPUへ切り替えない。ネイティブライブラリのプロセスabortはPython例外として捕捉できないため、
+実機での確認を要する。VibeVoiceにはこのCPU経路はない。通常の文字起こしのデコード設定は維持する。
+
 
 ---
 

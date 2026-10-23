@@ -1,4 +1,8 @@
 {
+  "The diagnostics folder could not be opened.": {
+    "code": "diagnostics_folder_open_failed",
+    "ja": "診断ログのフォルダーを開けませんでした。"
+  },
   "Transcribing with the configured speech provider.": {
     "code": "transcribing_with_speech_provider",
     "ja": "設定された音声認識プロバイダーで文字起こししています。"

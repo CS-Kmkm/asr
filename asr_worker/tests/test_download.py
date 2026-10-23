@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 from asr_worker.tests.support import IsolatedWorkerTestCase
 from pathlib import Path
@@ -37,6 +38,18 @@ def fake_hub(snapshot: Path, calls: list[dict]) -> types.ModuleType:
 
 
 class ByteProgressTqdmTests(IsolatedWorkerTestCase):
+    def test_parallel_updates_reach_the_exact_total_in_order(self) -> None:
+        events: list[dict] = []
+        bar = byte_progress_tqdm(events.append)(total=8_000, unit="B")
+        def download(_):
+            for _ in range(1_000):
+                bar.update(1)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(download, range(8)))
+        self.assertEqual(bar.completed, 8_000)
+        self.assertEqual(events[-1], {"completed_bytes": 8_000, "total_bytes": 8_000})
+        self.assertEqual([event["completed_bytes"] for event in events], sorted(event["completed_bytes"] for event in events))
+
     def test_reports_bytes_while_the_download_total_grows(self) -> None:
         events: list[dict] = []
         # huggingface_hub creates the aggregate bar with a zero total and raises

@@ -12,6 +12,13 @@ test("browser shortcut warnings are empty lists", async () => {
   expect(invoke).not.toHaveBeenCalled();
 });
 
+test("diagnostic folder uses a fixed native command without a client path", async () => {
+  Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+  const api = await import("../api");
+  await api.openDiagnosticsFolder();
+  expect(invoke).toHaveBeenCalledWith("open_diagnostics_folder");
+});
+
 test("native shortcut warnings keep the IPC list type", async () => {
   Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
   vi.mocked(invoke).mockResolvedValue(["Ask Anything (Ctrl+Shift+A)"]);

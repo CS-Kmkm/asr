@@ -9,6 +9,7 @@ import wave
 from pathlib import Path
 from typing import Any, Callable, Iterator, Protocol
 from urllib.parse import urlparse
+from .diagnostics import log_exception
 
 from .download import (
     FASTER_WHISPER_ALLOW_PATTERNS,
@@ -239,6 +240,7 @@ def wav_duration_seconds(audio_path: Path) -> float | None:
 
 
 def map_backend_exception(exc: BaseException, operation: str, backend_label: str = "VibeVoice") -> BackendError:
+    log_exception(exc, operation)
     details: list[str] = []
     current: BaseException | None = exc
     seen: set[int] = set()
@@ -548,6 +550,10 @@ class FasterWhisperBackend(ProgressReporting):
         )
         self.model_name = f"faster-whisper:{self.model_id}"
         self.model: Any = None
+        self.device_policy = os.environ.get("ASR_DEVICE", "auto").strip().lower()
+        if self.device_policy not in {"auto", "cpu", "cuda"}:
+            raise BackendError("invalid_device", "ASR_DEVICE must be auto, cpu, or cuda")
+        self.device: str | None = None
 
     def load(self, quantization: str) -> None:
         if quantization not in QUANTIZATIONS:
@@ -562,16 +568,56 @@ class FasterWhisperBackend(ProgressReporting):
         try:
             import ctranslate2
 
-            cuda = ctranslate2.get_cuda_device_count() > 0
+            cuda = self.device_policy == "cuda"
+            if self.device_policy == "auto":
+                try:
+                    cuda = ctranslate2.get_cuda_device_count() > 0
+                except Exception as exc:
+                    log_exception(exc, "load")
+                    self.report_progress("cpu_fallback")
+                    cuda = False
             device = "cuda" if cuda else "cpu"
             compute_type = faster_whisper_compute_type(quantization, cuda=cuda)
             model_source = self._resolve_model_files()
             self.report_progress("load")
-            self.model = WhisperModel(model_source, device=device, compute_type=compute_type)
+            try:
+                self.model = WhisperModel(model_source, device=device, compute_type=compute_type)
+                self._warm_up()
+            except Exception as exc:
+                if not cuda or self.device_policy != "auto":
+                    raise
+                log_exception(exc, "load")
+                # CUDA libraries can be missing even when a driver reports a
+                # device. Exercise kernels before declaring the model ready.
+                self.model = None
+                gc.collect()
+                self.report_progress("cpu_fallback")
+                device = "cpu"
+                self.model = WhisperModel(model_source, device="cpu", compute_type="int8")
+                self._warm_up()
+            self.device = device
         except BackendError:
             raise
         except BaseException as exc:
+            self.model = None
+            self.device = None
             raise map_backend_exception(exc, "load", "faster-whisper") from exc
+
+    def _warm_up(self) -> None:
+        import numpy as np
+
+        self.report_progress("warmup")
+        segments, _ = self.model.transcribe(
+            np.zeros(8_000, dtype=np.float32),
+            language="en",
+            beam_size=1,
+            vad_filter=False,
+            condition_on_previous_text=False,
+        )
+        # Decoding is lazy. Consume it so missing CUDA DLLs fail during load,
+        # and discard the artificial transcript without emitting user output.
+        for _ in segments:
+            pass
 
     def _resolve_model_files(self) -> str:
         """Return a local model source, downloading it only when it is missing.
@@ -599,6 +645,7 @@ class FasterWhisperBackend(ProgressReporting):
 
     def unload(self) -> None:
         self.model = None
+        self.device = None
         gc.collect()
 
     def transcribe(

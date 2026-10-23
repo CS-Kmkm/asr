@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, TextIO
 
 from .backends import Backend, BackendError, CancelCheck, cancelled_error, create_backend
+from .diagnostics import log_exception
 
 PROTOCOL_VERSION = 1
 WORKER_VERSION = "0.1.0"
@@ -28,6 +29,15 @@ def _configure_protocol_stdio() -> None:
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
             reconfigure(encoding="utf-8", errors="strict")
+
+
+def _isolate_protocol_stdout() -> TextIO:
+    """Reserve the original stdout pipe for JSONL; redirect library fd 1 too."""
+    sys.stdout.flush()
+    protocol = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8", errors="strict")
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    sys.stdout = sys.stderr
+    return protocol
 
 
 def _sanitize_unicode(value: Any) -> Any:
@@ -199,7 +209,7 @@ class Worker:
         except BackendError as exc:
             return error_response(request_id, exc.code, exc.message), operation == "shutdown"
         except BaseException as exc:
-            print(f"worker operation failed: {type(exc).__name__}", file=sys.stderr, flush=True)
+            log_exception(exc, "internal")
             return error_response(request_id, "internal_error", "Unexpected worker error"), operation == "shutdown"
 
 
@@ -358,7 +368,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         backend = create_backend(args.backend)
     except BackendError as exc:
-        print(f"worker startup failed: {exc.code}", file=sys.stderr)
+        log_exception(exc, "startup")
+        guidance = {
+            "invalid_api_config": "Check ASR_API_BASE_URL and ASR_API_TIMEOUT_SECONDS.",
+            "invalid_device": "Set ASR_DEVICE to auto, cpu, or cuda.",
+        }.get(exc.code, "Check the selected ASR backend and its configuration.")
+        print(f"worker startup failed: {exc.code}: {guidance}", file=sys.stderr)
         return 2
     if args.serve:
         try:
@@ -379,11 +394,13 @@ def main(argv: list[str] | None = None) -> int:
         # Progress notifications break a client that predates them, and the
         # worker runs from this repository while the desktop app is a
         # separately built binary. Only a client that asks for them gets them.
-        serve(
-            Worker(backend),
-            _stdin_lines(),
-            notify_progress=os.environ.get("ASR_WORKER_PROGRESS") == "1",
-        )
+        with _isolate_protocol_stdout() as output:
+            serve(
+                Worker(backend),
+                _stdin_lines(),
+                output_stream=output,
+                notify_progress=os.environ.get("ASR_WORKER_PROGRESS") == "1",
+            )
     return 0
 
 

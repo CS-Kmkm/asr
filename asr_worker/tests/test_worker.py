@@ -4,6 +4,8 @@ import io
 import json
 import os
 import tempfile
+import subprocess
+import sys
 import unittest
 
 from asr_worker.tests.support import IsolatedWorkerTestCase
@@ -15,6 +17,30 @@ from asr_worker.worker import Worker, _configure_protocol_stdio, serve
 
 
 class WorkerTests(IsolatedWorkerTestCase):
+    def test_library_stdout_cannot_corrupt_the_protocol_pipe(self) -> None:
+        script = '''
+import os, sys
+from asr_worker.worker import Worker, serve, _isolate_protocol_stdout
+from asr_worker.backends import MockBackend
+class Noisy(MockBackend):
+    def load(self, quantization):
+        print("library Python output", flush=True)
+        os.write(1, b"library native output\\n")
+        super().load(quantization)
+with _isolate_protocol_stdout() as output:
+    serve(Worker(Noisy()), sys.stdin, output_stream=output)
+'''
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            input='{"id":1,"command":"load"}\n{"id":2,"command":"shutdown"}\n',
+            capture_output=True, text=True, encoding="utf-8", timeout=10, check=True,
+        )
+        responses = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([response["id"] for response in responses], [1, 2])
+        self.assertTrue(all(response["ok"] for response in responses))
+        self.assertIn("library Python output", result.stderr)
+        self.assertIn("library native output", result.stderr)
+
     def test_hello_reports_version_without_loading_the_model(self) -> None:
         worker = Worker(MockBackend())
         response, stop = worker.handle({"id": "handshake", "command": "hello"})
@@ -57,7 +83,7 @@ class WorkerTests(IsolatedWorkerTestCase):
         self.assertEqual(response["id"], None)
         self.assertEqual(response["error"]["code"], "invalid_json")
 
-    def test_unexpected_failure_logs_only_its_type_to_stderr(self) -> None:
+    def test_unexpected_failure_logs_a_redacted_stack_to_stderr(self) -> None:
         # stderr is persisted to the desktop app's worker log, so an exception
         # quoting the request or its result must not reach it or the response.
         private = ("PROMPT-SECRET", "DICT-TERM", "AUDIO-NAME", "TRANSCRIPT-TEXT", "sk-SECRET")
@@ -89,7 +115,9 @@ class WorkerTests(IsolatedWorkerTestCase):
                     output,
                 )
 
-        self.assertEqual(stderr.getvalue(), "worker operation failed: RuntimeError\n")
+        diagnostic = json.loads(stderr.getvalue().removeprefix("ASR_DIAGNOSTIC "))
+        self.assertEqual(diagnostic["chain"][0]["type"], "RuntimeError")
+        self.assertTrue(diagnostic["chain"][0]["frames"])
         response = json.loads(output.getvalue().splitlines()[-1])
         self.assertEqual(response["error"]["code"], "internal_error")
         for value in private:

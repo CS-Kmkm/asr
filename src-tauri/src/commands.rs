@@ -4880,6 +4880,18 @@ mod tests {
     }
 }
 
+#[tauri::command]
+pub(crate) async fn open_diagnostics_folder(app: AppHandle) -> Result<(), String> {
+    const FAILED: &str = "The diagnostics folder could not be opened.";
+    tokio::task::spawn_blocking(move || {
+        let directory = app.path().app_log_dir().map_err(|_| FAILED.to_owned())?;
+        std::fs::create_dir_all(&directory).map_err(|_| FAILED.to_owned())?;
+        open_fixed_search(&directory.to_string_lossy()).map_err(|_| FAILED.to_owned())
+    })
+    .await
+    .map_err(|_| FAILED.to_owned())?
+}
+
 async fn storage_task<T: Send + 'static>(
     run: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {

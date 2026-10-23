@@ -7,11 +7,13 @@ export function DiagnosticsPage({
   gpu,
   statusLabel,
   onDiagnoseGpu,
+  onOpenLogs,
 }: {
   state: AppState;
   gpu: GpuDiagnostics | null;
   statusLabel: string;
   onDiagnoseGpu: () => void;
+  onOpenLogs?: () => void;
 }) {
   const { t } = useI18n();
   return (
@@ -33,6 +35,7 @@ export function DiagnosticsPage({
       <button className="secondary" onClick={onDiagnoseGpu}>
         {t("Run GPU probe")}
       </button>
+      {onOpenLogs && <button className="secondary" onClick={onOpenLogs}>{t("Open diagnostic logs")}</button>}
     </section>
   );
 }

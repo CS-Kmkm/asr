@@ -1555,6 +1555,7 @@ pub fn run() {
             commands::list_dictionary,
             commands::add_dictionary_entry,
             commands::update_dictionary_entry,
+            commands::open_diagnostics_folder,
             commands::delete_dictionary_entry,
             commands::import_dictionary_csv,
             commands::list_dictionary_candidates,

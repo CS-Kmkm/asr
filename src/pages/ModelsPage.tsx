@@ -50,6 +50,7 @@ export function ModelsPage({
   onDiagnoseGpu,
   model,
   progress,
+  onOpenLogs,
 }: {
   gpu: GpuDiagnostics | null;
   settings: Settings;
@@ -60,6 +61,7 @@ export function ModelsPage({
   onDiagnoseGpu: () => void;
   model?: ModelStatus | null;
   progress?: ModelProgress | null;
+  onOpenLogs?: () => void;
 }) {
   const { t, language } = useI18n();
   const [backend, setBackend] = useState(settings.asrBackend);
@@ -261,6 +263,7 @@ export function ModelsPage({
         {model && <div role={model.state === "error" ? "alert" : "status"}>
           <strong>{t(model.state === "ready" ? "Ready" : model.state === "loading" ? "Model loading" : model.state === "error" ? "Model error" : "Model not loaded")}</strong>
           <p>{translateAppMessage(language, model.detail)}</p>
+          {model.state === "error" && onOpenLogs && <button className="secondary" onClick={onOpenLogs}>{t("Open diagnostic logs")}</button>}
         </div>}
         {progress && <ModelProgressBar progress={progress} />}
         <p className="model-note">

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from pathlib import Path
 from typing import Any, Callable
 
@@ -106,6 +107,7 @@ def byte_progress_tqdm(progress: ProgressCallback) -> type:
 
     last_report = 0.0
     last_reported: tuple[int, int | None] | None = None
+    report_lock = threading.RLock()
 
     class ByteProgressTqdm(tqdm):  # type: ignore[misc]
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -117,6 +119,12 @@ def byte_progress_tqdm(progress: ProgressCallback) -> type:
             super().__init__(*args, **kwargs)
 
         def update(self, n: float | None = 1) -> Any:
+            # Counter, throttle and callback form one ordered update even when
+            # huggingface_hub invokes the aggregate bar from download threads.
+            with report_lock:
+                return self._update_locked(n)
+
+        def _update_locked(self, n: float | None) -> Any:
             nonlocal last_report, last_reported
             self.completed += float(n or 0)
             if self.reports_bytes:

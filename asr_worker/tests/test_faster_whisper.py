@@ -154,7 +154,7 @@ class _FakeWhisperModel:
             "compute_type": compute_type,
         }
 
-    def transcribe(self, audio_path, language=None, hotwords=None):  # noqa: ANN001
+    def transcribe(self, audio_path, language=None, hotwords=None, **kwargs):  # noqa: ANN001
         _FakeWhisperModel.last_transcribe_kwargs = {
             "audio_path": audio_path,
             "language": language,
@@ -322,6 +322,75 @@ class TranscribeWithFakeModuleTests(IsolatedWorkerTestCase):
         model_files = patch.object(FasterWhisperBackend, "_resolve_model_files", return_value="/fake/model")
         model_files.start()
         self.addCleanup(model_files.stop)
+
+    def test_cpu_policy_never_queries_or_initializes_cuda(self) -> None:
+        modules = _install_fake_faster_whisper()
+        def unexpected_cuda_query():
+            raise AssertionError("CPU mode must not query CUDA")
+        modules["ctranslate2"].get_cuda_device_count = unexpected_cuda_query
+        with patch.dict(os.environ, {"ASR_DEVICE": "cpu"}), patch.dict(sys.modules, modules):
+            backend = FasterWhisperBackend()
+            backend.load("bf16")
+        self.assertEqual(backend.device, "cpu")
+        self.assertEqual(_FakeWhisperModel.last_init_kwargs["compute_type"], "int8")
+
+    def test_invalid_device_policy_is_actionable(self) -> None:
+        with patch.dict(os.environ, {"ASR_DEVICE": "invalid"}):
+            with self.assertRaises(BackendError) as caught:
+                FasterWhisperBackend()
+        self.assertEqual(caught.exception.code, "invalid_device")
+
+    def test_auto_uses_cpu_when_cuda_discovery_raises(self) -> None:
+        modules = _install_fake_faster_whisper()
+        def failed_probe():
+            raise RuntimeError("CUDA driver unavailable")
+        modules["ctranslate2"].get_cuda_device_count = failed_probe
+        events = []
+        backend = FasterWhisperBackend()
+        backend.progress = events.append
+        with patch.dict(sys.modules, modules):
+            backend.load("4bit")
+        self.assertEqual(backend.device, "cpu")
+        self.assertEqual(_FakeWhisperModel.last_init_kwargs["compute_type"], "int8")
+        self.assertIn({"stage": "cpu_fallback"}, events)
+
+    def test_auto_retries_cpu_when_lazy_cuda_warmup_fails(self) -> None:
+        devices: list[str] = []
+        warmups: list[tuple[str, int]] = []
+        class FailingCudaModel(_FakeWhisperModel):
+            def __init__(self, model_id, device, compute_type):
+                super().__init__(model_id, device, compute_type)
+                self.device = device
+                devices.append(device)
+
+            def transcribe(self, audio, **kwargs):
+                def decode():
+                    warmups.append((self.device, len(audio)))
+                    if self.device == "cuda":
+                        raise RuntimeError("missing CUDA DLL")
+                    yield _FakeSegment(0, 0.5, "discard this warmup")
+                return decode(), None
+
+        modules = _install_fake_faster_whisper()
+        modules["faster_whisper"].WhisperModel = FailingCudaModel
+        modules["ctranslate2"].get_cuda_device_count = lambda: 1
+        backend = FasterWhisperBackend()
+        events: list[dict] = []
+        backend.progress = events.append
+        with patch.dict(sys.modules, modules):
+            backend.load("4bit")
+        self.assertEqual(devices, ["cuda", "cpu"])
+        self.assertEqual(warmups, [("cuda", 8_000), ("cpu", 8_000)])
+        self.assertEqual(backend.device, "cpu")
+        self.assertIn({"stage": "cpu_fallback"}, events)
+
+        devices.clear()
+        with patch.dict(os.environ, {"ASR_DEVICE": "cuda"}), patch.dict(sys.modules, modules):
+            forced = FasterWhisperBackend()
+            with self.assertRaises(BackendError):
+                forced.load("8bit")
+        self.assertEqual(devices, ["cuda"])
+        self.assertIsNone(forced.model)
 
     def test_transcribe_formats_segments_and_passes_hotwords(self) -> None:
         backend = create_backend("faster-whisper")

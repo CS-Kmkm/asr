@@ -2,6 +2,7 @@
 identifier = "main-commands"
 description = "Application commands available only to the main window"
 commands.allow = [
+    "open_diagnostics_folder",
     "list_audio_devices",
     "start_recording",
     "start_microphone_test",
