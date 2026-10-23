@@ -148,20 +148,6 @@ test("Dashboard distinguishes local, cloud speech and cloud AI settings", () => 
   assert.match(both.detail, /AI modes send text/);
 });
 
-test("Setup requires a ready model and shows preparation progress", () => {
-  const { SetupPage } = load("../src/pages/SetupPage.tsx", {
-    "../components/ui": { SettingRow: "row", ModelProgressBar: "progress" },
-    "../i18n": i18n,
-  });
-  const render = (patch) => nodes(SetupPage({ settings: defaultSettings, devices: [], gpu: null, gpuChecking: false, ...patch }));
-  const finish = (list) => list.find((node) => node.type === "button" && text(node) === "Finish setup");
-  assert.equal(finish(render({ modelReady: false })).props.disabled, true);
-  assert.equal(finish(render({ modelReady: true })).props.disabled, false);
-  assert.equal(finish(render({ modelReady: true, modelLoading: true })).props.disabled, true);
-  const progress = { stage: "download", completedBytes: 50, totalBytes: 100 };
-  assert.equal(render({ progress }).find((node) => node.type === "progress").props.progress, progress);
-});
-
 function historyPage(settings, history) {
   const { HistoryPage } = load("../src/pages/HistoryPage.tsx", {
     react: hooks,

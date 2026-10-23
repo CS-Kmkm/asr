@@ -23,7 +23,7 @@ export function PrivacyPage({
         title={t("Delete audio after processing")}
         detail={t("On by default: new recordings are deleted after processing and are not kept for History playback, download, or Retry, except failed recordings kept by the setting below. Turning this on keeps recordings already saved in History until you delete them there or History retention removes them.")}
         control={
-          <Toggle
+          <Toggle label={t("Delete audio after processing")}
             checked={settings.deleteAudioAfterProcessing}
             onChange={(value) => onSave({ deleteAudioAfterProcessing: value })}
           />
@@ -44,7 +44,7 @@ export function PrivacyPage({
         title={t("Keep failed recordings for 24 hours")}
         detail={t("On by default: when transcription fails, the recording (and, for Edit, the selected text) is kept in History for 24 hours so you can retry it, even if History retention is Never or Delete audio after processing is on. It is then deleted, or as soon as a Retry succeeds, unless your History and audio settings keep it. Turning this off deletes such recordings; failed recordings are then kept only when History keeps audio.")}
         control={
-          <Toggle
+          <Toggle label={t("Keep failed recordings for 24 hours")}
             checked={settings.keepFailedTakes}
             onChange={(value) => onSave({ keepFailedTakes: value })}
           />

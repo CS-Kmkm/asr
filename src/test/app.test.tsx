@@ -2,7 +2,7 @@
 import { beforeEach, expect, test, vi } from "vitest";
 import App from "../App";
 import { defaultSettings, getSettings, getShortcutWarning, updateSettings, listDictionaryCandidates,
-  listHistory, getGpuDiagnostics, getModelStatus, getStartupHotkeyWarning, stopRecording } from "../api";
+  listHistory, getGpuDiagnostics, getModelStatus, getStartupHotkeyWarning, stopRecording, loadModel, previewHistoryRetentionPurge } from "../api";
 import type { DictionaryCandidate, HistoryItem, Settings, SettingsSnapshot } from "../types";
 
 const events = vi.hoisted(() => new Map<string, Set<(event: { payload: unknown }) => void>>());
@@ -34,6 +34,8 @@ vi.mock("../api", async (original) => {
     listDictionary: async () => [],
     listDictionaryCandidates: vi.fn(async () => []),
     stopRecording: vi.fn(),
+    previewHistoryRetentionPurge: vi.fn(async () => ({ historyItems: 0, recordings: 0 })),
+    loadModel: vi.fn(async () => ({ modelId: "mock", quantization: "4bit", installed: true, state: "ready", detail: "" })),
   };
 });
 
@@ -78,8 +80,11 @@ test("settings saves stay ordered and an old acknowledgement cannot replace a ne
   await openSettings();
   const model = screen.getByDisplayValue(settings.openaiCorrectionModel);
   fireEvent.change(model, { target: { value: "first-model" } });
+  expect(updateSettings).not.toHaveBeenCalled();
+  fireEvent.blur(model);
   await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
   fireEvent.change(model, { target: { value: "newest-model" } });
+  fireEvent.blur(model);
   expect(updateSettings).toHaveBeenCalledTimes(1);
   await act(async () => { acknowledge({ settings: { ...settings, openaiCorrectionModel: "first-model" }, revision: 2 }); });
   await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
@@ -107,6 +112,7 @@ function deferred<T>() {
 }
 const candidate = (id: number): DictionaryCandidate => ({ id, originalSpan: "open ai", preferredSpan: `Suggested-${id}`, confidence: 1, historyId: null, createdAt: "2026-10-23" });
 async function emit(name: string, payload: unknown) {
+  if (name === "app-state") payload = { message: null, messageCode: null, lastResult: null, ...(payload as Record<string, unknown>) };
   await act(async () => {
     for (const handler of events.get(name) ?? []) handler({ payload });
   });
@@ -279,4 +285,149 @@ test("Finish setup cannot save before stored settings are known", async () => {
   fireEvent.click(finish);
   expect(updateSettings).not.toHaveBeenCalled();
   expect(screen.getByRole("button", { name: "Finish setup" })).toBeTruthy();
+});
+
+test("an AI failure survives completion warnings until the next operation", async () => {
+  await openSettings();
+  await emit("app-state", { phase: "processing", stage: "correcting", operation: "recording", operationId: 10, message: "busy", messageCode: null });
+  await emit("status", { kind: "text_correction_failed", code: "ai_invalid_api_key", outcome: "using_transcript", message: "specific failure cause" });
+  const shown = document.querySelector(".notice-message")!.textContent;
+  await emit("status", { kind: "success", message: "generic completion" });
+  for (const kind of ["history_save_failed", "metric_save_failed", "artifact_cleanup_failed"]) await emit("status", { kind, message: "later operational warning" });
+  await emit("app-state", { phase: "completed", stage: "completed", operation: null, operationId: 10 });
+  expect(document.querySelector(".notice-message")!.textContent).toBe(shown);
+  await emit("app-state", { phase: "recording", stage: "recording", operation: "recording", operationId: 11 });
+  await emit("status", { kind: "success", message: "new completion" });
+  expect(document.querySelector(".notice-message")!.textContent).toBe("new completion");
+});
+
+test("History Retry retains cancellation across processing and insertion", async () => {
+  render(<App />);
+  await navigate("History");
+  for (const phase of ["processing", "injecting"]) {
+    await emit("app-state", { phase, stage: "transcribing", operation: "retry", operationId: 1, message: "different wording" });
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeTruthy();
+  }
+  await emit("app-state", { phase: "completed", stage: "completed", operation: null, operationId: 1 });
+  expect(screen.queryByRole("button", { name: "Cancel" })).toBeNull();
+});
+
+test("model configuration waits for preceding settings saves before loading", async () => {
+  const first = deferred<SettingsSnapshot>(), second = deferred<SettingsSnapshot>();
+  vi.mocked(updateSettings).mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+  await openSettings();
+  fireEvent.click(screen.getByRole("button", { name: "Interaction sounds" }));
+  await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
+  await navigate("Models");
+  fireEvent.change(screen.getByRole("combobox", { name: "ASR backend" }), { target: { value: "builtin:vibevoice" } });
+  fireEvent.click(screen.getByRole("button", { name: "Load Model" }));
+  expect(updateSettings).toHaveBeenCalledTimes(1);
+  expect(loadModel).not.toHaveBeenCalled();
+  await act(async () => first.resolve({ settings: { ...settings, interactionSounds: true }, revision: 2 }));
+  await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
+  const patch = vi.mocked(updateSettings).mock.calls[1][0];
+  expect(patch).toMatchObject({ asrBackend: "vibevoice" });
+  expect(loadModel).not.toHaveBeenCalled();
+  await act(async () => second.resolve({ settings: { ...settings, interactionSounds: true, ...patch }, revision: 3 }));
+  await waitFor(() => expect(loadModel).toHaveBeenCalledWith(null, "4bit"));
+});
+
+test("custom model creation waits for queued settings and preserves their values", async () => {
+  const first = deferred<SettingsSnapshot>(), second = deferred<SettingsSnapshot>();
+  vi.mocked(updateSettings).mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+  await openSettings();
+  fireEvent.click(screen.getByRole("button", { name: "Interaction sounds" }));
+  await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
+  await navigate("Models");
+  fireEvent.change(screen.getByRole("combobox", { name: "ASR backend" }), { target: { value: "__additional_model__" } });
+  fireEvent.change(screen.getByRole("textbox", { name: "Model ID" }), { target: { value: "org/custom" } });
+  fireEvent.click(screen.getByRole("button", { name: "Add Model" }));
+  expect(updateSettings).toHaveBeenCalledTimes(1);
+  await act(async () => first.resolve({ settings: { ...settings, interactionSounds: true }, revision: 2 }));
+  await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
+  const patch = vi.mocked(updateSettings).mock.calls[1][0];
+  expect(patch).toMatchObject({ modelId: "org/custom", customModels: [{ asrBackend: "faster-whisper", modelId: "org/custom" }] });
+  await act(async () => second.resolve({ settings: { ...settings, interactionSounds: true, ...patch }, revision: 3 }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  expect(screen.getByRole("option", { name: /org\/custom/ })).toBeTruthy();
+});
+
+test("failed Finish retains unsaved microphone selection for the next attempt", async () => {
+  settings.setupComplete = false;
+  settings.microphoneId = "previous-microphone";
+  vi.mocked(getModelStatus).mockResolvedValue({ modelId: "mock", quantization: "4bit", installed: true, state: "ready", detail: "" });
+  vi.mocked(updateSettings).mockRejectedValueOnce(new Error("save failed"));
+  render(<App />);
+  const finish = await screen.findByRole("button", { name: "Finish setup" });
+  fireEvent.change(screen.getByRole("combobox", { name: "Microphone" }), { target: { value: "" } });
+  fireEvent.click(finish);
+  await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
+  expect(vi.mocked(updateSettings).mock.calls[0][0]).toMatchObject({ microphoneId: null, setupComplete: true });
+  await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
+  expect((screen.getByRole("combobox", { name: "Microphone" }) as HTMLSelectElement).value).toBe("");
+  vi.mocked(updateSettings).mockResolvedValueOnce({ settings: { ...settings, microphoneId: null, setupComplete: true }, revision: 2 });
+  fireEvent.click(screen.getByRole("button", { name: "Finish setup" }));
+  await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
+  expect(vi.mocked(updateSettings).mock.calls[1][0]).toMatchObject({ microphoneId: null, setupComplete: true });
+});
+
+test("a failed confirmed retention save restores the displayed original value", async () => {
+  settings.historyRetention = "forever";
+  vi.mocked(updateSettings).mockRejectedValueOnce(new Error("save failed"));
+  render(<App />);
+  await changeRetention("one_week");
+  await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("save failed"));
+  await waitFor(() => expect((screen.getByRole("combobox", { name: "History retention" }) as HTMLSelectElement).value).toBe("forever"));
+});
+
+test("a successful confirmed retention save shows the new value", async () => {
+  settings.historyRetention = "forever";
+  vi.mocked(updateSettings).mockImplementation(async (patch) => ({ settings: { ...settings, ...patch }, revision: 2 }));
+  render(<App />);
+  await changeRetention("one_week");
+  await waitFor(() => expect((screen.getByRole("combobox", { name: "History retention" }) as HTMLSelectElement).value).toBe("one_week"));
+});
+
+test("confirming a delayed purge count preserves settings changed while waiting", async () => {
+  settings.historyRetention = "forever";
+  const count = deferred<{ historyItems: number; recordings: number }>();
+  vi.mocked(previewHistoryRetentionPurge).mockReturnValueOnce(count.promise);
+  let stored = settings, revision = 1;
+  vi.mocked(updateSettings).mockImplementation(async (patch) => { stored = { ...stored, ...patch }; return { settings: stored, revision: ++revision }; });
+  render(<App />);
+  await navigate("Privacy");
+  fireEvent.change(screen.getByRole("combobox", { name: "History retention" }), { target: { value: "one_week" } });
+  await waitFor(() => expect(previewHistoryRetentionPurge).toHaveBeenCalled());
+  await navigate("Settings");
+  const model = screen.getByRole("textbox", { name: "OpenAI model" });
+  fireEvent.change(model, { target: { value: "changed-while-counting" } }); fireEvent.blur(model);
+  await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
+  await act(async () => count.resolve({ historyItems: 1, recordings: 0 }));
+  await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
+  expect(stored.openaiCorrectionModel).toBe("changed-while-counting");
+  expect(stored.historyRetention).toBe("one_week");
+});
+
+test("dismissing a preparation notice preserves the Models progress display", async () => {
+  render(<App />);
+  await navigate("Models");
+  await emit("model-status", { modelId: "mock", quantization: "4bit", installed: false, state: "loading", detail: "" });
+  await emit("model-progress", { stage: "setup", model: null, completedBytes: null, totalBytes: null });
+  expect(screen.getAllByRole("progressbar")).toHaveLength(2);
+  fireEvent.click(screen.getByRole("button", { name: "Dismiss notification" }));
+  expect(screen.getAllByRole("progressbar")).toHaveLength(1);
+  expect(screen.queryByRole("button", { name: "Dismiss notification" })).toBeNull();
+});
+
+test("a startup hotkey warning never hides page progress after dismissing the loading notice", async () => {
+  vi.mocked(getStartupHotkeyWarning).mockResolvedValue(["Some saved hotkeys overlap or could not be registered."]);
+  render(<App />);
+  await navigate("Models");
+  await emit("model-status", { modelId: "mock", quantization: "4bit", installed: false, state: "loading", detail: "" });
+  await emit("status", { kind: "model_loading", message: "Loading the speech model." });
+  await emit("model-progress", { stage: "setup", model: null, completedBytes: null, totalBytes: null });
+  expect(screen.getAllByRole("progressbar")).toHaveLength(2);
+  fireEvent.click(screen.getByRole("button", { name: "Dismiss notification" }));
+  expect(screen.getAllByRole("progressbar")).toHaveLength(1);
+  expect(document.querySelector(".notice-message")!.textContent).toContain("Some saved hotkeys overlap");
 });

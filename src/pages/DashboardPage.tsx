@@ -13,6 +13,7 @@ export function DashboardPage({
   onToggleRecording,
   onCancelRecording,
   onCopyResult,
+  inactiveShortcuts = [],
 }: {
   state: AppState;
   settings: Settings;
@@ -23,6 +24,7 @@ export function DashboardPage({
   onToggleRecording: () => void;
   onCancelRecording: () => void;
   onCopyResult: (text: string) => void;
+  inactiveShortcuts?: string[];
 }) {
   const { t, language } = useI18n();
   const cloudConfigured = settings.asrBackend === "openai-compatible" || settings.correctionProvider !== "local";
@@ -70,10 +72,19 @@ export function DashboardPage({
         {state.phase === "recording" && <RecordingLevel />}
       </article>
 
-      <InfoCard label={t("HOTKEY")} value={settings.shortcuts.dictate[0]} detail={t("Global toggle shortcut")} />
+      <article className="info-card"><p className="eyebrow">{t("HOTKEY")}</p><dl>
+        {([
+          ["Dictation", settings.shortcuts.dictate], ["Voice Translate", settings.shortcuts.translate],
+          ["Speak to edit", settings.shortcuts.edit], ["Ask Anything", settings.shortcuts.ask],
+          ["Selected-text translation", [settings.translationHotkey]],
+        ] as const).map(([action, chords]) => {
+          const active = chords.filter((chord) => !inactiveShortcuts.includes(`${action} (${chord})`));
+          return active.length > 0 ? <div key={action}><dt>{t(action)}</dt><dd>{active.join(", ")}</dd></div> : null;
+        })}
+      </dl></article>
       <InfoCard
         label={t("MODEL")}
-        value={model?.installed ? model.modelId ?? t("Ready") : t("Not installed")}
+        value={model?.state === "ready" ? model.modelId ?? t("Ready") : model?.state === "loading" ? t("Model loading") : model?.state === "error" ? t("Model error") : t("Model not loaded")}
         detail={model ? translateAppMessage(language, model.detail) ?? model.detail : t("Checking local cache")}
       />
       {state.lastResult && (

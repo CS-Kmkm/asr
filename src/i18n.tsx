@@ -1,4 +1,4 @@
-import { createContext, useContext, useMemo, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useMemo, type ReactNode } from "react";
 import type { UiLanguage } from "./types";
 import backendMessages from "./backend-messages.json";
 
@@ -23,6 +23,29 @@ const backendTemplates = Object.entries(backendCatalogue).filter(([, entry]) => 
 });
 
 const en = {
+  "Current translation target": "Current translation target",
+  "Language to add": "Language to add",
+  "Global profile formality": "Global profile formality",
+  "Global profile detail": "Global profile detail",
+  "Global profile guidance": "Global profile guidance",
+  "Profile scope": "Profile scope",
+  "Profile formality": "Profile formality",
+  "Profile detail": "Profile detail",
+  "Enter a non-empty model ID without control characters (up to 512 bytes).": "Enter a non-empty model ID without control characters (up to 512 bytes).",
+  "Use 1–128 ASCII letters, digits or underscores.": "Use 1–128 ASCII letters, digits or underscores.",
+  "Use a numeric loopback HTTP(S) endpoint ending in /v1.": "Use a numeric loopback HTTP(S) endpoint ending in /v1.",
+  "Enter a token limit between 128 and 32768.": "Enter a token limit between 128 and 32768.",
+  "Unavailable device": "Unavailable device",
+  "Refresh microphones": "Refresh microphones",
+  "Record shortcut": "Record shortcut",
+  "Press a key combination": "Press a key combination",
+  "Shortcut recording cancelled": "Shortcut recording cancelled",
+  "Unsupported shortcut key": "Unsupported shortcut key",
+  "Unsaved shortcut changes": "Unsaved shortcut changes",
+  "Copy notification": "Copy notification",
+  "Model not loaded": "Model not loaded",
+  "Model loading": "Model loading",
+  "Model error": "Model error",
   "Cloud speech is blocked until you grant endpoint consent in Privacy.": "Cloud speech is blocked until you grant endpoint consent in Privacy.",
   "Speech recognition stays local.": "Speech recognition stays local.",
   "AI modes send text to the selected provider after consent.": "AI modes send text to the selected provider after consent.",
@@ -243,6 +266,29 @@ const en = {
 } as const;
 export type MessageKey = keyof typeof en | keyof typeof backendMessages;
 const ja: Record<keyof typeof en, string> = {
+  "Current translation target": "現在の翻訳先",
+  "Language to add": "追加する言語",
+  "Global profile formality": "全体プロファイルの文体",
+  "Global profile detail": "全体プロファイルの詳しさ",
+  "Global profile guidance": "全体プロファイルの指示",
+  "Profile scope": "プロファイルの適用先",
+  "Profile formality": "プロファイルの文体",
+  "Profile detail": "プロファイルの詳しさ",
+  "Enter a non-empty model ID without control characters (up to 512 bytes).": "モデル ID は空にせず、制御文字を含まない512バイト以内で入力してください。",
+  "Use 1–128 ASCII letters, digits or underscores.": "半角英数字とアンダースコアで1〜128文字を入力してください。",
+  "Use a numeric loopback HTTP(S) endpoint ending in /v1.": "数値ループバックアドレスで、末尾が /v1 の HTTP(S) URL を入力してください。",
+  "Enter a token limit between 128 and 32768.": "トークン上限は128〜32768の整数で入力してください。",
+  "Unavailable device": "利用できないデバイス",
+  "Refresh microphones": "マイク一覧を更新",
+  "Record shortcut": "ショートカットを記録",
+  "Press a key combination": "キーの組み合わせを押してください",
+  "Shortcut recording cancelled": "ショートカットの記録を中止しました",
+  "Unsupported shortcut key": "このショートカットキーは使えません",
+  "Unsaved shortcut changes": "ショートカットの変更は未保存です",
+  "Copy notification": "通知をコピー",
+  "Model not loaded": "モデル未読み込み",
+  "Model loading": "モデル読み込み中",
+  "Model error": "モデルエラー",
   "Cloud speech is blocked until you grant endpoint consent in Privacy.": "プライバシー画面で送信先への同意を行うまで、クラウド音声は利用できません。",
   "Speech recognition stays local.": "音声認識はローカルで実行します。",
   "AI modes send text to the selected provider after consent.": "AIモードでは同意後、選択したプロバイダーへテキストを送信します。",
@@ -741,6 +787,7 @@ export function translateAppMessage(language: UiLanguage, message: string | null
 }
 const LanguageContext = createContext<UiLanguage>("ja");
 export function I18nProvider({ language, children }: { language: UiLanguage; children: ReactNode }) {
+  useEffect(() => { document.documentElement.lang = language; }, [language]);
   return <LanguageContext.Provider value={language}>{children}</LanguageContext.Provider>;
 }
 export function useI18n() {

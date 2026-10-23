@@ -1241,6 +1241,22 @@ async fn follow_cancel_chord(app: AppHandle) {
 }
 
 fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
+    let focused = app
+        .get_webview_window("main")
+        .is_some_and(|window| window.is_focused().unwrap_or(false));
+    let capture = app
+        .state::<Services>()
+        .shortcut_capture
+        .lock()
+        .ok()
+        .and_then(|mut capture| capture.take(focused));
+    if let Some(capture_id) = capture {
+        let _ = app.emit(
+            "shortcut-captured",
+            serde_json::json!({"captureId": capture_id, "chord": shortcut.to_string()}),
+        );
+        return;
+    }
     let route = app
         .state::<Services>()
         .shortcut_routes
@@ -1523,6 +1539,7 @@ pub fn run() {
             commands::get_settings,
             commands::get_ui_preferences,
             commands::get_shortcut_warning,
+            commands::set_shortcut_capture,
             commands::get_settings_repair_status,
             commands::persist_repaired_settings,
             commands::get_model_status,

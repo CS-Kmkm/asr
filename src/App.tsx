@@ -1,4 +1,6 @@
+import { useNoticeQueue, type Notice } from "./hooks/useNoticeQueue";
 import { useSettings } from "./hooks/useSettings";
+import { useAudioDevices } from "./hooks/useAudioDevices";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -24,7 +26,7 @@ import {
   getModelStatus,
   getUiPreferences,
   getStartupHotkeyWarning,
-  listAudioDevices,
+  getShortcutWarning,
   listDictionary,
   listHistory,
   runGpuDiagnostics,
@@ -36,7 +38,6 @@ import {
 import type {
   AppState,
   AsrBackend,
-  AudioDevice,
   AudioLevel,
   CustomModel,
   DictionaryEntry,
@@ -165,24 +166,8 @@ const translationLanguageKeys: Record<string, MessageKey> = {
   ko: "Korean",
 };
 
-interface Notice {
-  message: string;
-  code?: string;
-  outcome?: string;
-  severity: "info" | "success" | "warning" | "error";
-  // Kind of the backend status event, when the notice came from one.
-  kind?: string;
-}
-
-function retainImportantNotice(current: Notice | null, next: Notice): Notice {
-  const severity = { info: 0, success: 1, warning: 2, error: 3 };
-  const priority = (notice: Notice) => severity[notice.severity] * 2
-    + Number(Boolean(notice.code?.startsWith("ai_") && notice.outcome !== undefined));
-  return current && priority(current) > priority(next) ? current : next;
-}
-
 // Notices that only describe model preparation and are cleared once it ends.
-const MODEL_PREPARATION_KINDS = ["model_loading", "model_downloading"];
+const MODEL_PREPARATION_KINDS = ["model_loading", "model_downloading", "worker_setup"];
 
 const WARNING_STATUS_KINDS = new Set([
   "artifact_cleanup_failed",
@@ -568,15 +553,17 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const [model, setModel] = useState<ModelStatus | null>(null);
   const [modelLoading, setModelLoading] = useState(false);
   const [modelProgress, setModelProgress] = useState<ModelProgress | null>(null);
+  const [progressNoticeHidden, setProgressNoticeHidden] = useState(false);
   const [recordingAction, setRecordingAction] = useState(false);
   const recordingActionRef = useRef(false);
   const [gpu, setGpu] = useState<GpuDiagnostics | null>(null);
   const [gpuChecking, setGpuChecking] = useState(false);
-  const [notice, setNotice] = useState<Notice | null>(null);
+  const { notice, push: pushNotice, dismiss: dismissNotice, clear: clearNotices, removeKinds: removeNoticeKinds } = useNoticeQueue();
   const noticeOperationRef = useRef(0);
   const [startupHotkeyWarnings, setStartupHotkeyWarnings] = useState<string[]>([]);
+  const [inactiveShortcuts, setInactiveShortcuts] = useState<string[]>([]);
   const showNotice = (message: string, severity: Notice["severity"] = "info") =>
-    setNotice((current) => retainImportantNotice(current, { message, severity }));
+    pushNotice({ message, severity });
   const { settings, settingsRef, settingsLoaded, editSettingsLocally, settingsReady, queueSettingsSave } = useSettings({
     onLanguageChange,
     onSetupNeeded: () => setPage("setup"),
@@ -584,7 +571,12 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     onNotReady: () => showNotice(t("Settings have not been loaded yet, so changes were not saved. Try again in a moment."), "warning"),
   });
   const [noticeCopied, setNoticeCopied] = useState(false);
-  const [devices, setDevices] = useState<AudioDevice[]>([]);
+  const { devices, refresh: refreshDevices } = useAudioDevices(page === "settings" || page === "setup", (error) => showNotice(String(error), "error"));
+  useEffect(() => {
+    let active = true;
+    void getShortcutWarning().then((value) => { if (active) setInactiveShortcuts(value); }).catch(() => {});
+    return () => { active = false; };
+  }, [settings.shortcuts, settings.translationHotkey]);
   const [dictionary, setDictionary] = useState<DictionaryEntry[]>([]);
   const [dictionaryCandidates, setDictionaryCandidates] = useState<DictionaryCandidate[]>([]);
   const dictionaryRequestRef = useRef(0);
@@ -599,7 +591,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       const id = next.operationId;
       if (typeof id === "number") {
         if (id < noticeOperationRef.current) return;
-        if (id > noticeOperationRef.current) setNotice(null);
+        if (id > noticeOperationRef.current) clearNotices();
         noticeOperationRef.current = id;
       } else if (noticeOperationRef.current > 0) return;
       setState(next);
@@ -609,18 +601,16 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       listHistory(),
       getModelStatus(),
       getGpuDiagnostics(),
-      listAudioDevices(),
       listDictionary(),
     ])
       .then(
-        ([nextState, nextHistory, nextModel, nextGpu, nextDevices, nextDictionary]) => {
+        ([nextState, nextHistory, nextModel, nextGpu, nextDictionary]) => {
           applyAppState(nextState);
           if (historyRequestRef.current === 0 && historyFilterRef.current === "all") {
             setHistory(nextHistory);
           }
           setModel(nextModel);
           setGpu(nextGpu);
-          setDevices(nextDevices);
           setDictionary(nextDictionary);
         },
       )
@@ -629,25 +619,24 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       listen<AppState>("app-state", (event) => applyAppState(event.payload)),
       listen<ModelStatus>("model-status", (event) => {
         setModel(event.payload);
+        setProgressNoticeHidden(false);
         // Preparation is over once the worker reports an outcome, so its
         // progress and its running commentary both stop here.
         if (event.payload.state !== "loading") {
           setModelProgress(null);
-          setNotice((current) =>
-            current?.kind && MODEL_PREPARATION_KINDS.includes(current.kind) ? null : current,
-          );
+          removeNoticeKinds(MODEL_PREPARATION_KINDS);
         }
       }),
       listen<ModelProgress>("model-progress", (event) => setModelProgress(event.payload)),
       listen<GpuDiagnostics>("gpu-diagnostics", (event) => setGpu(event.payload)),
       listen<{ kind: string; code?: string; outcome?: string; message: string }>("status", (event) =>
-        setNotice((current) => retainImportantNotice(current, {
+        pushNotice({
           message: event.payload.message,
           code: event.payload.code,
           outcome: event.payload.outcome,
           severity: statusSeverity(event.payload.kind),
           kind: event.payload.kind,
-        })),
+        }),
       ),
     ]);
     return () => {
@@ -691,6 +680,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   async function copyHistoryText(text: string) {
     try {
       await copyToClipboard(text);
+      showNotice(t("Copied"), "success");
     } catch (error) {
       showNotice(String(error), "error");
     }
@@ -749,13 +739,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     }
     // A saved hotkey that still cannot be registered does not fail the save,
     // but the notice names the action that stays unavailable.
-    showNotice(
-      [
-        translate(saved.uiLanguage, "Settings saved locally."),
-        ...hotkeyWarnings.map((message) => translateAppMessage(saved.uiLanguage, message)),
-      ].join(" "),
-      hotkeyWarnings.length > 0 ? "warning" : "success",
-    );
+    if (hotkeyWarnings.length > 0) showNotice(hotkeyWarnings.map((message) => translateAppMessage(saved.uiLanguage, message)).join(" "), "warning");
     if (patch.historyRetention !== undefined || patch.deleteAudioAfterProcessing !== undefined) {
       // The optimistic render can read before the settings transaction has
       // purged old rows. Refresh again after its acknowledgement so that read
@@ -961,6 +945,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             <button
               key={item.id}
               className={page === item.id ? "active" : ""}
+              aria-current={page === item.id ? "page" : undefined}
               onClick={() => setPage(item.id)}
             >
               {t(item.label)}
@@ -995,6 +980,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             onToggleRecording={() => void toggleRecording()}
             onCancelRecording={() => void cancelRecording()}
             onCopyResult={(text) => void copyHistoryText(text)}
+            inactiveShortcuts={inactiveShortcuts}
           />
         )}
 
@@ -1002,6 +988,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
           <SetupPage
             settings={settings}
             devices={devices}
+            onRefreshDevices={() => void refreshDevices()}
             gpu={gpu}
             gpuChecking={gpuChecking}
             onSettingsChange={editSettingsLocally}
@@ -1009,7 +996,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             onLoadModel={() => void prepareModel()}
             modelLoading={preparingModel}
             modelReady={model?.state === "ready" && model.quantization === settings.modelQuantization}
-            progress={shownProgress}
+            progress={modelProgress}
             onDiagnoseGpu={() => void diagnoseGpu()}
             onFinish={() => {
               void saveSettings({ setupComplete: true }).then((saved) => { if (saved) setPage("dashboard"); });
@@ -1021,6 +1008,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
         <SettingsPage
             settings={settings}
             devices={devices}
+            onRefreshDevices={() => void refreshDevices()}
             recording={state.phase === "recording"}
             onSave={(patch) => void saveSettings(patch)}
           />
@@ -1032,6 +1020,8 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             settings={settings}
             asrBackendOptions={asrBackendOptions}
             modelLoading={modelLoading}
+            model={model}
+            progress={modelProgress}
             onConfigureModel={(configuration) => void prepareModel(configuration)}
             onSaveCustomModel={saveCustomModel}
             onDiagnoseGpu={() => void diagnoseGpu()}
@@ -1088,10 +1078,11 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
         )}
       </main>
 
-      {(shownNotice || shownProgress) && (
+      {(shownNotice || (shownProgress && !progressNoticeHidden)) && (
         <div
           className={`notice ${shownNotice?.severity ?? "info"}${preparingModel && !showingStartupWarning ? " loading" : ""}`}
           aria-live="polite"
+          role={shownNotice?.severity === "error" ? "alert" : "status"}
         >
           {preparingModel && !showingStartupWarning && <span className="progress-ring" aria-hidden="true" />}
           <div className="notice-body">
@@ -1105,15 +1096,16 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
                   ? t("Downloading the speech model files.")
                   : t("Loading the speech model."))}
             </button>
-            {shownProgress && <ModelProgressBar progress={shownProgress} />}
+            {shownProgress && !progressNoticeHidden && <ModelProgressBar progress={shownProgress} />}
           </div>
+          <button type="button" className="secondary" onClick={() => void copyNotice()} aria-label={t("Copy notification")}>{t("Copy")}</button>
           {noticeCopied && <span className="notice-copied">{t("Copied")}</span>}
           <button
             className="notice-dismiss"
             onClick={() => {
+              if (preparingModel) setProgressNoticeHidden(true);
               if (notice) {
-                setNotice(null);
-                setModelProgress(null);
+                dismissNotice();
               } else setStartupHotkeyWarnings([]);
             }}
             aria-label={t("Dismiss notification")}

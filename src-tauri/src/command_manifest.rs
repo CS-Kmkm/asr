@@ -14,6 +14,7 @@ pub const APP_COMMANDS: &[&str] = &[
     "get_settings",
     "get_ui_preferences",
     "get_shortcut_warning",
+    "set_shortcut_capture",
     "get_settings_repair_status",
     "persist_repaired_settings",
     "get_model_status",

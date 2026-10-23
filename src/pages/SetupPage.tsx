@@ -1,3 +1,4 @@
+import { ShortcutField } from "../components/ShortcutField";
 import { ModelProgressBar, SettingRow } from "../components/ui";
 import type { AudioDevice, GpuDiagnostics, ModelProgress, Settings, UiLanguage } from "../types";
 import { translateAppMessage, useI18n, type MessageKey } from "../i18n";
@@ -30,6 +31,7 @@ export function SetupPage({
   progress = null,
   onDiagnoseGpu,
   onFinish,
+  onRefreshDevices,
 }: {
   settings: Settings;
   devices: AudioDevice[];
@@ -43,6 +45,7 @@ export function SetupPage({
   progress?: ModelProgress | null;
   onDiagnoseGpu: () => void;
   onFinish: () => void;
+  onRefreshDevices?: () => void;
 }) {
   const { t, language } = useI18n();
   return (
@@ -55,30 +58,28 @@ export function SetupPage({
           title={t("Microphone")}
           detail={t("Captured only while recording.")}
           control={
-            <select
+            <div><select
               value={settings.microphoneId ?? ""}
               onChange={(e) =>
                 onSettingsChange({ ...settings, microphoneId: e.target.value || null })
               }
             >
               <option value="">{t("System default")}</option>
+              {settings.microphoneId && !devices.some((device) => device.id === settings.microphoneId) && <option value={settings.microphoneId}>{t("Unavailable device")}</option>}
               {devices.map((device) => (
                 <option key={device.id} value={device.id}>
                   {device.name}
                   {device.isDefault ? ` (${t("default")})` : ""}
                 </option>
               ))}
-            </select>
+            </select>{onRefreshDevices && <button type="button" className="secondary" onClick={onRefreshDevices}>{t("Refresh microphones")}</button>}</div>
           }
         />
         <SettingRow
           title={t("Global hotkey")}
           detail={t("Default recording toggle.")}
           control={
-            <input
-              value={settings.shortcuts.dictate[0]}
-              onChange={(e) => onSettingsChange({ ...settings, shortcuts: { ...settings.shortcuts, dictate: [e.target.value, ...settings.shortcuts.dictate.slice(1)] } })}
-            />
+            <ShortcutField label={t("Global hotkey")} value={settings.shortcuts.dictate[0]} onChange={(value) => onSettingsChange({ ...settings, shortcuts: { ...settings.shortcuts, dictate: [value, ...settings.shortcuts.dictate.slice(1)] } })} />
           }
         />
         <SettingRow

@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { ShortcutField, normalizeShortcutText } from "../components/ShortcutField";
+import { GainSlider } from "../components/CommitField";
 import { SettingRow, Toggle } from "../components/ui";
 import { AiCorrectionSettings } from "../components/AiCorrectionSettings";
 import { SettingsRepairBanner } from "../components/SettingsRepairBanner";
@@ -59,11 +61,13 @@ export function SettingsPage({
   onSave,
   devices,
   recording,
+  onRefreshDevices,
 }: {
   settings: Settings;
   onSave: (patch: Partial<Settings>) => void;
   devices: AudioDevice[];
   recording: boolean;
+  onRefreshDevices?: () => void;
 }) {
   const { language, t } = useI18n();
   const [shortcuts, setShortcuts] = useState(settings.shortcuts);
@@ -232,7 +236,8 @@ export function SettingsPage({
   }
 
   function commitShortcuts() {
-    const next = Object.fromEntries(Object.entries(shortcuts).map(([mode, chords]) => [mode, chords.map((chord) => chord.trim())])) as Settings["shortcuts"];
+    if ([...Object.values(shortcuts).flat(), translationHotkey].some((chord) => !normalizeShortcutText(chord))) { setShortcutError(t("Unsupported shortcut key")); return; }
+    const next = Object.fromEntries(Object.entries(shortcuts).map(([mode, chords]) => [mode, chords.map((chord) => normalizeShortcutText(chord) ?? chord.trim())])) as Settings["shortcuts"];
     if (Object.values(next).some((chords) => chords.length < 1 || chords.length > 4 || chords.some((chord) => !chord))) {
       setShortcutError(t("Each voice mode needs one to four non-empty shortcuts."));
       return;
@@ -267,7 +272,7 @@ export function SettingsPage({
       return;
     }
     setShortcutError(null);
-    const nextTranslationHotkey = translationHotkey.trim();
+    const nextTranslationHotkey = normalizeShortcutText(translationHotkey)!;
     if (JSON.stringify(next) !== JSON.stringify(settings.shortcuts) || nextTranslationHotkey !== settings.translationHotkey) {
       onSave({ shortcuts: next, translationHotkey: nextTranslationHotkey });
     }
@@ -319,13 +324,14 @@ export function SettingsPage({
             {speechLocaleRegistry.map(({ tag, label }) => <option key={tag} value={tag}>{t(label)}</option>)}
           </select>} />
         <SettingRow title={t("Microphone")} detail={t("Choose the input device used for recording and microphone testing.")}
-          control={<select value={settings.microphoneId ?? ""} onChange={(event) => {
+          control={<div><select value={settings.microphoneId ?? ""} onChange={(event) => {
             if (testRunningRef.current) void stopTest();
             onSave({ microphoneId: event.target.value || null });
           }}>
             <option value="">{t("System default")}</option>
+            {settings.microphoneId && !devices.some((device) => device.id === settings.microphoneId) && <option value={settings.microphoneId}>{t("Unavailable device")}</option>}
             {devices.map((device) => <option key={device.id} value={device.id}>{device.name}{device.isDefault ? ` (${t("Default")})` : ""}</option>)}
-          </select>} />
+          </select>{onRefreshDevices && <button type="button" className="secondary" onClick={onRefreshDevices}>{t("Refresh microphones")}</button>}</div>} />
         <SettingRow title={t("Microphone level test")} detail={t("Test the selected microphone. Audio is measured live and never saved.")}
           control={<div className="microphone-test-control">
             <button type="button" className={testRunning ? "secondary" : "primary"} disabled={recording || testStopping} onClick={() => void (testRunning ? stopTest() : startTest())}>
@@ -350,7 +356,7 @@ export function SettingsPage({
               : ""}`}
             control={<div className="shortcut-list">
               {shortcuts[mode].map((chord, index) => <div className="shortcut-item" key={`${mode}-${index}`}>
-                <input aria-label={`${t(label)} ${index + 1}`} value={chord} onChange={(event) => setShortcut(mode, index, event.target.value)} />
+                <ShortcutField label={`${t(label)} ${index + 1}`} value={chord} onChange={(value) => setShortcut(mode, index, value)} conflict={[...Object.entries(shortcuts).flatMap(([other, values]) => values.filter((_, otherIndex) => other !== mode || otherIndex !== index)), translationHotkey].some((other) => normalizeShortcutText(other) !== null && normalizeShortcutText(other) === normalizeShortcutText(chord))} />
                 <button type="button" className="secondary" aria-label={`${t("Remove shortcut")} ${chord || index + 1}`} disabled={shortcuts[mode].length <= 1} onClick={() => removeShortcut(mode, index)}>{t("Remove")}</button>
                 {isCancelKeyChord(chord) && <p className="settings-warning" role="note">{t(ESC_ROUTE_WARNING)}</p>}
               </div>)}
@@ -364,16 +370,18 @@ export function SettingsPage({
         }).join(", ")}</p>}
         <SettingRow title={t("Selected-text translation hotkey")} detail={t("Translates selected text; the default is Ctrl+Shift+T.")}
           control={<div className="shortcut-item">
-            <input value={translationHotkey} aria-label={t("Selected-text translation hotkey")} onChange={(event) => { setTranslationHotkey(event.target.value); setShortcutError(null); }} onKeyDown={(event) => {
+            <ShortcutField value={translationHotkey} label={t("Selected-text translation hotkey")} onChange={(value) => { setTranslationHotkey(value); setShortcutError(null); }} onKeyDown={(event) => {
+              if (event.nativeEvent.isComposing || event.keyCode === 229) return;
               if (event.key === "Enter") { event.preventDefault(); commitShortcuts(); event.currentTarget.blur(); }
               if (event.key === "Escape") { setTranslationHotkey(settings.translationHotkey); setShortcutError(null); event.currentTarget.blur(); }
             }} />
             {isCancelKeyChord(translationHotkey) && <p className="settings-warning" role="note">{t(ESC_ROUTE_WARNING)}</p>}
           </div>} />
+        {(JSON.stringify(shortcuts) !== JSON.stringify(settings.shortcuts) || translationHotkey !== settings.translationHotkey) && <p role="status">{t("Unsaved shortcut changes")}</p>}
         <button type="button" className="primary shortcut-save" onClick={commitShortcuts}>{t("Save shortcuts")}</button>
         <SettingRow title={t("Voice Translate target")} detail={`${t("The first language is the default. Reorder the list or choose the active target.")} ${t("Voice and selected-text Translate send text to the provider shown under AI text correction, even when correction is off.")} ${t("Provider:")} ${settings.correctionProvider === "openai" ? "OpenAI" : settings.correctionProvider === "gemini" ? "Google Gemini" : t("Local (OpenAI-compatible)")}.`}
           control={<div className="translation-target-settings">
-            <select value={settings.translationTargetLanguage} onChange={(event) => onSave({ translationTargetLanguage: event.target.value })}>
+            <select aria-label={t("Current translation target")} value={settings.translationTargetLanguage} onChange={(event) => onSave({ translationTargetLanguage: event.target.value })}>
               {settings.translationTargetLanguages.map((language) => {
                 const option = translationLanguages.find(([code]) => code === language);
                 return <option key={language} value={language}>{option ? t(option[1]) : language}</option>;
@@ -388,7 +396,7 @@ export function SettingsPage({
               </li>;
             })}</ol>
             <div className="translation-target-add">
-              <select value={languageToAdd} onChange={(event) => setLanguageToAdd(event.target.value)}>
+              <select aria-label={t("Language to add")} value={languageToAdd} onChange={(event) => setLanguageToAdd(event.target.value)}>
                 {translationLanguages
                   .filter(([code]) => !settings.translationTargetLanguages.includes(code))
                   .map(([code, label]) => <option key={code} value={code}>{t(label)}</option>)}
@@ -407,25 +415,26 @@ export function SettingsPage({
             if (suppressTranslationInstructionBlurRef.current) { suppressTranslationInstructionBlurRef.current = false; return; }
             if (translationInstruction !== settings.translationInstruction) onSave({ translationInstruction });
           }} onKeyDown={(event) => {
+              if (event.nativeEvent.isComposing || event.keyCode === 229) return;
             if (event.key === "Enter") { event.preventDefault(); if (translationInstruction !== settings.translationInstruction) onSave({ translationInstruction }); suppressTranslationInstructionBlurRef.current = true; event.currentTarget.blur(); }
             if (event.key === "Escape") { setTranslationInstruction(settings.translationInstruction); suppressTranslationInstructionBlurRef.current = true; event.currentTarget.blur(); }
           }} />} />
         <SettingRow title={t("Personalization")} detail={t("Use manually configured abstract style profiles for the captured app category.")}
-          control={<Toggle checked={settings.personalizationEnabled} onChange={(value) => onSave({ personalizationEnabled: value })} />} />
+          control={<Toggle label={t("Personalization")} checked={settings.personalizationEnabled} onChange={(value) => onSave({ personalizationEnabled: value })} />} />
         <SettingRow title={t("Start with Windows")} detail={t("Launches Local Voice Input automatically when you sign in to Windows.")}
-          control={<Toggle checked={settings.autoStart} onChange={(value) => onSave({ autoStart: value })} />} />
+          control={<Toggle label={t("Start with Windows")} checked={settings.autoStart} onChange={(value) => onSave({ autoStart: value })} />} />
         <SettingRow title={t("Restore clipboard")} detail={t("Restore previous clipboard contents after successful paste.")}
-          control={<Toggle checked={settings.clipboardRestore} onChange={(value) => onSave({ clipboardRestore: value })} />} />
+          control={<Toggle label={t("Restore clipboard")} checked={settings.clipboardRestore} onChange={(value) => onSave({ clipboardRestore: value })} />} />
         <SettingRow title={t("Live text insertion (experimental)")} detail={t("Off by default: Dictate inserts only the final text once. When on, partial text is typed into the target while you speak; some editors and browser fields may keep only the first part.")}
-          control={<Toggle checked={settings.liveTargetInsertion} onChange={(value) => onSave({ liveTargetInsertion: value })} />} />
+          control={<Toggle label={t("Live text insertion (experimental)")} checked={settings.liveTargetInsertion} onChange={(value) => onSave({ liveTargetInsertion: value })} />} />
         <SettingRow title={t("Noise suppression")} detail={t("Reduces steady fan and room noise after recording, without adding work to the live microphone callback.")}
           control={<select value={settings.noiseSuppression} onChange={(event) => onSave({ noiseSuppression: event.target.value as Settings["noiseSuppression"] })}>
             <option value="off">{t("Off")}</option><option value="low">{t("Low")}</option><option value="medium">{t("Medium")}</option><option value="high">{t("High")}</option>
           </select>} />
         <SettingRow title={t("Automatic gain")} detail={t("Targets a clear speech level after recording. Manual gain below is applied in addition.")}
-          control={<Toggle checked={settings.automaticGain} onChange={(value) => onSave({ automaticGain: value })} />} />
+          control={<Toggle label={t("Automatic gain")} checked={settings.automaticGain} onChange={(value) => onSave({ automaticGain: value })} />} />
         <SettingRow title={t("Input gain")} detail={t("Adjusts the processed microphone level from 25% to 400%.")}
-          control={<label className="range-control"><input type="range" min="25" max="400" step="5" value={settings.inputGainPercent} onChange={(event) => onSave({ inputGainPercent: Number(event.target.value) })} /><output>{settings.inputGainPercent}%</output></label>} />
+          control={<GainSlider label={t("Input gain")} value={settings.inputGainPercent} onCommit={(value) => onSave({ inputGainPercent: value })} />} />
       </section>
       <PersonalizationProfiles settings={settings} profiles={profiles} profileDraftIsInvalid={profileDraftIsInvalid} onSaveGlobal={saveGlobalProfile} onSaveProfiles={saveProfiles} onEditProfiles={setProfiles} onCommitProfiles={commitProfiles} />
       <AiCorrectionSettings settings={settings} onSave={onSave} />
@@ -473,6 +482,7 @@ function PersonalizationProfiles({
     if (global && guidance !== savedGuidance) updateGlobal({ guidance });
   };
   const commitOnEnter = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
     if (event.key === "Enter") { event.preventDefault(); event.currentTarget.blur(); }
   };
   return (
@@ -484,12 +494,13 @@ function PersonalizationProfiles({
       <SettingRow title={t("Global profile")} detail={t("Fallback style used when no app or category profile matches.")} control={
         <div className="profile-controls">
           {global ? <>
-            <select value={global.formality} onChange={(e) => updateGlobal({ formality: e.target.value as StyleProfile["formality"] })}><option value="formal">{t("Formal")}</option><option value="casual">{t("Casual")}</option></select>
-            <select value={global.detail} onChange={(e) => updateGlobal({ detail: e.target.value as StyleProfile["detail"] })}><option value="concise">{t("Concise")}</option><option value="detailed">{t("Detailed")}</option></select>
-            <input maxLength={300} placeholder={t("Optional guidance")} value={guidance} onChange={(e) => setGuidance(e.target.value)} onBlur={() => {
+            <select aria-label={t("Global profile formality")} value={global.formality} onChange={(e) => updateGlobal({ formality: e.target.value as StyleProfile["formality"] })}><option value="formal">{t("Formal")}</option><option value="casual">{t("Casual")}</option></select>
+            <select aria-label={t("Global profile detail")} value={global.detail} onChange={(e) => updateGlobal({ detail: e.target.value as StyleProfile["detail"] })}><option value="concise">{t("Concise")}</option><option value="detailed">{t("Detailed")}</option></select>
+            <input aria-label={t("Global profile guidance")} maxLength={300} placeholder={t("Optional guidance")} value={guidance} onChange={(e) => setGuidance(e.target.value)} onBlur={() => {
               if (suppressGuidanceBlurRef.current) { suppressGuidanceBlurRef.current = false; return; }
               commitGuidance();
             }} onKeyDown={(event) => {
+              if (event.nativeEvent.isComposing || event.keyCode === 229) return;
               if (event.key === "Enter") { event.preventDefault(); commitGuidance(); suppressGuidanceBlurRef.current = true; event.currentTarget.blur(); }
               if (event.key === "Escape") { setGuidance(savedGuidance); suppressGuidanceBlurRef.current = true; event.currentTarget.blur(); }
             }} />
@@ -506,10 +517,10 @@ function PersonalizationProfiles({
         {profileDraftIsInvalid && <p role="alert">{t("Profile scopes must be valid and unique before changes are saved.")}</p>}
         {profiles.map((item, index) => (
           <div className="setting-row" key={index}>
-            <input value={item.scope} maxLength={80} placeholder={t("app:code or category:development")} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, scope: e.target.value }; onEditProfiles(next); }} onBlur={onCommitProfiles} onKeyDown={commitOnEnter} />
-            <select value={item.profile.formality} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, formality: e.target.value as StyleProfile["formality"] } }; onSaveProfiles(next); }}><option value="formal">{t("Formal")}</option><option value="casual">{t("Casual")}</option></select>
-            <select value={item.profile.detail} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, detail: e.target.value as StyleProfile["detail"] } }; onSaveProfiles(next); }}><option value="concise">{t("Concise")}</option><option value="detailed">{t("Detailed")}</option></select>
-            <input maxLength={300} placeholder={t("Optional guidance")} value={item.profile.guidance ?? ""} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, guidance: e.target.value } }; onEditProfiles(next); }} onBlur={onCommitProfiles} onKeyDown={commitOnEnter} />
+            <input aria-label={`${t("Profile scope")} ${index + 1}`} value={item.scope} maxLength={80} placeholder={t("app:code or category:development")} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, scope: e.target.value }; onEditProfiles(next); }} onBlur={onCommitProfiles} onKeyDown={commitOnEnter} />
+            <select aria-label={`${t("Profile formality")} ${index + 1}`} value={item.profile.formality} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, formality: e.target.value as StyleProfile["formality"] } }; onSaveProfiles(next); }}><option value="formal">{t("Formal")}</option><option value="casual">{t("Casual")}</option></select>
+            <select aria-label={`${t("Profile detail")} ${index + 1}`} value={item.profile.detail} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, detail: e.target.value as StyleProfile["detail"] } }; onSaveProfiles(next); }}><option value="concise">{t("Concise")}</option><option value="detailed">{t("Detailed")}</option></select>
+            <input aria-label={`${t("Optional guidance")} ${index + 1}`} maxLength={300} placeholder={t("Optional guidance")} value={item.profile.guidance ?? ""} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, guidance: e.target.value } }; onEditProfiles(next); }} onBlur={onCommitProfiles} onKeyDown={commitOnEnter} />
             <button className="secondary" onClick={() => onSaveProfiles(profiles.filter((_, i) => i !== index))}>{t("Remove")}</button>
           </div>
         ))}

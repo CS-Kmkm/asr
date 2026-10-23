@@ -17,6 +17,10 @@ import type {
 
 const inTauri = "__TAURI_INTERNALS__" in window;
 
+export async function setShortcutCapture(captureId: number, active: boolean): Promise<void> {
+  if (inTauri) await invoke("set_shortcut_capture", { captureId, active });
+}
+
 export async function getUiPreferences(): Promise<{ settings: Pick<Settings, "uiLanguage" | "theme">; revision: number }> {
   if (!inTauri) return { settings: defaultSettings, revision: 0 };
   return invoke("get_ui_preferences");

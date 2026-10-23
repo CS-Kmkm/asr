@@ -4857,6 +4857,24 @@ pub(crate) fn get_shortcut_warning(services: State<'_, Services>) -> Vec<String>
         .clone()
 }
 
+#[tauri::command]
+pub(crate) fn set_shortcut_capture(
+    services: State<'_, Services>,
+    capture_id: u64,
+    active: bool,
+) -> Result<(), String> {
+    if active && services.lifecycle.phase() != crate::state::PipelinePhase::Idle {
+        return Err("Finish the current recording before recording a shortcut.".into());
+    }
+    let mut capture = services.shortcut_capture.lock().map_err(command_error)?;
+    if active {
+        capture.begin(capture_id);
+    } else {
+        capture.end(capture_id);
+    }
+    Ok(())
+}
+
 /// Names the stored settings fields this build could not read and replaces
 /// in memory (content-free JSON keys such as `historyRetention` or
 /// `shortcuts.ask`, or `unreadable` for the whole row). The Settings page

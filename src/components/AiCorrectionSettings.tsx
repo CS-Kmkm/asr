@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
 import { SettingRow, Toggle } from "./ui";
+import { CommitField, validateModel, validateEnvironmentName, validateLocalEndpoint } from "./CommitField";
 import type { Settings } from "../types";
 import { useI18n } from "../i18n";
 
@@ -11,44 +11,6 @@ interface AiCorrectionSettingsProps {
 export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsProps) {
   const { t } = useI18n();
   const status = settings.textCorrectionEnabled ? t("On") : t("Off");
-  const [localBaseUrl, setLocalBaseUrl] = useState(settings.localCorrectionBaseUrl);
-  const [localModel, setLocalModel] = useState(settings.localCorrectionModel);
-  const [localMaxTokens, setLocalMaxTokens] = useState(String(settings.localCorrectionMaxTokens));
-  const cancelLocalBaseUrlBlur = useRef(false);
-  const cancelLocalModelBlur = useRef(false);
-  useEffect(() => setLocalBaseUrl(settings.localCorrectionBaseUrl), [settings.localCorrectionBaseUrl]);
-  useEffect(() => setLocalModel(settings.localCorrectionModel), [settings.localCorrectionModel]);
-  useEffect(() => setLocalMaxTokens(String(settings.localCorrectionMaxTokens)), [settings.localCorrectionMaxTokens]);
-
-  function commitLocalBaseUrl() {
-    if (cancelLocalBaseUrlBlur.current) {
-      cancelLocalBaseUrlBlur.current = false;
-      return;
-    }
-    if (localBaseUrl !== settings.localCorrectionBaseUrl) {
-      onSave({ localCorrectionBaseUrl: localBaseUrl });
-    }
-  }
-
-  function commitLocalModel() {
-    if (cancelLocalModelBlur.current) {
-      cancelLocalModelBlur.current = false;
-      return;
-    }
-    if (localModel !== settings.localCorrectionModel) {
-      onSave({ localCorrectionModel: localModel });
-    }
-  }
-
-  function commitLocalMaxTokens() {
-    const value = Number(localMaxTokens);
-    if (Number.isInteger(value) && value >= 128 && value <= 32768 && value !== settings.localCorrectionMaxTokens) {
-      onSave({ localCorrectionMaxTokens: value });
-    } else if (!Number.isInteger(value) || value < 128 || value > 32768) {
-      setLocalMaxTokens(String(settings.localCorrectionMaxTokens));
-    }
-  }
-
   return (
     <section className="panel ai-correction-panel">
       <div className="ai-correction-header">
@@ -116,7 +78,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         title={t("Remove filler words")}
         detail={t("Remove empty hesitations such as ‘えーと’, ‘あのー’, ‘um’, and ‘uh’, while preserving meaningful hesitation or emphasis.")}
         control={
-          <Toggle
+          <Toggle label={t("Remove filler words")}
             checked={settings.correctionRemoveFillers}
             onChange={(value) => onSave({ correctionRemoveFillers: value })}
           />
@@ -126,7 +88,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         title={t("Remove accidental repetition")}
         detail={t("Collapse unintended repeated words and false starts, while retaining deliberate rhetorical repetition.")}
         control={
-          <Toggle
+          <Toggle label={t("Remove accidental repetition")}
             checked={settings.correctionRemoveRepetitions}
             onChange={(value) => onSave({ correctionRemoveRepetitions: value })}
           />
@@ -136,7 +98,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         title={t("Apply spoken self-corrections")}
         detail={t("For phrases such as ‘Tuesday—actually, Wednesday’, keep the speaker’s final intended revision.")}
         control={
-          <Toggle
+          <Toggle label={t("Apply spoken self-corrections")}
             checked={settings.correctionResolveSelfCorrections}
             onChange={(value) => onSave({ correctionResolveSelfCorrections: value })}
           />
@@ -146,7 +108,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         title={t("Automatic formatting")}
         detail={t("Turn spoken lists, steps, action items, and key points into paragraphs, bullets, or numbered lists when appropriate.")}
         control={
-          <Toggle
+          <Toggle label={t("Automatic formatting")}
             checked={settings.correctionAutoFormat}
             onChange={(value) => onSave({ correctionAutoFormat: value })}
           />
@@ -156,7 +118,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         title={t("Improve clarity")}
         detail={t("Lightly repair spontaneous-speech grammar and unclear phrasing without changing meaning, tone, or formality.")}
         control={
-          <Toggle
+          <Toggle label={t("Improve clarity")}
             checked={settings.correctionImproveClarity}
             onChange={(value) => onSave({ correctionImproveClarity: value })}
           />
@@ -168,10 +130,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
             title={t("OpenAI model")}
             detail={t("Model ID used through the OpenAI Responses API.")}
             control={
-              <input
-                value={settings.openaiCorrectionModel}
-                onChange={(event) => onSave({ openaiCorrectionModel: event.target.value })}
-              />
+              <CommitField label={t("OpenAI model")} value={settings.openaiCorrectionModel} onCommit={(value) => onSave({ openaiCorrectionModel: value })} validate={validateModel} />
             }
           />
           <SettingRow
@@ -200,10 +159,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
             title={t("OpenAI API key environment variable")}
             detail={t("The key itself is not saved. Restart the app after setting this variable.")}
             control={
-              <input
-                value={settings.openaiApiKeyEnvVar}
-                onChange={(event) => onSave({ openaiApiKeyEnvVar: event.target.value })}
-              />
+              <CommitField label={t("OpenAI API key environment variable")} value={settings.openaiApiKeyEnvVar} onCommit={(value) => onSave({ openaiApiKeyEnvVar: value })} validate={validateEnvironmentName} />
             }
           />
         </>
@@ -214,20 +170,14 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
             title={t("Gemini model")}
             detail={t("Model ID used through the Gemini Interactions API.")}
             control={
-              <input
-                value={settings.geminiCorrectionModel}
-                onChange={(event) => onSave({ geminiCorrectionModel: event.target.value })}
-              />
+              <CommitField label={t("Gemini model")} value={settings.geminiCorrectionModel} onCommit={(value) => onSave({ geminiCorrectionModel: value })} validate={validateModel} />
             }
           />
           <SettingRow
             title={t("Gemini API key environment variable")}
             detail={t("The key itself is not saved. Restart the app after setting this variable.")}
             control={
-              <input
-                value={settings.geminiApiKeyEnvVar}
-                onChange={(event) => onSave({ geminiApiKeyEnvVar: event.target.value })}
-              />
+              <CommitField label={t("Gemini API key environment variable")} value={settings.geminiApiKeyEnvVar} onCommit={(value) => onSave({ geminiApiKeyEnvVar: value })} validate={validateEnvironmentName} />
             }
           />
         </>
@@ -238,65 +188,21 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
             title={t("Local endpoint base URL")}
             detail={t("Use a numeric loopback URL ending in /v1. Requests bypass proxies and redirects are rejected.")}
             control={
-              <input
-                value={localBaseUrl}
-                placeholder="http://127.0.0.1:11434/v1"
-                onChange={(event) => setLocalBaseUrl(event.target.value)}
-                onBlur={commitLocalBaseUrl}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    event.currentTarget.blur();
-                  } else if (event.key === "Escape") {
-                    cancelLocalBaseUrlBlur.current = true;
-                    setLocalBaseUrl(settings.localCorrectionBaseUrl);
-                    event.currentTarget.blur();
-                  }
-                }}
-              />
+              <CommitField label={t("Local endpoint base URL")} value={settings.localCorrectionBaseUrl} onCommit={(value) => onSave({ localCorrectionBaseUrl: value })} validate={validateLocalEndpoint} />
             }
           />
           <SettingRow
             title={t("Local correction model")}
             detail={t("Model ID exposed by the local OpenAI-compatible Chat Completions server. No API key is sent.")}
             control={
-              <input
-                value={localModel}
-                placeholder="qwen3:8b"
-                onChange={(event) => setLocalModel(event.target.value)}
-                onBlur={commitLocalModel}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    event.currentTarget.blur();
-                  } else if (event.key === "Escape") {
-                    cancelLocalModelBlur.current = true;
-                    setLocalModel(settings.localCorrectionModel);
-                    event.currentTarget.blur();
-                  }
-                }}
-              />
+              <CommitField label={t("Local correction model")} value={settings.localCorrectionModel} onCommit={(value) => onSave({ localCorrectionModel: value })} validate={validateModel} />
             }
           />
           <SettingRow
             title={t("Local output token limit")}
             detail={t("Includes thinking tokens. Increase for reasoning models; supported range is 128 to 32768.")}
             control={
-              <input
-                type="number"
-                min={128}
-                max={32768}
-                step={1}
-                value={localMaxTokens}
-                onChange={(event) => setLocalMaxTokens(event.target.value)}
-                onBlur={commitLocalMaxTokens}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    event.currentTarget.blur();
-                  }
-                }}
-              />
+              <CommitField label={t("Local output token limit")} value={String(settings.localCorrectionMaxTokens)} onCommit={(value) => onSave({ localCorrectionMaxTokens: Number(value) })} validate={(value) => Number.isInteger(Number(value)) && Number(value) >= 128 && Number(value) <= 32768 ? null : "Enter a token limit between 128 and 32768."} />
             }
           />
         </>
@@ -305,12 +211,13 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         title={t("Additional style and tone guidance")}
         detail={t("Customize the editing style. Safety constraints, enabled operations, and dictionary spellings are applied automatically.")}
         control={
-          <textarea
-            rows={7}
+          <CommitField
+            label={t("Additional style and tone guidance")}
+            multiline
             maxLength={500}
             value={settings.correctionInstruction}
             placeholder={t("For example: Keep my tone concise and friendly.")}
-            onChange={(event) => onSave({ correctionInstruction: event.target.value })}
+            onCommit={(value) => onSave({ correctionInstruction: value })}
           />
         }
       />

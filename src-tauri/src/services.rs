@@ -59,6 +59,7 @@ pub(crate) struct Services {
     pub(crate) shutdown_started: AtomicBool,
     pub(crate) voice_translation_target: Mutex<Option<String>>,
     pub(crate) shortcut_routes: Mutex<shortcuts::Routes>,
+    pub(crate) shortcut_capture: Mutex<shortcuts::CaptureLease>,
     /// Saved shortcuts not dispatched since startup, named by action and
     /// chord: collision losers and chords the OS refused.
     pub(crate) inactive_shortcuts: Mutex<Vec<String>>,
@@ -101,6 +102,7 @@ impl Services {
                 shortcuts::Routes::parse_saved(settings).expect("validated settings"),
             ),
             inactive_shortcuts: Mutex::new(Vec::new()),
+            shortcut_capture: Mutex::new(shortcuts::CaptureLease::default()),
             settings_update: tokio::sync::Mutex::new(()),
             microphone_test: tokio::sync::Mutex::new(MicrophoneTestState::default()),
             cancel_chord_registered: Mutex::new(false),

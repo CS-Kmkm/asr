@@ -5,6 +5,39 @@ use crate::{
 };
 use tauri_plugin_global_shortcut::{Code, Shortcut};
 
+/// Short-lived capture of an already registered chord inside the main window.
+/// Chords stay registered, so the OS can deliver them to the recorder rather
+/// than starting a voice operation. A stale component cannot cancel a new lease.
+#[derive(Default)]
+pub(crate) struct CaptureLease {
+    current: Option<(u64, std::time::Instant)>,
+    newest: u64,
+}
+
+impl CaptureLease {
+    pub(crate) fn begin(&mut self, id: u64) {
+        if id <= self.newest {
+            return;
+        }
+        self.newest = id;
+        self.current = Some((
+            id,
+            std::time::Instant::now() + std::time::Duration::from_secs(15),
+        ));
+    }
+    pub(crate) fn end(&mut self, id: u64) {
+        if self.current.is_some_and(|(current, _)| current == id) {
+            self.current = None;
+        }
+    }
+    pub(crate) fn take(&mut self, focused: bool) -> Option<u64> {
+        self.current
+            .take()
+            .filter(|(_, expires)| focused && std::time::Instant::now() < *expires)
+            .map(|(id, _)| id)
+    }
+}
+
 /// What a voice-mode hotkey press does in the current lifecycle phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Press {
@@ -402,6 +435,25 @@ pub(crate) fn update_registrations<E: std::fmt::Display>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorder_leases_ignore_stale_cancellation_and_never_capture_outside_main_window() {
+        let mut capture = CaptureLease::default();
+        capture.begin(1);
+        capture.begin(2);
+        capture.begin(1); // A delayed older IPC request cannot replace B.
+        capture.end(1);
+        assert_eq!(capture.take(true), Some(2));
+        assert_eq!(capture.take(true), None);
+        capture.begin(3);
+        assert_eq!(capture.take(false), None);
+        assert_eq!(capture.take(true), None);
+        capture.current = Some((
+            4,
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        ));
+        assert_eq!(capture.take(true), None);
+    }
     use std::{cell::RefCell, collections::HashSet};
 
     #[test]

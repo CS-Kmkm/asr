@@ -882,5 +882,9 @@
   "Speech worker files are missing. Reinstall the app, or run uv sync from the development checkout.": {
     "code": "worker_source_missing",
     "ja": "音声ワーカーのファイルがありません。アプリを再インストールするか、開発用チェックアウトで uv sync を実行してください。"
+  },
+  "Finish the current recording before recording a shortcut.": {
+    "code": "shortcut_capture_busy",
+    "ja": "ショートカットを記録する前に、現在の録音・処理を終了してください。"
   }
 }

@@ -64,6 +64,20 @@ Audio is deleted after processing by default. Transcript history is optional and
 stored in the application SQLite database. Logs and status events must never
 contain transcript, audio, window-title, or clipboard content.
 
+## 主な機能とショートカット
+
+| 操作 | 既定キー |
+|---|---|
+| Dictate（音声入力） | `Ctrl+Shift+Space` |
+| Translate（音声翻訳） | `Ctrl+Shift+Y` |
+| 選択テキストの翻訳 | `Ctrl+Shift+T` |
+| Edit（選択範囲を音声で編集） | `Ctrl+Shift+E` |
+| Ask Anything（音声で質問・検索） | `Ctrl+Shift+A` |
+
+Dictionary では用語・読みと適用先を管理できます。Personalization では
+全体とアプリ別の style profile を設定し、補正に使う文章の調子を指定できます。
+ショートカットは Settings で変更できます。
+
 ## Windows prerequisites
 
 - Windows 11 and WebView2

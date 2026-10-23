@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
-import { SettingRow } from "../components/ui";
+import { ModelProgressBar, SettingRow } from "../components/ui";
 import type {
   AsrBackend,
   CustomModel,
   GpuDiagnostics,
   ModelQuantization,
   Settings,
+  ModelStatus,
+  ModelProgress,
 } from "../types";
 import { translateAppMessage, useI18n } from "../i18n";
 import type { MessageKey } from "../i18n";
@@ -46,6 +48,8 @@ export function ModelsPage({
   onConfigureModel,
   onSaveCustomModel,
   onDiagnoseGpu,
+  model,
+  progress,
 }: {
   gpu: GpuDiagnostics | null;
   settings: Settings;
@@ -54,6 +58,8 @@ export function ModelsPage({
   onConfigureModel: (configuration: ModelConfiguration) => void;
   onSaveCustomModel: (model: CustomModel) => Promise<boolean>;
   onDiagnoseGpu: () => void;
+  model?: ModelStatus | null;
+  progress?: ModelProgress | null;
 }) {
   const { t, language } = useI18n();
   const [backend, setBackend] = useState(settings.asrBackend);
@@ -250,8 +256,13 @@ export function ModelsPage({
           }
           disabled={modelLoading}
         >
-          {modelLoading ? t("Loading...") : t("Load Model")}
+          {modelLoading ? t("Loading...") : model?.state === "error" ? t("Retry") : t("Load Model")}
         </button>
+        {model && <div role={model.state === "error" ? "alert" : "status"}>
+          <strong>{t(model.state === "ready" ? "Ready" : model.state === "loading" ? "Model loading" : model.state === "error" ? "Model error" : "Model not loaded")}</strong>
+          <p>{translateAppMessage(language, model.detail)}</p>
+        </div>}
+        {progress && <ModelProgressBar progress={progress} />}
         <p className="model-note">
           {t("If recording starts before loading, Local Voice automatically prepares the selected backend.")}
         </p>
