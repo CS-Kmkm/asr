@@ -48,6 +48,9 @@ impl Stub {
                     Err(error) => panic!("stub accept failed: {error}"),
                 }
             };
+            // Winsock may propagate the listener's nonblocking mode to the
+            // accepted socket. The bounded reads below require blocking I/O.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
