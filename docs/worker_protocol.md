@@ -401,6 +401,7 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
 | `api_request_failed` | backends.py | HTTP 接続または API のステータスが失敗。 |
 | `invalid_api_response` | backends.py | API 応答に有効な text がない。 |
 | `serve_dependencies_missing` | api.py | HTTP サーバー用の追加依存が未インストール。 |
+| `serve_auth_required` | api.py | 非loopbackへ公開する場合は `ASR_SERVE_API_KEY` が必要。 |
 | `internal_error` | worker.py | 上記のいずれにも該当しない予期しない例外を `handle` が捕捉した場合の包括フォールバック。 |
 
 補足:
@@ -421,13 +422,20 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
   同じログには起動時のworkerルート・設定ファイル・データベースのパスも記録するため、
   ログ共有時にはこの起動メタデータが含まれる点を確認する。
 
-### 3.1 デバイス準備
+### 3.1 デバイス準備とローカルHTTPサーバー
 
 faster-whisperの `ASR_DEVICE=auto|cpu|cuda` は既定で `auto`。
 ロード後に0.5秒の無音を実際にデコードし、結果を破棄する。`auto` でCUDAの生成・ウォームアップが
 Python例外として失敗した場合はCPU/int8で1回再試行する。`cpu` はCUDAを照会せず、`cuda` は
 CPUへ切り替えない。ネイティブライブラリのプロセスabortはPython例外として捕捉できないため、
 実機での確認を要する。VibeVoiceにはこのCPU経路はない。通常の文字起こしのデコード設定は維持する。
+
+`--serve` で非loopbackへbindする場合は `ASR_SERVE_API_KEY` を必須とする。
+Hostはloopback名・bind先・`ASR_SERVE_ALLOWED_HOSTS` の明示的な追加名に限り、Originがある場合は
+同一オリジンだけを受け付ける。キーがある場合はhealthを含む全HTTP要求を本文の読み取り前に認証する。
+音声ファイルは25MiB、要求全体はその上限+64KiBのmultipart用領域までとする。
+実際の受信量を数え、上限超過はmultipartの解析や一時ファイル作成より前に413で拒否する。
+受信量の確認中は上限内のメモリを使用し、file partは1個、通常フィールドは8個までに制限する。
 
 
 ---

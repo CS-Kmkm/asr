@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import ipaddress
 import os
 import queue
 import secrets
@@ -80,6 +81,7 @@ def create_app(
     api_key: str | None = None,
     served_model: str | None = None,
     max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES,
+    allowed_hosts: set[str] | None = None,
 ):
     """Create an OpenAI Audio Transcriptions compatible ASGI application."""
 
@@ -88,6 +90,7 @@ def create_app(
         from fastapi.concurrency import run_in_threadpool
         from fastapi.exceptions import RequestValidationError
         from fastapi.responses import JSONResponse, PlainTextResponse
+        from fastapi.routing import APIRoute
     except ModuleNotFoundError as exc:
         raise BackendError(
             "serve_dependencies_missing",
@@ -102,6 +105,21 @@ def create_app(
     inference_lock = threading.Lock()
     model_name = served_model or os.environ.get("ASR_SERVED_MODEL_NAME") or backend.model_name
     app = FastAPI(title="Local ASR OpenAI-compatible API", version="1.0.0")
+
+    class SingleUploadRoute(APIRoute):
+        def get_route_handler(self):
+            handler = super().get_route_handler()
+            async def limited(request):
+                if request.method == "POST" and request.url.path == "/v1/audio/transcriptions":
+                    # Populate Starlette's form cache with strict part limits
+                    # before FastAPI resolves File/Form endpoint parameters.
+                    await request.form(max_files=1, max_fields=8, max_part_size=64 * 1024)
+                return await handler(request)
+            return limited
+
+    app.router.route_class = SingleUploadRoute
+    from .http_guard import RequestGate
+    app.add_middleware(RequestGate, api_key=api_key, allowed_hosts=allowed_hosts or {"localhost", "127.0.0.1", "::1"}, max_body_bytes=max_upload_bytes + 64 * 1024)
 
     def authorize(authorization: str | None) -> None:
         if api_key is None:
@@ -153,7 +171,8 @@ def create_app(
         )
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
+    async def health(authorization: str | None = Header(default=None)) -> dict[str, str]:
+        authorize(authorization)
         return {"status": "ok", "model": model_name}
 
     @app.get("/v1/models")
@@ -338,6 +357,12 @@ def run_api_server(
     served_model: str | None,
 ) -> None:
     try:
+        loopback = host.lower() == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback and not api_key:
+        raise BackendError("serve_auth_required", "Set ASR_SERVE_API_KEY before binding to a non-loopback address")
+    try:
         import uvicorn
     except ModuleNotFoundError as exc:
         raise BackendError(
@@ -349,5 +374,6 @@ def run_api_server(
         quantization=quantization,
         api_key=api_key,
         served_model=served_model,
+        allowed_hosts={"localhost", "127.0.0.1", "::1", host.lower()} | {item.strip().lower() for item in os.environ.get("ASR_SERVE_ALLOWED_HOSTS", "").split(",") if item.strip()},
     )
     uvicorn.run(app, host=host, port=port)

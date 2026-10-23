@@ -123,7 +123,7 @@ class ApiServerTests(IsolatedWorkerTestCase):
         from asr_worker.api import create_app
 
         with patch.dict(os.environ, {"ASR_WORKER_MOCK_TEXT": "served locally"}):
-            client = TestClient(create_app(MockBackend(), api_key="test-key", served_model="local-asr"))
+            client = TestClient(create_app(MockBackend(), api_key="test-key", served_model="local-asr"), base_url="http://localhost")
             unauthorized = client.post(
                 "/v1/audio/transcriptions",
                 data={"model": "local-asr"},
@@ -144,7 +144,7 @@ class ApiServerTests(IsolatedWorkerTestCase):
 
         from asr_worker.api import create_app
 
-        client = TestClient(create_app(MockBackend(), served_model="local-asr"))
+        client = TestClient(create_app(MockBackend(), served_model="local-asr"), base_url="http://localhost")
         models = client.get("/v1/models")
         response = client.post(
             "/v1/audio/transcriptions",
@@ -176,7 +176,7 @@ class ApiServerTests(IsolatedWorkerTestCase):
                 yield {"start": 0.0, "end": 1.0, "speaker": None, "text": " Hello"}
                 yield {"start": 1.0, "end": 2.0, "speaker": None, "text": " world."}
 
-        client = TestClient(create_app(SegmentedBackend(), served_model="local-asr"))
+        client = TestClient(create_app(SegmentedBackend(), served_model="local-asr"), base_url="http://localhost")
         response = client.post(
             "/v1/audio/transcriptions",
             data={"model": "local-asr", "stream": "true"},
@@ -208,7 +208,7 @@ class ApiServerTests(IsolatedWorkerTestCase):
                 yield {"start": 0.0, "end": 1.0, "speaker": None, "text": " Hello"}
                 raise BackendError("gpu_oom", "GPU out of memory while operating the ASR model")
 
-        client = TestClient(create_app(FailsMidway(), served_model="local-asr"))
+        client = TestClient(create_app(FailsMidway(), served_model="local-asr"), base_url="http://localhost")
         response = client.post(
             "/v1/audio/transcriptions",
             data={"model": "local-asr", "stream": "true"},
@@ -226,7 +226,7 @@ class ApiServerTests(IsolatedWorkerTestCase):
         from asr_worker.api import create_app
 
         with patch.dict(os.environ, {"ASR_WORKER_MOCK_TEXT": "served locally"}):
-            client = TestClient(create_app(MockBackend(), served_model="local-asr"))
+            client = TestClient(create_app(MockBackend(), served_model="local-asr"), base_url="http://localhost")
             response = client.post(
                 "/v1/audio/transcriptions",
                 data={"model": "local-asr", "stream": "true", "response_format": "text"},
@@ -246,7 +246,7 @@ class ApiServerTests(IsolatedWorkerTestCase):
                 raise BackendError("gpu_oom", "GPU out of memory while operating the ASR model")
                 yield  # pragma: no cover - makes this a generator
 
-        client = TestClient(create_app(FailingBackend(), served_model="local-asr"))
+        client = TestClient(create_app(FailingBackend(), served_model="local-asr"), base_url="http://localhost")
         unsupported = client.post(
             "/v1/audio/transcriptions",
             data={"model": "local-asr", "stream": "true", "response_format": "srt"},
@@ -266,7 +266,7 @@ class ApiServerTests(IsolatedWorkerTestCase):
 
         from asr_worker.api import create_app
 
-        client = TestClient(create_app(MockBackend(), max_upload_bytes=4))
+        client = TestClient(create_app(MockBackend(), max_upload_bytes=4), base_url="http://localhost")
         missing_file = client.post("/v1/audio/transcriptions", data={"model": "local-asr"})
         too_large = client.post(
             "/v1/audio/transcriptions",
