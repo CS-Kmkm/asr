@@ -1,4 +1,43 @@
-use super::*;
+#[cfg(test)]
+use crate::settings::validate_translation_targets;
+use crate::{
+    answer_panel, app_context, ask,
+    asr::{self, Transcriber},
+    audio::{
+        self, AudioCapture, AudioDevice, AudioEnhancementConfig, CaptureConfig,
+        NoiseSuppressionLevel,
+    },
+    command_error,
+    correction::{self, FailureOutcome},
+    emit_ai_failure, emit_stage, emit_state, emit_status,
+    injection::{
+        self, InjectionOptions, InsertResult, InsertionDetail, SystemTextInjector, TargetWindow,
+        TextInjector,
+    },
+    input_monitor::InputMonitor,
+    live_dictation, model_identity, personalization,
+    pipeline::{classify_ai_stage, AiStageResult},
+    recording_overlay,
+    services::MicrophoneTestState,
+    shortcuts,
+    state::{AppState, PipelineLifecycle, PipelineMode, PipelinePhase},
+    storage::{self, Storage},
+    types::{
+        self, AppPhase, AppStateSnapshot, DictionaryCandidate, DictionaryEntry,
+        DictionaryEntryInput, DictionaryImportInput, GpuDiagnostics, HistoryItem, LoadModelRequest,
+        ModelStatus, NewDictionaryEntry, NewHistoryItem, RecordingResult, Settings,
+    },
+    worker_command_for_settings, AskCapture, AskSession, EditSession, PipelineGuard, Services,
+    TempArtifact,
+};
+use std::{
+    path::{Path, PathBuf},
+    sync::{atomic::Ordering, Arc, Mutex},
+    time::{Duration, Instant},
+};
+use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 fn save_history(
     storage: &Storage,
@@ -310,31 +349,6 @@ async fn take_published_sessions<T, U>(
         .map_err(|_| "translation target service is unavailable".to_string())?
         .take();
     Ok((live_task, edit_session, ask_session, target_language))
-}
-
-fn validate_translation_targets(settings: &Settings) -> Result<(), String> {
-    if settings.translation_target_languages.is_empty()
-        || settings.translation_target_languages.len() > types::TRANSLATION_TARGET_LANGUAGES.len()
-    {
-        return Err("one to eight translation target languages are required".into());
-    }
-    for (index, language) in settings.translation_target_languages.iter().enumerate() {
-        if !types::TRANSLATION_TARGET_LANGUAGES.contains(&language.as_str()) {
-            return Err(format!(
-                "unsupported translation target language: {language}"
-            ));
-        }
-        if settings.translation_target_languages[..index].contains(language) {
-            return Err("translation target languages must be unique".into());
-        }
-    }
-    if !settings
-        .translation_target_languages
-        .contains(&settings.translation_target_language)
-    {
-        return Err("the current translation target must be in the configured list".into());
-    }
-    Ok(())
 }
 
 #[tauri::command]
@@ -830,6 +844,8 @@ async fn start_owned_recording(
 ) -> Result<(), String> {
     let (cancel_message, cancel_error) = cancellation_copy(mode);
     let settings = storage.get_settings().map_err(command_error)?;
+    crate::privacy::check_recording(&settings, mode).map_err(str::to_owned)?;
+    state.set_operation(types::OperationKind::Recording, operation_id);
     let mode_shortcuts =
         voice_mode_shortcuts(&settings, mode).ok_or("selected-text translation does not record")?;
     let active_hotkey = trigger_chord
@@ -880,7 +896,12 @@ async fn start_owned_recording(
         .map(|status| needs_model_preparation(&status, &model_identity(&settings).0))
         .unwrap_or(true);
     if preparing {
-        emit_state(&app, &state, AppPhase::Processing, PREPARING_SPEECH_MODEL);
+        emit_stage(
+            &app,
+            &state,
+            types::AppStage::PreparingModel,
+            PREPARING_SPEECH_MODEL,
+        );
     }
     let cancelled = wait_for_speech_model(
         &app,
@@ -1010,6 +1031,7 @@ async fn start_owned_recording(
             prompt,
             settings.speech_locale.clone(),
             cancel,
+            crate::privacy::live_preview_enabled(&settings),
         )
     });
     *edit_slot = edit_session.take();
@@ -1242,10 +1264,10 @@ pub(crate) async fn stop_recording_for(
     // in Recording until audio finalization completed; if finalization failed
     // (for example for a short or silent take), the lifecycle returned to Idle
     // while the UI incorrectly continued to offer "Stop and transcribe".
-    emit_state(
+    emit_stage(
         &app,
         &state,
-        AppPhase::Processing,
+        types::AppStage::FinishingAudio,
         processing_message(reason, false, "Stopping recording and preparing audio."),
     );
     let started = Instant::now();
@@ -1314,7 +1336,15 @@ pub(crate) async fn stop_recording_for(
         &app,
         &state,
         AppPhase::Processing,
-        processing_message(reason, disconnected, "Transcribing locally."),
+        processing_message(
+            reason,
+            disconnected,
+            if settings.asr_backend == "openai-compatible" {
+                "Transcribing with the configured speech provider."
+            } else {
+                "Transcribing locally."
+            },
+        ),
     );
 
     let app_context = services
@@ -1427,10 +1457,10 @@ pub(crate) async fn stop_recording_for(
             return Err("no edit instruction was captured".into());
         }
         emit_correction_preview(&app, &instruction_text, "draft");
-        emit_state(
+        emit_stage(
             &app,
             &state,
-            AppPhase::Processing,
+            types::AppStage::Correcting,
             "Applying the spoken edit instruction.",
         );
         let edit_started = Instant::now();
@@ -1456,8 +1486,12 @@ pub(crate) async fn stop_recording_for(
                     false,
                     Some("edit_failed"),
                 );
-                emit_state(&app, &state, AppPhase::Error, edit_failure_message(&error));
-                return Err("editing failed; the original selection was not changed".into());
+                emit_state(&app, &state, AppPhase::Error, &edit_failure_message(&error));
+                return Err(ai_command_error(
+                    &app,
+                    &error,
+                    FailureOutcome::UnchangedSelection,
+                ));
             }
         };
         emit_correction_preview(&app, &edited, "final");
@@ -1686,24 +1720,25 @@ pub(crate) async fn stop_recording_for(
             return Err("translation target language is unavailable".into());
         };
         emit_correction_preview(&app, &transcript.text, "draft");
-        emit_state(
+        emit_stage(
             &app,
             &state,
-            AppPhase::Processing,
+            types::AppStage::Translating,
             "Translating speech to the selected language.",
         );
         let translation_started = Instant::now();
         llm_provider = Some(settings.correction_provider.clone());
-        match correction::translate_transcript(
-            &settings,
-            &transcript.text,
-            target_language,
-            correction_cancel,
-            |delta| emit_correction_preview(&app, delta, "streaming"),
-        )
-        .await
-        {
-            Ok(translated) => {
+        match classify_ai_stage(
+            correction::translate_transcript(
+                &settings,
+                &transcript.text,
+                target_language,
+                correction_cancel,
+                |delta| emit_correction_preview(&app, delta, "streaming"),
+            )
+            .await,
+        ) {
+            AiStageResult::Corrected(translated) => {
                 final_text = translated;
                 processed_text = Some(final_text.clone());
                 // Publish before insertion so an insertion error cannot lose
@@ -1718,11 +1753,11 @@ pub(crate) async fn stop_recording_for(
                     None,
                 );
             }
-            Err(correction::CorrectionError::Cancelled) => {
+            AiStageResult::Cancelled => {
                 emit_state(&app, &state, AppPhase::Idle, "Translation cancelled.");
                 return Err("translation was cancelled".into());
             }
-            Err(_) => {
+            AiStageResult::Fallback(error) => {
                 translation_failed = true;
                 emit_correction_preview(&app, &transcript.text, "fallback");
                 let _ = storage.add_metric(
@@ -1730,18 +1765,20 @@ pub(crate) async fn stop_recording_for(
                     Some(settings.correction_provider.as_str()),
                     Some(translation_started.elapsed().as_millis() as i64),
                     false,
-                    Some("translation_failed"),
+                    Some(error.failure_code()),
                 );
-                emit_status(
+                emit_ai_failure(
                     &app,
                     "voice_translation_failed",
-                    "Translation failed; the raw transcript remains on the clipboard.",
+                    &error,
+                    FailureOutcome::UsingTranscript,
+                    &correction::failure_message(&error, FailureOutcome::UsingTranscript),
                 );
             }
         }
     } else if settings.text_correction_enabled {
         let correction_hints = storage
-            .dictionary_correction_hints(&transcript.text, app_context.as_ref())
+            .dictionary_correction_terms(&transcript.text, app_context.as_ref())
             .unwrap_or_default();
         emit_correction_preview(&app, &transcript.text, "draft");
         if streamed_into_target {
@@ -1752,10 +1789,10 @@ pub(crate) async fn stop_recording_for(
                 "Inserting the provisional transcript into the captured target.",
             );
         }
-        emit_state(
+        emit_stage(
             &app,
             &state,
-            AppPhase::Processing,
+            types::AppStage::Correcting,
             "Correcting the transcript with the configured AI provider.",
         );
         let correction_started = Instant::now();
@@ -1801,9 +1838,11 @@ pub(crate) async fn stop_recording_for(
                     false,
                     Some(correction_failure_metric_code(&error)),
                 );
-                emit_status(
+                emit_ai_failure(
                     &app,
                     "text_correction_failed",
+                    &error,
+                    FailureOutcome::UsingTranscript,
                     &correction_failure_status(&error),
                 );
             }
@@ -1816,10 +1855,14 @@ pub(crate) async fn stop_recording_for(
         return Err(cancel_error.into());
     }
 
-    emit_state(
+    emit_stage(
         &app,
         &state,
-        AppPhase::Injecting,
+        if streamed_into_target {
+            types::AppStage::UpdatingText
+        } else {
+            types::AppStage::Inserting
+        },
         if streamed_into_target {
             "Finalizing the provisional text in the captured target."
         } else {
@@ -2051,10 +2094,10 @@ async fn finish_ask(
     }
     require_ask_spoken_input(spoken)?;
     let settings = storage.get_settings().map_err(command_error)?;
-    emit_state(
+    emit_stage(
         app,
         state,
-        AppPhase::Processing,
+        types::AppStage::Planning,
         "Choosing a safe Ask action.",
     );
     // Planning receives spoken text and context only. It never receives source.
@@ -2068,7 +2111,7 @@ async fn finish_ask(
             .map_err(command_error)?,
     )
     .await
-    .map_err(|_| "Ask planning failed without taking an action".to_string())?;
+    .map_err(|error| ai_command_error(app, &error, FailureOutcome::NoAction))?;
     if services.lifecycle.is_cancelled(operation_id) {
         return Err("ask was cancelled".into());
     }
@@ -2089,8 +2132,8 @@ async fn finish_ask(
             }
             let published = services
                 .answer_panel
-                .publish(operation_id, clarification.into());
-            if !published || !answer_panel::show(app, operation_id, clarification) {
+                .publish_notice(operation_id, clarification.into());
+            if !published || !answer_panel::show_notice(app, operation_id, clarification) {
                 commit_ask_copy(&services.lifecycle, operation_id, || {
                     session.injector.copy_to_clipboard(clarification)
                 })?;
@@ -2177,7 +2220,7 @@ async fn finish_ask(
             .map_err(command_error)?,
     )
     .await
-    .map_err(|_| "Ask generation failed without taking an action".to_string())?;
+    .map_err(|error| ai_command_error(app, &error, FailureOutcome::NoAction))?;
     if services.lifecycle.is_cancelled(operation_id) {
         return Err("ask was cancelled".into());
     }
@@ -2454,6 +2497,7 @@ const TRANSLATION_FAILED_SELECTION_UNCHANGED: &str =
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SelectedTextFailure {
     SettingsUnavailable,
+    ConsentRequired,
     NoSelection,
     MonitorUnavailable,
     TranslationFailed,
@@ -2465,6 +2509,7 @@ impl SelectedTextFailure {
     fn message(self) -> &'static str {
         match self {
             Self::SettingsUnavailable => "Translation settings are unavailable.",
+            Self::ConsentRequired => crate::privacy::TEXT_CONSENT_REQUIRED,
             Self::NoSelection => "Select text in a supported foreground edit control.",
             Self::MonitorUnavailable => "Translation could not monitor the target safely.",
             // The selection is unchanged, so there is nothing to recover and
@@ -2477,6 +2522,7 @@ impl SelectedTextFailure {
     fn metric_code(self) -> &'static str {
         match self {
             Self::SettingsUnavailable => "settings_unavailable",
+            Self::ConsentRequired => "cloud_consent_required",
             Self::NoSelection => "no_selection",
             Self::MonitorUnavailable => "monitor_unavailable",
             Self::TranslationFailed => "translation_failed",
@@ -2681,6 +2727,9 @@ async fn run_selected_text_translation(
         return SelectedTextEnd::Failed(SelectedTextFailure::SettingsUnavailable);
     };
     *provider = Some(settings.correction_provider.clone());
+    if crate::privacy::check_text(&settings).is_err() {
+        return SelectedTextEnd::Failed(SelectedTextFailure::ConsentRequired);
+    }
     let mut injector = SystemTextInjector::new(InjectionOptions {
         restore_clipboard: settings.clipboard_restore,
     });
@@ -2707,9 +2756,16 @@ async fn run_selected_text_translation(
         }),
     );
     state.clear_result();
-    emit_state(app, state, AppPhase::Processing, SELECTED_TEXT_TRANSLATING);
-    let monitor = &services.input_monitor;
-    if !monitor.start() {
+    state.set_operation(types::OperationKind::SelectedText, operation_id);
+    emit_stage(
+        app,
+        state,
+        types::AppStage::Translating,
+        SELECTED_TEXT_TRANSLATING,
+    );
+    let monitor = InputMonitor::default();
+    monitor.observe_cancellation(Some(cancel.clone()));
+    if !monitor.start_for_recording(&settings.translation_hotkey, &[], true) {
         return SelectedTextEnd::Failed(SelectedTextFailure::MonitorUnavailable);
     }
     let Some(checkpoint) = monitor.checkpoint() else {
@@ -2737,7 +2793,7 @@ async fn run_selected_text_translation(
     // verification bounds to about a second; lifecycle readers (hotkeys,
     // Esc) wait that long instead of racing the paste.
     let committed = services.lifecycle.commit_side_effect(operation_id, || {
-        let replaced = injector.replace_selection(&selection, &translated, monitor, checkpoint);
+        let replaced = injector.replace_selection(&selection, &translated, &monitor, checkpoint);
         // A replacement error happens before any paste, so the selection is
         // unchanged and the clipboard is the fallback.
         let failure_detail = if replaced == Err(injection::InjectionError::ClipboardProtected) {
@@ -3209,79 +3265,28 @@ fn output_limit_inserted_message(error: &correction::CorrectionError) -> Option<
     }
 }
 
+fn ai_command_error(
+    app: &AppHandle,
+    error: &correction::CorrectionError,
+    outcome: FailureOutcome,
+) -> String {
+    let message = correction::failure_message(error, outcome);
+    emit_ai_failure(app, "ai_provider_failed", error, outcome, &message);
+    message
+}
+
 fn correction_failure_status(error: &correction::CorrectionError) -> String {
-    let kind = match error {
-        correction::CorrectionError::MissingApiKey(_) => "missing_api_key",
-        correction::CorrectionError::Request(_) => "request_failed",
-        correction::CorrectionError::Api { status, .. } => {
-            return format!(
-                "AI correction failed; using the original transcript. HTTP status {}.",
-                status.as_u16()
-            );
-        }
-        correction::CorrectionError::InvalidResponse(_) => "invalid_response",
-        correction::CorrectionError::OutputLimit => {
-            return "AI correction stopped at the local output token limit; using the original transcript. Increase the local output token limit.".into();
-        }
-        correction::CorrectionError::ProviderOutputLimit => {
-            return "AI correction stopped at the AI provider's output token limit; using the original transcript. Lower the reasoning effort or choose a different model.".into();
-        }
-        correction::CorrectionError::ProtectedContentChanged => "protected_content_changed",
-        correction::CorrectionError::Cancelled => "cancelled",
-        correction::CorrectionError::InvalidEndpoint(_) => "invalid_endpoint",
-        correction::CorrectionError::UnsupportedProvider(_) => "unsupported_provider",
-        correction::CorrectionError::EmptyEditInstruction => "empty_edit_instruction",
-    };
-    format!("AI correction failed; using the original transcript. Error kind: {kind}.")
+    correction::failure_message(error, FailureOutcome::UsingTranscript)
 }
 
-/// Names why Speak to edit failed, so the user can fix the cause. Every
-/// message is a fixed, localized string; error details are never shown.
-fn edit_failure_message(error: &correction::CorrectionError) -> &'static str {
-    use correction::CorrectionError;
-    match error {
-        CorrectionError::MissingApiKey(_) => {
-            "Editing failed because the AI provider API key is not set. The original selection was not changed."
-        }
-        CorrectionError::Api { status, .. } if matches!(status.as_u16(), 401 | 403) => {
-            "Editing failed because the AI provider rejected the API key. The original selection was not changed."
-        }
-        CorrectionError::Api { status, .. } if status.as_u16() == 429 => {
-            "Editing failed because the AI provider rate limit was reached. Try again later. The original selection was not changed."
-        }
-        CorrectionError::Api { .. } => {
-            "Editing failed because the AI provider returned an error. The original selection was not changed."
-        }
-        CorrectionError::Request(_) => {
-            "Editing failed because the AI provider could not be reached. The original selection was not changed."
-        }
-        CorrectionError::InvalidEndpoint(_) => {
-            "Editing failed because the local AI endpoint URL is invalid. The original selection was not changed."
-        }
-        CorrectionError::OutputLimit => {
-            "Editing stopped at the local output token limit. The original selection was not changed. Increase the local output token limit."
-        }
-        CorrectionError::ProviderOutputLimit => {
-            "Editing stopped at the AI provider's output token limit. The original selection was not changed. Lower the reasoning effort or choose a different model."
-        }
-        CorrectionError::InvalidResponse(_) | CorrectionError::ProtectedContentChanged => {
-            "Editing failed because the AI provider returned an unusable response. The original selection was not changed."
-        }
-        CorrectionError::UnsupportedProvider(_) => {
-            "Editing failed because the selected AI provider is not supported. The original selection was not changed."
-        }
-        CorrectionError::EmptyEditInstruction => {
-            "No edit instruction was captured; the original selection was not changed."
-        }
-        CorrectionError::Cancelled => "Editing cancelled.",
-    }
+fn edit_failure_message(error: &correction::CorrectionError) -> String {
+    correction::failure_message(error, FailureOutcome::UnchangedSelection)
 }
-
 /// Metric code for a failed correction; validator rejects stay countable.
 fn correction_failure_metric_code(error: &correction::CorrectionError) -> &'static str {
     match error {
         correction::CorrectionError::ProtectedContentChanged => "protected_content_changed",
-        _ => "correction_failed",
+        _ => error.failure_code(),
     }
 }
 
@@ -3408,12 +3413,12 @@ mod tests {
     #[test]
     fn retry_keeps_the_transcript_when_correction_fails_or_is_rejected() {
         assert!(matches!(
-            classify_retry_correction(Ok("corrected".into())),
-            RetryCorrection::Corrected(text) if text == "corrected"
+            classify_ai_stage(Ok("corrected".into())),
+            AiStageResult::Corrected(text) if text == "corrected"
         ));
         assert!(matches!(
-            classify_retry_correction(Err(correction::CorrectionError::Cancelled)),
-            RetryCorrection::Cancelled
+            classify_ai_stage(Err(correction::CorrectionError::Cancelled)),
+            AiStageResult::Cancelled
         ));
         for error in [
             correction::CorrectionError::ProtectedContentChanged,
@@ -3422,8 +3427,8 @@ mod tests {
             correction::CorrectionError::InvalidResponse("empty".into()),
         ] {
             assert!(matches!(
-                classify_retry_correction(Err(error)),
-                RetryCorrection::Fallback(_)
+                classify_ai_stage(Err(error)),
+                AiStageResult::Fallback(_)
             ));
         }
     }
@@ -4281,7 +4286,7 @@ mod tests {
             panic!("a patch is a JSON object");
         };
         let settings = apply_settings_patch(&previous, patch)?;
-        validate_settings(&settings)?;
+        settings.validate()?;
         let revision = persist_settings(storage, &settings)?;
         Ok(types::SettingsSnapshot { settings, revision })
     }
@@ -4301,6 +4306,28 @@ mod tests {
             }
         );
         assert_eq!(storage.get_settings_snapshot().unwrap(), saved);
+    }
+
+    #[test]
+    fn changing_speech_endpoints_revokes_old_speech_consents() {
+        let mut previous = Settings {
+            asr_backend: "openai-compatible".into(),
+            ..Settings::default()
+        };
+        previous.cloud_consents = vec!["openai".into(), crate::privacy::asr_consent_key(&previous)];
+        let patch = serde_json::json!({"apiBaseUrl": "https://another.example/v1"});
+        let next = apply_settings_patch(&previous, patch.as_object().unwrap().clone()).unwrap();
+        assert_eq!(next.cloud_consents, vec!["openai"]);
+        let back = serde_json::json!({"apiBaseUrl": previous.api_base_url});
+        let restored = apply_settings_patch(&next, back.as_object().unwrap().clone()).unwrap();
+        assert_eq!(restored.cloud_consents, vec!["openai"]);
+        let local = serde_json::json!({"asrBackend": "faster-whisper"});
+        assert_eq!(
+            apply_settings_patch(&previous, local.as_object().unwrap().clone())
+                .unwrap()
+                .cloud_consents,
+            vec!["openai"]
+        );
     }
 
     #[test]
@@ -5063,69 +5090,78 @@ mod tests {
 
     #[test]
     fn correction_failure_status_excludes_provider_response_body() {
-        let marker = "private transcript echoed by provider";
-        let message = correction_failure_status(&correction::CorrectionError::Api {
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            let error = correction::CorrectionError::Api {
+                status,
+                message: "synthetic-provider-secret".into(),
+            };
+            let message = correction_failure_status(&error);
+            assert!(message.contains("rejected the API key"));
+            assert!(message.contains("Using the original transcript."));
+            assert!(!message.contains("synthetic-provider-secret"));
+            assert!(
+                edit_failure_message(&error).contains("The original selection was not changed.")
+            );
+        }
+        let invalid = correction::CorrectionError::InvalidApiKey {
             status: reqwest::StatusCode::BAD_REQUEST,
-            message: marker.into(),
-        });
-
-        assert_eq!(
-            message,
-            "AI correction failed; using the original transcript. HTTP status 400."
-        );
-        assert!(!message.contains(marker));
+        };
+        assert!(correction_failure_status(&invalid).contains("rejected the API key"));
+        let error = correction::CorrectionError::Api {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            message: "synthetic-provider-secret".into(),
+        };
+        let message = correction_failure_status(&error);
+        assert!(message.contains("provider returned an error"));
+        assert!(!message.contains("synthetic-provider-secret"));
     }
 
     #[test]
     fn correction_failure_status_distinguishes_the_output_limit() {
-        assert_eq!(
-            correction_failure_status(&correction::CorrectionError::OutputLimit),
-            "AI correction stopped at the local output token limit; using the original transcript. Increase the local output token limit."
+        let local = correction_failure_status(&correction::CorrectionError::OutputLimit);
+        let cloud = correction_failure_status(&correction::CorrectionError::ProviderOutputLimit);
+        assert!(local.contains("local AI model"));
+        assert!(cloud.contains("AI provider"));
+        assert_ne!(local, cloud);
+        for message in [&local, &cloud] {
+            assert!(message.contains("output token limit"));
+            assert!(message.contains("Using the original transcript."));
+        }
+        assert!(
+            output_limit_inserted_message(&correction::CorrectionError::OutputLimit)
+                .unwrap()
+                .contains("the original transcript was inserted")
         );
-        assert_eq!(
-            correction_failure_status(&correction::CorrectionError::ProviderOutputLimit),
-            "AI correction stopped at the AI provider's output token limit; using the original transcript. Lower the reasoning effort or choose a different model."
-        );
-        assert_eq!(
-            output_limit_inserted_message(&correction::CorrectionError::OutputLimit),
-            Some("AI correction stopped at the local output token limit; the original transcript was inserted. Increase the local output token limit.")
-        );
-        assert_eq!(
-            output_limit_inserted_message(&correction::CorrectionError::ProviderOutputLimit),
-            Some("AI correction stopped at the AI provider's output token limit; the original transcript was inserted. Lower the reasoning effort or choose a different model.")
+        assert!(
+            output_limit_inserted_message(&correction::CorrectionError::ProviderOutputLimit)
+                .unwrap()
+                .contains("the original transcript was inserted")
         );
         assert_eq!(
             output_limit_inserted_message(&correction::CorrectionError::Cancelled),
             None
         );
-        assert_eq!(
-            correction_failure_status(&correction::CorrectionError::InvalidResponse(
-                "missing output text".into()
-            )),
-            "AI correction failed; using the original transcript. Error kind: invalid_response."
-        );
     }
 
     #[test]
     fn protected_content_rejection_has_distinct_status_and_metric() {
-        let rejected = correction::CorrectionError::ProtectedContentChanged;
+        let error = correction::CorrectionError::ProtectedContentChanged;
+        assert!(correction_failure_status(&error).contains("protected"));
         assert_eq!(
-            correction_failure_status(&rejected),
-            "AI correction failed; using the original transcript. Error kind: protected_content_changed."
-        );
-        assert_eq!(
-            correction_failure_metric_code(&rejected),
+            correction_failure_metric_code(&error),
             "protected_content_changed"
         );
-
-        let invalid = correction::CorrectionError::InvalidResponse("missing output text".into());
-        assert!(correction_failure_status(&invalid).ends_with("Error kind: invalid_response."));
+        let invalid =
+            correction::CorrectionError::InvalidResponse("synthetic-provider-secret".into());
         assert_eq!(
             correction_failure_metric_code(&invalid),
-            "correction_failed"
+            "ai_invalid_response"
         );
+        assert!(!correction_failure_status(&invalid).contains("synthetic-provider-secret"));
     }
-
     #[test]
     fn a_failed_microphone_or_the_time_limit_stops_the_recording() {
         let limit = MAX_RECORDING_DURATION;
@@ -5954,6 +5990,16 @@ pub(crate) fn get_settings(storage: State<'_, Storage>) -> Result<types::Setting
 }
 
 #[tauri::command]
+pub(crate) fn get_ui_preferences(storage: State<'_, Storage>) -> Result<serde_json::Value, String> {
+    let snapshot = storage.get_settings_snapshot().map_err(command_error)?;
+    Ok(
+        serde_json::json!({"revision": snapshot.revision, "settings": {
+            "uiLanguage": snapshot.settings.ui_language, "theme": snapshot.settings.theme
+        }}),
+    )
+}
+
+#[tauri::command]
 pub(crate) fn get_shortcut_warning(services: State<'_, Services>) -> Vec<String> {
     services
         .inactive_shortcuts
@@ -5999,6 +6045,7 @@ fn apply_settings_patch(
     stored: &Settings,
     patch: serde_json::Map<String, serde_json::Value>,
 ) -> Result<Settings, String> {
+    let explicit_consent = patch.contains_key("cloudConsents");
     let serde_json::Value::Object(mut merged) =
         serde_json::to_value(stored).map_err(|error| error.to_string())?
     else {
@@ -6010,156 +6057,20 @@ fn apply_settings_patch(
         };
         *field = value;
     }
-    serde_json::from_value(serde_json::Value::Object(merged))
-        .map_err(|error| format!("invalid settings value: {error}"))
-}
-
-/// The checks of a settings save that depend only on the saved values.
-fn validate_settings(settings: &Settings) -> Result<(), String> {
-    personalization::validate_settings_profiles(settings).map_err(str::to_owned)?;
-    if !["en", "ja"].contains(&settings.ui_language.as_str()) {
-        return Err("ui language must be en or ja".into());
-    }
-    if !["system", "light", "dark"].contains(&settings.theme.as_str()) {
-        return Err("theme must be system, light, or dark".into());
-    }
-    if settings
-        .speech_locale
-        .as_deref()
-        .is_some_and(|locale| !types::SPEECH_LOCALES.contains(&locale))
+    let mut settings: Settings = serde_json::from_value(serde_json::Value::Object(merged))
+        .map_err(|error| format!("invalid settings value: {error}"))?;
+    if settings.asr_backend != stored.asr_backend
+        || crate::privacy::asr_consent_key(&settings) != crate::privacy::asr_consent_key(stored)
     {
-        return Err("speech locale is unsupported".into());
+        let current = crate::privacy::asr_consent_key(&settings);
+        settings.cloud_consents.retain(|key| {
+            !key.starts_with("asr:")
+                || (explicit_consent
+                    && settings.asr_backend == "openai-compatible"
+                    && *key == current)
+        });
     }
-    validate_translation_targets(settings)?;
-    if !["off", "low", "medium", "high"].contains(&settings.noise_suppression.as_str()) {
-        return Err("noise suppression must be off, low, medium, or high".into());
-    }
-    if !(25..=400).contains(&settings.input_gain_percent) {
-        return Err("input gain must be between 25 and 400 percent".into());
-    }
-    if !types::ASR_BACKENDS.contains(&settings.asr_backend.as_str()) {
-        return Err(
-            "asr backend must be vibevoice, faster-whisper, openai-compatible, or mock".into(),
-        );
-    }
-    if !types::CORRECTION_PROVIDERS.contains(&settings.correction_provider.as_str()) {
-        return Err("text correction provider must be openai, gemini, or local".into());
-    }
-    if !types::CORRECTION_MODES.contains(&settings.correction_mode.as_str()) {
-        return Err("correction mode must be conservative or intent_aware".into());
-    }
-    if !types::OPENAI_REASONING_EFFORTS.contains(&settings.openai_reasoning_effort.as_str()) {
-        return Err(
-            "OpenAI reasoning effort must be none, low, medium, high, xhigh, or max".into(),
-        );
-    }
-    if !["4bit", "8bit", "bf16"].contains(&settings.model_quantization.as_str()) {
-        return Err("model quantization must be 4bit, 8bit, or bf16".into());
-    }
-    if settings.model_id.as_deref().is_some_and(|value| {
-        value.trim().is_empty() || value.len() > 512 || value.chars().any(char::is_control)
-    }) {
-        return Err(
-            "model ID must be non-empty, at most 512 characters, and contain no control characters"
-                .into(),
-        );
-    }
-    if settings.custom_models.len() > 100 {
-        return Err("at most 100 custom models can be saved".into());
-    }
-    let api_url = settings.api_base_url.trim();
-    if api_url.len() > 2048
-        || !(api_url.starts_with("http://") || api_url.starts_with("https://"))
-        || api_url.chars().any(char::is_control)
-    {
-        return Err(
-            "API base URL must be an absolute HTTP(S) URL of at most 2048 characters".into(),
-        );
-    }
-    let api_key_env = settings.api_key_env_var.trim();
-    if api_key_env.is_empty()
-        || api_key_env.len() > 128
-        || !api_key_env
-            .chars()
-            .all(|character| character == '_' || character.is_ascii_alphanumeric())
-    {
-        return Err(
-            "API key environment variable must contain only ASCII letters, digits, or underscores"
-                .into(),
-        );
-    }
-    for (label, model) in [
-        (
-            "OpenAI correction model",
-            settings.openai_correction_model.as_str(),
-        ),
-        (
-            "Gemini correction model",
-            settings.gemini_correction_model.as_str(),
-        ),
-        (
-            "Local correction model",
-            settings.local_correction_model.as_str(),
-        ),
-    ] {
-        if model.trim().is_empty() || model.len() > 512 || model.chars().any(char::is_control) {
-            return Err(format!(
-                "{label} must be non-empty, at most 512 characters, and contain no control characters"
-            ));
-        }
-    }
-    correction::local_chat_completions_url(&settings.local_correction_base_url)
-        .map_err(|error| error.to_string())?;
-    if !(128..=32768).contains(&settings.local_correction_max_tokens) {
-        return Err("local correction max tokens must be between 128 and 32768".into());
-    }
-    for (label, environment_variable) in [
-        (
-            "OpenAI API key environment variable",
-            settings.openai_api_key_env_var.as_str(),
-        ),
-        (
-            "Gemini API key environment variable",
-            settings.gemini_api_key_env_var.as_str(),
-        ),
-    ] {
-        let environment_variable = environment_variable.trim();
-        if environment_variable.is_empty()
-            || environment_variable.len() > 128
-            || !environment_variable
-                .chars()
-                .all(|character| character == '_' || character.is_ascii_alphanumeric())
-        {
-            return Err(format!(
-                "{label} must contain only ASCII letters, digits, or underscores"
-            ));
-        }
-    }
-    if settings.correction_instruction.chars().count() > 500
-        || settings.correction_instruction.chars().any(|character| {
-            character.is_control() && character != '\n' && character != '\r' && character != '\t'
-        })
-    {
-        return Err(
-            "correction instruction must be at most 500 characters and contain no unsupported control characters"
-                .into(),
-        );
-    }
-    for model in &settings.custom_models {
-        if !types::ASR_BACKENDS.contains(&model.asr_backend.as_str()) {
-            return Err("custom model backend is not supported".into());
-        }
-        if model.model_id.trim().is_empty()
-            || model.model_id.len() > 512
-            || model.model_id.chars().any(char::is_control)
-        {
-            return Err(
-                "custom model ID must be non-empty, at most 512 characters, and contain no control characters"
-                    .into(),
-            );
-        }
-    }
-    Ok(())
+    Ok(settings)
 }
 
 /// Saves `patch` (see `apply_settings_patch`) over the stored settings and
@@ -6181,8 +6092,14 @@ pub(crate) async fn update_settings(
         let _settings_writes = storage.lock_settings_writes().map_err(command_error)?;
         let previous = storage.get_settings().map_err(command_error)?;
         let settings = apply_settings_patch(&previous, patch)?;
-        validate_settings(&settings)?;
+        settings.validate()?;
         crate::environment::register_provider_keys(&settings);
+        if !previous.setup_complete
+            && settings.setup_complete
+            && !is_prepared_model(&services.model.get()?, &settings)
+        {
+            return Err("Load the selected speech model before finishing setup.".into());
+        }
         // Held until the transcriber is reconfigured and its status reset;
         // recording starts and Retry fail fast meanwhile instead of waiting.
         let model_change =
@@ -6194,16 +6111,6 @@ pub(crate) async fn update_settings(
             .clone();
         let desired_routes =
             shortcuts::desired_routes_for_update(&previous, &settings, &old_routes)?;
-        if settings.translation_instruction.chars().count() > 500
-            || settings.translation_instruction.chars().any(|character| {
-                character.is_control()
-                    && character != '\n'
-                    && character != '\r'
-                    && character != '\t'
-            })
-        {
-            return Err("translation instruction must be at most 500 characters and contain no unsupported control characters".into());
-        }
         if cfg!(debug_assertions) && settings.auto_start && !previous.auto_start {
             return Err(
             "autostart cannot be enabled from a development build; install and run a release build"
@@ -6497,10 +6404,11 @@ pub(crate) async fn retry_history_item(
         // The overlay labels Processing by the last voice mode; without this
         // a dictation Retry would show the previous Ask or Edit session's.
         let _ = app.emit("voice-mode", retry_voice_mode(mode, &source));
-        emit_state(
+        state.set_operation(types::OperationKind::Retry, operation_id);
+        emit_stage(
             &app,
             &state,
-            AppPhase::Processing,
+            types::AppStage::Retrying,
             "Retrying the saved recording.",
         );
         let retry_path = storage
@@ -6520,6 +6428,16 @@ pub(crate) async fn retry_history_item(
             return Err("history retry was cancelled".into());
         }
         model_ready?;
+        emit_stage(
+            &app,
+            &state,
+            types::AppStage::Transcribing,
+            if settings.asr_backend == "openai-compatible" {
+                "Transcribing with the configured speech provider."
+            } else {
+                "Transcribing locally."
+            },
+        );
         // History keeps only the captured category, so Retry routes to
         // category-scoped and global dictionary entries and profiles.
         let retry_context = retry_app_context(&source);
@@ -6542,26 +6460,67 @@ pub(crate) async fn retry_history_item(
         let mut output = transcript.text.clone();
         let mut llm_provider = None;
         let mut correction_failed = false;
-        if source.mode == "translate" {
+        if mode == PipelineMode::Translate {
             let target = source
                 .target_language
                 .as_deref()
                 .ok_or("saved translation target is unavailable")?;
-            output = correction::translate_transcript(
+            emit_stage(
+                &app,
+                &state,
+                types::AppStage::Translating,
+                "Translating speech to the selected language.",
+            );
+            let translation_started = Instant::now();
+            let result = correction::translate_transcript(
                 &settings,
                 &transcript.text,
                 target,
                 cancel.clone(),
                 |_| {},
             )
-            .await
-            .map_err(command_error)?;
-            llm_provider = Some(settings.correction_provider.as_str());
-        } else if source.mode == "edit" {
+            .await;
+            match classify_ai_stage(result) {
+                AiStageResult::Corrected(translated) => {
+                    output = translated;
+                    llm_provider = Some(settings.correction_provider.as_str());
+                    let _ = storage.add_metric(
+                        "voice_translation",
+                        llm_provider,
+                        Some(translation_started.elapsed().as_millis() as i64),
+                        true,
+                        None,
+                    );
+                }
+                AiStageResult::Cancelled => return Err("history retry was cancelled".into()),
+                AiStageResult::Fallback(error) => {
+                    emit_ai_failure(
+                        &app,
+                        "voice_translation_failed",
+                        &error,
+                        FailureOutcome::UsingTranscript,
+                        &correction::failure_message(&error, FailureOutcome::UsingTranscript),
+                    );
+                    let _ = storage.add_metric(
+                        "voice_translation",
+                        Some(settings.correction_provider.as_str()),
+                        Some(translation_started.elapsed().as_millis() as i64),
+                        false,
+                        Some(error.failure_code()),
+                    );
+                }
+            }
+        } else if mode == PipelineMode::Edit {
             let selected = source
                 .source_text
                 .as_deref()
                 .ok_or("saved edit source is unavailable")?;
+            emit_stage(
+                &app,
+                &state,
+                types::AppStage::Correcting,
+                "Applying the spoken edit instruction.",
+            );
             output = correction::edit_selected_text(
                 &settings,
                 selected,
@@ -6570,9 +6529,15 @@ pub(crate) async fn retry_history_item(
                 |_| {},
             )
             .await
-            .map_err(command_error)?;
+            .map_err(|error| ai_command_error(&app, &error, FailureOutcome::NoAction))?;
             llm_provider = Some(settings.correction_provider.as_str());
-        } else if source.mode == "ask" {
+        } else if mode == PipelineMode::Ask {
+            emit_stage(
+                &app,
+                &state,
+                types::AppStage::Planning,
+                "Choosing a safe Ask action.",
+            );
             if source.action_kind.as_deref() == Some("search") {
                 let stored_site = stored_search_site(&source)?;
                 let plan = correction::generate_ask_plan(
@@ -6582,7 +6547,7 @@ pub(crate) async fn retry_history_item(
                     cancel.clone(),
                 )
                 .await
-                .map_err(|_| "Ask search retry planning failed".to_string())?;
+                .map_err(|error| ai_command_error(&app, &error, FailureOutcome::NoAction))?;
                 output = ask::validate_fixed_search_retry_plan(
                     &plan,
                     &transcript.text,
@@ -6600,12 +6565,18 @@ pub(crate) async fn retry_history_item(
                     cancel.clone(),
                 )
                 .await
-                .map_err(command_error)?;
+                .map_err(|error| ai_command_error(&app, &error, FailureOutcome::NoAction))?;
             }
             llm_provider = Some(settings.correction_provider.as_str());
         } else if settings.text_correction_enabled {
+            emit_stage(
+                &app,
+                &state,
+                types::AppStage::Correcting,
+                "Correcting the transcript with the configured AI provider.",
+            );
             let hints = storage
-                .dictionary_correction_hints(&transcript.text, retry_context.as_ref())
+                .dictionary_correction_terms(&transcript.text, retry_context.as_ref())
                 .unwrap_or_default();
             let correction_started = Instant::now();
             let result = correction::correct_transcript(
@@ -6619,19 +6590,21 @@ pub(crate) async fn retry_history_item(
                 |_| {},
             )
             .await;
-            match classify_retry_correction(result) {
-                RetryCorrection::Corrected(corrected) => {
+            match classify_ai_stage(result) {
+                AiStageResult::Corrected(corrected) => {
                     output = corrected;
                     llm_provider = Some(settings.correction_provider.as_str());
                 }
-                RetryCorrection::Cancelled => return Err("history retry was cancelled".into()),
-                RetryCorrection::Fallback(error) => {
+                AiStageResult::Cancelled => return Err("history retry was cancelled".into()),
+                AiStageResult::Fallback(error) => {
                     // Like a new recording, a failed correction keeps the new
                     // transcript instead of failing the whole Retry.
                     correction_failed = true;
-                    emit_status(
+                    emit_ai_failure(
                         &app,
                         "text_correction_failed",
+                        &error,
+                        FailureOutcome::UsingTranscript,
                         &correction_failure_status(&error),
                     );
                     let _ = storage.add_metric(
@@ -6761,25 +6734,6 @@ fn retry_dictate_history_mode(llm_provider: Option<&str>, correction_failed: boo
         "faithful_fallback"
     } else {
         "faithful"
-    }
-}
-
-/// How a Retry continues after its AI correction finishes.
-#[derive(Debug)]
-enum RetryCorrection {
-    Corrected(String),
-    /// The correction failed or was rejected; the new transcript is kept.
-    Fallback(correction::CorrectionError),
-    Cancelled,
-}
-
-fn classify_retry_correction(
-    result: Result<String, correction::CorrectionError>,
-) -> RetryCorrection {
-    match result {
-        Ok(corrected) => RetryCorrection::Corrected(corrected),
-        Err(correction::CorrectionError::Cancelled) => RetryCorrection::Cancelled,
-        Err(error) => RetryCorrection::Fallback(error),
     }
 }
 
@@ -7052,6 +7006,7 @@ pub(crate) async fn ensure_model_loaded_cancellable(
     settings: &Settings,
     cancel: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<ModelStatus, String> {
+    crate::privacy::check_asr(settings).map_err(str::to_owned)?;
     let (model_id, detail) = model_identity(settings);
     // A reset or restoring worker does not hold the model, whatever the
     // status says.
@@ -7174,13 +7129,14 @@ async fn load_and_publish_status(
             (Err(MODEL_LOAD_CANCELLED.into()), None)
         }
         Err(error) => {
-            let message = command_error(&error);
+            let message =
+                crate::pipeline::model_load::model_load_failure_message(&error).to_owned();
             show(ModelStatus {
                 model_id: statuses.loading.model_id.clone(),
                 quantization: statuses.loading.quantization.clone(),
                 installed: false,
                 state: "error".into(),
-                detail: format!("{} {message}", statuses.detail),
+                detail: message.clone(),
             });
             (Err(message), None)
         }

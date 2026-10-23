@@ -1,15 +1,13 @@
 import { InfoCard } from "../components/ui";
-import type { AppState, AudioLevel, HistoryItem, ModelStatus, Settings } from "../types";
-import { useI18n } from "../i18n";
-
-const WAVE_SCALES = [0.4, 0.7, 1, 0.6, 0.9, 0.5, 0.8, 0.55, 0.35];
+import { RecordingLevel } from "../components/RecordingLevel";
+import type { AppState, HistoryItem, ModelStatus, Settings } from "../types";
+import { translateAppMessage, useI18n } from "../i18n";
 
 export function DashboardPage({
   state,
   settings,
   history,
   model,
-  level,
   statusLabel,
   recordingAction,
   onToggleRecording,
@@ -20,14 +18,25 @@ export function DashboardPage({
   settings: Settings;
   history: HistoryItem[];
   model: ModelStatus | null;
-  level: AudioLevel;
   statusLabel: string;
   recordingAction: boolean;
   onToggleRecording: () => void;
   onCancelRecording: () => void;
   onCopyResult: (text: string) => void;
 }) {
-  const { t } = useI18n();
+  const { t, language } = useI18n();
+  const cloudConfigured = settings.asrBackend === "openai-compatible" || settings.correctionProvider !== "local";
+  const consents = settings.cloudConsents ?? [];
+  const cloudSpeech = settings.asrBackend === "openai-compatible" && consents.includes(`asr:${settings.apiBaseUrl.trim().replace(/\/+$/, "")}`);
+  const cloudText = settings.correctionProvider !== "local" && consents.includes(settings.correctionProvider);
+  const privacyDetail = [
+    settings.asrBackend === "openai-compatible"
+      ? cloudSpeech ? t("Recordings are sent to the configured speech endpoint after consent.") : t("Cloud speech is blocked until you grant endpoint consent in Privacy.")
+      : t("Speech recognition stays local."),
+    settings.correctionProvider !== "local"
+      ? cloudText ? t("AI modes send text to the selected provider after consent.") : t("Cloud text requests are blocked until you grant provider consent in Privacy.")
+      : t("AI text processing stays local."),
+  ].join(" ");
   return (
     <section className="grid">
       <article className="hero-card span-2">
@@ -58,23 +67,14 @@ export function DashboardPage({
             </button>
           )}
         </div>
-        {state.phase === "recording" && (
-          <div
-            className="wave"
-            aria-label={`${t("Input level")} ${Math.round(level.peak * 100)} ${t("percent")}`}
-          >
-            {WAVE_SCALES.map((scale, i) => (
-              <i key={i} style={{ height: Math.max(8, level.peak * 100 * scale) }} />
-            ))}
-          </div>
-        )}
+        {state.phase === "recording" && <RecordingLevel />}
       </article>
 
       <InfoCard label={t("HOTKEY")} value={settings.shortcuts.dictate[0]} detail={t("Global toggle shortcut")} />
       <InfoCard
         label={t("MODEL")}
         value={model?.installed ? model.modelId ?? t("Ready") : t("Not installed")}
-        detail={model?.detail ?? t("Checking local cache")}
+        detail={model ? translateAppMessage(language, model.detail) ?? model.detail : t("Checking local cache")}
       />
       {state.lastResult && (
         <article className="info-card span-2">
@@ -99,14 +99,9 @@ export function DashboardPage({
       )}
       <InfoCard
         label={t("PRIVACY")}
-        value={t("Local only")}
-        detail={
-          settings.historyRetention !== "never"
-            ? t("History stored locally on this device")
-            : settings.keepFailedTakes
-              ? t("History disabled; only failed recordings (and Edit selections) are kept for 24 hours for Retry")
-              : t("History disabled; nothing is stored")
-        }
+        warning={cloudSpeech || cloudText}
+        value={cloudSpeech || cloudText ? t("Cloud services configured") : cloudConfigured ? t("Cloud consent required") : t("Local only")}
+        detail={privacyDetail}
       />
       <InfoCard
         label={t("RECENT ITEMS")}

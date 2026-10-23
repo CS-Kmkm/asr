@@ -1930,35 +1930,51 @@ impl Storage {
         Ok((!terms.is_empty()).then(|| terms.join("\n")))
     }
 
-    pub fn dictionary_correction_hints(
+    pub fn dictionary_correction_terms(
         &self,
         transcript: &str,
         context: Option<&crate::types::AppContext>,
-    ) -> Result<Vec<String>, StorageError> {
-        let transcript = transcript.to_lowercase();
+    ) -> Result<Vec<crate::dictionary::CorrectionTerm>, StorageError> {
+        let transcript = crate::dictionary::fold(transcript);
         Ok(self
             .list_dictionary()?
             .into_iter()
             .filter(|entry| scope_matches(entry.app_scope.as_deref(), context))
             .filter_map(|entry| {
                 let surface = entry.surface.trim();
-                let surface_folded = surface.to_lowercase();
+                let surface_folded = crate::dictionary::fold(surface);
                 let mut matched = Vec::new();
                 for variant in std::iter::once(entry.reading.as_str())
                     .chain(entry.aliases.iter().map(String::as_str))
                 {
                     let variant = variant.trim();
-                    if variant.is_empty() || variant.to_lowercase() == surface_folded {
+                    if variant.is_empty() || crate::dictionary::fold(variant) == surface_folded {
                         continue;
                     }
-                    if transcript.contains(&variant.to_lowercase())
+                    if transcript.contains(&crate::dictionary::fold(variant))
                         && !matched.iter().any(|current| current == variant)
                     {
                         matched.push(variant.to_owned());
                     }
                 }
-                (!matched.is_empty()).then(|| format!("{surface}<={}", matched.join("|")))
+                (!matched.is_empty()).then(|| crate::dictionary::CorrectionTerm {
+                    surface: surface.to_owned(),
+                    readings: matched,
+                })
             })
+            .collect())
+    }
+
+    #[cfg(test)]
+    fn dictionary_correction_hints(
+        &self,
+        transcript: &str,
+        context: Option<&crate::types::AppContext>,
+    ) -> Result<Vec<String>, StorageError> {
+        Ok(self
+            .dictionary_correction_terms(transcript, context)?
+            .iter()
+            .map(|term| term.prompt_hint())
             .collect())
     }
 

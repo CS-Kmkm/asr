@@ -292,7 +292,7 @@ p { color: var(--text-muted); line-height: 1.55; }
 .status-pill.recording span { background: var(--warning); box-shadow: 0 0 8px rgba(138, 75, 8, .35); }
 .notice { position: fixed; top: 22px; right: 24px; z-index: 10; width: min(500px, calc(100vw - 48px)); display: flex; align-items: center; gap: 11px; text-align: left; border: 1px solid var(--accent-border); background: var(--accent-soft); color: var(--accent-strong); padding: 11px 12px 11px 17px; border-radius: 10px; box-shadow: 0 16px 46px rgba(35, 50, 75, .16); animation: notice-in .18s ease-out; }
 .notice.success { border-color: var(--success-border); background: var(--success-soft); color: var(--success); }
-.notice.warning { border-color: var(--warning-border); background: var(--warning-soft); color: var(--warning); }
+.notice.warning, .info-card.warning { border-color: var(--warning-border); background: var(--warning-soft); color: var(--warning); }
 .notice.error { border-color: var(--error-border); background: var(--error-soft); color: var(--error-strong); }
 .notice.success .notice-copied { color: var(--success); }
 .notice.warning .notice-copied { color: var(--warning); }

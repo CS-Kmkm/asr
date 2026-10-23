@@ -12,17 +12,29 @@ const require = createRequire(import.meta.url);
 function load(relativePath, mocks = {}) {
   const source = readFileSync(new URL(relativePath, import.meta.url), "utf8");
   const output = ts.transpileModule(source, {
-    compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2021 },
+    compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2021, esModuleInterop: true },
   }).outputText;
   const module = { exports: {} };
   runInNewContext(output, {
     module, exports: module.exports, window: {},
-    require: (name) => name in mocks ? mocks[name] : require(name),
+    require: (name) => name in mocks ? mocks[name] : createRequire(new URL(relativePath, import.meta.url))(name),
   });
   return module.exports;
 }
 const { defaultSettings } = load("../src/api.ts");
 const { translate, translateAppMessage, insertionDetailLabels } = load("../src/i18n.tsx");
+
+test("invalid provider keys show localized actionable guidance", () => {
+  const message = "The AI provider rejected the API key. Check the API key in Settings.";
+  assert.equal(translateAppMessage("en", message), message);
+  assert.equal(translateAppMessage("ja", message), "AIプロバイダーがAPIキーを拒否しました。設定のAPIキーを確認してください。");
+  const edit = "Editing failed because the AI provider rejected the API key. Check the API key in Settings. The original selection was not changed.";
+  assert.equal(translateAppMessage("en", edit), edit);
+  assert.equal(translateAppMessage("ja", edit), "AIプロバイダーがAPIキーを拒否したため、編集に失敗しました。設定のAPIキーを確認してください。元の選択範囲は変更されていません。");
+  const correction = "AI correction failed because the AI provider rejected the API key; using the original transcript. Check the API key in Settings.";
+  assert.equal(translateAppMessage("en", correction), correction);
+  assert.equal(translateAppMessage("ja", correction), "AIプロバイダーがAPIキーを拒否したため、AI修正に失敗しました。元の文字起こしを使用します。設定のAPIキーを確認してください。");
+});
 const i18n = { useI18n: () => ({ language: "en", t: (key) => key }) };
 const hooks = {
   useState: (initial) => [typeof initial === "function" ? initial() : initial, () => {}],
@@ -68,7 +80,7 @@ test("failed takes are kept for Retry by default", () => {
 test("the Privacy page explains and toggles failed-take retention next to History retention", () => {
   const { rows, patches } = privacyRows({ ...structuredClone(defaultSettings), historyRetention: "never" });
   const titles = rows.map((row) => row.props.title);
-  assert.deepEqual(titles, ["Delete audio after processing", "History retention", KEEP_TITLE]);
+  assert.deepEqual(titles.slice(0, 3), ["Delete audio after processing", "History retention", KEEP_TITLE]);
   const keep = rows[2];
   assert.match(keep.props.detail, /24 hours/);
   assert.match(keep.props.detail, /History retention is Never/);
@@ -95,6 +107,59 @@ test("the failed-take retention copy is translated", () => {
     assert.equal(translate("en", key), key);
     assert.notEqual(translate("ja", key), key, key);
   }
+});
+
+test("cloud consent is explicit, revocable and scoped to the speech endpoint", () => {
+  const settings = { ...structuredClone(defaultSettings), asrBackend: "openai-compatible", apiBaseUrl: "https://speech.example/v1/", cloudConsents: [] };
+  const { rows, patches } = privacyRows(settings);
+  const openai = rows.find((row) => row.props.title === "OpenAI").props.control;
+  assert.equal(openai.props.checked, false);
+  openai.props.onChange(true);
+  assert.deepEqual(patches.pop(), { cloudConsents: ["openai"] });
+  const speech = rows.find((row) => row.props.title === "Cloud speech provider").props.control;
+  speech.props.onChange(true);
+  assert.deepEqual(patches.pop(), { cloudConsents: ["asr:https://speech.example/v1"] });
+  const allowed = privacyRows({ ...settings, cloudConsents: ["gemini", "openai"] });
+  allowed.rows.find((row) => row.props.title === "OpenAI").props.control.props.onChange(false);
+  assert.deepEqual(allowed.patches, [{ cloudConsents: ["gemini"] }]);
+  const preview = rows.find((row) => row.props.title === "Live transcription preview").props.control;
+  assert.equal(preview.props.checked, false);
+});
+
+test("Dashboard distinguishes local, cloud speech and cloud AI settings", () => {
+  const { DashboardPage } = load("../src/pages/DashboardPage.tsx", {
+    "../components/RecordingLevel": { RecordingLevel: "recording-level" },
+    "../components/ui": { InfoCard: "card" },
+    "../i18n": { useI18n: () => ({ t: (key) => key }) },
+  });
+  const render = (settings) => {
+    const tree = DashboardPage({ settings, state: { phase: "idle", lastResult: null }, history: [], level: {}, model: null });
+    return tree.props.children.flat().find((node) => node?.type === "card" && node.props.label === "PRIVACY").props;
+  };
+  assert.equal(render({ ...defaultSettings, correctionProvider: "local" }).value, "Local only");
+  assert.equal(render({ ...defaultSettings, correctionProvider: "gemini" }).warning, false);
+  assert.equal(render({ ...defaultSettings, correctionProvider: "gemini", cloudConsents: ["gemini"] }).warning, true);
+  assert.match(render({ ...defaultSettings, asrBackend: "openai-compatible", cloudConsents: [`asr:${defaultSettings.apiBaseUrl}`] }).detail, /Recordings are sent/);
+  const mixed = render({ ...defaultSettings, asrBackend: "openai-compatible", cloudConsents: ["openai"] });
+  assert.match(mixed.detail, /Cloud speech is blocked/);
+  assert.doesNotMatch(mixed.detail, /recognition stays local/);
+  const both = render({ ...defaultSettings, asrBackend: "openai-compatible", cloudConsents: ["openai", `asr:${defaultSettings.apiBaseUrl}`] });
+  assert.match(both.detail, /Recordings are sent/);
+  assert.match(both.detail, /AI modes send text/);
+});
+
+test("Setup requires a ready model and shows preparation progress", () => {
+  const { SetupPage } = load("../src/pages/SetupPage.tsx", {
+    "../components/ui": { SettingRow: "row", ModelProgressBar: "progress" },
+    "../i18n": i18n,
+  });
+  const render = (patch) => nodes(SetupPage({ settings: defaultSettings, devices: [], gpu: null, gpuChecking: false, ...patch }));
+  const finish = (list) => list.find((node) => node.type === "button" && text(node) === "Finish setup");
+  assert.equal(finish(render({ modelReady: false })).props.disabled, true);
+  assert.equal(finish(render({ modelReady: true })).props.disabled, false);
+  assert.equal(finish(render({ modelReady: true, modelLoading: true })).props.disabled, true);
+  const progress = { stage: "download", completedBytes: 50, totalBytes: 100 };
+  assert.equal(render({ progress }).find((node) => node.type === "progress").props.progress, progress);
 });
 
 function historyPage(settings, history) {

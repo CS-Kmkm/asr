@@ -7,7 +7,7 @@ import type {
   ModelQuantization,
   Settings,
 } from "../types";
-import { useI18n } from "../i18n";
+import { translateAppMessage, useI18n } from "../i18n";
 import type { MessageKey } from "../i18n";
 
 type ModelConfiguration = Pick<
@@ -55,7 +55,7 @@ export function ModelsPage({
   onSaveCustomModel: (model: CustomModel) => Promise<boolean>;
   onDiagnoseGpu: () => void;
 }) {
-  const { t } = useI18n();
+  const { t, language } = useI18n();
   const [backend, setBackend] = useState(settings.asrBackend);
   const [additionalModelId, setAdditionalModelId] = useState(settings.modelId ?? "");
   const [quantization, setQuantization] = useState<ModelQuantization>(
@@ -260,7 +260,7 @@ export function ModelsPage({
       <article className="panel span-2">
         <p className="eyebrow">{t("GPU")}</p>
         <h2>{gpu?.adapterName ?? t("Not checked")}</h2>
-        <p>{gpu?.recommendation ?? t("Run diagnostics to check NVIDIA availability and VRAM.")}</p>
+        <p>{gpu ? translateAppMessage(language, gpu.recommendation) : t("Run diagnostics to check NVIDIA availability and VRAM.")}</p>
         {gpu?.memoryTotalMb && <strong>{gpu.memoryTotalMb} MB VRAM</strong>}
         <br />
         <button className="secondary" onClick={onDiagnoseGpu}>

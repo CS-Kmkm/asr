@@ -6,12 +6,19 @@ mod audio;
 mod commands;
 mod correction;
 mod correction_prompt;
+mod dictionary;
 mod environment;
 mod injection;
 mod input_monitor;
 mod live_dictation;
+mod messages;
 mod personalization;
+mod pipeline;
+mod privacy;
 mod recording_overlay;
+mod services;
+mod sessions;
+mod settings;
 mod shortcuts;
 mod startup_error;
 mod state;
@@ -23,71 +30,33 @@ use std::{
     ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
-    process::Command,
     str::FromStr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use ask::AskContextKind;
-use asr::{JsonlTranscriber, Transcriber, WorkerCommand};
-use audio::{
-    AudioCapture, AudioDevice, AudioEnhancementConfig, CaptureConfig, CpalAudioCapture,
-    NoiseSuppressionLevel,
-};
-use injection::{
-    InjectionOptions, InsertResult, InsertionDetail, SelectedText, SystemTextInjector,
-    TargetWindow, TextInjector,
-};
-use input_monitor::InputMonitor;
-use state::{AppState, PipelineLifecycle, PipelineMode, PipelinePhase};
+use asr::WorkerCommand;
+#[cfg(test)]
+use injection::TargetWindow;
+#[cfg(test)]
+use services::MicrophoneTestState;
+use services::Services;
+#[cfg(test)]
+use sessions::is_external_ask_target;
+pub(crate) use sessions::{AskCapture, AskSession, EditSession};
+use state::{AppState, PipelineLifecycle, PipelineMode};
 use storage::{SettingsRepairs, Storage};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Emitter, Manager, RunEvent, State, WindowEvent,
+    AppHandle, Emitter, Manager, RunEvent, WindowEvent,
 };
-use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
-use types::{
-    AppPhase, AppStateSnapshot, DictionaryCandidate, DictionaryEntry, DictionaryEntryInput,
-    DictionaryImportInput, GpuDiagnostics, HistoryItem, LoadModelRequest, ModelStatus,
-    NewDictionaryEntry, NewHistoryItem, RecordingResult, Settings,
-};
+use types::{AppPhase, GpuDiagnostics, Settings};
 
 /// Minimum response timeout for an ASR request. Transcription of a long
 /// recording scales beyond it with the audio length (`asr::transcription_timeout`).
 const ASR_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const ASR_MODEL_LOAD_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
-
-#[derive(Default)]
-struct MicrophoneTestState {
-    generation: u64,
-    active: Option<u64>,
-}
-
-impl MicrophoneTestState {
-    fn start(&mut self) -> u64 {
-        self.generation = self.generation.wrapping_add(1);
-        self.active = Some(self.generation);
-        self.generation
-    }
-
-    fn stop(&mut self) -> bool {
-        self.active.take().is_some()
-    }
-
-    fn is_current(&self, generation: u64) -> bool {
-        self.active == Some(generation)
-    }
-
-    fn is_active(&self) -> bool {
-        self.active.is_some()
-    }
-}
 
 pub(crate) fn model_identity(settings: &Settings) -> (Option<String>, String) {
     let custom_model = settings
@@ -122,236 +91,6 @@ pub(crate) fn model_identity(settings: &Settings) -> (Option<String>, String) {
             "Mock backend for development; no model is downloaded.".into(),
         ),
         _ => (None, format!("Unknown ASR backend: {}.", settings.asr_backend)),
-    }
-}
-
-pub(crate) struct Services {
-    audio: tokio::sync::Mutex<Box<dyn AudioCapture>>,
-    live: tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
-    edit: tokio::sync::Mutex<Option<EditSession>>,
-    ask: tokio::sync::Mutex<Option<AskSession>>,
-    answer_panel: answer_panel::AnswerPanelState,
-    target: Mutex<Option<TargetWindow>>,
-    app_context: Mutex<Option<types::AppContext>>,
-    transcriber: Arc<dyn Transcriber>,
-    input_monitor: Arc<InputMonitor>,
-    model: commands::ModelStatusSlot,
-    gpu_diagnostics: Mutex<Option<GpuDiagnostics>>,
-    lifecycle: PipelineLifecycle,
-    initialization: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
-    shutdown_started: AtomicBool,
-    voice_translation_target: Mutex<Option<String>>,
-    shortcut_routes: Mutex<shortcuts::Routes>,
-    /// Saved shortcuts not dispatched since startup, named by action and
-    /// chord: collision losers and chords the OS refused.
-    inactive_shortcuts: Mutex<Vec<String>>,
-    settings_update: tokio::sync::Mutex<()>,
-    microphone_test: tokio::sync::Mutex<MicrophoneTestState>,
-    /// Whether this app holds the Esc cancel chord. Locked before
-    /// `shortcut_routes` whenever both are needed.
-    cancel_chord_registered: Mutex<bool>,
-}
-
-impl Services {
-    fn new(settings: &Settings) -> Self {
-        let (model_id, detail) = model_identity(settings);
-        Self {
-            audio: tokio::sync::Mutex::new(Box::new(CpalAudioCapture::new())),
-            live: tokio::sync::Mutex::new(None),
-            edit: tokio::sync::Mutex::new(None),
-            ask: tokio::sync::Mutex::new(None),
-            answer_panel: answer_panel::AnswerPanelState::default(),
-            target: Mutex::new(None),
-            app_context: Mutex::new(None),
-            transcriber: Arc::new(JsonlTranscriber::new(
-                worker_command_for_settings(settings),
-                ASR_REQUEST_TIMEOUT,
-                ASR_MODEL_LOAD_TIMEOUT,
-            )),
-            input_monitor: Arc::new(InputMonitor::default()),
-            model: commands::ModelStatusSlot::new(ModelStatus {
-                model_id,
-                quantization: settings.model_quantization.clone(),
-                installed: false,
-                state: "not_loaded".into(),
-                detail,
-            }),
-            gpu_diagnostics: Mutex::new(None),
-            lifecycle: PipelineLifecycle::default(),
-            initialization: Mutex::new(None),
-            shutdown_started: AtomicBool::new(false),
-            voice_translation_target: Mutex::new(None),
-            shortcut_routes: Mutex::new(
-                shortcuts::Routes::parse_saved(settings).expect("validated settings"),
-            ),
-            inactive_shortcuts: Mutex::new(Vec::new()),
-            settings_update: tokio::sync::Mutex::new(()),
-            microphone_test: tokio::sync::Mutex::new(MicrophoneTestState::default()),
-            cancel_chord_registered: Mutex::new(false),
-        }
-    }
-
-    fn begin_shutdown(&self) -> bool {
-        self.shutdown_started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-
-    async fn shutdown(&self) {
-        let _ = self.lifecycle.cancel();
-        if let Ok(mut initialization) = self.initialization.lock() {
-            if let Some(task) = initialization.take() {
-                task.abort();
-            }
-        }
-        {
-            self.microphone_test.lock().await.stop();
-            let mut audio = self.audio.lock().await;
-            let _ = audio.cancel().await;
-            let _ = audio.disarm().await;
-        }
-        if let Some(task) = self.live.lock().await.take() {
-            let _ = task.finish().await;
-        }
-        self.edit.lock().await.take();
-        self.ask.lock().await.take();
-        if let Ok(mut target) = self.target.lock() {
-            target.take();
-        }
-        if let Ok(mut language) = self.voice_translation_target.lock() {
-            language.take();
-        }
-        self.input_monitor.shutdown();
-        let _ = self.transcriber.shutdown().await;
-    }
-}
-
-pub(crate) struct EditSession {
-    selection: SelectedText,
-    injector: SystemTextInjector,
-    monitor: Arc<InputMonitor>,
-    checkpoint: u64,
-}
-
-impl EditSession {
-    fn new(settings: &Settings, active_hotkey: &str, from_shortcut: bool) -> Result<Self, String> {
-        let injector = SystemTextInjector::new(InjectionOptions {
-            restore_clipboard: settings.clipboard_restore,
-        });
-        let selection = injector
-            .capture_selection()
-            .map_err(|_| "Select text in a supported foreground edit control.".to_string())?;
-        let monitor = Arc::new(InputMonitor::default());
-        if !monitor.start_for_recording(active_hotkey, &settings.shortcuts.edit, from_shortcut) {
-            return Err("Speak to edit could not monitor the original selection safely.".into());
-        }
-        let checkpoint = monitor
-            .checkpoint()
-            .ok_or("Speak to edit could not monitor the original selection safely.")?;
-        Ok(Self {
-            selection,
-            injector,
-            monitor,
-            checkpoint,
-        })
-    }
-}
-
-impl Drop for EditSession {
-    fn drop(&mut self) {
-        self.monitor.shutdown();
-    }
-}
-
-pub(crate) enum AskCapture {
-    Selected(SelectedText),
-    Caret(TargetWindow),
-    Unavailable,
-}
-
-// The answer panel and all other app windows share our process. Never use
-// their focused text as a fresh Ask source or insertion target.
-fn is_external_ask_target(target: &TargetWindow) -> bool {
-    target.process_id != std::process::id()
-}
-
-pub(crate) struct AskSession {
-    pub(crate) capture: AskCapture,
-    pub(crate) injector: SystemTextInjector,
-    pub(crate) monitor: Option<Arc<InputMonitor>>,
-    pub(crate) checkpoint: Option<u64>,
-}
-
-impl AskSession {
-    fn new(settings: &Settings, active_hotkey: &str, from_shortcut: bool) -> Self {
-        let injector = SystemTextInjector::new(InjectionOptions {
-            restore_clipboard: settings.clipboard_restore,
-        });
-        // Only the known "no selection" result may become a caret capture.
-        // Any inaccessible/changed selection becomes panel-only, never an
-        // insertion target.
-        let capture = match injector.capture_selection() {
-            Ok(selection) if is_external_ask_target(selection.target()) => {
-                AskCapture::Selected(selection)
-            }
-            Ok(_) => AskCapture::Unavailable,
-            Err(injection::InjectionError::NoSelection) => match injector.capture_target() {
-                Ok(target) if is_external_ask_target(&target) => AskCapture::Caret(target),
-                Ok(_) => AskCapture::Unavailable,
-                Err(_) => AskCapture::Unavailable,
-            },
-            Err(_) => AskCapture::Unavailable,
-        };
-        let monitor = match &capture {
-            AskCapture::Selected(_) | AskCapture::Caret(_) => {
-                let monitor = Arc::new(InputMonitor::default());
-                if monitor.start_for_recording(
-                    active_hotkey,
-                    &settings.shortcuts.ask,
-                    from_shortcut,
-                ) {
-                    Some(monitor)
-                } else {
-                    None
-                }
-            }
-            AskCapture::Unavailable => None,
-        };
-        let checkpoint = monitor.as_ref().and_then(|monitor| monitor.checkpoint());
-        let capture = if matches!(&capture, AskCapture::Caret(_)) && checkpoint.is_none() {
-            AskCapture::Unavailable
-        } else {
-            capture
-        };
-        Self {
-            capture,
-            injector,
-            monitor,
-            checkpoint,
-        }
-    }
-
-    pub(crate) fn kind(&self) -> AskContextKind {
-        match self.capture {
-            AskCapture::Selected(_) => AskContextKind::Selected,
-            AskCapture::Caret(_) => AskContextKind::Caret,
-            AskCapture::Unavailable => AskContextKind::Unavailable,
-        }
-    }
-
-    pub(crate) fn selected_source(&self) -> Option<&str> {
-        match &self.capture {
-            AskCapture::Selected(selection) => Some(selection.text()),
-            _ => None,
-        }
-    }
-}
-
-impl Drop for AskSession {
-    fn drop(&mut self) {
-        if let Some(monitor) = &self.monitor {
-            monitor.shutdown();
-        }
     }
 }
 
@@ -529,17 +268,39 @@ fn worker_runtime() -> (OsString, Option<PathBuf>) {
 }
 
 pub(crate) fn emit_state(app: &AppHandle, state: &AppState, phase: AppPhase, message: &str) {
+    emit_stage(app, state, types::AppStage::for_phase(&phase), message);
+}
+
+pub(crate) fn emit_stage(app: &AppHandle, state: &AppState, stage: types::AppStage, message: &str) {
     // The overlay is the feedback surface while the main window is hidden:
     // an Error shows its message there instead of only reaching the windows.
-    recording_overlay::publish(app, &phase, message);
-    let snapshot = state.transition(phase, Some(message.into()));
+    recording_overlay::publish(app, &stage.phase(), message);
+    let snapshot = state.transition_stage(stage, Some(message.into()));
     let _ = app.emit("app-state", snapshot);
 }
 
 pub(crate) fn emit_status(app: &AppHandle, kind: &str, message: &str) {
     let _ = app.emit(
         "status",
-        serde_json::json!({ "kind": kind, "message": message }),
+        serde_json::json!({ "kind": kind, "code": messages::code(message), "message": message }),
+    );
+}
+
+pub(crate) fn emit_ai_failure(
+    app: &AppHandle,
+    kind: &str,
+    error: &correction::CorrectionError,
+    outcome: correction::FailureOutcome,
+    message: &str,
+) {
+    if matches!(error, correction::CorrectionError::Cancelled) {
+        return;
+    }
+    let _ = app.emit(
+        "status",
+        serde_json::json!({
+            "kind": kind, "code": error.failure_code(), "outcome": outcome, "message": message
+        }),
     );
 }
 
@@ -1170,10 +931,10 @@ mod model_configuration_tests {
 
     #[test]
     fn settings_fallback_notice_is_translated() {
-        let catalog = include_str!("../../src/i18n.tsx");
-        let key = format!("\"{SETTINGS_FALLBACK_MESSAGE}\"");
-        // English and Japanese catalogs plus the backend message list.
-        assert_eq!(catalog.matches(&key).count(), 4);
+        assert!(crate::messages::code(SETTINGS_FALLBACK_MESSAGE).is_some());
+        assert!(!crate::messages::catalogue()[SETTINGS_FALLBACK_MESSAGE]
+            .ja
+            .is_empty());
     }
 
     #[test]
@@ -1515,6 +1276,10 @@ async fn initialize_model_runtime(app: AppHandle, settings: Settings) {
     let _ = app.emit("gpu-diagnostics", diagnostics);
 
     let services = app.state::<Services>();
+    // Setup requires an explicit Load action; never start an unseen download.
+    if !settings.setup_complete || privacy::check_asr(&settings).is_err() {
+        return;
+    }
     if let Err(error) = commands::ensure_model_loaded(&app, &services, &settings).await {
         emit_status(&app, "model_load_failed", &error);
     }
@@ -1726,6 +1491,7 @@ pub fn run() {
             commands::get_app_state,
             commands::get_startup_hotkey_warning,
             commands::get_settings,
+            commands::get_ui_preferences,
             commands::get_shortcut_warning,
             commands::get_settings_repair_status,
             commands::persist_repaired_settings,

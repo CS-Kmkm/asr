@@ -1,27 +1,15 @@
+import { loadSource } from "./test-support/load-source.mjs";
 // Run with node --test scripts/test-settings-save-order.mjs.
 // Exercise MainAppContent.saveSettings with saves made while earlier ones are
 // pending: sending order, acknowledgements, failures and settings-changed echoes.
 // IPC and events are stubs; this does not emulate a browser or the backend.
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { test } from "node:test";
 import { runInNewContext } from "node:vm";
 import ts from "typescript";
 
-const require = createRequire(import.meta.url);
 function load(path, mocks = {}, exposeMain = false) {
-  let source = readFileSync(new URL(path, import.meta.url), "utf8");
-  if (exposeMain) source = source.replace("function MainAppContent(", "export function MainAppContent(");
-  const output = ts.transpileModule(source, {
-    compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
-  }).outputText;
-  const module = { exports: {} };
-  runInNewContext(output, {
-    module, exports: module.exports, window: {},
-    require: (name) => name in mocks ? mocks[name] : require(name),
-  });
-  return module.exports;
+ return loadSource(new URL(path, import.meta.url), {mocks, expose: exposeMain ? ['MainAppContent'] : []});
 }
 const { defaultSettings } = load("../src/api.ts");
 
@@ -154,6 +142,52 @@ function fixture(stored = {}) {
 }
 
 const profile = (patch = {}) => ({ formality: "formal", detail: "concise", guidance: "", ...patch });
+
+test("a specific AI failure notice survives a later completion notice until the next operation", async () => {
+  const app = fixture();
+  await app.open();
+  await app.emit("app-state", { phase: "processing", stage: "correcting", operation: "recording", operationId: 10, message: "busy", messageCode: null });
+  await app.emit("status", { kind: "text_correction_failed", code: "ai_invalid_api_key", outcome: "using_transcript", message: "specific failure cause" });
+  await app.emit("status", { kind: "success", message: "generic completion" });
+  assert.equal(app.notice(), "specific failure cause");
+  for (const kind of ["history_save_failed", "metric_save_failed", "artifact_cleanup_failed"]) {
+    await app.emit("status", { kind, message: "later operational warning" });
+    assert.equal(app.notice(), "specific failure cause");
+  }
+  await app.emit("app-state", { phase: "completed", stage: "completed", operation: null, operationId: 10, message: "done", messageCode: null });
+  assert.equal(app.notice(), "specific failure cause");
+  await app.emit("app-state", { phase: "recording", stage: "recording", operation: "recording", operationId: 11, message: "new operation", messageCode: null });
+  await app.emit("status", { kind: "success", message: "new completion" });
+  assert.equal(app.notice(), "new completion");
+});
+
+test("History Retry cancellation follows operation identity through later processing stages", async () => {
+  const app = fixture();
+  await app.navigate("History");
+  for (const phase of ["processing", "injecting"]) {
+    await app.emit("app-state", { phase, stage: "transcribing", operation: "retry", message: "changed wording", messageCode: null });
+    assert.equal(app.props("History").retryActive, true);
+  }
+  await app.emit("app-state", { phase: "completed", stage: "completed", operation: null, message: "done", messageCode: null });
+  assert.equal(app.props("History").retryActive, false);
+});
+
+test("Setup stays open after a failed Finish save and navigates only after success", async () => {
+  const app = fixture({ setupComplete: false });
+  await app.settle();
+  app.props("Setup").onFinish();
+  await app.settle();
+  assert.equal(app.saves.length, 1);
+  app.saves[0].reject(new Error("settings write failed"));
+  await app.settle();
+  assert.ok(app.props("Setup"));
+  assert.match(app.notice(), /settings write failed/);
+  app.props("Setup").onFinish();
+  await app.settle();
+  app.saves[1].resolve();
+  await app.settle();
+  assert.ok(app.props("Dashboard"));
+});
 
 // A select saves at once; the guidance text is committed while it is pending.
 async function selectThenCommit(app) {

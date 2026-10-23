@@ -1,26 +1,14 @@
+import { loadSource } from "./test-support/load-source.mjs";
 // Run with node --test scripts/test-history-retention.mjs.
 // Exercise page-level guards with isolated hooks and IPC stubs; this does not
 // emulate a browser, so native constraint validation and dialogs are stubbed.
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { createRequire } from "node:module";
 import { test } from "node:test";
 import { runInNewContext } from "node:vm";
 import ts from "typescript";
 
-const require = createRequire(import.meta.url);
 function load(relativePath, mocks = {}, runtimeWindow = {}, exposeMain = false) {
-  let source = readFileSync(new URL(relativePath, import.meta.url), "utf8");
-  if (exposeMain) source = source.replace("function MainAppContent(", "export function MainAppContent(");
-  const output = ts.transpileModule(source, {
-    compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, target: ts.ScriptTarget.ES2021 },
-  }).outputText;
-  const module = { exports: {} };
-  runInNewContext(output, {
-    module, exports: module.exports, window: runtimeWindow,
-    require: (name) => name in mocks ? mocks[name] : require(name),
-  });
-  return module.exports;
+ return loadSource(new URL(relativePath, import.meta.url), {mocks, globals:{window:runtimeWindow}, expose:exposeMain?['MainAppContent']:[]});
 }
 
 const i18n = { useI18n: () => ({ language: "en", t: (key) => key }) };
@@ -73,7 +61,7 @@ const pages = {
   }).HistoryPage({ settings, settingsLoaded, history: [], filter: "all", onSave, onFilter() {}, onCopyItem() {}, onRetry() {}, onDelete() {}, onDeleteAll() {}, onLoadAudio() {}, onAudioError() {}, retryActive: false, onCancelRetry() {} }),
   privacy: (component, settings, onSave, settingsLoaded = true) => load("../src/pages/PrivacyPage.tsx", {
     "../components/ui": { SettingRow: "row", Toggle: "toggle" }, "../components/HistoryRetentionSelect": component, "../i18n": i18n,
-  }).PrivacyPage({ settings, settingsLoaded, onSave }),
+  }).PrivacyPage({ settings: { ...load("../src/api.ts").defaultSettings, ...settings }, settingsLoaded, onSave }),
 };
 
 for (const [name, render] of Object.entries(pages)) {

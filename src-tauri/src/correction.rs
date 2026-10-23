@@ -1,11 +1,24 @@
-use std::{collections::HashMap, env, future::Future, net::IpAddr, time::Duration};
+mod budget;
+mod transport;
+use budget::OutputBudget;
+mod fact_check;
+#[cfg(not(test))]
+use fact_check::accept_provider_correction;
+#[cfg(test)]
+use fact_check::*;
+
+use std::{future::Future, net::IpAddr, time::Duration};
 
 use futures_util::StreamExt;
 use reqwest::{redirect::Policy, Client, StatusCode, Url};
 use serde_json::{json, Value};
 use tokio::sync::watch;
 
-use crate::{correction_prompt::build_correction_instruction, types::Settings};
+#[cfg(test)]
+use crate::correction_prompt::build_correction_instruction;
+use crate::{
+    correction_prompt::build_correction_context, dictionary::CorrectionTerm, types::Settings,
+};
 
 const OPENAI_RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 const GEMINI_INTERACTIONS_URL: &str = "https://generativelanguage.googleapis.com/v1/interactions";
@@ -15,6 +28,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCAL_READ_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_ERROR_BODY_CHARS: usize = 500;
+pub(crate) const INVALID_API_KEY_MESSAGE: &str =
+    "The AI provider rejected the API key. Check the API key in Settings.";
 const ASK_PLAN_MIN_OUTPUT_TOKENS: usize = 512;
 const ASK_TEXT_MIN_OUTPUT_TOKENS: usize = 4096;
 /// Smallest visible-text budget sent to any provider; per-model output
@@ -29,6 +44,10 @@ pub enum CorrectionError {
     Request(#[from] reqwest::Error),
     #[error("text correction API returned HTTP {status}: {message}")]
     Api { status: StatusCode, message: String },
+    #[error("{}", INVALID_API_KEY_MESSAGE)]
+    InvalidApiKey { status: StatusCode },
+    #[error("Allow this AI provider in Privacy before sending text.")]
+    ConsentRequired,
     #[error("text correction API returned an invalid response: {0}")]
     InvalidResponse(String),
     #[error("the local model reached its output token limit")]
@@ -50,1118 +69,87 @@ pub enum CorrectionError {
     EmptyEditInstruction,
 }
 
+impl CorrectionError {
+    pub(crate) fn failure_code(&self) -> &'static str {
+        match self {
+            Self::MissingApiKey(_) => "ai_missing_api_key",
+            Self::InvalidApiKey { .. } => "ai_invalid_api_key",
+            Self::Api { status, .. } if matches!(status.as_u16(), 401 | 403) => {
+                "ai_invalid_api_key"
+            }
+            Self::Api { status, .. } if status.as_u16() == 429 => "ai_rate_limited",
+            Self::Api { .. } => "ai_provider_error",
+            Self::Request(_) => "ai_unreachable",
+            Self::InvalidResponse(_) => "ai_invalid_response",
+            Self::OutputLimit => "ai_output_limit",
+            Self::ProviderOutputLimit => "ai_provider_output_limit",
+            Self::ProtectedContentChanged => "ai_protected_content_changed",
+            Self::ConsentRequired => "ai_consent_required",
+            Self::InvalidEndpoint(_) => "ai_invalid_endpoint",
+            Self::UnsupportedProvider(_) => "ai_unsupported_provider",
+            Self::EmptyEditInstruction => "ai_empty_edit_instruction",
+            Self::Cancelled => "ai_cancelled",
+        }
+    }
+
+    pub(crate) fn user_message(&self) -> &'static str {
+        crate::messages::english(self.failure_code())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_authentication_error(&self) -> bool {
+        matches!(self, Self::InvalidApiKey { .. })
+            || matches!(self, Self::Api { status, .. } if matches!(status.as_u16(), 401 | 403))
+    }
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FailureOutcome {
+    UsingTranscript,
+    UnchangedSelection,
+    NoAction,
+}
+
+impl FailureOutcome {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::UsingTranscript => "outcome_using_transcript",
+            Self::UnchangedSelection => "outcome_unchanged_selection",
+            Self::NoAction => "outcome_no_action",
+        }
+    }
+}
+
+pub(crate) fn failure_message(error: &CorrectionError, outcome: FailureOutcome) -> String {
+    format!(
+        "{} {}",
+        error.user_message(),
+        crate::messages::english(outcome.code())
+    )
+}
+
 pub async fn correct_transcript(
     settings: &Settings,
     transcript: &str,
-    dictionary_hints: &[String],
+    dictionary_hints: &[CorrectionTerm],
     style_guidance: Option<&str>,
     cancel: watch::Receiver<bool>,
     on_update: impl FnMut(&str),
 ) -> Result<String, CorrectionError> {
-    let mut instruction = build_correction_instruction(settings, dictionary_hints, style_guidance);
-    append_speech_locale(&mut instruction, settings);
+    let mut context = build_correction_context(settings, dictionary_hints, style_guidance);
+    append_speech_locale(&mut context.instruction, settings);
     let corrected = request_text(
         settings,
         transcript,
-        &instruction,
+        &context.instruction,
         cancel,
         on_update,
         true,
-        None,
+        OutputBudget::Transcript,
     )
     .await?;
-    accept_provider_correction(
-        settings,
-        transcript,
-        &instruction,
-        dictionary_hints,
-        corrected,
-    )
-}
-
-/// Decides whether a completed provider result may replace the transcript.
-///
-/// Conservative mode returns the provider text unchanged, exactly as before
-/// intent-aware mode existed. Only intent-aware output is fact-checked.
-fn accept_provider_correction(
-    settings: &Settings,
-    transcript: &str,
-    instruction: &str,
-    dictionary_hints: &[String],
-    corrected: String,
-) -> Result<String, CorrectionError> {
-    if settings.correction_mode != "intent_aware" {
-        return Ok(corrected);
-    }
-    let prompted_hints = instruction
-        .lines()
-        .rev()
-        .find_map(|line| line.strip_prefix("Terms: "))
-        .map(|terms| {
-            terms
-                .split("; ")
-                .filter(|term| dictionary_hints.iter().any(|hint| hint.trim() == *term))
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    validate_correction_output_with_hints(settings, transcript, &corrected, &prompted_hints)?;
-    Ok(corrected)
-}
-
-#[cfg(test)]
-fn validate_correction_output(
-    settings: &Settings,
-    transcript: &str,
-    corrected: &str,
-) -> Result<(), CorrectionError> {
-    validate_correction_output_with_hints(settings, transcript, corrected, &[])
-}
-
-fn validate_correction_output_with_hints(
-    settings: &Settings,
-    transcript: &str,
-    corrected: &str,
-    dictionary_hints: &[String],
-) -> Result<(), CorrectionError> {
-    if settings.correction_mode != "intent_aware" {
-        return Ok(());
-    }
-    let edits = FactEdits {
-        corrections: settings.correction_resolve_self_corrections,
-        merge_duplicates: settings.correction_remove_repetitions,
-    };
-    if !preserves_protected_spans_with_hints(transcript, corrected, edits, dictionary_hints) {
-        return Err(CorrectionError::ProtectedContentChanged);
-    }
-    Ok(())
-}
-
-/// Editing switches that decide which source facts the output may drop.
-#[derive(Clone, Copy)]
-struct FactEdits {
-    /// Explicitly superseded values may be dropped or applied globally.
-    corrections: bool,
-    /// Repeated mentions of one value may be merged into a single mention.
-    merge_duplicates: bool,
-}
-
-#[cfg(test)]
-fn preserves_protected_spans(transcript: &str, corrected: &str, allow_corrections: bool) -> bool {
-    let edits = FactEdits {
-        corrections: allow_corrections,
-        merge_duplicates: false,
-    };
-    preserves_protected_spans_with_hints(transcript, corrected, edits, &[])
-}
-
-fn preserves_protected_spans_with_hints(
-    transcript: &str,
-    corrected: &str,
-    edits: FactEdits,
-    dictionary_hints: &[String],
-) -> bool {
-    // Ordered-list markers the model adds for formatting are not facts: they
-    // may neither count as new values nor stand in for a dropped number.
-    let corrected = &strip_ordered_list_markers(corrected);
-    let Some(output_for_new_values) =
-        remove_prompted_dictionary_surfaces(transcript, corrected, dictionary_hints)
-    else {
-        return false;
-    };
-    [
-        ProtectedKind::Url,
-        ProtectedKind::Number,
-        ProtectedKind::Code,
-    ]
-    .into_iter()
-    .all(|kind| facts_preserved(transcript, corrected, &output_for_new_values, kind, edits))
-        && uncertainty_preserved(transcript, corrected)
-        && proper_nouns_preserved(transcript, corrected, edits, dictionary_hints)
-}
-
-/// Names must survive intent-aware editing: every kept source name stays,
-/// an explicitly repaired name may be replaced by its repair, and the output
-/// may not introduce a name the speaker never said. Comparison ignores case,
-/// so capitalization fixes such as Github -> GitHub are accepted, and a name
-/// may be mentioned more or fewer times while it still appears.
-///
-/// Names are Latin-script tokens that look like proper nouns (see
-/// [`is_latin_proper_noun`]) and prompted dictionary terms, the only way a
-/// Japanese name is known to be a name.
-fn proper_nouns_preserved(
-    source: &str,
-    output: &str,
-    edits: FactEdits,
-    dictionary_hints: &[String],
-) -> bool {
-    let terms = dictionary_terms(dictionary_hints);
-    let occurrences = name_occurrences(source, &terms);
-    let roles = occurrence_roles(source, &occurrences, edits.corrections);
-    let present = |key: &FactKey| {
-        terms
-            .iter()
-            .find(|(surface, _)| fold(surface) == key.value)
-            .map_or_else(
-                || contains_name(output, &key.value),
-                |(surface, readings)| {
-                    term_spellings(surface, readings)
-                        .any(|spelling| contains_name(output, &fold(spelling)))
-                },
-            )
-    };
-    let kept = occurrences
-        .iter()
-        .zip(&roles)
-        .all(|((_, key), role)| match role {
-            OccurrenceRole::Kept => present(key),
-            OccurrenceRole::Superseded => true,
-            OccurrenceRole::Replaceable(final_key) => present(key) || present(final_key),
-        });
-    // Prompted dictionary spellings are trusted; any other name must have
-    // been spoken. Whole tokens are skipped, so a surface such as "Git" never
-    // turns "GitHub" into an unknown "Hub".
-    let term_ranges = name_occurrences(output, &terms)
-        .into_iter()
-        .filter(|(_, key)| terms.iter().any(|(surface, _)| fold(surface) == key.value))
-        .map(|(range, _)| range)
-        .collect::<Vec<_>>();
-    kept && latin_name_occurrences(output)
-        .iter()
-        .filter(|(range, _)| !term_ranges.iter().any(|term| ranges_overlap(term, range)))
-        .all(|(_, name)| contains_name(source, &fold(name)))
-}
-
-/// The spellings that identify a prompted term. Readings in scripts without
-/// word separators must be at least three characters, since a short reading
-/// such as あい also occurs inside unrelated words (ぐあい).
-fn term_spellings<'a>(surface: &'a str, readings: &'a [String]) -> impl Iterator<Item = &'a str> {
-    std::iter::once(surface).chain(
-        readings
-            .iter()
-            .map(String::as_str)
-            .filter(|reading| reading.is_ascii() || reading.chars().count() >= 3),
-    )
-}
-
-/// Prompted dictionary terms as `(surface, spoken readings)`.
-fn dictionary_terms(dictionary_hints: &[String]) -> Vec<(String, Vec<String>)> {
-    dictionary_hints
-        .iter()
-        .filter_map(|hint| {
-            let (surface, readings) = hint.split_once("<=")?;
-            let surface = surface.trim();
-            (!surface.is_empty()).then(|| {
-                (
-                    surface.to_owned(),
-                    readings
-                        .split('|')
-                        .map(str::trim)
-                        .filter(|reading| !reading.is_empty())
-                        .map(str::to_owned)
-                        .collect(),
-                )
-            })
-        })
-        .collect()
-}
-
-/// Name occurrences in source order. A prompted term is keyed by its surface,
-/// whichever spelling was spoken.
-fn name_occurrences(text: &str, terms: &[(String, Vec<String>)]) -> Vec<FactOccurrence> {
-    let mut candidates: Vec<FactOccurrence> = Vec::new();
-    let folded = Folded::new(text);
-    for (surface, readings) in terms {
-        let key = FactKey {
-            value: fold(surface),
-            unit: None,
-        };
-        for spelling in term_spellings(surface, readings) {
-            for range in folded.matches(&fold(spelling)) {
-                if name_boundaries(text, &range) {
-                    candidates.push((range, key.clone()));
-                }
-            }
-        }
-    }
-    // The longest spelling wins where terms overlap: "git hub" is GitHub,
-    // not Git followed by "hub".
-    candidates.sort_by_key(|(range, _)| (std::cmp::Reverse(range.len()), range.start));
-    let mut occurrences: Vec<FactOccurrence> = Vec::new();
-    for (range, key) in candidates {
-        if !occurrences
-            .iter()
-            .any(|(existing, _)| ranges_overlap(existing, &range))
-        {
-            occurrences.push((range, key));
-        }
-    }
-    for (range, name) in latin_name_occurrences(text) {
-        if !occurrences
-            .iter()
-            .any(|(existing, _)| ranges_overlap(existing, &range))
-        {
-            occurrences.push((
-                range,
-                FactKey {
-                    value: fold(&name),
-                    unit: None,
-                },
-            ));
-        }
-    }
-    occurrences.sort_by_key(|(range, _)| range.start);
-    occurrences
-}
-
-fn ranges_overlap(left: &std::ops::Range<usize>, right: &std::ops::Range<usize>) -> bool {
-    left.start < right.end && right.start < left.end
-}
-
-/// ASCII names need word boundaries; other scripts have no word separators.
-fn name_boundaries(text: &str, range: &std::ops::Range<usize>) -> bool {
-    if !text[range.clone()].is_ascii() {
-        return true;
-    }
-    let before = text[..range.start].chars().next_back();
-    let after = text[range.end..].chars().next();
-    !before.is_some_and(|character| character.is_ascii_alphanumeric())
-        && !after.is_some_and(|character| character.is_ascii_alphanumeric())
-}
-
-/// Case folding for name comparison: every character lowercased on its own,
-/// so a name folds the same way wherever it occurs (no final-sigma context).
-fn fold(text: &str) -> String {
-    text.chars().flat_map(char::to_lowercase).collect()
-}
-
-/// `text` folded, with each folded byte offset that begins a source
-/// character's folding mapped back to that character's offset in `text`.
-/// Case mapping can change lengths (the Kelvin sign shrinks, a dotted capital
-/// I grows), so folded offsets are never reused directly on `text`.
-struct Folded {
-    folded: String,
-    to_source: Vec<Option<usize>>,
-}
-
-impl Folded {
-    fn new(text: &str) -> Self {
-        let mut folded = String::with_capacity(text.len());
-        let mut to_source = Vec::with_capacity(text.len() + 1);
-        for (at, character) in text.char_indices() {
-            to_source.push(Some(at));
-            folded.extend(character.to_lowercase());
-            to_source.resize(folded.len(), None);
-        }
-        to_source.push(Some(text.len()));
-        Self { folded, to_source }
-    }
-
-    /// Source ranges of `name` (already folded). A match that starts or ends
-    /// inside one character's folding is not a match of that character.
-    fn matches<'a>(&'a self, name: &'a str) -> impl Iterator<Item = std::ops::Range<usize>> + 'a {
-        self.folded
-            .match_indices(name)
-            .filter(|_| !name.is_empty())
-            .filter_map(|(at, _)| Some(self.to_source[at]?..self.to_source[at + name.len()]?))
-    }
-}
-
-/// Whether `text` mentions `name` (folded), as a whole word when ASCII.
-fn contains_name(text: &str, name: &str) -> bool {
-    !name.is_empty()
-        && Folded::new(text)
-            .matches(name)
-            .any(|range| name_boundaries(text, &range))
-}
-
-/// Latin-script tokens that look like proper nouns, outside URLs and code.
-fn latin_name_occurrences(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
-    let excluded = url_occurrences(text)
-        .into_iter()
-        .chain(code_span_occurrences(text))
-        .map(|(range, _)| range)
-        .collect::<Vec<_>>();
-    let bytes = text.as_bytes();
-    let mut names = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        if !bytes[index].is_ascii_alphanumeric() {
-            index += 1;
-            continue;
-        }
-        let start = index;
-        let mut end = index;
-        while end < bytes.len() {
-            if bytes[end].is_ascii_alphanumeric() {
-                end += 1;
-            } else if matches!(bytes[end], b'.' | b'-' | b'_' | b'\'')
-                && bytes.get(end + 1).is_some_and(u8::is_ascii_alphanumeric)
-            {
-                end += 2;
-            } else {
-                break;
-            }
-        }
-        while end < bytes.len() && matches!(bytes[end], b'+' | b'#') {
-            end += 1;
-        }
-        index = end;
-        // A possessive belongs to the sentence, not the name: Tanaka's.
-        let token = &bytes[start..end];
-        if token.len() > 2 && (token.ends_with(b"'s") || token.ends_with(b"'S")) {
-            end -= 2;
-        }
-        let range = start..end;
-        if excluded.iter().any(|other| ranges_overlap(other, &range)) {
-            continue;
-        }
-        let token = &text[range.clone()];
-        if is_latin_proper_noun(token, sentence_initial(text, start)) {
-            names.push((range, token.to_owned()));
-        }
-    }
-    names
-}
-
-/// A token is a name when it has an inner capital (GitHub, iPhone, NASA) or
-/// is capitalized away from a sentence start (Tanaka, Zoom). A capitalized
-/// sentence start is ambiguous and ignored. Single letters, "I" contractions
-/// and "OK" are ordinary words.
-fn is_latin_proper_noun(token: &str, sentence_initial: bool) -> bool {
-    let letters = token.chars().filter(char::is_ascii_alphabetic).count();
-    if letters < 2 || token.eq_ignore_ascii_case("ok") || token.starts_with("I'") {
-        return false;
-    }
-    let mut characters = token.chars();
-    let first = characters.next().unwrap_or_default();
-    let inner_capital = characters.any(|character| character.is_ascii_uppercase());
-    inner_capital || first.is_ascii_uppercase() && !sentence_initial
-}
-
-fn sentence_initial(text: &str, start: usize) -> bool {
-    let before = text[..start].trim_end_matches(|character: char| {
-        character.is_whitespace() || matches!(character, '"' | '\'' | '(' | '「' | '『' | '（')
-    });
-    match before.char_indices().next_back() {
-        None => true,
-        Some((index, character)) => {
-            character == '\n'
-                || matches!(character, ':' | '：' | '-' | '*' | '・')
-                || is_sentence_break_at(before, index, character)
-        }
-    }
-}
-
-/// Removes a line-leading `1.` or `1)` marker (one or two ASCII digits followed
-/// by whitespace) from every line.
-fn strip_ordered_list_markers(text: &str) -> String {
-    text.split_inclusive('\n')
-        .map(|line| {
-            let body = line.trim_start_matches([' ', '\t']);
-            let indent = &line[..line.len() - body.len()];
-            let digits = body.bytes().take_while(u8::is_ascii_digit).count();
-            let rest = &body[digits..];
-            let marker = (1..=2).contains(&digits)
-                && rest.starts_with(['.', ')'])
-                && rest[1..].starts_with([' ', '\t']);
-            if marker {
-                format!("{indent}{}", &rest[1..])
-            } else {
-                line.to_owned()
-            }
-        })
-        .collect()
-}
-
-/// Removes trusted dictionary spellings before new values are counted. Returns
-/// `None` when a surface appears more often than its spoken readings allow.
-fn remove_prompted_dictionary_surfaces(
-    transcript: &str,
-    corrected: &str,
-    dictionary_hints: &[String],
-) -> Option<String> {
-    let mut without_dictionary_surfaces = corrected.to_owned();
-    for hint in dictionary_hints {
-        let Some((surface, readings)) = hint.split_once("<=") else {
-            continue;
-        };
-        if surface.is_empty() {
-            continue;
-        }
-        let source_lower = transcript.to_lowercase();
-        let allowed = readings
-            .split('|')
-            .filter(|reading| !reading.is_empty())
-            .map(|reading| source_lower.matches(&reading.to_lowercase()).count())
-            .sum::<usize>();
-        if allowed == 0
-            || corrected.matches(surface).count() > allowed + transcript.matches(surface).count()
-        {
-            return None;
-        }
-        without_dictionary_surfaces = without_dictionary_surfaces.replace(surface, "");
-    }
-    Some(without_dictionary_surfaces)
-}
-
-#[derive(Clone, Copy)]
-enum ProtectedKind {
-    Url,
-    Number,
-    Code,
-}
-
-/// A protected value. Numbers keep their counter so 3人 and 3円 differ.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct FactKey {
-    value: String,
-    unit: Option<char>,
-}
-
-type FactOccurrence = (std::ops::Range<usize>, FactKey);
-
-/// How the output may treat one source occurrence, decided by its position.
-#[derive(Clone, PartialEq)]
-enum OccurrenceRole {
-    /// The value must survive.
-    Kept,
-    /// An explicit repair cue replaced this occurrence; it may be dropped.
-    Superseded,
-    /// An earlier mention of a value that a later repair replaced. A global
-    /// correction may turn it into the final replacement instead of keeping it.
-    Replaceable(FactKey),
-}
-
-fn fact_occurrences(text: &str, kind: ProtectedKind) -> Vec<FactOccurrence> {
-    let plain =
-        |(range, value): (std::ops::Range<usize>, String)| (range, FactKey { value, unit: None });
-    match kind {
-        ProtectedKind::Number => number_occurrences(text)
-            .into_iter()
-            .map(|(range, value)| {
-                let unit = number_unit(text, &range);
-                (range, FactKey { value, unit })
-            })
-            .collect(),
-        ProtectedKind::Url => url_occurrences(text).into_iter().map(plain).collect(),
-        ProtectedKind::Code => code_span_occurrences(text).into_iter().map(plain).collect(),
-    }
-}
-
-/// Returns the counter or unit after a number, with equivalent counters
-/// (人/名, 回/度, つ/個) mapped to one representative.
-fn number_unit(text: &str, range: &std::ops::Range<usize>) -> Option<char> {
-    let unit = text[range.end..]
-        .chars()
-        .next()
-        .filter(|character| is_counter_character(*character))?;
-    Some(match unit {
-        '名' => '人',
-        '度' => '回',
-        '個' => 'つ',
-        other => other,
-    })
-}
-
-fn is_counter_character(character: char) -> bool {
-    matches!(
-        character,
-        '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}'
-    ) || ('ァ'..='ヺ').contains(&character)
-        || character == 'つ'
-}
-
-/// Matches source occurrences by position: each one is kept, superseded by a
-/// nearby explicit repair, or (before a later repair of the same value)
-/// replaceable by that repair's final value. The output must retain every kept
-/// occurrence and may not contain a value more often than the source allows.
-fn facts_preserved(
-    source: &str,
-    output: &str,
-    output_for_new_values: &str,
-    kind: ProtectedKind,
-    edits: FactEdits,
-) -> bool {
-    let occurrences = fact_occurrences(source, kind);
-    let roles = occurrence_roles(source, &occurrences, edits.corrections);
-    let count_keys = |text: &str| {
-        let mut counts = HashMap::<FactKey, usize>::new();
-        for (_, key) in fact_occurrences(text, kind) {
-            *counts.entry(key).or_default() += 1;
-        }
-        counts
-    };
-
-    // No new facts: a value may appear as often as in the source, plus once
-    // for each earlier mention that a later correction may replace with it.
-    for (key, count) in count_keys(output_for_new_values) {
-        let in_source = occurrences
-            .iter()
-            .filter(|(_, value)| *value == key)
-            .count();
-        let replaced_into = roles
-            .iter()
-            .filter(
-                |role| matches!(role, OccurrenceRole::Replaceable(final_key) if *final_key == key),
-            )
-            .count();
-        if count > in_source + replaced_into {
-            return false;
-        }
-    }
-
-    let mut available = count_keys(output);
-    let mut kept = HashMap::<&FactKey, usize>::new();
-    for ((_, key), role) in occurrences.iter().zip(&roles) {
-        if *role == OccurrenceRole::Kept {
-            *kept.entry(key).or_default() += 1;
-        }
-    }
-    for (key, required) in kept {
-        let found = available.get(key).copied().unwrap_or_default();
-        if edits.merge_duplicates {
-            // Merged duplicates must still leave one mention of the value.
-            if found == 0 {
-                return false;
-            }
-        } else if found < required {
-            return false;
-        } else {
-            available.insert(key.clone(), found - required);
-        }
-    }
-    for ((_, key), role) in occurrences.iter().zip(&roles) {
-        let OccurrenceRole::Replaceable(final_key) = role else {
-            continue;
-        };
-        let original = available.get(key).copied().unwrap_or_default();
-        let replacement = available.get(final_key).copied().unwrap_or_default();
-        if edits.merge_duplicates {
-            if original == 0 && replacement == 0 {
-                return false;
-            }
-        } else if original > 0 {
-            available.insert(key.clone(), original - 1);
-        } else if replacement > 0 {
-            available.insert(final_key.clone(), replacement - 1);
-        } else {
-            return false;
-        }
-    }
-    true
-}
-
-fn occurrence_roles(
-    source: &str,
-    occurrences: &[FactOccurrence],
-    allow_corrections: bool,
-) -> Vec<OccurrenceRole> {
-    let mut roles = vec![OccurrenceRole::Kept; occurrences.len()];
-    if !allow_corrections {
-        return roles;
-    }
-    let replacements = (0..occurrences.len())
-        .map(|index| replacement_index(source, occurrences, index))
-        .collect::<Vec<_>>();
-    for index in 0..occurrences.len() {
-        let Some(mut target) = replacements[index] else {
-            continue;
-        };
-        roles[index] = OccurrenceRole::Superseded;
-        // Replacements always lie later in the transcript, so following
-        // successive revisions terminates at the final explicit choice.
-        while let Some(next) = replacements[target] {
-            target = next;
-        }
-        let final_key = &occurrences[target].1;
-        for earlier in 0..index {
-            if roles[earlier] == OccurrenceRole::Kept
-                && occurrences[earlier].1 == occurrences[index].1
-            {
-                roles[earlier] = OccurrenceRole::Replaceable(final_key.clone());
-            }
-        }
-    }
-    roles
-}
-
-/// Returns the occurrence that explicitly replaces `occurrences[index]`, if any.
-fn replacement_index(source: &str, occurrences: &[FactOccurrence], index: usize) -> Option<usize> {
-    let (old_range, old) = &occurrences[index];
-    let tail_start = old_range.end;
-    let tail_end = occurrences[index + 1..]
-        .iter()
-        .find(|(_, key)| key.value == old.value)
-        .map_or(source.len(), |(range, _)| range.start);
-    let tail = &source[tail_start..tail_end];
-    let source_clause = source[..old_range.start]
-        .rsplit(['。', '、', ',', '.', '!', '?', '！', '？'])
-        .next()
-        .unwrap_or_default()
-        .trim();
-    // Only a nearby repair cue with a replacement in its first clause can
-    // license dropping a value. A value in a later topic is not a repair.
-    let (cue_at, cue_len) = find_repair_cue(tail)?;
-    let before_cue = &tail[..cue_at];
-    let sentence_breaks = before_cue
-        .char_indices()
-        .filter(|(index, character)| is_sentence_break_at(before_cue, *index, *character))
-        .collect::<Vec<_>>();
-    if before_cue.chars().count() > 80 || sentence_breaks.len() > 2 {
-        return None;
-    }
-    if let Some((last_break, character)) = sentence_breaks.last() {
-        let after_break = &before_cue[*last_break + character.len_utf8()..];
-        if !after_break.trim().is_empty() {
-            return None;
-        }
-    }
-    // A second same-kind value before the cue makes its target ambiguous.
-    let cue_start = tail_start + cue_at;
-    if occurrences.iter().any(|(range, key)| {
-        range.start >= tail_start && range.start < cue_start && key.value != old.value
-    }) {
-        return None;
-    }
-    let repair = skip_repair_separators_and_fillers(&tail[cue_at + cue_len..]);
-    let repair_start = tail_end - repair.len();
-    let limit = repair
-        .char_indices()
-        .nth(80)
-        .map_or(repair.len(), |(at, _)| at);
-    let clause = &repair[..limit];
-    let clause_end = repair_start
-        + clause
-            .char_indices()
-            .find(|(index, character)| {
-                is_sentence_break_at(clause, *index, *character) || matches!(character, '、' | ',')
-            })
-            .map_or(clause.len(), |(index, _)| index);
-    let (replacement_index, (replacement_range, replacement)) = occurrences
-        .iter()
-        .enumerate()
-        .skip(index + 1)
-        .find(|(_, (range, _))| range.start >= repair_start && range.start < clause_end)?;
-    if replacement.value == old.value {
-        return None;
-    }
-    let prefix = source[repair_start..replacement_range.start].trim();
-    if !prefix.is_empty() && !source_clause.ends_with(prefix) {
-        return None;
-    }
-    if old.unit.is_some() && replacement.unit.is_some() && old.unit != replacement.unit {
-        return None;
-    }
-    Some(replacement_index)
-}
-
-// Longer cues precede their prefixes so ties resolve to the full cue.
-const REPAIR_CUES: [&str; 12] = [
-    "いや",
-    "ではなくて",
-    "ではなく",
-    "じゃなくて",
-    "じゃなく",
-    "違う",
-    "訂正",
-    "正しくは",
-    "actually",
-    "I meant",
-    "I mean",
-    "rather",
-];
-// Empty hesitations that may sit between a repair cue and its replacement.
-const REPAIR_FILLERS: [&str; 11] = [
-    "えーっと",
-    "えーと",
-    "ええと",
-    "えっと",
-    "えー",
-    "あのー",
-    "あの",
-    "うーん",
-    "um",
-    "uh",
-    "er",
-];
-
-/// Finds the earliest repair cue in `text` as `(byte offset, byte length)`.
-/// English cues match case-insensitively on word boundaries.
-fn find_repair_cue(text: &str) -> Option<(usize, usize)> {
-    REPAIR_CUES
-        .iter()
-        .filter_map(|cue| {
-            let at = if cue.is_ascii() {
-                find_english_phrase(text, cue)
-            } else {
-                text.find(cue)
-            };
-            at.map(|at| (at, cue.len()))
-        })
-        .min_by_key(|(at, length)| (*at, std::cmp::Reverse(*length)))
-}
-
-fn skip_repair_separators_and_fillers(text: &str) -> &str {
-    let mut rest = text;
-    loop {
-        rest = rest.trim_start_matches(|c: char| {
-            c.is_whitespace() || matches!(c, '、' | ',' | ':' | '：')
-        });
-        let filler = REPAIR_FILLERS.iter().find(|filler| {
-            rest.get(..filler.len()).is_some_and(|candidate| {
-                if filler.is_ascii() {
-                    candidate.eq_ignore_ascii_case(filler)
-                        && english_word_boundary_after(rest, filler.len())
-                } else {
-                    candidate == **filler
-                }
-            })
-        });
-        match filler {
-            Some(filler) => rest = &rest[filler.len()..],
-            None => return rest,
-        }
-    }
-}
-
-fn is_sentence_break_at(text: &str, index: usize, character: char) -> bool {
-    if character == '.' {
-        let before = text[..index].chars().next_back();
-        let after = text[index + 1..].chars().next();
-        return !(before.is_some_and(|value| value.is_ascii_alphanumeric())
-            && after.is_some_and(|value| value.is_ascii_alphanumeric()));
-    }
-    matches!(character, '。' | '!' | '?' | '！' | '？')
-}
-
-fn code_span_occurrences(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
-    let mut spans = Vec::new();
-    let mut cursor = 0;
-    while let Some(relative_start) = text[cursor..].find('`') {
-        let start = cursor + relative_start;
-        let delimiter_length = text[start..]
-            .bytes()
-            .take_while(|byte| *byte == b'`')
-            .count();
-        let delimiter = "`".repeat(delimiter_length);
-        let content_start = start + delimiter_length;
-        let Some(relative_end) = text[content_start..].find(&delimiter) else {
-            break;
-        };
-        let end = content_start + relative_end + delimiter_length;
-        spans.push((start..end, text[start..end].to_owned()));
-        cursor = end;
-    }
-    spans
-}
-
-#[cfg(test)]
-fn extract_code_spans(text: &str) -> Vec<String> {
-    let mut spans = Vec::new();
-    for (_, span) in code_span_occurrences(text) {
-        push_unique_span(&mut spans, &span);
-    }
-    spans
-}
-
-#[cfg(test)]
-fn extract_numbers(text: &str) -> Vec<String> {
-    let mut numbers = Vec::new();
-    for (_, value) in number_occurrences(text) {
-        push_unique_span(&mut numbers, &value);
-    }
-    numbers
-}
-
-fn number_occurrences(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
-    let url_ranges = url_occurrences(text)
-        .into_iter()
-        .map(|(range, _)| range)
-        .collect::<Vec<_>>();
-    let mut spans = Vec::new();
-    let mut start = None;
-    for (index, character) in text
-        .char_indices()
-        .chain(std::iter::once((text.len(), ' ')))
-    {
-        let numeric = is_number_character(character);
-        let separator = matches!(character, ':' | '.' | ',' | '/' | '-')
-            && start.is_some()
-            && text[index + character.len_utf8()..]
-                .chars()
-                .next()
-                .is_some_and(is_number_character);
-        if numeric || separator {
-            if start.is_none() {
-                let mut prefix = text[..index]
-                    .rfind(|c: char| !is_english_word_character(c))
-                    .map_or(0, |at| at + text[at..].chars().next().unwrap().len_utf8());
-                if let Some((sign_at, sign)) = text[..index].char_indices().next_back() {
-                    if matches!(sign, '-' | '+') && sign_at < prefix {
-                        prefix = sign_at;
-                    }
-                }
-                let before = text[..index].trim_end_matches([' ', '\t']);
-                if index - before.len() <= 2 {
-                    if let Some((sign_at, sign)) = before.char_indices().next_back() {
-                        if matches!(sign, '-' | '+') && sign_at < prefix {
-                            prefix = sign_at;
-                        }
-                    }
-                }
-                start = Some(prefix);
-            }
-        } else if start.is_some() && is_english_word_character(character) {
-            continue;
-        } else if let Some(begin) = start.take() {
-            let number = &text[begin..index];
-            if !url_ranges.iter().any(|range| range.contains(&begin))
-                && (!is_kanji_numeral_only(number)
-                    || kanji_numeral_in_numeric_context(text, begin..index))
-            {
-                let normalized = if matches!(number.chars().next(), Some('+' | '-')) {
-                    let mut chars = number.chars();
-                    let sign = chars.next().unwrap();
-                    format!("{sign}{}", chars.as_str().trim_start_matches([' ', '\t']))
-                } else {
-                    number.to_owned()
-                };
-                spans.push((begin..index, normalized));
-            }
-        }
-    }
-    spans
-}
-
-const KANJI_NUMERALS: &str = "〇零一二三四五六七八九十百千万億兆壱弐参";
-// Counters that make a lone kanji numeral a number. 番, 緒, and 旦 are
-// deliberately absent so 一番, 一緒, and 一旦 stay ordinary words.
-const KANJI_NUMERAL_COUNTERS: &str =
-    "人名回度つ個時分秒日月年円件本枚台冊階歳才週割倍点位号杯匹頭羽曲社店泊軒票行列章節条項期席箇ヶヵかカケ桁";
-// Compounds whose lone numeral is idiomatic rather than a count.
-const KANJI_NUMERAL_IDIOMS: [&str; 2] = ["十分", "一時的"];
-
-fn is_number_character(character: char) -> bool {
-    character.is_numeric() || KANJI_NUMERALS.contains(character)
-}
-
-fn is_kanji_numeral_only(token: &str) -> bool {
-    !token
-        .chars()
-        .any(|character| character.is_numeric() && !KANJI_NUMERALS.contains(character))
-}
-
-/// Kanji numerals count as numbers only next to other numerals or before a
-/// counter, so words such as 一緒, 一番, and 一旦 are not protected numbers.
-fn kanji_numeral_in_numeric_context(text: &str, range: std::ops::Range<usize>) -> bool {
-    let numerals = text[range.clone()]
-        .chars()
-        .filter(|character| KANJI_NUMERALS.contains(*character))
-        .count();
-    if numerals >= 2 {
-        return true;
-    }
-    text[range.end..]
-        .chars()
-        .next()
-        .is_some_and(|counter| KANJI_NUMERAL_COUNTERS.contains(counter))
-        && !KANJI_NUMERAL_IDIOMS
-            .iter()
-            .any(|idiom| text[range.start..].starts_with(idiom))
-}
-
-fn uncertainty_preserved(source: &str, output: &str) -> bool {
-    let english = [
-        "maybe",
-        "perhaps",
-        "possibly",
-        "uncertain",
-        "not sure",
-        "i think",
-        "i guess",
-    ];
-    for marker in english {
-        if find_english_uncertainty_marker(source, marker).is_some()
-            && find_english_uncertainty_marker(output, marker).is_none()
-        {
-            return false;
-        }
-    }
-    for variants in [
-        &["たぶん", "多分"][..],
-        &["おそらく", "恐らく"][..],
-        &["かもしれない", "かもしれません", "かも"][..],
-        &["不明"][..],
-        &["わからない", "分からない", "わかりません", "分かりません"][..],
-        &["と思う", "と思います"][..],
-    ] {
-        if variants
-            .iter()
-            .any(|marker| contains_japanese_uncertainty(source, marker))
-            && !variants
-                .iter()
-                .any(|marker| contains_japanese_uncertainty(output, marker))
-        {
-            return false;
-        }
-    }
-    true
-}
-
-fn contains_japanese_uncertainty(text: &str, marker: &str) -> bool {
-    text.match_indices(marker).any(|(at, _)| {
-        // しかも ("moreover") contains かも but expresses no uncertainty.
-        !(marker == "かも" && text[..at].ends_with('し'))
-    })
-}
-
-#[cfg(test)]
-fn protected_spans(transcript: &str) -> Vec<String> {
-    let mut spans = Vec::new();
-    for url in extract_urls(transcript) {
-        push_unique_span(&mut spans, &url);
-    }
-    for number in extract_numbers(transcript) {
-        push_unique_span(&mut spans, &number);
-    }
-    for code in extract_code_spans(transcript) {
-        push_unique_span(&mut spans, &code);
-    }
-
-    for marker in [
-        "maybe",
-        "perhaps",
-        "possibly",
-        "uncertain",
-        "not sure",
-        "i think",
-        "i guess",
-    ] {
-        if let Some(found) = find_english_uncertainty_marker(transcript, marker) {
-            push_unique_span(&mut spans, found);
-        }
-    }
-    for marker in [
-        "たぶん",
-        "多分",
-        "おそらく",
-        "恐らく",
-        "かもしれない",
-        "かも",
-        "不明",
-        "わからない",
-        "分からない",
-        "と思う",
-    ] {
-        if contains_japanese_uncertainty(transcript, marker) {
-            push_unique_span(&mut spans, marker);
-        }
-    }
-    spans
-}
-
-#[cfg(test)]
-fn extract_urls(text: &str) -> Vec<String> {
-    url_occurrences(text)
-        .into_iter()
-        .map(|(_, url)| url)
-        .collect()
-}
-
-fn url_occurrences(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
-    let mut urls = Vec::new();
-    let mut cursor = 0;
-    while cursor < text.len() {
-        let remaining = &text[cursor..];
-        let scheme_length = if remaining
-            .as_bytes()
-            .get(..8)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"https://"))
-        {
-            "https://".len()
-        } else if remaining
-            .as_bytes()
-            .get(..7)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"http://"))
-        {
-            "http://".len()
-        } else {
-            let character_length = remaining
-                .chars()
-                .next()
-                .expect("cursor is within the source text")
-                .len_utf8();
-            cursor += character_length;
-            continue;
-        };
-        let end = remaining
-            .char_indices()
-            .find(|(index, character)| *index >= scheme_length && !is_url_character(*character))
-            .map_or(text.len(), |(index, _)| cursor + index);
-        let url = trim_url_sentence_delimiter(&text[cursor..end]);
-        if url.len() > scheme_length {
-            urls.push((cursor..cursor + url.len(), url.to_string()));
-        }
-        cursor = end.max(cursor + scheme_length);
-    }
-    urls
-}
-
-fn is_url_character(character: char) -> bool {
-    character.is_ascii()
-        && !character.is_whitespace()
-        && !character.is_control()
-        && !matches!(
-            character,
-            '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}'
-        )
-}
-
-fn trim_url_sentence_delimiter(url: &str) -> &str {
-    url.trim_end_matches(['.', '!', '?', ',', ';', ':'])
-}
-
-fn find_english_uncertainty_marker<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
-    find_english_phrase(text, marker).map(|start| &text[start..start + marker.len()])
-}
-
-/// Finds an ASCII phrase case-insensitively on English word boundaries.
-fn find_english_phrase(text: &str, phrase: &str) -> Option<usize> {
-    text.char_indices().map(|(start, _)| start).find(|start| {
-        text.get(*start..)
-            .and_then(|remaining| remaining.get(..phrase.len()))
-            .is_some_and(|candidate| {
-                candidate.eq_ignore_ascii_case(phrase)
-                    && english_word_boundary_before(text, *start)
-                    && english_word_boundary_after(text, start + phrase.len())
-            })
-    })
-}
-
-fn english_word_boundary_before(text: &str, index: usize) -> bool {
-    text[..index]
-        .chars()
-        .next_back()
-        .is_none_or(|character| !is_english_word_character(character))
-}
-
-fn english_word_boundary_after(text: &str, index: usize) -> bool {
-    text[index..]
-        .chars()
-        .next()
-        .is_none_or(|character| !is_english_word_character(character))
-}
-
-fn is_english_word_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || character == '_'
-}
-
-#[cfg(test)]
-fn push_unique_span(spans: &mut Vec<String>, span: &str) {
-    if !span.is_empty() && !spans.iter().any(|existing| existing == span) {
-        spans.push(span.into());
-    }
+    accept_provider_correction(settings, transcript, &context.terms, corrected)
 }
 
 pub async fn translate_text(
@@ -1177,7 +165,7 @@ pub async fn translate_text(
         cancel,
         |_| {},
         true,
-        None,
+        OutputBudget::Transcript,
     )
     .await
 }
@@ -1198,7 +186,7 @@ pub async fn translate_transcript(
         cancel,
         on_update,
         true,
-        None,
+        OutputBudget::Transcript,
     )
     .await
 }
@@ -1223,7 +211,7 @@ pub async fn edit_selected_text(
         cancel,
         on_update,
         true,
-        None,
+        OutputBudget::Edit,
     )
     .await?;
     Ok(restore_selection_whitespace(selected_text, &edited))
@@ -1306,91 +294,24 @@ async fn request_text(
     settings: &Settings,
     transcript: &str,
     instruction: &str,
-    mut cancel: watch::Receiver<bool>,
-    mut on_update: impl FnMut(&str),
+    cancel: watch::Receiver<bool>,
+    on_update: impl FnMut(&str),
     trim_output: bool,
-    minimum_output_tokens: Option<usize>,
+    budget: OutputBudget,
 ) -> Result<String, CorrectionError> {
-    if *cancel.borrow() {
-        return Err(CorrectionError::Cancelled);
-    }
-
-    let provider = settings.correction_provider.as_str();
-    let client = if provider == "local" {
-        local_client()?
-    } else {
-        Client::builder().timeout(REQUEST_TIMEOUT).build()?
-    };
-    let request = match settings.correction_provider.as_str() {
-        "openai" => {
-            let key = api_key(&settings.openai_api_key_env_var)?;
-            let mut body = openai_request(settings, transcript, instruction);
-            if let Some(minimum) = minimum_output_tokens {
-                body["max_output_tokens"] = json!(openai_output_budget(
-                    settings,
-                    max_output_tokens(transcript).max(minimum)
-                ));
-            }
-            client
-                .post(OPENAI_RESPONSES_URL)
-                .bearer_auth(key)
-                .json(&body)
-        }
-        "gemini" => {
-            let key = api_key(&settings.gemini_api_key_env_var)?;
-            let mut body = gemini_request(settings, transcript, instruction);
-            if let Some(minimum) = minimum_output_tokens {
-                body["generation_config"]["max_output_tokens"] = json!(gemini_output_budget(
-                    settings,
-                    max_output_tokens(transcript).max(minimum)
-                ));
-            }
-            client
-                .post(GEMINI_INTERACTIONS_URL)
-                .header("x-goog-api-key", key)
-                .json(&body)
-        }
-        "local" => {
-            let mut body = local_request(settings, transcript, instruction);
-            if let Some(minimum) = minimum_output_tokens {
-                body["max_tokens"] = json!(local_ask_output_tokens(settings, transcript, minimum));
-            }
-            client
-                .post(local_chat_completions_url(
-                    &settings.local_correction_base_url,
-                )?)
-                .json(&body)
-        }
-        provider => return Err(CorrectionError::UnsupportedProvider(provider.into())),
-    };
-
-    let response = await_reqwest_or_cancel(request.send(), &mut cancel).await?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = await_reqwest_or_cancel(response.text(), &mut cancel).await?;
-        return Err(CorrectionError::Api {
-            status,
-            message: compact_error_body(&body),
-        });
-    }
-    let corrected = collect_response(
-        response,
-        settings.correction_provider.as_str(),
-        &mut cancel,
-        &mut on_update,
+    transport::request_text_with_access(
+        settings,
+        transport::TextRequest {
+            input: transcript,
+            instruction,
+            trim_output,
+            budget,
+        },
+        cancel,
+        on_update,
+        transport::ProviderAccess::Configured,
     )
-    .await?;
-    let corrected = if trim_output {
-        corrected.trim()
-    } else {
-        &corrected
-    };
-    if corrected.is_empty() {
-        return Err(CorrectionError::InvalidResponse(
-            "the model returned empty text".into(),
-        ));
-    }
-    Ok(corrected.to_owned())
+    .await
 }
 
 /// A deliberately narrow text-only provider seam for the second Ask stage.
@@ -1410,7 +331,7 @@ pub async fn generate_ask_text(
         cancel,
         |_| {},
         true,
-        Some(ASK_TEXT_MIN_OUTPUT_TOKENS),
+        OutputBudget::AskText,
     )
     .await
 }
@@ -1429,7 +350,7 @@ pub async fn generate_ask_plan(
         cancel,
         |_| {},
         false,
-        Some(ASK_PLAN_MIN_OUTPUT_TOKENS),
+        OutputBudget::AskPlan,
     )
     .await
 }
@@ -1512,7 +433,12 @@ pub(crate) fn local_chat_completions_url(base_url: &str) -> Result<Url, Correcti
     Ok(url)
 }
 
-fn openai_request(settings: &Settings, transcript: &str, instruction: &str) -> Value {
+fn openai_request(
+    settings: &Settings,
+    transcript: &str,
+    instruction: &str,
+    budget: OutputBudget,
+) -> Value {
     let model = settings.openai_correction_model.trim();
     let effort = settings.openai_reasoning_effort.as_str();
     let mut request = json!({
@@ -1521,7 +447,7 @@ fn openai_request(settings: &Settings, transcript: &str, instruction: &str) -> V
         "input": transcript,
         "max_output_tokens": openai_output_budget(
             settings,
-            request_output_tokens(transcript, instruction)
+            budget.visible_tokens(transcript)
         ),
         "store": false,
         "stream": true
@@ -1535,7 +461,12 @@ fn openai_request(settings: &Settings, transcript: &str, instruction: &str) -> V
     request
 }
 
-fn gemini_request(settings: &Settings, transcript: &str, instruction: &str) -> Value {
+fn gemini_request(
+    settings: &Settings,
+    transcript: &str,
+    instruction: &str,
+    budget: OutputBudget,
+) -> Value {
     let mut request = json!({
         "model": settings.gemini_correction_model.trim(),
         "system_instruction": instruction,
@@ -1543,7 +474,7 @@ fn gemini_request(settings: &Settings, transcript: &str, instruction: &str) -> V
         "generation_config": {
             "max_output_tokens": gemini_output_budget(
                 settings,
-                request_output_tokens(transcript, instruction)
+                budget.visible_tokens(transcript)
             )
         },
         "store": false,
@@ -1555,14 +486,19 @@ fn gemini_request(settings: &Settings, transcript: &str, instruction: &str) -> V
     request
 }
 
-fn local_request(settings: &Settings, transcript: &str, instruction: &str) -> Value {
+fn local_request(
+    settings: &Settings,
+    transcript: &str,
+    instruction: &str,
+    budget: OutputBudget,
+) -> Value {
     json!({
         "model": settings.local_correction_model.trim(),
         "messages": [
             {"role": "system", "content": instruction},
             {"role": "user", "content": transcript}
         ],
-        "max_tokens": settings.local_correction_max_tokens,
+        "max_tokens": budget.minimum().map(|minimum| local_ask_output_tokens(settings, transcript, minimum)).unwrap_or(settings.local_correction_max_tokens),
         "stream": true
     })
 }
@@ -1960,21 +896,6 @@ fn max_output_tokens(transcript: &str) -> usize {
         .clamp(MIN_VISIBLE_OUTPUT_TOKENS, 32_768)
 }
 
-fn request_output_tokens(input: &str, instruction: &str) -> usize {
-    if instruction.starts_with(build_edit_instruction()) {
-        // Rewrites may expand the selection substantially; retain a bounded
-        // budget across all three provider request formats.
-        input
-            .chars()
-            .count()
-            .saturating_mul(4)
-            .saturating_add(1024)
-            .clamp(2048, 32_768)
-    } else {
-        max_output_tokens(input)
-    }
-}
-
 /// Output tokens reserved for hidden reasoning on top of the visible-text
 /// budget. OpenAI counts reasoning tokens against `max_output_tokens`, so a
 /// short utterance (visible budget 128) would otherwise be starved by any
@@ -2270,6 +1191,32 @@ fn error_object(value: &Value) -> Option<&Value> {
         .get("error")
 }
 
+fn api_error(status: StatusCode, body: &str) -> CorrectionError {
+    let invalid_key = serde_json::from_str::<Value>(body)
+        .ok()
+        .as_ref()
+        .and_then(error_object)
+        .is_some_and(|error| {
+            error.get("status").and_then(Value::as_str) == Some("API_KEY_INVALID")
+                || error
+                    .get("details")
+                    .and_then(Value::as_array)
+                    .is_some_and(|details| {
+                        details.iter().any(|detail| {
+                            detail.get("reason").and_then(Value::as_str) == Some("API_KEY_INVALID")
+                        })
+                    })
+        });
+    if matches!(status.as_u16(), 401 | 403) || invalid_key {
+        CorrectionError::InvalidApiKey { status }
+    } else {
+        CorrectionError::Api {
+            status,
+            message: compact_error_body(body),
+        }
+    }
+}
+
 fn compact_error_body(body: &str) -> String {
     let Some(message) = serde_json::from_str::<Value>(body).ok().and_then(|value| {
         error_object(&value)?
@@ -2294,13 +1241,128 @@ fn compact_error_body(body: &str) -> String {
 }
 
 #[cfg(test)]
+fn fixture_terms(hints: &[String]) -> Vec<CorrectionTerm> {
+    hints
+        .iter()
+        .map(|hint| CorrectionTerm::from_fixture(hint))
+        .collect()
+}
+#[cfg(test)]
+fn validate_correction_output_with_hints(
+    settings: &Settings,
+    transcript: &str,
+    corrected: &str,
+    hints: &[String],
+) -> Result<(), CorrectionError> {
+    validate_correction_output_with_terms(settings, transcript, corrected, &fixture_terms(hints))
+}
+#[cfg(test)]
+fn preserves_protected_spans_with_hints(
+    transcript: &str,
+    corrected: &str,
+    edits: FactEdits,
+    hints: &[String],
+) -> bool {
+    preserves_protected_spans_with_terms(transcript, corrected, edits, &fixture_terms(hints))
+}
+#[cfg(test)]
+fn proper_nouns_preserved(
+    transcript: &str,
+    corrected: &str,
+    edits: FactEdits,
+    hints: &[String],
+) -> bool {
+    proper_nouns_preserved_with_terms(transcript, corrected, edits, &fixture_terms(hints))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::{
+        env,
         io::{Read, Write},
         net::TcpListener,
         thread,
     };
+
+    #[test]
+    fn failure_codes_distinguish_actionable_causes_without_provider_text() {
+        let marker = "synthetic-provider-secret";
+        let cases = [
+            (
+                CorrectionError::MissingApiKey(marker.into()),
+                "ai_missing_api_key",
+            ),
+            (
+                CorrectionError::InvalidApiKey {
+                    status: StatusCode::BAD_REQUEST,
+                },
+                "ai_invalid_api_key",
+            ),
+            (
+                CorrectionError::Api {
+                    status: StatusCode::FORBIDDEN,
+                    message: marker.into(),
+                },
+                "ai_invalid_api_key",
+            ),
+            (
+                CorrectionError::Api {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    message: marker.into(),
+                },
+                "ai_rate_limited",
+            ),
+            (
+                CorrectionError::Api {
+                    status: StatusCode::BAD_GATEWAY,
+                    message: marker.into(),
+                },
+                "ai_provider_error",
+            ),
+            (
+                CorrectionError::Request(Client::new().get("not a URL").build().unwrap_err()),
+                "ai_unreachable",
+            ),
+            (CorrectionError::OutputLimit, "ai_output_limit"),
+            (
+                CorrectionError::ProviderOutputLimit,
+                "ai_provider_output_limit",
+            ),
+            (
+                CorrectionError::ProtectedContentChanged,
+                "ai_protected_content_changed",
+            ),
+            (
+                CorrectionError::InvalidResponse(marker.into()),
+                "ai_invalid_response",
+            ),
+            (CorrectionError::ConsentRequired, "ai_consent_required"),
+            (
+                CorrectionError::InvalidEndpoint(marker.into()),
+                "ai_invalid_endpoint",
+            ),
+            (
+                CorrectionError::UnsupportedProvider(marker.into()),
+                "ai_unsupported_provider",
+            ),
+            (
+                CorrectionError::EmptyEditInstruction,
+                "ai_empty_edit_instruction",
+            ),
+            (CorrectionError::Cancelled, "ai_cancelled"),
+        ];
+        for (error, code) in cases {
+            assert_eq!(error.failure_code(), code);
+            assert!(!error.user_message().contains(marker));
+            assert!(!crate::messages::catalogue()
+                .values()
+                .find(|entry| entry.code == code)
+                .unwrap()
+                .ja
+                .is_empty());
+        }
+    }
 
     #[tokio::test]
     async fn local_transport_sends_no_credentials_and_rejects_redirect() {
@@ -2694,6 +1756,8 @@ mod tests {
                 CorrectionError::MissingApiKey(_) => "MissingApiKey",
                 CorrectionError::Request(_) => "Request",
                 CorrectionError::Api { .. } => "Api",
+                CorrectionError::InvalidApiKey { .. } => "InvalidApiKey",
+                CorrectionError::ConsentRequired => "ConsentRequired",
                 CorrectionError::InvalidResponse(_) => "InvalidResponse",
                 CorrectionError::OutputLimit => "OutputLimit",
                 CorrectionError::ProviderOutputLimit => "ProviderOutputLimit",
@@ -2716,6 +1780,9 @@ mod tests {
         }
         // A missing or rejected credential is not a budget problem.
         fn invalid_key(error: &CorrectionError) -> bool {
+            if error.is_authentication_error() {
+                return true;
+            }
             let CorrectionError::Api { status, message } = error else {
                 return false;
             };
@@ -2776,10 +1843,12 @@ mod tests {
             let mut instruction = build_correction_instruction(&settings, &[], None);
             append_speech_locale(&mut instruction, &settings);
             let sent = if provider == "openai" {
-                openai_request(&settings, TEXT, &instruction)["max_output_tokens"].clone()
-            } else {
-                gemini_request(&settings, TEXT, &instruction)["generation_config"]
+                openai_request(&settings, TEXT, &instruction, OutputBudget::Transcript)
                     ["max_output_tokens"]
+                    .clone()
+            } else {
+                gemini_request(&settings, TEXT, &instruction, OutputBudget::Transcript)
+                    ["generation_config"]["max_output_tokens"]
                     .clone()
             };
             let case = format!("{provider} {model} effort={effort} max_output_tokens={sent}");
@@ -2825,7 +1894,12 @@ mod tests {
     #[test]
     fn builds_provider_requests_without_api_keys() {
         let settings = Settings::default();
-        let openai = openai_request(&settings, "raw text", "correct it");
+        let openai = openai_request(
+            &settings,
+            "raw text",
+            "correct it",
+            OutputBudget::Transcript,
+        );
         assert_eq!(openai["model"], "gpt-5.6-luna");
         assert_eq!(openai["input"], "raw text");
         assert_eq!(openai["max_output_tokens"], 128);
@@ -2834,7 +1908,12 @@ mod tests {
         assert_eq!(openai["store"], false);
         assert_eq!(openai["stream"], true);
 
-        let gemini = gemini_request(&settings, "raw text", "correct it");
+        let gemini = gemini_request(
+            &settings,
+            "raw text",
+            "correct it",
+            OutputBudget::Transcript,
+        );
         assert_eq!(gemini["model"], "gemini-flash-lite-latest");
         assert_eq!(gemini["system_instruction"], "correct it");
         assert_eq!(gemini["generation_config"]["max_output_tokens"], 128);
@@ -2842,7 +1921,12 @@ mod tests {
         assert_eq!(gemini["store"], false);
         assert_eq!(gemini["stream"], true);
 
-        let local = local_request(&settings, "raw text", "correct it");
+        let local = local_request(
+            &settings,
+            "raw text",
+            "correct it",
+            OutputBudget::Transcript,
+        );
         assert_eq!(local["model"], "qwen3:8b");
         assert_eq!(local["messages"][0]["role"], "system");
         assert_eq!(local["messages"][0]["content"], "correct it");
@@ -2894,7 +1978,12 @@ mod tests {
             ..Settings::default()
         };
 
-        let request = openai_request(&settings, "raw text", "correct it");
+        let request = openai_request(
+            &settings,
+            "raw text",
+            "correct it",
+            OutputBudget::Transcript,
+        );
 
         assert_eq!(request["reasoning"]["effort"], "high");
     }
@@ -4030,30 +3119,86 @@ mod tests {
         };
         let transcript = "Maybe deploy version 42 from https://example.test with `cargo test`.";
         let provider_output = "Deploy the current version.";
-        let instruction = build_correction_instruction(&settings, &[], None);
-
         assert!(matches!(
             validate_correction_output(&settings, transcript, provider_output),
             Err(CorrectionError::ProtectedContentChanged)
         ));
         // The dictation pipeline inserts the original transcript on any error.
         assert!(matches!(
-            accept_provider_correction(
-                &settings,
-                transcript,
-                &instruction,
-                &[],
-                provider_output.into(),
-            ),
+            accept_provider_correction(&settings, transcript, &[], provider_output.into(),),
             Err(CorrectionError::ProtectedContentChanged)
         ));
+    }
+
+    #[test]
+    fn structured_dictionary_terms_preserve_delimiters_and_case_without_prompt_parsing() {
+        let settings = Settings {
+            correction_mode: "intent_aware".into(),
+            ..Settings::default()
+        };
+        for (surface, reading, corrected) in [
+            ("ACME; Labs<=v2|Beta", "old project", "ACME; Labs<=v2|Beta"),
+            ("GPT-4", "old|project<=first; value", "GPT-4"),
+            ("Gpt-4", "gpt four", "GPT-4"),
+        ] {
+            let terms = vec![CorrectionTerm {
+                surface: surface.into(),
+                readings: vec![reading.into()],
+            }];
+            let context = build_correction_context(&settings, &terms, None);
+            assert!(
+                accept_provider_correction(&settings, reading, &context.terms, corrected.into())
+                    .is_ok(),
+                "{surface}"
+            );
+            assert!(
+                accept_provider_correction(
+                    &settings,
+                    reading,
+                    &context.terms,
+                    format!("{corrected} {corrected}")
+                )
+                .is_err(),
+                "duplicate {surface}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_dictionary_readings_do_not_allow_added_occurrences() {
+        let settings = Settings {
+            correction_mode: "intent_aware".into(),
+            correction_remove_repetitions: false,
+            ..Settings::default()
+        };
+        for readings in [
+            vec!["open ai", "OPEN AI"],
+            vec!["open ai", "open", "ai"],
+            vec!["open ai", "OpenAI", "openai"],
+        ] {
+            let terms = [CorrectionTerm {
+                surface: "OpenAI".into(),
+                readings: readings.into_iter().map(str::to_owned).collect(),
+            }];
+            for (source, accepted, rejected) in [
+                ("open ai", "OpenAI", "OpenAI OpenAI"),
+                ("open ai open ai", "OpenAI OpenAI", "OpenAI OpenAI OpenAI"),
+                ("open ai OpenAI", "OpenAI OpenAI", "OpenAI OpenAI OpenAI"),
+            ] {
+                assert!(
+                    accept_provider_correction(&settings, source, &terms, accepted.into()).is_ok()
+                );
+                assert!(
+                    accept_provider_correction(&settings, source, &terms, rejected.into()).is_err()
+                );
+            }
+        }
     }
 
     #[test]
     fn conservative_mode_accepts_provider_output_without_fact_validation() {
         let conservative = Settings::default();
         assert_eq!(conservative.correction_mode, "conservative");
-        let instruction = build_correction_instruction(&conservative, &[], None);
         for (transcript, provider_output) in [
             (
                 "買うものは牛乳と卵とパンです",
@@ -4071,14 +3216,8 @@ mod tests {
                 "rejected {transcript} => {provider_output}"
             );
             assert_eq!(
-                accept_provider_correction(
-                    &conservative,
-                    transcript,
-                    &instruction,
-                    &[],
-                    provider_output.into(),
-                )
-                .unwrap(),
+                accept_provider_correction(&conservative, transcript, &[], provider_output.into(),)
+                    .unwrap(),
                 provider_output
             );
         }
@@ -4187,7 +3326,12 @@ mod tests {
                     openai_reasoning_effort: effort.into(),
                     ..Settings::default()
                 };
-                let request = openai_request(&settings, "はい、了解です", "correct it");
+                let request = openai_request(
+                    &settings,
+                    "はい、了解です",
+                    "correct it",
+                    OutputBudget::Transcript,
+                );
                 assert!(request.get("reasoning").is_none(), "{model} {effort}");
                 assert_eq!(
                     request["max_output_tokens"],
@@ -4202,7 +3346,12 @@ mod tests {
             openai_reasoning_effort: "low".into(),
             ..Settings::default()
         };
-        let request = openai_request(&o1, "はい、了解です", "correct it");
+        let request = openai_request(
+            &o1,
+            "はい、了解です",
+            "correct it",
+            OutputBudget::Transcript,
+        );
         assert_eq!(request["reasoning"]["effort"], "low");
         assert_eq!(request["max_output_tokens"], 128 + 4_096);
     }
@@ -4254,7 +3403,12 @@ mod tests {
                 openai_reasoning_effort: "high".into(),
                 ..Settings::default()
             };
-            let request = openai_request(&settings, "はい、了解です", "correct it");
+            let request = openai_request(
+                &settings,
+                "はい、了解です",
+                "correct it",
+                OutputBudget::Transcript,
+            );
             assert_eq!(request["reasoning"]["effort"], "high", "{model}");
             assert_eq!(request["max_output_tokens"], 128 + 16_384, "{model}");
         }
@@ -4273,7 +3427,12 @@ mod tests {
                 openai_reasoning_effort: effort.into(),
                 ..Settings::default()
             };
-            let request = openai_request(&settings, "はい、了解です", "correct it");
+            let request = openai_request(
+                &settings,
+                "はい、了解です",
+                "correct it",
+                OutputBudget::Transcript,
+            );
             assert_eq!(request["max_output_tokens"], budget, "{effort}");
             if effort == "none" {
                 assert!(request.get("reasoning").is_none());
@@ -4287,7 +3446,12 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(
-            openai_request(&unknown_max, &"x".repeat(20_000), "correct it")["max_output_tokens"],
+            openai_request(
+                &unknown_max,
+                &"x".repeat(20_000),
+                "correct it",
+                OutputBudget::Transcript
+            )["max_output_tokens"],
             32_768 + 32_768
         );
     }
@@ -4307,7 +3471,12 @@ mod tests {
                 openai_reasoning_effort: effort.into(),
                 ..Settings::default()
             };
-            let request = openai_request(&settings, "はい、了解です", "correct it");
+            let request = openai_request(
+                &settings,
+                "はい、了解です",
+                "correct it",
+                OutputBudget::Transcript,
+            );
             assert_eq!(request["max_output_tokens"], budget, "{model} {effort}");
             if sends_reasoning {
                 assert_eq!(request["reasoning"]["effort"], effort, "{model} {effort}");
@@ -4324,15 +3493,17 @@ mod tests {
         let instruction = build_edit_instruction();
         let input = edit_request_input("short", "expand substantially");
         assert_eq!(
-            openai_request(&edit, &input, instruction)["max_output_tokens"],
+            openai_request(&edit, &input, instruction, OutputBudget::Edit)["max_output_tokens"],
             2_048 + 16_384
         );
         assert_eq!(
-            gemini_request(&edit, &input, instruction)["generation_config"]["max_output_tokens"],
+            gemini_request(&edit, &input, instruction, OutputBudget::Edit)["generation_config"]
+                ["max_output_tokens"],
             2_048 + 8_192
         );
         assert_eq!(
-            gemini_request(&edit, "short", "correct it")["generation_config"]["max_output_tokens"],
+            gemini_request(&edit, "short", "correct it", OutputBudget::Transcript)
+                ["generation_config"]["max_output_tokens"],
             128 + 8_192
         );
         let non_thinking = Settings {
@@ -4340,8 +3511,12 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(
-            gemini_request(&non_thinking, "short", "correct it")["generation_config"]
-                ["max_output_tokens"],
+            gemini_request(
+                &non_thinking,
+                "short",
+                "correct it",
+                OutputBudget::Transcript
+            )["generation_config"]["max_output_tokens"],
             128
         );
 
@@ -4372,24 +3547,26 @@ mod tests {
         assert_eq!(defaults.gemini_correction_model, "gemini-flash-lite-latest");
         let input = "はい、了解です";
         assert_eq!(
-            openai_request(&defaults, input, "correct it")["max_output_tokens"],
+            openai_request(&defaults, input, "correct it", OutputBudget::Transcript)
+                ["max_output_tokens"],
             128
         );
         assert_eq!(
-            gemini_request(&defaults, input, "correct it")["generation_config"]
-                ["max_output_tokens"],
+            gemini_request(&defaults, input, "correct it", OutputBudget::Transcript)
+                ["generation_config"]["max_output_tokens"],
             128
         );
 
         let instruction = build_edit_instruction();
         let edit_input = edit_request_input("short", "expand substantially");
         assert_eq!(
-            openai_request(&defaults, &edit_input, instruction)["max_output_tokens"],
+            openai_request(&defaults, &edit_input, instruction, OutputBudget::Edit)
+                ["max_output_tokens"],
             2_048
         );
         assert_eq!(
-            gemini_request(&defaults, &edit_input, instruction)["generation_config"]
-                ["max_output_tokens"],
+            gemini_request(&defaults, &edit_input, instruction, OutputBudget::Edit)
+                ["generation_config"]["max_output_tokens"],
             2_048
         );
 
@@ -4421,13 +3598,19 @@ mod tests {
             };
             // A short utterance gets no reasoning allowance.
             assert_eq!(
-                openai_request(&settings, "はい、了解です", "correct it")["max_output_tokens"],
+                openai_request(
+                    &settings,
+                    "はい、了解です",
+                    "correct it",
+                    OutputBudget::Transcript
+                )["max_output_tokens"],
                 128,
                 "{model}"
             );
             // A long transcript is clamped to the model's ceiling.
             assert_eq!(
-                openai_request(&settings, &long, "correct it")["max_output_tokens"],
+                openai_request(&settings, &long, "correct it", OutputBudget::Transcript)
+                    ["max_output_tokens"],
                 32_768.min(ceiling),
                 "{model}"
             );
@@ -4450,8 +3633,8 @@ mod tests {
                 ..Settings::default()
             };
             assert_eq!(
-                gemini_request(&settings, &long, "correct it")["generation_config"]
-                    ["max_output_tokens"],
+                gemini_request(&settings, &long, "correct it", OutputBudget::Transcript)
+                    ["generation_config"]["max_output_tokens"],
                 8_192,
                 "{model}"
             );
@@ -4521,7 +3704,8 @@ mod tests {
                 ..Settings::default()
             };
             assert_eq!(
-                openai_request(&settings, &long, "correct it")["max_output_tokens"],
+                openai_request(&settings, &long, "correct it", OutputBudget::Transcript)
+                    ["max_output_tokens"],
                 65_536,
                 "{model}"
             );
@@ -4535,7 +3719,8 @@ mod tests {
                 ..Settings::default()
             };
             assert_eq!(
-                openai_request(&settings, &long, "correct it")["max_output_tokens"],
+                openai_request(&settings, &long, "correct it", OutputBudget::Transcript)
+                    ["max_output_tokens"],
                 budget,
                 "{model}"
             );
@@ -4545,8 +3730,8 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(
-            gemini_request(&settings, &long, "correct it")["generation_config"]
-                ["max_output_tokens"],
+            gemini_request(&settings, &long, "correct it", OutputBudget::Transcript)
+                ["generation_config"]["max_output_tokens"],
             32_768 + 8_192
         );
     }
@@ -4579,7 +3764,7 @@ mod tests {
             openai_correction_model: "gpt-4o-mini".into(),
             ..Settings::default()
         };
-        let openai = openai_request(&openai_settings, "text", "edit");
+        let openai = openai_request(&openai_settings, "text", "edit", OutputBudget::Transcript);
         assert!(openai.get("reasoning").is_none());
         assert!(openai.get("text").is_none());
 
@@ -4599,7 +3784,12 @@ mod tests {
                     openai_reasoning_effort: effort.into(),
                     ..Settings::default()
                 };
-                let request = openai_request(&settings, "はい、了解です", "correct it");
+                let request = openai_request(
+                    &settings,
+                    "はい、了解です",
+                    "correct it",
+                    OutputBudget::Transcript,
+                );
                 assert!(request.get("reasoning").is_none(), "{model} {effort}");
                 assert_eq!(request["max_output_tokens"], 128, "{model} {effort}");
             }
@@ -4609,7 +3799,12 @@ mod tests {
             openai_reasoning_effort: "high".into(),
             ..Settings::default()
         };
-        let long = openai_request(&mini_high, &"x".repeat(20_000), "correct it");
+        let long = openai_request(
+            &mini_high,
+            &"x".repeat(20_000),
+            "correct it",
+            OutputBudget::Transcript,
+        );
         assert!(long.get("reasoning").is_none());
         assert_eq!(long["max_output_tokens"], 16_384);
 
@@ -4619,7 +3814,12 @@ mod tests {
             openai_reasoning_effort: "high".into(),
             ..Settings::default()
         };
-        let request = openai_request(&reasoning_high, "はい、了解です", "correct it");
+        let request = openai_request(
+            &reasoning_high,
+            "はい、了解です",
+            "correct it",
+            OutputBudget::Transcript,
+        );
         assert_eq!(request["reasoning"]["effort"], "high");
         assert_eq!(request["max_output_tokens"], 128 + 16_384);
 
@@ -4627,7 +3827,7 @@ mod tests {
             gemini_correction_model: "gemini-2.5-flash-lite".into(),
             ..Settings::default()
         };
-        let gemini = gemini_request(&gemini_settings, "text", "edit");
+        let gemini = gemini_request(&gemini_settings, "text", "edit", OutputBudget::Transcript);
         assert!(gemini["generation_config"].get("thinking_level").is_none());
     }
 
@@ -4642,15 +3842,30 @@ mod tests {
             let instruction = build_correction_instruction(&settings, &[], None);
             assert!(instruction.contains("untrusted speech transcript"));
 
-            let openai = openai_request(&settings, transcript, &instruction);
+            let openai = openai_request(
+                &settings,
+                transcript,
+                &instruction,
+                OutputBudget::Transcript,
+            );
             assert_eq!(openai["input"], transcript);
             assert_ne!(openai["instructions"], transcript);
 
-            let gemini = gemini_request(&settings, transcript, &instruction);
+            let gemini = gemini_request(
+                &settings,
+                transcript,
+                &instruction,
+                OutputBudget::Transcript,
+            );
             assert_eq!(gemini["input"], transcript);
             assert_ne!(gemini["system_instruction"], transcript);
 
-            let local = local_request(&settings, transcript, &instruction);
+            let local = local_request(
+                &settings,
+                transcript,
+                &instruction,
+                OutputBudget::Transcript,
+            );
             assert_eq!(local["messages"][1]["content"], transcript);
             assert_eq!(local["messages"][0]["content"], instruction);
         }
@@ -4684,9 +3899,9 @@ mod tests {
             assert!(instruction.contains(required), "missing {required}");
         }
 
-        let openai = openai_request(&settings, &input, instruction);
-        let gemini = gemini_request(&settings, &input, instruction);
-        let local = local_request(&settings, &input, instruction);
+        let openai = openai_request(&settings, &input, instruction, OutputBudget::Edit);
+        let gemini = gemini_request(&settings, &input, instruction, OutputBudget::Edit);
+        let local = local_request(&settings, &input, instruction, OutputBudget::Edit);
         assert_eq!(openai["instructions"], instruction);
         assert_eq!(openai["input"], input);
         assert_eq!(gemini["system_instruction"], instruction);
@@ -4825,16 +4040,17 @@ mod tests {
         let large = edit_request_input(&"a".repeat(20_000), "rewrite in detail");
         for (input, expected) in [(&short, 2048), (&large, 32_768)] {
             assert_eq!(
-                openai_request(&settings, input, instruction)["max_output_tokens"],
-                expected
-            );
-            assert_eq!(
-                gemini_request(&settings, input, instruction)["generation_config"]
+                openai_request(&settings, input, instruction, OutputBudget::Edit)
                     ["max_output_tokens"],
                 expected
             );
             assert_eq!(
-                local_request(&settings, input, instruction)["max_tokens"],
+                gemini_request(&settings, input, instruction, OutputBudget::Edit)
+                    ["generation_config"]["max_output_tokens"],
+                expected
+            );
+            assert_eq!(
+                local_request(&settings, input, instruction, OutputBudget::Edit)["max_tokens"],
                 4096
             );
         }
@@ -4843,7 +4059,7 @@ mod tests {
             ..settings
         };
         assert_eq!(
-            local_request(&configured, &large, instruction)["max_tokens"],
+            local_request(&configured, &large, instruction, OutputBudget::Edit)["max_tokens"],
             32_768
         );
     }
@@ -4879,7 +4095,12 @@ mod tests {
         let instruction = build_correction_instruction(&settings, &[], Some(&guidance));
         assert!(instruction.contains("formal"));
         assert!(instruction.contains("detailed"));
-        let request = openai_request(&settings, transcript, &instruction);
+        let request = openai_request(
+            &settings,
+            transcript,
+            &instruction,
+            OutputBudget::Transcript,
+        );
         assert_eq!(request["input"], transcript);
         assert!(request["instructions"].as_str().unwrap().contains("formal"));
     }
@@ -4956,6 +4177,25 @@ mod tests {
         let long = "あ".repeat(MAX_ERROR_BODY_CHARS + 1);
         let message = compact_error_body(&json!([{"error": {"message": long}}]).to_string());
         assert_eq!(message.chars().count(), MAX_ERROR_BODY_CHARS + 1);
+    }
+
+    #[test]
+    fn invalid_key_errors_never_echo_provider_credentials() {
+        for error in [
+            json!({"message": "invalid secret-key-value", "details": [{"reason": "API_KEY_INVALID"}]}),
+            json!({"message": "invalid secret-key-value", "status": "API_KEY_INVALID"}),
+        ] {
+            for body in [json!({"error": error}), json!([{"error": error}])] {
+                let error = api_error(StatusCode::BAD_REQUEST, &body.to_string());
+                assert_eq!(error.to_string(), INVALID_API_KEY_MESSAGE);
+                assert!(error.is_authentication_error());
+            }
+        }
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            let error = api_error(status, "secret-key-value");
+            assert_eq!(error.to_string(), INVALID_API_KEY_MESSAGE);
+            assert!(error.is_authentication_error());
+        }
     }
 
     #[test]
@@ -5095,6 +4335,19 @@ mod tests {
         let mut instruction = build_edit_instruction().to_owned();
         append_speech_locale(&mut instruction, &settings);
         let input = edit_request_input("short", "expand substantially");
-        assert_eq!(request_output_tokens(&input, &instruction), 2048);
+        assert_eq!(
+            openai_request(&settings, &input, &instruction, OutputBudget::Edit)
+                ["max_output_tokens"],
+            2048
+        );
+        assert_eq!(
+            openai_request(
+                &settings,
+                &input,
+                "new wording unrelated to the original edit prompt",
+                OutputBudget::Edit
+            )["max_output_tokens"],
+            2048
+        );
     }
 }

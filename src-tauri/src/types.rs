@@ -11,11 +11,64 @@ pub enum AppPhase {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppStage {
+    Idle,
+    PreparingModel,
+    Recording,
+    FinishingAudio,
+    Transcribing,
+    Translating,
+    Correcting,
+    Planning,
+    Inserting,
+    UpdatingText,
+    Retrying,
+    Completed,
+    Error,
+}
+
+impl AppStage {
+    pub fn for_phase(phase: &AppPhase) -> Self {
+        match phase {
+            AppPhase::Idle => Self::Idle,
+            AppPhase::Recording => Self::Recording,
+            AppPhase::Processing => Self::Transcribing,
+            AppPhase::Injecting => Self::Inserting,
+            AppPhase::Completed => Self::Completed,
+            AppPhase::Error => Self::Error,
+        }
+    }
+    pub fn phase(self) -> AppPhase {
+        match self {
+            Self::Idle => AppPhase::Idle,
+            Self::Recording => AppPhase::Recording,
+            Self::Inserting | Self::UpdatingText => AppPhase::Injecting,
+            Self::Completed => AppPhase::Completed,
+            Self::Error => AppPhase::Error,
+            _ => AppPhase::Processing,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationKind {
+    Recording,
+    SelectedText,
+    Retry,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppStateSnapshot {
     pub phase: AppPhase,
+    pub stage: AppStage,
+    pub operation: Option<OperationKind>,
+    pub operation_id: Option<u64>,
     pub message: Option<String>,
+    pub message_code: Option<String>,
     pub last_result: Option<String>,
     pub updated_at: String,
 }
@@ -26,6 +79,12 @@ pub struct Settings {
     #[serde(default = "default_ui_language")]
     pub ui_language: String,
     pub setup_complete: bool,
+    #[serde(default)]
+    pub cloud_consents: Vec<String>,
+    #[serde(default)]
+    pub live_preview_enabled: Option<bool>,
+    #[serde(default)]
+    pub cloud_live_preview_enabled: bool,
     #[serde(default)]
     pub shortcuts: VoiceShortcuts,
     #[serde(default = "default_translation_hotkey")]
@@ -114,6 +173,12 @@ pub struct Settings {
     pub global_style_profile: Option<StyleProfile>,
     #[serde(default)]
     pub scoped_style_profiles: Vec<ScopedStyleProfile>,
+}
+
+impl Settings {
+    pub fn validate(&self) -> Result<(), String> {
+        crate::settings::validate(self)
+    }
 }
 
 /// Stored settings with the in-process revision of the write that stored
@@ -291,6 +356,9 @@ impl Default for Settings {
         Self {
             ui_language: default_ui_language(),
             setup_complete: false,
+            cloud_consents: Vec::new(),
+            live_preview_enabled: None,
+            cloud_live_preview_enabled: false,
             shortcuts: VoiceShortcuts::default(),
             translation_hotkey: default_translation_hotkey(),
             translation_instruction: String::new(),

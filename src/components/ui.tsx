@@ -46,13 +46,15 @@ export function InfoCard({
   label,
   value,
   detail,
+  warning = false,
 }: {
   label: string;
   value: string;
   detail: string;
+  warning?: boolean;
 }) {
   return (
-    <article className="info-card">
+    <article className={`info-card${warning ? " warning" : ""}`}>
       <p className="eyebrow">{label}</p>
       <h3>{value}</h3>
       <p>{detail}</p>

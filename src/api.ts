@@ -17,12 +17,20 @@ import type {
 
 const inTauri = "__TAURI_INTERNALS__" in window;
 
+export async function getUiPreferences(): Promise<{ settings: Pick<Settings, "uiLanguage" | "theme">; revision: number }> {
+  if (!inTauri) return { settings: defaultSettings, revision: 0 };
+  return invoke("get_ui_preferences");
+}
+
 export const defaultSettings: Settings = {
   uiLanguage: "ja",
   theme: "system",
   interactionSounds: false,
   speechLocale: null,
   setupComplete: false,
+  cloudConsents: [],
+  livePreviewEnabled: null,
+  cloudLivePreviewEnabled: false,
   shortcuts: {
     dictate: ["Ctrl+Shift+Space"],
     translate: ["Ctrl+Shift+Y"],
@@ -73,7 +81,7 @@ export const defaultSettings: Settings = {
 
 export async function getAppState(): Promise<AppState> {
   if (!inTauri) {
-    return { phase: "idle", message: null, lastResult: null, updatedAt: new Date().toISOString() };
+    return { phase: "idle", stage: "idle", operation: null, operationId: null, message: null, messageCode: null, lastResult: null, updatedAt: new Date().toISOString() };
   }
   return invoke("get_app_state");
 }
@@ -228,7 +236,7 @@ export async function copyToClipboard(text: string): Promise<void> {
   await navigator.clipboard.writeText(text);
 }
 
-export type AskAnswer = { operationId: number; payload: string };
+export type AskAnswer = { operationId: number; payload: string; kind: "generated" | "notice" };
 
 export async function getAskAnswer(): Promise<AskAnswer | null> {
   if (!inTauri) return null;

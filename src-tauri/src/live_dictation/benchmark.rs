@@ -1,8 +1,11 @@
 //! Opt-in real-time replay through the actual warmed worker and segmentation
 //! policy. Input is synthetic/reference PCM, never microphone or history data.
 use super::*;
-use crate::audio::{AudioSnapshot, TARGET_SAMPLE_RATE};
+use crate::asr::JsonlTranscriber;
+use crate::audio::{AudioSnapshot, CaptureConfig, TARGET_SAMPLE_RATE};
+use crate::{worker_command_for_settings, ASR_MODEL_LOAD_TIMEOUT, ASR_REQUEST_TIMEOUT};
 use serde_json::json;
+use std::{fs, path::PathBuf};
 
 #[tokio::test]
 #[ignore = "requires ASR_LIVE_BENCH_DIR with speech.f32; uses the installed faster-whisper model"]

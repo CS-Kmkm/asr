@@ -3,11 +3,19 @@ use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 pub(crate) const WINDOW_LABEL: &str = "ask-answer";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AnswerKind {
+    Generated,
+    Notice,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct AnswerPayload {
     #[serde(rename = "operationId")]
     pub operation_id: u64,
     pub payload: String,
+    pub kind: AnswerKind,
 }
 
 /// Backend-owned, monotonic panel state.  A stale completion/dismiss cannot
@@ -19,6 +27,12 @@ pub(crate) struct AnswerPanelState {
 }
 impl AnswerPanelState {
     pub(crate) fn publish(&self, operation_id: u64, payload: String) -> bool {
+        self.publish_kind(operation_id, payload, AnswerKind::Generated)
+    }
+    pub(crate) fn publish_notice(&self, operation_id: u64, payload: String) -> bool {
+        self.publish_kind(operation_id, payload, AnswerKind::Notice)
+    }
+    fn publish_kind(&self, operation_id: u64, payload: String, kind: AnswerKind) -> bool {
         let Ok(mut current) = self.current.lock() else {
             return false;
         };
@@ -31,6 +45,7 @@ impl AnswerPanelState {
         *current = Some(AnswerPayload {
             operation_id,
             payload,
+            kind,
         });
         true
     }
@@ -72,13 +87,21 @@ pub(crate) fn create(app: &AppHandle) -> tauri::Result<()> {
 }
 
 pub(crate) fn show(app: &AppHandle, operation_id: u64, payload: &str) -> bool {
+    show_kind(app, operation_id, payload, AnswerKind::Generated)
+}
+
+pub(crate) fn show_notice(app: &AppHandle, operation_id: u64, payload: &str) -> bool {
+    show_kind(app, operation_id, payload, AnswerKind::Notice)
+}
+
+fn show_kind(app: &AppHandle, operation_id: u64, payload: &str, kind: AnswerKind) -> bool {
     let Some(window) = app.get_webview_window(WINDOW_LABEL) else {
         return false;
     };
     if app
         .emit(
             "ask-answer",
-            serde_json::json!({"operationId": operation_id, "payload": payload }),
+            serde_json::json!({"operationId": operation_id, "payload": payload, "kind": kind }),
         )
         .is_err()
     {
@@ -118,6 +141,7 @@ mod tests {
         let json = serde_json::to_value(AnswerPayload {
             operation_id: 7,
             payload: "answer".into(),
+            kind: AnswerKind::Generated,
         })
         .unwrap();
         assert_eq!(json["operationId"], 7);

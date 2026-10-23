@@ -8,10 +8,16 @@ export type AppPhase =
 
 export interface AppState {
   phase: AppPhase;
+  stage: AppStage;
+  operation: "recording" | "selected_text" | "retry" | null;
+  operationId: number | null;
   message: string | null;
+  messageCode: string | null;
   lastResult: string | null;
   updatedAt: string;
 }
+
+export type AppStage = "idle" | "preparing_model" | "recording" | "finishing_audio" | "transcribing" | "translating" | "correcting" | "planning" | "inserting" | "updating_text" | "retrying" | "completed" | "error";
 
 export interface AudioDevice {
   id: string;
@@ -37,6 +43,9 @@ export interface Settings {
   interactionSounds: boolean;
   speechLocale: SpeechLocale | null;
   setupComplete: boolean;
+  cloudConsents: string[];
+  livePreviewEnabled: boolean | null;
+  cloudLivePreviewEnabled: boolean;
   shortcuts: Record<ShortcutMode, string[]>;
   translationHotkey: string;
   translationInstruction: string;

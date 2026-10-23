@@ -1,3 +1,4 @@
+import { useSettings } from "./hooks/useSettings";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -21,7 +22,7 @@ import {
   dismissAskAnswer,
   getGpuDiagnostics,
   getModelStatus,
-  getSettings,
+  getUiPreferences,
   getStartupHotkeyWarning,
   listAudioDevices,
   listDictionary,
@@ -30,7 +31,6 @@ import {
   loadModel,
   startRecording,
   stopRecording,
-  updateSettings,
   updateDictionaryEntry,
 } from "./api";
 import type {
@@ -106,8 +106,9 @@ const phaseMessageKeys: Record<AppState["phase"], MessageKey> = {
   error: "Error",
 };
 
-const isRecordingOverlay = getCurrentWebviewWindow().label === "recording-overlay";
-const isAskAnswer = getCurrentWebviewWindow().label === "ask-answer";
+const windowLabel = "__TAURI_INTERNALS__" in window ? getCurrentWebviewWindow().label : "main";
+const isRecordingOverlay = windowLabel === "recording-overlay";
+const isAskAnswer = windowLabel === "ask-answer";
 const OVERLAY_WAVE_BAR_COUNT = 9;
 const OVERLAY_PREVIEW_CHARS = 140;
 
@@ -132,10 +133,8 @@ interface InsertionNoticeEvent {
 const INSERTION_NOTICE_MS = 5_000;
 
 // The Processing message of a hotkey start that waits for the speech model.
-const PREPARING_SPEECH_MODEL = "Preparing the speech model. Recording starts when it is ready.";
 
 // The Processing message of a selected-text translation.
-const TRANSLATING_SELECTED_TEXT = "Translating the selected text.";
 
 // A failure or warning sentence from the backend, shown while the main
 // window may be hidden. The backend chooses how long it stays up.
@@ -168,40 +167,18 @@ const translationLanguageKeys: Record<string, MessageKey> = {
 
 interface Notice {
   message: string;
+  code?: string;
+  outcome?: string;
   severity: "info" | "success" | "warning" | "error";
   // Kind of the backend status event, when the notice came from one.
   kind?: string;
 }
 
-// A settings key shown with a value changed in this window that the backend
-// has not confirmed yet.
-interface LocalEdit {
-  // Taken anew by every change, so a save confirms only the value it sent.
-  generation: number;
-  // An unsaved Setup choice: sent with the next save, but kept rather than
-  // reverted when that save fails.
-  draft: boolean;
-}
-
-// How a queued settings save ended.
-type SettingsSaveOutcome =
-  | { saved: true; settings: Settings }
-  | { saved: false; error: unknown };
-
-// `target` with the values of `keys` taken from `source`.
-function withKeys(target: Settings, source: Settings, keys: ReadonlyArray<keyof Settings>): Settings {
-  const result = { ...target };
-  const copy = <K extends keyof Settings>(key: K) => { result[key] = source[key]; };
-  keys.forEach(copy);
-  return result;
-}
-
-// Only the values of `keys` from `source`.
-function pickKeys(source: Settings, keys: ReadonlyArray<keyof Settings>): Partial<Settings> {
-  const picked: Partial<Settings> = {};
-  const copy = <K extends keyof Settings>(key: K) => { picked[key] = source[key]; };
-  keys.forEach(copy);
-  return picked;
+function retainImportantNotice(current: Notice | null, next: Notice): Notice {
+  const severity = { info: 0, success: 1, warning: 2, error: 3 };
+  const priority = (notice: Notice) => severity[notice.severity] * 2
+    + Number(Boolean(notice.code?.startsWith("ai_") && notice.outcome !== undefined));
+  return current && priority(current) > priority(next) ? current : next;
 }
 
 // Notices that only describe model preparation and are cleared once it ends.
@@ -233,7 +210,7 @@ const SUCCESS_STATUS_KINDS = new Set([
 ]);
 
 function statusSeverity(kind: string): Notice["severity"] {
-  if (kind === "error" || kind === "model_load_failed") return "error";
+  if (kind === "error" || kind === "model_load_failed" || kind === "ai_provider_failed") return "error";
   if (WARNING_STATUS_KINDS.has(kind)) return "warning";
   if (SUCCESS_STATUS_KINDS.has(kind)) return "success";
   return "info";
@@ -253,16 +230,18 @@ if (isRecordingOverlay) {
 function AskAnswerPanel() {
   const { language, t } = useI18n();
   const [answer, setAnswer] = useState("");
+  const [answerKind, setAnswerKind] = useState<"generated" | "notice">("generated");
   const [operationId, setOperationId] = useState(0);
   const operationRef = useRef(0);
   useEffect(() => {
     let active = true;
     const setup = async () => {
-      const unlisten = await listen<{ operationId: number; payload: string }>("ask-answer", ({ payload }) => {
+      const unlisten = await listen<{ operationId: number; payload: string; kind: "generated" | "notice" }>("ask-answer", ({ payload }) => {
         if (!active || payload.operationId < operationRef.current) return;
         operationRef.current = payload.operationId;
         setOperationId(payload.operationId);
         setAnswer(payload.payload);
+        setAnswerKind(payload.kind);
       });
       if (!active) {
         unlisten();
@@ -273,6 +252,7 @@ function AskAnswerPanel() {
         operationRef.current = current.operationId;
         setOperationId(current.operationId);
         setAnswer(current.payload);
+        setAnswerKind(current.kind);
       }
       return unlisten;
     };
@@ -283,7 +263,7 @@ function AskAnswerPanel() {
   const dismiss = async () => {
     await dismissAskAnswer(operationId);
   };
-  const displayedAnswer = translateAppMessage(language, answer) ?? answer;
+  const displayedAnswer = answerKind === "notice" ? translateAppMessage(language, answer) ?? answer : answer;
   return <main className="ask-answer-panel" aria-live="polite">
     <p className="eyebrow">{t("Ask Anything")}</p><div className="ask-answer-text">{displayedAnswer}</div>
     <div className="ask-answer-actions"><button className="secondary" type="button" disabled={!answer} onClick={() => void copyToClipboard(displayedAnswer)}>{t("Copy")}</button><button className="secondary" type="button" disabled={!answer} onClick={() => void dismiss()}>{t("Dismiss")}</button></div>
@@ -296,8 +276,10 @@ function RecordingOverlay() {
     () => Array(OVERLAY_WAVE_BAR_COUNT).fill(0),
   );
   const [phase, setPhase] = useState<AppState["phase"]>("idle");
+  const [stage, setStage] = useState<AppState["stage"]>("idle");
   const previousPhase = useRef<AppState["phase"]>("idle");
   const [message, setMessage] = useState<string | null>(null);
+  const [messageCode, setMessageCode] = useState<string | null>(null);
   const [preview, setPreview] = useState<CorrectionPreview | null>(null);
   const [voiceMode, setVoiceMode] = useState<VoiceModeEvent>({
     mode: "dictate",
@@ -338,7 +320,9 @@ function RecordingOverlay() {
         const recordingStarted = payload.phase === "recording" && previousPhase.current !== "recording";
         previousPhase.current = payload.phase;
         setPhase(payload.phase);
+        setStage(payload.stage);
         setMessage(payload.message);
+        setMessageCode(payload.messageCode);
         if (recordingStarted) {
           setWaveform(Array(OVERLAY_WAVE_BAR_COUNT).fill(0));
           setPreview(null);
@@ -346,10 +330,8 @@ function RecordingOverlay() {
           setNotice(null);
         } else if (
           payload.phase === "processing" &&
-          (payload.message === PREPARING_SPEECH_MODEL ||
-            payload.message === TRANSLATING_SELECTED_TEXT ||
-            payload.message?.startsWith("Stopping") ||
-            payload.message?.startsWith("Transcribing"))
+          (["preparing_model", "finishing_audio", "transcribing", "retrying"].includes(payload.stage)
+            || (payload.stage === "translating" && payload.operation === "selected_text"))
         ) {
           setPreview(null);
         }
@@ -470,7 +452,7 @@ function RecordingOverlay() {
 
   const compactPreview = compactOverlayPreview(preview?.text ?? "");
   // A start waiting for the model has not published its voice mode yet.
-  const preparing = message === PREPARING_SPEECH_MODEL;
+  const preparing = stage === "preparing_model";
   const label = preparing
     ? t("Preparing speech model")
     : voiceMode.mode === "selected_translate"
@@ -480,12 +462,12 @@ function RecordingOverlay() {
     : voiceMode.mode === "edit"
     ? t("Editing")
     : phase === "injecting"
-      ? message?.startsWith("Finalizing")
+      ? stage === "updating_text"
         ? t("Updating text")
         : t("Inserting")
-      : message?.startsWith("Stopping")
+      : stage === "finishing_audio"
         ? t("Finishing audio")
-        : message?.startsWith("Transcribing")
+        : stage === "transcribing" || stage === "retrying"
           ? t("Transcribing")
           : preview?.stage === "draft"
             ? t("Transcript ready")
@@ -503,7 +485,7 @@ function RecordingOverlay() {
         <span className={`correction-preview${compactPreview && !preparing ? "" : " pending"}`}>
           {preparing
             ? t("Starts when ready")
-            : compactPreview || translateAppMessage(language, message) || t("Preparing text…")}
+            : compactPreview || translateAppMessage(language, message, messageCode) || t("Preparing text…")}
         </span>
       </div>
       {phase === "processing" && cancelButton}
@@ -519,13 +501,13 @@ export default function App() {
     // The load and settings-changed events can arrive in any order; only a
     // snapshot newer than the last one applied changes the language or theme.
     let revision = -1;
-    const apply = (snapshot: SettingsSnapshot) => {
+    const apply = (snapshot: { settings: Pick<Settings, "uiLanguage" | "theme">; revision: number }) => {
       if (snapshot.revision <= revision) return;
       revision = snapshot.revision;
       setLanguage(snapshot.settings.uiLanguage);
       setTheme(snapshot.settings.theme);
     };
-    getSettings()
+    getUiPreferences()
       .then(apply)
       .catch(() => setLanguage(defaultSettings.uiLanguage));
     let unlisten: (() => void) | undefined;
@@ -571,37 +553,14 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const [page, setPage] = useState<Page>("dashboard");
   const [state, setState] = useState<AppState>({
     phase: "idle",
+    stage: "idle",
+    operation: null,
+    operationId: null,
     message: null,
+    messageCode: null,
     lastResult: null,
     updatedAt: new Date().toISOString(),
   });
-  const [settings, setSettings] = useState<Settings>(defaultSettings);
-  // A save can run from a callback captured renders ago (the retention select
-  // awaits a count and a confirmation first); it must merge its patch into
-  // the latest settings, or it would revert changes made in the meantime.
-  const settingsRef = useRef(settings);
-  settingsRef.current = settings;
-  // Saves can follow each other quickly (a select saves at once, text on
-  // blur). They are sent one at a time, and each sends only the keys changed
-  // here that the backend has not confirmed yet, so a save never rewrites a
-  // key changed elsewhere (such as a voice translation's target).
-  const saveQueueRef = useRef<Promise<void>>(Promise.resolve());
-  const latestSaveRef = useRef(0);
-  const pendingSavesRef = useRef(0);
-  // The newest backend snapshot applied. Acknowledgements and settings-changed
-  // events can arrive in any order; the revision decides which is newer.
-  const settingsRevisionRef = useRef(-1);
-  const confirmedSettingsRef = useRef(settings);
-  // Keys shown with their local value instead of the confirmed one, until a
-  // save confirms that value; a failed latest save returns them to the
-  // confirmed values.
-  const localEditsRef = useRef(new Map<keyof Settings, LocalEdit>());
-  const editGenerationRef = useRef(0);
-  // A shorter history retention purges data, so nothing is saved until the
-  // stored settings are known.
-  const [settingsLoaded, setSettingsLoaded] = useState(false);
-  const settingsLoadedRef = useRef(false);
-  const settingsRequestRef = useRef(0);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>("all");
   const historyFilterRef = useRef<HistoryFilter>("all");
@@ -614,12 +573,18 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const [gpu, setGpu] = useState<GpuDiagnostics | null>(null);
   const [gpuChecking, setGpuChecking] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
+  const noticeOperationRef = useRef(0);
   const [startupHotkeyWarnings, setStartupHotkeyWarnings] = useState<string[]>([]);
   const showNotice = (message: string, severity: Notice["severity"] = "info") =>
-    setNotice({ message, severity });
+    setNotice((current) => retainImportantNotice(current, { message, severity }));
+  const { settings, settingsRef, settingsLoaded, editSettingsLocally, settingsReady, queueSettingsSave } = useSettings({
+    onLanguageChange,
+    onSetupNeeded: () => setPage("setup"),
+    onError: (error) => showNotice(String(error), "error"),
+    onNotReady: () => showNotice(t("Settings have not been loaded yet, so changes were not saved. Try again in a moment."), "warning"),
+  });
   const [noticeCopied, setNoticeCopied] = useState(false);
   const [devices, setDevices] = useState<AudioDevice[]>([]);
-  const [level, setLevel] = useState<AudioLevel>({ rms: 0, peak: 0 });
   const [dictionary, setDictionary] = useState<DictionaryEntry[]>([]);
   const [dictionaryCandidates, setDictionaryCandidates] = useState<DictionaryCandidate[]>([]);
   const dictionaryRequestRef = useRef(0);
@@ -630,9 +595,15 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
 
   useEffect(() => {
     void getStartupHotkeyWarning().then(setStartupHotkeyWarnings).catch(() => {});
-    // Settings load on their own so a failing diagnostic or device call
-    // cannot leave the defaults in place for the session.
-    void loadSettings();
+    const applyAppState = (next: AppState) => {
+      const id = next.operationId;
+      if (typeof id === "number") {
+        if (id < noticeOperationRef.current) return;
+        if (id > noticeOperationRef.current) setNotice(null);
+        noticeOperationRef.current = id;
+      } else if (noticeOperationRef.current > 0) return;
+      setState(next);
+    };
     Promise.all([
       getAppState(),
       listHistory(),
@@ -643,7 +614,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     ])
       .then(
         ([nextState, nextHistory, nextModel, nextGpu, nextDevices, nextDictionary]) => {
-          setState(nextState);
+          applyAppState(nextState);
           if (historyRequestRef.current === 0 && historyFilterRef.current === "all") {
             setHistory(nextHistory);
           }
@@ -655,8 +626,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       )
       .catch((error: unknown) => showNotice(String(error), "error"));
     const listeners = Promise.all([
-      listen<AppState>("app-state", (event) => setState(event.payload)),
-      listen<AudioLevel>("audio-level", (event) => setLevel(event.payload)),
+      listen<AppState>("app-state", (event) => applyAppState(event.payload)),
       listen<ModelStatus>("model-status", (event) => {
         setModel(event.payload);
         // Preparation is over once the worker reports an outcome, so its
@@ -670,15 +640,14 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       }),
       listen<ModelProgress>("model-progress", (event) => setModelProgress(event.payload)),
       listen<GpuDiagnostics>("gpu-diagnostics", (event) => setGpu(event.payload)),
-      // Applied in revision order, also while saves are pending: keys changed
-      // here keep their local values until a save confirms them.
-      listen<SettingsSnapshot>("settings-changed", (event) => applyReadSnapshot(event.payload)),
-      listen<{ kind: string; message: string }>("status", (event) =>
-        setNotice({
+      listen<{ kind: string; code?: string; outcome?: string; message: string }>("status", (event) =>
+        setNotice((current) => retainImportantNotice(current, {
           message: event.payload.message,
+          code: event.payload.code,
+          outcome: event.payload.outcome,
           severity: statusSeverity(event.payload.kind),
           kind: event.payload.kind,
-        }),
+        })),
       ),
     ]);
     return () => {
@@ -692,7 +661,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
 
   const statusLabel = t(phaseMessageKeys[state.phase]);
   const localizedState = useMemo(
-    () => ({ ...state, message: translateAppMessage(language, state.message) }),
+    () => ({ ...state, message: translateAppMessage(language, state.message, state.messageCode) }),
     [language, state],
   );
   // A load started from the Models page or automatically at startup.
@@ -711,7 +680,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   async function copyNotice() {
     if (!shownNotice) return;
     try {
-      await copyToClipboard(translateAppMessage(language, shownNotice.message) ?? shownNotice.message);
+      await copyToClipboard(translateAppMessage(language, shownNotice.message, shownNotice.code, shownNotice.outcome) ?? shownNotice.message);
       setNoticeCopied(true);
     } catch (error) {
       showNotice(String(error), "error");
@@ -762,139 +731,6 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       dictionaryRequestRef.current += 1;
     };
   }, [page, state.phase, settings.historyRetention]);
-
-  // Shows the confirmed settings with every key changed here keeping its
-  // local value.
-  function showConfirmedWithLocalEdits() {
-    const shown = withKeys(confirmedSettingsRef.current, settingsRef.current, Array.from(localEditsRef.current.keys()));
-    settingsRef.current = shown;
-    setSettings(shown);
-  }
-
-  // Records that `keys` now show local values not yet confirmed.
-  function recordLocalEdits(keys: ReadonlyArray<keyof Settings>, draft: boolean) {
-    for (const key of keys) {
-      const previous = localEditsRef.current.get(key);
-      localEditsRef.current.set(key, {
-        generation: ++editGenerationRef.current,
-        // A key a save already changed stays one to revert on failure.
-        draft: draft && (previous?.draft ?? true),
-      });
-    }
-  }
-
-  // Applies a backend snapshot (the load, a save's acknowledgement or
-  // settings-changed) unless a newer one is applied already, keeping local
-  // values of unconfirmed keys. The first one also decides whether
-  // onboarding is still needed.
-  function applyBackendSnapshot(snapshot: SettingsSnapshot): boolean {
-    if (snapshot.revision <= settingsRevisionRef.current) return false;
-    settingsRevisionRef.current = snapshot.revision;
-    const first = !settingsLoadedRef.current;
-    settingsLoadedRef.current = true;
-    confirmedSettingsRef.current = snapshot.settings;
-    showConfirmedWithLocalEdits();
-    setSettingsLoaded(true);
-    if (first && !snapshot.settings.setupComplete) setPage("setup");
-    return true;
-  }
-
-  // Applies a snapshot that is not a save's acknowledgement. While saves are
-  // pending, the latest one's acknowledgement switches the UI language.
-  function applyReadSnapshot(snapshot: SettingsSnapshot) {
-    if (applyBackendSnapshot(snapshot) && pendingSavesRef.current === 0) {
-      onLanguageChange(snapshot.settings.uiLanguage);
-    }
-  }
-
-  async function loadSettings() {
-    const request = ++settingsRequestRef.current;
-    try {
-      const snapshot = await getSettings();
-      // A superseded read is dropped, and an older one cannot replace newer
-      // settings (for example from settings-changed after a save).
-      if (request !== settingsRequestRef.current) return;
-      applyReadSnapshot(snapshot);
-    } catch (error) {
-      if (request === settingsRequestRef.current && !settingsLoadedRef.current) showNotice(String(error), "error");
-    }
-  }
-
-  // Setup changes choices locally and saves them with Finish. They go with
-  // whichever save comes next, and a failed save keeps them.
-  function editSettingsLocally(next: Settings) {
-    const keys = Object.keys(next) as Array<keyof Settings>;
-    recordLocalEdits(keys.filter((key) => !Object.is(next[key], settingsRef.current[key])), true);
-    settingsRef.current = next;
-    setSettings(next);
-  }
-
-  // Refuses a save while only the defaults are known, and retries the load so
-  // a transient startup failure does not block saving for the whole session.
-  function settingsReady() {
-    if (settingsLoadedRef.current) return true;
-    showNotice(t("Settings have not been loaded yet, so changes were not saved. Try again in a moment."), "warning");
-    void loadSettings();
-    return false;
-  }
-
-  // Shows `patch` at once and queues its save. Saves are sent one at a time
-  // in the order they were made; when its turn comes, a save sends every key
-  // still unconfirmed with the value shown then, or nothing at all when an
-  // earlier save already confirmed them. The outcome carries the settings
-  // the backend stored.
-  async function queueSettingsSave(patch: Partial<Settings>): Promise<SettingsSaveOutcome> {
-    recordLocalEdits(Object.keys(patch) as Array<keyof Settings>, false);
-    const next = { ...settingsRef.current, ...patch };
-    settingsRef.current = next;
-    setSettings(next);
-    const save = ++latestSaveRef.current;
-    pendingSavesRef.current += 1;
-    const turn = saveQueueRef.current;
-    let endTurn = () => {};
-    saveQueueRef.current = new Promise<void>((resolve) => { endTurn = resolve; });
-    await turn;
-    const sent = Array.from(localEditsRef.current, ([key, edit]) => ({ key, generation: edit.generation }));
-    let snapshot: SettingsSnapshot | null = null;
-    try {
-      if (sent.length > 0) {
-        snapshot = await updateSettings(pickKeys(settingsRef.current, sent.map(({ key }) => key)));
-      }
-    } catch (error) {
-      // A later queued save sends the unconfirmed keys again and decides.
-      // Otherwise each of them returns to its confirmed value; unsaved Setup
-      // choices stay.
-      if (save === latestSaveRef.current) {
-        const reverted = Array.from(localEditsRef.current)
-          .filter(([, edit]) => !edit.draft)
-          .map(([key]) => key);
-        for (const key of reverted) localEditsRef.current.delete(key);
-        const restored = withKeys(settingsRef.current, confirmedSettingsRef.current, reverted);
-        settingsRef.current = restored;
-        setSettings(restored);
-        // A save can fail after its settings were stored (a later step of the
-        // command failed) without a settings-changed; a newer stored revision
-        // then replaces the restored values.
-        void loadSettings();
-      }
-      pendingSavesRef.current -= 1;
-      endTurn();
-      return { saved: false, error };
-    }
-    // A key changed again after it was sent stays unconfirmed for the next save.
-    for (const { key, generation } of sent) {
-      if (localEditsRef.current.get(key)?.generation === generation) localEditsRef.current.delete(key);
-    }
-    // An acknowledgement older than an applied settings-changed only
-    // confirms keys; the newer snapshot stays shown.
-    if (!snapshot || !applyBackendSnapshot(snapshot)) showConfirmedWithLocalEdits();
-    pendingSavesRef.current -= 1;
-    endTurn();
-    // An older acknowledgement must not switch back a language chosen by a
-    // newer save, so only the latest save switches the UI language.
-    if (save === latestSaveRef.current) onLanguageChange(settingsRef.current.uiLanguage);
-    return { saved: true, settings: snapshot?.settings ?? confirmedSettingsRef.current };
-  }
 
   async function saveSettings(patch: Partial<Settings>): Promise<boolean> {
     if (!settingsReady()) return false;
@@ -990,13 +826,10 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     setModelLoading(true);
     showNotice(t("Saving ASR settings and preparing the selected model..."));
     try {
-      let saved = settingsRef.current;
-      if (configuration) {
-        // Saved in turn with the other settings saves.
-        const outcome = await queueSettingsSave(configuration);
-        if (!outcome.saved) throw outcome.error;
-        saved = outcome.settings;
-      }
+      // Flush pending Setup edits as well as explicit model configuration.
+      const outcome = await queueSettingsSave(configuration ?? {});
+      if (!outcome.saved) throw outcome.error;
+      const saved = outcome.settings;
       setModel(await loadModel(saved.modelId, saved.modelQuantization));
       showNotice(t("Model loaded and ready."), "success");
     } catch (error) {
@@ -1157,7 +990,6 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             settings={settings}
             history={history}
             model={model}
-            level={level}
             statusLabel={statusLabel}
             recordingAction={recordingAction}
             onToggleRecording={() => void toggleRecording()}
@@ -1174,6 +1006,10 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             gpuChecking={gpuChecking}
             onSettingsChange={editSettingsLocally}
             onConfigureModel={() => setPage("models")}
+            onLoadModel={() => void prepareModel()}
+            modelLoading={preparingModel}
+            modelReady={model?.state === "ready" && model.quantization === settings.modelQuantization}
+            progress={shownProgress}
             onDiagnoseGpu={() => void diagnoseGpu()}
             onFinish={() => {
               void saveSettings({ setupComplete: true }).then((saved) => { if (saved) setPage("dashboard"); });
@@ -1220,7 +1056,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             onDeleteAll={() => void clearHistory()}
             onLoadAudio={getHistoryAudio}
             onAudioError={() => void reportHistoryAudioFailure()}
-            retryActive={state.phase === "processing" && state.message === "Retrying the saved recording."}
+            retryActive={state.operation === "retry" && (state.phase === "processing" || state.phase === "injecting")}
             onCancelRetry={() => void cancelRecording()}
           />
         )}
@@ -1264,7 +1100,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
               onDoubleClick={() => void copyNotice()}
               title={t("Double-click to copy")}
             >
-              {translateAppMessage(language, shownNotice?.message ?? null) ??
+              {translateAppMessage(language, shownNotice?.message ?? null, shownNotice?.code, shownNotice?.outcome) ??
                 (shownProgress?.stage === "download"
                   ? t("Downloading the speech model files.")
                   : t("Loading the speech model."))}

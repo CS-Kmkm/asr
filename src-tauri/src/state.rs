@@ -3,7 +3,7 @@ use std::sync::{Mutex, RwLock};
 use chrono::Utc;
 use tokio::sync::watch;
 
-use crate::types::{AppPhase, AppStateSnapshot};
+use crate::types::{AppPhase, AppStage, AppStateSnapshot, OperationKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PipelinePhase {
@@ -278,7 +278,11 @@ impl Default for AppState {
         Self {
             inner: RwLock::new(AppStateSnapshot {
                 phase: AppPhase::Idle,
+                stage: AppStage::Idle,
+                operation: None,
+                operation_id: None,
                 message: None,
+                message_code: None,
                 last_result: None,
                 updated_at: Utc::now().to_rfc3339(),
             }),
@@ -291,12 +295,35 @@ impl AppState {
         self.inner.read().expect("app state lock poisoned").clone()
     }
 
+    #[cfg(test)]
     pub fn transition(&self, phase: AppPhase, message: Option<String>) -> AppStateSnapshot {
+        self.transition_stage(AppStage::for_phase(&phase), message)
+    }
+
+    pub fn transition_stage(&self, stage: AppStage, message: Option<String>) -> AppStateSnapshot {
         let mut state = self.inner.write().expect("app state lock poisoned");
-        state.phase = phase;
+        state.phase = stage.phase();
+        state.stage = stage;
+        if matches!(
+            state.phase,
+            AppPhase::Idle | AppPhase::Completed | AppPhase::Error
+        ) {
+            state.operation = None;
+        }
         state.message = message;
+        state.message_code = state
+            .message
+            .as_deref()
+            .and_then(crate::messages::code)
+            .map(str::to_owned);
         state.updated_at = Utc::now().to_rfc3339();
         state.clone()
+    }
+
+    pub fn set_operation(&self, operation: OperationKind, id: u64) {
+        let mut state = self.inner.write().expect("app state lock poisoned");
+        state.operation = Some(operation);
+        state.operation_id = Some(id);
     }
 
     pub fn publish_result(&self, result: String) -> AppStateSnapshot {
@@ -309,7 +336,14 @@ impl AppState {
     pub fn complete(&self, result: String, message: String) -> AppStateSnapshot {
         let mut state = self.inner.write().expect("app state lock poisoned");
         state.phase = AppPhase::Completed;
+        state.stage = AppStage::Completed;
+        state.operation = None;
         state.message = Some(message);
+        state.message_code = state
+            .message
+            .as_deref()
+            .and_then(crate::messages::code)
+            .map(str::to_owned);
         state.last_result = Some(result);
         state.updated_at = Utc::now().to_rfc3339();
         state.clone()
@@ -409,6 +443,20 @@ mod tests {
         assert_eq!(state.phase, AppPhase::Idle);
         assert_eq!(state.message, None);
         assert_eq!(state.last_result, None);
+    }
+
+    #[test]
+    fn typed_stages_keep_retry_identity_and_clear_it_at_the_terminal_phase() {
+        let state = AppState::default();
+        state.set_operation(OperationKind::Retry, 7);
+        let next = state.transition_stage(AppStage::Transcribing, Some("changed wording".into()));
+        let json = serde_json::to_value(&next).unwrap();
+        assert_eq!(json["stage"], "transcribing");
+        assert_eq!(json["operation"], "retry");
+        assert_eq!(json["phase"], "processing");
+        let done = state.complete("result".into(), "Done.".into());
+        assert_eq!(done.stage, AppStage::Completed);
+        assert_eq!(done.operation, None);
     }
 
     #[test]

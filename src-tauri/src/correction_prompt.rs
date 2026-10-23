@@ -1,4 +1,4 @@
-use crate::types::Settings;
+use crate::{dictionary::CorrectionTerm, types::Settings};
 
 // Prompt tuning
 // -------------
@@ -66,11 +66,17 @@ impl ToggleInstruction {
     }
 }
 
-pub(crate) fn build_correction_instruction(
+pub(crate) struct CorrectionContext {
+    pub instruction: String,
+    /// The exact terms that fit the prompt budget, without decoding the prompt.
+    pub terms: Vec<CorrectionTerm>,
+}
+
+pub(crate) fn build_correction_context(
     settings: &Settings,
-    dictionary_hints: &[String],
+    dictionary_hints: &[CorrectionTerm],
     style_guidance: Option<&str>,
-) -> String {
+) -> CorrectionContext {
     let style_guidance = style_guidance
         .map(str::trim)
         .filter(|value| !value.is_empty());
@@ -129,11 +135,11 @@ pub(crate) fn build_correction_instruction(
     let mut dictionary_chars = 0;
     let hints = dictionary_hints
         .iter()
-        .map(|term| term.trim())
-        .filter(|term| !term.is_empty())
+        .filter(|term| !term.surface.trim().is_empty())
         .take(MAX_DICTIONARY_TERMS)
         .filter(|term| {
-            let added = term.chars().count() + usize::from(dictionary_chars > 0);
+            let added =
+                term.prompt_hint().chars().count() + if dictionary_chars > 0 { 2 } else { 0 };
             if dictionary_chars + added > MAX_DICTIONARY_CHARS {
                 return false;
             }
@@ -143,10 +149,32 @@ pub(crate) fn build_correction_instruction(
         .collect::<Vec<_>>();
     if !hints.is_empty() {
         instruction.push_str(DICTIONARY_PREFIX);
-        instruction.push_str(&hints.join("; "));
+        instruction.push_str(
+            &hints
+                .iter()
+                .map(|term| term.prompt_hint())
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
         instruction.push('\n');
     }
-    instruction
+    CorrectionContext {
+        instruction,
+        terms: hints.into_iter().cloned().collect(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn build_correction_instruction(
+    settings: &Settings,
+    hints: &[String],
+    style: Option<&str>,
+) -> String {
+    let terms = hints
+        .iter()
+        .map(|hint| CorrectionTerm::from_fixture(hint))
+        .collect::<Vec<_>>();
+    build_correction_context(settings, &terms, style).instruction
 }
 
 fn append_rule(instruction: &mut String, rule: &str) {
@@ -157,6 +185,34 @@ fn append_rule(instruction: &mut String, rule: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_terms_keep_original_fields_and_fit_the_actual_prompt_budget() {
+        let term = CorrectionTerm {
+            surface: "ACME; Labs<=v2|Beta".into(),
+            readings: vec!["old|project<=first; value".into()],
+        };
+        let context = build_correction_context(&Settings::default(), &[term.clone()], None);
+        assert_eq!(context.terms, [term]);
+        let terms = (0..20)
+            .map(|index| CorrectionTerm {
+                surface: format!("{index}{}", "x".repeat(39)),
+                readings: vec![],
+            })
+            .collect::<Vec<_>>();
+        let context = build_correction_context(&Settings::default(), &terms, None);
+        assert!(context.terms.len() <= MAX_DICTIONARY_TERMS);
+        let rendered = context
+            .terms
+            .iter()
+            .map(|term| term.prompt_hint())
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(rendered.chars().count() <= MAX_DICTIONARY_CHARS);
+        assert!(context
+            .instruction
+            .ends_with(&format!("Terms: {rendered}\n")));
+    }
 
     // Copied verbatim from the prompt before personalization existed. The
     // no-profile instruction must keep matching it byte for byte.

@@ -13,6 +13,10 @@ export function PrivacyPage({
   onSave: (patch: Partial<Settings>) => void;
 }) {
   const { t } = useI18n();
+  const consents = settings.cloudConsents ?? [];
+  const changeConsent = (key: string, allowed: boolean) => onSave({ cloudConsents: allowed
+    ? [...new Set([...consents, key])] : consents.filter((saved) => saved !== key) });
+  const asrConsent = `asr:${settings.apiBaseUrl.trim().replace(/\/+$/, "")}`;
   return (
     <section className="panel">
       <SettingRow
@@ -46,6 +50,21 @@ export function PrivacyPage({
           />
         }
       />
+      <p>{t("Usage metrics follow History retention and are removed by Delete all. Failed recordings kept for Retry follow the separate 24-hour setting above.")}</p>
+      <h2>{t("Cloud provider consent")}</h2>
+      <p>{t("Allow a provider only if you agree to send text to it. Translate, Edit and Ask send transcripts or selected text even when Dictate AI correction is off. You can revoke consent here.")}</p>
+      {(["openai", "gemini"] as const).map((provider) => (
+        <SettingRow key={provider} title={provider === "openai" ? "OpenAI" : "Gemini"}
+          detail={t("Allow text to be sent to this provider.")}
+          control={<Toggle label={`${provider} ${t("Cloud provider consent")}`} checked={consents.includes(provider)} onChange={(allowed) => changeConsent(provider, allowed)} />} />
+      ))}
+      {settings.asrBackend === "openai-compatible" && <SettingRow
+        title={t("Cloud speech provider")}
+        detail={`${t("Allow recordings to be sent to this endpoint:")} ${settings.apiBaseUrl}`}
+        control={<Toggle label={t("Cloud speech provider")} checked={consents.includes(asrConsent)} onChange={(allowed) => changeConsent(asrConsent, allowed)} />} />}
+      <SettingRow title={t("Live transcription preview")}
+        detail={t("Preview can transcribe the same audio more than once. With a cloud speech backend, each preview sends another audio upload. Off by default for cloud speech.")}
+        control={<Toggle label={t("Live transcription preview")} checked={settings.asrBackend === "openai-compatible" ? settings.cloudLivePreviewEnabled : settings.livePreviewEnabled ?? true} onChange={(enabled) => onSave(settings.asrBackend === "openai-compatible" ? { cloudLivePreviewEnabled: enabled } : { livePreviewEnabled: enabled })} />} />
     </section>
   );
 }

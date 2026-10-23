@@ -1,6 +1,22 @@
-use super::*;
-use audio::AudioError;
-use injection::ProvisionalInsertion;
+use crate::{
+    asr::{self, Transcriber},
+    audio::{self, AudioCapture, AudioError},
+    command_error, emit_status,
+    injection::{
+        self, InjectionOptions, InsertResult, InsertionDetail, ProvisionalInsertion,
+        SystemTextInjector, TargetWindow,
+    },
+    input_monitor::InputMonitor,
+    services::Services,
+    state::{AppState, PipelineMode, PipelinePhase},
+    types::Settings,
+    TempArtifact,
+};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::watch;
 #[cfg(test)]
 mod benchmark;
@@ -355,10 +371,14 @@ pub(crate) fn start(
     prompt: Option<String>,
     speech_locale: Option<String>,
     cancel: watch::Receiver<bool>,
+    preview_enabled: bool,
 ) -> LiveTask {
     draft.monitor.observe_cancellation(Some(cancel.clone()));
     let (stop, stopped) = watch::channel(false);
     let task = tauri::async_runtime::spawn(async move {
+        if !preview_enabled {
+            return draft;
+        }
         let services = app.state::<Services>();
         let result = run(
             &services.audio,
@@ -589,9 +609,17 @@ fn window_text(result: Result<asr::Transcript, asr::AsrError>) -> Result<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use audio::{AudioArtifact, AudioFuture, AudioSnapshot, CaptureState, LevelMeter};
+    use crate::asr::WorkerCommand;
+    use audio::{
+        AudioArtifact, AudioDevice, AudioFuture, AudioSnapshot, CaptureConfig, CaptureState,
+        LevelMeter,
+    };
     use injection::test_backend::{self, MockBackend};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
     use tokio::sync::Notify;
 
     fn deferred_test_draft() -> LiveDraft {

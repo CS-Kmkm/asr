@@ -57,4 +57,5 @@ windows = { version = "0.58", features = [
 ] }
 
 [dev-dependencies]
+syn = { version = "=2.0.117", features = ["full", "visit"] }
 tempfile = "3"
