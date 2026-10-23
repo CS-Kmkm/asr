@@ -90,7 +90,9 @@ pnpm run tauri dev
 ```
 
 `pip install -e .` installs the default faster-whisper stack (CPU-capable, no
-GPU required). Select **Load ASR model** before the first dictation. The worker
+GPU required). On first setup, select **Download and load speech model**, or use
+**Load Model** on the Models page. Startup does not download a model before
+setup is complete. Later dictations prepare the selected model before recording. The worker
 downloads `large-v3-turbo` from Hugging Face on first load and uses the normal
 Hugging Face cache. The model is not bundled with the app.
 
@@ -193,7 +195,13 @@ directory the app was started from. The chosen project directory and `.env`
 path are printed to stderr at startup; they are visible only when the app is
 started from a console (for example `pnpm run tauri dev`), not from release
 builds started from a shortcut or autostart. Existing process/system
-environment variables take precedence over values from `.env`.
+environment variables take precedence over values from `.env`. The file is read
+into application configuration rather than exported into the process environment.
+Child processes receive an allowlist of runtime variables; OpenAI/Gemini keys are
+not inherited by Python, input-monitor helpers or GPU probes. Only the selected
+speech API key is explicitly passed to an OpenAI-compatible ASR worker.
+Hugging Face credentials, when configured, are passed only to the ASR worker for
+private/gated models; they are not passed to input-monitor helpers or GPU probes.
 
 ```powershell
 # Put this in .env instead:
@@ -396,13 +404,28 @@ Full usage and Phase 0 gate criteria are documented in
 
 ## Privacy and limitations
 
-- Local processing remains the default. Cloud/API processing is used only when
-  the OpenAI-compatible backend is explicitly selected.
+- Speech recognition is local by default. The OpenAI-compatible ASR backend
+  sends recordings to its configured endpoint. Dictate AI correction, Translate,
+  Edit and Ask use the configured AI provider: OpenAI/Gemini send transcripts
+  and, where relevant, selected text to that provider; the local provider stays
+  on loopback. Translate/Edit/Ask use AI even with Dictate AI correction off.
+  Privacy requires explicit consent per text provider and speech endpoint before
+  a request can be sent. Changing the speech backend or endpoint removes old
+  speech consents, so returning to a previous endpoint requires consent again.
+- Live transcription preview may decode the same audio repeatedly. It is on by
+  default for local backends (including VibeVoice) and off for OpenAI-compatible speech; enabling it
+  with cloud speech causes multiple audio uploads. Privacy controls local and
+  cloud preview separately; a local opt-in never enables cloud uploads.
 - History can be disabled; when disabled, transcript rows are not written
   (failed recordings kept for Retry are the exception described below).
 - Usage metrics (event type, provider, duration, success, and error code; no
   text) follow History: they are not recorded while History is off, are
   deleted with the History retention window, and are removed by Delete all.
+- New SQLite deletions overwrite freed record content using secure-delete.
+  History deletions request a WAL checkpoint/truncation; an active external reader or
+  database error can defer this until the next policy pass. Previously freed
+  pages from older versions are not retroactively erased. This is not forensic
+  erasure of filesystem backups, SSD snapshots or copied databases/audio files.
 - Temporary WAV deletion defaults to enabled. When History is on and "Delete
   audio after processing" is off, History keeps a copy of each new recording
   for playback, download, and Retry. Turning it on stops keeping new recordings
@@ -425,8 +448,9 @@ Full usage and Phase 0 gate criteria are documented in
   and code-editor fields) receive one unverified paste, and live text insertion
   in them may keep only the first fragment.
 - Elevated applications, password controls, and secure controls are not forced.
-- Model download progress/resume UI and checksum verification remain future model
-  management work; Transformers manages the current cache download.
+- Model download progress is displayed during preparation. Resuming interrupted
+  downloads and checksum verification remain future model management work;
+  Transformers manages the current cache download.
 - The default shortcut is registered at startup, and persisted custom shortcuts
   are re-registered on launch. If another app holds a saved hotkey, the app
   names the action that stays unavailable; saving other settings still works,
