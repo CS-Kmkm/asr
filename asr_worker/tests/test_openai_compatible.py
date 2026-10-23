@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import tempfile
 import time
 import unittest
+
+from asr_worker.tests.support import IsolatedWorkerTestCase
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,7 +18,7 @@ from asr_worker.backends import BackendError, OpenAICompatibleBackend, create_ba
 from asr_worker.backends import MockBackend
 
 
-class OpenAICompatibleBackendTests(unittest.TestCase):
+class OpenAICompatibleBackendTests(IsolatedWorkerTestCase):
     def create_local_backend(self) -> OpenAICompatibleBackend:
         with patch.dict(
             os.environ,
@@ -94,7 +97,7 @@ class OpenAICompatibleBackendTests(unittest.TestCase):
         self.assertNotIn("secret response body", context.exception.message)
 
 
-class ApiFormattingTests(unittest.TestCase):
+class ApiFormattingTests(IsolatedWorkerTestCase):
     def test_verbose_response_is_openai_shaped(self) -> None:
         payload = _verbose_response(
             "hello",
@@ -112,7 +115,8 @@ class ApiFormattingTests(unittest.TestCase):
         self.assertIn("00:00:01.250 --> 00:00:02.500", _subtitle(segments, "", vtt=True))
 
 
-class ApiServerTests(unittest.TestCase):
+@unittest.skipUnless(importlib.util.find_spec("fastapi"), "requires the serve extra")
+class ApiServerTests(IsolatedWorkerTestCase):
     def test_transcriptions_endpoint_and_auth(self) -> None:
         from fastapi.testclient import TestClient
 

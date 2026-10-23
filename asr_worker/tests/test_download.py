@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+
+from asr_worker.tests.support import IsolatedWorkerTestCase
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -34,7 +36,7 @@ def fake_hub(snapshot: Path, calls: list[dict]) -> types.ModuleType:
     return module
 
 
-class ByteProgressTqdmTests(unittest.TestCase):
+class ByteProgressTqdmTests(IsolatedWorkerTestCase):
     def test_reports_bytes_while_the_download_total_grows(self) -> None:
         events: list[dict] = []
         # huggingface_hub creates the aggregate bar with a zero total and raises
@@ -74,7 +76,7 @@ class ByteProgressTqdmTests(unittest.TestCase):
         self.assertEqual(events, [])
 
 
-class CachedSnapshotPathTests(unittest.TestCase):
+class CachedSnapshotPathTests(IsolatedWorkerTestCase):
     def resolve(self, files: list[str], required: list[str] | None) -> tuple[str | None, str, list[dict]]:
         with TemporaryDirectory() as tmp:
             snapshot = Path(tmp) / "snapshots" / "abc123"

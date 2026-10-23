@@ -5,6 +5,8 @@ import importlib.util
 import os
 import sys
 import unittest
+
+from asr_worker.tests.support import IsolatedWorkerTestCase
 from pathlib import Path
 from unittest.mock import patch
 
@@ -64,7 +66,7 @@ sys.exit(3)
 """
 
 
-class WorkerStderrTests(unittest.TestCase):
+class WorkerStderrTests(IsolatedWorkerTestCase):
     def test_worker_flooding_stderr_does_not_block_requests(self) -> None:
         with bench_asr.WorkerSession([sys.executable, "-c", _NOISY_WORKER], timeout_s=30) as session:
             response, _ = session.request({"command": "load"})
@@ -95,7 +97,7 @@ class WorkerStderrTests(unittest.TestCase):
         self.assertIn("last diagnostic line", tail)
 
 
-class WorkerEnvTests(unittest.TestCase):
+class WorkerEnvTests(IsolatedWorkerTestCase):
     def test_worker_stderr_is_requested_as_utf8(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("PYTHONIOENCODING", None)

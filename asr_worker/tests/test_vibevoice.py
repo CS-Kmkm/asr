@@ -6,9 +6,11 @@ import os
 import sys
 import types
 import unittest
+
+from asr_worker.tests.support import IsolatedWorkerTestCase
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from asr_worker.backends import BackendError, VibeVoiceBackend, join_segment_texts
 
@@ -78,6 +80,53 @@ def _fake_torch() -> types.ModuleType:
     return module
 
 
+class VibeVoiceLoadTests(IsolatedWorkerTestCase):
+    def fake_modules(self, *, cuda: bool = True, device: str = "cuda:0"):
+        torch = _fake_torch()
+        torch.cuda = types.SimpleNamespace(is_available=lambda: cuda)
+        torch.bfloat16 = "bfloat16"
+        transformers = types.ModuleType("transformers")
+        processor = Mock()
+        model = Mock()
+        model.parameters.side_effect = lambda: iter([types.SimpleNamespace(device=device)])
+        transformers.AutoProcessor = types.SimpleNamespace(from_pretrained=Mock(return_value=processor))
+        transformers.VibeVoiceAsrForConditionalGeneration = types.SimpleNamespace(from_pretrained=Mock(return_value=model))
+        transformers.BitsAndBytesConfig = lambda **options: options
+        return {"torch": torch, "transformers": transformers}, transformers, processor, model
+
+    def test_load_uses_selected_quantization_without_network_or_gpu(self) -> None:
+        for quantization in ("4bit", "8bit", "bf16"):
+            with self.subTest(quantization=quantization):
+                modules, transformers, processor, model = self.fake_modules()
+                backend = VibeVoiceBackend()
+                with patch.dict(sys.modules, modules), patch("asr_worker.backends.cached_snapshot_path", return_value="/fake/cached"):
+                    backend.load(quantization)
+                self.assertIs(backend.processor, processor)
+                self.assertIs(backend.model, model)
+                options = transformers.VibeVoiceAsrForConditionalGeneration.from_pretrained.call_args.kwargs
+                self.assertEqual(options["device_map"], "cuda")
+                if quantization == "bf16":
+                    self.assertEqual(options["torch_dtype"], "bfloat16")
+                else:
+                    self.assertEqual(options["quantization_config"], {f"load_in_{quantization}": True})
+
+    def test_missing_cuda_fails_before_loading_any_model(self) -> None:
+        modules, transformers, _, _ = self.fake_modules(cuda=False)
+        with patch.dict(sys.modules, modules), self.assertRaises(BackendError) as failure:
+            VibeVoiceBackend().load("4bit")
+        self.assertEqual(failure.exception.code, "gpu_unsupported")
+        transformers.AutoProcessor.from_pretrained.assert_not_called()
+
+    def test_unexpected_cpu_placement_does_not_publish_a_ready_model(self) -> None:
+        modules, _, _, _ = self.fake_modules(device="cpu")
+        backend = VibeVoiceBackend()
+        with patch.dict(sys.modules, modules), patch("asr_worker.backends.cached_snapshot_path", return_value="/fake/cached"), self.assertRaises(BackendError) as failure:
+            backend.load("8bit")
+        self.assertEqual(failure.exception.code, "gpu_unsupported")
+        self.assertIsNone(backend.model)
+        self.assertIsNone(backend.processor)
+
+
 def _segments(*texts: str) -> list[dict[str, Any]]:
     return [
         {"Start": float(index), "End": float(index + 1), "Speaker": 0, "Content": text}
@@ -93,7 +142,7 @@ def _transcribe(processor: _FakeProcessor, model: _FakeModel) -> tuple[str, list
         return backend.transcribe(Path("missing.wav"), None)
 
 
-class JoinSegmentTextsTests(unittest.TestCase):
+class JoinSegmentTextsTests(IsolatedWorkerTestCase):
     def test_japanese_segments_are_joined_without_spaces(self) -> None:
         self.assertEqual(join_segment_texts(["今日は会議です。", "明日は休みです"]), "今日は会議です。明日は休みです")
         self.assertEqual(join_segment_texts(["コーヒー", "ください"]), "コーヒーください")
@@ -118,7 +167,7 @@ class JoinSegmentTextsTests(unittest.TestCase):
         self.assertEqual(join_segment_texts([]), "")
 
 
-class VibeVoiceTranscribeTests(unittest.TestCase):
+class VibeVoiceTranscribeTests(IsolatedWorkerTestCase):
     def test_japanese_segments_reach_the_transcript_without_spaces(self) -> None:
         processor = _FakeProcessor(_segments("今日は会議です", "明日は休みです"))
         text, segments = _transcribe(processor, _FakeModel([7, 8, 2]))
@@ -134,7 +183,7 @@ class VibeVoiceTranscribeTests(unittest.TestCase):
 
 
 
-class VibeVoiceTruncationTests(unittest.TestCase):
+class VibeVoiceTruncationTests(IsolatedWorkerTestCase):
     def transcribe_with_limit(self, processor: _FakeProcessor, model: _FakeModel) -> tuple[str, list[dict[str, Any]]]:
         with patch.dict(os.environ, {"ASR_MAX_NEW_TOKENS": "4"}):
             return _transcribe(processor, model)

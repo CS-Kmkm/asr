@@ -9,6 +9,8 @@ import tempfile
 import threading
 import time
 import unittest
+
+from asr_worker.tests.support import IsolatedWorkerTestCase
 from pathlib import Path
 from typing import Any, Iterator
 from unittest.mock import patch
@@ -60,7 +62,7 @@ def _by_id(messages: list[dict[str, Any]]) -> dict[Any, dict[str, Any]]:
     return {message["id"]: message for message in messages}
 
 
-class CancelOperationTests(unittest.TestCase):
+class CancelOperationTests(IsolatedWorkerTestCase):
     def test_running_transcription_stops_and_cancel_is_acknowledged(self) -> None:
         backend = _BlockingBackend()
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as audio:
@@ -118,7 +120,7 @@ class CancelOperationTests(unittest.TestCase):
         self.assertIn("cancel", response["error"]["message"])
 
 
-class BackendCancellationTests(unittest.TestCase):
+class BackendCancellationTests(IsolatedWorkerTestCase):
     def test_faster_whisper_stops_between_segments(self) -> None:
         class _Segment:
             def __init__(self, text: str) -> None:
@@ -196,7 +198,7 @@ class BackendCancellationTests(unittest.TestCase):
         self.assertFalse(backend.processor.decoded)
 
 
-class WorkerProcessTests(unittest.TestCase):
+class WorkerProcessTests(IsolatedWorkerTestCase):
     """The real `python -m asr_worker` process, as the desktop app runs it."""
 
     def test_cancel_keeps_the_process_and_shutdown_exits_cleanly(self) -> None:

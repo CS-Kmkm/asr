@@ -20,9 +20,10 @@ from asr_worker.backends import (
     wav_duration_seconds,
 )
 from asr_worker.download import FASTER_WHISPER_ALLOW_PATTERNS
+from asr_worker.tests.support import IsolatedWorkerTestCase
 
 
-class CreateBackendTests(unittest.TestCase):
+class CreateBackendTests(IsolatedWorkerTestCase):
     def test_default_model_name(self) -> None:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("ASR_FASTER_WHISPER_MODEL", None)
@@ -43,7 +44,7 @@ class CreateBackendTests(unittest.TestCase):
         self.assertEqual(backend.model_name, "faster-whisper:custom/whisper")
 
 
-class LoadUnavailableTests(unittest.TestCase):
+class LoadUnavailableTests(IsolatedWorkerTestCase):
     def test_load_without_faster_whisper_reports_backend_unavailable(self) -> None:
         backend = FasterWhisperBackend()
         # Ensure import fails: faster_whisper is not installed in this env.
@@ -60,7 +61,7 @@ class LoadUnavailableTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "unsupported_quantization")
 
 
-class ComputeTypeTests(unittest.TestCase):
+class ComputeTypeTests(IsolatedWorkerTestCase):
     def test_4bit_and_8bit(self) -> None:
         self.assertEqual(faster_whisper_compute_type("4bit", cuda=True), "int8_float16")
         self.assertEqual(faster_whisper_compute_type("4bit", cuda=False), "int8")
@@ -72,7 +73,7 @@ class ComputeTypeTests(unittest.TestCase):
         self.assertEqual(faster_whisper_compute_type("bf16", cuda=False), "int8")
 
 
-class MaxNewTokensTests(unittest.TestCase):
+class MaxNewTokensTests(IsolatedWorkerTestCase):
     def test_short_audio_clamped_to_floor(self) -> None:
         self.assertEqual(compute_max_new_tokens(1.0, None), 256)
 
@@ -114,7 +115,7 @@ class MaxNewTokensTests(unittest.TestCase):
         self.assertEqual(compute_max_new_tokens(None, None), VIBEVOICE_MAX_NEW_TOKENS)
 
 
-class WavDurationTests(unittest.TestCase):
+class WavDurationTests(IsolatedWorkerTestCase):
     def test_valid_wav(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "tone.wav"
@@ -177,7 +178,7 @@ def _install_fake_faster_whisper() -> dict[str, types.ModuleType]:
 BUILTIN_REPO = "Systran/faster-whisper-tiny"
 
 
-class ResolveModelFilesTests(unittest.TestCase):
+class ResolveModelFilesTests(IsolatedWorkerTestCase):
     def test_cached_model_is_loaded_without_downloading(self) -> None:
         backend = FasterWhisperBackend()
         events: list[dict] = []
@@ -314,7 +315,14 @@ class ResolveModelFilesTests(unittest.TestCase):
         self.assertEqual(events, [])
 
 
-class TranscribeWithFakeModuleTests(unittest.TestCase):
+class TranscribeWithFakeModuleTests(IsolatedWorkerTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # A fake CTranslate2 module must never resolve/download a real model.
+        model_files = patch.object(FasterWhisperBackend, "_resolve_model_files", return_value="/fake/model")
+        model_files.start()
+        self.addCleanup(model_files.stop)
+
     def test_transcribe_formats_segments_and_passes_hotwords(self) -> None:
         backend = create_backend("faster-whisper")
         with patch.dict(sys.modules, _install_fake_faster_whisper()):

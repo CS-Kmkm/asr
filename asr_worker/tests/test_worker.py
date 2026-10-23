@@ -5,6 +5,8 @@ import json
 import os
 import tempfile
 import unittest
+
+from asr_worker.tests.support import IsolatedWorkerTestCase
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,7 +14,7 @@ from asr_worker.backends import MockBackend, map_backend_exception, vibevoice_de
 from asr_worker.worker import Worker, _configure_protocol_stdio, serve
 
 
-class WorkerTests(unittest.TestCase):
+class WorkerTests(IsolatedWorkerTestCase):
     def test_protocol_stdio_is_forced_to_utf8(self) -> None:
         input_bytes = io.BytesIO()
         output_bytes = io.BytesIO()
@@ -278,7 +280,7 @@ class _ProgressBackend(MockBackend):
         super().load(quantization)
 
 
-class LoadProgressTests(unittest.TestCase):
+class LoadProgressTests(IsolatedWorkerTestCase):
     def test_load_reports_progress_before_its_response(self) -> None:
         output = io.StringIO()
         serve(
