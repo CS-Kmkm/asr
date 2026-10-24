@@ -6,7 +6,7 @@ use super::{
 };
 use crate::types::Settings;
 use reqwest::{redirect::Policy, Client};
-use std::sync::OnceLock;
+use std::{sync::OnceLock, time::Duration};
 use tokio::sync::watch;
 
 pub(super) struct TextRequest<'a> {
@@ -22,6 +22,7 @@ pub(super) enum ProviderAccess {
     Stub {
         endpoint: String,
         api_key: String,
+        client: Option<Client>,
     },
 }
 
@@ -43,11 +44,14 @@ impl ProviderAccess {
     fn client(&self, local: bool) -> Result<Client, reqwest::Error> {
         #[cfg(test)]
         if matches!(self, Self::Stub { .. }) {
-            return Client::builder()
-                .timeout(REQUEST_TIMEOUT)
-                .redirect(Policy::none())
-                .no_proxy()
-                .build();
+            if let Self::Stub {
+                client: Some(client),
+                ..
+            } = self
+            {
+                return Ok(client.clone());
+            }
+            return cloud_client_with(REQUEST_TIMEOUT, true);
         }
         // Reuse connection pools. Auth headers remain per request so a changed
         // provider key never needs to rebuild or invalidate a client.
@@ -60,14 +64,22 @@ impl ProviderAccess {
         let client = if local {
             local_client()?
         } else {
-            Client::builder()
-                .timeout(REQUEST_TIMEOUT)
-                .redirect(Policy::none())
-                .build()?
+            cloud_client_with(REQUEST_TIMEOUT, false)?
         };
         let _ = slot.set(client.clone());
         Ok(client)
     }
+}
+
+fn cloud_client_with(idle_timeout: Duration, no_proxy: bool) -> Result<Client, reqwest::Error> {
+    let mut builder = Client::builder()
+        .connect_timeout(super::LOCAL_CONNECT_TIMEOUT)
+        .read_timeout(idle_timeout)
+        .redirect(Policy::none());
+    if no_proxy {
+        builder = builder.no_proxy();
+    }
+    builder.build()
 }
 
 pub(super) async fn request_text_with_access(
@@ -118,23 +130,100 @@ pub(super) async fn request_text_with_access(
         ),
         provider => return Err(CorrectionError::UnsupportedProvider(provider.into())),
     };
-    let response = await_reqwest_or_cancel(request.send(), &mut cancel).await?;
-    let status = response.status();
-    if !status.is_success() {
-        let mut body = await_reqwest_or_cancel(response.text(), &mut cancel).await?;
-        if let Some(key) = sent_key.filter(|key| !key.is_empty()) {
-            body = body.replace(&key, "[redacted]");
+    let template = request.build()?;
+    let cloud = provider != "local";
+    // The read timeout measures silence. A separate generous total budget
+    // scales with output size and covers both attempts together.
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_secs((budget.visible_tokens(input) as u64 / 2 + 60).clamp(180, 1_800));
+    for attempt in 0..=1 {
+        let mut request = template.try_clone().ok_or_else(|| {
+            CorrectionError::InvalidResponse("provider request cannot be cloned".into())
+        })?;
+        if cloud {
+            *request.timeout_mut() =
+                Some(deadline.saturating_duration_since(tokio::time::Instant::now()));
         }
-        return Err(api_error(status, &body));
+        let response = match await_reqwest_or_cancel(client.execute(request), &mut cancel).await {
+            Ok(response) => response,
+            Err(CorrectionError::Request(_)) if cloud && attempt == 0 => {
+                retry_wait(None, &mut cancel).await?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let status = response.status();
+        if !status.is_success() {
+            if cloud && attempt == 0 && (status.as_u16() == 429 || status.is_server_error()) {
+                if let Some(delay) = short_retry_after(
+                    response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|value| value.to_str().ok()),
+                ) {
+                    drop(response);
+                    retry_wait(Some(delay), &mut cancel).await?;
+                    continue;
+                }
+            }
+            let mut body = await_reqwest_or_cancel(response.text(), &mut cancel).await?;
+            if let Some(key) = sent_key.as_ref().filter(|key| !key.is_empty()) {
+                body = body.replace(key, "[redacted]");
+            }
+            return Err(api_error(status, &body));
+        }
+        let mut emitted = false;
+        let result = collect_response(response, provider, &mut cancel, &mut |delta| {
+            emitted |= !delta.is_empty();
+            on_update(delta);
+        })
+        .await;
+        let result = match result {
+            Err(CorrectionError::Request(_)) if cloud && attempt == 0 && !emitted => {
+                retry_wait(None, &mut cancel).await?;
+                continue;
+            }
+            result => result?,
+        };
+        let result = if trim_output { result.trim() } else { &result };
+        if result.is_empty() {
+            return Err(CorrectionError::InvalidResponse(
+                "the model returned empty text".into(),
+            ));
+        }
+        return Ok(result.to_owned());
     }
-    let result = collect_response(response, provider, &mut cancel, &mut on_update).await?;
-    let result = if trim_output { result.trim() } else { &result };
-    if result.is_empty() {
-        return Err(CorrectionError::InvalidResponse(
-            "the model returned empty text".into(),
-        ));
+    unreachable!("each final attempt returns its result")
+}
+
+fn short_retry_after(value: Option<&str>) -> Option<Duration> {
+    let Some(value) = value else {
+        return Some(Duration::from_millis(250));
+    };
+    let seconds = value.parse::<u64>().ok().or_else(|| {
+        let retry_at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+        Some((retry_at.timestamp() - chrono::Utc::now().timestamp()).max(0) as u64)
+    })?;
+    // Preserve longer server backoffs by returning the original failure
+    // rather than retrying earlier than requested or blocking for minutes.
+    (seconds <= 2).then(|| Duration::from_secs(seconds))
+}
+
+async fn retry_wait(
+    retry_after: Option<Duration>,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<(), CorrectionError> {
+    let mut jitter = [0u8; 1];
+    let _ = getrandom::fill(&mut jitter);
+    let delay = retry_after.unwrap_or(Duration::from_millis(250))
+        + Duration::from_millis(u64::from(jitter[0] % 100));
+    if *cancel.borrow() {
+        return Err(CorrectionError::Cancelled);
     }
-    Ok(result.to_owned())
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => Ok(()),
+        _ = cancel.changed() => Err(CorrectionError::Cancelled),
+    }
 }
 
 #[cfg(test)]
