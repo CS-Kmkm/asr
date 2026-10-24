@@ -70,6 +70,7 @@ const TRANSCRIPT_TRUNCATED_CODE: &str = "transcript_truncated";
 pub(crate) enum TranscriptionFailure {
     /// Retrying may succeed, for example after a transient worker failure.
     Retryable,
+    CpuMemory,
     /// The take exceeds what the speech model can transcribe; Retry with the
     /// same model fails the same way.
     TooLongForModel,
@@ -78,6 +79,7 @@ pub(crate) enum TranscriptionFailure {
 impl TranscriptionFailure {
     pub(crate) fn of(error: &asr::AsrError) -> Self {
         match error {
+            asr::AsrError::Worker(worker) if worker.code == "cpu_oom" => Self::CpuMemory,
             asr::AsrError::Worker(worker) if worker.code == TRANSCRIPT_TRUNCATED_CODE => {
                 Self::TooLongForModel
             }
@@ -88,7 +90,7 @@ impl TranscriptionFailure {
     /// `insertion_detail` of the failed take's History row.
     pub(crate) fn history_detail(self) -> Option<&'static str> {
         match self {
-            Self::Retryable => None,
+            Self::Retryable | Self::CpuMemory => None,
             Self::TooLongForModel => Some(TRANSCRIPT_TRUNCATED_CODE),
         }
     }
@@ -161,6 +163,9 @@ pub(crate) fn failed_take_message(
     failure: TranscriptionFailure,
 ) -> &'static str {
     match (failure, kept) {
+        (TranscriptionFailure::CpuMemory, None) => CPU_MEMORY_FAILURE,
+        (TranscriptionFailure::CpuMemory, Some(storage::FailedTakeRetention::Normal)) => "Not enough system memory for speech recognition. The recording was saved to History. Choose a smaller model before retrying.",
+        (TranscriptionFailure::CpuMemory, Some(storage::FailedTakeRetention::Temporary)) => "Not enough system memory for speech recognition. The recording is kept in History for 24 hours. Choose a smaller model before retrying.",
         (TranscriptionFailure::TooLongForModel, Some(_)) => TRANSCRIPTION_TOO_LONG_SAVED_TO_HISTORY,
         (TranscriptionFailure::TooLongForModel, None) => TRANSCRIPTION_TOO_LONG_FOR_MODEL,
         (_, Some(storage::FailedTakeRetention::Normal)) => TRANSCRIPTION_FAILED_SAVED_TO_HISTORY,
@@ -168,6 +173,8 @@ pub(crate) fn failed_take_message(
         (_, None) => "Transcription failed. Check model and GPU diagnostics.",
     }
 }
+
+pub(crate) const CPU_MEMORY_FAILURE: &str = "Not enough system memory for speech recognition. Choose a smaller model or a shorter recording.";
 
 fn capture_config(settings: &Settings) -> CaptureConfig {
     let noise_suppression = match settings.noise_suppression.as_str() {
@@ -4995,6 +5002,30 @@ mod tests {
         ] {
             assert!(message.contains("will fail the same way"));
             assert!(message.contains("faster-whisper"));
+        }
+    }
+
+    #[test]
+    fn cpu_memory_failures_offer_system_memory_guidance_with_truthful_retention() {
+        let failure = TranscriptionFailure::of(&asr::AsrError::Worker(asr::WorkerError {
+            code: "cpu_oom".into(),
+            message: "private worker details".into(),
+        }));
+        assert_eq!(failure, TranscriptionFailure::CpuMemory);
+        for kept in [
+            None,
+            Some(storage::FailedTakeRetention::Normal),
+            Some(storage::FailedTakeRetention::Temporary),
+        ] {
+            let message = failed_take_message(kept, failure);
+            assert!(message.contains("system memory"));
+            assert!(!message.contains("GPU"));
+            assert!(!message.contains("private"));
+            assert!(crate::messages::code(message).is_some());
+            assert_eq!(
+                message.contains("24 hours"),
+                kept == Some(storage::FailedTakeRetention::Temporary)
+            );
         }
     }
 

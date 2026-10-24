@@ -242,7 +242,7 @@ def wav_duration_seconds(audio_path: Path) -> float | None:
         return None
 
 
-def map_backend_exception(exc: BaseException, operation: str, backend_label: str = "VibeVoice") -> BackendError:
+def map_backend_exception(exc: BaseException, operation: str, backend_label: str = "VibeVoice", *, device: str | None = None) -> BackendError:
     log_exception(exc, operation)
     details: list[str] = []
     current: BaseException | None = exc
@@ -254,6 +254,8 @@ def map_backend_exception(exc: BaseException, operation: str, backend_label: str
     diagnostic = "\n".join(details)
 
     if "out of memory" in diagnostic or "cuda oom" in diagnostic:
+        if device == "cpu":
+            return BackendError("cpu_oom", "Not enough system memory while operating the ASR model")
         return BackendError("gpu_oom", "GPU out of memory while operating the ASR model")
     if operation == "load":
         if any(marker in diagnostic for marker in ("rate limit", "ratelimit", "too many requests", "status code: 429")):
@@ -566,6 +568,7 @@ class FasterWhisperBackend(ProgressReporting):
         if self.device_policy not in {"auto", "cpu", "cuda"}:
             raise BackendError("invalid_device", "ASR_DEVICE must be auto, cpu, or cuda")
         self.device: str | None = None
+        self._model_source: str | None = None
 
     def load(self, quantization: str) -> None:
         if quantization not in QUANTIZATIONS:
@@ -610,6 +613,7 @@ class FasterWhisperBackend(ProgressReporting):
                 self._warm_up()
             self.device = device
             self.compute_type = compute_type
+            self._model_source = model_source
         except BackendError:
             raise
         except BaseException as exc:
@@ -662,6 +666,7 @@ class FasterWhisperBackend(ProgressReporting):
         self.model = None
         self.device = None
         self.compute_type = None
+        self._model_source = None
         gc.collect()
 
     def transcribe(
@@ -688,25 +693,81 @@ class FasterWhisperBackend(ProgressReporting):
     ) -> Iterator[dict[str, Any]]:
         """Yield segments as faster-whisper decodes them, for streaming."""
         try:
-            hotwords = prompt if prompt else None
-            raw_segments, _info = self.model.transcribe(
-                str(audio_path),
-                # Whisper accepts an ISO 639 language, not a regional BCP 47 tag.
-                language=language.split("-", 1)[0] if language else None,
-                hotwords=hotwords,
-            )
-            for segment in raw_segments:
-                yield {
-                    "start": float(segment.start),
-                    "end": float(segment.end),
-                    "speaker": None,
-                    "text": str(segment.text),
-                }
+            emitted = False
+            for attempt in range(2):
+                self.raise_if_cancelled()
+                try:
+                    raw_segments, _info = self.model.transcribe(
+                        str(audio_path),
+                        # Whisper accepts an ISO 639 language, not a regional BCP 47 tag.
+                        language=language.split("-", 1)[0] if language else None,
+                        hotwords=prompt if prompt else None,
+                    )
+                    for segment in raw_segments:
+                        self.raise_if_cancelled()
+                        value = {
+                            "start": float(segment.start),
+                            "end": float(segment.end),
+                            "speaker": None,
+                            "text": str(segment.text),
+                        }
+                        emitted = True
+                        yield value
+                    return
+                except Exception as exc:
+                    self.raise_if_cancelled()
+                    if (
+                        attempt != 0 or emitted or self.device_policy != "auto"
+                        or self.device != "cuda" or self._model_source is None
+                        or not self._is_cuda_failure(exc)
+                    ):
+                        raise
+                    # Restart only before publishing any segment: consumers must
+                    # never receive duplicated/mixed GPU and CPU output.
+                    log_exception(exc, "transcribe")
+                    self._retry_on_cpu()
         except GeneratorExit:
             # A consumer stopped reading; that is not a transcription failure.
             raise
+        except BackendError:
+            raise
         except BaseException as exc:
-            raise map_backend_exception(exc, "transcribe", "faster-whisper") from exc
+            raise map_backend_exception(exc, "transcribe", "faster-whisper", device=self.device) from exc
+
+    @staticmethod
+    def _is_cuda_failure(exc: Exception) -> bool:
+        current: BaseException | None = exc
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, BackendError):
+                return current.code == "gpu_oom"
+            diagnostic = str(current).lower()
+            if any(marker in diagnostic for marker in (
+                "cuda", "cudnn", "cublas", "curand", "nvrtc", "nvcuda", "out of memory",
+            )):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    def _retry_on_cpu(self) -> None:
+        from faster_whisper import WhisperModel
+
+        self.raise_if_cancelled()
+        previous = self.model
+        try:
+            # Reuse the exact resolved snapshot rather than resolving/downloading
+            # another model. Preserve the old model if CPU initialization fails.
+            self.model = WhisperModel(self._model_source, device="cpu", compute_type="int8")
+            self._warm_up()
+            self.raise_if_cancelled()
+        except BaseException as exc:
+            self.model = previous
+            if isinstance(exc, BackendError):
+                raise
+            raise map_backend_exception(exc, "transcribe", "faster-whisper", device="cpu") from exc
+        self.device = "cpu"
+        self.compute_type = "int8"
 
 
 class OpenAICompatibleBackend(ProgressReporting):

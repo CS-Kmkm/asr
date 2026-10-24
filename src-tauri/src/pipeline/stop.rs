@@ -236,7 +236,12 @@ impl RecordingDriver for Desktop<'_> {
                 }
                 Err(error) => {
                     let failure = TranscriptionFailure::of(&error);
-                    Err((command_error(error), failure))
+                    let message = if failure == TranscriptionFailure::CpuMemory {
+                        crate::commands::CPU_MEMORY_FAILURE.to_owned()
+                    } else {
+                        command_error(error)
+                    };
+                    Err((message, failure))
                 }
             },
         };

@@ -204,6 +204,13 @@ argument to the worker or the `ASR_WORKER_BACKEND` environment variable.
 The default backend. Runs on CPU (int8) or CUDA (int8/fp16). No NVIDIA GPU
 required. Installed by `uv sync`.
 
+デバイス選択は `ASR_DEVICE=auto|cpu|cuda`（既定は `auto`）です。`auto` は、CUDAの
+ロード・ウォームアップ失敗に加え、文字起こし開始後のCUDA例外も、内部のデコーダーが
+まだセグメントを返していなければCPU/int8で1回再試行します。キャンセル済みや、
+内部でセグメントを取得済みの要求は再試行しません。アプリには全セグメントを集約して
+から認識結果を返します。切り替え後のデバイスは Diagnostics の worker health で確認できます。
+`cuda` を明示した場合と、プロセス自体が異常終了した場合はCPU再試行の対象外です。
+
 The Whisper model is configured via `ASR_FASTER_WHISPER_MODEL` (default:
 `large-v3-turbo`). The model is downloaded from Hugging Face on first load.
 

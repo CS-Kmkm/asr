@@ -107,7 +107,15 @@ pub(crate) async fn run(
                 transcript.is_err().then_some("asr_failed"),
             );
         }
-        let transcript = transcript.map_err(command_error)?;
+        let transcript = transcript.map_err(|error| {
+            if crate::commands::TranscriptionFailure::of(&error)
+                == crate::commands::TranscriptionFailure::CpuMemory
+            {
+                crate::commands::CPU_MEMORY_FAILURE.to_owned()
+            } else {
+                command_error(error)
+            }
+        })?;
         if services.lifecycle.is_cancelled(operation_id) {
             return Err("history retry was cancelled".into());
         }
@@ -375,6 +383,12 @@ pub(crate) async fn run(
     if result.is_err() {
         let message = if services.lifecycle.is_cancelled(operation_id) {
             "History retry cancelled."
+        } else if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error == crate::commands::CPU_MEMORY_FAILURE)
+        {
+            crate::commands::CPU_MEMORY_FAILURE
         } else {
             "History retry failed."
         };

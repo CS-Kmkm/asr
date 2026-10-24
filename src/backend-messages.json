@@ -1,4 +1,7 @@
 {
+  "Not enough system memory for speech recognition. Choose a smaller model or a shorter recording.": {"code":"asr_cpu_memory_exhausted","ja":"音声認識に必要なシステムメモリが不足しています。小さいモデルか短い録音でお試しください。"},
+  "Not enough system memory for speech recognition. The recording was saved to History. Choose a smaller model before retrying.": {"code":"asr_cpu_memory_history_saved","ja":"音声認識に必要なシステムメモリが不足しています。録音は履歴に保存しました。小さいモデルを選んでから再試行してください。"},
+  "Not enough system memory for speech recognition. The recording is kept in History for 24 hours. Choose a smaller model before retrying.": {"code":"asr_cpu_memory_history_temporary","ja":"音声認識に必要なシステムメモリが不足しています。録音は履歴に24時間保持します。小さいモデルを選んでから再試行してください。"},
   "Insertion test failed. Choose an editable field in another app and try again.": {"code":"setup_insertion_test_failed","ja":"文字挿入テストに失敗しました。別アプリの編集可能な入力欄を選び、もう一度お試しください。"},
   "Dictation test completed without inserting text.": {"code":"setup_dictation_test_completed","ja":"音声認識テストが完了しました。文字挿入は行っていません。"},
   "Switch to another app within 3 seconds to test insertion.": {"code":"setup_insertion_test_waiting","ja":"3秒以内に別アプリへ切り替えて、文字挿入を試してください。"},

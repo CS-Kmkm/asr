@@ -437,5 +437,172 @@ class TranscribeWithFakeModuleTests(IsolatedWorkerTestCase):
         self.assertIsNone(backend.model)
 
 
+class InferenceFallbackTests(IsolatedWorkerTestCase):
+    def loaded(self, cuda_decode, cpu_decode=None, policy="auto"):
+        calls = []
+        initialized = []
+
+        class InferenceModel(_FakeWhisperModel):
+            def __init__(self, model_id, device, compute_type):
+                super().__init__(model_id, device, compute_type)
+                self.device = device
+                initialized.append((model_id, device, compute_type))
+
+            def transcribe(self, audio, **kwargs):
+                if not isinstance(audio, str):
+                    return super().transcribe(audio, **kwargs)
+                calls.append((self.device, audio, kwargs))
+                decode = cuda_decode if self.device == "cuda" else cpu_decode
+                if decode is None:
+                    return iter([_FakeSegment(0, 1, " CPU result")]), None
+                return decode(), None
+
+        modules = _install_fake_faster_whisper()
+        modules["faster_whisper"].WhisperModel = InferenceModel
+        modules["ctranslate2"].get_cuda_device_count = lambda: 1
+        self.enterContext(patch.dict(os.environ, {"ASR_DEVICE": policy}))
+        self.enterContext(patch.dict(sys.modules, modules))
+        resolved = self.enterContext(patch.object(FasterWhisperBackend, "_resolve_model_files", return_value="/fake/pinned-snapshot"))
+        backend = FasterWhisperBackend()
+        backend.load("8bit")
+        return backend, calls, initialized, resolved
+
+    @staticmethod
+    def cuda_failure():
+        raise RuntimeError("CUDA out of memory")
+
+    def test_caught_first_inference_failure_retries_same_input_on_cpu_once(self):
+        backend, calls, initialized, resolved = self.loaded(self.cuda_failure)
+        text, segments = backend.transcribe(Path("audio.wav"), "dictionary", "ja-JP")
+        self.assertEqual(text, "CPU result")
+        self.assertEqual(len(segments), 1)
+        self.assertEqual([call[0] for call in calls], ["cuda", "cpu"])
+        self.assertEqual(calls[0][1:], calls[1][1:])
+        self.assertEqual(initialized, [("/fake/pinned-snapshot", "cuda", "int8_float16"), ("/fake/pinned-snapshot", "cpu", "int8")])
+        resolved.assert_called_once()
+        self.assertEqual((backend.device, backend.compute_type), ("cpu", "int8"))
+        backend.transcribe(Path("next.wav"), None)
+        self.assertEqual([call[0] for call in calls], ["cuda", "cpu", "cpu"])
+
+    def test_lazy_cuda_failure_before_a_segment_also_retries(self):
+        def lazy_failure():
+            raise RuntimeError("Could not locate cudnn_ops64 DLL")
+            yield  # pragma: no cover
+        backend, calls, initialized, _ = self.loaded(lazy_failure)
+        self.assertEqual(backend.transcribe(Path("audio.wav"), None)[0], "CPU result")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(initialized), 2)
+
+    def test_failure_after_publishing_a_segment_never_mixes_in_cpu_output(self):
+        def partial_failure():
+            yield _FakeSegment(0, 1, " GPU prefix")
+            raise RuntimeError("CUDA kernel failed")
+        backend, calls, initialized, _ = self.loaded(partial_failure)
+        segments = backend.transcribe_segments(Path("audio.wav"), None)
+        self.assertEqual(next(segments)["text"], " GPU prefix")
+        with self.assertRaises(BackendError):
+            next(segments)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(initialized), 1)
+        self.assertEqual(backend.device, "cuda")
+
+    def test_explicit_cuda_and_unrelated_errors_never_fall_back(self):
+        for policy, message in [("cuda", "CUDA kernel failed"), ("auto", "invalid audio format")]:
+            with self.subTest(policy=policy, message=message):
+                def fail():
+                    raise RuntimeError(message)
+                backend, calls, initialized, _ = self.loaded(fail, policy=policy)
+                with self.assertRaises(BackendError):
+                    backend.transcribe(Path("audio.wav"), None)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(len(initialized), 1)
+
+    def test_cancelled_cuda_failure_never_initializes_cpu(self):
+        cancelled = False
+        def fail():
+            nonlocal cancelled
+            cancelled = True
+            raise RuntimeError("CUDA kernel failed")
+        backend, calls, initialized, _ = self.loaded(fail)
+        backend.cancel_requested = lambda: cancelled
+        with self.assertRaises(BackendError) as caught:
+            backend.transcribe(Path("audio.wav"), None)
+        self.assertEqual(caught.exception.code, "cancelled")
+        self.assertEqual(len(initialized), 1)
+        self.assertEqual(len(calls), 1)
+
+    def test_cpu_decode_failure_is_not_retried_again(self):
+        def cpu_failure():
+            raise RuntimeError("CPU decode failed")
+        backend, calls, initialized, _ = self.loaded(self.cuda_failure, cpu_failure)
+        with self.assertRaises(BackendError):
+            backend.transcribe(Path("audio.wav"), None)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(initialized), 2)
+        self.assertEqual(backend.device, "cpu")
+
+    def test_cpu_retry_oom_never_claims_gpu_memory_exhaustion(self):
+        def oom():
+            raise RuntimeError("out of memory")
+        backend, calls, _, _ = self.loaded(self.cuda_failure, oom)
+        with self.assertRaises(BackendError) as caught:
+            backend.transcribe(Path("audio.wav"), None)
+        self.assertEqual(caught.exception.code, "cpu_oom")
+        self.assertNotIn("GPU", caught.exception.message)
+        self.assertEqual(len(calls), 2)
+
+    def test_cpu_constructor_and_warmup_oom_restore_the_previous_model(self):
+        for phase in ["constructor", "warmup"]:
+            with self.subTest(phase=phase):
+                backend, calls, _, _ = self.loaded(self.cuda_failure)
+                previous = backend.model
+                patcher = patch("faster_whisper.WhisperModel", side_effect=RuntimeError("out of memory")) if phase == "constructor" else patch.object(backend, "_warm_up", side_effect=RuntimeError("out of memory"))
+                with patcher:
+                    with self.assertRaises(BackendError) as caught:
+                        backend.transcribe(Path("audio.wav"), None)
+                self.assertEqual(caught.exception.code, "cpu_oom")
+                self.assertIs(backend.model, previous)
+                self.assertEqual(backend.device, "cuda")
+                self.assertEqual(len(calls), 1)
+
+    def test_cancel_during_cpu_warmup_restores_previous_device_without_decoding(self):
+        backend, calls, initialized, _ = self.loaded(self.cuda_failure)
+        previous = backend.model
+        def cancel():
+            backend.cancel_requested = lambda: True
+        with patch.object(backend, "_warm_up", side_effect=cancel):
+            with self.assertRaises(BackendError) as caught:
+                backend.transcribe(Path("audio.wav"), None)
+        self.assertEqual(caught.exception.code, "cancelled")
+        self.assertIs(backend.model, previous)
+        self.assertEqual(backend.device, "cuda")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(initialized), 2)
+
+    def test_consumer_close_does_not_trigger_cpu_retry(self):
+        backend, calls, initialized, _ = self.loaded(lambda: iter([_FakeSegment(0, 1, " result")]))
+        segments = backend.transcribe_segments(Path("audio.wav"), None)
+        next(segments)
+        segments.close()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(initialized), 1)
+
+    def test_worker_health_reports_the_cpu_used_after_inference_retry(self):
+        from asr_worker.worker import Worker
+
+        backend, _, _, _ = self.loaded(self.cuda_failure)
+        worker = Worker(backend)
+        worker.loaded = True
+        with TemporaryDirectory() as tmp:
+            audio = Path(tmp) / "fake.wav"
+            audio.write_bytes(b"fake input for model stub")
+            response, _ = worker.handle({"id": 1, "command": "transcribe", "audio_path": str(audio)})
+        self.assertTrue(response["ok"])
+        health, _ = worker.handle({"id": 2, "command": "health"})
+        self.assertTrue(health["health"]["loaded"])
+        self.assertEqual(health["health"]["device"], "cpu")
+        self.assertEqual(health["health"]["computeType"], "int8")
+
+
 if __name__ == "__main__":
     unittest.main()

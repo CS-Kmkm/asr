@@ -406,7 +406,8 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
 | `unsupported_quantization` | backends.py(各バックエンドの `load` / `faster_whisper_compute_type`) | `quantization` が許容集合 `{4bit, 8bit, bf16}` 外。 |
 | `unsupported_backend` | backends.py (`create_backend`) | 未知のバックエンド名。プロセス起動時 (`main`) に発生し、終了コード2でワーカーが起動失敗する(この場合プロトコル応答ではなくstderr出力)。 |
 | `backend_unavailable` | backends.py | faster-whisper、VibeVoice、HTTP バックエンドの必要パッケージがない。 |
-| `gpu_oom` | backends.py(例外マッピング / mock) | 例外メッセージに "out of memory" または "cuda oom" を含む(load/transcribe両方で発生しうる)。 |
+| `gpu_oom` | backends.py(例外マッピング / mock) | CPU推論・CPU再試行以外の文脈でメモリ不足を捕捉した。load/transcribe両方で発生しうる。 |
+| `cpu_oom` | backends.py(CPU推論 / CPU再試行の例外マッピング) | CPUでの推論・再試行の初期化やウォームアップ中にメモリ不足を捕捉した。小さいモデルや短い録音で再試行する。 |
 | `gpu_unsupported` | backends.py (`VibeVoiceBackend.load`) | CUDA GPUが利用不可、またはモデルがCUDAに配置されなかった(CPUフォールバック無効)。 |
 | `hf_auth_required` | backends.py(例外マッピング) | Hugging Faceのgatedモデル、無効なトークン、または401/403応答によりモデルを取得できない。 |
 | `hf_repository_unavailable` | backends.py(例外マッピング) | Hugging FaceのモデルIDが存在しない、またはprivateモデルへの読取権限がない。 |
@@ -429,7 +430,7 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
 - `unsupported_backend` は起動時のバックエンド生成失敗としてのみ発生し、ワーカーは
   終了コード2で即時終了する。これはプロトコル上のレスポンスではなく、起動時の失敗である。
 - `BackendError` として送出されたコード(`unsupported_quantization`, `backend_unavailable`,
-  `gpu_oom`, `gpu_unsupported`, `hf_auth_required`, `hf_repository_unavailable`,
+  `gpu_oom`, `cpu_oom`, `gpu_unsupported`, `hf_auth_required`, `hf_repository_unavailable`,
   `hf_rate_limited`, `hf_download_failed`, `model_load_failed`, `transcription_failed`,
   `transcript_truncated`)は
   `handle` 内で捕捉され、そのコードのままレスポンスに反映される。
@@ -449,6 +450,13 @@ faster-whisperの `ASR_DEVICE=auto|cpu|cuda` は既定で `auto`。
 Python例外として失敗した場合はCPU/int8で1回再試行する。`cpu` はCUDAを照会せず、`cuda` は
 CPUへ切り替えない。ネイティブライブラリのプロセスabortはPython例外として捕捉できないため、
 実機での確認を要する。VibeVoiceにはこのCPU経路はない。通常の文字起こしのデコード設定は維持する。
+
+`auto` の文字起こし中に捕捉したCUDA/DLL・メモリ不足の例外でも、内部のセグメント
+イテレーターがまだ1つも返していなければ、同じモデルファイルと音声・辞書・言語で
+CPU/int8へ1回だけ切り替える。JSONLの応答は全セグメントを集約してから返す。
+CPUでも失敗した場合はエラーを返す。キャンセル済みの要求、CUDAと無関係なエラー、
+内部でセグメントを取得した後の失敗では再試行しない。切り替え後のdevice/compute typeはhealthで
+確認できる。推論中はload用のprogress eventを発行しない。
 
 `--serve` で非loopbackへbindする場合は `ASR_SERVE_API_KEY` を必須とする。
 Hostはloopback名・bind先・`ASR_SERVE_ALLOWED_HOSTS` の明示的な追加名に限り、Originがある場合は
