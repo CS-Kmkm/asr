@@ -36,8 +36,13 @@ pub(crate) async fn finish(
         mut artifact_cleanup,
         started,
         correction_cancel,
+        app_context,
         ..
     } = take;
+    let metrics = storage.metrics_for(
+        crate::state::PipelineMode::Edit,
+        crate::app_context::history_category(app_context.as_ref()),
+    );
     let duration_ms = artifact.duration.as_millis() as u64;
     let session = edit_session.take().ok_or("edit session is unavailable")?;
     let instruction_text = transcript.text.clone();
@@ -74,8 +79,8 @@ pub(crate) async fn finish(
             return Err("editing was cancelled".into());
         }
         Err(error) => {
-            let _ = storage.add_metric(
-                "speak_to_edit",
+            let _ = metrics.add_metric(
+                "edit_generation",
                 Some(settings.correction_provider.as_str()),
                 Some(edit_started.elapsed().as_millis() as i64),
                 false,
@@ -89,6 +94,13 @@ pub(crate) async fn finish(
             ));
         }
     };
+    let _ = metrics.add_metric(
+        "edit_generation",
+        Some(&settings.correction_provider),
+        Some(edit_started.elapsed().as_millis() as i64),
+        true,
+        None,
+    );
     emit_correction_preview(app, &edited, "final");
     if services.lifecycle.is_cancelled(operation_id) {
         emit_state(app, state, AppPhase::Idle, "Editing cancelled.");
@@ -167,7 +179,7 @@ pub(crate) async fn finish(
             asr_provider: &transcript.model,
             llm_provider: Some(settings.correction_provider.as_str()),
             target_language: None,
-            app_category: None,
+            app_category: crate::app_context::history_category(app_context.as_ref()),
             duration_ms: Some(duration_ms as i64),
             latency_ms: Some(latency_ms as i64),
             retry_of_id: None,

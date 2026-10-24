@@ -7,9 +7,9 @@ import type { AppState, StorageDiagnostics } from "../types";
 
 vi.mock("../api", () => ({ copyToClipboard: vi.fn(), getStorageDiagnostics: vi.fn(), getWorkerHealth: vi.fn() }));
 const report: StorageDiagnostics = {
-  databaseOk: true, schemaVersion: 2,
-  summaries: [{ eventType: "asr", provider: "cpu", count: 22, successes: 20, timedCount: 20, p50Ms: 10, p95Ms: 19 }],
-  outcomes: [{ eventType: "asr", provider: "cpu", success: false, code: "asr_failed", count: 2 }],
+  databaseOk: true, schemaVersion: 3,
+  summaries: [{ eventType: "asr", provider: "faster-whisper", mode: "dictate", appCategory: "email", count: 22, successes: 20, timedCount: 20, p50Ms: 10, p95Ms: 19 }],
+  outcomes: [{ eventType: "asr", provider: "faster-whisper", mode: "dictate", appCategory: "email", success: false, code: "asr_failed", count: 2 }],
 };
 const state: AppState = { phase: "idle", stage: "idle", operation: null, operationId: null, message: null, messageCode: null, lastResult: "private transcript sentinel", updatedAt: new Date().toISOString() };
 function show() {
@@ -20,9 +20,11 @@ beforeEach(() => { vi.mocked(getStorageDiagnostics).mockReset(); vi.mocked(copyT
 test("real diagnostics display aggregates and copy excludes dictated text", async () => {
   vi.mocked(getStorageDiagnostics).mockResolvedValue(report);
   show();
-  const table = await screen.findByRole("table", { name: "イベント・プロバイダー別の処理時間" });
+  const table = await screen.findByRole("table", { name: "モード・アプリカテゴリ・プロバイダー別の性能" });
   expect(within(table).getByText("19")).toBeTruthy();
-  expect(screen.getByText("スキーマのバージョン: 2")).toBeTruthy();
+  expect(screen.getByText("スキーマのバージョン: 3")).toBeTruthy();
+  expect(within(table).getByText("dictate")).toBeTruthy();
+  expect(within(table).getByText("email")).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "診断結果をコピー" }));
   await screen.findByText("診断結果をコピーしました");
   expect(copyToClipboard).toHaveBeenCalledWith(JSON.stringify({ storage: report, gpu: null, worker: null }, null, 2));
@@ -33,7 +35,7 @@ test("worker probe is explicit and copied metadata excludes the interpreter path
   vi.mocked(getStorageDiagnostics).mockResolvedValue(report);
   vi.mocked(getWorkerHealth).mockResolvedValue({ pythonPath: "C:/Users/private-sentinel/python.exe", pythonVersion: "3.12", fasterWhisperVersion: "1.2", ctranslate2Version: "4.6", backend: "faster-whisper", loaded: true, device: "cpu", computeType: "int8" });
   show();
-  await screen.findByRole("table", { name: "イベント・プロバイダー別の処理時間" });
+  await screen.findByRole("table", { name: "モード・アプリカテゴリ・プロバイダー別の性能" });
   expect(getWorkerHealth).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole("button", { name: "ワーカー環境を検査" }));
   await screen.findByText("int8");
@@ -49,7 +51,7 @@ test("worker probe is explicit and copied metadata excludes the interpreter path
 test("failed refresh removes stale data and disables copy", async () => {
   vi.mocked(getStorageDiagnostics).mockResolvedValueOnce(report).mockRejectedValueOnce(new Error("private error"));
   show();
-  await screen.findByRole("table", { name: "イベント・プロバイダー別の処理時間" });
+  await screen.findByRole("table", { name: "モード・アプリカテゴリ・プロバイダー別の性能" });
   fireEvent.click(screen.getByRole("button", { name: "データベースを検査" }));
   await screen.findByText("データベースの検査に失敗");
   expect(screen.queryByRole("table")).toBeNull();

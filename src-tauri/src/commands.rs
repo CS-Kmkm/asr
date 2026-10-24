@@ -240,6 +240,7 @@ pub(crate) fn persist_edit_completion(
     let history_status = save_history(storage, item, audio_path);
     let insertion_failed = item.insertion_result == Some("insertion_failed");
     let metric_failed = storage
+        .metrics_for(PipelineMode::Edit, item.app_category)
         .add_metric(
             "speak_to_edit",
             Some(provider),
@@ -248,7 +249,18 @@ pub(crate) fn persist_edit_completion(
             insertion_failed.then_some("insertion_failed"),
         )
         .is_err();
-    (history_status, metric_failed)
+    let insertion_metric_failed = storage
+        .metrics_for(PipelineMode::Edit, item.app_category)
+        .add_metric(
+            "insertion",
+            Some("speak_to_edit"),
+            Some(elapsed_ms),
+            item.insertion_result == Some("clipboard_paste"),
+            item.insertion_result
+                .filter(|result| *result != "clipboard_paste"),
+        )
+        .is_err();
+    (history_status, metric_failed || insertion_metric_failed)
 }
 
 /// This warning follows, and visually replaces, the completion notice. Only a
@@ -913,16 +925,16 @@ async fn start_owned_recording(
     // keeps the foreground anchor instead of moving to the primary monitor.
     // A start from this app has no window handle to anchor to, so it keeps
     // the foreground anchor (the app window) too.
-    if let Some(target) = target
-        .as_ref()
-        .filter(|target| !target.is_this_app())
-        .or_else(|| {
-            edit_session
-                .as_ref()
-                .map(|session| session.selection.target())
-        })
-        .or(ask_target)
-    {
+    let context_target = app_context::recording_target(
+        mode,
+        target.as_ref(),
+        edit_session
+            .as_ref()
+            .map(|session| session.selection.target()),
+        ask_target,
+    );
+    let app_context = context_target.and_then(app_context::from_target);
+    if let Some(target) = context_target.filter(|target| !target.is_this_app()) {
         recording_overlay::set_anchor(target.window_handle);
     }
     let preparing = services
@@ -948,9 +960,6 @@ async fn start_owned_recording(
         emit_state(&app, &state, AppPhase::Idle, cancel_message);
         return Err(cancel_error.into());
     }
-    // Edit and Ask capture a selection instead of a target window, so their
-    // ASR hints use global dictionary entries only; they apply no style profile.
-    let app_context = target.as_ref().and_then(app_context::from_target);
     let mut live_slot = services.live.lock().await;
     let mut edit_slot = services.edit.lock().await;
     let mut ask_slot = services.ask.lock().await;
@@ -1012,7 +1021,10 @@ async fn start_owned_recording(
         }
     }
     let prompt = storage
-        .dictionary_asr_prompt_for(app_context.as_ref(), &settings.asr_backend)
+        .dictionary_asr_prompt_for(
+            app_context::asr_prompt_context(mode, app_context.as_ref()),
+            &settings.asr_backend,
+        )
         .unwrap_or_default();
     let capture_config = capture_config(&settings);
     let mut test = services.microphone_test.lock().await;
@@ -1629,7 +1641,7 @@ pub(crate) async fn translate_selection(app: AppHandle) {
         |phase, message| emit_state(&app, &state, phase, message),
     );
     let started = Instant::now();
-    let mut provider = None;
+    let mut metric_context = SelectedTextMetricContext::default();
     let end = run_selected_text_translation(
         &app,
         &services,
@@ -1638,17 +1650,22 @@ pub(crate) async fn translate_selection(app: AppHandle) {
         operation_id,
         cancel,
         started,
-        &mut provider,
+        &mut metric_context,
     )
     .await;
     if let Some((success, error_code)) = selected_text_metric(end) {
-        let _ = storage.add_metric(
-            SELECTED_TEXT_METRIC,
-            provider.as_deref(),
-            Some(started.elapsed().as_millis() as i64),
-            success,
-            error_code,
-        );
+        let _ = storage
+            .metrics_for(
+                PipelineMode::SelectedText,
+                metric_context.app_category.as_deref(),
+            )
+            .add_metric(
+                SELECTED_TEXT_METRIC,
+                metric_context.provider.as_deref(),
+                Some(started.elapsed().as_millis() as i64),
+                success,
+                error_code,
+            );
     }
     // A delivered translation already published its outcome.
     if !matches!(end, SelectedTextEnd::Delivered(_)) {
@@ -1659,6 +1676,12 @@ pub(crate) async fn translate_selection(app: AppHandle) {
 
 /// The owned part of `translate_selection`. The caller publishes every end
 /// except a delivered translation, which publishes its own outcome.
+#[derive(Default)]
+struct SelectedTextMetricContext {
+    provider: Option<String>,
+    app_category: Option<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_selected_text_translation(
     app: &AppHandle,
@@ -1668,12 +1691,12 @@ async fn run_selected_text_translation(
     operation_id: u64,
     cancel: tokio::sync::watch::Receiver<bool>,
     started: Instant,
-    provider: &mut Option<String>,
+    metric_context: &mut SelectedTextMetricContext,
 ) -> SelectedTextEnd {
     let Ok(settings) = storage.get_settings() else {
         return SelectedTextEnd::Failed(SelectedTextFailure::SettingsUnavailable);
     };
-    *provider = Some(settings.correction_provider.clone());
+    metric_context.provider = Some(settings.correction_provider.clone());
     if crate::privacy::check_text(&settings).is_err() {
         return SelectedTextEnd::Failed(SelectedTextFailure::ConsentRequired);
     }
@@ -1695,6 +1718,7 @@ async fn run_selected_text_translation(
     recording_overlay::set_anchor(selection.target().window_handle);
     let source = selection.text().to_owned();
     let app_context = app_context::from_target(selection.target());
+    metric_context.app_category = app_context.as_ref().map(|context| context.category.clone());
     let _ = app.emit(
         "voice-mode",
         serde_json::json!({

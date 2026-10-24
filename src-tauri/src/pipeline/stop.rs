@@ -189,8 +189,15 @@ impl RecordingDriver for Desktop<'_> {
             .map_err(|_| "target service is unavailable".to_string())?
             .clone();
         let prompt = storage
-            .dictionary_asr_prompt_for(app_context.as_ref(), &settings.asr_backend)
+            .dictionary_asr_prompt_for(
+                crate::app_context::asr_prompt_context(mode, app_context.as_ref()),
+                &settings.asr_backend,
+            )
             .unwrap_or_default();
+        let metrics = storage.metrics_for(
+            mode,
+            crate::app_context::history_category(app_context.as_ref()),
+        );
         let correction_cancel = cancel.clone();
         // Defense in depth: model changes are refused while a recording is
         // active, but if the model is not marked ready (for example its load
@@ -202,6 +209,8 @@ impl RecordingDriver for Desktop<'_> {
             emit_state(app, state, AppPhase::Idle, cancel_message);
             return Err(cancel_error.into());
         }
+        let asr_started = Instant::now();
+        let model_was_ready = model_ready.is_ok();
         let transcript_result = match model_ready {
             Err(error) => Err((error, TranscriptionFailure::Retryable)),
             Ok(_) => match services
@@ -229,10 +238,10 @@ impl RecordingDriver for Desktop<'_> {
         let transcript = match transcript_result {
             Ok(value) => value,
             Err((error, failure)) => {
-                let _ = storage.add_metric(
+                let _ = metrics.add_metric(
                     "asr",
                     Some(settings.asr_backend.as_str()),
-                    None,
+                    model_was_ready.then(|| asr_started.elapsed().as_millis() as i64),
                     false,
                     Some("asr_failed"),
                 );
@@ -273,7 +282,13 @@ impl RecordingDriver for Desktop<'_> {
             emit_state(app, state, AppPhase::Idle, cancel_message);
             return Err(cancel_error.into());
         }
-
+        let _ = metrics.add_metric(
+            "asr",
+            Some(&settings.asr_backend),
+            Some(asr_started.elapsed().as_millis() as i64),
+            true,
+            None,
+        );
         services
             .target
             .lock()

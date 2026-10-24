@@ -81,9 +81,14 @@ pub(crate) async fn run(
         // History keeps only the captured category, so Retry routes to
         // category-scoped and global dictionary entries and profiles.
         let retry_context = retry_app_context(&source);
+        let metrics = storage.metrics_for(mode, source.app_category.as_deref());
         let prompt = storage
-            .dictionary_asr_prompt_for(retry_context.as_ref(), &settings.asr_backend)
+            .dictionary_asr_prompt_for(
+                crate::app_context::asr_prompt_context(mode, retry_context.as_ref()),
+                &settings.asr_backend,
+            )
             .unwrap_or_default();
+        let asr_started = Instant::now();
         let transcript = services
             .transcriber
             .transcribe_with_locale(
@@ -92,8 +97,17 @@ pub(crate) async fn run(
                 settings.speech_locale.as_deref(),
                 cancel.clone(),
             )
-            .await
-            .map_err(command_error)?;
+            .await;
+        if !matches!(transcript, Err(crate::asr::AsrError::Cancelled)) {
+            let _ = metrics.add_metric(
+                "asr",
+                Some(&settings.asr_backend),
+                Some(asr_started.elapsed().as_millis() as i64),
+                transcript.is_ok(),
+                transcript.is_err().then_some("asr_failed"),
+            );
+        }
+        let transcript = transcript.map_err(command_error)?;
         if services.lifecycle.is_cancelled(operation_id) {
             return Err("history retry was cancelled".into());
         }
@@ -124,7 +138,7 @@ pub(crate) async fn run(
                 AiStageResult::Corrected(translated) => {
                     output = translated;
                     llm_provider = Some(settings.correction_provider.as_str());
-                    let _ = storage.add_metric(
+                    let _ = metrics.add_metric(
                         "voice_translation",
                         llm_provider,
                         Some(translation_started.elapsed().as_millis() as i64),
@@ -141,7 +155,7 @@ pub(crate) async fn run(
                         FailureOutcome::UsingTranscript,
                         &correction::failure_message(&error, FailureOutcome::UsingTranscript),
                     );
-                    let _ = storage.add_metric(
+                    let _ = metrics.add_metric(
                         "voice_translation",
                         Some(settings.correction_provider.as_str()),
                         Some(translation_started.elapsed().as_millis() as i64),
@@ -247,7 +261,7 @@ pub(crate) async fn run(
                         FailureOutcome::UsingTranscript,
                         &correction_failure_status(&error),
                     );
-                    let _ = storage.add_metric(
+                    let _ = metrics.add_metric(
                         "text_correction",
                         Some(settings.correction_provider.as_str()),
                         Some(correction_started.elapsed().as_millis() as i64),

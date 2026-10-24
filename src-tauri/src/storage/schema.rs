@@ -32,7 +32,21 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         apply: migrate_v2_settings_backups,
         min_reader_version: 1,
     },
+    Migration {
+        apply: migrate_v3_metric_context,
+        min_reader_version: 1,
+    },
 ];
+
+fn migrate_v3_metric_context(connection: &Connection) -> Result<(), StorageError> {
+    if !column_exists(connection, "metrics", "mode")? {
+        connection.execute("ALTER TABLE metrics ADD COLUMN mode TEXT", [])?;
+    }
+    if !column_exists(connection, "metrics", "app_category")? {
+        connection.execute("ALTER TABLE metrics ADD COLUMN app_category TEXT", [])?;
+    }
+    Ok(())
+}
 
 /// Key in `schema_meta` holding the highest `min_reader_version` of every
 /// applied step.

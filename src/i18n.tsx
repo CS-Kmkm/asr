@@ -23,6 +23,8 @@ const backendTemplates = Object.entries(backendCatalogue).filter(([, entry]) => 
 });
 
 const en = {
+  "Performance by mode, category and provider": "Performance by mode, category and provider",
+  "Mode": "Mode",
   "Reprocessed result": "Reprocessed result",
   "Copy result": "Copy result",
   "Dismiss result": "Dismiss result",
@@ -334,6 +336,8 @@ const en = {
 } as const;
 export type MessageKey = keyof typeof en | keyof typeof backendMessages;
 const ja: Record<keyof typeof en, string> = {
+  "Performance by mode, category and provider": "モード・アプリカテゴリ・プロバイダー別の性能",
+  "Mode": "モード",
   "Reprocessed result": "再処理の結果",
   "Copy result": "結果をコピー",
   "Dismiss result": "結果を閉じる",

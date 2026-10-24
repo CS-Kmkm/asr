@@ -42,6 +42,7 @@ pub(crate) async fn finish(
         translation_target,
         mut draft,
     } = take;
+    let metrics = storage.metrics_for(mode, app_context::history_category(app_context.as_ref()));
     let duration_ms = artifact.duration.as_millis() as u64;
     let (cancel_message, cancel_error) = cancellation_copy(mode);
     let mut draft = draft
@@ -127,7 +128,7 @@ pub(crate) async fn finish(
                 // the completed translation.
                 let _ = app.emit("app-state", state.publish_result(final_text.clone()));
                 emit_correction_preview(app, &final_text, "final");
-                let _ = storage.add_metric(
+                let _ = metrics.add_metric(
                     "voice_translation",
                     Some(settings.correction_provider.as_str()),
                     Some(translation_started.elapsed().as_millis() as i64),
@@ -142,7 +143,7 @@ pub(crate) async fn finish(
             AiStageResult::Fallback(error) => {
                 translation_failed = true;
                 emit_correction_preview(app, &transcript.text, "fallback");
-                let _ = storage.add_metric(
+                let _ = metrics.add_metric(
                     "voice_translation",
                     Some(settings.correction_provider.as_str()),
                     Some(translation_started.elapsed().as_millis() as i64),
@@ -197,7 +198,7 @@ pub(crate) async fn finish(
                 emit_correction_preview(app, &final_text, "final");
                 processed_text = Some(final_text.clone());
                 llm_provider = Some(settings.correction_provider.clone());
-                let _ = storage.add_metric(
+                let _ = metrics.add_metric(
                     "text_correction",
                     Some(settings.correction_provider.as_str()),
                     Some(correction_started.elapsed().as_millis() as i64),
@@ -213,7 +214,7 @@ pub(crate) async fn finish(
                 correction_failed = true;
                 correction_output_limit = output_limit_inserted_message(&error);
                 emit_correction_preview(app, &transcript.text, "fallback");
-                let _ = storage.add_metric(
+                let _ = metrics.add_metric(
                     "text_correction",
                     Some(settings.correction_provider.as_str()),
                     Some(correction_started.elapsed().as_millis() as i64),
@@ -361,7 +362,7 @@ pub(crate) async fn finish(
     } else {
         "dictation"
     };
-    let metric_result = storage.add_metric(
+    let metric_result = metrics.add_metric(
         mode_metric,
         Some(&settings.asr_backend),
         Some(latency_ms as i64),
@@ -374,7 +375,7 @@ pub(crate) async fn finish(
         || insertion_label.to_owned(),
         |detail| format!("{insertion_label}:{detail}"),
     );
-    let insertion_metric = storage.add_metric(
+    let insertion_metric = metrics.add_metric(
         "insertion",
         Some(mode_metric),
         Some(latency_ms as i64),

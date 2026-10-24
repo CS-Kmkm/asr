@@ -1,5 +1,32 @@
 use crate::{injection::TargetWindow, types::AppContext};
 
+pub(crate) fn recording_target<'a>(
+    mode: crate::state::PipelineMode,
+    dictate: Option<&'a TargetWindow>,
+    edit: Option<&'a TargetWindow>,
+    ask: Option<&'a TargetWindow>,
+) -> Option<&'a TargetWindow> {
+    match mode {
+        crate::state::PipelineMode::Dictate | crate::state::PipelineMode::Translate => dictate,
+        crate::state::PipelineMode::Edit => edit,
+        crate::state::PipelineMode::Ask => ask,
+        crate::state::PipelineMode::SelectedText => None,
+    }
+}
+
+/// Metric context does not implicitly opt Edit/Ask into scoped ASR hints.
+pub(crate) fn asr_prompt_context(
+    mode: crate::state::PipelineMode,
+    context: Option<&AppContext>,
+) -> Option<&AppContext> {
+    matches!(
+        mode,
+        crate::state::PipelineMode::Dictate | crate::state::PipelineMode::Translate
+    )
+    .then_some(context)
+    .flatten()
+}
+
 pub(crate) fn normalize_executable_stem(path: &str) -> Option<String> {
     let basename = path.rsplit(['\\', '/']).next()?;
     let lowered = basename.to_ascii_lowercase();
@@ -88,6 +115,41 @@ pub(crate) fn history_category(context: Option<&AppContext>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn edit_and_ask_context_uses_the_session_target_without_a_dictation_target() {
+        use crate::state::PipelineMode;
+        let edit = TargetWindow {
+            window_handle: 1,
+            control_handle: 1,
+            process_id: 1,
+            thread_id: 1,
+            is_secure: false,
+        };
+        let ask = TargetWindow {
+            window_handle: 2,
+            ..edit.clone()
+        };
+        assert_eq!(
+            recording_target(PipelineMode::Edit, None, Some(&edit), None)
+                .map(|target| target.window_handle),
+            Some(1)
+        );
+        assert_eq!(
+            recording_target(PipelineMode::Ask, None, None, Some(&ask))
+                .map(|target| target.window_handle),
+            Some(2)
+        );
+        assert!(recording_target(PipelineMode::Ask, Some(&edit), Some(&edit), None).is_none());
+        let context = from_executable_path(Some("outlook.exe")).unwrap();
+        assert!(asr_prompt_context(PipelineMode::Edit, Some(&context)).is_none());
+        assert!(asr_prompt_context(PipelineMode::Ask, Some(&context)).is_none());
+        assert_eq!(
+            asr_prompt_context(PipelineMode::Dictate, Some(&context))
+                .unwrap()
+                .category,
+            "email"
+        );
+    }
     #[test]
     fn normalizes_stem_without_exposing_path() {
         assert_eq!(

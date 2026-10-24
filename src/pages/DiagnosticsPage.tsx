@@ -104,17 +104,17 @@ export function DiagnosticsPage({
       <p>{t("Custom model identifiers are grouped as other to exclude local paths from diagnostics.")}</p>
       {!report ? <p>{t("Not checked")}</p> : !report.summaries.length ? <p>{t("No retained metrics")}</p> : <>
         <table>
-          <caption>{t("Performance by event and provider")}</caption>
-          <thead><tr>{(["Event", "Provider", "Samples", "Successes", "Timed samples", "p50 (ms)", "p95 (ms)"] as const).map((label) => <th scope="col" key={label}>{t(label)}</th>)}</tr></thead>
-          <tbody>{report.summaries.map((row) => <tr key={JSON.stringify([row.eventType, row.provider])}>
-            <th scope="row">{row.eventType}</th><td>{row.provider ?? "—"}</td><td>{row.count}</td><td>{row.successes}</td><td>{row.timedCount}</td><td>{row.p50Ms ?? "—"}</td><td>{row.p95Ms ?? "—"}</td>
+          <caption>{t("Performance by mode, category and provider")}</caption>
+          <thead><tr>{(["Event", "Mode", "App category", "Provider", "Samples", "Successes", "Timed samples", "p50 (ms)", "p95 (ms)"] as const).map((label) => <th scope="col" key={label}>{t(label)}</th>)}</tr></thead>
+          <tbody>{report.summaries.map((row) => <tr key={JSON.stringify([row.eventType, row.mode, row.appCategory, row.provider])}>
+            <th scope="row">{row.eventType}</th><td>{row.mode ?? "—"}</td><td>{row.appCategory ?? "—"}</td><td>{row.provider ?? "—"}</td><td>{row.count}</td><td>{row.successes}</td><td>{row.timedCount}</td><td>{row.p50Ms ?? "—"}</td><td>{row.p95Ms ?? "—"}</td>
           </tr>)}</tbody>
         </table>
         <table>
           <caption>{t("Outcome codes")}</caption>
-          <thead><tr>{(["Event", "Provider", "Outcome", "Code", "Samples"] as const).map((label) => <th scope="col" key={label}>{t(label)}</th>)}</tr></thead>
-          <tbody>{report.outcomes.map((row) => <tr key={JSON.stringify([row.eventType, row.provider, row.success, row.code])}>
-            <th scope="row">{row.eventType}</th><td>{row.provider ?? "—"}</td><td>{t(row.success ? "Success" : "Failure")}</td><td>{row.code ?? "—"}</td><td>{row.count}</td>
+          <thead><tr>{(["Event", "Mode", "App category", "Provider", "Outcome", "Code", "Samples"] as const).map((label) => <th scope="col" key={label}>{t(label)}</th>)}</tr></thead>
+          <tbody>{report.outcomes.map((row) => <tr key={JSON.stringify([row.eventType, row.mode, row.appCategory, row.provider, row.success, row.code])}>
+            <th scope="row">{row.eventType}</th><td>{row.mode ?? "—"}</td><td>{row.appCategory ?? "—"}</td><td>{row.provider ?? "—"}</td><td>{t(row.success ? "Success" : "Failure")}</td><td>{row.code ?? "—"}</td><td>{row.count}</td>
           </tr>)}</tbody>
         </table>
       </>}

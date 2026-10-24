@@ -154,6 +154,7 @@ pub(crate) async fn run(
     if services.lifecycle.is_cancelled(operation_id) {
         return Err("History retry cancelled.".into());
     }
+    let ai_started = Instant::now();
     let result = match &prepared.action {
         Action::Correct { .. } => {
             emit_stage(
@@ -211,6 +212,7 @@ pub(crate) async fn run(
             )
         }
     };
+    let ai_ms = ai_started.elapsed().as_millis() as i64;
     let latency = started.elapsed().as_millis() as i64;
     let commit_app = app.clone();
     let output = text.clone();
@@ -220,7 +222,7 @@ pub(crate) async fn run(
         services
             .lifecycle
             .commit_side_effect(operation_id, || {
-                save(&storage, &prepared, &output, failure, latency)
+                save(&storage, &prepared, &output, failure, latency, ai_ms)
             })
             .map_err(str::to_owned)?
     })
@@ -248,6 +250,7 @@ fn save(
     output: &str,
     failure: Option<&str>,
     latency: i64,
+    ai_ms: i64,
 ) -> Result<super::finish::HistorySaveStatus, String> {
     let target = match &prepared.action {
         Action::Translate { target } => Some(target.as_str()),
@@ -291,13 +294,18 @@ fn save(
         Ok(Some(_)) => super::finish::HistorySaveStatus::Complete,
         Err(_) => super::finish::HistorySaveStatus::Failed,
     };
-    let _ = storage.add_metric(
-        event,
-        Some(&prepared.settings.correction_provider),
-        Some(latency),
-        failure.is_none(),
-        failure,
-    );
+    let _ = storage
+        .metrics_for(
+            prepared.action.mode(),
+            prepared.source.app_category.as_deref(),
+        )
+        .add_metric(
+            event,
+            Some(&prepared.settings.correction_provider),
+            Some(ai_ms),
+            failure.is_none(),
+            failure,
+        );
     Ok(status)
 }
 
@@ -357,7 +365,7 @@ mod tests {
         assert_eq!(prepared.source.transcript_text, "raw transcript");
         assert!(!prepared.source.has_audio);
         assert_eq!(
-            save(&storage, &prepared, "翻訳結果", None, 42).unwrap(),
+            save(&storage, &prepared, "翻訳結果", None, 42, 40).unwrap(),
             super::super::finish::HistorySaveStatus::Complete
         );
         let rows = storage.list_history(HistoryFilter::All, 10).unwrap();
@@ -452,7 +460,7 @@ mod tests {
         let (storage, id) = fixture();
         let prepared = prepare(&storage, id, Action::Correct { profile: None }).unwrap();
         storage.delete_all_history().unwrap();
-        assert!(save(&storage, &prepared, "new result", None, 1).is_err());
+        assert!(save(&storage, &prepared, "new result", None, 1, 1).is_err());
         assert!(storage
             .list_history(HistoryFilter::All, 10)
             .unwrap()
@@ -474,7 +482,7 @@ mod tests {
             .unwrap();
         let status = lifecycle
             .commit_side_effect(operation, || {
-                save(&storage, &prepared, "generated answer", None, 1)
+                save(&storage, &prepared, "generated answer", None, 1, 1)
             })
             .unwrap()
             .unwrap();
@@ -500,6 +508,7 @@ mod tests {
                 &prepared,
                 "cancelled output",
                 None,
+                1,
                 1
             ))
             .is_err());
@@ -512,6 +521,7 @@ mod tests {
             &prepared,
             &prepared.source.transcript_text,
             Some("ai_unreachable"),
+            1,
             1,
         )
         .unwrap();

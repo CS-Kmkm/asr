@@ -474,9 +474,11 @@ Full usage and Phase 0 gate criteria are documented in
   入力先への挿入は行いません。結果は履歴の保持設定に従って別の行に保存され、元の行は変更しません。
   結果は検索・絞り込みにかかわらず表示され、コピーできます。クラウドAIへの送信にはPrivacyでの同意も必要です。
   処理中に削除・期限切れになった元履歴は再保存しません。
-- Usage metrics (event type, provider, duration, success, and error code; no
-  text) follow History: they are not recorded while History is off, are
+- Usage metrics (event type, mode, coarse app category, provider, duration,
+  success, and error code; no text) follow History: they are not recorded while History is off, are
   deleted with the History retention window, and are removed by Delete all.
+  Diagnostics groups new performance and outcome records by mode, category,
+  event and provider; older records without context keep an unknown group.
 - New SQLite deletions overwrite freed record content using secure-delete.
   History deletions request a WAL checkpoint/truncation; an active external reader or
   database error can defer this until the next policy pass. Previously freed

@@ -200,6 +200,8 @@ export interface StorageDiagnostics {
   summaries: {
     eventType: string;
     provider: string | null;
+    mode: string | null;
+    appCategory: string | null;
     count: number;
     successes: number;
     timedCount: number;
@@ -209,6 +211,8 @@ export interface StorageDiagnostics {
   outcomes: {
     eventType: string;
     provider: string | null;
+    mode: string | null;
+    appCategory: string | null;
     success: boolean;
     code: string | null;
     count: number;

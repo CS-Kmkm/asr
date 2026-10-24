@@ -35,6 +35,8 @@ pub(crate) async fn finish(
         mut artifact_cleanup,
         started,
         mode,
+        settings,
+        app_context,
         ..
     } = take;
     let duration_ms = artifact.duration.as_millis() as u64;
@@ -54,6 +56,37 @@ pub(crate) async fn finish(
         Some(&artifact.path),
     )
     .await;
+    if !services.lifecycle.is_cancelled(operation_id) {
+        let metrics = context.storage.metrics_for(
+            mode,
+            crate::app_context::history_category(app_context.as_ref()),
+        );
+        let elapsed = result.as_ref().map_or_else(
+            |_| started.elapsed().as_millis() as i64,
+            |result| result.latency_ms as i64,
+        );
+        let _ = metrics.add_metric(
+            "ask",
+            Some(&settings.asr_backend),
+            Some(elapsed),
+            result.is_ok(),
+            result.is_err().then_some("ask_failed"),
+        );
+        if let Ok(result) = &result {
+            let inserted = matches!(result.insertion.as_str(), "selection" | "caret");
+            let _ = metrics.add_metric(
+                if matches!(result.insertion.as_str(), "panel" | "search") {
+                    "ask_delivery"
+                } else {
+                    "insertion"
+                },
+                Some("ask"),
+                Some(elapsed),
+                inserted || matches!(result.insertion.as_str(), "panel" | "search"),
+                (!inserted).then_some(result.insertion.as_str()),
+            );
+        }
+    }
     if result.is_ok() {
         recording_overlay::set_phase(app, &AppPhase::Completed);
     }
@@ -93,6 +126,15 @@ async fn finish_ask(
     }
     require_ask_spoken_input(spoken)?;
     let settings = storage.get_settings().map_err(command_error)?;
+    let app_context = services
+        .app_context
+        .lock()
+        .map_err(|_| "target service is unavailable".to_owned())?
+        .clone();
+    let metrics = storage.metrics_for(
+        crate::state::PipelineMode::Ask,
+        crate::app_context::history_category(app_context.as_ref()),
+    );
     emit_stage(
         app,
         state,
@@ -100,6 +142,7 @@ async fn finish_ask(
         "Choosing a safe Ask action.",
     );
     // Planning receives spoken text and context only. It never receives source.
+    let plan_started = Instant::now();
     let plan = correction::generate_ask_plan(
         &settings,
         spoken,
@@ -109,8 +152,17 @@ async fn finish_ask(
             .cancellation(operation_id)
             .map_err(command_error)?,
     )
-    .await
-    .map_err(|error| ai_command_error(app, &error, FailureOutcome::NoAction))?;
+    .await;
+    if !matches!(plan, Err(correction::CorrectionError::Cancelled)) {
+        let _ = metrics.add_metric(
+            "ask_plan",
+            Some(&settings.correction_provider),
+            Some(plan_started.elapsed().as_millis() as i64),
+            plan.is_ok(),
+            plan.as_ref().err().map(|error| error.failure_code()),
+        );
+    }
+    let plan = plan.map_err(|error| ai_command_error(app, &error, FailureOutcome::NoAction))?;
     if services.lifecycle.is_cancelled(operation_id) {
         return Err("ask was cancelled".into());
     }
@@ -209,6 +261,7 @@ async fn finish_ask(
         });
     }
     let input = ask::generation_input(session.selected_source(), spoken);
+    let generation_started = Instant::now();
     let output = correction::generate_ask_text(
         &settings,
         &input,
@@ -218,8 +271,17 @@ async fn finish_ask(
             .cancellation(operation_id)
             .map_err(command_error)?,
     )
-    .await
-    .map_err(|error| ai_command_error(app, &error, FailureOutcome::NoAction))?;
+    .await;
+    if !matches!(output, Err(correction::CorrectionError::Cancelled)) {
+        let _ = metrics.add_metric(
+            "ask_generation",
+            Some(&settings.correction_provider),
+            Some(generation_started.elapsed().as_millis() as i64),
+            output.is_ok(),
+            output.as_ref().err().map(|error| error.failure_code()),
+        );
+    }
+    let output = output.map_err(|error| ai_command_error(app, &error, FailureOutcome::NoAction))?;
     if services.lifecycle.is_cancelled(operation_id) {
         return Err("ask was cancelled".into());
     }

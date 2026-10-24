@@ -3,7 +3,7 @@ mod history_audio;
 mod metrics;
 mod schema;
 use history_audio::queue_audio_deletion;
-pub use metrics::StorageDiagnostics;
+pub use metrics::{MetricContext, StorageDiagnostics};
 use schema::{run_migrations, MIGRATIONS};
 #[cfg(test)]
 use schema::{stored_min_reader_version, Migration, MIN_READER_VERSION_KEY};
@@ -1983,6 +1983,7 @@ impl Storage {
 
     /// Records one usage metric. Metrics follow the History retention, so
     /// nothing is written while History is off.
+    #[cfg(test)]
     pub fn add_metric(
         &self,
         event_type: &str,
@@ -1991,20 +1992,34 @@ impl Storage {
         success: bool,
         error_code: Option<&str>,
     ) -> Result<(), StorageError> {
+        self.add_metric_in_context(event_type, provider, duration_ms, success, error_code, None)
+    }
+
+    pub fn add_metric_in_context(
+        &self,
+        event_type: &str,
+        provider: Option<&str>,
+        duration_ms: Option<i64>,
+        success: bool,
+        error_code: Option<&str>,
+        context: Option<MetricContext<'_>>,
+    ) -> Result<(), StorageError> {
         let connection = self.connection()?;
         if stored_settings(&connection)?.history_retention == HistoryRetention::Never {
             return Ok(());
         }
         connection.execute(
-            "INSERT INTO metrics(event_type, provider, duration_ms, success, error_code, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO metrics(event_type, provider, duration_ms, success, error_code, created_at, mode, app_category)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 event_type,
                 provider,
                 duration_ms,
                 i64::from(success),
                 error_code,
-                Utc::now().to_rfc3339()
+                Utc::now().to_rfc3339(),
+                context.map(|value| value.mode_code()),
+                context.and_then(|value| value.category_code())
             ],
         )?;
         Ok(())
@@ -5658,6 +5673,23 @@ mod tests {
             .list_history(HistoryFilter::All, 10)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn metric_context_migration_preserves_legacy_events_and_reader_compatibility() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run_migrations(&mut connection, &MIGRATIONS[..2]).unwrap();
+        connection.execute("INSERT INTO metrics(event_type, provider, duration_ms, success, created_at) VALUES ('asr', 'faster-whisper', 123, 1, '2099-01-01T00:00:00Z')", []).unwrap();
+        run_migrations(&mut connection, MIGRATIONS).unwrap();
+        let row: (i64, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT duration_ms, mode, app_category FROM metrics",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (123, None, None));
+        assert_eq!(stored_min_reader_version(&connection).unwrap(), 1);
     }
 
     #[test]
