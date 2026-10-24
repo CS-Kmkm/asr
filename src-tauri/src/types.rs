@@ -58,6 +58,8 @@ pub enum OperationKind {
     Recording,
     SelectedText,
     Retry,
+    DictationTest,
+    InsertionTest,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -205,6 +205,7 @@ impl Resolver<'_> {
                 | ("pipeline/orchestration.rs", "run", "message")
                 // TerminalPhaseGuard forwards its checked terminal-state messages.
                 | ("pipeline/history_text.rs", "run", "message")
+                | ("pipeline/setup_tests.rs", "run_insertion", "message")
                 | ("pipeline/ask.rs", "finish", "error")
                 | ("commands.rs", "processing_message", "default")
                 | ("commands.rs", "start_failure_message", "error")

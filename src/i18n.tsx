@@ -23,6 +23,14 @@ const backendTemplates = Object.entries(backendCatalogue).filter(([, entry]) => 
 });
 
 const en = {
+  "Try dictation and insertion": "Try dictation and insertion",
+  "Dictation tests show raw recognized text without AI correction, insertion or History. Cloud speech still requires consent.": "Dictation tests show raw recognized text without AI correction, insertion or History. Cloud speech still requires consent.",
+  "Test dictation": "Test dictation",
+  "Stop test and transcribe": "Stop test and transcribe",
+  "Insertion test: switch to a text field in another app within 3 seconds. A fixed sample will be pasted there.": "Insertion test: switch to a text field in another app within 3 seconds. A fixed sample will be pasted there.",
+  "Test insertion": "Test insertion",
+  "Cancel test": "Cancel test",
+  "Setup test failed. Check the app status and try again.": "Setup test failed. Check the app status and try again.",
   "Apply saved writing preferences to Dictate, Ask and Edit using the captured app.": "Apply saved writing preferences to Dictate, Ask and Edit using the captured app.",
   "For Dictate, profiles require AI text correction. Ask and Edit use them when Personalization is on.": "For Dictate, profiles require AI text correction. Ask and Edit use them when Personalization is on.",
   "Refresh": "Refresh",
@@ -346,6 +354,14 @@ const en = {
 } as const;
 export type MessageKey = keyof typeof en | keyof typeof backendMessages;
 const ja: Record<keyof typeof en, string> = {
+  "Try dictation and insertion": "音声認識と文字挿入を試す",
+  "Dictation tests show raw recognized text without AI correction, insertion or History. Cloud speech still requires consent.": "音声認識テストでは、AI補正・文字挿入・履歴保存を行わず、認識結果だけを表示します。クラウド音声認識には同意が必要です。",
+  "Test dictation": "音声認識をテスト",
+  "Stop test and transcribe": "テスト録音を停止して認識",
+  "Insertion test: switch to a text field in another app within 3 seconds. A fixed sample will be pasted there.": "挿入テスト：3秒以内に別アプリの入力欄へ切り替えてください。固定のテスト文が貼り付けられます。",
+  "Test insertion": "文字挿入をテスト",
+  "Cancel test": "テストをキャンセル",
+  "Setup test failed. Check the app status and try again.": "テストに失敗しました。アプリの状態を確認して、もう一度お試しください。",
   "Apply saved writing preferences to Dictate, Ask and Edit using the captured app.": "取得した入力先に合わせ、Dictate・Ask・Editへ保存済みの文章スタイルを適用します。",
   "For Dictate, profiles require AI text correction. Ask and Edit use them when Personalization is on.": "Dictateへの適用にはAI文章補正が必要です。Ask・EditではPersonalizationがオンの場合に適用します。",
   "Refresh": "更新",

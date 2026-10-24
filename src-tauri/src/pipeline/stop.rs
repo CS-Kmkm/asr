@@ -104,7 +104,12 @@ impl RecordingDriver for Desktop<'_> {
             .map(|artifact| TempArtifact::new(artifact.path.clone(), false));
         let draft = match live_task {
             Some(task) => Some(task.finish().await?),
-            None if mode == PipelineMode::Edit || mode == PipelineMode::Ask => None,
+            None if mode == PipelineMode::Edit
+                || mode == PipelineMode::Ask
+                || services.lifecycle.dictation_test_id().is_some() =>
+            {
+                None
+            }
             None => return Err("live dictation session is unavailable".into()),
         };
         let settings = storage.get_settings().map_err(command_error)?;
@@ -238,35 +243,44 @@ impl RecordingDriver for Desktop<'_> {
         let transcript = match transcript_result {
             Ok(value) => value,
             Err((error, failure)) => {
-                let _ = metrics.add_metric(
-                    "asr",
-                    Some(settings.asr_backend.as_str()),
-                    model_was_ready.then(|| asr_started.elapsed().as_millis() as i64),
-                    false,
-                    Some("asr_failed"),
-                );
+                let dictation_test = services.lifecycle.is_dictation_test(operation_id);
+                let _ = if dictation_test {
+                    Ok(())
+                } else {
+                    metrics.add_metric(
+                        "asr",
+                        Some(settings.asr_backend.as_str()),
+                        model_was_ready.then(|| asr_started.elapsed().as_millis() as i64),
+                        false,
+                        Some("asr_failed"),
+                    )
+                };
                 let asr_provider = model_identity(&settings)
                     .0
                     .unwrap_or_else(|| settings.asr_backend.clone());
-                let preserved = preserve_failed_take(
-                    storage,
-                    &settings,
-                    failed_take_history_item(
-                        mode,
-                        &asr_provider,
-                        edit_session
-                            .as_ref()
-                            .map(|session| session.selection.text()),
-                        translation_target.as_deref(),
-                        app_context::history_category(app_context.as_ref()),
-                        duration_ms,
+                let preserved = if dictation_test {
+                    None
+                } else {
+                    preserve_failed_take(
+                        storage,
+                        &settings,
+                        failed_take_history_item(
+                            mode,
+                            &asr_provider,
+                            edit_session
+                                .as_ref()
+                                .map(|session| session.selection.text()),
+                            translation_target.as_deref(),
+                            app_context::history_category(app_context.as_ref()),
+                            duration_ms,
+                        )
+                        .map(|item| NewHistoryItem {
+                            insertion_detail: failure.history_detail(),
+                            ..item
+                        }),
+                        &artifact.path,
                     )
-                    .map(|item| NewHistoryItem {
-                        insertion_detail: failure.history_detail(),
-                        ..item
-                    }),
-                    &artifact.path,
-                );
+                };
                 emit_state(
                     app,
                     state,
@@ -282,13 +296,17 @@ impl RecordingDriver for Desktop<'_> {
             emit_state(app, state, AppPhase::Idle, cancel_message);
             return Err(cancel_error.into());
         }
-        let _ = metrics.add_metric(
-            "asr",
-            Some(&settings.asr_backend),
-            Some(asr_started.elapsed().as_millis() as i64),
-            true,
-            None,
-        );
+        let _ = if services.lifecycle.is_dictation_test(operation_id) {
+            Ok(())
+        } else {
+            metrics.add_metric(
+                "asr",
+                Some(&settings.asr_backend),
+                Some(asr_started.elapsed().as_millis() as i64),
+                true,
+                None,
+            )
+        };
         services
             .target
             .lock()
@@ -329,6 +347,9 @@ impl RecordingDriver for Desktop<'_> {
             storage,
             operation_id,
         };
+        if services.lifecycle.is_dictation_test(operation_id) {
+            return super::setup_tests::finish_dictation_test(context, take).await;
+        }
         match mode {
             PipelineMode::Edit => super::edit::finish(context, take, edit_session).await,
             PipelineMode::Ask => super::ask::finish(context, take, ask_session).await,

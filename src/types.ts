@@ -9,7 +9,7 @@ export type AppPhase =
 export interface AppState {
   phase: AppPhase;
   stage: AppStage;
-  operation: "recording" | "selected_text" | "retry" | null;
+  operation: "recording" | "selected_text" | "retry" | "dictation_test" | "insertion_test" | null;
   operationId: number | null;
   message: string | null;
   messageCode: string | null;

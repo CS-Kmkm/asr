@@ -1,4 +1,14 @@
 {
+  "Insertion test failed. Choose an editable field in another app and try again.": {"code":"setup_insertion_test_failed","ja":"文字挿入テストに失敗しました。別アプリの編集可能な入力欄を選び、もう一度お試しください。"},
+  "Dictation test completed without inserting text.": {"code":"setup_dictation_test_completed","ja":"音声認識テストが完了しました。文字挿入は行っていません。"},
+  "Switch to another app within 3 seconds to test insertion.": {"code":"setup_insertion_test_waiting","ja":"3秒以内に別アプリへ切り替えて、文字挿入を試してください。"},
+  "Insertion test completed.": {"code":"setup_insertion_test_completed","ja":"文字挿入テストが完了しました。"},
+  "The test text is on the clipboard; automatic insertion was skipped.": {"code":"setup_insertion_test_clipboard","ja":"テスト文をクリップボードにコピーしました。自動挿入は行っていません。"},
+  "The test paste was sent. Check the target app before pasting again.": {"code":"setup_insertion_test_unverified","ja":"テストの貼り付け操作を送りました。再度貼り付ける前に、対象アプリを確認してください。"},
+  "Setup test cancelled.": {"code":"setup_test_cancelled","ja":"テストをキャンセルしました。"},
+  "Choose another app for the insertion test.": {"code":"setup_test_target_required","ja":"文字挿入テストでは、別アプリへ切り替えてください。"},
+  "No dictation test is recording.": {"code":"setup_no_dictation_test","ja":"音声認識テストの録音は行われていません。"},
+  "Setup test failed.": {"code":"setup_test_failed","ja":"テストに失敗しました。"},
   "Release the held shortcut before changing shortcut settings.": {
     "code": "shortcut_settings_held",
     "ja": "押しているショートカットを離してから、ショートカットの設定を変更してください。"

@@ -1,6 +1,7 @@
 pub(crate) mod credentials;
 pub(crate) mod history_text;
 pub(crate) mod recent_apps;
+pub(crate) mod setup_tests;
 
 #[cfg(test)]
 use crate::pipeline::{classify_ai_stage, AiStageResult};
@@ -802,6 +803,30 @@ async fn start_recording_mode(
             return Err(error.into());
         }
     };
+    start_claimed_recording(
+        app,
+        services,
+        state,
+        storage,
+        from_shortcut,
+        trigger_chord,
+        mode,
+        operation_id,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn start_claimed_recording(
+    app: AppHandle,
+    services: State<'_, Services>,
+    state: State<'_, AppState>,
+    storage: State<'_, Storage>,
+    from_shortcut: bool,
+    trigger_chord: Option<String>,
+    mode: PipelineMode,
+    operation_id: u64,
+) -> Result<(), String> {
     let guard = PipelineGuard {
         lifecycle: &services.lifecycle,
         id: operation_id,
@@ -874,14 +899,26 @@ async fn start_owned_recording(
     operation_id: u64,
 ) -> Result<(), String> {
     let (cancel_message, cancel_error) = cancellation_copy(mode);
+    let dictation_test = services.lifecycle.is_dictation_test(operation_id);
+    state.set_operation(
+        if dictation_test {
+            types::OperationKind::DictationTest
+        } else {
+            types::OperationKind::Recording
+        },
+        operation_id,
+    );
     let settings = storage.get_settings().map_err(command_error)?;
     crate::privacy::check_recording(&settings, mode).map_err(str::to_owned)?;
     let preflight_settings = settings.clone();
-    tokio::task::spawn_blocking(move || correction::preflight_recording(&preflight_settings, mode))
+    if !dictation_test {
+        tokio::task::spawn_blocking(move || {
+            correction::preflight_recording(&preflight_settings, mode)
+        })
         .await
         .map_err(|_| "recording session task failed".to_owned())?
         .map_err(|error| error.user_message().to_owned())?;
-    state.set_operation(types::OperationKind::Recording, operation_id);
+    }
     let mode_shortcuts =
         voice_mode_shortcuts(&settings, mode).ok_or("selected-text translation does not record")?;
     let active_hotkey = trigger_chord
@@ -906,7 +943,7 @@ async fn start_owned_recording(
         };
     // Capture the target at the press: a model load may take minutes, and
     // the foreground window by then is not necessarily the one meant.
-    let target = (mode != PipelineMode::Edit && mode != PipelineMode::Ask)
+    let target = (!dictation_test && mode != PipelineMode::Edit && mode != PipelineMode::Ask)
         .then(|| {
             SystemTextInjector::default()
                 .capture_target()
@@ -1217,6 +1254,7 @@ const MAX_RECORDING_DURATION: Duration = Duration::from_secs(15 * 60);
 pub(crate) enum StopReason {
     User,
     HoldRelease(u64),
+    DictationTest(u64),
     MicrophoneDisconnected,
     MaximumDuration,
 }
@@ -2193,7 +2231,33 @@ async fn cancel_pipeline_operation(
     ask: &tokio::sync::Mutex<Option<AskSession>>,
     publish_cancelled: impl FnOnce(),
 ) -> Result<Option<PipelinePhase>, String> {
-    let Some((operation_id, phase)) = lifecycle.cancel()? else {
+    cancel_pipeline_operation_for(
+        lifecycle,
+        audio,
+        target,
+        translation_target,
+        live,
+        edit,
+        ask,
+        None,
+        publish_cancelled,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cancel_pipeline_operation_for(
+    lifecycle: &PipelineLifecycle,
+    audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
+    target: &Mutex<Option<TargetWindow>>,
+    translation_target: &Mutex<Option<String>>,
+    live: &tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
+    edit: &tokio::sync::Mutex<Option<EditSession>>,
+    ask: &tokio::sync::Mutex<Option<AskSession>>,
+    expected: Option<u64>,
+    publish_cancelled: impl FnOnce(),
+) -> Result<Option<PipelinePhase>, String> {
+    let Some((operation_id, phase)) = lifecycle.cancel_for(expected)? else {
         return Ok(None);
     };
     // Starting and Processing already have an owner. Releasing their lifecycle
@@ -5351,6 +5415,14 @@ pub(crate) fn begin_history_retry(
     MODEL_CHANGE_GATE
         .begin_pipeline(|| services.lifecycle.begin_non_recording(mode))
         .map_err(str::to_string)
+}
+
+pub(crate) fn begin_setup_insertion(
+    services: &Services,
+) -> Result<(u64, tokio::sync::watch::Receiver<bool>), String> {
+    MODEL_CHANGE_GATE
+        .begin_pipeline(|| services.lifecycle.begin_insertion_test())
+        .map_err(str::to_owned)
 }
 
 static MODEL_CHANGE_GATE: ModelChangeGate = ModelChangeGate::new();

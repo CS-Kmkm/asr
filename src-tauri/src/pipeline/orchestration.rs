@@ -48,7 +48,9 @@ pub(super) async fn run(
     reason: StopReason,
 ) -> Result<RecordingResult, String> {
     let claimed = match reason {
-        StopReason::HoldRelease(id) => driver.lifecycle().begin_processing_for(Some(id)),
+        StopReason::HoldRelease(id) | StopReason::DictationTest(id) => {
+            driver.lifecycle().begin_processing_for(Some(id))
+        }
         _ => driver.lifecycle().begin_processing(),
     };
     let (id, mode, cancel) = claimed.map_err(|error| {

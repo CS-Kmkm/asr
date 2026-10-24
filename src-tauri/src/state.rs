@@ -23,6 +23,13 @@ pub enum PipelineMode {
     SelectedText,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PipelinePurpose {
+    Input,
+    DictationTest,
+    InsertionTest,
+}
+
 struct PipelineOperation {
     id: u64,
     mode: PipelineMode,
@@ -32,6 +39,7 @@ struct PipelineOperation {
     /// lifecycle claimed until its owner publishes completion and finishes,
     /// but it can no longer be cancelled.
     committed: bool,
+    purpose: PipelinePurpose,
 }
 
 pub struct PipelineLifecycle {
@@ -79,6 +87,20 @@ impl PipelineLifecycle {
         &self,
         mode: PipelineMode,
     ) -> Result<(u64, watch::Receiver<bool>), &'static str> {
+        self.begin_non_recording_for(mode, PipelinePurpose::Input)
+    }
+
+    pub(crate) fn begin_insertion_test(
+        &self,
+    ) -> Result<(u64, watch::Receiver<bool>), &'static str> {
+        self.begin_non_recording_for(PipelineMode::SelectedText, PipelinePurpose::InsertionTest)
+    }
+
+    fn begin_non_recording_for(
+        &self,
+        mode: PipelineMode,
+        purpose: PipelinePurpose,
+    ) -> Result<(u64, watch::Receiver<bool>), &'static str> {
         let mut inner = self
             .inner
             .lock()
@@ -96,12 +118,50 @@ impl PipelineLifecycle {
             phase: PipelinePhase::Processing,
             cancel,
             committed: false,
+            purpose,
         });
         self.publish_phase(&inner);
         Ok((id, receiver))
     }
 
     pub fn begin_start(&self, mode: PipelineMode) -> Result<u64, &'static str> {
+        self.begin_start_for(mode, false)
+    }
+
+    pub(crate) fn begin_dictation_test(&self) -> Result<u64, &'static str> {
+        self.begin_start_for(PipelineMode::Dictate, true)
+    }
+
+    pub(crate) fn is_dictation_test(&self, id: u64) -> bool {
+        self.inner.lock().is_ok_and(|inner| {
+            inner.as_ref().is_some_and(|operation| {
+                operation.id == id && operation.purpose == PipelinePurpose::DictationTest
+            })
+        })
+    }
+
+    pub(crate) fn dictation_test_id(&self) -> Option<u64> {
+        self.inner.lock().ok().and_then(|inner| {
+            inner
+                .as_ref()
+                .filter(|operation| operation.purpose == PipelinePurpose::DictationTest)
+                .map(|operation| operation.id)
+        })
+    }
+
+    pub(crate) fn is_setup_test(&self, id: u64) -> bool {
+        self.inner.lock().is_ok_and(|inner| {
+            inner.as_ref().is_some_and(|operation| {
+                operation.id == id && operation.purpose != PipelinePurpose::Input
+            })
+        })
+    }
+
+    fn begin_start_for(
+        &self,
+        mode: PipelineMode,
+        dictation_test: bool,
+    ) -> Result<u64, &'static str> {
         let mut inner = self
             .inner
             .lock()
@@ -119,6 +179,11 @@ impl PipelineLifecycle {
             phase: PipelinePhase::Starting,
             cancel,
             committed: false,
+            purpose: if dictation_test {
+                PipelinePurpose::DictationTest
+            } else {
+                PipelinePurpose::Input
+            },
         });
         self.publish_phase(&inner);
         Ok(id)
@@ -187,6 +252,13 @@ impl PipelineLifecycle {
     }
 
     pub fn cancel(&self) -> Result<Option<(u64, PipelinePhase)>, &'static str> {
+        self.cancel_for(None)
+    }
+
+    pub(crate) fn cancel_for(
+        &self,
+        expected: Option<u64>,
+    ) -> Result<Option<(u64, PipelinePhase)>, &'static str> {
         let inner = self
             .inner
             .lock()
@@ -194,7 +266,10 @@ impl PipelineLifecycle {
         let Some(operation) = inner.as_ref() else {
             return Ok(None);
         };
-        if operation.committed || *operation.cancel.borrow() {
+        if expected.is_some_and(|id| id != operation.id)
+            || operation.committed
+            || *operation.cancel.borrow()
+        {
             return Ok(None);
         }
         operation.cancel.send_replace(true);
@@ -538,6 +613,37 @@ mod tests {
             lifecycle.begin_processing().unwrap_err(),
             "recording stop is already in progress"
         );
+    }
+
+    #[test]
+    fn setup_test_identity_survives_processing_and_stale_cancel_cannot_touch_new_take() {
+        let lifecycle = PipelineLifecycle::default();
+        let test = lifecycle.begin_dictation_test().unwrap();
+        assert!(lifecycle.is_dictation_test(test));
+        lifecycle.mark_recording(test).unwrap();
+        lifecycle.begin_processing_for(Some(test)).unwrap();
+        assert!(lifecycle.is_dictation_test(test));
+        lifecycle.finish(test);
+        let normal = lifecycle.begin_start(PipelineMode::Dictate).unwrap();
+        assert_eq!(lifecycle.cancel_for(Some(test)).unwrap(), None);
+        assert!(!lifecycle.is_cancelled(normal));
+        assert!(!lifecycle.is_setup_test(normal));
+        assert!(lifecycle.begin_processing_for(Some(test)).is_err());
+        lifecycle.finish(normal);
+        let (insertion, cancel) = lifecycle.begin_insertion_test().unwrap();
+        assert!(lifecycle.is_setup_test(insertion));
+        assert!(!lifecycle.is_dictation_test(insertion));
+        assert!(lifecycle.begin_start(PipelineMode::Ask).is_err());
+        lifecycle.cancel_for(Some(insertion)).unwrap();
+        assert!(*cancel.borrow());
+        let mut wrote = false;
+        assert!(lifecycle
+            .commit_side_effect(insertion, || {
+                wrote = true;
+                Ok::<_, String>(())
+            })
+            .is_err());
+        assert!(!wrote);
     }
 
     #[test]

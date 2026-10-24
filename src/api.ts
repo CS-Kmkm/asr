@@ -139,6 +139,24 @@ export async function startRecording(): Promise<void> {
   return invoke("start_recording");
 }
 
+export async function startDictationTest(): Promise<number> {
+  if (!inTauri) throw new Error("Setup tests require the desktop app.");
+  return invoke("start_dictation_test");
+}
+
+export async function stopDictationTest(id: number): Promise<RecordingResult> {
+  return invoke("stop_dictation_test", { id });
+}
+
+export async function testInsertion(): Promise<number> {
+  if (!inTauri) throw new Error("Setup tests require the desktop app.");
+  return invoke("test_insertion");
+}
+
+export async function cancelSetupTest(id: number): Promise<void> {
+  if (inTauri) await invoke("cancel_setup_test", { id });
+}
+
 export async function getStartupHotkeyWarning(): Promise<string[]> {
   if (!inTauri) return [];
   const warning = await invoke<string | null>("get_startup_hotkey_warning");

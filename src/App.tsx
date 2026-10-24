@@ -1069,6 +1069,9 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
 
         {page === "setup" && (
           <SetupPage
+            appState={state}
+            testsDisabled={!settingsLoaded}
+            onPrepareTest={() => saveSettings({})}
             settings={settings}
             devices={devices}
             onRefreshDevices={() => void refreshDevices()}

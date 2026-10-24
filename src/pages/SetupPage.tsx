@@ -1,6 +1,8 @@
 import { ShortcutField } from "../components/ShortcutField";
+import { useState } from "react";
+import { SetupTests } from "../components/SetupTests";
 import { ModelProgressBar, SettingRow } from "../components/ui";
-import type { AudioDevice, GpuDiagnostics, ModelProgress, Settings, UiLanguage } from "../types";
+import type { AppState, AudioDevice, GpuDiagnostics, ModelProgress, Settings, UiLanguage } from "../types";
 import { translateAppMessage, useI18n, type MessageKey } from "../i18n";
 
 function gpuSummary(gpu: GpuDiagnostics | null, t: (key: MessageKey) => string, language: UiLanguage) {
@@ -32,6 +34,9 @@ export function SetupPage({
   onDiagnoseGpu,
   onFinish,
   onRefreshDevices,
+  appState,
+  testsDisabled = false,
+  onPrepareTest,
 }: {
   settings: Settings;
   devices: AudioDevice[];
@@ -46,8 +51,12 @@ export function SetupPage({
   onDiagnoseGpu: () => void;
   onFinish: () => void;
   onRefreshDevices?: () => void;
+  appState?: AppState;
+  testsDisabled?: boolean;
+  onPrepareTest?: () => Promise<boolean>;
 }) {
   const { t, language } = useI18n();
+  const [testing, setTesting] = useState(false);
   return (
     <section className="panel">
       <p className="eyebrow">{t("FIRST RUN")}</p>
@@ -105,8 +114,9 @@ export function SetupPage({
           control={<button className="secondary" disabled={modelLoading} onClick={onLoadModel}>{t("Download and load speech model")}</button>} />}
       </div>
       {progress && <ModelProgressBar progress={progress} />}
+      {appState && onPrepareTest && <SetupTests state={appState} modelReady={modelReady} disabled={testsDisabled || modelLoading} onPrepare={onPrepareTest} onBusyChange={setTesting} />}
       {!modelReady && <p>{t("Load the selected speech model before finishing setup.")}</p>}
-      <button className="primary" disabled={!modelReady || modelLoading} onClick={onFinish}>
+      <button className="primary" disabled={!modelReady || modelLoading || testing} onClick={onFinish}>
         {t("Finish setup")}
       </button>
     </section>

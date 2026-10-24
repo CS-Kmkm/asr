@@ -22,6 +22,7 @@ pub(crate) fn classify_ai_stage(result: Result<String, CorrectionError>) -> AiSt
 mod ask;
 mod dictate_translate;
 mod edit;
+pub(crate) mod setup_tests;
 pub(crate) mod stop;
 
 #[derive(Clone, Copy)]
