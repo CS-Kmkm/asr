@@ -15,6 +15,7 @@ import type { MessageKey } from "../i18n";
 type ModelConfiguration = Pick<
   Settings,
   | "asrBackend"
+  | "asrDevice"
   | "modelId"
   | "modelQuantization"
   | "apiBaseUrl"
@@ -65,6 +66,7 @@ export function ModelsPage({
 }) {
   const { t, language } = useI18n();
   const [backend, setBackend] = useState(settings.asrBackend);
+  const [device, setDevice] = useState(settings.asrDevice);
   const [additionalModelId, setAdditionalModelId] = useState(settings.modelId ?? "");
   const [quantization, setQuantization] = useState<ModelQuantization>(
     settings.modelQuantization,
@@ -78,6 +80,7 @@ export function ModelsPage({
 
   useEffect(() => {
     setBackend(settings.asrBackend);
+    setDevice(settings.asrDevice);
     setAdditionalModelId(settings.modelId ?? "");
     setQuantization(settings.modelQuantization);
     setApiBaseUrl(settings.apiBaseUrl);
@@ -86,6 +89,7 @@ export function ModelsPage({
     settings.apiBaseUrl,
     settings.apiKeyEnvVar,
     settings.asrBackend,
+    settings.asrDevice,
     settings.modelId,
     settings.modelQuantization,
   ]);
@@ -199,6 +203,13 @@ export function ModelsPage({
               </select>
             }
           />
+          {backend === "faster-whisper" && <SettingRow title={t("Speech device")} detail={t("Auto retries caught CUDA failures on CPU. Explicit CUDA reports an error instead. The environment option preserves ASR_DEVICE.")}
+            control={<select aria-label={t("Speech device")} value={device ?? ""} onChange={(event) => setDevice((event.target.value || null) as Settings["asrDevice"])}>
+              <option value="">{t("Environment (auto by default)")}</option>
+              <option value="auto">{t("Auto (CUDA with CPU fallback)")}</option>
+              <option value="cpu">{t("CPU only")}</option>
+              <option value="cuda">{t("CUDA only")}</option>
+            </select>} />}
           {backend === "openai-compatible" ? (
             <>
               <SettingRow
@@ -250,6 +261,7 @@ export function ModelsPage({
           onClick={() =>
             onConfigureModel({
               asrBackend: backend,
+              asrDevice: device,
               modelId: additionalModelId || null,
               modelQuantization: quantization,
               apiBaseUrl: apiBaseUrl.trim(),

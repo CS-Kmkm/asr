@@ -211,6 +211,10 @@ required. Installed by `uv sync`.
 から認識結果を返します。切り替え後のデバイスは Diagnostics の worker health で確認できます。
 `cuda` を明示した場合と、プロセス自体が異常終了した場合はCPU再試行の対象外です。
 
+Models の「音声認識デバイス」で自動・CPUのみ・CUDAのみを選び、「モデルを読み込む」で
+反映できます。「環境設定」は既存の `ASR_DEVICE` を引き継ぎ、未指定なら自動選択です。
+この選択はfaster-whisperに適用され、VibeVoiceとAPIバックエンドには影響しません。
+
 The Whisper model is configured via `ASR_FASTER_WHISPER_MODEL` (default:
 `large-v3-turbo`). The model is downloaded from Hugging Face on first load.
 

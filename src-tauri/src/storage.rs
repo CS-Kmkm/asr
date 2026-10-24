@@ -4139,6 +4139,21 @@ mod tests {
     }
 
     #[test]
+    fn missing_device_policy_preserves_environment_and_bad_policy_repairs_only_itself() {
+        let mut saved = serde_json::to_value(Settings::default()).unwrap();
+        saved["inputGainPercent"] = serde_json::json!(125);
+        saved.as_object_mut().unwrap().remove("asrDevice");
+        let old = load_settings(&saved.to_string());
+        assert!(old.settings.asr_device.is_none());
+        assert!(old.repairs.is_empty());
+        saved["asrDevice"] = serde_json::json!("unsupported-device");
+        let repaired = load_settings(&saved.to_string());
+        assert!(repaired.settings.asr_device.is_none());
+        assert_eq!(repaired.settings.input_gain_percent, 125);
+        assert_eq!(repaired.repairs.fields(), vec!["asrDevice".to_owned()]);
+    }
+
+    #[test]
     fn legacy_settings_receive_automatic_editing_defaults() {
         let mut value = serde_json::to_value(Settings::default()).unwrap();
         let object = value.as_object_mut().unwrap();

@@ -155,6 +155,13 @@ pub(crate) fn worker_command_for_settings(settings: &Settings) -> WorkerCommand 
     worker_command_with_speech_key(settings, key)
 }
 
+pub(crate) fn worker_device_policy(settings: &Settings) -> Option<&'static str> {
+    (settings.asr_backend == "faster-whisper")
+        .then_some(settings.asr_device)
+        .flatten()
+        .map(types::AsrDevice::as_str)
+}
+
 pub(crate) fn worker_command_with_speech_key(
     settings: &Settings,
     speech_key: Option<String>,
@@ -173,6 +180,9 @@ pub(crate) fn worker_command_with_speech_key(
         }
     }
     command.quantization = Some(settings.model_quantization.clone());
+    if let Some(device) = worker_device_policy(settings) {
+        command.env.push(("ASR_DEVICE".into(), device.into()));
+    }
     let executable = std::env::current_exe().ok();
     if let Some(directory) = worker_directory(project_root.as_deref(), executable.as_deref()) {
         command = command.with_current_dir(directory);
@@ -896,6 +906,38 @@ mod model_configuration_tests {
     fn default_model_does_not_override_worker_environment() {
         let command = worker_command_for_settings(&Settings::default());
         assert!(!command.env.iter().any(|(key, _)| key == "ASR_MODEL_ID"));
+    }
+
+    #[test]
+    fn device_override_only_reaches_faster_whisper_and_none_preserves_environment() {
+        let mut settings = Settings::default();
+        assert!(!worker_command_for_settings(&settings)
+            .env
+            .iter()
+            .any(|(key, _)| key == "ASR_DEVICE"));
+        for device in [
+            types::AsrDevice::Auto,
+            types::AsrDevice::Cpu,
+            types::AsrDevice::Cuda,
+        ] {
+            settings.asr_device = Some(device);
+            let command = worker_command_for_settings(&settings);
+            assert_eq!(
+                command
+                    .env
+                    .iter()
+                    .filter(|(key, _)| key == "ASR_DEVICE")
+                    .collect::<Vec<_>>(),
+                vec![&("ASR_DEVICE".into(), device.as_str().into())]
+            );
+        }
+        for backend in ["vibevoice", "openai-compatible", "mock"] {
+            settings.asr_backend = backend.into();
+            assert!(!worker_command_for_settings(&settings)
+                .env
+                .iter()
+                .any(|(key, _)| key == "ASR_DEVICE"));
+        }
     }
 
     #[test]

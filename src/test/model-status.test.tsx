@@ -40,3 +40,21 @@ test("model errors can open diagnostics and CPU preparation stays localized", as
   view.rerender(<I18nProvider language="ja"><ModelProgressBar progress={{ stage: "cpu_fallback", model: null, completedBytes: null, totalBytes: null }} /></I18nProvider>);
   expect(screen.getByRole("progressbar").textContent).toContain("CPUを準備中");
 });
+
+test("Models applies the selected speech device and tracks confirmed settings changes", () => {
+  const configure = vi.fn();
+  const props = { settings: defaultSettings, gpu: null, asrBackendOptions: [], modelLoading: false, onConfigureModel: configure, onSaveCustomModel: async () => true, onDiagnoseGpu: vi.fn() };
+  const app = render(<I18nProvider language="en"><ModelsPage {...props} /></I18nProvider>);
+  const device = screen.getByRole("combobox", { name: "Speech device" });
+  expect(device).toHaveProperty("value", "");
+  fireEvent.change(device, { target: { value: "cpu" } });
+  fireEvent.click(screen.getByRole("button", { name: "Load Model" }));
+  expect(configure).toHaveBeenLastCalledWith(expect.objectContaining({ asrDevice: "cpu" }));
+  app.rerender(<I18nProvider language="en"><ModelsPage {...props} settings={{ ...defaultSettings, asrDevice: "cuda" }} /></I18nProvider>);
+  expect(device).toHaveProperty("value", "cuda");
+  fireEvent.change(device, { target: { value: "" } });
+  fireEvent.click(screen.getByRole("button", { name: "Load Model" }));
+  expect(configure).toHaveBeenLastCalledWith(expect.objectContaining({ asrDevice: null }));
+  app.rerender(<I18nProvider language="en"><ModelsPage {...props} settings={{ ...defaultSettings, asrBackend: "vibevoice" }} /></I18nProvider>);
+  expect(screen.queryByRole("combobox", { name: "Speech device" })).toBeNull();
+});

@@ -848,6 +848,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     configuration?: Pick<
       Settings,
       | "asrBackend"
+      | "asrDevice"
       | "modelId"
       | "modelQuantization"
       | "apiBaseUrl"

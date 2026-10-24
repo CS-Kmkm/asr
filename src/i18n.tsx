@@ -23,6 +23,12 @@ const backendTemplates = Object.entries(backendCatalogue).filter(([, entry]) => 
 });
 
 const en = {
+  "Speech device": "Speech device",
+  "Auto retries caught CUDA failures on CPU. Explicit CUDA reports an error instead. The environment option preserves ASR_DEVICE.": "Auto retries caught CUDA failures on CPU. Explicit CUDA reports an error instead. The environment option preserves ASR_DEVICE.",
+  "Environment (auto by default)": "Environment (auto by default)",
+  "Auto (CUDA with CPU fallback)": "Auto (CUDA with CPU fallback)",
+  "CPU only": "CPU only",
+  "CUDA only": "CUDA only",
   "Try dictation and insertion": "Try dictation and insertion",
   "Dictation tests show raw recognized text without AI correction, insertion or History. Cloud speech still requires consent.": "Dictation tests show raw recognized text without AI correction, insertion or History. Cloud speech still requires consent.",
   "Test dictation": "Test dictation",
@@ -354,6 +360,12 @@ const en = {
 } as const;
 export type MessageKey = keyof typeof en | keyof typeof backendMessages;
 const ja: Record<keyof typeof en, string> = {
+  "Speech device": "音声認識デバイス",
+  "Auto retries caught CUDA failures on CPU. Explicit CUDA reports an error instead. The environment option preserves ASR_DEVICE.": "自動選択では、捕捉できたCUDAエラー時にCPUで再試行します。CUDAのみを指定した場合はエラーを返します。環境設定を選ぶとASR_DEVICEを引き継ぎます。",
+  "Environment (auto by default)": "環境設定（未指定時は自動）",
+  "Auto (CUDA with CPU fallback)": "自動（CUDA・失敗時はCPU）",
+  "CPU only": "CPUのみ",
+  "CUDA only": "CUDAのみ",
   "Try dictation and insertion": "音声認識と文字挿入を試す",
   "Dictation tests show raw recognized text without AI correction, insertion or History. Cloud speech still requires consent.": "音声認識テストでは、AI補正・文字挿入・履歴保存を行わず、認識結果だけを表示します。クラウド音声認識には同意が必要です。",
   "Test dictation": "音声認識をテスト",

@@ -4693,6 +4693,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn device_policy_changes_invalidate_loaded_workers_and_wait_for_idle() {
+        let previous = Settings::default();
+        let mut next = previous.clone();
+        next.asr_device = Some(types::AsrDevice::Cpu);
+        assert!(worker_configuration_changed(&previous, &next));
+        assert_ne!(
+            worker_command_for_settings(&previous),
+            worker_command_for_settings(&next)
+        );
+        for phase in [
+            PipelinePhase::Starting,
+            PipelinePhase::Recording,
+            PipelinePhase::Processing,
+        ] {
+            assert!(reject_model_change_while_busy(&previous, &next, phase).is_err());
+        }
+        assert!(reject_model_change_while_busy(&previous, &next, PipelinePhase::Idle).is_ok());
+        for backend in ["vibevoice", "openai-compatible"] {
+            let mut previous = previous.clone();
+            previous.asr_backend = backend.into();
+            next = previous.clone();
+            next.asr_device = Some(types::AsrDevice::Cpu);
+            assert!(!worker_configuration_changed(&previous, &next));
+            assert_eq!(
+                worker_command_for_settings(&previous),
+                worker_command_for_settings(&next)
+            );
+        }
+    }
+
     fn failed_take_storage(settings: Settings) -> (Storage, tempfile::TempDir, PathBuf) {
         let storage = Storage::in_memory().unwrap();
         storage.update_settings(&settings).unwrap();
@@ -5401,6 +5432,7 @@ pub(crate) async fn update_settings(
 /// Settings that require a new worker command (`reconfigure` kills the worker).
 fn worker_configuration_changed(previous: &Settings, next: &Settings) -> bool {
     worker_command_inputs(previous) != worker_command_inputs(next)
+        || crate::worker_device_policy(previous) != crate::worker_device_policy(next)
         || previous.model_quantization != next.model_quantization
 }
 

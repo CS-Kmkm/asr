@@ -87,6 +87,7 @@ export const defaultSettings: Settings = {
   modelId: null,
   modelQuantization: "4bit",
   asrBackend: "faster-whisper",
+  asrDevice: null,
   apiBaseUrl: "https://api.openai.com/v1",
   apiKeyEnvVar: "OPENAI_API_KEY",
   textCorrectionEnabled: false,

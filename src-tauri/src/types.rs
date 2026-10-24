@@ -1,5 +1,23 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AsrDevice {
+    Auto,
+    Cpu,
+    Cuda,
+}
+
+impl AsrDevice {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AppPhase {
@@ -131,6 +149,9 @@ pub struct Settings {
     pub model_quantization: String,
     #[serde(default = "default_asr_backend")]
     pub asr_backend: String,
+    /// None preserves ASR_DEVICE from the launch environment for existing users.
+    #[serde(default)]
+    pub asr_device: Option<AsrDevice>,
     #[serde(default = "default_api_base_url")]
     pub api_base_url: String,
     #[serde(default = "default_api_key_env_var")]
@@ -406,6 +427,7 @@ impl Default for Settings {
             model_id: None,
             model_quantization: default_model_quantization(),
             asr_backend: default_asr_backend(),
+            asr_device: None,
             api_base_url: default_api_base_url(),
             api_key_env_var: default_api_key_env_var(),
             text_correction_enabled: false,

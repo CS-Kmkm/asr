@@ -66,6 +66,7 @@ export interface Settings {
   modelId: string | null;
   modelQuantization: ModelQuantization;
   asrBackend: AsrBackend;
+  asrDevice: "auto" | "cpu" | "cuda" | null;
   apiBaseUrl: string;
   apiKeyEnvVar: string;
   textCorrectionEnabled: boolean;
