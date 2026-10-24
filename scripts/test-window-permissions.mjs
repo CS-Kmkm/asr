@@ -26,7 +26,7 @@ test("every IPC handler is covered by the application manifest and main permissi
   const source = read("src-tauri/src/lib.rs");
   const handler = /\.invoke_handler\(tauri::generate_handler!\[([\s\S]*?)\]\)/.exec(source)?.[1];
   assert.ok(handler);
-  const names = [...handler.matchAll(/commands::([a-z_]+)/g)].map((match) => match[1]).sort();
+  const names = [...handler.matchAll(/commands(?:::[a-z_]+)+/g)].map((match) => match[0].split("::").at(-1)).sort();
   for (const path of ["src-tauri/src/command_manifest.rs", "src-tauri/permissions/main.toml"]) {
     const declared = [...read(path).matchAll(/^\s*"([a-z_]+)",/gm)].map((match) => match[1]).sort();
     assert.deepEqual(declared, names, path);

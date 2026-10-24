@@ -5,6 +5,8 @@ import type {
   GpuDiagnostics,
   StorageDiagnostics,
   WorkerHealth,
+  CredentialProvider,
+  CredentialStatus,
   HistoryItem,
   ModelStatus,
   Settings,
@@ -27,6 +29,16 @@ export async function getStorageDiagnostics(): Promise<StorageDiagnostics | null
 export async function getWorkerHealth(): Promise<WorkerHealth | null> {
   if (!inTauri) return null;
   return invoke("get_worker_health");
+}
+
+export async function getProviderCredentials(): Promise<CredentialStatus[]> {
+  if (!inTauri) return (["openai", "gemini", "speech"] as const).map((provider) => ({ provider, alias: (provider === "openai" ? browserSettings.settings.openaiApiKeyEnvVar : provider === "gemini" ? browserSettings.settings.geminiApiKeyEnvVar : browserSettings.settings.apiKeyEnvVar).trim().toUpperCase(), source: "missing", storeAvailable: false }));
+  return invoke("get_provider_credentials");
+}
+
+export async function updateProviderCredential(provider: CredentialProvider, expectedAlias: string, secret: string | null): Promise<CredentialStatus> {
+  if (!inTauri) throw new Error("Windows Credential Manager is unavailable.");
+  return invoke("update_provider_credential", { provider, expectedAlias, secret });
 }
 
 export async function openDiagnosticsFolder(): Promise<void> {

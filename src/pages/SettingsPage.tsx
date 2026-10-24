@@ -4,6 +4,7 @@ import { ShortcutField, normalizeShortcutText } from "../components/ShortcutFiel
 import { GainSlider } from "../components/CommitField";
 import { SettingRow, Toggle } from "../components/ui";
 import { AiCorrectionSettings } from "../components/AiCorrectionSettings";
+import { ApiKeySettings } from "../components/ApiKeySettings";
 import { SettingsRepairBanner } from "../components/SettingsRepairBanner";
 import type { AudioDevice, AudioLevel, ScopedStyleProfile, Settings, ShortcutMode, StyleProfile } from "../types";
 import { speechLocaleRegistry, uiLocaleRegistry } from "../types";
@@ -440,6 +441,7 @@ export function SettingsPage({
       </section>
       <PersonalizationProfiles settings={settings} profiles={profiles} profileDraftIsInvalid={profileDraftIsInvalid} onSaveGlobal={saveGlobalProfile} onSaveProfiles={saveProfiles} onEditProfiles={setProfiles} onCommitProfiles={commitProfiles} />
       <AiCorrectionSettings settings={settings} onSave={onSave} />
+      <ApiKeySettings settings={settings} />
     </div>
   );
 }

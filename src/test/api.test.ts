@@ -19,6 +19,19 @@ test("diagnostic folder uses a fixed native command without a client path", asyn
   expect(invoke).toHaveBeenCalledWith("open_diagnostics_folder");
 });
 
+test("credential IPC reads presence and passes explicit save/delete without Settings persistence", async () => {
+  Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+  const api = await import("../api");
+  await api.getProviderCredentials();
+  await api.updateProviderCredential("openai", "OPENAI_API_KEY", "synthetic-key");
+  await api.updateProviderCredential("openai", "OPENAI_API_KEY", null);
+  expect(vi.mocked(invoke).mock.calls).toEqual([
+    ["get_provider_credentials"],
+    ["update_provider_credential", { provider: "openai", expectedAlias: "OPENAI_API_KEY", secret: "synthetic-key" }],
+    ["update_provider_credential", { provider: "openai", expectedAlias: "OPENAI_API_KEY", secret: null }],
+  ]);
+});
+
 test("native shortcut warnings keep the IPC list type", async () => {
   Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
   vi.mocked(invoke).mockResolvedValue(["Ask Anything (Ctrl+Shift+A)"]);

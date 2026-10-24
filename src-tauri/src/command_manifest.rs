@@ -1,4 +1,6 @@
 pub const APP_COMMANDS: &[&str] = &[
+    "get_provider_credentials",
+    "update_provider_credential",
     "get_worker_health",
     "get_storage_diagnostics",
     "open_diagnostics_folder",

@@ -64,7 +64,7 @@ fn wav_file_duration(path: &Path) -> Option<Duration> {
     wav_duration(&header, file_len)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct WorkerCommand {
     pub program: PathBuf,
     pub args: Vec<String>,
@@ -76,6 +76,23 @@ pub struct WorkerCommand {
     pub quantization: Option<String>,
     pub(crate) provision: Option<crate::worker_setup::Provision>,
     pub(crate) source_required: bool,
+}
+
+impl fmt::Debug for WorkerCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkerCommand")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field(
+                "environment_names",
+                &self.env.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            )
+            .field("current_dir", &self.current_dir)
+            .field("quantization", &self.quantization)
+            .field("provision", &self.provision)
+            .field("source_required", &self.source_required)
+            .finish()
+    }
 }
 
 impl WorkerCommand {
@@ -1232,6 +1249,17 @@ impl Transcriber for JsonlTranscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_command_debug_never_formats_environment_values() {
+        let mut command = WorkerCommand::python("python");
+        command
+            .env
+            .push(("ASR_API_KEY".into(), "synthetic-private-key".into()));
+        let debug = format!("{command:?}");
+        assert!(debug.contains("ASR_API_KEY"));
+        assert!(!debug.contains("synthetic-private-key"));
+    }
 
     #[test]
     fn worker_health_parsing_reports_runtime_and_rejects_untrusted_shapes() {

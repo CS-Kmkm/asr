@@ -6,6 +6,7 @@ mod audio;
 mod commands;
 mod correction;
 mod correction_prompt;
+mod credentials;
 mod dictionary;
 mod environment;
 mod injection;
@@ -148,6 +149,16 @@ pub(crate) fn command_error(error: impl std::fmt::Display) -> String {
 }
 
 pub(crate) fn worker_command_for_settings(settings: &Settings) -> WorkerCommand {
+    let key = (settings.asr_backend == "openai-compatible")
+        .then(|| credentials::key(settings.api_key_env_var.trim()))
+        .flatten();
+    worker_command_with_speech_key(settings, key)
+}
+
+pub(crate) fn worker_command_with_speech_key(
+    settings: &Settings,
+    speech_key: Option<String>,
+) -> WorkerCommand {
     let (python, project_root) = worker_runtime();
     let mut command = WorkerCommand::python(python).with_backend(&settings.asr_backend);
     command.source_required = environment::value_os("ASR_PYTHON").is_none();
@@ -179,7 +190,7 @@ pub(crate) fn worker_command_for_settings(settings: &Settings) -> WorkerCommand 
             "ASR_API_BASE_URL".into(),
             settings.api_base_url.trim().into(),
         ));
-        if let Some(api_key) = environment::value(settings.api_key_env_var.trim()) {
+        if let Some(api_key) = speech_key {
             command.env.push(("ASR_API_KEY".into(), api_key));
         }
     }
@@ -1648,6 +1659,8 @@ pub fn run() {
             commands::get_gpu_diagnostics,
             commands::get_storage_diagnostics,
             commands::get_worker_health,
+            commands::credentials::get_provider_credentials,
+            commands::credentials::update_provider_credential,
             commands::run_gpu_diagnostics,
             commands::list_history,
             commands::delete_history_item,

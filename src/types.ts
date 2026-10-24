@@ -224,6 +224,14 @@ export interface WorkerHealth {
   computeType: string | null;
 }
 
+export type CredentialProvider = "openai" | "gemini" | "speech";
+export interface CredentialStatus {
+  provider: CredentialProvider;
+  alias: string;
+  source: "credential_manager" | "environment" | "missing";
+  storeAvailable: boolean;
+}
+
 export interface DictionaryEntry {
   id: number;
   reading: string;

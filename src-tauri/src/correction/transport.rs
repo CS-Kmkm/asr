@@ -27,9 +27,14 @@ pub(super) enum ProviderAccess {
 }
 
 impl ProviderAccess {
-    fn key(&self, environment: &str) -> Result<String, CorrectionError> {
+    async fn key(&self, environment: &str) -> Result<String, CorrectionError> {
         match self {
-            Self::Configured => api_key(environment),
+            Self::Configured => {
+                let name = environment.to_owned();
+                tokio::task::spawn_blocking(move || api_key(&name))
+                    .await
+                    .map_err(|_| CorrectionError::MissingApiKey(environment.into()))?
+            }
             #[cfg(test)]
             Self::Stub { api_key, .. } => Ok(api_key.clone()),
         }
@@ -103,7 +108,7 @@ pub(super) async fn request_text_with_access(
     let client = access.client(provider == "local")?;
     let (request, sent_key) = match provider {
         "openai" => {
-            let key = access.key(&settings.openai_api_key_env_var)?;
+            let key = access.key(&settings.openai_api_key_env_var).await?;
             let body = openai_request(settings, input, instruction, budget);
             let request = client
                 .post(access.endpoint(OPENAI_RESPONSES_URL))
@@ -112,7 +117,7 @@ pub(super) async fn request_text_with_access(
             (request, Some(key))
         }
         "gemini" => {
-            let key = access.key(&settings.gemini_api_key_env_var)?;
+            let key = access.key(&settings.gemini_api_key_env_var).await?;
             let body = gemini_request(settings, input, instruction, budget);
             let request = client
                 .post(access.endpoint(GEMINI_INTERACTIONS_URL))

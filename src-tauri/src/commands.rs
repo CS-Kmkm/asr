@@ -1,3 +1,5 @@
+pub(crate) mod credentials;
+
 #[cfg(test)]
 use crate::pipeline::{classify_ai_stage, AiStageResult};
 #[cfg(test)]
@@ -4418,6 +4420,28 @@ mod tests {
     }
 
     #[test]
+    fn credential_changes_refuse_busy_operations_and_keep_starts_out_until_reconfigured() {
+        let gate = ModelChangeGate::new();
+        assert!(gate
+            .begin_secret_change(|| PipelinePhase::Recording)
+            .is_err());
+        assert!(gate
+            .begin_secret_change(|| PipelinePhase::Processing)
+            .is_err());
+        assert!(gate
+            .begin_secret_change(|| PipelinePhase::Starting)
+            .is_err());
+        let change = gate.begin_secret_change(|| PipelinePhase::Idle).unwrap();
+        assert_eq!(
+            gate.begin_pipeline(|| Ok(())),
+            Err(MODEL_CHANGE_IN_PROGRESS)
+        );
+        assert!(gate.begin_secret_change(|| PipelinePhase::Idle).is_err());
+        drop(change);
+        assert_eq!(gate.begin_pipeline(|| Ok(())), Ok(()));
+    }
+
+    #[test]
     fn a_start_during_a_model_change_fails_fast_instead_of_waiting() {
         let gate = Arc::new(ModelChangeGate::new());
         let lifecycle = PipelineLifecycle::default();
@@ -5226,10 +5250,12 @@ pub(crate) async fn update_settings(
     }
     let model_configuration_changed = worker_configuration_changed(&previous, &settings);
     if model_configuration_changed {
-        services
-            .transcriber
-            .reconfigure(worker_command_for_settings(&settings))
-            .await;
+        let worker_settings = settings.clone();
+        let command =
+            tokio::task::spawn_blocking(move || worker_command_for_settings(&worker_settings))
+                .await
+                .map_err(|_| "settings task failed".to_owned())?;
+        services.transcriber.reconfigure(command).await;
     }
     if model_configuration_changed {
         let (model_id, detail) = model_identity(&settings);
@@ -5302,6 +5328,20 @@ pub(crate) fn begin_history_retry(
 static MODEL_CHANGE_GATE: ModelChangeGate = ModelChangeGate::new();
 
 impl ModelChangeGate {
+    fn begin_secret_change(
+        &self,
+        phase: impl FnOnce() -> PipelinePhase,
+    ) -> Result<ModelChangeGuard<'_>, String> {
+        let mut changing = self.changing();
+        if *changing {
+            return Err(MODEL_CHANGE_IN_PROGRESS.into());
+        }
+        if phase() != PipelinePhase::Idle {
+            return Err("Finish the current voice operation before changing API keys.".into());
+        }
+        *changing = true;
+        Ok(ModelChangeGuard { gate: self })
+    }
     const fn new() -> Self {
         Self {
             changing: Mutex::new(false),

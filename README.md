@@ -206,9 +206,9 @@ The generation token limit for VibeVoice can be overridden via
 This backend calls `POST /v1/audio/transcriptions`, so the same desktop workflow
 can use OpenAI or a compatible local server. In **Models**, select
 **OpenAI-compatible API**, then configure the base URL and model ID. API secrets
-are not stored in application settings. The desktop app loads a local `.env`
-file at startup and reads the environment variable named in the UI (by default
-`OPENAI_API_KEY`). Only the first existing `.env` is loaded (files are not
+are not stored in application settings. Settingsの「プロバイダーのAPIキー」で保存すると、Windows資格情報マネージャーを優先して使います。
+未保存・利用不可の場合は、UIで指定した環境変数名（既定 `OPENAI_API_KEY`）の値を使います。
+The desktop app loads a local `.env` file at startup. Only the first existing `.env` is loaded (files are not
 merged), checked in this order:
 
 1. next to the desktop executable;
@@ -253,8 +253,9 @@ exist.
 
 The optional correction stage runs after transcription and before text
 insertion. Its dedicated **AI text correction** card in **Settings** has a
-master switch that enables or disables all correction processing and external
-API requests at once. Provider, model, and editing options remain editable
+master switch that enables or disables Dictate correction. Translate、Edit、Askはこのスイッチとは別に、起動時に選択プロバイダーを使います。
+必要なAIモードでは、録音前にキー・モデル・ローカルendpointの設定を検査します。この検査は通信しないため、キーの有効性や接続先の稼働は保証しません。
+Provider, model, and editing options remain editable
 while the master switch is off, so correction can be configured before it is
 enabled. The transcript text and preferred dictionary spellings are sent to
 the selected provider; recorded audio is not. If correction fails, the
@@ -346,8 +347,14 @@ All fixed prompt text and prompt-size limits are centralized in
 `src-tauri/src/correction_prompt.rs` under the `Prompt tuning` block. Edit that
 block to tune correction behavior without changing provider/API request code.
 
-API secrets are never stored in application settings. Put the environment
-variables shown in Settings in `.env`, then restart the desktop app:
+Settingsの「プロバイダーのAPIキー」ではマスク入力から保存・削除でき、変更は再起動なしで反映します。
+保存先はWindows資格情報マネージャーで、設定・履歴のDBには保存しません。開発版と配布版は別の保存領域を使い、
+キーは同じWindowsアカウントのローカル保存とします。[keyringのWindows用アダプター](https://github.com/open-source-cooperative/windows-native-keyring-store)
+を使い、同じエントリの操作は1つの専用スレッドで順序付けます。
+キーは設定済みの環境変数名に紐づきます。音声とOpenAIで同じ名前を使う場合は同じキーを共有します。
+保存済みキーを削除しても、環境変数・`.env`のキーは削除しません。
+
+環境変数・`.env`も引き続き代替として利用できます。`.env`を編集した場合はアプリを再起動します:
 
 ```powershell
 # OpenAI Responses API

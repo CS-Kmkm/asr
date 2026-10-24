@@ -23,6 +23,19 @@ const backendTemplates = Object.entries(backendCatalogue).filter(([, entry]) => 
 });
 
 const en = {
+  "Provider API keys": "Provider API keys",
+  "Keys saved here use Windows Credential Manager and take effect without restarting. They are not saved in Settings or History. Environment and .env keys remain a fallback. Finish voice operations before changing keys.": "Keys saved here use Windows Credential Manager and take effect without restarting. They are not saved in Settings or History. Environment and .env keys remain a fallback. Finish voice operations before changing keys.",
+  "Speech API key": "Speech API key",
+  "OpenAI API key": "OpenAI API key",
+  "Gemini API key": "Gemini API key",
+  "Saved in Credential Manager": "Saved in Credential Manager",
+  "Environment fallback": "Environment fallback",
+  "Credential Manager is unavailable in this environment.": "Credential Manager is unavailable in this environment.",
+  "Save key": "Save key",
+  "Delete saved key": "Delete saved key",
+  "API key saved": "API key saved",
+  "Saved key deleted. Environment fallback may still apply.": "Saved key deleted. Environment fallback may still apply.",
+  "API key status or update failed. Finish voice operations, check the saved environment variable names and Windows credentials, then reopen Settings.": "API key status or update failed. Finish voice operations, check the saved environment variable names and Windows credentials, then reopen Settings.",
   "Worker environment": "Worker environment",
   "Check worker environment": "Check worker environment",
   "This check starts a temporary worker if needed and may prepare dependencies. It does not load or restore a model. The Python path is shown locally and excluded from copied diagnostics.": "This check starts a temporary worker if needed and may prepare dependencies. It does not load or restore a model. The Python path is shown locally and excluded from copied diagnostics.",
@@ -303,6 +316,19 @@ const en = {
 } as const;
 export type MessageKey = keyof typeof en | keyof typeof backendMessages;
 const ja: Record<keyof typeof en, string> = {
+  "Provider API keys": "プロバイダーのAPIキー",
+  "Keys saved here use Windows Credential Manager and take effect without restarting. They are not saved in Settings or History. Environment and .env keys remain a fallback. Finish voice operations before changing keys.": "ここで保存するキーはWindows資格情報マネージャーに保存し、再起動なしで反映します。設定や履歴には保存しません。環境変数・.envのキーは代替として引き続き利用できます。キーの変更前に録音・処理を終了してください。",
+  "Speech API key": "音声APIのキー",
+  "OpenAI API key": "OpenAIのAPIキー",
+  "Gemini API key": "GeminiのAPIキー",
+  "Saved in Credential Manager": "資格情報マネージャーに保存済み",
+  "Environment fallback": "環境変数・.envから取得",
+  "Credential Manager is unavailable in this environment.": "この環境では資格情報マネージャーを利用できません。",
+  "Save key": "キーを保存",
+  "Delete saved key": "保存済みのキーを削除",
+  "API key saved": "APIキーを保存しました",
+  "Saved key deleted. Environment fallback may still apply.": "保存済みのキーを削除しました。環境変数・.envのキーが使われる場合があります。",
+  "API key status or update failed. Finish voice operations, check the saved environment variable names and Windows credentials, then reopen Settings.": "APIキーの状態確認または更新に失敗しました。録音・処理を終了し、保存済みの環境変数名とWindowsの資格情報を確認して、設定画面を開き直してください。",
   "Worker environment": "ワーカー環境",
   "Check worker environment": "ワーカー環境を検査",
   "This check starts a temporary worker if needed and may prepare dependencies. It does not load or restore a model. The Python path is shown locally and excluded from copied diagnostics.": "必要に応じて一時ワーカーを起動し、依存環境を構築します。モデルのロードや復元は行いません。Pythonのパスはこの画面だけに表示し、コピーする診断結果には含めません。",
