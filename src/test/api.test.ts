@@ -32,6 +32,17 @@ test("History IPC carries the search and cursor, defaulting to the first page", 
   ]);
 });
 
+test("text-only History IPC passes the explicit saved row and action", async () => {
+  Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+  const api = await import("../api");
+  await api.reprocessHistoryText(12, { kind: "correct", profile: "category:email" });
+  await api.reprocessHistoryText(12, { kind: "translate", target: "ja" });
+  expect(vi.mocked(invoke).mock.calls).toEqual([
+    ["reprocess_history_text", { id: 12, action: { kind: "correct", profile: "category:email" } }],
+    ["reprocess_history_text", { id: 12, action: { kind: "translate", target: "ja" } }],
+  ]);
+});
+
 test("credential IPC reads presence and passes explicit save/delete without Settings persistence", async () => {
   Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
   const api = await import("../api");

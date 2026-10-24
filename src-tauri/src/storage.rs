@@ -5636,6 +5636,31 @@ mod tests {
     }
 
     #[test]
+    fn text_retry_save_purges_expired_source_before_atomic_insert() {
+        let storage = Storage::in_memory().unwrap();
+        storage.add_history(&item()).unwrap();
+        let source = storage.list_history(HistoryFilter::All, 1).unwrap()[0].id;
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE dictation_history SET expires_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+                [source],
+            )
+            .unwrap();
+        let mut result = item();
+        result.retry_of_id = Some(source);
+        assert_eq!(
+            storage.save_history_text_retry(source, &result).unwrap(),
+            None
+        );
+        assert!(storage
+            .list_history(HistoryFilter::All, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn history_search_and_paging_apply_before_limit_with_stable_ties() {
         let storage = Storage::in_memory().unwrap();
         for _ in 0..105 {

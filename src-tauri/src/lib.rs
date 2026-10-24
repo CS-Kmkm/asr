@@ -1668,6 +1668,7 @@ pub fn run() {
             commands::preview_history_retention_purge,
             commands::get_history_audio,
             commands::retry_history_item,
+            commands::history_text::reprocess_history_text,
             commands::list_dictionary,
             commands::add_dictionary_entry,
             commands::update_dictionary_entry,

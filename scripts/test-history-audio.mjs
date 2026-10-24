@@ -101,7 +101,7 @@ function historyPage(onLoadAudio) {
   }, globals);
   const noop = () => {};
   const tree = HistoryPage({
-    settings: { historyRetention: "one_month", keepFailedTakes: true }, settingsLoaded: true, history: [item],
+    settings: { ...load("../src/api.ts").defaultSettings, historyRetention: "one_month", keepFailedTakes: true }, settingsLoaded: true, history: [item],
     filter: "all", onSave: noop, onFilter: noop, onCopyItem: noop, onRetry: noop, onDelete: noop,
     onDeleteAll: noop, onLoadAudio, onAudioError: () => effects.errors++, retryActive: false, onCancelRetry: noop,
   });

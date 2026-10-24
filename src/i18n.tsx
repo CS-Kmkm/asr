@@ -23,6 +23,17 @@ const backendTemplates = Object.entries(backendCatalogue).filter(([, entry]) => 
 });
 
 const en = {
+  "Reprocessed result": "Reprocessed result",
+  "Copy result": "Copy result",
+  "Dismiss result": "Dismiss result",
+  "Global": "Global",
+  "Translation target": "Translation target",
+  "Correction profile": "Correction profile",
+  "Current profile": "Current profile",
+  "Re-correct": "Re-correct",
+  "Translate to…": "Translate to…",
+  "Copy raw": "Copy raw",
+  "Reprocessing uses the raw transcript and does not insert text.": "Reprocessing uses the raw transcript and does not insert text.",
   "History could not be loaded.": "History could not be loaded.",
   "Reload history": "Reload history",
   "Search history": "Search history",
@@ -323,6 +334,17 @@ const en = {
 } as const;
 export type MessageKey = keyof typeof en | keyof typeof backendMessages;
 const ja: Record<keyof typeof en, string> = {
+  "Reprocessed result": "再処理の結果",
+  "Copy result": "結果をコピー",
+  "Dismiss result": "結果を閉じる",
+  "Global": "全体設定",
+  "Translation target": "翻訳先の言語",
+  "Correction profile": "再補正のスタイル",
+  "Current profile": "現在のスタイル設定",
+  "Re-correct": "再補正",
+  "Translate to…": "指定言語へ翻訳",
+  "Copy raw": "原文をコピー",
+  "Reprocessing uses the raw transcript and does not insert text.": "原文を再処理します。入力先への挿入は行いません。",
   "History could not be loaded.": "履歴を読み込めませんでした。",
   "Reload history": "履歴を再読み込み",
   "Search history": "履歴を検索",

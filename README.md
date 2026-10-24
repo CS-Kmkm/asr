@@ -469,6 +469,11 @@ Full usage and Phase 0 gate criteria are documented in
   cloud preview separately; a local opt-in never enables cloud uploads.
 - History can be disabled; when disabled, transcript rows are not written
   (failed recordings kept for Retry are the exception described below).
+- 履歴は本文検索と追加読み込みに対応しています。録音を削除した後も「原文をコピー」「再補正」「指定言語へ翻訳」を使えます。
+  再補正では現在のスタイル設定、または保存済みのスタイルを選択できます。再処理は原文を使い、
+  入力先への挿入は行いません。結果は履歴の保持設定に従って別の行に保存され、元の行は変更しません。
+  結果は検索・絞り込みにかかわらず表示され、コピーできます。クラウドAIへの送信にはPrivacyでの同意も必要です。
+  処理中に削除・期限切れになった元履歴は再保存しません。
 - Usage metrics (event type, provider, duration, success, and error code; no
   text) follow History: they are not recorded while History is off, are
   deleted with the History retention window, and are removed by Delete all.

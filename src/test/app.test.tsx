@@ -2,7 +2,7 @@
 import { beforeEach, expect, test, vi } from "vitest";
 import App from "../App";
 import { defaultSettings, getSettings, getShortcutWarning, updateSettings, listDictionaryCandidates,
-  listHistory, listHistoryPage, deleteAllHistory, getGpuDiagnostics, getModelStatus, getStartupHotkeyWarning, stopRecording, loadModel, previewHistoryRetentionPurge } from "../api";
+  listHistory, listHistoryPage, deleteAllHistory, reprocessHistoryText, copyToClipboard, getGpuDiagnostics, getModelStatus, getStartupHotkeyWarning, stopRecording, loadModel, previewHistoryRetentionPurge } from "../api";
 import type { DictionaryCandidate, HistoryItem, Settings, SettingsSnapshot } from "../types";
 
 const events = vi.hoisted(() => new Map<string, Set<(event: { payload: unknown }) => void>>());
@@ -33,6 +33,8 @@ vi.mock("../api", async (original) => {
     listAudioDevices: async () => [],
     listHistory,
     deleteAllHistory: vi.fn(async () => 0),
+    reprocessHistoryText: vi.fn(),
+    copyToClipboard: vi.fn(async () => {}),
     listHistoryPage: vi.fn<typeof actual.listHistoryPage>(),
     listDictionary: async () => [],
     listDictionaryCandidates: vi.fn(async () => []),
@@ -53,6 +55,7 @@ beforeEach(() => {
   vi.mocked(getStartupHotkeyWarning).mockResolvedValue([]);
   vi.mocked(listDictionaryCandidates).mockResolvedValue([]);
   vi.mocked(listHistory).mockResolvedValue([]);
+  vi.mocked(reprocessHistoryText).mockReset();
   vi.mocked(listHistoryPage).mockReset().mockImplementation(async (filter, options) => ({ items: await listHistory(filter, options), retainedIds: options?.knownIds ?? [] }));
   vi.mocked(getGpuDiagnostics).mockResolvedValue({ status: "unavailable", adapterName: null, driverVersion: null, memoryTotalMb: null, recommendation: "" });
   vi.mocked(getModelStatus).mockResolvedValue({ modelId: null, quantization: "4bit", installed: false, state: "not_configured", detail: "" });
@@ -317,6 +320,86 @@ test("a successful History deletion clears an earlier load failure", async () =>
   await waitFor(() => expect(deleteAllHistory).toHaveBeenCalled());
   await waitFor(() => expect(screen.queryByRole("button", { name: "Reload history" })).toBeNull());
   expect(screen.getByText("No dictations yet")).toBeTruthy();
+});
+
+test("History without audio supports raw copy, explicit profile correction and target translation", async () => {
+  settings.translationTargetLanguages = ["en", "ja"];
+  settings.globalStyleProfile = { formality: "formal", detail: "concise", guidance: "email style" };
+  vi.mocked(listHistory).mockResolvedValue([{ ...history(12), processedText: "old processed text" }]);
+  const correction = deferred<Awaited<ReturnType<typeof reprocessHistoryText>>>();
+  vi.mocked(reprocessHistoryText).mockReturnValueOnce(correction.promise).mockResolvedValueOnce({ text: "翻訳", insertion: "history_only", durationMs: 0, latencyMs: 1 });
+  render(<App />);
+  await navigate("History");
+  const correct = await screen.findByRole("button", { name: "Re-correct" });
+  expect((screen.getByRole("button", { name: "Retry" }) as HTMLButtonElement).disabled).toBe(true);
+  expect((correct as HTMLButtonElement).disabled).toBe(false);
+  fireEvent.click(screen.getByRole("button", { name: "Copy raw" }));
+  await waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith("Transcript-12"));
+  fireEvent.change(screen.getByRole("combobox", { name: "Correction profile" }), { target: { value: "global" } });
+  fireEvent.click(correct);
+  expect(reprocessHistoryText).toHaveBeenCalledWith(12, { kind: "correct", profile: "global" });
+  expect((screen.getByRole("button", { name: "Translate to…" }) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(correct);
+  expect(reprocessHistoryText).toHaveBeenCalledTimes(1);
+  await act(async () => { correction.resolve({ text: "corrected", insertion: "history_only", durationMs: 0, latencyMs: 1 }); });
+  await waitFor(() => expect((screen.getByRole("button", { name: "Translate to…" }) as HTMLButtonElement).disabled).toBe(false));
+  fireEvent.change(screen.getByRole("combobox", { name: "Translation target" }), { target: { value: "ja" } });
+  fireEvent.click(screen.getByRole("button", { name: "Translate to…" }));
+  await waitFor(() => expect(reprocessHistoryText).toHaveBeenLastCalledWith(12, { kind: "translate", target: "ja" }));
+});
+
+test("History exposes returned text for copying even under a filter and source-only search", async () => {
+  vi.mocked(listHistory).mockResolvedValue([{ ...history(12), mode: "ask", sourceText: "selected operand" }]);
+  vi.mocked(reprocessHistoryText).mockResolvedValueOnce({ text: "new corrected output", insertion: "history_only", durationMs: 0, latencyMs: 1 });
+  render(<App />);
+  await navigate("History");
+  fireEvent.change(screen.getByRole("combobox", { name: "History filter" }), { target: { value: "ask" } });
+  fireEvent.change(screen.getByRole("searchbox", { name: "Search history" }), { target: { value: "selected operand" } });
+  fireEvent.click(screen.getByRole("button", { name: "Search" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Re-correct" }));
+  const result = await screen.findByRole("region", { name: "Reprocessed result" });
+  expect(result.textContent).toContain("new corrected output");
+  expect((screen.getByRole("combobox", { name: "History filter" }) as HTMLSelectElement).value).toBe("ask");
+  expect((screen.getByRole("searchbox", { name: "Search history" }) as HTMLInputElement).value).toBe("selected operand");
+  fireEvent.click(screen.getByRole("button", { name: "Copy result" }));
+  await waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith("new corrected output"));
+  fireEvent.click(screen.getByRole("button", { name: "Dismiss result" }));
+  expect(screen.queryByRole("region", { name: "Reprocessed result" })).toBeNull();
+});
+
+test("Delete all suppresses a late text-only reprocessing response", async () => {
+  vi.mocked(listHistory).mockResolvedValue([history(12)]);
+  const pending = deferred<Awaited<ReturnType<typeof reprocessHistoryText>>>();
+  vi.mocked(reprocessHistoryText).mockReturnValueOnce(pending.promise);
+  render(<App />);
+  await navigate("History");
+  fireEvent.click(await screen.findByRole("button", { name: "Re-correct" }));
+  fireEvent.click(screen.getByRole("button", { name: "Delete all" }));
+  await screen.findByText("History deleted.");
+  await act(async () => { pending.resolve({ text: "late output", insertion: "history_only", durationMs: 0, latencyMs: 1 }); });
+  expect(screen.queryByRole("region", { name: "Reprocessed result" })).toBeNull();
+  expect(screen.queryByText("late output")).toBeNull();
+});
+
+test.each([false, true])("Delete all suppresses a stale post-reprocess refresh notice (failure=%s)", async (failure) => {
+  vi.mocked(listHistory).mockResolvedValue([history(12)]);
+  vi.mocked(reprocessHistoryText).mockResolvedValueOnce({ text: "new output", insertion: "history_only", durationMs: 0, latencyMs: 1 });
+  render(<App />);
+  await navigate("History");
+  await screen.findByRole("button", { name: "Re-correct" });
+  const refresh = deferred<Awaited<ReturnType<typeof listHistoryPage>>>();
+  vi.mocked(listHistoryPage).mockReturnValueOnce(refresh.promise);
+  fireEvent.click(screen.getByRole("button", { name: "Re-correct" }));
+  await screen.findByRole("region", { name: "Reprocessed result" });
+  fireEvent.click(screen.getByRole("button", { name: "Delete all" }));
+  await screen.findByText("History deleted.");
+  await act(async () => {
+    if (failure) refresh.reject(new Error("stale refresh failure"));
+    else refresh.resolve({ items: [history(12)], retainedIds: [] });
+  });
+  expect(screen.queryByText("History retry completed.")).toBeNull();
+  expect(screen.queryByText("stale refresh failure")).toBeNull();
+  expect(screen.queryByRole("region", { name: "Reprocessed result" })).toBeNull();
 });
 
 test("retention changes stay disabled until stored settings load", async () => {

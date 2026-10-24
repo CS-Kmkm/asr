@@ -221,6 +221,11 @@ export async function listHistoryPage(filter: HistoryFilter = "all", options: { 
   return invoke("list_history", { filter, limit: 100, query: options.query ?? "", before: options.before ?? null, knownIds: options.knownIds ?? [] });
 }
 
+export async function reprocessHistoryText(id: number, action: import("./types").HistoryTextAction): Promise<RecordingResult> {
+  if (!inTauri) throw new Error("Text reprocessing requires the desktop app.");
+  return invoke("reprocess_history_text", { id, action });
+}
+
 export async function deleteHistoryItem(id: number): Promise<boolean> {
   if (!inTauri) return false;
   return invoke("delete_history_item", { id });

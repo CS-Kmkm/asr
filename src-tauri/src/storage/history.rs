@@ -1,7 +1,8 @@
 //! History queries and transactional deletion. Column order has one owner.
 use super::{
-    checkpoint_deleted_history, purge_dictionary_candidates_before, purge_metrics_before,
-    queue_audio_deletion, Storage, StorageError,
+    checkpoint_deleted_history, insert_history_row, purge_dictionary_candidates_before,
+    purge_history, purge_metrics_before, queue_audio_deletion, stored_settings, Storage,
+    StorageError,
 };
 use crate::types::{HistoryCursor, HistoryFilter, HistoryItem, HistoryPage, HistoryRetention};
 use chrono::Utc;
@@ -51,6 +52,33 @@ fn retained_history_ids(
 }
 
 impl Storage {
+    /// Text-only retries cannot resurrect a source deleted while AI was running.
+    pub fn save_history_text_retry(
+        &self,
+        source_id: i64,
+        item: &crate::types::NewHistoryItem<'_>,
+    ) -> Result<Option<bool>, StorageError> {
+        let mut connection = self.connection()?;
+        let settings = stored_settings(&connection)?;
+        let transaction = connection.transaction()?;
+        let now = Utc::now();
+        purge_history(&transaction, &settings, now)?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dictation_history WHERE id = ?1)",
+            [source_id],
+            |row| row.get(0),
+        )?;
+        let saved = exists && settings.history_retention != HistoryRetention::Never;
+        if saved {
+            insert_history_row(&transaction, item, &now.to_rfc3339(), None, None)?;
+        }
+        transaction.commit()?;
+        checkpoint_deleted_history(&connection);
+        drop(connection);
+        let _ = self.retry_pending_audio_deletions();
+        Ok(exists.then_some(saved))
+    }
+
     #[cfg(test)]
     pub fn list_history(
         &self,

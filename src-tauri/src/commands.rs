@@ -1,4 +1,5 @@
 pub(crate) mod credentials;
+pub(crate) mod history_text;
 
 #[cfg(test)]
 use crate::pipeline::{classify_ai_stage, AiStageResult};

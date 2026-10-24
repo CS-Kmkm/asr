@@ -32,6 +32,7 @@ pub const APP_COMMANDS: &[&str] = &[
     "preview_history_retention_purge",
     "get_history_audio",
     "retry_history_item",
+    "reprocess_history_text",
     "list_dictionary",
     "add_dictionary_entry",
     "update_dictionary_entry",

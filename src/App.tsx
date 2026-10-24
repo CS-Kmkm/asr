@@ -15,6 +15,7 @@ import {
   deleteAllHistory,
   getHistoryAudio,
   retryHistoryItem,
+  reprocessHistoryText,
   confirmDictionaryCandidate,
   importDictionaryCsv,
   listDictionaryCandidates,
@@ -559,6 +560,11 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyFailed, setHistoryFailed] = useState(false);
   const [historyHasMore, setHistoryHasMore] = useState(false);
+  const [historyReprocessing, setHistoryReprocessing] = useState(false);
+  const [historyTextResult, setHistoryTextResult] = useState<{ sourceId: number; text: string } | null>(null);
+  const historyReprocessingRef = useRef(false);
+  const historyTextRequestRef = useRef(0);
+  const historyTextPendingSourceRef = useRef<number | null>(null);
   const [model, setModel] = useState<ModelStatus | null>(null);
   const [modelLoading, setModelLoading] = useState(false);
   const [modelProgress, setModelProgress] = useState<ModelProgress | null>(null);
@@ -910,7 +916,12 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   }
 
   async function removeHistory(id: number) {
-    try { await deleteHistoryItem(id); await refreshHistory(); }
+    try {
+      await deleteHistoryItem(id);
+      if (historyTextPendingSourceRef.current === id) historyTextRequestRef.current += 1;
+      setHistoryTextResult(null);
+      await refreshHistory();
+    }
     catch (error) { showNotice(String(error), "error"); }
   }
 
@@ -924,6 +935,8 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       historyLoadingRef.current = false;
       setHistoryLoading(false);
       setHistoryFailed(false);
+      setHistoryTextResult(null);
+      historyTextRequestRef.current += 1;
       showNotice(t("History deleted."), "success");
     }
     catch (error) { showNotice(String(error), "error"); }
@@ -941,6 +954,24 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       await refreshHistory();
       showNotice(t("History retry completed."), "success");
     } catch (error) { showNotice(String(error), "error"); }
+  }
+
+  async function reprocessHistory(id: number, action: import("./types").HistoryTextAction) {
+    if (historyReprocessingRef.current) return;
+    historyReprocessingRef.current = true;
+    const request = ++historyTextRequestRef.current;
+    historyTextPendingSourceRef.current = id;
+    setHistoryReprocessing(true);
+    setHistoryTextResult(null);
+    try {
+      const result = await reprocessHistoryText(id, action);
+      if (request !== historyTextRequestRef.current) return;
+      setHistoryTextResult({ sourceId: id, text: result.text });
+      await refreshHistory();
+      if (request !== historyTextRequestRef.current) return;
+      showNotice(t("History retry completed."), "success");
+    } catch (error) { if (request === historyTextRequestRef.current) showNotice(String(error), "error"); }
+    finally { historyReprocessingRef.current = false; historyTextPendingSourceRef.current = null; setHistoryReprocessing(false); }
   }
 
   async function updateDictionary(id: number, entry: DictionaryEntryInput): Promise<boolean> {
@@ -1109,6 +1140,10 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
               void refreshHistory(filter).catch((error) => showNotice(String(error), "error"));
             }}
             onRetry={(id) => void retryHistory(id)}
+            onReprocess={(id, action) => void reprocessHistory(id, action)}
+            reprocessedText={historyTextResult?.text}
+            onDismissResult={() => setHistoryTextResult(null)}
+            reprocessing={historyReprocessing || state.phase === "recording" || state.phase === "processing" || state.phase === "injecting"}
             onDelete={(id) => void removeHistory(id)}
             onDeleteAll={() => void clearHistory()}
             onLoadAudio={getHistoryAudio}

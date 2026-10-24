@@ -122,6 +122,8 @@ export const speechLocaleRegistry = [
 ] as const;
 export type SpeechLocale = (typeof speechLocaleRegistry)[number]["tag"];
 export type HistoryRetention = "never" | "24_hours" | "one_week" | "one_month" | "three_months" | "one_year" | "forever";
+
+export type HistoryTextAction = { kind: "correct"; profile: string | null } | { kind: "translate"; target: string };
 export type HistoryFilter = "all" | "dictate" | "translate" | "edit" | "ask";
 
 export type AsrBackend = "vibevoice" | "faster-whisper" | "openai-compatible";

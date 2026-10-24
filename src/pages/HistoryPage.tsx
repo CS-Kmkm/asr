@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Empty } from "../components/ui";
 import { HistoryRetentionSelect } from "../components/HistoryRetentionSelect";
-import type { HistoryAudioPayload, HistoryFilter, HistoryItem, Settings } from "../types";
+import type { HistoryAudioPayload, HistoryFilter, HistoryItem, HistoryTextAction, Settings } from "../types";
 import { insertionDetailLabels, insertionOutcomeLabels, useI18n } from "../i18n";
 
 const filters = [
@@ -24,7 +24,7 @@ const modeLabels = {
   selected_translate: "Selected-text translation",
 } as const;
 
-export function HistoryPage({ settings, settingsLoaded, history, filter, query = "", loading = false, failed = false, hasMore = false, onSearch, onLoadMore, onSave, onFilter, onCopyItem, onRetry, onDelete, onDeleteAll, onLoadAudio, onAudioError, retryActive, onCancelRetry }: {
+export function HistoryPage({ settings, settingsLoaded, history, filter, query = "", loading = false, failed = false, hasMore = false, onSearch, onLoadMore, onReprocess, reprocessing = false, reprocessedText, onDismissResult, onSave, onFilter, onCopyItem, onRetry, onDelete, onDeleteAll, onLoadAudio, onAudioError, retryActive, onCancelRetry }: {
   settings: Settings;
   settingsLoaded: boolean;
   history: HistoryItem[];
@@ -35,6 +35,10 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, query =
   hasMore?: boolean;
   onSearch?: (query: string) => void;
   onLoadMore?: () => void;
+  onReprocess?: (id: number, action: HistoryTextAction) => void;
+  reprocessing?: boolean;
+  reprocessedText?: string;
+  onDismissResult?: () => void;
   onSave: (patch: Partial<Settings>) => void;
   onFilter: (filter: HistoryFilter) => void;
   onCopyItem: (text: string) => void;
@@ -48,6 +52,11 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, query =
 }) {
   const { t } = useI18n();
   const [searchDraft, setSearchDraft] = useState(query);
+  const [target, setTarget] = useState(settings.translationTargetLanguage);
+  const [profile, setProfile] = useState("");
+  const effectiveTarget = settings.translationTargetLanguages.includes(target) ? target : settings.translationTargetLanguage;
+  const effectiveProfile = profile === "global" ? (settings.globalStyleProfile ? profile : "")
+    : settings.scopedStyleProfiles.some((entry) => entry.scope === profile) ? profile : "";
   useEffect(() => setSearchDraft(query), [query]);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [playingId, setPlayingId] = useState<number | null>(null);
@@ -100,6 +109,25 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, query =
       <button className="danger-button" onClick={() => { if (window.confirm(t("Delete all history and suggested spellings?"))) onDeleteAll(); }}>{t("Delete all")}</button>
       {retryActive && <button onClick={onCancelRetry}>{t("Cancel")}</button>}
     </div>
+    {onReprocess && <div className="history-toolbar">
+      <label>{t("Correction profile")} <select aria-label={t("Correction profile")} value={effectiveProfile} disabled={reprocessing} onChange={(event) => setProfile(event.target.value)}>
+        <option value="">{t("Current profile")}</option>
+        {settings.globalStyleProfile && <option value="global">{t("Global")}</option>}
+        {settings.scopedStyleProfiles.map((entry) => <option key={entry.scope} value={entry.scope}>{entry.scope}</option>)}
+      </select></label>
+      <label>{t("Translation target")} <select aria-label={t("Translation target")} value={effectiveTarget} disabled={reprocessing} onChange={(event) => setTarget(event.target.value)}>
+        {settings.translationTargetLanguages.map((language) => <option key={language} value={language}>{language}</option>)}
+      </select></label>
+      <small>{t("Reprocessing uses the raw transcript and does not insert text.")}</small>
+    </div>}
+    {reprocessedText !== undefined && <section className="history-item" aria-label={t("Reprocessed result")}>
+      <strong>{t("Reprocessed result")}</strong>
+      <HistoryText text={reprocessedText} onCopy={onCopyItem} corrected />
+      <div className="history-actions">
+        <button onClick={() => onCopyItem(reprocessedText)}>{t("Copy result")}</button>
+        {onDismissResult && <button onClick={onDismissResult}>{t("Dismiss result")}</button>}
+      </div>
+    </section>}
     {audioUrl && <audio className="history-player" src={audioUrl} controls autoPlay onError={onAudioError} />}
     {loading && <p role="status">{t("Loading...")}</p>}
     {failed && <p role="alert">{t("History could not be loaded.")} {onSearch && <button onClick={() => onSearch(query)}>{t("Reload history")}</button>}</p>}
@@ -124,7 +152,12 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, query =
           {item.processedText && <HistoryText text={item.processedText} onCopy={onCopyItem} corrected />}
           <div className="history-actions">
             <button onClick={() => onCopyItem(item.processedText ?? item.transcriptText)}>{t("Copy")}</button>
-            <button disabled={!item.hasAudio} onClick={() => onRetry(item.id)}>{t("Retry")}</button>
+            <button disabled={!item.transcriptText} onClick={() => onCopyItem(item.transcriptText)}>{t("Copy raw")}</button>
+            {onReprocess && <>
+              <button disabled={!settingsLoaded || reprocessing || !item.transcriptText.trim()} onClick={() => onReprocess(item.id, { kind: "correct", profile: effectiveProfile || null })}>{t("Re-correct")}</button>
+              <button disabled={!settingsLoaded || reprocessing || !item.transcriptText.trim()} onClick={() => onReprocess(item.id, { kind: "translate", target: effectiveTarget })}>{t("Translate to…")}</button>
+            </>}
+            <button disabled={!item.hasAudio || reprocessing} onClick={() => onRetry(item.id)}>{t("Retry")}</button>
             <button disabled={!item.hasAudio} onClick={() => void audio(item, false)}>{t("Play")}</button>
             <button disabled={!item.hasAudio} onClick={() => void audio(item, true)}>{t("Download")}</button>
             <button className="danger-button" onClick={() => onDelete(item.id)}>{t("Delete")}</button>

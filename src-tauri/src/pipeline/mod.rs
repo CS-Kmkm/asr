@@ -47,6 +47,7 @@ struct RecordedTake {
 }
 
 pub(crate) mod finish;
+pub(crate) mod history_text;
 pub(crate) mod retry;
 
 mod orchestration;

@@ -58,7 +58,7 @@ function retentionChange(element, value) {
 const pages = {
   history: (component, settings, onSave, settingsLoaded = true) => load("../src/pages/HistoryPage.tsx", {
     react: hooks, "../components/ui": { Empty: "empty" }, "../components/HistoryRetentionSelect": component, "../i18n": { ...i18n, insertionDetailLabels: {}, insertionOutcomeLabels: {} },
-  }).HistoryPage({ settings, settingsLoaded, history: [], filter: "all", onSave, onFilter() {}, onCopyItem() {}, onRetry() {}, onDelete() {}, onDeleteAll() {}, onLoadAudio() {}, onAudioError() {}, retryActive: false, onCancelRetry() {} }),
+  }).HistoryPage({ settings: { ...load("../src/api.ts").defaultSettings, ...settings }, settingsLoaded, history: [], filter: "all", onSave, onFilter() {}, onCopyItem() {}, onRetry() {}, onDelete() {}, onDeleteAll() {}, onLoadAudio() {}, onAudioError() {}, retryActive: false, onCancelRetry() {} }),
   privacy: (component, settings, onSave, settingsLoaded = true) => load("../src/pages/PrivacyPage.tsx", {
     "../components/ui": { SettingRow: "row", Toggle: "toggle" }, "../components/HistoryRetentionSelect": component, "../i18n": i18n,
   }).PrivacyPage({ settings: { ...load("../src/api.ts").defaultSettings, ...settings }, settingsLoaded, onSave }),
