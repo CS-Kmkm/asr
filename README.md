@@ -290,24 +290,33 @@ optional **Intent-aware** mode may organize the current transcript across its
 utterance order, apply a later explicit correction consistently, merge duplicate
 information, and select paragraph or list structure. The provider is instructed
 not to add details; the mode does not learn automatically or use context beyond
-the current transcript and selected profile. Only intent-aware results are
-checked after correction: a result that drops or adds URLs, digit-bearing
-tokens, backtick code, or listed explicit uncertainty markers is discarded and
-the original transcript is used. This check is syntactic, so it cannot detect
-changed names, spelled-out numbers, unquoted code, domains without a scheme, or
-other invented details; review important text before relying on it.
-Conservative results are inserted without this additional check, exactly as
-before the mode switch existed.
+the current transcript and selected profile.
+
+補正の入力は `{"transcript": ...}` で区切ります。Conservativeでは、文字列の重なり・長さ・主要な文字種を
+使う簡易検査に通らない結果を破棄し、元の文字起こしを使います。Intent-awareではURL・数値・コード・
+不確実さを示す表現・検出できる固有名詞も検査します。名前の比較はNFKCで全角・半角の差を吸収し、
+辞書に読みがあり実際に発話された場合は「ズーム」から「Zoom」などの表記修正を許可します。
+却下の種類は内容を含まないmetric codeとして保存します。これらは構文的な検査であり、意味の保持を
+保証するものではありません。重要な文章は挿入結果を確認してください。
 
 For OpenAI correction, reasoning effort can be set to `none`, `low`, `medium`,
 `high`, `xhigh`, or `max`. Higher values can improve difficult corrections at
 the cost of additional latency and token usage; support depends on the selected
 model.
 
-The provider prompt treats the transcript as untrusted data. Questions and
-commands spoken into the transcript are edited as text rather than answered or
-executed. Additional style and tone guidance can be configured separately from
-the safety and fidelity rules.
+質問や命令も本文として編集するようプロンプトで指示し、簡易検査に通らない回答や翻訳は元文に戻します。
+検査を通る誤りもあるため、回答・命令追従を完全に防ぐものではありません。
+文体の追加指示は、意味保持の指示とは別に設定できます。
+
+クラウド通信は接続10秒・受信の無通信90秒を上限とし、継続して届く長い回答を90秒で打ち切りません。
+出力トークン予算に応じて3〜30分の総上限も設けます。接続・受信エラーや429/5xxは、文字列をまだ
+送出していない場合に限り1回再試行します。2秒以下のRetry-Afterには短いjitterを加えて従い、
+それより長い待機指定では元のエラーを返します。送出開始後は重複を避けるため再試行しません。
+
+Askの計画は、[OpenAIのStructured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)・
+[Gemini Interactionsの構造化出力](https://ai.google.dev/gemini-api/docs/structured-output)・対応するローカルAPIの
+JSON Schemaを要求します。OpenAIの古いモデルや対応を確認できないIDでは、従来どおりプロンプトでJSONを要求します。
+受信後はどちらも厳密に解析・権限判定し、形式の修復や別の操作への置換はしません。
 
 To keep API cost and latency low, the editor uses a compact instruction, sends
 only dictionary aliases actually found in the transcript, caps optional style

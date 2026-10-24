@@ -1,15 +1,75 @@
 //! Fact preservation independent of provider transport and prompt wording.
-use super::CorrectionError;
+use super::{CorrectionError, ProtectedContentKind};
 use crate::{
     dictionary::{fold, CorrectionTerm},
     types::Settings,
 };
 use std::collections::HashMap;
+use unicode_normalization::UnicodeNormalization;
+
+fn conservative_output_is_plausible(source: &str, output: &str, terms: &[CorrectionTerm]) -> bool {
+    let normalize = |text: &str| fold(&text.nfkc().collect::<String>());
+    let mut source = normalize(source);
+    let output = normalize(output);
+    for term in terms {
+        let surface = normalize(&term.surface);
+        for reading in &term.readings {
+            let reading = normalize(reading);
+            if reading.chars().count() >= 3 && !surface.is_empty() {
+                source = source.replace(&reading, &surface);
+            }
+        }
+    }
+    let content = |text: &str| {
+        text.chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<Vec<_>>()
+    };
+    let source = content(&source);
+    let output = content(&output);
+    if source == output {
+        return true;
+    }
+    if source.is_empty() || output.is_empty() || output.len() > source.len() * 3 + 8 {
+        return false;
+    }
+    let japanese = |c: &&char| matches!(**c as u32, 0x3040..=0x30ff | 0x3400..=0x9fff);
+    let source_ja = source.iter().filter(japanese).count();
+    let output_ja = output.iter().filter(japanese).count();
+    let source_latin = source.iter().filter(|c| c.is_ascii_alphabetic()).count();
+    let output_latin = output.iter().filter(|c| c.is_ascii_alphabetic()).count();
+    if (source_ja >= 4 && output_ja * 3 < source_ja)
+        || (source_latin >= 4 && output_latin * 3 < source_latin)
+    {
+        return false;
+    }
+    let grams = |text: &[char]| {
+        let mut counts = HashMap::new();
+        for pair in text.windows(2) {
+            *counts.entry((pair[0], pair[1])).or_insert(0usize) += 1;
+        }
+        counts
+    };
+    if source.len() < 4 || output.len() < 4 {
+        // Short commands and questions give too little evidence for a rewrite.
+        return source.len() >= 3
+            && output.starts_with(&source)
+            && output.len() <= source.len() + 4;
+    }
+    let before = grams(&source);
+    let after = grams(&output);
+    let common: usize = before
+        .iter()
+        .map(|(pair, count)| count.min(after.get(pair).unwrap_or(&0)))
+        .sum();
+    common as f64 / (source.len() - 1) as f64 >= 0.30
+        && common as f64 / (output.len() - 1) as f64 >= 0.30
+}
 
 /// Decides whether a completed provider result may replace the transcript.
 ///
-/// Conservative mode returns the provider text unchanged, exactly as before
-/// intent-aware mode existed. Only intent-aware output is fact-checked.
+/// Conservative output uses a cheap similarity guard; intent-aware output
+/// additionally verifies the protected source facts.
 pub(super) fn accept_provider_correction(
     settings: &Settings,
     transcript: &str,
@@ -17,7 +77,11 @@ pub(super) fn accept_provider_correction(
     corrected: String,
 ) -> Result<String, CorrectionError> {
     if settings.correction_mode != "intent_aware" {
-        return Ok(corrected);
+        return if conservative_output_is_plausible(transcript, &corrected, dictionary_hints) {
+            Ok(corrected)
+        } else {
+            Err(CorrectionError::ConservativeContentChanged)
+        };
     }
     validate_correction_output_with_terms(settings, transcript, &corrected, dictionary_hints)?;
     Ok(corrected)
@@ -45,9 +109,9 @@ pub(super) fn validate_correction_output_with_terms(
         corrections: settings.correction_resolve_self_corrections,
         merge_duplicates: settings.correction_remove_repetitions,
     };
-    if !preserves_protected_spans_with_terms(transcript, corrected, edits, dictionary_hints) {
-        return Err(CorrectionError::ProtectedContentChanged);
-    }
+    protected_rejection(transcript, corrected, edits, dictionary_hints).map_or(Ok(()), |kind| {
+        Err(CorrectionError::ProtectedContentChanged(kind))
+    })?;
     Ok(())
 }
 
@@ -73,29 +137,46 @@ pub(super) fn preserves_protected_spans(
     preserves_protected_spans_with_terms(transcript, corrected, edits, &[])
 }
 
+#[cfg(test)]
 pub(super) fn preserves_protected_spans_with_terms(
     transcript: &str,
     corrected: &str,
     edits: FactEdits,
     dictionary_hints: &[CorrectionTerm],
 ) -> bool {
+    protected_rejection(transcript, corrected, edits, dictionary_hints).is_none()
+}
+
+fn protected_rejection(
+    transcript: &str,
+    corrected: &str,
+    edits: FactEdits,
+    dictionary_hints: &[CorrectionTerm],
+) -> Option<ProtectedContentKind> {
     // Ordered-list markers the model adds for formatting are not facts: they
     // may neither count as new values nor stand in for a dropped number.
     let corrected = &strip_ordered_list_markers(corrected);
     let Some(output_for_new_values) =
         remove_prompted_dictionary_surfaces(transcript, corrected, dictionary_hints)
     else {
-        return false;
+        return Some(ProtectedContentKind::Name);
     };
-    [
-        ProtectedKind::Url,
-        ProtectedKind::Number,
-        ProtectedKind::Code,
-    ]
-    .into_iter()
-    .all(|kind| facts_preserved(transcript, corrected, &output_for_new_values, kind, edits))
-        && uncertainty_preserved(transcript, corrected)
-        && proper_nouns_preserved_with_terms(transcript, corrected, edits, dictionary_hints)
+    for (kind, reason) in [
+        (ProtectedKind::Url, ProtectedContentKind::Url),
+        (ProtectedKind::Number, ProtectedContentKind::Number),
+        (ProtectedKind::Code, ProtectedContentKind::Code),
+    ] {
+        if !facts_preserved(transcript, corrected, &output_for_new_values, kind, edits) {
+            return Some(reason);
+        }
+    }
+    if !uncertainty_preserved(transcript, corrected) {
+        return Some(ProtectedContentKind::Uncertainty);
+    }
+    if !proper_nouns_preserved_with_terms(transcript, corrected, edits, dictionary_hints) {
+        return Some(ProtectedContentKind::Name);
+    }
+    None
 }
 
 /// Names must survive intent-aware editing: every kept source name stays,
@@ -113,7 +194,23 @@ pub(super) fn proper_nouns_preserved_with_terms(
     edits: FactEdits,
     dictionary_hints: &[CorrectionTerm],
 ) -> bool {
-    let terms = dictionary_terms(dictionary_hints);
+    // Normalize only the name comparison. Number, URL and code checks keep
+    // their existing spelling-sensitive contract.
+    let normalized_source: String = source.nfkc().collect();
+    let normalized_output: String = output.nfkc().collect();
+    let (source, output) = (normalized_source.as_str(), normalized_output.as_str());
+    let terms: Vec<_> = dictionary_terms(dictionary_hints)
+        .into_iter()
+        .map(|(surface, readings)| {
+            (
+                surface.nfkc().collect::<String>(),
+                readings
+                    .iter()
+                    .map(|reading| reading.nfkc().collect::<String>())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
     let occurrences = name_occurrences(source, &terms);
     let roles = occurrence_roles(source, &occurrences, edits.corrections);
     let present = |key: &FactKey| {
@@ -322,7 +419,14 @@ pub(super) fn latin_name_occurrences(text: &str) -> Vec<(std::ops::Range<usize>,
             continue;
         }
         let token = &text[range.clone()];
-        if is_latin_proper_noun(token, sentence_initial(text, start)) {
+        let followed_by_non_latin_word = text[end..]
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_ascii() && c.is_alphabetic());
+        if is_latin_proper_noun(
+            token,
+            sentence_initial(text, start) && !followed_by_non_latin_word,
+        ) {
             names.push((range, token.to_owned()));
         }
     }

@@ -1,4 +1,8 @@
 {
+  "Conservative AI correction changed the transcript too much.": {
+    "code": "ai_conservative_content_changed",
+    "ja": "保守的なAI修正で元の文字起こしから大きな変更があったため、修正結果を採用しませんでした。"
+  },
   "The diagnostics folder could not be opened.": {
     "code": "diagnostics_folder_open_failed",
     "ja": "診断ログのフォルダーを開けませんでした。"

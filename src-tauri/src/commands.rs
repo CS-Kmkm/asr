@@ -2166,7 +2166,7 @@ pub(crate) fn edit_failure_message(error: &correction::CorrectionError) -> Strin
 /// Metric code for a failed correction; validator rejects stay countable.
 pub(crate) fn correction_failure_metric_code(error: &correction::CorrectionError) -> &'static str {
     match error {
-        correction::CorrectionError::ProtectedContentChanged => "protected_content_changed",
+        correction::CorrectionError::ProtectedContentChanged(kind) => kind.metric_code(),
         _ => error.failure_code(),
     }
 }
@@ -2302,7 +2302,9 @@ mod tests {
             AiStageResult::Cancelled
         ));
         for error in [
-            correction::CorrectionError::ProtectedContentChanged,
+            correction::CorrectionError::ProtectedContentChanged(
+                correction::ProtectedContentKind::Name,
+            ),
             correction::CorrectionError::OutputLimit,
             correction::CorrectionError::MissingApiKey("OPENAI_API_KEY".into()),
             correction::CorrectionError::InvalidResponse("empty".into()),
@@ -4044,11 +4046,13 @@ mod tests {
 
     #[test]
     fn protected_content_rejection_has_distinct_status_and_metric() {
-        let error = correction::CorrectionError::ProtectedContentChanged;
+        let error = correction::CorrectionError::ProtectedContentChanged(
+            correction::ProtectedContentKind::Name,
+        );
         assert!(correction_failure_status(&error).contains("protected"));
         assert_eq!(
             correction_failure_metric_code(&error),
-            "protected_content_changed"
+            "protected_name_changed"
         );
         let invalid =
             correction::CorrectionError::InvalidResponse("synthetic-provider-secret".into());

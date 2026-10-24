@@ -21,6 +21,7 @@ dotenvy = "0.15"
 futures-util = "0.3"
 getrandom = "0.3"
 unicode-segmentation = "1.12"
+unicode-normalization = "0.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 serde = { version = "1", features = ["derive"] }

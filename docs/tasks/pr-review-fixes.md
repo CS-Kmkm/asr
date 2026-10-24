@@ -13,6 +13,7 @@ Constraints:
 Shared decisions (may decide myself; decided 2026-09-29):
 - D1 Shortcut collision precedence: when saved chords collide across actions, the older action keeps the chord: Dictate > selected-text Translate > voice Translate > Speak to edit > Ask. The losing action is not dispatched on that chord until reassigned, and the warning names it. Applies to #8, #9, #10 and to #14's route order. A save is not rejected for collisions that are unchanged from the saved settings; a newly introduced collision is still rejected (matches #14 `Routes::parse_saved`).
 - D2 #15 conservative mode: remove post-correction fact validation from conservative mode, because the #15 contract requires conservative behavior to stay byte-for-byte equivalent. The validator applies only to `intent_aware`.
+  - Historical scope: the current all-open-issues implementation supersedes this byte-for-byte compatibility decision for #48. Conservative correction now wraps transcript data in JSON and applies a separate similarity guard; it does not adopt the intent-aware fact validator.
 - D3 #12 delete-audio OFF->ON: keep already retained recordings (non-destructive) and state this in Settings; they remain visible and deletable in History.
 - D4 #9 Edit: restore the selection's leading/trailing whitespace around the result. Empty model output stays rejected (fail safe); document that deletion is not an Edit result.
 - D5 Local provider budgets: respect the user's `local_correction_max_tokens` as the cap for every local request (Ask included); do not raise it silently.
