@@ -6,7 +6,11 @@ Python ASR worker (VibeVoice, faster-whisper, or an OpenAI-compatible API).
 ## Current workflow
 
 `Ctrl+Shift+Space` captures the foreground target and starts recording. Press it
-again to stop. The Windows capture backend converts input to a temporary 24 kHz
+again to stop. Settingsの「押している間だけ録音」をモード別にオンにすると、約200ミリ秒待って開始し、キーを離すと停止します。
+短い押下は無視します。開始・停止のタイミングはWindowsのキー通知に依存し、200ミリ秒の境界は厳密ではありません。
+準備中に離した場合は録音を取り消します。既定は従来のtoggleです。待機録音・停止後の追加録音は行いません。
+押下中は、ショートカットやhold設定の変更を保存できません。
+The Windows capture backend converts input to a temporary 16 kHz (faster-whisper) or 24 kHz
 mono PCM WAV, and sends it to the persistent JSONL worker. While you speak,
 partial text appears only in the recording overlay. After transcription and any
 AI correction, the final text is pasted once into the captured target with the

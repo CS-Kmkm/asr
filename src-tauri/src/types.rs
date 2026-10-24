@@ -87,6 +87,8 @@ pub struct Settings {
     pub cloud_live_preview_enabled: bool,
     #[serde(default)]
     pub shortcuts: VoiceShortcuts,
+    #[serde(default)]
+    pub hold_to_talk: HoldToTalk,
     #[serde(default = "default_translation_hotkey")]
     pub translation_hotkey: String,
     #[serde(default)]
@@ -229,6 +231,27 @@ pub struct VoiceShortcuts {
     pub edit: Vec<String>,
 }
 
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct HoldToTalk {
+    pub dictate: bool,
+    pub translate: bool,
+    pub ask: bool,
+    pub edit: bool,
+}
+
+impl HoldToTalk {
+    pub(crate) fn enabled(&self, mode: crate::state::PipelineMode) -> bool {
+        match mode {
+            crate::state::PipelineMode::Dictate => self.dictate,
+            crate::state::PipelineMode::Translate => self.translate,
+            crate::state::PipelineMode::Ask => self.ask,
+            crate::state::PipelineMode::Edit => self.edit,
+            crate::state::PipelineMode::SelectedText => false,
+        }
+    }
+}
+
 impl Default for VoiceShortcuts {
     fn default() -> Self {
         Self {
@@ -360,6 +383,7 @@ impl Default for Settings {
             live_preview_enabled: None,
             cloud_live_preview_enabled: false,
             shortcuts: VoiceShortcuts::default(),
+            hold_to_talk: HoldToTalk::default(),
             translation_hotkey: default_translation_hotkey(),
             translation_instruction: String::new(),
             theme: default_theme(),
@@ -648,6 +672,7 @@ mod tests {
         assert_eq!(settings.api_key_env_var, "OPENAI_API_KEY");
         assert_eq!(settings.shortcuts.translate, ["Ctrl+Shift+Y"]);
         assert_eq!(settings.shortcuts.edit, ["Ctrl+Shift+E"]);
+        assert_eq!(settings.hold_to_talk, HoldToTalk::default());
         assert_eq!(settings.translation_target_languages, ["en", "ja"]);
         assert_eq!(settings.translation_target_language, "en");
         assert!(!settings.text_correction_enabled);

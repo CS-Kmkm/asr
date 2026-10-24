@@ -1,4 +1,12 @@
 {
+  "Release the held shortcut before changing shortcut settings.": {
+    "code": "shortcut_settings_held",
+    "ja": "押しているショートカットを離してから、ショートカットの設定を変更してください。"
+  },
+  "Shortcut settings could not be loaded. Open Settings and try again.": {
+    "code": "shortcut_settings_unavailable",
+    "ja": "ショートカットの設定を読み込めませんでした。設定を開き、もう一度お試しください。"
+  },
   "Configure a valid AI model in Settings before recording.": {
     "code": "ai_invalid_model_configuration",
     "ja": "録音前に、設定で有効なAIモデルを指定してください。"

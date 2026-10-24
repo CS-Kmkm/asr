@@ -47,6 +47,7 @@ export interface Settings {
   livePreviewEnabled: boolean | null;
   cloudLivePreviewEnabled: boolean;
   shortcuts: Record<ShortcutMode, string[]>;
+  holdToTalk: Record<ShortcutMode, boolean>;
   translationHotkey: string;
   translationInstruction: string;
   translationTargetLanguages: string[];

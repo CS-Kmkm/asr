@@ -143,11 +143,21 @@ impl PipelineLifecycle {
     pub fn begin_processing(
         &self,
     ) -> Result<(u64, PipelineMode, watch::Receiver<bool>), &'static str> {
+        self.begin_processing_for(None)
+    }
+
+    pub fn begin_processing_for(
+        &self,
+        expected: Option<u64>,
+    ) -> Result<(u64, PipelineMode, watch::Receiver<bool>), &'static str> {
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| "pipeline lifecycle is unavailable")?;
         let operation = inner.as_mut().ok_or("no recording is active")?;
+        if expected.is_some_and(|id| operation.id != id) {
+            return Err("pipeline operation is no longer active");
+        }
         if operation.phase != PipelinePhase::Recording {
             return Err("recording stop is already in progress");
         }
@@ -158,6 +168,22 @@ impl PipelineLifecycle {
         let claimed = (operation.id, operation.mode, operation.cancel.subscribe());
         self.publish_phase(&inner);
         Ok(claimed)
+    }
+
+    /// A held chord released during preparation must prevent a later mic
+    /// open. The start owner performs cleanup and releases the lifecycle.
+    pub fn cancel_start(&self, id: u64) -> bool {
+        let Ok(inner) = self.inner.lock() else {
+            return false;
+        };
+        let Some(operation) = inner
+            .as_ref()
+            .filter(|op| op.id == id && op.phase == PipelinePhase::Starting)
+        else {
+            return false;
+        };
+        operation.cancel.send_replace(true);
+        true
     }
 
     pub fn cancel(&self) -> Result<Option<(u64, PipelinePhase)>, &'static str> {
@@ -435,6 +461,23 @@ impl<P: FnMut(AppPhase, &'static str)> Drop for TerminalPhaseGuard<'_, P> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hold_release_is_identity_checked_across_start_record_and_new_operations() {
+        let lifecycle = super::PipelineLifecycle::default();
+        let first = lifecycle.begin_start(super::PipelineMode::Dictate).unwrap();
+        assert!(lifecycle.cancel_start(first));
+        assert!(lifecycle.mark_recording(first).is_err());
+        lifecycle.finish(first);
+        let next = lifecycle.begin_start(super::PipelineMode::Ask).unwrap();
+        assert!(!lifecycle.cancel_start(first));
+        lifecycle.mark_recording(next).unwrap();
+        assert!(lifecycle.begin_processing_for(Some(first)).is_err());
+        assert_eq!(lifecycle.phase(), super::PipelinePhase::Recording);
+        assert!(!lifecycle.cancel_start(next));
+        assert_eq!(lifecycle.begin_processing_for(Some(next)).unwrap().0, next);
+        assert!(lifecycle.begin_processing_for(Some(next)).is_err());
+        assert!(!lifecycle.is_cancelled(next));
+    }
     use super::*;
 
     #[test]

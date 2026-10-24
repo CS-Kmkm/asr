@@ -47,7 +47,11 @@ pub(super) async fn run(
     driver: &impl RecordingDriver,
     reason: StopReason,
 ) -> Result<RecordingResult, String> {
-    let (id, mode, cancel) = driver.lifecycle().begin_processing().map_err(|error| {
+    let claimed = match reason {
+        StopReason::HoldRelease(id) => driver.lifecycle().begin_processing_for(Some(id)),
+        _ => driver.lifecycle().begin_processing(),
+    };
+    let (id, mode, cancel) = claimed.map_err(|error| {
         // An automatic stop losing the race must not overwrite the winner.
         if error == "no recording is active" && reason == StopReason::User {
             driver.stage(

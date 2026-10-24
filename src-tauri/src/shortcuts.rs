@@ -3,7 +3,72 @@ use crate::{
     state::{PipelineMode, PipelinePhase},
     types::Settings,
 };
-use tauri_plugin_global_shortcut::{Code, Shortcut};
+use tauri_plugin_global_shortcut::{Code, Shortcut, ShortcutState};
+
+/// Keep native notifications nonblocking while preserving key event order.
+/// The plugin calls its handler under the native shortcut registry lock.
+pub(crate) async fn dispatch_events(
+    mut events: tokio::sync::mpsc::UnboundedReceiver<(Shortcut, ShortcutState)>,
+    handler: impl Fn(Shortcut, ShortcutState) + Send + Sync + 'static,
+) {
+    let handler = std::sync::Arc::new(handler);
+    while let Some((chord, state)) = events.recv().await {
+        let handler = handler.clone();
+        let _ = tokio::task::spawn_blocking(move || handler(chord, state)).await;
+    }
+}
+
+/// One physical key hold. Repeats and overlapping chords never replace its
+/// owner; a release can affect only the operation this generation started.
+#[derive(Default)]
+pub(crate) struct HoldLease {
+    next: u64,
+    current: Option<(u64, Shortcut, Option<u64>)>,
+}
+
+impl HoldLease {
+    pub(crate) fn check_settings_update(
+        &self,
+        previous: &Settings,
+        next: &Settings,
+    ) -> Result<(), &'static str> {
+        if self.current.is_some()
+            && (previous.shortcuts != next.shortcuts
+                || previous.translation_hotkey != next.translation_hotkey
+                || previous.hold_to_talk != next.hold_to_talk)
+        {
+            return Err("Release the held shortcut before changing shortcut settings.");
+        }
+        Ok(())
+    }
+    pub(crate) fn begin(&mut self, chord: Shortcut) -> Option<u64> {
+        if self.current.is_some() {
+            return None;
+        }
+        self.next = self.next.checked_add(1)?;
+        self.current = Some((self.next, chord, None));
+        Some(self.next)
+    }
+
+    pub(crate) fn is_current(&self, generation: u64) -> bool {
+        self.current.is_some_and(|(id, _, _)| id == generation)
+    }
+
+    pub(crate) fn bind(&mut self, generation: u64, operation: u64) {
+        if let Some((id, _, owned)) = self.current.as_mut() {
+            if *id == generation {
+                *owned = Some(operation);
+            }
+        }
+    }
+
+    pub(crate) fn release(&mut self, chord: Shortcut) -> Option<u64> {
+        if !self.current.is_some_and(|(_, held, _)| held == chord) {
+            return None;
+        }
+        self.current.take().and_then(|(_, _, owned)| owned)
+    }
+}
 
 /// Short-lived capture of an already registered chord inside the main window.
 /// Chords stay registered, so the OS can deliver them to the recorder rather
@@ -434,6 +499,85 @@ pub(crate) fn update_registrations<E: std::fmt::Display>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn native_notifications_remain_nonblocking_and_ordered_while_dispatch_waits() {
+        let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (output, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let signal = entered.clone();
+        let (resume, blocked) = std::sync::mpsc::channel();
+        let blocked = std::sync::Mutex::new(blocked);
+        let task = tokio::spawn(super::dispatch_events(receiver, move |_, state| {
+            if state == super::ShortcutState::Pressed {
+                signal.notify_one();
+                blocked
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+            }
+            output.send(state).unwrap();
+        }));
+        let chord = super::cancel_chord();
+        events.send((chord, super::ShortcutState::Pressed)).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        events
+            .send((chord, super::ShortcutState::Released))
+            .unwrap();
+        assert!(observed.try_recv().is_err());
+        resume.send(()).unwrap();
+        assert_eq!(observed.recv().await, Some(super::ShortcutState::Pressed));
+        assert_eq!(observed.recv().await, Some(super::ShortcutState::Released));
+        drop(events);
+        task.await.unwrap();
+    }
+    #[test]
+    fn route_or_behavior_changes_wait_for_physical_key_release() {
+        let previous = crate::types::Settings::default();
+        let mut next = previous.clone();
+        let mut hold = super::HoldLease::default();
+        let chord = super::cancel_chord();
+        hold.begin(chord).unwrap();
+        next.interaction_sounds = !next.interaction_sounds;
+        assert!(hold.check_settings_update(&previous, &next).is_ok());
+        next.shortcuts.dictate = vec!["Ctrl+Alt+V".into()];
+        assert!(hold.check_settings_update(&previous, &next).is_err());
+        next = previous.clone();
+        next.hold_to_talk.dictate = true;
+        assert!(hold.check_settings_update(&previous, &next).is_err());
+        hold.release(chord);
+        assert!(hold.check_settings_update(&previous, &next).is_ok());
+    }
+    #[test]
+    fn released_short_hold_never_owns_an_operation_and_repeats_do_not_rearm() {
+        let mut hold = super::HoldLease::default();
+        let chord = super::cancel_chord();
+        let first = hold.begin(chord).unwrap();
+        assert!(hold.begin(chord).is_none());
+        assert!(hold.is_current(first));
+        assert_eq!(hold.release(chord), None);
+        assert!(!hold.is_current(first));
+        let second = hold.begin(chord).unwrap();
+        assert!(!hold.is_current(first));
+        hold.bind(first, 1);
+        hold.bind(second, 2);
+        assert_eq!(hold.release(chord), Some(2));
+        assert_eq!(hold.release(chord), None);
+    }
+
+    #[test]
+    fn another_chord_cannot_replace_or_release_a_held_operation() {
+        let mut hold = super::HoldLease::default();
+        let chord = super::cancel_chord();
+        let other = crate::parse_shortcut("Ctrl+Shift+Space").unwrap();
+        let id = hold.begin(chord).unwrap();
+        hold.bind(id, 99);
+        assert!(hold.begin(other).is_none());
+        assert_eq!(hold.release(other), None);
+        assert_eq!(hold.release(chord), Some(99));
+    }
     use super::*;
 
     #[test]

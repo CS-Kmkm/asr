@@ -23,6 +23,8 @@ const backendTemplates = Object.entries(backendCatalogue).filter(([, entry]) => 
 });
 
 const en = {
+  "Hold to talk": "Hold to talk",
+  "Hold to talk waits about 200 ms before recording and stops on key release. Turn it off to toggle recording with two presses.": "Hold to talk waits about 200 ms before recording and stops on key release. Turn it off to toggle recording with two presses.",
   "Custom model identifiers are grouped as other to exclude local paths from diagnostics.": "Custom model identifiers are grouped as other to exclude local paths from diagnostics.",
   "Database check failed": "Database check failed",
   "Schema version": "Schema version",
@@ -291,6 +293,8 @@ const en = {
 } as const;
 export type MessageKey = keyof typeof en | keyof typeof backendMessages;
 const ja: Record<keyof typeof en, string> = {
+  "Hold to talk": "押している間だけ録音",
+  "Hold to talk waits about 200 ms before recording and stops on key release. Turn it off to toggle recording with two presses.": "録音開始まで約200ミリ秒待ち、キーを離すと停止します。オフの場合は、2回の押下で録音の開始・停止を切り替えます。",
   "Custom model identifiers are grouped as other to exclude local paths from diagnostics.": "ローカルのパスを診断結果に含めないよう、任意のモデル識別子は other にまとめます。",
   "Database check failed": "データベースの検査に失敗",
   "Schema version": "スキーマのバージョン",

@@ -13,6 +13,15 @@ vi.mock("../api", async (original) => ({ ...await original<typeof import("../api
 beforeEach(() => { vi.clearAllMocks(); vi.mocked(setShortcutCapture).mockResolvedValue(undefined); });
 afterEach(() => vi.useRealTimers());
 
+test("hold to talk is off by default and each mode saves its own choice", () => {
+  const save = vi.fn();
+  render(<I18nProvider language="en"><SettingsPage settings={defaultSettings} onSave={save} devices={[]} recording={false} /></I18nProvider>);
+  const dictate = screen.getByRole("button", { name: "Dictation shortcuts: Hold to talk" });
+  expect(dictate.getAttribute("aria-pressed")).toBe("false");
+  fireEvent.click(dictate);
+  expect(save).toHaveBeenCalledWith({ holdToTalk: { dictate: true, translate: false, ask: false, edit: false } });
+});
+
 test("free text stays a draft, rejects invalid commits, and saves Enter exactly once", () => {
   const save = vi.fn();
   render(<I18nProvider language="ja"><CommitField label="Model" value="old-model" onCommit={save} validate={validateModel} /></I18nProvider>);

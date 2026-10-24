@@ -306,6 +306,21 @@ async fn a_losing_automatic_stop_does_not_replace_completed_state() {
 }
 
 #[tokio::test]
+async fn stale_hold_release_does_not_touch_another_recording() {
+    let driver = FakeDriver::new(PipelineMode::Dictate, Fault::None);
+    let current = driver.lifecycle.begin_processing().unwrap().0;
+    driver.lifecycle.finish(current);
+    let next = driver.lifecycle.begin_start(PipelineMode::Ask).unwrap();
+    driver.lifecycle.mark_recording(next).unwrap();
+    assert!(run(&driver, StopReason::HoldRelease(current))
+        .await
+        .is_err());
+    assert_eq!(driver.lifecycle.phase(), PipelinePhase::Recording);
+    assert_eq!(driver.audio.lock().await.stops, 0);
+    assert_eq!(driver.transcriber.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn cancelling_in_flight_recognition_publishes_idle_without_delivery() {
     for mode in MODES {
         let driver = FakeDriver::new(mode, Fault::CancelInFlight);

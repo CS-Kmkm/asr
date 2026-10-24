@@ -37,6 +37,7 @@ export async function getUiPreferences(): Promise<{ settings: Pick<Settings, "ui
 }
 
 export const defaultSettings: Settings = {
+  holdToTalk: { dictate: false, translate: false, ask: false, edit: false },
   uiLanguage: "ja",
   theme: "system",
   interactionSounds: false,

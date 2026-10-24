@@ -555,8 +555,11 @@ pub(crate) async fn start_recording_with_origin(
         services,
         state,
         storage,
-        from_shortcut,
-        trigger_chord,
+        StartOrigin {
+            from_shortcut,
+            trigger_chord,
+            hold_generation: None,
+        },
         PipelineMode::Dictate,
     )
     .await
@@ -575,8 +578,11 @@ pub(crate) async fn start_voice_translation_with_origin(
         services,
         state,
         storage,
-        from_shortcut,
-        trigger_chord,
+        StartOrigin {
+            from_shortcut,
+            trigger_chord,
+            hold_generation: None,
+        },
         PipelineMode::Translate,
     )
     .await
@@ -595,8 +601,11 @@ pub(crate) async fn start_speak_to_edit_with_origin(
         services,
         state,
         storage,
-        from_shortcut,
-        trigger_chord,
+        StartOrigin {
+            from_shortcut,
+            trigger_chord,
+            hold_generation: None,
+        },
         PipelineMode::Edit,
     )
     .await
@@ -615,8 +624,11 @@ pub(crate) async fn start_ask_with_origin(
         services,
         state,
         storage,
-        from_shortcut,
-        trigger_chord,
+        StartOrigin {
+            from_shortcut,
+            trigger_chord,
+            hold_generation: None,
+        },
         PipelineMode::Ask,
     )
     .await
@@ -695,27 +707,76 @@ fn start_failure_message(error: &str) -> String {
     known.map_or_else(|| error.to_owned(), str::to_owned)
 }
 
+struct StartOrigin {
+    from_shortcut: bool,
+    trigger_chord: Option<String>,
+    hold_generation: Option<u64>,
+}
+
+pub(crate) async fn start_held_recording(
+    app: AppHandle,
+    mode: PipelineMode,
+    chord: String,
+    generation: u64,
+) -> Result<(), String> {
+    start_recording_mode(
+        app.clone(),
+        app.state::<Services>(),
+        app.state::<AppState>(),
+        app.state::<Storage>(),
+        StartOrigin {
+            from_shortcut: true,
+            trigger_chord: Some(chord),
+            hold_generation: Some(generation),
+        },
+        mode,
+    )
+    .await
+}
+
 async fn start_recording_mode(
     app: AppHandle,
     services: State<'_, Services>,
     state: State<'_, AppState>,
     storage: State<'_, Storage>,
-    from_shortcut: bool,
-    trigger_chord: Option<String>,
+    origin: StartOrigin,
     mode: PipelineMode,
 ) -> Result<(), String> {
+    let StartOrigin {
+        from_shortcut,
+        trigger_chord,
+        hold_generation,
+    } = origin;
     // Until this take captures its own target, the overlay follows the
     // window the user is working in. Never move a running session's overlay.
     if services.lifecycle.phase() == PipelinePhase::Idle {
         recording_overlay::anchor_to_foreground();
     }
-    let claimed = MODEL_CHANGE_GATE.begin_pipeline(|| services.lifecycle.begin_start(mode));
+    let claimed = MODEL_CHANGE_GATE.begin_pipeline(|| {
+        if let Some(generation) = hold_generation {
+            let mut hold = services
+                .shortcut_hold
+                .lock()
+                .map_err(|_| "pipeline lifecycle is unavailable")?;
+            if !hold.is_current(generation) {
+                return Err(cancellation_copy(mode).1);
+            }
+            let id = services.lifecycle.begin_start(mode)?;
+            hold.bind(generation, id);
+            Ok(id)
+        } else {
+            services.lifecycle.begin_start(mode)
+        }
+    });
     let operation_id = match claimed {
         Ok(id) => id,
         Err(error) => {
             // Nothing is owned, so only the overlay reports it, and only when
             // no other operation is using the overlay.
-            if from_shortcut && services.lifecycle.phase() == PipelinePhase::Idle {
+            if hold_generation.is_none()
+                && from_shortcut
+                && services.lifecycle.phase() == PipelinePhase::Idle
+            {
                 recording_overlay::show_message_notice(
                     &app,
                     recording_overlay::NoticeSeverity::Failure,
@@ -1138,6 +1199,7 @@ const MAX_RECORDING_DURATION: Duration = Duration::from_secs(15 * 60);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StopReason {
     User,
+    HoldRelease(u64),
     MicrophoneDisconnected,
     MaximumDuration,
 }
@@ -5068,6 +5130,13 @@ pub(crate) async fn update_settings(
         // recording starts and Retry fail fast meanwhile instead of waiting.
         let model_change =
             MODEL_CHANGE_GATE.begin_change(&previous, &settings, || services.lifecycle.phase())?;
+        // Keep the held route registered until its physical key-up arrives.
+        // The press path takes this same lock before checking the live route.
+        let hold = services
+            .shortcut_hold
+            .lock()
+            .map_err(|_| "pipeline lifecycle is unavailable")?;
+        hold.check_settings_update(&previous, &settings)?;
         let old_routes = services
             .shortcut_routes
             .lock()
@@ -5110,6 +5179,7 @@ pub(crate) async fn update_settings(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = desired_routes;
         drop(cancel_chord);
+        drop(hold);
         *services
             .inactive_shortcuts
             .lock()

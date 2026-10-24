@@ -347,6 +347,7 @@ export function SettingsPage({
         <p className="settings-note">{t("Muting or pausing other applications is unavailable because this app cannot safely control their audio.")}</p>
 
         <h3>{t("Voice mode shortcuts")}</h3>
+        <p>{t("Hold to talk waits about 200 ms before recording and stops on key release. Turn it off to toggle recording with two presses.")}</p>
         <p>{t("Add one to four keyboard shortcuts for each voice mode. A shortcut must be unique across all actions.")}</p>
         {shortcutModes.map(({ mode, label }) => (
           <SettingRow key={mode} title={t(label)} detail={`${t("Enter a shortcut chord such as Ctrl+Shift+Space.")} ${mode === "edit"
@@ -355,6 +356,7 @@ export function SettingsPage({
               ? t("Ask sends only the transcribed spoken instruction to the selected provider for planning. Answer generation using a selection also sends the selected source text with the instruction, even when Dictation AI correction is off. The selected ASR backend may send audio.")
               : ""}`}
             control={<div className="shortcut-list">
+              <Toggle checked={settings.holdToTalk[mode]} label={`${t(label)}: ${t("Hold to talk")}`} onChange={(enabled) => onSave({ holdToTalk: { ...settings.holdToTalk, [mode]: enabled } })} />
               {shortcuts[mode].map((chord, index) => <div className="shortcut-item" key={`${mode}-${index}`}>
                 <ShortcutField label={`${t(label)} ${index + 1}`} value={chord} onChange={(value) => setShortcut(mode, index, value)} conflict={[...Object.entries(shortcuts).flatMap(([other, values]) => values.filter((_, otherIndex) => other !== mode || otherIndex !== index)), translationHotkey].some((other) => normalizeShortcutText(other) !== null && normalizeShortcutText(other) === normalizeShortcutText(chord))} />
                 <button type="button" className="secondary" aria-label={`${t("Remove shortcut")} ${chord || index + 1}`} disabled={shortcuts[mode].length <= 1} onClick={() => removeShortcut(mode, index)}>{t("Remove")}</button>

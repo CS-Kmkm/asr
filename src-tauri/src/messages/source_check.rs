@@ -213,7 +213,10 @@ impl Resolver<'_> {
                 )
                 | (
                     "lib.rs",
-                    "toggle_voice_mode" | "cancel_voice_session" | "initialize_model_runtime",
+                    "toggle_voice_mode"
+                        | "held_voice_mode"
+                        | "cancel_voice_session"
+                        | "initialize_model_runtime",
                     "error"
                 )
         )

@@ -47,7 +47,7 @@ use services::Services;
 #[cfg(test)]
 use sessions::is_external_ask_target;
 pub(crate) use sessions::{AskCapture, AskSession, EditSession};
-use state::{AppState, PipelineLifecycle, PipelineMode};
+use state::{AppState, PipelineLifecycle, PipelineMode, PipelinePhase};
 use storage::{SettingsRepairs, Storage};
 use tauri::{
     menu::{Menu, MenuItem},
@@ -1240,6 +1240,9 @@ async fn follow_cancel_chord(app: AppHandle) {
     }
 }
 
+const SHORTCUT_SETTINGS_UNAVAILABLE: &str =
+    "Shortcut settings could not be loaded. Open Settings and try again.";
+
 fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
     let focused = app
         .get_webview_window("main")
@@ -1269,6 +1272,55 @@ fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
         }
         return;
     };
+    let services = app.state::<Services>();
+    let Ok(mut hold) = services.shortcut_hold.lock() else {
+        return;
+    };
+    // Registration updates use the same gate. Validate queued presses for
+    // both hold and toggle before reading their current behavior setting.
+    let registered = services.shortcut_routes.lock().is_ok_and(|routes| {
+        routes
+            .find(shortcut)
+            .is_some_and(|current| current.action == route.action)
+    });
+    if !registered {
+        return;
+    }
+    let mode = match route.action {
+        shortcuts::Action::Dictate => Some(PipelineMode::Dictate),
+        shortcuts::Action::Translate => Some(PipelineMode::Translate),
+        shortcuts::Action::Edit => Some(PipelineMode::Edit),
+        shortcuts::Action::Ask => Some(PipelineMode::Ask),
+        shortcuts::Action::SelectedText => None,
+    };
+    let hold_mode = if let Some(mode) = mode {
+        let settings = match app.state::<Storage>().get_settings() {
+            Ok(settings) => settings,
+            Err(_) => {
+                emit_status(&app, "error", SHORTCUT_SETTINGS_UNAVAILABLE);
+                if app.state::<Services>().lifecycle.phase() == PipelinePhase::Idle {
+                    recording_overlay::show_message_notice(
+                        &app,
+                        recording_overlay::NoticeSeverity::Failure,
+                        SHORTCUT_SETTINGS_UNAVAILABLE,
+                    );
+                }
+                return;
+            }
+        };
+        settings.hold_to_talk.enabled(mode).then_some(mode)
+    } else {
+        None
+    };
+    if let Some(mode) = hold_mode {
+        let generation = hold.begin(shortcut);
+        drop(hold);
+        if let Some(generation) = generation {
+            tauri::async_runtime::spawn(held_voice_mode(app, mode, route.text, generation));
+        }
+        return;
+    }
+    drop(hold);
     match route.action {
         shortcuts::Action::Dictate => {
             tauri::async_runtime::spawn(toggle_voice_mode(app, PipelineMode::Dictate, route.text))
@@ -1286,6 +1338,48 @@ fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
             tauri::async_runtime::spawn(commands::translate_selection(app))
         }
     };
+}
+
+async fn held_voice_mode(app: AppHandle, mode: PipelineMode, chord: String, generation: u64) {
+    // A brief accidental press opens no microphone and never captures
+    // pre-roll. Starting also rechecks the generation under the hold lock.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    if let Err(error) = commands::start_held_recording(app.clone(), mode, chord, generation).await {
+        let held = app
+            .state::<Services>()
+            .shortcut_hold
+            .lock()
+            .is_ok_and(|hold| hold.is_current(generation));
+        if held {
+            emit_status(&app, "error", &error);
+        }
+    }
+}
+
+fn release_shortcut(app: AppHandle, shortcut: Shortcut) {
+    let owned = app
+        .state::<Services>()
+        .shortcut_hold
+        .lock()
+        .ok()
+        .and_then(|mut hold| hold.release(shortcut));
+    if let Some(id) = owned {
+        tauri::async_runtime::spawn(async move {
+            if app.state::<Services>().lifecycle.cancel_start(id) {
+                return;
+            }
+            // The stop claim checks identity under the lifecycle lock. A
+            // delayed release cannot stop a newer recording or processing.
+            let _ = commands::stop_recording_for(
+                app.clone(),
+                app.state::<Services>(),
+                app.state::<AppState>(),
+                app.state::<Storage>(),
+                commands::StopReason::HoldRelease(id),
+            )
+            .await;
+        });
+    }
 }
 
 async fn initialize_model_runtime(app: AppHandle, settings: Settings) {
@@ -1484,6 +1578,7 @@ fn setup_app(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let (shortcut_events, shortcut_receiver) = tokio::sync::mpsc::unbounded_channel();
     let startup_diagnostics = load_environment_file();
     let builder = tauri::Builder::default();
     // Must stay the first plugin: a second launch hands over to the running
@@ -1507,10 +1602,8 @@ pub fn run() {
         ))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(move |app, pressed, event| {
-                    if event.state() == ShortcutState::Pressed {
-                        handle_shortcut(app.clone(), *pressed);
-                    }
+                .with_handler(move |_app, pressed, event| {
+                    let _ = shortcut_events.send((*pressed, event.state()));
                 })
                 .build(),
         )
@@ -1521,6 +1614,14 @@ pub fn run() {
             if let Err(error) = setup_app(app, log_dir.as_deref(), &startup_diagnostics) {
                 startup_error::report_and_exit(error.as_ref(), log_dir.as_deref());
             }
+            let shortcut_app = app.handle().clone();
+            tauri::async_runtime::spawn(shortcuts::dispatch_events(
+                shortcut_receiver,
+                move |chord, state| match state {
+                    ShortcutState::Pressed => handle_shortcut(shortcut_app.clone(), chord),
+                    ShortcutState::Released => release_shortcut(shortcut_app.clone(), chord),
+                },
+            ));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
