@@ -65,6 +65,8 @@ pub enum CorrectionError {
     Cancelled,
     #[error("invalid local correction endpoint: {0}")]
     InvalidEndpoint(String),
+    #[error("Configure a valid AI model in Settings before recording.")]
+    InvalidModelConfiguration,
     #[error("unsupported text correction provider: {0}")]
     UnsupportedProvider(String),
     #[error("the spoken edit instruction is empty")]
@@ -89,6 +91,7 @@ impl CorrectionError {
             Self::ConservativeContentChanged => "ai_conservative_content_changed",
             Self::ConsentRequired => "ai_consent_required",
             Self::InvalidEndpoint(_) => "ai_invalid_endpoint",
+            Self::InvalidModelConfiguration => "ai_invalid_model_configuration",
             Self::UnsupportedProvider(_) => "ai_unsupported_provider",
             Self::EmptyEditInstruction => "ai_empty_edit_instruction",
             Self::Cancelled => "ai_cancelled",
@@ -407,6 +410,50 @@ fn api_key(environment_variable: &str) -> Result<String, CorrectionError> {
     crate::environment::value(environment_variable)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| CorrectionError::MissingApiKey(environment_variable.into()))
+}
+
+/// Validate required AI configuration without a request or billable probe.
+/// Optional Dictate correction deliberately retains its raw-text fallback.
+pub(crate) fn preflight_recording(
+    settings: &Settings,
+    mode: crate::state::PipelineMode,
+) -> Result<(), CorrectionError> {
+    preflight_with(settings, mode, api_key)
+}
+
+fn preflight_with(
+    settings: &Settings,
+    mode: crate::state::PipelineMode,
+    resolve_key: impl FnOnce(&str) -> Result<String, CorrectionError>,
+) -> Result<(), CorrectionError> {
+    if mode == crate::state::PipelineMode::Dictate {
+        return Ok(());
+    }
+    let (model, key_name) = match settings.correction_provider.as_str() {
+        "openai" => (
+            &settings.openai_correction_model,
+            Some(&settings.openai_api_key_env_var),
+        ),
+        "gemini" => (
+            &settings.gemini_correction_model,
+            Some(&settings.gemini_api_key_env_var),
+        ),
+        "local" => {
+            local_chat_completions_url(&settings.local_correction_base_url)?;
+            (&settings.local_correction_model, None)
+        }
+        provider => return Err(CorrectionError::UnsupportedProvider(provider.into())),
+    };
+    if model.trim().is_empty() || model.len() > 512 || model.chars().any(char::is_control) {
+        return Err(CorrectionError::InvalidModelConfiguration);
+    }
+    if let Some(name) = key_name {
+        let key = resolve_key(name)?;
+        if key.trim().is_empty() || reqwest::header::HeaderValue::from_str(&key).is_err() {
+            return Err(CorrectionError::MissingApiKey(name.to_owned()));
+        }
+    }
+    Ok(())
 }
 
 async fn await_reqwest_or_cancel<T>(
@@ -1338,12 +1385,66 @@ fn proper_nouns_preserved(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::PipelineMode;
     use std::{
         env,
         io::{Read, Write},
         net::TcpListener,
         thread,
     };
+
+    #[test]
+    fn required_ai_modes_reject_missing_credentials_before_recording() {
+        for provider in ["openai", "gemini"] {
+            let settings = Settings {
+                correction_provider: provider.into(),
+                ..Settings::default()
+            };
+            for mode in [
+                PipelineMode::Translate,
+                PipelineMode::Edit,
+                PipelineMode::Ask,
+            ] {
+                let error = preflight_with(&settings, mode, |name| {
+                    Err(CorrectionError::MissingApiKey(name.into()))
+                })
+                .unwrap_err();
+                assert_eq!(error.failure_code(), "ai_missing_api_key");
+                assert!(preflight_with(&settings, mode, |_| Ok("test-key".into())).is_ok());
+                assert!(preflight_with(&settings, mode, |_| Ok("bad\r\nheader".into())).is_err());
+            }
+            assert!(preflight_with(&settings, PipelineMode::Dictate, |_| panic!(
+                "optional correction keeps raw fallback"
+            ))
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn local_preflight_validates_endpoint_and_model_without_a_key_or_network() {
+        let mut settings = Settings {
+            correction_provider: "local".into(),
+            ..Settings::default()
+        };
+        assert!(preflight_with(&settings, PipelineMode::Ask, |_| panic!(
+            "local needs no key"
+        ))
+        .is_ok());
+        settings.local_correction_base_url = "https://public.example/v1".into();
+        assert!(matches!(
+            preflight_with(&settings, PipelineMode::Edit, |_| unreachable!()),
+            Err(CorrectionError::InvalidEndpoint(_))
+        ));
+        settings.local_correction_base_url = "http://127.0.0.1:8000/v1".into();
+        settings.local_correction_model.clear();
+        let error =
+            preflight_with(&settings, PipelineMode::Translate, |_| unreachable!()).unwrap_err();
+        assert_eq!(error.failure_code(), "ai_invalid_model_configuration");
+        assert_eq!(
+            error.user_message(),
+            "Configure a valid AI model in Settings before recording."
+        );
+    }
 
     #[test]
     fn failure_codes_distinguish_actionable_causes_without_provider_text() {
@@ -1827,6 +1928,7 @@ mod tests {
                 CorrectionError::ConservativeContentChanged => "ConservativeContentChanged",
                 CorrectionError::Cancelled => "Cancelled",
                 CorrectionError::InvalidEndpoint(_) => "InvalidEndpoint",
+                CorrectionError::InvalidModelConfiguration => "InvalidModelConfiguration",
                 CorrectionError::UnsupportedProvider(_) => "UnsupportedProvider",
                 CorrectionError::EmptyEditInstruction => "EmptyEditInstruction",
             }

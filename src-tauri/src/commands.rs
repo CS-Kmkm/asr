@@ -799,6 +799,11 @@ async fn start_owned_recording(
     let (cancel_message, cancel_error) = cancellation_copy(mode);
     let settings = storage.get_settings().map_err(command_error)?;
     crate::privacy::check_recording(&settings, mode).map_err(str::to_owned)?;
+    let preflight_settings = settings.clone();
+    tokio::task::spawn_blocking(move || correction::preflight_recording(&preflight_settings, mode))
+        .await
+        .map_err(|_| "recording session task failed".to_owned())?
+        .map_err(|error| error.user_message().to_owned())?;
     state.set_operation(types::OperationKind::Recording, operation_id);
     let mode_shortcuts =
         voice_mode_shortcuts(&settings, mode).ok_or("selected-text translation does not record")?;

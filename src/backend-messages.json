@@ -1,4 +1,8 @@
 {
+  "Configure a valid AI model in Settings before recording.": {
+    "code": "ai_invalid_model_configuration",
+    "ja": "録音前に、設定で有効なAIモデルを指定してください。"
+  },
   "Conservative AI correction changed the transcript too much.": {
     "code": "ai_conservative_content_changed",
     "ja": "保守的なAI修正で元の文字起こしから大きな変更があったため、修正結果を採用しませんでした。"
