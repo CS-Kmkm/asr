@@ -363,7 +363,7 @@ pub(crate) async fn finish(
     };
     let metric_result = storage.add_metric(
         mode_metric,
-        Some(&transcript.model),
+        Some(&settings.asr_backend),
         Some(latency_ms as i64),
         !translation_failed,
         translation_failed.then_some("translation_failed"),

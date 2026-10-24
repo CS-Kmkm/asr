@@ -1,4 +1,5 @@
 pub const APP_COMMANDS: &[&str] = &[
+    "get_storage_diagnostics",
     "open_diagnostics_folder",
     "list_audio_devices",
     "start_recording",

@@ -191,6 +191,27 @@ export interface GpuDiagnostics {
   recommendation: string;
 }
 
+export interface StorageDiagnostics {
+  databaseOk: boolean;
+  schemaVersion: number;
+  summaries: {
+    eventType: string;
+    provider: string | null;
+    count: number;
+    successes: number;
+    timedCount: number;
+    p50Ms: number | null;
+    p95Ms: number | null;
+  }[];
+  outcomes: {
+    eventType: string;
+    provider: string | null;
+    success: boolean;
+    code: string | null;
+    count: number;
+  }[];
+}
+
 export interface DictionaryEntry {
   id: number;
   reading: string;

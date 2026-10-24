@@ -4905,6 +4905,14 @@ async fn storage_task<T: Send + 'static>(
 }
 
 #[tauri::command]
+pub(crate) async fn get_storage_diagnostics(
+    storage: State<'_, Storage>,
+) -> Result<crate::storage::StorageDiagnostics, String> {
+    let storage = storage.inner().clone();
+    storage_task(move || storage.diagnostics().map_err(command_error)).await
+}
+
+#[tauri::command]
 pub(crate) async fn get_settings(
     storage: State<'_, Storage>,
 ) -> Result<types::SettingsSnapshot, String> {

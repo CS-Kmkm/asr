@@ -1,7 +1,9 @@
 mod history;
 mod history_audio;
+mod metrics;
 mod schema;
 use history_audio::queue_audio_deletion;
+pub use metrics::StorageDiagnostics;
 use schema::{run_migrations, MIGRATIONS};
 #[cfg(test)]
 use schema::{stored_min_reader_version, Migration, MIN_READER_VERSION_KEY};
