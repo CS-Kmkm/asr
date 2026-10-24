@@ -114,13 +114,26 @@ pub(crate) fn resolve_profile(
 }
 
 pub(crate) fn guidance(profile: &StyleProfile) -> String {
-    let formality = match profile.formality.as_str() {
-        "formal" => "Use formal, professional wording.",
-        _ => "Use casual, conversational wording.",
-    };
     let detail = match profile.detail.as_str() {
         "detailed" => "Prefer detailed phrasing of existing facts; never add new details.",
         _ => "Prefer concise phrasing.",
+    };
+    guidance_with_detail(profile, detail)
+}
+
+pub(crate) fn action_guidance(profile: &StyleProfile) -> String {
+    let detail = if profile.detail == "detailed" {
+        "Prefer detailed responses when appropriate for the requested action."
+    } else {
+        "Prefer concise phrasing."
+    };
+    guidance_with_detail(profile, detail)
+}
+
+fn guidance_with_detail(profile: &StyleProfile, detail: &str) -> String {
+    let formality = match profile.formality.as_str() {
+        "formal" => "Use formal, professional wording.",
+        _ => "Use casual, conversational wording.",
     };
     let mut result = format!("{formality} {detail}");
     if let Some(extra) = profile

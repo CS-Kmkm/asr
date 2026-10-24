@@ -63,11 +63,22 @@ pub(crate) async fn finish(
         types::AppStage::Correcting,
         "Applying the spoken edit instruction.",
     );
+    let personalization = super::personalization::resolve(
+        storage,
+        &settings,
+        app_context.as_ref(),
+        &instruction_text,
+        Some(&source_text),
+        correction_cancel.clone(),
+    )
+    .await
+    .ok_or("editing was cancelled")?;
     let edit_started = Instant::now();
     let edited = match correction::edit_selected_text(
         &settings,
         &source_text,
         &instruction_text,
+        personalization.prompt(),
         correction_cancel,
         |delta| emit_correction_preview(app, delta, "streaming"),
     )

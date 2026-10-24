@@ -5692,6 +5692,35 @@ mod tests {
         assert_eq!(stored_min_reader_version(&connection).unwrap(), 1);
     }
 
+    #[tokio::test]
+    async fn blocked_personalization_read_does_not_delay_pipeline_cancellation() {
+        let storage = Storage::in_memory().unwrap();
+        let locked_storage = storage.clone();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _lock = locked_storage.connection().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        });
+        held_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let settings = Settings::default();
+        let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
+        let resolution = crate::pipeline::personalization::resolve(
+            &storage, &settings, None, "spoken", None, cancel,
+        );
+        tokio::pin!(resolution);
+        tokio::select! { biased; _ = &mut resolution => panic!("read completed while connection was locked"), _ = tokio::task::yield_now() => {} }
+        cancel_tx.send(true).unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut resolution).await;
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(result.unwrap().is_none());
+    }
+
     #[test]
     fn history_search_and_paging_apply_before_limit_with_stable_ties() {
         let storage = Storage::in_memory().unwrap();

@@ -23,6 +23,8 @@ const backendTemplates = Object.entries(backendCatalogue).filter(([, entry]) => 
 });
 
 const en = {
+  "Apply saved writing preferences to Dictate, Ask and Edit using the captured app.": "Apply saved writing preferences to Dictate, Ask and Edit using the captured app.",
+  "For Dictate, profiles require AI text correction. Ask and Edit use them when Personalization is on.": "For Dictate, profiles require AI text correction. Ask and Edit use them when Personalization is on.",
   "Refresh": "Refresh",
   "Email preset": "Email", "Chat preset": "Chat", "Code / Technical preset": "Code / Technical", "Notes preset": "Notes",
   "Apply a preset": "Apply a preset", "Global style preset": "Global style preset", "Scoped style preset": "Scoped style preset",
@@ -344,6 +346,8 @@ const en = {
 } as const;
 export type MessageKey = keyof typeof en | keyof typeof backendMessages;
 const ja: Record<keyof typeof en, string> = {
+  "Apply saved writing preferences to Dictate, Ask and Edit using the captured app.": "取得した入力先に合わせ、Dictate・Ask・Editへ保存済みの文章スタイルを適用します。",
+  "For Dictate, profiles require AI text correction. Ask and Edit use them when Personalization is on.": "Dictateへの適用にはAI文章補正が必要です。Ask・EditではPersonalizationがオンの場合に適用します。",
   "Refresh": "更新",
   "Email preset": "メール", "Chat preset": "チャット", "Code / Technical preset": "コード・技術文書", "Notes preset": "メモ",
   "Apply a preset": "プリセットを適用", "Global style preset": "全体スタイルのプリセット", "Scoped style preset": "個別スタイルのプリセット",

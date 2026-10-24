@@ -175,10 +175,21 @@ pub(crate) async fn run(
                 types::AppStage::Correcting,
                 "Applying the spoken edit instruction.",
             );
+            let personalization = super::personalization::resolve(
+                storage,
+                &settings,
+                retry_context.as_ref(),
+                &transcript.text,
+                Some(selected),
+                cancel.clone(),
+            )
+            .await
+            .ok_or("history retry was cancelled")?;
             output = correction::edit_selected_text(
                 &settings,
                 selected,
                 &transcript.text,
+                personalization.prompt(),
                 cancel.clone(),
                 |_| {},
             )
@@ -194,10 +205,20 @@ pub(crate) async fn run(
             );
             if source.action_kind.as_deref() == Some("search") {
                 let stored_site = stored_search_site(&source)?;
+                let personalization = super::personalization::resolve(
+                    storage,
+                    &settings,
+                    retry_context.as_ref(),
+                    &transcript.text,
+                    None,
+                    cancel.clone(),
+                )
+                .await
+                .ok_or("history retry was cancelled")?;
                 let plan = correction::generate_ask_plan(
                     &settings,
                     &transcript.text,
-                    &ask::planning_prompt(ask::AskContextKind::Caret),
+                    &personalization.instruction(&ask::planning_prompt(ask::AskContextKind::Caret)),
                     cancel.clone(),
                 )
                 .await
@@ -212,10 +233,20 @@ pub(crate) async fn run(
             } else {
                 let action = stored_ask_action(&source)?;
                 let input = ask::generation_input(source.source_text.as_deref(), &transcript.text);
+                let personalization = super::personalization::resolve(
+                    storage,
+                    &settings,
+                    retry_context.as_ref(),
+                    &transcript.text,
+                    source.source_text.as_deref(),
+                    cancel.clone(),
+                )
+                .await
+                .ok_or("history retry was cancelled")?;
                 output = correction::generate_ask_text(
                     &settings,
                     &input,
-                    &ask::generation_prompt_with_target(&action),
+                    &personalization.instruction(&ask::generation_prompt_with_target(&action)),
                     cancel.clone(),
                 )
                 .await

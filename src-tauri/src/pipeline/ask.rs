@@ -142,11 +142,24 @@ async fn finish_ask(
         "Choosing a safe Ask action.",
     );
     // Planning receives spoken text and context only. It never receives source.
+    let planning_personalization = super::personalization::resolve(
+        storage,
+        &settings,
+        app_context.as_ref(),
+        spoken,
+        None,
+        services
+            .lifecycle
+            .cancellation(operation_id)
+            .map_err(command_error)?,
+    )
+    .await
+    .ok_or("ask was cancelled")?;
     let plan_started = Instant::now();
     let plan = correction::generate_ask_plan(
         &settings,
         spoken,
-        &ask::planning_prompt(session.kind()),
+        &planning_personalization.instruction(&ask::planning_prompt(session.kind())),
         services
             .lifecycle
             .cancellation(operation_id)
@@ -241,7 +254,7 @@ async fn finish_ask(
                 target_language: None,
                 action_kind: Some("search"),
                 search_site: Some(search_site_name(*site)),
-                app_category: None,
+                app_category: crate::app_context::history_category(app_context.as_ref()),
                 duration_ms: Some(duration_ms as i64),
                 latency_ms: Some(latency_ms as i64),
                 retry_of_id: None,
@@ -261,11 +274,24 @@ async fn finish_ask(
         });
     }
     let input = ask::generation_input(session.selected_source(), spoken);
+    let generation_personalization = super::personalization::resolve(
+        storage,
+        &settings,
+        app_context.as_ref(),
+        spoken,
+        session.selected_source(),
+        services
+            .lifecycle
+            .cancellation(operation_id)
+            .map_err(command_error)?,
+    )
+    .await
+    .ok_or("ask was cancelled")?;
     let generation_started = Instant::now();
     let output = correction::generate_ask_text(
         &settings,
         &input,
-        &ask::generation_prompt_with_target(&action),
+        &generation_personalization.instruction(&ask::generation_prompt_with_target(&action)),
         services
             .lifecycle
             .cancellation(operation_id)
@@ -385,7 +411,7 @@ async fn finish_ask(
             },
             action_kind: Some(action_name(&action)),
             search_site: None,
-            app_category: None,
+            app_category: crate::app_context::history_category(app_context.as_ref()),
             duration_ms: Some(duration_ms as i64),
             latency_ms: Some(latency_ms as i64),
             retry_of_id: None,

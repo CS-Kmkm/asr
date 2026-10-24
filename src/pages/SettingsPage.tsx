@@ -422,7 +422,7 @@ export function SettingsPage({
             if (event.key === "Enter") { event.preventDefault(); if (translationInstruction !== settings.translationInstruction) onSave({ translationInstruction }); suppressTranslationInstructionBlurRef.current = true; event.currentTarget.blur(); }
             if (event.key === "Escape") { setTranslationInstruction(settings.translationInstruction); suppressTranslationInstructionBlurRef.current = true; event.currentTarget.blur(); }
           }} />} />
-        <SettingRow title={t("Personalization")} detail={t("Use manually configured abstract style profiles for the captured app category.")}
+        <SettingRow title={t("Personalization")} detail={t("Apply saved writing preferences to Dictate, Ask and Edit using the captured app.")}
           control={<Toggle label={t("Personalization")} checked={settings.personalizationEnabled} onChange={(value) => onSave({ personalizationEnabled: value })} />} />
         <SettingRow title={t("Start with Windows")} detail={t("Launches Local Voice Input automatically when you sign in to Windows.")}
           control={<Toggle label={t("Start with Windows")} checked={settings.autoStart} onChange={(value) => onSave({ autoStart: value })} />} />
@@ -494,7 +494,7 @@ function PersonalizationProfiles({
       <h2>{t("Personalization profiles")}</h2>
       <p>{t("Structured style settings are retained locally; no transcript examples are stored.")}</p>
       {!settings.personalizationEnabled && <p role="status">{t("Inactive: Personalization is off, so these profiles are not used.")}</p>}
-      {!settings.textCorrectionEnabled && <p role="status">{t("Inactive: profiles are used only when AI text correction is on.")}</p>}
+      {!settings.textCorrectionEnabled && <p role="status">{t("For Dictate, profiles require AI text correction. Ask and Edit use them when Personalization is on.")}</p>}
       <SettingRow title={t("Global profile")} detail={t("Fallback style used when no app or category profile matches.")} control={
         <div className="profile-controls">
           <select aria-label={t("Global style preset")} value="" onChange={(event) => {
