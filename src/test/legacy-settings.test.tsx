@@ -110,6 +110,27 @@ test("global profile selects still save immediately", () => {
   assert.deepEqual(page.patches, [{ globalStyleProfile: { ...configuredGlobal, formality: "casual", guidance: "Saved" } }]);
 });
 
+test("built-in presets apply complete editable global and scoped profiles", () => {
+  const page = profileFixture({ globalStyleProfile: configuredGlobal,
+    scopedStyleProfiles: [{ scope: "category:terminal", profile: configuredGlobal }] });
+  fireEvent.change(screen.getByRole("combobox", { name: "Global style preset" }), { target: { value: "chat" } });
+  assert.equal(page.patches.at(-1)!.globalStyleProfile!.formality, "casual");
+  assert.equal(page.patches.at(-1)!.globalStyleProfile!.detail, "concise");
+  assert.match(page.value(GUIDANCE), /conversational/);
+  fireEvent.change(screen.getByRole("combobox", { name: "Scoped style preset 1" }), { target: { value: "technical" } });
+  const profile = page.patches.at(-1)!.scopedStyleProfiles![0];
+  assert.equal(profile.scope, "category:terminal");
+  assert.equal(profile.profile.formality, "formal");
+  assert.match(profile.profile.guidance!, /commands, identifiers/);
+});
+
+test("category picker creates a valid terminal profile without typing a scope", () => {
+  const page = profileFixture();
+  fireEvent.change(screen.getByRole("combobox", { name: "Add category profile" }), { target: { value: "terminal" } });
+  assert.equal(page.patches.length, 1);
+  assert.equal(page.patches[0].scopedStyleProfiles![0].scope, "category:terminal");
+});
+
 test("scoped profile scope and guidance are saved on blur, not per keystroke", () => {
   const page = profileFixture({ globalStyleProfile: configuredGlobal });
   page.click("Add scoped profile");

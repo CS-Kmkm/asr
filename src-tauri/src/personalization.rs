@@ -4,12 +4,13 @@ use crate::types::{AppContext, Settings, StyleProfile};
 
 pub(crate) const MAX_GUIDANCE_CHARS: usize = 300;
 pub(crate) const MAX_SCOPE_CHARS: usize = 80;
-pub(crate) const CATEGORIES: [&str; 6] = [
+pub(crate) const CATEGORIES: [&str; 7] = [
     "browser",
     "email",
     "messaging",
     "development",
     "document",
+    "terminal",
     "other",
 ];
 
@@ -136,6 +137,11 @@ pub(crate) fn guidance(profile: &StyleProfile) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn terminal_scopes_are_valid_for_profiles_and_dictionary_entries() {
+        assert!(validate_scope("category:terminal").is_ok());
+        assert!(validate_dictionary_scope(Some("category:terminal")).is_ok());
+    }
 
     fn profile(formality: &str, detail: &str) -> StyleProfile {
         StyleProfile {

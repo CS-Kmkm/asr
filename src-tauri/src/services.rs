@@ -51,6 +51,7 @@ pub(crate) struct Services {
     pub(crate) answer_panel: answer_panel::AnswerPanelState,
     pub(crate) target: Mutex<Option<TargetWindow>>,
     pub(crate) app_context: Mutex<Option<types::AppContext>>,
+    pub(crate) recent_apps: Mutex<crate::app_context::RecentApps>,
     pub(crate) transcriber: Arc<dyn Transcriber>,
     pub(crate) model: commands::ModelStatusSlot,
     pub(crate) gpu_diagnostics: Mutex<Option<GpuDiagnostics>>,
@@ -82,6 +83,7 @@ impl Services {
             answer_panel: answer_panel::AnswerPanelState::default(),
             target: Mutex::new(None),
             app_context: Mutex::new(None),
+            recent_apps: Mutex::new(crate::app_context::RecentApps::default()),
             transcriber: Arc::new(JsonlTranscriber::new(
                 worker_command_for_settings(settings),
                 ASR_REQUEST_TIMEOUT,
@@ -115,6 +117,21 @@ impl Services {
         self.shutdown_started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+
+    pub(crate) fn observe_app_context(
+        &self,
+        app: &tauri::AppHandle,
+        context: Option<&types::AppContext>,
+    ) {
+        use tauri::Emitter;
+        if self
+            .recent_apps
+            .lock()
+            .is_ok_and(|mut recent| recent.observe(context))
+        {
+            let _ = app.emit_to("main", "recent-apps-changed", ());
+        }
     }
 
     pub(crate) async fn shutdown(&self) {

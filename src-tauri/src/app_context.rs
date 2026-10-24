@@ -50,6 +50,18 @@ pub(crate) fn category_for_stem(stem: Option<&str>) -> String {
         "development"
     } else if ["winword", "excel", "powerpnt", "notepad"].contains(&stem) {
         "document"
+    } else if [
+        "windowsterminal",
+        "wt",
+        "powershell",
+        "pwsh",
+        "cmd",
+        "wezterm",
+        "alacritty",
+    ]
+    .contains(&stem)
+    {
+        "terminal"
     } else {
         "other"
     };
@@ -112,6 +124,52 @@ pub(crate) fn history_category(context: Option<&AppContext>) -> Option<&str> {
     context.map(|context| context.category.as_str())
 }
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RecentApp {
+    app_key: String,
+    category: String,
+}
+
+/// Only bounded executable stems are kept, in memory until clear/restart.
+#[derive(Default)]
+pub(crate) struct RecentApps(Vec<RecentApp>);
+
+impl RecentApps {
+    pub(crate) fn observe(&mut self, context: Option<&AppContext>) -> bool {
+        let Some(app_key) = context.and_then(|context| context.app_key.as_deref()) else {
+            return false;
+        };
+        if app_key.len() > 76 || normalize_executable_stem(app_key).as_deref() != Some(app_key) {
+            return false;
+        }
+        let category = category_for_stem(Some(app_key));
+        if self
+            .0
+            .first()
+            .is_some_and(|app| app.app_key == app_key && app.category == category)
+        {
+            return false;
+        }
+        self.0.retain(|app| app.app_key != app_key);
+        self.0.insert(
+            0,
+            RecentApp {
+                app_key: app_key.into(),
+                category,
+            },
+        );
+        self.0.truncate(20);
+        true
+    }
+    pub(crate) fn list(&self) -> Vec<RecentApp> {
+        self.0.clone()
+    }
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +226,56 @@ mod tests {
         assert_eq!(category_for_stem(Some("olk")), "email");
         assert_eq!(category_for_stem(Some("unknown")), "other");
         assert_eq!(category_for_stem(None), "other");
+        for terminal in [
+            "windowsterminal",
+            "wt",
+            "powershell",
+            "pwsh",
+            "cmd",
+            "wezterm",
+            "alacritty",
+        ] {
+            assert_eq!(category_for_stem(Some(terminal)), "terminal");
+        }
+    }
+
+    #[test]
+    fn recent_apps_are_bounded_deduplicated_stems_and_clear_without_persistence() {
+        let mut recent = RecentApps::default();
+        assert!(!recent.observe(None));
+        for index in 0..25 {
+            recent.observe(Some(&AppContext {
+                app_key: Some(format!("editor{index}")),
+                category: "private-sentinel".into(),
+            }));
+        }
+        assert_eq!(recent.list().len(), 20);
+        recent.observe(from_executable_path(Some("pwsh.exe")).as_ref());
+        assert!(!recent.observe(from_executable_path(Some("pwsh.exe")).as_ref()));
+        assert_eq!(recent.list()[0].app_key, "pwsh");
+        assert_eq!(recent.list()[0].category, "terminal");
+        assert!(
+            recent
+                .list()
+                .iter()
+                .filter(|app| app.app_key == "pwsh")
+                .count()
+                == 1
+        );
+        assert!(!recent.observe(Some(&AppContext {
+            app_key: Some("C:/private/path.exe".into()),
+            category: "email".into()
+        })));
+        assert!(!recent.observe(Some(&AppContext {
+            app_key: Some("a".repeat(77)),
+            category: "email".into()
+        })));
+        assert!(!serde_json::to_string(&recent.list())
+            .unwrap()
+            .contains("sentinel"));
+        recent.clear();
+        assert!(recent.list().is_empty());
+        assert!(RecentApps::default().list().is_empty());
     }
 
     #[test]

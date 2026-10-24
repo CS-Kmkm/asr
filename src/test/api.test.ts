@@ -43,6 +43,14 @@ test("text-only History IPC passes the explicit saved row and action", async () 
   ]);
 });
 
+test("recent app IPC has no client-supplied paths or process query", async () => {
+  Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+  const api = await import("../api");
+  await api.listRecentApps();
+  await api.clearRecentApps();
+  expect(vi.mocked(invoke).mock.calls).toEqual([["list_recent_apps"], ["clear_recent_apps"]]);
+});
+
 test("credential IPC reads presence and passes explicit save/delete without Settings persistence", async () => {
   Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
   const api = await import("../api");

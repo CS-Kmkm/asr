@@ -23,6 +23,14 @@ const backendTemplates = Object.entries(backendCatalogue).filter(([, entry]) => 
 });
 
 const en = {
+  "Refresh": "Refresh",
+  "Email preset": "Email", "Chat preset": "Chat", "Code / Technical preset": "Code / Technical", "Notes preset": "Notes",
+  "Apply a preset": "Apply a preset", "Global style preset": "Global style preset", "Scoped style preset": "Scoped style preset",
+  "Recent apps": "Recent apps", "Choose an app": "Choose an app", "Clear recent apps": "Clear recent apps",
+  "Add category profile": "Add category profile", "Choose a category": "Choose a category",
+  "Recent apps stay in memory until cleared or the app exits. Window titles and paths are not stored.": "Recent apps stay in memory until cleared or the app exits. Window titles and paths are not stored.",
+  "Recent apps could not be loaded or cleared.": "Recent apps could not be loaded or cleared.",
+  "Browser category": "Browser", "Email category": "Email", "Messaging category": "Messaging", "Development category": "Development", "Document category": "Documents", "Terminal category": "Terminal", "Other category": "Other",
   "Performance by mode, category and provider": "Performance by mode, category and provider",
   "Mode": "Mode",
   "Reprocessed result": "Reprocessed result",
@@ -336,6 +344,14 @@ const en = {
 } as const;
 export type MessageKey = keyof typeof en | keyof typeof backendMessages;
 const ja: Record<keyof typeof en, string> = {
+  "Refresh": "更新",
+  "Email preset": "メール", "Chat preset": "チャット", "Code / Technical preset": "コード・技術文書", "Notes preset": "メモ",
+  "Apply a preset": "プリセットを適用", "Global style preset": "全体スタイルのプリセット", "Scoped style preset": "個別スタイルのプリセット",
+  "Recent apps": "最近使ったアプリ", "Choose an app": "アプリを選択", "Clear recent apps": "最近のアプリを消去",
+  "Add category profile": "カテゴリからスタイルを追加", "Choose a category": "カテゴリを選択",
+  "Recent apps stay in memory until cleared or the app exits. Window titles and paths are not stored.": "アプリ候補は消去または終了までメモリ内に保持します。ウィンドウ名やパスは保存しません。",
+  "Recent apps could not be loaded or cleared.": "最近のアプリを取得・消去できませんでした。",
+  "Browser category": "ブラウザー", "Email category": "メール", "Messaging category": "メッセージ", "Development category": "開発", "Document category": "文書", "Terminal category": "ターミナル", "Other category": "その他",
   "Performance by mode, category and provider": "モード・アプリカテゴリ・プロバイダー別の性能",
   "Mode": "モード",
   "Reprocessed result": "再処理の結果",

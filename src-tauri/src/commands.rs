@@ -1,5 +1,6 @@
 pub(crate) mod credentials;
 pub(crate) mod history_text;
+pub(crate) mod recent_apps;
 
 #[cfg(test)]
 use crate::pipeline::{classify_ai_stage, AiStageResult};
@@ -934,6 +935,7 @@ async fn start_owned_recording(
         ask_target,
     );
     let app_context = context_target.and_then(app_context::from_target);
+    services.observe_app_context(&app, app_context.as_ref());
     if let Some(target) = context_target.filter(|target| !target.is_this_app()) {
         recording_overlay::set_anchor(target.window_handle);
     }
@@ -1718,6 +1720,7 @@ async fn run_selected_text_translation(
     recording_overlay::set_anchor(selection.target().window_handle);
     let source = selection.text().to_owned();
     let app_context = app_context::from_target(selection.target());
+    services.observe_app_context(app, app_context.as_ref());
     metric_context.app_category = app_context.as_ref().map(|context| context.category.clone());
     let _ = app.emit(
         "voice-mode",

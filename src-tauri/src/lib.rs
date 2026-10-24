@@ -1669,6 +1669,8 @@ pub fn run() {
             commands::get_history_audio,
             commands::retry_history_item,
             commands::history_text::reprocess_history_text,
+            commands::recent_apps::list_recent_apps,
+            commands::recent_apps::clear_recent_apps,
             commands::list_dictionary,
             commands::add_dictionary_entry,
             commands::update_dictionary_entry,

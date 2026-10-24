@@ -226,6 +226,15 @@ export async function reprocessHistoryText(id: number, action: import("./types")
   return invoke("reprocess_history_text", { id, action });
 }
 
+export async function listRecentApps(): Promise<import("./types").RecentApp[]> {
+  if (!inTauri) return [];
+  return invoke("list_recent_apps");
+}
+
+export async function clearRecentApps(): Promise<void> {
+  if (inTauri) await invoke("clear_recent_apps");
+}
+
 export async function deleteHistoryItem(id: number): Promise<boolean> {
   if (!inTauri) return false;
   return invoke("delete_history_item", { id });

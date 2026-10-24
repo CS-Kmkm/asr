@@ -5,6 +5,8 @@ import { GainSlider } from "../components/CommitField";
 import { SettingRow, Toggle } from "../components/ui";
 import { AiCorrectionSettings } from "../components/AiCorrectionSettings";
 import { ApiKeySettings } from "../components/ApiKeySettings";
+import { RecentAppPicker } from "../components/RecentAppPicker";
+import { stylePresets, profileCategories } from "../stylePresets";
 import { SettingsRepairBanner } from "../components/SettingsRepairBanner";
 import type { AudioDevice, AudioLevel, ScopedStyleProfile, Settings, ShortcutMode, StyleProfile } from "../types";
 import { speechLocaleRegistry, uiLocaleRegistry } from "../types";
@@ -38,12 +40,10 @@ export function isCancelKeyChord(chord: string): boolean {
 // Inactive shortcuts arrive as "Action (chord)" with the English action label.
 const shortcutActionLabels = ["Dictation", "Selected-text translation", "Voice Translate", "Speak to edit", "Ask Anything"] as const;
 
-const profileCategories = new Set(["browser", "email", "messaging", "development", "document", "other"]);
-
 function isValidProfileScope(scope: string): boolean {
   if (Array.from(scope).length > 80 || scope.trim() !== scope) return false;
   if (scope.startsWith("app:")) return /^app:[a-z0-9_-]+$/.test(scope);
-  if (scope.startsWith("category:")) return profileCategories.has(scope.slice("category:".length));
+  if (scope.startsWith("category:")) return profileCategories.some((category) => category === scope.slice("category:".length));
   return false;
 }
 
@@ -497,6 +497,13 @@ function PersonalizationProfiles({
       {!settings.textCorrectionEnabled && <p role="status">{t("Inactive: profiles are used only when AI text correction is on.")}</p>}
       <SettingRow title={t("Global profile")} detail={t("Fallback style used when no app or category profile matches.")} control={
         <div className="profile-controls">
+          <select aria-label={t("Global style preset")} value="" onChange={(event) => {
+            const preset = stylePresets.find((preset) => preset.id === event.target.value);
+            if (preset) { setGuidance(preset.profile.guidance); onSaveGlobal({ ...preset.profile }); }
+          }}>
+            <option value="">{t("Apply a preset")}</option>
+            {stylePresets.map((preset) => <option key={preset.id} value={preset.id}>{t(preset.label)}</option>)}
+          </select>
           {global ? <>
             <select aria-label={t("Global profile formality")} value={global.formality} onChange={(e) => updateGlobal({ formality: e.target.value as StyleProfile["formality"] })}><option value="formal">{t("Formal")}</option><option value="casual">{t("Casual")}</option></select>
             <select aria-label={t("Global profile detail")} value={global.detail} onChange={(e) => updateGlobal({ detail: e.target.value as StyleProfile["detail"] })}><option value="concise">{t("Concise")}</option><option value="detailed">{t("Detailed")}</option></select>
@@ -518,9 +525,17 @@ function PersonalizationProfiles({
       <div className="profile-list">
         <strong>{t("Scoped profiles")}</strong>
         <p>{t("Precedence is fixed: exact app > category > global. List order has no effect.")}</p>
+        <RecentAppPicker scopes={profiles.map((entry) => entry.scope)} onChoose={(scope) => onSaveProfiles([...profiles, { scope, profile: { ...defaultGlobal } }])} />
         {profileDraftIsInvalid && <p role="alert">{t("Profile scopes must be valid and unique before changes are saved.")}</p>}
         {profiles.map((item, index) => (
           <div className="setting-row" key={index}>
+            <select aria-label={`${t("Scoped style preset")} ${index + 1}`} value="" onChange={(event) => {
+              const preset = stylePresets.find((preset) => preset.id === event.target.value);
+              if (preset) onSaveProfiles(profiles.map((entry, current) => current === index ? { ...entry, profile: { ...preset.profile } } : entry));
+            }}>
+              <option value="">{t("Apply a preset")}</option>
+              {stylePresets.map((preset) => <option key={preset.id} value={preset.id}>{t(preset.label)}</option>)}
+            </select>
             <input aria-label={`${t("Profile scope")} ${index + 1}`} value={item.scope} maxLength={80} placeholder={t("app:code or category:development")} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, scope: e.target.value }; onEditProfiles(next); }} onBlur={onCommitProfiles} onKeyDown={commitOnEnter} />
             <select aria-label={`${t("Profile formality")} ${index + 1}`} value={item.profile.formality} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, formality: e.target.value as StyleProfile["formality"] } }; onSaveProfiles(next); }}><option value="formal">{t("Formal")}</option><option value="casual">{t("Casual")}</option></select>
             <select aria-label={`${t("Profile detail")} ${index + 1}`} value={item.profile.detail} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, detail: e.target.value as StyleProfile["detail"] } }; onSaveProfiles(next); }}><option value="concise">{t("Concise")}</option><option value="detailed">{t("Detailed")}</option></select>

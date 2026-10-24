@@ -36,6 +36,8 @@ commands.allow = [
     "get_history_audio",
     "retry_history_item",
     "reprocess_history_text",
+    "list_recent_apps",
+    "clear_recent_apps",
     "list_dictionary",
     "add_dictionary_entry",
     "update_dictionary_entry",

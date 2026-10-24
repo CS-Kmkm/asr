@@ -97,6 +97,7 @@ export interface Settings {
 export interface SettingsSnapshot { settings: Settings; revision: number; }
 export interface StyleProfile { formality: "formal" | "casual"; detail: "concise" | "detailed"; guidance?: string | null; }
 export interface ScopedStyleProfile { scope: string; profile: StyleProfile; }
+export interface RecentApp { appKey: string; category: string; }
 
 export const uiLocaleRegistry = [
   { tag: "en", label: "English" },
