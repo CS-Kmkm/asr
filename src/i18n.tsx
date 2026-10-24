@@ -23,6 +23,13 @@ const backendTemplates = Object.entries(backendCatalogue).filter(([, entry]) => 
 });
 
 const en = {
+  "History could not be loaded.": "History could not be loaded.",
+  "Reload history": "Reload history",
+  "Search history": "Search history",
+  "Search": "Search",
+  "Load more": "Load more",
+  "No matching history": "No matching history",
+  "Try a different search or filter.": "Try a different search or filter.",
   "Provider API keys": "Provider API keys",
   "Keys saved here use Windows Credential Manager and take effect without restarting. They are not saved in Settings or History. Environment and .env keys remain a fallback. Finish voice operations before changing keys.": "Keys saved here use Windows Credential Manager and take effect without restarting. They are not saved in Settings or History. Environment and .env keys remain a fallback. Finish voice operations before changing keys.",
   "Speech API key": "Speech API key",
@@ -316,6 +323,13 @@ const en = {
 } as const;
 export type MessageKey = keyof typeof en | keyof typeof backendMessages;
 const ja: Record<keyof typeof en, string> = {
+  "History could not be loaded.": "履歴を読み込めませんでした。",
+  "Reload history": "履歴を再読み込み",
+  "Search history": "履歴を検索",
+  "Search": "検索",
+  "Load more": "さらに読み込む",
+  "No matching history": "一致する履歴はありません",
+  "Try a different search or filter.": "検索語や絞り込み条件を変更してください。",
   "Provider API keys": "プロバイダーのAPIキー",
   "Keys saved here use Windows Credential Manager and take effect without restarting. They are not saved in Settings or History. Environment and .env keys remain a fallback. Finish voice operations before changing keys.": "ここで保存するキーはWindows資格情報マネージャーに保存し、再起動なしで反映します。設定や履歴には保存しません。環境変数・.envのキーは代替として引き続き利用できます。キーの変更前に録音・処理を終了してください。",
   "Speech API key": "音声APIのキー",

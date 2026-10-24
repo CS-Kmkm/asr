@@ -2,7 +2,7 @@
 import { beforeEach, expect, test, vi } from "vitest";
 import App from "../App";
 import { defaultSettings, getSettings, getShortcutWarning, updateSettings, listDictionaryCandidates,
-  listHistory, getGpuDiagnostics, getModelStatus, getStartupHotkeyWarning, stopRecording, loadModel, previewHistoryRetentionPurge } from "../api";
+  listHistory, listHistoryPage, deleteAllHistory, getGpuDiagnostics, getModelStatus, getStartupHotkeyWarning, stopRecording, loadModel, previewHistoryRetentionPurge } from "../api";
 import type { DictionaryCandidate, HistoryItem, Settings, SettingsSnapshot } from "../types";
 
 const events = vi.hoisted(() => new Map<string, Set<(event: { payload: unknown }) => void>>());
@@ -19,6 +19,7 @@ vi.mock("@tauri-apps/api/webviewWindow", () => ({
 }));
 vi.mock("../api", async (original) => {
   const actual = await original<typeof import("../api")>();
+  const listHistory = vi.fn<typeof actual.listHistory>(async () => []);
   return {
     ...actual,
     getUiPreferences: async () => ({ settings: { uiLanguage: "en", theme: "system" }, revision: 1 }),
@@ -30,7 +31,9 @@ vi.mock("../api", async (original) => {
     getModelStatus: vi.fn(async () => ({ modelId: null, quantization: "4bit", installed: false, state: "not_configured", detail: "" })),
     getGpuDiagnostics: vi.fn(async () => null),
     listAudioDevices: async () => [],
-    listHistory: vi.fn(async () => []),
+    listHistory,
+    deleteAllHistory: vi.fn(async () => 0),
+    listHistoryPage: vi.fn<typeof actual.listHistoryPage>(),
     listDictionary: async () => [],
     listDictionaryCandidates: vi.fn(async () => []),
     stopRecording: vi.fn(),
@@ -50,6 +53,7 @@ beforeEach(() => {
   vi.mocked(getStartupHotkeyWarning).mockResolvedValue([]);
   vi.mocked(listDictionaryCandidates).mockResolvedValue([]);
   vi.mocked(listHistory).mockResolvedValue([]);
+  vi.mocked(listHistoryPage).mockReset().mockImplementation(async (filter, options) => ({ items: await listHistory(filter, options), retainedIds: options?.knownIds ?? [] }));
   vi.mocked(getGpuDiagnostics).mockResolvedValue({ status: "unavailable", adapterName: null, driverVersion: null, memoryTotalMb: null, recommendation: "" });
   vi.mocked(getModelStatus).mockResolvedValue({ modelId: null, quantization: "4bit", installed: false, state: "not_configured", detail: "" });
   vi.spyOn(window, "confirm").mockReturnValue(true);
@@ -107,8 +111,9 @@ test("a newer settings event wins over a late initial read", async () => {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
-  return { promise, resolve };
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 }
 const candidate = (id: number): DictionaryCandidate => ({ id, originalSpan: "open ai", preferredSpan: `Suggested-${id}`, confidence: 1, historyId: null, createdAt: "2026-10-23" });
 async function emit(name: string, payload: unknown) {
@@ -225,6 +230,93 @@ test("History entry and shortcut completion refresh retained rows", async () => 
   await phase("completed");
   expect(await screen.findByText("Transcript-2")).toBeTruthy();
   expect(screen.queryByText("Transcript-1")).toBeNull();
+});
+
+test("History loads beyond the first hundred and ignores a stale page after a search", async () => {
+  const nextPage = deferred<HistoryItem[]>();
+  vi.mocked(listHistory).mockImplementation(async (_filter, options) => {
+    if (options?.query === "new search") return [history(900)];
+    if (options?.before?.id === 100) return nextPage.promise;
+    return Array.from({ length: 100 }, (_, index) => history(index + 1));
+  });
+  render(<App />);
+  await navigate("History");
+  const more = await screen.findByRole("button", { name: "Load more" });
+  await waitFor(() => expect((more as HTMLButtonElement).disabled).toBe(false));
+  fireEvent.click(more);
+  await waitFor(() => expect(listHistory).toHaveBeenCalledWith("all", expect.objectContaining({ query: "", before: { createdAt: "2026-10-23T00:00:00Z", id: 100 } })));
+  expect((more as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.change(screen.getByRole("searchbox", { name: "Search history" }), { target: { value: "new search" } });
+  fireEvent.click(screen.getByRole("button", { name: "Search" }));
+  expect(await screen.findByText("Transcript-900")).toBeTruthy();
+  await act(async () => { nextPage.resolve([history(101)]); });
+  expect(screen.queryByText("Transcript-101")).toBeNull();
+  expect(screen.queryByText("Transcript-1")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+});
+
+test("History appends the next page and changing filter keeps the submitted query", async () => {
+  vi.mocked(listHistory).mockImplementation(async (filter, options) => {
+    if (filter === "translate") return [history(700)];
+    if (options?.before?.id === 100) return [history(101)];
+    return Array.from({ length: 100 }, (_, index) => history(index + 1));
+  });
+  render(<App />);
+  await navigate("History");
+  const more = await screen.findByRole("button", { name: "Load more" });
+  await waitFor(() => expect((more as HTMLButtonElement).disabled).toBe(false));
+  fireEvent.click(more);
+  expect(await screen.findByText("Transcript-101")).toBeTruthy();
+  expect(screen.getByText("Transcript-1")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+  fireEvent.change(screen.getByRole("searchbox", { name: "Search history" }), { target: { value: "  日本語  " } });
+  fireEvent.click(screen.getByRole("button", { name: "Search" }));
+  await waitFor(() => expect(listHistory).toHaveBeenCalledWith("all", { query: "日本語", before: null, knownIds: [] }));
+  fireEvent.change(screen.getByRole("combobox", { name: "History filter" }), { target: { value: "translate" } });
+  expect(await screen.findByText("Transcript-700")).toBeTruthy();
+  expect(listHistory).toHaveBeenLastCalledWith("translate", { query: "日本語", before: null, knownIds: [] });
+  expect(screen.queryByText("Transcript-1")).toBeNull();
+});
+
+test("History drops previously displayed rows purged before the next page", async () => {
+  vi.mocked(listHistory).mockResolvedValue(Array.from({ length: 100 }, (_, index) => history(index + 1)));
+  render(<App />);
+  await navigate("History");
+  const more = await screen.findByRole("button", { name: "Load more" });
+  await waitFor(() => expect((more as HTMLButtonElement).disabled).toBe(false));
+  vi.mocked(listHistoryPage).mockResolvedValueOnce({ items: [history(101)], retainedIds: Array.from({ length: 99 }, (_, index) => index + 2) });
+  fireEvent.click(more);
+  expect(await screen.findByText("Transcript-101")).toBeTruthy();
+  expect(screen.queryByText("Transcript-1")).toBeNull();
+  expect(screen.getByText("Transcript-2")).toBeTruthy();
+});
+
+test("History search failure offers reload without asserting no matches", async () => {
+  render(<App />);
+  await navigate("History");
+  const search = deferred<Awaited<ReturnType<typeof listHistoryPage>>>();
+  vi.mocked(listHistoryPage).mockReturnValueOnce(search.promise);
+  fireEvent.change(screen.getByRole("searchbox", { name: "Search history" }), { target: { value: "a query" } });
+  fireEvent.click(screen.getByRole("button", { name: "Search" }));
+  expect(screen.getByRole("status").textContent).toContain("Loading...");
+  expect(screen.queryByText("No matching history")).toBeNull();
+  await act(async () => { search.reject(new Error("query failed")); });
+  expect(await screen.findByRole("button", { name: "Reload history" })).toBeTruthy();
+  expect(screen.queryByText("No matching history")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Reload history" }));
+  expect(await screen.findByText("No matching history")).toBeTruthy();
+});
+
+test("a successful History deletion clears an earlier load failure", async () => {
+  render(<App />);
+  await navigate("History");
+  vi.mocked(listHistoryPage).mockRejectedValueOnce(new Error("query failed"));
+  fireEvent.click(screen.getByRole("button", { name: "Search" }));
+  await screen.findByRole("button", { name: "Reload history" });
+  fireEvent.click(screen.getByRole("button", { name: "Delete all" }));
+  await waitFor(() => expect(deleteAllHistory).toHaveBeenCalled());
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Reload history" })).toBeNull());
+  expect(screen.getByText("No dictations yet")).toBeTruthy();
 });
 
 test("retention changes stay disabled until stored settings load", async () => {

@@ -3,7 +3,7 @@ use super::{
     checkpoint_deleted_history, purge_dictionary_candidates_before, purge_metrics_before,
     queue_audio_deletion, Storage, StorageError,
 };
-use crate::types::{HistoryFilter, HistoryItem, HistoryRetention};
+use crate::types::{HistoryCursor, HistoryFilter, HistoryItem, HistoryPage, HistoryRetention};
 use chrono::Utc;
 use rusqlite::{params, OptionalExtension, Row};
 
@@ -39,12 +39,48 @@ fn row_to_history_item(row: &Row<'_>) -> rusqlite::Result<HistoryItem> {
     })
 }
 
+fn retained_history_ids(
+    connection: &rusqlite::Connection,
+    known_ids: &[i64],
+) -> Result<Vec<i64>, StorageError> {
+    let mut statement = connection.prepare(
+        "SELECT id FROM dictation_history WHERE id IN (SELECT value FROM json_each(?1))",
+    )?;
+    let rows = statement.query_map([serde_json::to_string(known_ids)?], |row| row.get(0))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 impl Storage {
+    #[cfg(test)]
     pub fn list_history(
         &self,
         filter: HistoryFilter,
         limit: u32,
     ) -> Result<Vec<HistoryItem>, StorageError> {
+        self.list_history_page(filter, limit, None, "")
+    }
+
+    #[cfg(test)]
+    pub fn list_history_page(
+        &self,
+        filter: HistoryFilter,
+        limit: u32,
+        before: Option<&HistoryCursor>,
+        query: &str,
+    ) -> Result<Vec<HistoryItem>, StorageError> {
+        Ok(self
+            .query_history_page(filter, limit, before, query, &[])?
+            .items)
+    }
+
+    pub fn query_history_page(
+        &self,
+        filter: HistoryFilter,
+        limit: u32,
+        before: Option<&HistoryCursor>,
+        query: &str,
+        known_ids: &[i64],
+    ) -> Result<HistoryPage, StorageError> {
         let settings = self.get_settings()?;
         self.apply_history_policy(&settings)?;
         // With History off, only failed takes kept for Retry remain listed.
@@ -57,7 +93,12 @@ impl Storage {
                (?1 = 'translate' AND mode IN ('translate', 'selected_translate')) OR
                (?1 = 'edit' AND mode = 'edit') OR
                (?1 = 'ask' AND mode = 'ask'))
-             ORDER BY created_at DESC LIMIT ?2"
+             AND (?4 = '' OR instr(lower(transcript_text), lower(?4)) > 0
+               OR instr(lower(COALESCE(processed_text, '')), lower(?4)) > 0
+               OR instr(lower(COALESCE(source_text, '')), lower(?4)) > 0
+               OR instr(lower(COALESCE(instruction_text, '')), lower(?4)) > 0)
+             AND (?5 IS NULL OR created_at < ?5 OR (created_at = ?5 AND id < ?6))
+             ORDER BY created_at DESC, id DESC LIMIT ?2"
         ))?;
         let filter = match filter {
             HistoryFilter::All => "all",
@@ -67,10 +108,24 @@ impl Storage {
             HistoryFilter::Ask => "ask",
         };
         let rows = statement.query_map(
-            params![filter, limit.min(500), history_off],
+            params![
+                filter,
+                limit.min(500),
+                history_off,
+                query.trim().chars().take(500).collect::<String>(),
+                before.map(|cursor| cursor.created_at.as_str()),
+                before.map(|cursor| cursor.id)
+            ],
             row_to_history_item,
         )?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        let items = rows.collect::<Result<Vec<_>, _>>()?;
+        // Keep the page and previously displayed IDs in one locked snapshot;
+        // concurrent deletion cannot invalidate half of this response.
+        let retained_ids = retained_history_ids(&connection, known_ids)?;
+        Ok(HistoryPage {
+            items,
+            retained_ids,
+        })
     }
 
     pub fn history_text(&self, id: i64) -> Result<Option<String>, StorageError> {

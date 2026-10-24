@@ -212,9 +212,13 @@ export async function updateSettings(patch: Partial<Settings>): Promise<Settings
   return invoke("update_settings", { patch });
 }
 
-export async function listHistory(filter: HistoryFilter = "all"): Promise<HistoryItem[]> {
-  if (!inTauri) return [];
-  return invoke("list_history", { filter, limit: 100 });
+export async function listHistory(filter: HistoryFilter = "all", options: { query?: string; before?: Pick<HistoryItem, "createdAt" | "id"> | null } = {}): Promise<HistoryItem[]> {
+  return (await listHistoryPage(filter, options)).items;
+}
+
+export async function listHistoryPage(filter: HistoryFilter = "all", options: { query?: string; before?: Pick<HistoryItem, "createdAt" | "id"> | null; knownIds?: number[] } = {}): Promise<{ items: HistoryItem[]; retainedIds: number[] }> {
+  if (!inTauri) return { items: [], retainedIds: [] };
+  return invoke("list_history", { filter, limit: 100, query: options.query ?? "", before: options.before ?? null, knownIds: options.knownIds ?? [] });
 }
 
 export async function deleteHistoryItem(id: number): Promise<boolean> {

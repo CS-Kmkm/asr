@@ -5423,14 +5423,20 @@ fn reject_model_change_while_busy(
 pub(crate) async fn list_history(
     filter: Option<types::HistoryFilter>,
     limit: Option<u32>,
+    before: Option<types::HistoryCursor>,
+    query: Option<String>,
+    known_ids: Option<Vec<i64>>,
     storage: State<'_, Storage>,
-) -> Result<Vec<HistoryItem>, String> {
+) -> Result<types::HistoryPage, String> {
     let storage = storage.inner().clone();
     storage_task(move || {
         storage
-            .list_history(
+            .query_history_page(
                 filter.unwrap_or(types::HistoryFilter::All),
                 limit.unwrap_or(100),
+                before.as_ref(),
+                query.as_deref().unwrap_or(""),
+                known_ids.as_deref().unwrap_or(&[]),
             )
             .map_err(command_error)
     })

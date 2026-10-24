@@ -29,6 +29,7 @@ import {
   getShortcutWarning,
   listDictionary,
   listHistory,
+  listHistoryPage,
   runGpuDiagnostics,
   openDiagnosticsFolder,
   loadModel,
@@ -551,6 +552,13 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>("all");
   const historyFilterRef = useRef<HistoryFilter>("all");
   const historyRequestRef = useRef(0);
+  const [historyQuery, setHistoryQuery] = useState("");
+  const historyQueryRef = useRef("");
+  const historyCursorRef = useRef<Pick<HistoryItem, "createdAt" | "id"> | null>(null);
+  const historyLoadingRef = useRef(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyFailed, setHistoryFailed] = useState(false);
+  const [historyHasMore, setHistoryHasMore] = useState(false);
   const [model, setModel] = useState<ModelStatus | null>(null);
   const [modelLoading, setModelLoading] = useState(false);
   const [modelProgress, setModelProgress] = useState<ModelProgress | null>(null);
@@ -609,6 +617,9 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
           applyAppState(nextState);
           if (historyRequestRef.current === 0 && historyFilterRef.current === "all") {
             setHistory(nextHistory);
+            const last = nextHistory.at(-1);
+            historyCursorRef.current = last ? { createdAt: last.createdAt, id: last.id } : null;
+            setHistoryHasMore(nextHistory.length === 100);
           }
           setModel(nextModel);
           setGpu(nextGpu);
@@ -687,11 +698,36 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     }
   }
 
-  async function refreshHistory(filter: HistoryFilter = historyFilterRef.current) {
+  async function refreshHistory(filter: HistoryFilter = historyFilterRef.current, append = false) {
+    if (append && historyLoadingRef.current) return;
     const request = ++historyRequestRef.current;
-    const items = await listHistory(filter);
-    if (request === historyRequestRef.current && filter === historyFilterRef.current) {
-      setHistory(items);
+    const query = historyQueryRef.current;
+    const before = append ? historyCursorRef.current : null;
+    historyLoadingRef.current = true;
+    setHistoryLoading(true);
+    setHistoryFailed(false);
+    try {
+      const { items, retainedIds } = await listHistoryPage(filter, { query, before, knownIds: append ? history.map((item) => item.id) : [] });
+      if (request === historyRequestRef.current) {
+        setHistory((previous) => {
+          if (!append) return items;
+          const retained = new Set(retainedIds);
+          const kept = previous.filter((item) => retained.has(item.id));
+          const existingIds = new Set(kept.map((item) => item.id));
+          return [...kept, ...items.filter((item) => !existingIds.has(item.id))];
+        });
+        const last = items.at(-1);
+        historyCursorRef.current = last ? { createdAt: last.createdAt, id: last.id } : null;
+        setHistoryHasMore(items.length === 100);
+      }
+    } catch (error) {
+      if (request === historyRequestRef.current) setHistoryFailed(true);
+      throw error;
+    } finally {
+      if (request === historyRequestRef.current) {
+        historyLoadingRef.current = false;
+        setHistoryLoading(false);
+      }
     }
   }
 
@@ -879,7 +915,17 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   }
 
   async function clearHistory() {
-    try { await deleteAllHistory(); historyRequestRef.current += 1; setHistory([]); showNotice(t("History deleted."), "success"); }
+    try {
+      await deleteAllHistory();
+      historyRequestRef.current += 1;
+      setHistory([]);
+      historyCursorRef.current = null;
+      setHistoryHasMore(false);
+      historyLoadingRef.current = false;
+      setHistoryLoading(false);
+      setHistoryFailed(false);
+      showNotice(t("History deleted."), "success");
+    }
     catch (error) { showNotice(String(error), "error"); }
   }
 
@@ -1041,11 +1087,25 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             settingsLoaded={settingsLoaded}
             history={history}
             filter={historyFilter}
+            query={historyQuery}
+            loading={historyLoading}
+            failed={historyFailed}
+            hasMore={historyHasMore}
+            onSearch={(query) => {
+              setHistoryQuery(query);
+              historyQueryRef.current = query;
+              setHistory([]);
+              setHistoryHasMore(false);
+              void refreshHistory().catch((error) => showNotice(String(error), "error"));
+            }}
+            onLoadMore={() => void refreshHistory(historyFilterRef.current, true).catch((error) => showNotice(String(error), "error"))}
             onSave={(patch) => void saveSettings(patch)}
             onCopyItem={(text) => void copyHistoryText(text)}
             onFilter={(filter) => {
               setHistoryFilter(filter);
               historyFilterRef.current = filter;
+              setHistory([]);
+              setHistoryHasMore(false);
               void refreshHistory(filter).catch((error) => showNotice(String(error), "error"));
             }}
             onRetry={(id) => void retryHistory(id)}

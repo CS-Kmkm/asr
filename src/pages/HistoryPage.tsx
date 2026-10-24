@@ -24,11 +24,17 @@ const modeLabels = {
   selected_translate: "Selected-text translation",
 } as const;
 
-export function HistoryPage({ settings, settingsLoaded, history, filter, onSave, onFilter, onCopyItem, onRetry, onDelete, onDeleteAll, onLoadAudio, onAudioError, retryActive, onCancelRetry }: {
+export function HistoryPage({ settings, settingsLoaded, history, filter, query = "", loading = false, failed = false, hasMore = false, onSearch, onLoadMore, onSave, onFilter, onCopyItem, onRetry, onDelete, onDeleteAll, onLoadAudio, onAudioError, retryActive, onCancelRetry }: {
   settings: Settings;
   settingsLoaded: boolean;
   history: HistoryItem[];
   filter: HistoryFilter;
+  query?: string;
+  loading?: boolean;
+  failed?: boolean;
+  hasMore?: boolean;
+  onSearch?: (query: string) => void;
+  onLoadMore?: () => void;
   onSave: (patch: Partial<Settings>) => void;
   onFilter: (filter: HistoryFilter) => void;
   onCopyItem: (text: string) => void;
@@ -41,6 +47,8 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, onSave,
   onCancelRetry: () => void;
 }) {
   const { t } = useI18n();
+  const [searchDraft, setSearchDraft] = useState(query);
+  useEffect(() => setSearchDraft(query), [query]);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [playingId, setPlayingId] = useState<number | null>(null);
   useEffect(() => () => { if (audioUrl) URL.revokeObjectURL(audioUrl); }, [audioUrl]);
@@ -79,6 +87,10 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, onSave,
 
   return <section className="panel compact-page-panel">
     <div className="history-toolbar">
+      {onSearch && <form onSubmit={(event) => { event.preventDefault(); onSearch(searchDraft.trim()); }}>
+        <input type="search" aria-label={t("Search history")} maxLength={500} value={searchDraft} onChange={(event) => setSearchDraft(event.target.value)} />
+        <button type="submit">{t("Search")}</button>
+      </form>}
       <select value={filter} aria-label={t("History filter")} onChange={(event) => {
         onFilter(event.target.value as HistoryFilter);
       }}>
@@ -89,7 +101,11 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, onSave,
       {retryActive && <button onClick={onCancelRetry}>{t("Cancel")}</button>}
     </div>
     {audioUrl && <audio className="history-player" src={audioUrl} controls autoPlay onError={onAudioError} />}
-    {settings.historyRetention === "never" && history.length === 0 ? <Empty title={t("History is disabled")} detail={settings.keepFailedTakes
+    {loading && <p role="status">{t("Loading...")}</p>}
+    {failed && <p role="alert">{t("History could not be loaded.")} {onSearch && <button onClick={() => onSearch(query)}>{t("Reload history")}</button>}</p>}
+    {history.length === 0 && (loading || failed) ? null
+      : history.length === 0 && query ? <Empty title={t("No matching history")} detail={t("Try a different search or filter.")} />
+      : settings.historyRetention === "never" && history.length === 0 ? <Empty title={t("History is disabled")} detail={settings.keepFailedTakes
       ? t("New transcripts are not saved. A failed recording (and, for Edit, the selected text) is kept for 24 hours so you can retry it.")
       : t("New transcripts will not be written to SQLite.")} />
       : history.length === 0 ? <Empty title={t("No dictations yet")} detail={t("Completed local dictations will appear here.")} />
@@ -114,6 +130,7 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, onSave,
             <button className="danger-button" onClick={() => onDelete(item.id)}>{t("Delete")}</button>
           </div>
         </article>)}</div></>}
+    {hasMore && onLoadMore && <button disabled={loading} onClick={onLoadMore}>{t("Load more")}</button>}
   </section>;
 }
 

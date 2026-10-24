@@ -19,6 +19,19 @@ test("diagnostic folder uses a fixed native command without a client path", asyn
   expect(invoke).toHaveBeenCalledWith("open_diagnostics_folder");
 });
 
+test("History IPC carries the search and cursor, defaulting to the first page", async () => {
+  Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+  const api = await import("../api");
+  vi.mocked(invoke).mockResolvedValue({ items: [], retainedIds: [] });
+  const before = { createdAt: "2026-10-23T00:00:00Z", id: 123 };
+  await api.listHistory("translate", { query: "日本語 %_", before });
+  await api.listHistory();
+  expect(vi.mocked(invoke).mock.calls).toEqual([
+    ["list_history", { filter: "translate", limit: 100, query: "日本語 %_", before, knownIds: [] }],
+    ["list_history", { filter: "all", limit: 100, query: "", before: null, knownIds: [] }],
+  ]);
+});
+
 test("credential IPC reads presence and passes explicit save/delete without Settings persistence", async () => {
   Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
   const api = await import("../api");

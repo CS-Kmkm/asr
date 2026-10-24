@@ -5636,6 +5636,102 @@ mod tests {
     }
 
     #[test]
+    fn history_search_and_paging_apply_before_limit_with_stable_ties() {
+        let storage = Storage::in_memory().unwrap();
+        for _ in 0..105 {
+            storage.add_history(&item()).unwrap();
+        }
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE dictation_history SET created_at = '2099-01-01T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+        let first = storage
+            .list_history_page(HistoryFilter::All, 100, None, "PRIVATE")
+            .unwrap();
+        let cursor = crate::types::HistoryCursor {
+            created_at: first[99].created_at.clone(),
+            id: first[99].id,
+        };
+        // Page two enforces retention again. Removing earlier rows must not
+        // shift the cursor past surviving rows, including when its own row expires.
+        storage.connection().unwrap().execute(
+            "UPDATE dictation_history SET expires_at = '2000-01-01T00:00:00Z' WHERE id IN (?1, ?2)",
+            params![first[0].id, cursor.id],
+        ).unwrap();
+        let page = storage
+            .query_history_page(
+                HistoryFilter::All,
+                100,
+                Some(&cursor),
+                "PRIVATE",
+                &first.iter().map(|row| row.id).collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let second = page.items;
+        assert_eq!(first.len(), 100);
+        assert_eq!(second.len(), 5);
+        assert!(first.windows(2).all(|pair| pair[0].id > pair[1].id));
+        assert!(first.iter().all(|a| second.iter().all(|b| a.id != b.id)));
+        assert!(first.last().unwrap().id > second[0].id);
+        let retained = page.retained_ids;
+        assert_eq!(retained.len(), 98);
+        assert!(!retained.contains(&cursor.id));
+        assert!(storage
+            .list_history_page(HistoryFilter::Translate, 100, None, "PRIVATE")
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .list_history_page(HistoryFilter::All, 100, None, "%")
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .list_history_page(HistoryFilter::All, 100, None, "_")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn history_search_matches_each_text_operand_literally() {
+        let storage = Storage::in_memory().unwrap();
+        let mut entry = item();
+        entry.transcript_text = "日本語の原文";
+        entry.processed_text = Some("corrected 50%_");
+        entry.source_text = Some("selected operand");
+        entry.instruction_text = Some("spoken command");
+        storage.add_history(&entry).unwrap();
+        for query in ["日本語", "50%_", "SELECTED", "spoken", "  日本語  "] {
+            assert_eq!(
+                storage
+                    .list_history_page(HistoryFilter::All, 1, None, query)
+                    .unwrap()
+                    .len(),
+                1,
+                "{query}"
+            );
+        }
+        assert!(storage
+            .list_history_page(HistoryFilter::All, 1, None, "' OR 1=1 --")
+            .unwrap()
+            .is_empty());
+        let row = storage
+            .list_history(HistoryFilter::All, 1)
+            .unwrap()
+            .remove(0);
+        let cursor = crate::types::HistoryCursor {
+            created_at: row.created_at,
+            id: row.id,
+        };
+        assert!(storage
+            .list_history_page(HistoryFilter::All, 1, Some(&cursor), "日本語")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn retained_audio_is_id_only_and_removed_with_its_row() {
         let storage = Storage::in_memory().unwrap();
         let settings = Settings {
