@@ -4980,6 +4980,16 @@ pub(crate) async fn get_storage_diagnostics(
 }
 
 #[tauri::command]
+pub(crate) async fn get_worker_health(
+    services: State<'_, Services>,
+) -> Result<crate::asr::WorkerHealth, String> {
+    tokio::time::timeout(Duration::from_secs(60), services.transcriber.health())
+        .await
+        .map_err(|_| "The worker health check could not be completed.".to_owned())?
+        .map_err(|_| "The worker health check could not be completed.".to_owned())
+}
+
+#[tauri::command]
 pub(crate) async fn get_settings(
     storage: State<'_, Storage>,
 ) -> Result<types::SettingsSnapshot, String> {

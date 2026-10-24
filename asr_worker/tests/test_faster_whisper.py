@@ -382,6 +382,7 @@ class TranscribeWithFakeModuleTests(IsolatedWorkerTestCase):
         self.assertEqual(devices, ["cuda", "cpu"])
         self.assertEqual(warmups, [("cuda", 8_000), ("cpu", 8_000)])
         self.assertEqual(backend.device, "cpu")
+        self.assertEqual(backend.compute_type, "int8")
         self.assertIn({"stage": "cpu_fallback"}, events)
 
         devices.clear()

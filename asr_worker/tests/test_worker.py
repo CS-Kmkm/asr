@@ -17,6 +17,37 @@ from asr_worker.worker import Worker, _configure_protocol_stdio, serve
 
 
 class WorkerTests(IsolatedWorkerTestCase):
+    def test_health_reports_runtime_without_loading_or_importing_model_packages(self) -> None:
+        worker = Worker(MockBackend())
+        def installed_version(name: str) -> str:
+            return {"faster-whisper": "test-whisper", "ctranslate2": "test-ct2"}[name]
+        with patch("asr_worker.worker.importlib.metadata.version", side_effect=installed_version):
+            response, stop = worker.handle({"id": 1, "command": "health"})
+        self.assertTrue(response["ok"])
+        self.assertFalse(stop)
+        health = response["health"]
+        self.assertEqual(health["pythonPath"], sys.executable)
+        self.assertEqual(health["backend"], "mock")
+        self.assertEqual(health["fasterWhisperVersion"], "test-whisper")
+        self.assertEqual(health["ctranslate2Version"], "test-ct2")
+        self.assertFalse(health["loaded"])
+        self.assertIsNone(health["device"])
+        self.assertFalse(worker.loaded)
+
+    def test_health_reports_loaded_device_and_missing_optional_packages(self) -> None:
+        import importlib.metadata
+        worker = Worker(MockBackend())
+        worker.handle({"id": 1, "command": "load"})
+        worker.backend.device = "cpu"
+        worker.backend.compute_type = "int8"
+        with patch("asr_worker.worker.importlib.metadata.version", side_effect=importlib.metadata.PackageNotFoundError):
+            response, _ = worker.handle({"id": 2, "command": "health"})
+        health = response["health"]
+        self.assertTrue(health["loaded"])
+        self.assertEqual(health["device"], "cpu")
+        self.assertEqual(health["computeType"], "int8")
+        self.assertIsNone(health["fasterWhisperVersion"])
+        self.assertIsNone(health["ctranslate2Version"])
     def test_library_stdout_cannot_corrupt_the_protocol_pipe(self) -> None:
         script = '''
 import os, sys

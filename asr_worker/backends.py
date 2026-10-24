@@ -63,6 +63,9 @@ class ProgressReporting:
     """
 
     progress: ProgressCallback | None = None
+    backend_name: str = "unknown"
+    device: str | None = None
+    compute_type: str | None = None
     # Assigned by the worker for the duration of a transcription. A backend
     # polls it where it can stop early (between segments or tokens) and raises
     # the `cancelled` error; one that cannot poll simply finishes.
@@ -340,6 +343,7 @@ class MockBackend(ProgressReporting):
     - ``ASR_WORKER_MOCK_EVENT_LOG``: appends ``<pid> <event>`` lines.
     """
 
+    backend_name = "mock"
     model_name = f"{MODEL_ID}:mock"
 
     def __init__(self) -> None:
@@ -391,6 +395,8 @@ class MockBackend(ProgressReporting):
 
 
 class VibeVoiceBackend(ProgressReporting):
+    backend_name = "vibevoice"
+
     def __init__(self) -> None:
         self.model_id = os.environ.get("ASR_MODEL_ID", MODEL_ID)
         self.model_name = self.model_id
@@ -432,6 +438,8 @@ class VibeVoiceBackend(ProgressReporting):
                     "gpu_unsupported",
                     "VibeVoice was not placed on CUDA; CPU fallback is disabled",
                 )
+            self.device = "cuda"
+            self.compute_type = quantization
         except ModuleNotFoundError as exc:
             raise vibevoice_dependency_error(exc) from exc
         except BackendError:
@@ -453,6 +461,8 @@ class VibeVoiceBackend(ProgressReporting):
     def unload(self) -> None:
         self.model = None
         self.processor = None
+        self.device = None
+        self.compute_type = None
         gc.collect()
         try:
             import torch
@@ -543,6 +553,8 @@ def _cancel_stopping_criteria(backend: ProgressReporting) -> Any:
 
 
 class FasterWhisperBackend(ProgressReporting):
+    backend_name = "faster-whisper"
+
     def __init__(self) -> None:
         self.model_id = os.environ.get(
             "ASR_MODEL_ID",
@@ -593,14 +605,17 @@ class FasterWhisperBackend(ProgressReporting):
                 gc.collect()
                 self.report_progress("cpu_fallback")
                 device = "cpu"
+                compute_type = "int8"
                 self.model = WhisperModel(model_source, device="cpu", compute_type="int8")
                 self._warm_up()
             self.device = device
+            self.compute_type = compute_type
         except BackendError:
             raise
         except BaseException as exc:
             self.model = None
             self.device = None
+            self.compute_type = None
             raise map_backend_exception(exc, "load", "faster-whisper") from exc
 
     def _warm_up(self) -> None:
@@ -646,6 +661,7 @@ class FasterWhisperBackend(ProgressReporting):
     def unload(self) -> None:
         self.model = None
         self.device = None
+        self.compute_type = None
         gc.collect()
 
     def transcribe(
@@ -700,6 +716,8 @@ class OpenAICompatibleBackend(ProgressReporting):
     credentials are read from the environment so they are not part of worker
     protocol messages or diagnostic output.
     """
+
+    backend_name = "openai-compatible"
 
     def __init__(self) -> None:
         self.base_url = os.environ.get("ASR_API_BASE_URL", "https://api.openai.com/v1").rstrip("/")

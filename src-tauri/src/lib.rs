@@ -1647,6 +1647,7 @@ pub fn run() {
             commands::load_model,
             commands::get_gpu_diagnostics,
             commands::get_storage_diagnostics,
+            commands::get_worker_health,
             commands::run_gpu_diagnostics,
             commands::list_history,
             commands::delete_history_item,

@@ -213,6 +213,17 @@ export interface StorageDiagnostics {
   }[];
 }
 
+export interface WorkerHealth {
+  pythonPath: string;
+  pythonVersion: string;
+  fasterWhisperVersion: string | null;
+  ctranslate2Version: string | null;
+  backend: string;
+  loaded: boolean;
+  device: string | null;
+  computeType: string | null;
+}
+
 export interface DictionaryEntry {
   id: number;
   reading: string;

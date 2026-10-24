@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
+import platform
 import queue
 import sys
 import threading
@@ -15,7 +17,7 @@ from .diagnostics import log_exception
 
 PROTOCOL_VERSION = 1
 WORKER_VERSION = "0.1.0"
-SUPPORTED_OPERATIONS = "hello, load, transcribe, cancel, shutdown"
+SUPPORTED_OPERATIONS = "hello, health, load, transcribe, cancel, shutdown"
 
 
 def _configure_protocol_stdio() -> None:
@@ -119,6 +121,27 @@ class Worker:
                     "ok": True,
                     "protocol_version": PROTOCOL_VERSION,
                     "worker_version": WORKER_VERSION,
+                }, False
+            if operation == "health":
+                def version(package: str) -> str | None:
+                    try:
+                        return importlib.metadata.version(package)
+                    except importlib.metadata.PackageNotFoundError:
+                        return None
+
+                return {
+                    "id": request_id,
+                    "ok": True,
+                    "health": {
+                        "pythonPath": sys.executable,
+                        "pythonVersion": platform.python_version(),
+                        "fasterWhisperVersion": version("faster-whisper"),
+                        "ctranslate2Version": version("ctranslate2"),
+                        "backend": getattr(self.backend, "backend_name", "unknown"),
+                        "loaded": self.loaded,
+                        "device": getattr(self.backend, "device", None) if self.loaded else None,
+                        "computeType": getattr(self.backend, "compute_type", None) if self.loaded else None,
+                    },
                 }, False
             if operation == "load":
                 quantization = request.get("quantization", "4bit")

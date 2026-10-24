@@ -50,7 +50,7 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
   Rust側 (`JsonlTranscriber`) が最後に成功した `load` の量子化設定 (`loaded_quantization`) を
   保持しており、再spawn時 (`ensure_running`) に自動的に `load` を再送してモデルロード状態を
   再現する。この再ロードも、それを必要とした `transcribe` のキャンセル信号で中断できる。
-  ワーカー起動時には `hello`（§2.6）でバージョンを確認する。モデル状態の問い合わせは実装していない。
+  ワーカー起動時には `hello`（§2.6）でバージョンを確認する。`health`（§2.7）で環境とモデル常駐状態を確認できる。
 - `load` が失敗した場合、ワーカーは以前のモデルを解放済みである(ロード前に `unload` する)
   ため、Rust側は `loaded_quantization` を消去する。同じ量子化のモデルがすでに常駐している
   ワーカーへの `load` は送らずに成功とする(再spawn時の自動再ロード後に、UIの読み込み操作が
@@ -369,6 +369,26 @@ Rust はワーカー起動直後、モデルを読み込む前に次の要求を
 配布版は起動前に uv で環境を準備する。この間 Rust が `stage: "setup"` の
 model-progress を発行する。これは Python の JSONL 通知ではない。
 
+### 2.7 health 操作（実装済み）
+
+```json
+→ {"id": 2, "command": "health"}
+← {"id": 2, "ok": true, "health": {"pythonPath": "C:/runtime/python.exe", "pythonVersion": "3.12.8", "fasterWhisperVersion": "1.2.0", "ctranslate2Version": "4.6.0", "backend": "faster-whisper", "loaded": true, "device": "cpu", "computeType": "int8"}}
+```
+
+実行中のPythonのパス・バージョンとインストール済みパッケージのバージョンを返す。
+任意パッケージが未インストールならそのバージョンは `null` となる。`health` 自体はモデルを
+ロードせず、文字起こしも行わない。未ロード時やリモートAPIなど実行デバイスを報告できない場合、
+`device` / `computeType` は `null`。ロード済みのローカルバックエンドでは、成功したロードで
+選択したデバイスと計算形式（CPUフォールバックが起きた場合はその値）を返す。
+リモートサーバーのGPUを推測しない。
+
+デスクトップからの明示的な検査は、稼働中のワーカーがなければ一時ワーカーを起動する。
+起動時のuv環境構築は行われる場合があるが、この検査からモデルのロードや復元は行わない。
+一時ワーカーは検査後に終了し、次の通常処理が必要なら以前のモデルを復元する。
+検査全体は60秒、要求送信後の応答は10秒を
+上限とする。Pythonのパスはローカル画面だけに表示し、コピーする診断結果からは除外する。
+
 ## 3. エラーコード一覧
 
 `error.code` は実装上の文字列定数であり、以下が全コードである。`message` は人間可読の
@@ -381,7 +401,7 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
 | `model_not_loaded` | worker.py | `load` 成功前に `transcribe` を要求した。 |
 | `invalid_audio_path` | worker.py | `audio_path` が非空文字列でない。 |
 | `audio_not_found` | worker.py | `audio_path` が示すパスが存在しない、またはファイルでない。 |
-| `unsupported_operation` | worker.py | `command`/`op` が `hello`/`load`/`transcribe`/`cancel`/`shutdown` のいずれでもない。 |
+| `unsupported_operation` | worker.py | `command`/`op` が `hello`/`health`/`load`/`transcribe`/`cancel`/`shutdown` のいずれでもない。 |
 | `cancelled` | worker.py / backends.py | `cancel`(§2.5)で中断された `transcribe`。中断できずに完了した場合も結果を破棄してこのコードを返す。 |
 | `unsupported_quantization` | backends.py(各バックエンドの `load` / `faster_whisper_compute_type`) | `quantization` が許容集合 `{4bit, 8bit, bf16}` 外。 |
 | `unsupported_backend` | backends.py (`create_backend`) | 未知のバックエンド名。プロセス起動時 (`main`) に発生し、終了コード2でワーカーが起動失敗する(この場合プロトコル応答ではなくstderr出力)。 |

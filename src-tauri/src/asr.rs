@@ -130,6 +130,68 @@ pub struct Transcript {
     pub duration_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerHealth {
+    pub python_path: String,
+    pub python_version: String,
+    pub faster_whisper_version: Option<String>,
+    pub ctranslate2_version: Option<String>,
+    pub backend: String,
+    pub loaded: bool,
+    pub device: Option<String>,
+    pub compute_type: Option<String>,
+}
+
+impl WorkerHealth {
+    fn parse(response: &Value) -> Result<Self, AsrError> {
+        let health: Self =
+            serde_json::from_value(response.get("health").cloned().unwrap_or(Value::Null))
+                .map_err(|_| AsrError::Protocol("invalid worker health response".into()))?;
+        let text_ok = |text: &str, limit| {
+            !text.is_empty() && text.len() <= limit && !text.chars().any(char::is_control)
+        };
+        if !text_ok(&health.python_path, 32_768)
+            || !text_ok(&health.python_version, 128)
+            || [&health.faster_whisper_version, &health.ctranslate2_version]
+                .iter()
+                .any(|v| v.as_deref().is_some_and(|v| !text_ok(v, 128)))
+            || ![
+                "mock",
+                "faster-whisper",
+                "vibevoice",
+                "openai-compatible",
+                "unknown",
+            ]
+            .contains(&health.backend.as_str())
+            || health
+                .device
+                .as_deref()
+                .is_some_and(|v| !["cpu", "cuda"].contains(&v))
+            || health.compute_type.as_deref().is_some_and(|v| {
+                ![
+                    "int8",
+                    "int8_float16",
+                    "int8_float32",
+                    "int8_bfloat16",
+                    "int16",
+                    "float16",
+                    "float32",
+                    "bfloat16",
+                    "4bit",
+                    "8bit",
+                    "bf16",
+                ]
+                .contains(&v)
+            })
+            || (!health.loaded && (health.device.is_some() || health.compute_type.is_some()))
+        {
+            return Err(AsrError::Protocol("invalid worker health response".into()));
+        }
+        Ok(health)
+    }
+}
+
 /// Progress the worker reports while a `load` request is still running.
 ///
 /// `stage` is `download` while model files are being fetched on first use and
@@ -181,6 +243,9 @@ pub enum AsrError {
     reason = "async_trait generates must_use on boxed futures; required on its generated methods on newer Clippy."
 )]
 pub trait Transcriber: Send + Sync {
+    async fn health(&self) -> Result<WorkerHealth, AsrError> {
+        Err(AsrError::Protocol("worker health is unavailable".into()))
+    }
     async fn load(&self, quantization: &str) -> Result<(), AsrError>;
     /// `load` that gives up with `AsrError::Cancelled` once `cancel` turns
     /// true, for example when the recording that needs the model is cancelled.
@@ -915,15 +980,37 @@ impl JsonlTranscriber {
         }
     }
 
-    async fn transcribe_request(
+    async fn protocol_request(
         &self,
         request: Value,
         cancel: watch::Receiver<bool>,
         response_timeout: Duration,
+        restore_model: bool,
     ) -> Result<Value, AsrError> {
         let mut cancel = Some(cancel);
         let mut interrupt = self.interrupt.subscribe();
         let mut state = self.lock_state(&mut cancel, &mut interrupt).await?;
+        if !restore_model && state.running.is_none() {
+            // Diagnostics must not start a long model restore or publish
+            // Restoring. Keep this temporary worker owned by the future;
+            // kill_on_drop also handles an outer health deadline expiring.
+            let mut worker = self
+                .spawn(&state.command, &mut cancel, &mut interrupt)
+                .await?;
+            let id = request.get("id").cloned().unwrap_or(Value::Null);
+            let result = match worker.send(&request).await {
+                Ok(()) => until_cancelled(
+                    self.read_response(&mut worker, &id, response_timeout),
+                    &mut cancel,
+                    &mut interrupt,
+                )
+                .await
+                .unwrap_or(Err(AsrError::Cancelled)),
+                Err(error) => Err(error),
+            };
+            worker.kill().await;
+            return result;
+        }
         self.ensure_running(&mut state, &mut cancel, &mut interrupt)
             .await?;
         let target_id = request.get("id").cloned().unwrap_or(Value::Null);
@@ -1018,6 +1105,18 @@ fn transcribe_request(
 
 #[async_trait]
 impl Transcriber for JsonlTranscriber {
+    async fn health(&self) -> Result<WorkerHealth, AsrError> {
+        let (_sender, cancel) = watch::channel(false);
+        let response = self
+            .protocol_request(
+                json!({"id": self.next_id(), "command": "health"}),
+                cancel,
+                Duration::from_secs(10),
+                false,
+            )
+            .await?;
+        WorkerHealth::parse(&response)
+    }
     async fn load(&self, quantization: &str) -> Result<(), AsrError> {
         self.load_with(quantization, None, None).await
     }
@@ -1062,7 +1161,7 @@ impl Transcriber for JsonlTranscriber {
             wav_file_duration(audio_path).unwrap_or_default(),
         );
         let response = self
-            .transcribe_request(request, cancel, response_timeout)
+            .protocol_request(request, cancel, response_timeout, true)
             .await?;
         match serde_json::from_value(response) {
             Ok(transcript) => Ok(transcript),
@@ -1133,6 +1232,32 @@ impl Transcriber for JsonlTranscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_health_parsing_reports_runtime_and_rejects_untrusted_shapes() {
+        let response = json!({"health": {
+            "pythonPath": "C:/runtime/python.exe", "pythonVersion": "3.12.8",
+            "fasterWhisperVersion": "1.2.0", "ctranslate2Version": "4.6.0",
+            "backend": "faster-whisper", "loaded": true, "device": "cpu", "computeType": "int8"
+        }});
+        let health = WorkerHealth::parse(&response).unwrap();
+        assert_eq!(health.device.as_deref(), Some("cpu"));
+        assert_eq!(health.python_version, "3.12.8");
+        assert_eq!(serde_json::to_value(&health).unwrap(), response["health"]);
+        for (field, value) in [
+            ("loaded", json!(false)),
+            ("device", json!("unexpected")),
+            ("backend", json!("C:/private/model")),
+            ("pythonVersion", json!("bad\nversion")),
+            ("computeType", json!("secret")),
+            ("pythonPath", json!("x".repeat(32_769))),
+        ] {
+            let mut invalid = response.clone();
+            invalid["health"][field] = value;
+            assert!(WorkerHealth::parse(&invalid).is_err(), "{field}");
+        }
+        assert!(WorkerHealth::parse(&json!({"health": null})).is_err());
+    }
 
     #[test]
     fn worker_commands_never_inherit_text_provider_secrets() {
@@ -1614,6 +1739,52 @@ mod tests {
             .await
             .expect("worker was never reset")
             .unwrap();
+        }
+
+        #[tokio::test]
+        async fn health_after_worker_reset_never_starts_a_slow_restore() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = mock.transcriber();
+            transcriber.load("4bit").await.unwrap();
+            transcriber.reset().await;
+            mock.hold();
+            // A restore would block in MockBackend.load until release().
+            let health = timeout(BOUNDED, transcriber.health())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!health.loaded);
+            assert_eq!(
+                *transcriber.model_residency().unwrap().borrow(),
+                ModelResidency::Absent
+            );
+            assert_eq!(mock.event_names(), ["load 4bit"]);
+            mock.release();
+            mock.transcribe(&transcriber).await.unwrap();
+            assert_eq!(mock.event_names(), ["load 4bit", "load 4bit", "transcribe"]);
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn health_starts_worker_without_loading_and_reports_residency_after_load() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = mock.transcriber();
+            let initial = transcriber.health().await.unwrap();
+            assert_eq!(initial.backend, "mock");
+            assert!(!initial.loaded);
+            assert_eq!(initial.device, None);
+            assert!(!initial.python_path.is_empty());
+            assert!(mock.event_names().is_empty());
+            assert_eq!(resident(&transcriber), None);
+            transcriber.load("4bit").await.unwrap();
+            assert!(transcriber.health().await.unwrap().loaded);
+            assert_eq!(mock.event_names(), ["load 4bit"]);
+            assert_eq!(resident(&transcriber), Some(1));
+            transcriber.shutdown().await.unwrap();
         }
 
         #[tokio::test]

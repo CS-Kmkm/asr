@@ -4,6 +4,7 @@ import type {
   AudioDevice,
   GpuDiagnostics,
   StorageDiagnostics,
+  WorkerHealth,
   HistoryItem,
   ModelStatus,
   Settings,
@@ -21,6 +22,11 @@ const inTauri = "__TAURI_INTERNALS__" in window;
 export async function getStorageDiagnostics(): Promise<StorageDiagnostics | null> {
   if (!inTauri) return null;
   return invoke("get_storage_diagnostics");
+}
+
+export async function getWorkerHealth(): Promise<WorkerHealth | null> {
+  if (!inTauri) return null;
+  return invoke("get_worker_health");
 }
 
 export async function openDiagnosticsFolder(): Promise<void> {

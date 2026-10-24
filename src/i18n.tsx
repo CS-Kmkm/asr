@@ -23,6 +23,16 @@ const backendTemplates = Object.entries(backendCatalogue).filter(([, entry]) => 
 });
 
 const en = {
+  "Worker environment": "Worker environment",
+  "Check worker environment": "Check worker environment",
+  "This check starts a temporary worker if needed and may prepare dependencies. It does not load or restore a model. The Python path is shown locally and excluded from copied diagnostics.": "This check starts a temporary worker if needed and may prepare dependencies. It does not load or restore a model. The Python path is shown locally and excluded from copied diagnostics.",
+  "The worker health check could not be completed.": "The worker health check could not be completed.",
+  "Python path": "Python path",
+  "Model residency": "Model residency",
+  "Loaded": "Loaded",
+  "Not loaded": "Not loaded",
+  "Selected device": "Selected device",
+  "Compute type": "Compute type",
   "Hold to talk": "Hold to talk",
   "Hold to talk waits about 200 ms before recording and stops on key release. Turn it off to toggle recording with two presses.": "Hold to talk waits about 200 ms before recording and stops on key release. Turn it off to toggle recording with two presses.",
   "Custom model identifiers are grouped as other to exclude local paths from diagnostics.": "Custom model identifiers are grouped as other to exclude local paths from diagnostics.",
@@ -139,7 +149,7 @@ const en = {
   "If recording starts before loading, Local Voice automatically prepares the selected backend.": "If recording starts before loading, Local Voice automatically prepares the selected backend.",
   "Not checked": "Not checked",
   "Run diagnostics to check NVIDIA availability and VRAM.": "Run diagnostics to check NVIDIA availability and VRAM.",
-  "Diagnostics report status codes and hardware metadata only. Audio, transcripts, clipboard contents, window titles, and API keys are excluded.": "Diagnostics report status codes and hardware metadata only. Audio, transcripts, clipboard contents, window titles, and API keys are excluded.",
+  "Copied diagnostics contain status codes, software versions and hardware metadata. Audio, transcripts, clipboard contents, window titles, paths and API keys are excluded.": "Copied diagnostics contain status codes, software versions and hardware metadata. Audio, transcripts, clipboard contents, window titles, paths and API keys are excluded.",
   "APP STATE": "APP STATE",
   Updated: "Updated",
   "Run the hardware probe": "Run the hardware probe",
@@ -293,6 +303,16 @@ const en = {
 } as const;
 export type MessageKey = keyof typeof en | keyof typeof backendMessages;
 const ja: Record<keyof typeof en, string> = {
+  "Worker environment": "ワーカー環境",
+  "Check worker environment": "ワーカー環境を検査",
+  "This check starts a temporary worker if needed and may prepare dependencies. It does not load or restore a model. The Python path is shown locally and excluded from copied diagnostics.": "必要に応じて一時ワーカーを起動し、依存環境を構築します。モデルのロードや復元は行いません。Pythonのパスはこの画面だけに表示し、コピーする診断結果には含めません。",
+  "The worker health check could not be completed.": "ワーカーの検査を完了できませんでした。",
+  "Python path": "Pythonのパス",
+  "Model residency": "モデルの常駐状態",
+  "Loaded": "ロード済み",
+  "Not loaded": "未ロード",
+  "Selected device": "選択されたデバイス",
+  "Compute type": "計算形式",
   "Hold to talk": "押している間だけ録音",
   "Hold to talk waits about 200 ms before recording and stops on key release. Turn it off to toggle recording with two presses.": "録音開始まで約200ミリ秒待ち、キーを離すと停止します。オフの場合は、2回の押下で録音の開始・停止を切り替えます。",
   "Custom model identifiers are grouped as other to exclude local paths from diagnostics.": "ローカルのパスを診断結果に含めないよう、任意のモデル識別子は other にまとめます。",
@@ -417,7 +437,7 @@ const ja: Record<keyof typeof en, string> = {
   "If recording starts before loading, Local Voice automatically prepares the selected backend.": "読み込み前に録音を開始した場合、選択したバックエンドを自動的に準備します。",
   "Not checked": "未確認",
   "Run diagnostics to check NVIDIA availability and VRAM.": "診断を実行してNVIDIA GPUとVRAMを確認してください。",
-  "Diagnostics report status codes and hardware metadata only. Audio, transcripts, clipboard contents, window titles, and API keys are excluded.": "診断にはステータスコードとハードウェア情報のみを表示します。音声、文字起こし、クリップボード、ウィンドウタイトル、APIキーは含みません。",
+  "Copied diagnostics contain status codes, software versions and hardware metadata. Audio, transcripts, clipboard contents, window titles, paths and API keys are excluded.": "コピーする診断結果にはステータスコード、ソフトウェアのバージョン、ハードウェア情報を含みます。音声、文字起こし、クリップボード、ウィンドウタイトル、パス、APIキーは含みません。",
   "APP STATE": "アプリ状態",
   Updated: "更新",
   "Run the hardware probe": "ハードウェア診断を実行してください",
