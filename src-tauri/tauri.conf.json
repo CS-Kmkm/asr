@@ -18,16 +18,23 @@
         "minWidth": 900,
         "minHeight": 620,
         "resizable": true,
+        "visible": false,
         "center": true
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost; media-src 'self' blob:"
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": {
+      "../asr_worker/*.py": "worker/asr_worker/",
+      "../pyproject.toml": "worker/pyproject.toml",
+      "../uv.lock": "worker/uv.lock",
+      "../.python-version": "worker/.python-version"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

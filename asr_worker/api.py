@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+import ipaddress
 import os
+import queue
 import secrets
 import tempfile
 import threading
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +15,8 @@ from .backends import Backend, BackendError
 
 
 RESPONSE_FORMATS = {"json", "text", "verbose_json", "srt", "vtt"}
+# Like OpenAI, streamed transcripts are plain text deltas without segments.
+STREAM_RESPONSE_FORMATS = {"json", "text"}
 SUPPORTED_AUDIO_SUFFIXES = {".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga", ".ogg", ".wav", ".webm"}
 DEFAULT_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
@@ -75,6 +81,7 @@ def create_app(
     api_key: str | None = None,
     served_model: str | None = None,
     max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES,
+    allowed_hosts: set[str] | None = None,
 ):
     """Create an OpenAI Audio Transcriptions compatible ASGI application."""
 
@@ -83,6 +90,7 @@ def create_app(
         from fastapi.concurrency import run_in_threadpool
         from fastapi.exceptions import RequestValidationError
         from fastapi.responses import JSONResponse, PlainTextResponse
+        from fastapi.routing import APIRoute
     except ModuleNotFoundError as exc:
         raise BackendError(
             "serve_dependencies_missing",
@@ -97,6 +105,21 @@ def create_app(
     inference_lock = threading.Lock()
     model_name = served_model or os.environ.get("ASR_SERVED_MODEL_NAME") or backend.model_name
     app = FastAPI(title="Local ASR OpenAI-compatible API", version="1.0.0")
+
+    class SingleUploadRoute(APIRoute):
+        def get_route_handler(self):
+            handler = super().get_route_handler()
+            async def limited(request):
+                if request.method == "POST" and request.url.path == "/v1/audio/transcriptions":
+                    # Populate Starlette's form cache with strict part limits
+                    # before FastAPI resolves File/Form endpoint parameters.
+                    await request.form(max_files=1, max_fields=8, max_part_size=64 * 1024)
+                return await handler(request)
+            return limited
+
+    app.router.route_class = SingleUploadRoute
+    from .http_guard import RequestGate
+    app.add_middleware(RequestGate, api_key=api_key, allowed_hosts=allowed_hosts or {"localhost", "127.0.0.1", "::1"}, max_body_bytes=max_upload_bytes + 64 * 1024)
 
     def authorize(authorization: str | None) -> None:
         if api_key is None:
@@ -148,7 +171,8 @@ def create_app(
         )
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
+    async def health(authorization: str | None = Header(default=None)) -> dict[str, str]:
+        authorize(authorization)
         return {"status": "ok", "model": model_name}
 
     @app.get("/v1/models")
@@ -174,12 +198,15 @@ def create_app(
             raise HTTPException(status_code=400, detail="temperature must be between 0 and 1")
         if language is not None and len(language) > 32:
             raise HTTPException(status_code=400, detail="language is too long")
-        if stream:
-            raise HTTPException(status_code=400, detail="Streaming transcription is not supported")
         if response_format not in RESPONSE_FORMATS:
             raise HTTPException(
                 status_code=400,
                 detail=f"response_format must be one of: {', '.join(sorted(RESPONSE_FORMATS))}",
+            )
+        if stream and response_format not in STREAM_RESPONSE_FORMATS:
+            raise HTTPException(
+                status_code=400,
+                detail="Streaming supports only the json and text response formats",
             )
         suffix = Path(file.filename or "audio.wav").suffix.lower()
         if suffix not in SUPPORTED_AUDIO_SUFFIXES:
@@ -194,6 +221,13 @@ def create_app(
                     if uploaded > max_upload_bytes:
                         raise HTTPException(status_code=413, detail="Audio file is too large")
                     temporary.write(chunk)
+
+            if stream:
+                # The producer thread now owns the upload and deletes it.
+                audio_path, temporary_path = temporary_path, None
+                return await _stream_transcription(
+                    backend, inference_lock, audio_path, prompt, language
+                )
 
             def infer() -> tuple[str, list[dict[str, Any]]]:
                 with inference_lock:
@@ -218,6 +252,101 @@ def create_app(
     return app
 
 
+def _text_deltas(
+    backend: Backend,
+    audio_path: Path,
+    prompt: str | None,
+    language: str | None,
+) -> Iterator[str]:
+    """Yield transcript pieces whose concatenation is the transcript text.
+
+    Backends that decode incrementally yield one piece per segment; others
+    yield their whole transcript at once.
+    """
+    segments = getattr(backend, "transcribe_segments", None)
+    if segments is None:
+        text, _segments = backend.transcribe(audio_path, prompt, language)
+        if text:
+            yield text
+        return
+    started = False
+    for segment in segments(audio_path, prompt, language):
+        piece = segment["text"] if started else segment["text"].lstrip()
+        if piece:
+            started = True
+            yield piece
+
+
+def _sse(event: dict[str, Any]) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+async def _stream_transcription(
+    backend: Backend,
+    inference_lock: threading.Lock,
+    audio_path: Path,
+    prompt: str | None,
+    language: str | None,
+):
+    """Stream OpenAI-style ``transcript.text.delta``/``done`` server-sent events.
+
+    Inference runs on its own thread so a client that disconnects early still
+    releases the model lock and the uploaded file once decoding finishes.
+    """
+    from fastapi.concurrency import run_in_threadpool
+    from fastapi.responses import StreamingResponse
+
+    events: queue.Queue[tuple[str, Any]] = queue.Queue()
+
+    def produce() -> None:
+        try:
+            with inference_lock:
+                for piece in _text_deltas(backend, audio_path, prompt, language):
+                    events.put(("delta", piece))
+            events.put(("done", None))
+        except BackendError as exc:
+            events.put(("error", exc))
+        except BaseException:  # noqa: BLE001 - reported to the client below
+            events.put(("error", BackendError("transcription_failed", "Transcription failed")))
+        finally:
+            audio_path.unlink(missing_ok=True)
+
+    threading.Thread(target=produce, name="asr-api-stream", daemon=True).start()
+    # A failure before any text keeps its HTTP error status.
+    first = await run_in_threadpool(events.get)
+    if first[0] == "error":
+        raise first[1]
+
+    async def body() -> AsyncIterator[str]:
+        event = first
+        pieces: list[str] = []
+        while True:
+            kind, value = event
+            if kind == "delta":
+                pieces.append(value)
+                yield _sse({"type": "transcript.text.delta", "delta": value, "logprobs": []})
+            elif kind == "done":
+                text = "".join(pieces).rstrip()
+                yield _sse({"type": "transcript.text.done", "text": text, "logprobs": []})
+                return
+            else:
+                yield _sse(
+                    {
+                        "type": "error",
+                        "error": {
+                            "message": value.message,
+                            "type": "server_error",
+                            "param": None,
+                            "code": value.code,
+                        },
+                    }
+                )
+                return
+            event = await run_in_threadpool(events.get)
+
+    return StreamingResponse(body(), media_type="text/event-stream")
+
+
 def run_api_server(
     backend: Backend,
     *,
@@ -227,6 +356,12 @@ def run_api_server(
     api_key: str | None,
     served_model: str | None,
 ) -> None:
+    try:
+        loopback = host.lower() == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback and not api_key:
+        raise BackendError("serve_auth_required", "Set ASR_SERVE_API_KEY before binding to a non-loopback address")
     try:
         import uvicorn
     except ModuleNotFoundError as exc:
@@ -239,5 +374,6 @@ def run_api_server(
         quantization=quantization,
         api_key=api_key,
         served_model=served_model,
+        allowed_hosts={"localhost", "127.0.0.1", "::1", host.lower()} | {item.strip().lower() for item in os.environ.get("ASR_SERVE_ALLOWED_HOSTS", "").split(",") if item.strip()},
     )
     uvicorn.run(app, host=host, port=port)

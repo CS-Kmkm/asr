@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
+import platform
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, TextIO
+from typing import Any, Callable, Iterable, Iterator, TextIO
 
-from .backends import Backend, BackendError, create_backend
+from .backends import Backend, BackendError, CancelCheck, cancelled_error, create_backend
+from .diagnostics import log_exception
+
+PROTOCOL_VERSION = 1
+WORKER_VERSION = "0.1.0"
+SUPPORTED_OPERATIONS = "hello, health, load, transcribe, cancel, shutdown"
 
 
 def _configure_protocol_stdio() -> None:
@@ -22,6 +31,15 @@ def _configure_protocol_stdio() -> None:
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
             reconfigure(encoding="utf-8", errors="strict")
+
+
+def _isolate_protocol_stdout() -> TextIO:
+    """Reserve the original stdout pipe for JSONL; redirect library fd 1 too."""
+    sys.stdout.flush()
+    protocol = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8", errors="strict")
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    sys.stdout = sys.stderr
+    return protocol
 
 
 def _sanitize_unicode(value: Any) -> Any:
@@ -83,7 +101,13 @@ class Worker:
             return
         self.notify({"id": request_id, "event": "progress", **update})
 
-    def handle(self, request: Any) -> tuple[dict[str, Any], bool]:
+    def handle(
+        self,
+        request: Any,
+        cancel_requested: CancelCheck | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Run one request. `cancel_requested` reports whether the client has
+        cancelled this request since it arrived (see `serve`)."""
         if not isinstance(request, dict):
             return error_response(None, "invalid_request", "Request must be a JSON object"), False
         request_id = request.get("id")
@@ -91,6 +115,34 @@ class Worker:
             return error_response(None, "invalid_request", "Request id is required"), False
         operation = request.get("command", request.get("op"))
         try:
+            if operation == "hello":
+                return {
+                    "id": request_id,
+                    "ok": True,
+                    "protocol_version": PROTOCOL_VERSION,
+                    "worker_version": WORKER_VERSION,
+                }, False
+            if operation == "health":
+                def version(package: str) -> str | None:
+                    try:
+                        return importlib.metadata.version(package)
+                    except importlib.metadata.PackageNotFoundError:
+                        return None
+
+                return {
+                    "id": request_id,
+                    "ok": True,
+                    "health": {
+                        "pythonPath": sys.executable,
+                        "pythonVersion": platform.python_version(),
+                        "fasterWhisperVersion": version("faster-whisper"),
+                        "ctranslate2Version": version("ctranslate2"),
+                        "backend": getattr(self.backend, "backend_name", "unknown"),
+                        "loaded": self.loaded,
+                        "device": getattr(self.backend, "device", None) if self.loaded else None,
+                        "computeType": getattr(self.backend, "compute_type", None) if self.loaded else None,
+                    },
+                }, False
             if operation == "load":
                 quantization = request.get("quantization", "4bit")
                 if not isinstance(quantization, str):
@@ -142,8 +194,18 @@ class Worker:
                         "invalid_request",
                         "language must be a short string or null",
                     ), False
+                if cancel_requested is not None and cancel_requested():
+                    raise cancelled_error()
                 started = time.perf_counter()
-                text, segments = self.backend.transcribe(audio_path, prompt, language)
+                self.backend.cancel_requested = cancel_requested
+                try:
+                    text, segments = self.backend.transcribe(audio_path, prompt, language)
+                finally:
+                    self.backend.cancel_requested = None
+                # A backend that cannot stop early finishes; its result is
+                # discarded because the client no longer waits for it.
+                if cancel_requested is not None and cancel_requested():
+                    raise cancelled_error()
                 return {
                     "id": request_id,
                     "ok": True,
@@ -153,15 +215,24 @@ class Worker:
                     "duration_ms": round((time.perf_counter() - started) * 1000),
                 }, False
 
+            if operation == "cancel":
+                # Handled by `serve` while another request runs; reaching this
+                # point means nothing is in flight to cancel.
+                if "target_id" not in request:
+                    return error_response(request_id, "invalid_request", "target_id is required"), False
+                return {"id": request_id, "ok": True, "cancelled": False}, False
+
             if operation == "shutdown":
                 self.backend.unload()
                 self.loaded = False
                 return {"id": request_id, "ok": True}, True
-            return error_response(request_id, "unsupported_operation", "Supported operations: load, transcribe, shutdown"), False
+            return error_response(
+                request_id, "unsupported_operation", f"Supported operations: {SUPPORTED_OPERATIONS}"
+            ), False
         except BackendError as exc:
             return error_response(request_id, exc.code, exc.message), operation == "shutdown"
         except BaseException as exc:
-            print(f"worker operation failed: {type(exc).__name__}", file=sys.stderr, flush=True)
+            log_exception(exc, "internal")
             return error_response(request_id, "internal_error", "Unexpected worker error"), operation == "shutdown"
 
 
@@ -171,25 +242,136 @@ def _write_message(output_stream: TextIO, message: dict[str, Any]) -> None:
     output_stream.flush()
 
 
+def _request_key(request_id: Any) -> str:
+    # Request ids are arbitrary JSON values; compare them by their encoding.
+    return json.dumps(request_id, sort_keys=True)
+
+
+def _is_cancel(request: Any) -> bool:
+    return isinstance(request, dict) and request.get("command", request.get("op")) == "cancel"
+
+
+class _CancelRegistry:
+    """Requests read but not yet answered, and which of them were cancelled."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending: set[str] = set()
+        self._cancelled: set[str] = set()
+
+    def submit(self, key: str) -> None:
+        with self._lock:
+            self._pending.add(key)
+
+    def finish(self, key: str) -> None:
+        with self._lock:
+            self._pending.discard(key)
+            self._cancelled.discard(key)
+
+    def is_cancelled(self, key: str) -> bool:
+        with self._lock:
+            return key in self._cancelled
+
+    def cancel(self, request: dict[str, Any]) -> dict[str, Any]:
+        request_id = request.get("id")
+        if "id" not in request:
+            return error_response(None, "invalid_request", "Request id is required")
+        if "target_id" not in request:
+            return error_response(request_id, "invalid_request", "target_id is required")
+        key = _request_key(request["target_id"])
+        with self._lock:
+            pending = key in self._pending
+            if pending:
+                self._cancelled.add(key)
+        return {"id": request_id, "ok": True, "cancelled": pending}
+
+
+_END_OF_INPUT = object()
+
+
 def serve(
     worker: Worker,
-    input_stream: TextIO = sys.stdin,
+    input_stream: Iterable[str] = sys.stdin,
     output_stream: TextIO = sys.stdout,
     *,
     notify_progress: bool = True,
 ) -> None:
+    """Answer requests until EOF or `shutdown`.
+
+    A reader thread keeps consuming input while a request runs, so a `cancel`
+    is acknowledged at once and the running transcription can stop early.
+    Every other request is answered in arrival order by the calling thread.
+    """
+    write_lock = threading.Lock()
+
+    def write(message: dict[str, Any]) -> None:
+        with write_lock:
+            _write_message(output_stream, message)
+
     if notify_progress:
-        worker.notify = lambda message: _write_message(output_stream, message)
-    for line in input_stream:
+        worker.notify = write
+    registry = _CancelRegistry()
+    requests: queue.Queue[Any] = queue.Queue()
+
+    def read_requests() -> None:
         try:
-            request = json.loads(line)
-        except json.JSONDecodeError:
-            response, should_stop = error_response(None, "invalid_json", "Request is not valid JSON"), False
-        else:
-            response, should_stop = worker.handle(request)
-        _write_message(output_stream, response)
+            for line in input_stream:
+                try:
+                    request = json.loads(line)
+                except json.JSONDecodeError:
+                    requests.put((None, error_response(None, "invalid_json", "Request is not valid JSON")))
+                    continue
+                if _is_cancel(request):
+                    write(registry.cancel(request))
+                    continue
+                if isinstance(request, dict) and "id" in request:
+                    registry.submit(_request_key(request["id"]))
+                requests.put((request, None))
+        finally:
+            requests.put(_END_OF_INPUT)
+
+    threading.Thread(target=read_requests, name="asr-worker-input", daemon=True).start()
+    while True:
+        item = requests.get()
+        if item is _END_OF_INPUT:
+            return
+        request, rejection = item
+        if rejection is not None:
+            write(rejection)
+            continue
+        key = _request_key(request["id"]) if isinstance(request, dict) and "id" in request else None
+        try:
+            response, should_stop = worker.handle(
+                request,
+                None if key is None else (lambda: registry.is_cancelled(key)),
+            )
+        finally:
+            if key is not None:
+                registry.finish(key)
+        write(response)
         if should_stop:
             return
+
+
+def _stdin_lines() -> Iterator[str]:
+    """Protocol lines read straight from file descriptor 0.
+
+    The reader thread is still blocked here when the worker exits after
+    `shutdown`. Reading through `sys.stdin` would leave its buffer lock held
+    by a daemon thread, which aborts interpreter shutdown.
+    """
+    fd = sys.stdin.fileno()
+    buffered = b""
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            if buffered:
+                yield buffered.decode("utf-8", errors="replace")
+            return
+        buffered += chunk
+        while (newline := buffered.find(b"\n")) >= 0:
+            line, buffered = buffered[: newline + 1], buffered[newline + 1 :]
+            yield line.decode("utf-8", errors="replace")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -209,7 +391,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         backend = create_backend(args.backend)
     except BackendError as exc:
-        print(f"worker startup failed: {exc.code}", file=sys.stderr)
+        log_exception(exc, "startup")
+        guidance = {
+            "invalid_api_config": "Check ASR_API_BASE_URL and ASR_API_TIMEOUT_SECONDS.",
+            "invalid_device": "Set ASR_DEVICE to auto, cpu, or cuda.",
+        }.get(exc.code, "Check the selected ASR backend and its configuration.")
+        print(f"worker startup failed: {exc.code}: {guidance}", file=sys.stderr)
         return 2
     if args.serve:
         try:
@@ -230,10 +417,13 @@ def main(argv: list[str] | None = None) -> int:
         # Progress notifications break a client that predates them, and the
         # worker runs from this repository while the desktop app is a
         # separately built binary. Only a client that asks for them gets them.
-        serve(
-            Worker(backend),
-            notify_progress=os.environ.get("ASR_WORKER_PROGRESS") == "1",
-        )
+        with _isolate_protocol_stdout() as output:
+            serve(
+                Worker(backend),
+                _stdin_lines(),
+                output_stream=output,
+                notify_progress=os.environ.get("ASR_WORKER_PROGRESS") == "1",
+            )
     return 0
 
 

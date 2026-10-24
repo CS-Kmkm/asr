@@ -1,18 +1,21 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
-import { SettingRow } from "../components/ui";
+import { ModelProgressBar, SettingRow } from "../components/ui";
 import type {
   AsrBackend,
   CustomModel,
   GpuDiagnostics,
   ModelQuantization,
   Settings,
+  ModelStatus,
+  ModelProgress,
 } from "../types";
-import { useI18n } from "../i18n";
+import { translateAppMessage, useI18n } from "../i18n";
 import type { MessageKey } from "../i18n";
 
 type ModelConfiguration = Pick<
   Settings,
   | "asrBackend"
+  | "asrDevice"
   | "modelId"
   | "modelQuantization"
   | "apiBaseUrl"
@@ -46,6 +49,9 @@ export function ModelsPage({
   onConfigureModel,
   onSaveCustomModel,
   onDiagnoseGpu,
+  model,
+  progress,
+  onOpenLogs,
 }: {
   gpu: GpuDiagnostics | null;
   settings: Settings;
@@ -54,9 +60,13 @@ export function ModelsPage({
   onConfigureModel: (configuration: ModelConfiguration) => void;
   onSaveCustomModel: (model: CustomModel) => Promise<boolean>;
   onDiagnoseGpu: () => void;
+  model?: ModelStatus | null;
+  progress?: ModelProgress | null;
+  onOpenLogs?: () => void;
 }) {
-  const { t } = useI18n();
+  const { t, language } = useI18n();
   const [backend, setBackend] = useState(settings.asrBackend);
+  const [device, setDevice] = useState(settings.asrDevice);
   const [additionalModelId, setAdditionalModelId] = useState(settings.modelId ?? "");
   const [quantization, setQuantization] = useState<ModelQuantization>(
     settings.modelQuantization,
@@ -70,6 +80,7 @@ export function ModelsPage({
 
   useEffect(() => {
     setBackend(settings.asrBackend);
+    setDevice(settings.asrDevice);
     setAdditionalModelId(settings.modelId ?? "");
     setQuantization(settings.modelQuantization);
     setApiBaseUrl(settings.apiBaseUrl);
@@ -78,6 +89,7 @@ export function ModelsPage({
     settings.apiBaseUrl,
     settings.apiKeyEnvVar,
     settings.asrBackend,
+    settings.asrDevice,
     settings.modelId,
     settings.modelQuantization,
   ]);
@@ -191,6 +203,13 @@ export function ModelsPage({
               </select>
             }
           />
+          {backend === "faster-whisper" && <SettingRow title={t("Speech device")} detail={t("Auto retries caught CUDA failures on CPU. Explicit CUDA reports an error instead. The environment option preserves ASR_DEVICE.")}
+            control={<select aria-label={t("Speech device")} value={device ?? ""} onChange={(event) => setDevice((event.target.value || null) as Settings["asrDevice"])}>
+              <option value="">{t("Environment (auto by default)")}</option>
+              <option value="auto">{t("Auto (CUDA with CPU fallback)")}</option>
+              <option value="cpu">{t("CPU only")}</option>
+              <option value="cuda">{t("CUDA only")}</option>
+            </select>} />}
           {backend === "openai-compatible" ? (
             <>
               <SettingRow
@@ -242,6 +261,7 @@ export function ModelsPage({
           onClick={() =>
             onConfigureModel({
               asrBackend: backend,
+              asrDevice: device,
               modelId: additionalModelId || null,
               modelQuantization: quantization,
               apiBaseUrl: apiBaseUrl.trim(),
@@ -250,8 +270,14 @@ export function ModelsPage({
           }
           disabled={modelLoading}
         >
-          {modelLoading ? t("Loading...") : t("Load Model")}
+          {modelLoading ? t("Loading...") : model?.state === "error" ? t("Retry") : t("Load Model")}
         </button>
+        {model && <div role={model.state === "error" ? "alert" : "status"}>
+          <strong>{t(model.state === "ready" ? "Ready" : model.state === "loading" ? "Model loading" : model.state === "error" ? "Model error" : "Model not loaded")}</strong>
+          <p>{translateAppMessage(language, model.detail)}</p>
+          {model.state === "error" && onOpenLogs && <button className="secondary" onClick={onOpenLogs}>{t("Open diagnostic logs")}</button>}
+        </div>}
+        {progress && <ModelProgressBar progress={progress} />}
         <p className="model-note">
           {t("If recording starts before loading, Local Voice automatically prepares the selected backend.")}
         </p>
@@ -260,7 +286,7 @@ export function ModelsPage({
       <article className="panel span-2">
         <p className="eyebrow">{t("GPU")}</p>
         <h2>{gpu?.adapterName ?? t("Not checked")}</h2>
-        <p>{gpu?.recommendation ?? t("Run diagnostics to check NVIDIA availability and VRAM.")}</p>
+        <p>{gpu ? translateAppMessage(language, gpu.recommendation) : t("Run diagnostics to check NVIDIA availability and VRAM.")}</p>
         {gpu?.memoryTotalMb && <strong>{gpu.memoryTotalMb} MB VRAM</strong>}
         <br />
         <button className="secondary" onClick={onDiagnoseGpu}>

@@ -3,19 +3,36 @@
 //! The CPAL backend is intentionally Windows-only. This lets non-Windows CI exercise
 //! the DSP and lifecycle code without requiring native ALSA development packages.
 
+mod dsp;
+mod vad;
+mod wav;
+
+#[cfg(test)]
+pub use dsp::enhance_audio;
+pub use dsp::meter;
+use dsp::resample_linear_owned;
+#[cfg(test)]
+pub use dsp::{interleaved_to_mono, resample_linear};
+#[cfg(test)]
+pub use vad::VoiceActivityDetector;
+pub use vad::{EnergyVad, EnergyVadConfig, VadAnalysis};
+use wav::{temporary_wav_path, write_pcm16_wav};
+
 use serde::Serialize;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs;
 use std::future::Future;
-use std::io::{self, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::io;
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 #[cfg(target_os = "windows")]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "windows")]
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 pub const TARGET_SAMPLE_RATE: u32 = 24_000;
 
@@ -45,13 +62,17 @@ pub trait AudioCapture: Send {
     fn snapshot(&self, since: Duration) -> Result<AudioSnapshot, AudioError>;
     fn stop(&mut self) -> AudioFuture<'_, AudioArtifact>;
     fn cancel(&mut self) -> AudioFuture<'_, ()>;
+    #[cfg(test)]
     fn state(&self) -> CaptureState;
     fn level(&self) -> LevelMeter;
-}
-
-/// Boundary for replacing the deterministic fallback with WebRTC VAD later.
-pub trait VoiceActivityDetector: Send + Sync {
-    fn analyze(&self, samples: &[f32], sample_rate: u32) -> VadAnalysis;
+    fn stream_error(&self) -> Option<String> {
+        None
+    }
+    /// Whether the open stream uses the default input device because the
+    /// requested one was missing (see `CaptureConfig::fallback_to_default`).
+    fn uses_fallback_device(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -66,6 +87,11 @@ pub struct AudioDevice {
 #[derive(Clone, Debug)]
 pub struct CaptureConfig {
     pub device_id: Option<String>,
+    /// Open the default input device when `device_id` names a device that is
+    /// not present (for example a disconnected Bluetooth headset). Recordings
+    /// opt in; the Settings microphone test does not, because it tests the
+    /// chosen device. The saved selection is never changed.
+    pub fallback_to_default: bool,
     pub target_sample_rate: u32,
     pub minimum_duration: Duration,
     /// Amount of pre-press audio retained in the preroll ring. `Duration::ZERO`
@@ -80,6 +106,7 @@ impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
             device_id: None,
+            fallback_to_default: false,
             target_sample_rate: TARGET_SAMPLE_RATE,
             minimum_duration: Duration::from_millis(250),
             preroll: DEFAULT_PREROLL,
@@ -126,6 +153,9 @@ pub struct AudioArtifact {
     pub peak_level: f32,
     pub rms_level: f32,
     pub vad: VadAnalysis,
+    /// Set when the input stream failed during the take. The artifact holds
+    /// the audio captured before the failure.
+    pub warning: Option<String>,
 }
 
 pub struct AudioSnapshot {
@@ -136,6 +166,7 @@ pub struct AudioSnapshot {
 
 impl AudioSnapshot {
     /// Processing and disk I/O run outside the capture lock and callback.
+    #[cfg(test)]
     pub fn into_artifact(self) -> Result<AudioArtifact, AudioError> {
         self.prepare()?.into_artifact()
     }
@@ -173,6 +204,7 @@ impl PreparedAudio {
 
 impl AudioArtifact {
     /// Explicit cleanup helper; artifacts are not deleted automatically on drop.
+    #[cfg(test)]
     pub fn remove(self) -> Result<(), AudioError> {
         match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
@@ -191,102 +223,10 @@ pub struct LevelMeter {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub enum CaptureState {
     Idle,
     Capturing,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct EnergyVadConfig {
-    pub frame_duration: Duration,
-    pub rms_threshold: f32,
-    pub minimum_voice_duration: Duration,
-}
-
-impl Default for EnergyVadConfig {
-    fn default() -> Self {
-        Self {
-            frame_duration: Duration::from_millis(20),
-            rms_threshold: 0.01,
-            minimum_voice_duration: Duration::from_millis(100),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct VadAnalysis {
-    pub contains_voice: bool,
-    pub voiced_duration: Duration,
-    pub trailing_silence: Duration,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct EnergyVad {
-    config: EnergyVadConfig,
-}
-
-impl EnergyVad {
-    pub fn new(config: EnergyVadConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl VoiceActivityDetector for EnergyVad {
-    fn analyze(&self, samples: &[f32], sample_rate: u32) -> VadAnalysis {
-        self.analyze_with_meter(samples, sample_rate).0
-    }
-}
-
-impl EnergyVad {
-    /// Computes VAD and the whole-recording meter in one pass over the audio.
-    fn analyze_with_meter(&self, samples: &[f32], sample_rate: u32) -> (VadAnalysis, LevelMeter) {
-        if samples.is_empty() || sample_rate == 0 {
-            return (VadAnalysis::default(), LevelMeter::default());
-        }
-
-        let frame_len = duration_to_samples(self.config.frame_duration, sample_rate).max(1);
-        let mut voiced_samples = 0usize;
-        let mut trailing_silent_samples = 0usize;
-        let mut seen_voice = false;
-        let mut peak = 0.0f32;
-        let mut total_sum_squares = 0.0f64;
-
-        for frame in samples.chunks(frame_len) {
-            let mut frame_sum_squares = 0.0f64;
-            for &sample in frame {
-                let value = if sample.is_finite() {
-                    sample.clamp(-1.0, 1.0)
-                } else {
-                    0.0
-                };
-                peak = peak.max(value.abs());
-                let square = f64::from(value) * f64::from(value);
-                frame_sum_squares += square;
-                total_sum_squares += square;
-            }
-            let frame_rms = (frame_sum_squares / frame.len() as f64).sqrt() as f32;
-            if frame_rms >= self.config.rms_threshold {
-                voiced_samples += frame.len();
-                trailing_silent_samples = 0;
-                seen_voice = true;
-            } else if seen_voice {
-                trailing_silent_samples += frame.len();
-            }
-        }
-
-        let voiced_duration = samples_to_duration(voiced_samples, sample_rate);
-        (
-            VadAnalysis {
-                contains_voice: voiced_duration >= self.config.minimum_voice_duration,
-                voiced_duration,
-                trailing_silence: samples_to_duration(trailing_silent_samples, sample_rate),
-            },
-            LevelMeter {
-                rms: (total_sum_squares / samples.len() as f64).sqrt() as f32,
-                peak,
-            },
-        )
-    }
 }
 
 /// Fixed-capacity ring of the most recent mono samples.
@@ -324,11 +264,13 @@ impl PrerollBuffer {
         }
     }
 
+    #[cfg(test)]
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
     /// Number of samples currently retained, never exceeding `capacity`.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         if self.full {
             self.capacity
@@ -337,6 +279,7 @@ impl PrerollBuffer {
         }
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -383,6 +326,7 @@ impl PrerollBuffer {
     }
 
     /// Returns the retained samples in oldest-first order without clearing them.
+    #[cfg(test)]
     pub fn snapshot(&self) -> Vec<f32> {
         if !self.full {
             return self.buffer.clone();
@@ -403,12 +347,6 @@ impl PrerollBuffer {
         self.full = false;
         out
     }
-
-    pub fn clear(&mut self) {
-        self.buffer.clear();
-        self.head = 0;
-        self.full = false;
-    }
 }
 
 #[derive(Debug)]
@@ -416,6 +354,8 @@ pub enum AudioError {
     AlreadyCapturing,
     NotCapturing,
     Cancelled,
+    // The portable backend constructs this; WASAPI builds do not.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     UnsupportedPlatform,
     DeviceNotFound(String),
     DeviceEnumeration(String),
@@ -424,7 +364,10 @@ pub enum AudioError {
     StreamPlay(String),
     StreamFailure(String),
     InvalidConfiguration(&'static str),
-    TooShort { actual: Duration, minimum: Duration },
+    TooShort {
+        actual: Duration,
+        minimum: Duration,
+    },
     NoVoiceDetected,
     Io(io::Error),
 }
@@ -513,12 +456,27 @@ impl SharedCapture {
         self.samples = self.preroll.drain();
         self.recording = true;
     }
+
+    /// Ends the take and hands over its samples. A stream failure (for example
+    /// an unplugged or powered-off headset) keeps the audio captured before it
+    /// and is returned alongside as a warning; the take fails only when the
+    /// stream failed before any sample was captured.
+    fn finish_recording(&mut self) -> Result<(Vec<f32>, Option<String>), AudioError> {
+        self.recording = false;
+        let samples = std::mem::take(&mut self.samples);
+        match self.stream_error.clone() {
+            Some(message) if samples.is_empty() => Err(AudioError::StreamFailure(message)),
+            stream_error => Ok((samples, stream_error)),
+        }
+    }
 }
 
 /// An open input stream that is either armed (preroll only) or recording.
 struct ActiveCapture {
     config: CaptureConfig,
     input_sample_rate: u32,
+    /// The stream uses the default device in place of a missing one.
+    fell_back_to_default: bool,
     shared: Arc<Mutex<SharedCapture>>,
     #[cfg(target_os = "windows")]
     stream_worker: StreamWorker,
@@ -560,6 +518,18 @@ pub struct CpalAudioCapture {
     recording: bool,
 }
 
+/// A blocking task can outlive its awaiting future. Remove an unclaimed WAV
+/// instead of leaving microphone audio behind when the caller is cancelled.
+struct PendingArtifact(Option<Result<AudioArtifact, AudioError>>);
+
+impl Drop for PendingArtifact {
+    fn drop(&mut self) {
+        if let Some(Ok(artifact)) = &self.0 {
+            let _ = fs::remove_file(&artifact.path);
+        }
+    }
+}
+
 impl CpalAudioCapture {
     pub fn new() -> Self {
         Self::default()
@@ -586,14 +556,11 @@ impl CpalAudioCapture {
             .shared
             .lock()
             .map_err(|_| AudioError::StreamFailure("capture buffer lock poisoned".into()))?;
-        if let Some(message) = &shared.stream_error {
-            return Err(AudioError::StreamFailure(message.clone()));
-        }
-
-        shared.recording = false;
-        let mono = std::mem::take(&mut shared.samples);
+        let (mono, stream_error) = shared.finish_recording()?;
         drop(shared);
-        finalize_samples(mono, active.input_sample_rate, &active.config)
+        let mut artifact = finalize_samples(mono, active.input_sample_rate, &active.config)?;
+        artifact.warning = stream_error;
+        Ok(artifact)
     }
 }
 
@@ -683,12 +650,25 @@ impl AudioCapture for CpalAudioCapture {
     }
 
     fn stop(&mut self) -> AudioFuture<'_, AudioArtifact> {
-        Box::pin(async move { self.finish(false) })
+        Box::pin(async move {
+            let mut capture = std::mem::take(self);
+            let mut pending =
+                tokio::task::spawn_blocking(move || PendingArtifact(Some(capture.finish(false))))
+                    .await
+                    .map_err(|_| {
+                        AudioError::StreamFailure("audio finalization task failed".into())
+                    })?;
+            pending.0.take().unwrap_or(Err(AudioError::Cancelled))
+        })
     }
 
     fn cancel(&mut self) -> AudioFuture<'_, ()> {
         Box::pin(async move {
-            match self.finish(true) {
+            let mut capture = std::mem::take(self);
+            let result = tokio::task::spawn_blocking(move || capture.finish(true))
+                .await
+                .map_err(|_| AudioError::StreamFailure("audio cancellation task failed".into()))?;
+            match result {
                 Err(AudioError::Cancelled) => Ok(()),
                 Err(error) => Err(error),
                 Ok(_) => Ok(()),
@@ -696,6 +676,7 @@ impl AudioCapture for CpalAudioCapture {
         })
     }
 
+    #[cfg(test)]
     fn state(&self) -> CaptureState {
         if self.is_recording() {
             CaptureState::Capturing
@@ -709,6 +690,22 @@ impl AudioCapture for CpalAudioCapture {
             .as_ref()
             .and_then(|active| active.shared.lock().ok().map(|shared| shared.level))
             .unwrap_or_default()
+    }
+
+    fn uses_fallback_device(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| active.fell_back_to_default)
+    }
+
+    fn stream_error(&self) -> Option<String> {
+        self.active.as_ref().and_then(|active| {
+            active
+                .shared
+                .lock()
+                .ok()
+                .and_then(|shared| shared.stream_error.clone())
+        })
     }
 }
 
@@ -754,7 +751,12 @@ fn prepare_samples(
         });
     }
 
-    enhance_audio(&mut samples, config.target_sample_rate, config.enhancement);
+    dsp::enhance_audio_with_vad(
+        &mut samples,
+        config.target_sample_rate,
+        config.enhancement,
+        config.vad,
+    );
     Ok(PreparedAudio { samples, config })
 }
 
@@ -790,248 +792,8 @@ fn write_prepared_audio(
         peak_level: levels.peak,
         rms_level: levels.rms,
         vad,
+        warning: None,
     })
-}
-
-/// Applies inexpensive, deterministic post-capture processing. Keeping this out
-/// of the CPAL callback prevents audio cleanup from competing with foreground
-/// typing while the microphone is active.
-pub fn enhance_audio(samples: &mut [f32], sample_rate: u32, config: AudioEnhancementConfig) {
-    if samples.is_empty() || sample_rate == 0 {
-        return;
-    }
-
-    sanitize_and_high_pass(samples, sample_rate);
-    suppress_stationary_noise(samples, sample_rate, config.noise_suppression);
-
-    let measured_rms = meter(samples).rms;
-    let automatic_gain = if config.automatic_gain && measured_rms > 0.000_1 {
-        // -20 dBFS is a conservative speech target. The cap prevents quiet
-        // recordings from turning residual background noise into loud audio.
-        (0.1 / measured_rms).clamp(0.5, 4.0)
-    } else {
-        1.0
-    };
-    let gain = config.gain * automatic_gain;
-    for sample in samples {
-        // A smooth limiter avoids hard clipping while preserving small signals.
-        *sample = soft_limit(*sample * gain);
-    }
-}
-
-fn sanitize_and_high_pass(samples: &mut [f32], sample_rate: u32) {
-    let cutoff_hz = 70.0f32;
-    let dt = 1.0 / sample_rate as f32;
-    let rc = 1.0 / (2.0 * std::f32::consts::PI * cutoff_hz);
-    let alpha = rc / (rc + dt);
-    let mut previous_input = 0.0f32;
-    let mut previous_output = 0.0f32;
-    for sample in samples {
-        let input = if sample.is_finite() { *sample } else { 0.0 };
-        let output = alpha * (previous_output + input - previous_input);
-        previous_input = input;
-        previous_output = output;
-        *sample = output;
-    }
-}
-
-fn suppress_stationary_noise(samples: &mut [f32], sample_rate: u32, level: NoiseSuppressionLevel) {
-    let strength = match level {
-        NoiseSuppressionLevel::Off => return,
-        NoiseSuppressionLevel::Low => 1.5,
-        NoiseSuppressionLevel::Medium => 2.0,
-        NoiseSuppressionLevel::High => 2.8,
-    };
-    let frame_len = (sample_rate as usize / 100).max(1); // 10 ms
-    let mut frame_levels: Vec<f32> = samples
-        .chunks(frame_len)
-        .map(|frame| meter(frame).rms)
-        .collect();
-    if frame_levels.is_empty() {
-        return;
-    }
-    frame_levels.sort_by(f32::total_cmp);
-    let noise_floor = frame_levels[frame_levels.len() / 4].max(0.000_5);
-    let threshold = noise_floor * strength;
-    let minimum_gain = match level {
-        NoiseSuppressionLevel::Low => 0.45,
-        NoiseSuppressionLevel::Medium => 0.2,
-        NoiseSuppressionLevel::High => 0.08,
-        NoiseSuppressionLevel::Off => 1.0,
-    };
-    let mut smoothed_gain = 1.0f32;
-    for frame in samples.chunks_mut(frame_len) {
-        let rms = meter(frame).rms;
-        let target_gain = if rms >= threshold {
-            1.0
-        } else {
-            (rms / threshold).clamp(minimum_gain, 1.0)
-        };
-        // Open quickly for speech, close gradually to avoid audible pumping.
-        let smoothing = if target_gain > smoothed_gain {
-            0.65
-        } else {
-            0.18
-        };
-        smoothed_gain += (target_gain - smoothed_gain) * smoothing;
-        for sample in frame {
-            *sample *= smoothed_gain;
-        }
-    }
-}
-
-fn soft_limit(value: f32) -> f32 {
-    if value.abs() <= 0.95 {
-        value
-    } else {
-        value.signum() * (0.95 + 0.05 * ((value.abs() - 0.95) / 0.05).tanh())
-    }
-}
-
-/// Averages complete interleaved frames into normalized mono samples.
-pub fn interleaved_to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
-    let channels = channels as usize;
-    if channels == 0 {
-        return Vec::new();
-    }
-    samples
-        .chunks_exact(channels)
-        .map(|frame| frame.iter().copied().sum::<f32>() / channels as f32)
-        .collect()
-}
-
-/// Deterministic linear interpolation resampler suitable for ASR preprocessing.
-pub fn resample_linear(samples: &[f32], source_rate: u32, target_rate: u32) -> Vec<f32> {
-    if samples.is_empty() || source_rate == 0 || target_rate == 0 {
-        return Vec::new();
-    }
-    if source_rate == target_rate {
-        return samples.to_vec();
-    }
-
-    let output_len = ((samples.len() as u64 * target_rate as u64) / source_rate as u64) as usize;
-    if output_len == 0 {
-        return Vec::new();
-    }
-
-    let scale = source_rate as f64 / target_rate as f64;
-    (0..output_len)
-        .map(|index| {
-            let position = index as f64 * scale;
-            let left = position.floor() as usize;
-            let right = (left + 1).min(samples.len() - 1);
-            let fraction = (position - left as f64) as f32;
-            samples[left] + (samples[right] - samples[left]) * fraction
-        })
-        .collect()
-}
-
-/// Owned variant used by the recording pipeline. Downsampling is performed in
-/// place, which avoids holding both the full input and output recordings at once.
-fn resample_linear_owned(mut samples: Vec<f32>, source_rate: u32, target_rate: u32) -> Vec<f32> {
-    if samples.is_empty() || source_rate == 0 || target_rate == 0 {
-        samples.clear();
-        return samples;
-    }
-    if source_rate == target_rate {
-        return samples;
-    }
-    if target_rate > source_rate {
-        return resample_linear(&samples, source_rate, target_rate);
-    }
-
-    let output_len = ((samples.len() as u64 * target_rate as u64) / source_rate as u64) as usize;
-    let scale = source_rate as f64 / target_rate as f64;
-    for index in 0..output_len {
-        let position = index as f64 * scale;
-        let left = position.floor() as usize;
-        let right = (left + 1).min(samples.len() - 1);
-        let fraction = (position - left as f64) as f32;
-        samples[index] = samples[left] + (samples[right] - samples[left]) * fraction;
-    }
-    samples.truncate(output_len);
-    samples
-}
-
-pub fn meter(samples: &[f32]) -> LevelMeter {
-    if samples.is_empty() {
-        return LevelMeter::default();
-    }
-    let mut peak = 0.0f32;
-    let mut sum_squares = 0.0f64;
-    for sample in samples {
-        let value = if sample.is_finite() {
-            sample.clamp(-1.0, 1.0)
-        } else {
-            0.0
-        };
-        peak = peak.max(value.abs());
-        sum_squares += f64::from(value) * f64::from(value);
-    }
-    LevelMeter {
-        rms: (sum_squares / samples.len() as f64).sqrt() as f32,
-        peak,
-    }
-}
-
-fn write_pcm16_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<(), AudioError> {
-    let data_size = samples
-        .len()
-        .checked_mul(2)
-        .and_then(|size| u32::try_from(size).ok())
-        .ok_or(AudioError::InvalidConfiguration(
-            "WAV artifact is too large",
-        ))?;
-    let riff_size = 36u32
-        .checked_add(data_size)
-        .ok_or(AudioError::InvalidConfiguration(
-            "WAV artifact is too large",
-        ))?;
-    let mut writer = BufWriter::new(File::create(path)?);
-
-    writer.write_all(b"RIFF")?;
-    writer.write_all(&riff_size.to_le_bytes())?;
-    writer.write_all(b"WAVEfmt ")?;
-    writer.write_all(&16u32.to_le_bytes())?;
-    writer.write_all(&1u16.to_le_bytes())?;
-    writer.write_all(&1u16.to_le_bytes())?;
-    writer.write_all(&sample_rate.to_le_bytes())?;
-    writer.write_all(&(sample_rate * 2).to_le_bytes())?;
-    writer.write_all(&2u16.to_le_bytes())?;
-    writer.write_all(&16u16.to_le_bytes())?;
-    writer.write_all(b"data")?;
-    writer.write_all(&data_size.to_le_bytes())?;
-    const SAMPLES_PER_CHUNK: usize = 4096;
-    let mut encoded = [0u8; SAMPLES_PER_CHUNK * 2];
-    for chunk in samples.chunks(SAMPLES_PER_CHUNK) {
-        for (sample, bytes) in chunk.iter().zip(encoded.chunks_exact_mut(2)) {
-            let normalized = if sample.is_finite() {
-                sample.clamp(-1.0, 1.0)
-            } else {
-                0.0
-            };
-            bytes.copy_from_slice(&((normalized * i16::MAX as f32).round() as i16).to_le_bytes());
-        }
-        writer.write_all(&encoded[..chunk.len() * 2])?;
-    }
-    writer.flush()?;
-    Ok(())
-}
-
-fn temporary_wav_path(directory: Option<&Path>) -> PathBuf {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let nonce = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    directory
-        .map(Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(format!(
-            "local-ai-voice-{}-{timestamp}-{nonce}.wav",
-            std::process::id()
-        ))
 }
 
 fn duration_to_samples(duration: Duration, sample_rate: u32) -> usize {
@@ -1062,6 +824,50 @@ fn device_name_from_id(id: &str) -> Option<&str> {
     let (index, name) = id.split_once(':')?;
     (!index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()) && !name.is_empty())
         .then_some(name)
+}
+
+/// The input device a capture opens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+enum InputDeviceChoice<'a> {
+    /// The present device with this friendly name.
+    Named(&'a str),
+    /// The system default input device. `fell_back` is set when it replaces
+    /// a requested device that is not present.
+    Default { fell_back: bool },
+}
+
+/// Chooses the input device for `requested_id` among the present devices'
+/// friendly names. No request means the default device. A request that is
+/// absent (or not a device id) uses the default device only when
+/// `fallback_to_default` allows it; otherwise, and when there is no default
+/// device, it is `DeviceNotFound`.
+fn choose_input_device<'a>(
+    requested_id: Option<&str>,
+    available_names: &[&'a str],
+    has_default: bool,
+    fallback_to_default: bool,
+) -> Result<InputDeviceChoice<'a>, AudioError> {
+    let Some(requested_id) = requested_id else {
+        return if has_default {
+            Ok(InputDeviceChoice::Default { fell_back: false })
+        } else {
+            Err(AudioError::DeviceNotFound("default".into()))
+        };
+    };
+    if let Some(name) = device_name_from_id(requested_id).and_then(|requested| {
+        available_names
+            .iter()
+            .copied()
+            .find(|name| *name == requested)
+    }) {
+        return Ok(InputDeviceChoice::Named(name));
+    }
+    if fallback_to_default && has_default {
+        Ok(InputDeviceChoice::Default { fell_back: true })
+    } else {
+        Err(AudioError::DeviceNotFound(requested_id.to_owned()))
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1105,8 +911,16 @@ fn start_cpal_capture(config: CaptureConfig) -> Result<ActiveCapture, AudioError
         .spawn(move || {
             let startup = start_cpal_stream(config);
             match startup {
-                Ok((input_sample_rate, shared, stream)) => {
-                    if startup_tx.send(Ok((input_sample_rate, shared))).is_err() {
+                Ok(CpalStartup {
+                    input_sample_rate,
+                    fell_back_to_default,
+                    shared,
+                    stream,
+                }) => {
+                    if startup_tx
+                        .send(Ok((input_sample_rate, fell_back_to_default, shared)))
+                        .is_err()
+                    {
                         return;
                     }
                     let _ = shutdown_rx.recv();
@@ -1120,7 +934,7 @@ fn start_cpal_capture(config: CaptureConfig) -> Result<ActiveCapture, AudioError
         })
         .map_err(|error| AudioError::StreamBuild(error.to_string()))?;
 
-    let (input_sample_rate, shared) = match startup_rx.recv() {
+    let (input_sample_rate, fell_back_to_default, shared) = match startup_rx.recv() {
         Ok(Ok(startup)) => startup,
         Ok(Err(error)) => {
             let _ = thread.join();
@@ -1137,6 +951,7 @@ fn start_cpal_capture(config: CaptureConfig) -> Result<ActiveCapture, AudioError
     Ok(ActiveCapture {
         config: active_config,
         input_sample_rate,
+        fell_back_to_default,
         shared,
         stream_worker: StreamWorker {
             shutdown: shutdown_tx,
@@ -1145,26 +960,49 @@ fn start_cpal_capture(config: CaptureConfig) -> Result<ActiveCapture, AudioError
     })
 }
 
+/// What the stream thread reports once the input stream plays.
 #[cfg(target_os = "windows")]
-fn start_cpal_stream(
-    config: CaptureConfig,
-) -> Result<(u32, Arc<Mutex<SharedCapture>>, cpal::Stream), AudioError> {
+struct CpalStartup {
+    input_sample_rate: u32,
+    fell_back_to_default: bool,
+    shared: Arc<Mutex<SharedCapture>>,
+    stream: cpal::Stream,
+}
+
+#[cfg(target_os = "windows")]
+fn start_cpal_stream(config: CaptureConfig) -> Result<CpalStartup, AudioError> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     let host = cpal::default_host();
-    let device = if let Some(requested_id) = config.device_id.as_deref() {
-        let requested_name = device_name_from_id(requested_id)
-            .ok_or_else(|| AudioError::DeviceNotFound(requested_id.to_owned()))?;
+    let default_device = host.default_input_device();
+    // Only a named request needs the device list.
+    let mut devices: Vec<(String, cpal::Device)> = if config.device_id.is_some() {
         host.input_devices()
             .map_err(|error| AudioError::DeviceEnumeration(error.to_string()))?
-            .find_map(|device| {
-                let name = device.name().ok()?;
-                (name == requested_name).then_some(device)
-            })
-            .ok_or_else(|| AudioError::DeviceNotFound(requested_id.to_owned()))?
+            .filter_map(|device| Some((device.name().ok()?, device)))
+            .collect()
     } else {
-        host.default_input_device()
-            .ok_or_else(|| AudioError::DeviceNotFound("default".into()))?
+        Vec::new()
+    };
+    let names: Vec<&str> = devices.iter().map(|(name, _)| name.as_str()).collect();
+    let choice = choose_input_device(
+        config.device_id.as_deref(),
+        &names,
+        default_device.is_some(),
+        config.fallback_to_default,
+    )?;
+    let (device, fell_back_to_default) = match choice {
+        InputDeviceChoice::Named(name) => {
+            let index = names
+                .iter()
+                .position(|candidate| *candidate == name)
+                .expect("the chosen name is one of the listed devices");
+            (devices.swap_remove(index).1, false)
+        }
+        InputDeviceChoice::Default { fell_back } => (
+            default_device.ok_or_else(|| AudioError::DeviceNotFound("default".into()))?,
+            fell_back,
+        ),
     };
     let supported = device
         .default_input_config()
@@ -1213,7 +1051,12 @@ fn start_cpal_stream(
         .play()
         .map_err(|error| AudioError::StreamPlay(error.to_string()))?;
 
-    Ok((input_sample_rate, shared, stream))
+    Ok(CpalStartup {
+        input_sample_rate,
+        fell_back_to_default,
+        shared,
+        stream,
+    })
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1291,6 +1134,57 @@ fn drop_active_stream(active: &mut ActiveCapture) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn abandoned_finalization_removes_only_its_unclaimed_wav() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = CaptureConfig {
+            artifact_directory: Some(directory.path().to_owned()),
+            ..CaptureConfig::default()
+        };
+        let samples: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.1).sin() * 0.2).collect();
+        let artifact = finalize_samples(samples, TARGET_SAMPLE_RATE, &config).unwrap();
+        let path = artifact.path.clone();
+        let retained = directory.path().join("unrelated.wav");
+        fs::write(&retained, b"retained").unwrap();
+        drop(PendingArtifact(Some(Ok(artifact))));
+        assert!(!path.exists());
+        assert!(retained.exists());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopping_a_stream_does_not_block_the_async_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(Mutex::new(SharedCapture {
+            samples: (0..24_000).map(|i| (i as f32 * 0.1).sin() * 0.2).collect(),
+            recording: true,
+            ..SharedCapture::default()
+        }));
+        let mut capture = recording_capture(&shared, directory.path());
+        let (shutdown, shutdown_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        capture.active.as_mut().unwrap().stream_worker = StreamWorker {
+            shutdown,
+            thread: Some(thread::spawn(move || {
+                shutdown_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            })),
+        };
+        let started = std::time::Instant::now();
+        let release_stream = async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let elapsed = started.elapsed();
+            let _ = release.send(());
+            elapsed
+        };
+        let (result, timer_elapsed) = tokio::join!(capture.stop(), release_stream);
+        result.unwrap().remove().unwrap();
+        assert!(
+            timer_elapsed < Duration::from_secs(1),
+            "runtime blocked for {timer_elapsed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn snapshot_keeps_capture_active_and_final_audio_complete() {
         let directory = tempfile::tempdir().unwrap();
@@ -1309,6 +1203,7 @@ mod tests {
             active: Some(ActiveCapture {
                 config,
                 input_sample_rate: TARGET_SAMPLE_RATE,
+                fell_back_to_default: false,
                 shared: Arc::clone(&shared),
                 #[cfg(target_os = "windows")]
                 stream_worker: StreamWorker {
@@ -1339,6 +1234,76 @@ mod tests {
         complete.remove().unwrap();
     }
 
+    fn recording_capture(shared: &Arc<Mutex<SharedCapture>>, directory: &Path) -> CpalAudioCapture {
+        CpalAudioCapture {
+            recording: true,
+            active: Some(ActiveCapture {
+                config: CaptureConfig {
+                    artifact_directory: Some(directory.to_owned()),
+                    ..CaptureConfig::default()
+                },
+                input_sample_rate: TARGET_SAMPLE_RATE,
+                fell_back_to_default: false,
+                shared: Arc::clone(shared),
+                #[cfg(target_os = "windows")]
+                stream_worker: StreamWorker {
+                    shutdown: mpsc::channel().0,
+                    thread: None,
+                },
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_failure_keeps_the_audio_captured_before_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let samples: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.1).sin() * 0.2).collect();
+        let shared = Arc::new(Mutex::new(SharedCapture {
+            samples,
+            recording: true,
+            stream_error: Some("device disconnected".into()),
+            ..SharedCapture::default()
+        }));
+        let mut capture = recording_capture(&shared, directory.path());
+        let artifact = capture.stop().await.unwrap();
+        assert_eq!(artifact.sample_count, 24_000);
+        assert_eq!(artifact.warning.as_deref(), Some("device disconnected"));
+        assert!(artifact.path.is_file());
+        assert_eq!(capture.state(), CaptureState::Idle);
+        artifact.remove().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_failure_before_any_audio_still_fails_the_take() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(Mutex::new(SharedCapture {
+            recording: true,
+            stream_error: Some("device disconnected".into()),
+            ..SharedCapture::default()
+        }));
+        let mut capture = recording_capture(&shared, directory.path());
+        assert!(matches!(
+            capture.stop().await,
+            Err(AudioError::StreamFailure(message)) if message == "device disconnected"
+        ));
+        assert_eq!(capture.state(), CaptureState::Idle);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_healthy_take_finishes_without_a_warning() {
+        let mut shared = SharedCapture {
+            samples: vec![0.1; 8],
+            recording: true,
+            ..SharedCapture::default()
+        };
+        let (samples, warning) = shared.finish_recording().unwrap();
+        assert_eq!(samples.len(), 8);
+        assert_eq!(warning, None);
+        assert!(!shared.recording);
+        assert!(shared.samples.is_empty());
+    }
+
     #[test]
     fn device_ids_do_not_depend_on_enumeration_order() {
         assert_eq!(
@@ -1358,6 +1323,93 @@ mod tests {
             Some("Microphone: USB")
         );
         assert_eq!(device_name_from_id("not-an-id"), None);
+    }
+
+    #[test]
+    fn no_saved_microphone_opens_the_default_device() {
+        let present = ["USB Microphone"];
+        for fallback in [false, true] {
+            assert_eq!(
+                choose_input_device(None, &present, true, fallback).unwrap(),
+                InputDeviceChoice::Default { fell_back: false }
+            );
+        }
+    }
+
+    #[test]
+    fn a_present_saved_microphone_is_used() {
+        let present = ["USB Microphone", "ヘッドセット (SOUNDPEATS Air5 Pro)"];
+        for fallback in [false, true] {
+            assert_eq!(
+                choose_input_device(
+                    Some("name:ヘッドセット (SOUNDPEATS Air5 Pro)"),
+                    &present,
+                    true,
+                    fallback,
+                )
+                .unwrap(),
+                InputDeviceChoice::Named("ヘッドセット (SOUNDPEATS Air5 Pro)")
+            );
+            // A legacy index-based id resolves by name too.
+            assert_eq!(
+                choose_input_device(Some("7:USB Microphone"), &present, false, fallback).unwrap(),
+                InputDeviceChoice::Named("USB Microphone")
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_saved_microphone_falls_back_to_the_default_when_allowed() {
+        let present = ["USB Microphone"];
+        for missing in [
+            "name:ヘッドセット (SOUNDPEATS Air5 Pro)",
+            "not-an-id",
+            "name:",
+        ] {
+            assert_eq!(
+                choose_input_device(Some(missing), &present, true, true).unwrap(),
+                InputDeviceChoice::Default { fell_back: true },
+                "{missing}"
+            );
+        }
+        assert_eq!(
+            choose_input_device(Some("name:Headset"), &[], true, true).unwrap(),
+            InputDeviceChoice::Default { fell_back: true }
+        );
+    }
+
+    #[test]
+    fn without_fallback_a_missing_saved_microphone_is_not_found() {
+        // The Settings microphone test tests the chosen device; it must not
+        // silently measure another one.
+        let present = ["USB Microphone"];
+        for missing in ["name:Headset", "not-an-id"] {
+            let error = choose_input_device(Some(missing), &present, true, false).unwrap_err();
+            assert!(matches!(&error, AudioError::DeviceNotFound(id) if id == missing));
+            assert!(error
+                .to_string()
+                .starts_with("audio input device not found"));
+        }
+    }
+
+    #[test]
+    fn no_default_device_is_not_found_even_with_fallback() {
+        let present = ["USB Microphone"];
+        assert!(matches!(
+            choose_input_device(None, &present, false, true),
+            Err(AudioError::DeviceNotFound(id)) if id == "default"
+        ));
+        assert!(matches!(
+            choose_input_device(Some("name:Headset"), &present, false, true),
+            Err(AudioError::DeviceNotFound(id)) if id == "name:Headset"
+        ));
+    }
+
+    #[test]
+    fn captures_do_not_fall_back_unless_they_opt_in() {
+        assert!(!CaptureConfig::default().fallback_to_default);
+        let capture = CpalAudioCapture::new();
+        assert!(!capture.uses_fallback_device());
     }
 
     #[test]
@@ -1515,6 +1567,7 @@ mod tests {
             active: Some(ActiveCapture {
                 config: CaptureConfig::default(),
                 input_sample_rate: TARGET_SAMPLE_RATE,
+                fell_back_to_default: false,
                 shared,
             }),
             recording: true,
@@ -1534,6 +1587,7 @@ mod tests {
             active: Some(ActiveCapture {
                 config: CaptureConfig::default(),
                 input_sample_rate: TARGET_SAMPLE_RATE,
+                fell_back_to_default: false,
                 shared,
             }),
             recording: false,

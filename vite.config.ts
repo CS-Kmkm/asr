@@ -8,5 +8,8 @@ export default defineConfig({
     port: 1420,
     strictPort: true,
     host: "127.0.0.1",
+    watch: {
+      ignored: ["**/.worktrees/**", "**/.pnpm-store/**", "**/.venv/**", "**/src-tauri/target/**", "**/.diagnostics/**"],
+    },
   },
 });

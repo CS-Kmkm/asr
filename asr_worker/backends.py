@@ -4,17 +4,23 @@ import contextlib
 import gc
 import mimetypes
 import os
+import time
 import wave
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Iterator, Protocol
 from urllib.parse import urlparse
+from .diagnostics import log_exception
 
 from .download import (
     FASTER_WHISPER_ALLOW_PATTERNS,
+    FASTER_WHISPER_BUILTIN_REQUIRED_FILES,
+    FASTER_WHISPER_REQUIRED_FILES,
     ProgressCallback,
     cached_snapshot_path,
     download_snapshot,
 )
+
+CancelCheck = Callable[[], bool]
 
 MODEL_ID = "microsoft/VibeVoice-ASR-HF"
 QUANTIZATIONS = {"4bit", "8bit", "bf16"}
@@ -28,9 +34,14 @@ class BackendError(Exception):
         self.message = message
 
 
+def cancelled_error() -> BackendError:
+    return BackendError("cancelled", "Transcription was cancelled")
+
+
 class Backend(Protocol):
     model_name: str
     progress: ProgressCallback | None
+    cancel_requested: CancelCheck | None
 
     def load(self, quantization: str) -> None: ...
 
@@ -52,11 +63,26 @@ class ProgressReporting:
     """
 
     progress: ProgressCallback | None = None
+    backend_name: str = "unknown"
+    device: str | None = None
+    compute_type: str | None = None
+    # Assigned by the worker for the duration of a transcription. A backend
+    # polls it where it can stop early (between segments or tokens) and raises
+    # the `cancelled` error; one that cannot poll simply finishes.
+    cancel_requested: CancelCheck | None = None
 
     def report_progress(self, stage: str, **fields: Any) -> None:
         callback = self.progress
         if callback is not None:
             callback({"stage": stage, **fields})
+
+    def is_cancel_requested(self) -> bool:
+        check = self.cancel_requested
+        return check is not None and check()
+
+    def raise_if_cancelled(self) -> None:
+        if self.is_cancel_requested():
+            raise cancelled_error()
 
 
 def faster_whisper_repo_id(model_id: str) -> str | None:
@@ -75,6 +101,17 @@ def faster_whisper_repo_id(model_id: str) -> str | None:
     return _MODELS.get(model_id)
 
 
+def faster_whisper_required_files(repo_id: str) -> list[str]:
+    """Files a cached snapshot of ``repo_id`` must hold to count as complete."""
+    try:
+        from faster_whisper.utils import _MODELS
+    except ImportError:
+        return list(FASTER_WHISPER_REQUIRED_FILES)
+    if repo_id in _MODELS.values():
+        return list(FASTER_WHISPER_BUILTIN_REQUIRED_FILES)
+    return list(FASTER_WHISPER_REQUIRED_FILES)
+
+
 def faster_whisper_compute_type(quantization: str, *, cuda: bool) -> str:
     if quantization in {"4bit", "8bit"}:
         return "int8_float16" if cuda else "int8"
@@ -83,11 +120,35 @@ def faster_whisper_compute_type(quantization: str, *, cuda: bool) -> str:
     raise BackendError("unsupported_quantization", f"Unsupported quantization: {quantization}")
 
 
+# VibeVoice output budget. The length-based estimate assumes about 40 output
+# tokens per second of audio plus a fixed headroom for the structured
+# (speaker/timestamp) wrapper.
+VIBEVOICE_TOKENS_PER_AUDIO_SECOND = 40
+VIBEVOICE_TOKEN_HEADROOM = 128
+# Tied to the app's recording limit (MAX_RECORDING_DURATION, 15 minutes, in
+# src-tauri/src/commands.rs): the ceiling covers a full-length recording plus
+# one minute of margin. When the clip length is known, the per-clip estimate
+# (seconds x VIBEVOICE_TOKENS_PER_AUDIO_SECOND + headroom) is the binding
+# budget, so a full-length take fits only if the speech stays within that
+# unmeasured ~40 tokens/second estimate; denser speech can still end with
+# transcript_truncated. Keep both in step if the recording limit changes.
+#
+# Cost: max_new_tokens is only an upper bound (generation stops at the end of
+# the transcript), but a long recording really does generate tens of thousands
+# of tokens, and the KV cache grows with every one of them. A 15-minute take
+# therefore needs considerably more VRAM than a short one; ASR_MAX_NEW_TOKENS
+# lowers the budget on GPUs that cannot hold it.
+APP_MAX_RECORDING_SECONDS = 15 * 60
+VIBEVOICE_MAX_NEW_TOKENS = (
+    APP_MAX_RECORDING_SECONDS + 60
+) * VIBEVOICE_TOKENS_PER_AUDIO_SECOND + VIBEVOICE_TOKEN_HEADROOM
+
+
 def compute_max_new_tokens(
     audio_seconds: float | None,
     env_override: str | None,
     floor: int = 256,
-    ceiling: int = 4096,
+    ceiling: int = VIBEVOICE_MAX_NEW_TOKENS,
 ) -> int:
     if env_override is not None:
         try:
@@ -98,8 +159,75 @@ def compute_max_new_tokens(
             return override
     if audio_seconds is None:
         return ceiling
-    estimate = int(audio_seconds * 40) + 128
+    estimate = int(audio_seconds * VIBEVOICE_TOKENS_PER_AUDIO_SECOND) + VIBEVOICE_TOKEN_HEADROOM
     return max(floor, min(ceiling, estimate))
+
+
+# Scripts written without spaces between words, plus the full-width forms used
+# with them. Hangul is excluded on purpose: Korean separates words with spaces.
+_UNSPACED_SCRIPT_RANGES = (
+    (0x2E80, 0x2FDF),  # CJK radicals and Kangxi radicals
+    (0x3000, 0x303F),  # CJK symbols and punctuation (、。「」)
+    (0x3040, 0x30FF),  # Hiragana and Katakana (including ー)
+    (0x3100, 0x312F),  # Bopomofo
+    (0x31F0, 0x31FF),  # Katakana phonetic extensions
+    (0x3200, 0x33FF),  # Enclosed CJK letters and CJK compatibility
+    (0x3400, 0x4DBF),  # CJK unified ideographs extension A
+    (0x4E00, 0x9FFF),  # CJK unified ideographs
+    (0xF900, 0xFAFF),  # CJK compatibility ideographs
+    (0xFE30, 0xFE4F),  # CJK compatibility forms
+    (0xFF00, 0xFF9F),  # Full-width forms, half-width CJK punctuation and Katakana
+    (0x20000, 0x3134F),  # CJK unified ideographs extensions B and later
+)
+
+
+def _is_unspaced_script(char: str) -> bool:
+    code = ord(char)
+    return any(start <= code <= end for start, end in _UNSPACED_SCRIPT_RANGES)
+
+
+def join_segment_texts(texts: list[str]) -> str:
+    """Join segment texts with one space, except next to CJK, kana or full-width text.
+
+    Japanese and Chinese are written without spaces between words, so a space
+    at a segment boundary would be inserted into the user's text verbatim.
+    """
+    joined = ""
+    for text in texts:
+        text = text.strip()
+        if not text:
+            continue
+        if joined and not (_is_unspaced_script(joined[-1]) or _is_unspaced_script(text[0])):
+            joined += " "
+        joined += text
+    return joined
+
+
+def generation_reached_limit(
+    generated_ids: Any,
+    max_new_tokens: int,
+    eos_token_ids: set[int],
+) -> bool:
+    """Whether generation stopped at ``max_new_tokens`` instead of finishing.
+
+    A sequence whose end-of-sequence token is exactly the last allowed token is
+    complete, so only a full-length sequence without one counts as cut off.
+    """
+    if generated_ids.shape[1] < max_new_tokens:
+        return False
+    return int(generated_ids[0, -1]) not in eos_token_ids
+
+
+def _eos_token_ids(model: Any) -> set[int]:
+    eos = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+    if eos is None:
+        return set()
+    if isinstance(eos, int):
+        return {eos}
+    try:
+        return {int(token) for token in eos}
+    except (TypeError, ValueError):
+        return set()
 
 
 def wav_duration_seconds(audio_path: Path) -> float | None:
@@ -114,7 +242,8 @@ def wav_duration_seconds(audio_path: Path) -> float | None:
         return None
 
 
-def map_backend_exception(exc: BaseException, operation: str, backend_label: str = "VibeVoice") -> BackendError:
+def map_backend_exception(exc: BaseException, operation: str, backend_label: str = "VibeVoice", *, device: str | None = None) -> BackendError:
+    log_exception(exc, operation)
     details: list[str] = []
     current: BaseException | None = exc
     seen: set[int] = set()
@@ -125,6 +254,8 @@ def map_backend_exception(exc: BaseException, operation: str, backend_label: str
     diagnostic = "\n".join(details)
 
     if "out of memory" in diagnostic or "cuda oom" in diagnostic:
+        if device == "cpu":
+            return BackendError("cpu_oom", "Not enough system memory while operating the ASR model")
         return BackendError("gpu_oom", "GPU out of memory while operating the ASR model")
     if operation == "load":
         if any(marker in diagnostic for marker in ("rate limit", "ratelimit", "too many requests", "status code: 429")):
@@ -201,16 +332,48 @@ def vibevoice_dependency_error(exc: ModuleNotFoundError) -> BackendError:
 
 
 class MockBackend(ProgressReporting):
+    """Model-free backend for tests and protocol debugging.
+
+    Environment hooks let process-level tests drive the worker lifecycle
+    without downloading a model:
+
+    - ``ASR_WORKER_MOCK_HOLD_FILE``: while this file exists, ``load``,
+      ``transcribe`` and ``unload`` wait. A held transcription stops when it is
+      cancelled, unless ``ASR_WORKER_MOCK_IGNORE_CANCEL=1``.
+    - ``ASR_WORKER_MOCK_CRASH_FILE``: a transcription that finds this file
+      removes it and exits the process, so it crashes exactly once.
+    - ``ASR_WORKER_MOCK_EVENT_LOG``: appends ``<pid> <event>`` lines.
+    """
+
+    backend_name = "mock"
     model_name = f"{MODEL_ID}:mock"
 
     def __init__(self) -> None:
         self.loaded = False
+
+    @staticmethod
+    def _log_event(event: str) -> None:
+        path = os.environ.get("ASR_WORKER_MOCK_EVENT_LOG")
+        if path:
+            with open(path, "a", encoding="utf-8") as log:
+                log.write(f"{os.getpid()} {event}\n")
+
+    def _hold(self, *, cancellable: bool) -> None:
+        hold_file = os.environ.get("ASR_WORKER_MOCK_HOLD_FILE")
+        honor_cancel = cancellable and os.environ.get("ASR_WORKER_MOCK_IGNORE_CANCEL") != "1"
+        while hold_file and os.path.exists(hold_file):
+            if honor_cancel and self.is_cancel_requested():
+                self._log_event("cancelled")
+                raise cancelled_error()
+            time.sleep(0.01)
 
     def load(self, quantization: str) -> None:
         if quantization not in QUANTIZATIONS:
             raise BackendError("unsupported_quantization", f"Unsupported quantization: {quantization}")
         if os.environ.get("ASR_WORKER_MOCK_LOAD_ERROR") == "oom":
             raise BackendError("gpu_oom", "GPU out of memory while operating the ASR model")
+        self._log_event(f"load {quantization}")
+        self._hold(cancellable=False)
         self.loaded = True
 
     def transcribe(
@@ -219,14 +382,23 @@ class MockBackend(ProgressReporting):
         prompt: str | None,
         language: str | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
+        self._log_event("transcribe")
+        crash_file = os.environ.get("ASR_WORKER_MOCK_CRASH_FILE")
+        if crash_file and os.path.exists(crash_file):
+            os.remove(crash_file)
+            os._exit(3)
+        self._hold(cancellable=True)
         text = os.environ.get("ASR_WORKER_MOCK_TEXT", "mock transcription")
         return text, [{"start": 0.0, "end": 0.0, "speaker": 0, "text": text}]
 
     def unload(self) -> None:
+        self._hold(cancellable=False)
         self.loaded = False
 
 
 class VibeVoiceBackend(ProgressReporting):
+    backend_name = "vibevoice"
+
     def __init__(self) -> None:
         self.model_id = os.environ.get("ASR_MODEL_ID", MODEL_ID)
         self.model_name = self.model_id
@@ -268,6 +440,8 @@ class VibeVoiceBackend(ProgressReporting):
                     "gpu_unsupported",
                     "VibeVoice was not placed on CUDA; CPU fallback is disabled",
                 )
+            self.device = "cuda"
+            self.compute_type = quantization
         except ModuleNotFoundError as exc:
             raise vibevoice_dependency_error(exc) from exc
         except BackendError:
@@ -289,6 +463,8 @@ class VibeVoiceBackend(ProgressReporting):
     def unload(self) -> None:
         self.model = None
         self.processor = None
+        self.device = None
+        self.compute_type = None
         gc.collect()
         try:
             import torch
@@ -324,9 +500,24 @@ class VibeVoiceBackend(ProgressReporting):
                     wav_duration_seconds(audio_path),
                     os.environ.get("ASR_MAX_NEW_TOKENS"),
                 )
-                output_ids = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
-                generated_ids = output_ids[:, input_length:]
+                generate_options: dict[str, Any] = {"max_new_tokens": max_new_tokens}
+                if self.cancel_requested is not None:
+                    generate_options["stopping_criteria"] = _cancel_stopping_criteria(self)
+                output_ids = self.model.generate(**inputs, **generate_options)
                 del inputs
+                # A cancelled generation stops at the next token; its partial
+                # output is never parsed.
+                self.raise_if_cancelled()
+                generated_ids = output_ids[:, input_length:]
+                # A cut-off transcript is an unterminated JSON array, which the
+                # parser reports only as an opaque JSONDecodeError.
+                if generation_reached_limit(generated_ids, max_new_tokens, _eos_token_ids(self.model)):
+                    del generated_ids, output_ids
+                    raise BackendError(
+                        "transcript_truncated",
+                        f"VibeVoice reached its {max_new_tokens}-token output limit before the "
+                        "transcript ended. Record a shorter clip or raise ASR_MAX_NEW_TOKENS.",
+                    )
                 parsed = self.processor.decode(generated_ids, return_format="parsed")[0]
                 del generated_ids, output_ids
             segments = [
@@ -338,13 +529,34 @@ class VibeVoiceBackend(ProgressReporting):
                 }
                 for item in parsed
             ]
-            text = " ".join(segment["text"] for segment in segments).strip()
+            text = join_segment_texts([segment["text"] for segment in segments])
             return text, segments
+        except BackendError:
+            raise
         except BaseException as exc:
             raise map_backend_exception(exc, "transcribe") from exc
 
 
+def _cancel_stopping_criteria(backend: ProgressReporting) -> Any:
+    """Stop `generate` at the next token once the worker cancels the request."""
+    import torch
+    from transformers import StoppingCriteria, StoppingCriteriaList
+
+    class _CancelCriteria(StoppingCriteria):
+        def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> Any:
+            return torch.full(
+                (input_ids.shape[0],),
+                backend.is_cancel_requested(),
+                dtype=torch.bool,
+                device=input_ids.device,
+            )
+
+    return StoppingCriteriaList([_CancelCriteria()])
+
+
 class FasterWhisperBackend(ProgressReporting):
+    backend_name = "faster-whisper"
+
     def __init__(self) -> None:
         self.model_id = os.environ.get(
             "ASR_MODEL_ID",
@@ -352,6 +564,11 @@ class FasterWhisperBackend(ProgressReporting):
         )
         self.model_name = f"faster-whisper:{self.model_id}"
         self.model: Any = None
+        self.device_policy = os.environ.get("ASR_DEVICE", "auto").strip().lower()
+        if self.device_policy not in {"auto", "cpu", "cuda"}:
+            raise BackendError("invalid_device", "ASR_DEVICE must be auto, cpu, or cuda")
+        self.device: str | None = None
+        self._model_source: str | None = None
 
     def load(self, quantization: str) -> None:
         if quantization not in QUANTIZATIONS:
@@ -366,16 +583,60 @@ class FasterWhisperBackend(ProgressReporting):
         try:
             import ctranslate2
 
-            cuda = ctranslate2.get_cuda_device_count() > 0
+            cuda = self.device_policy == "cuda"
+            if self.device_policy == "auto":
+                try:
+                    cuda = ctranslate2.get_cuda_device_count() > 0
+                except Exception as exc:
+                    log_exception(exc, "load")
+                    self.report_progress("cpu_fallback")
+                    cuda = False
             device = "cuda" if cuda else "cpu"
             compute_type = faster_whisper_compute_type(quantization, cuda=cuda)
             model_source = self._resolve_model_files()
             self.report_progress("load")
-            self.model = WhisperModel(model_source, device=device, compute_type=compute_type)
+            try:
+                self.model = WhisperModel(model_source, device=device, compute_type=compute_type)
+                self._warm_up()
+            except Exception as exc:
+                if not cuda or self.device_policy != "auto":
+                    raise
+                log_exception(exc, "load")
+                # CUDA libraries can be missing even when a driver reports a
+                # device. Exercise kernels before declaring the model ready.
+                self.model = None
+                gc.collect()
+                self.report_progress("cpu_fallback")
+                device = "cpu"
+                compute_type = "int8"
+                self.model = WhisperModel(model_source, device="cpu", compute_type="int8")
+                self._warm_up()
+            self.device = device
+            self.compute_type = compute_type
+            self._model_source = model_source
         except BackendError:
             raise
         except BaseException as exc:
+            self.model = None
+            self.device = None
+            self.compute_type = None
             raise map_backend_exception(exc, "load", "faster-whisper") from exc
+
+    def _warm_up(self) -> None:
+        import numpy as np
+
+        self.report_progress("warmup")
+        segments, _ = self.model.transcribe(
+            np.zeros(8_000, dtype=np.float32),
+            language="en",
+            beam_size=1,
+            vad_filter=False,
+            condition_on_previous_text=False,
+        )
+        # Decoding is lazy. Consume it so missing CUDA DLLs fail during load,
+        # and discard the artificial transcript without emitting user output.
+        for _ in segments:
+            pass
 
     def _resolve_model_files(self) -> str:
         """Return a local model source, downloading it only when it is missing.
@@ -389,7 +650,9 @@ class FasterWhisperBackend(ProgressReporting):
         repo_id = faster_whisper_repo_id(self.model_id)
         if repo_id is None:
             return self.model_id
-        cached = cached_snapshot_path(repo_id, FASTER_WHISPER_ALLOW_PATTERNS)
+        cached = cached_snapshot_path(
+            repo_id, FASTER_WHISPER_ALLOW_PATTERNS, faster_whisper_required_files(repo_id)
+        )
         if cached is not None:
             return cached
         self.report_progress("download", model=repo_id)
@@ -401,6 +664,9 @@ class FasterWhisperBackend(ProgressReporting):
 
     def unload(self) -> None:
         self.model = None
+        self.device = None
+        self.compute_type = None
+        self._model_source = None
         gc.collect()
 
     def transcribe(
@@ -409,26 +675,99 @@ class FasterWhisperBackend(ProgressReporting):
         prompt: str | None,
         language: str | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
+        segments: list[dict[str, Any]] = []
+        # faster-whisper decodes lazily, so cancellation takes effect at the
+        # next segment boundary.
+        for segment in self.transcribe_segments(audio_path, prompt, language):
+            self.raise_if_cancelled()
+            segments.append(segment)
+        self.raise_if_cancelled()
+        text = "".join(segment["text"] for segment in segments).strip()
+        return text, segments
+
+    def transcribe_segments(
+        self,
+        audio_path: Path,
+        prompt: str | None,
+        language: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield segments as faster-whisper decodes them, for streaming."""
         try:
-            hotwords = prompt if prompt else None
-            raw_segments, _info = self.model.transcribe(
-                str(audio_path),
-                language=language,
-                hotwords=hotwords,
-            )
-            segments = [
-                {
-                    "start": float(segment.start),
-                    "end": float(segment.end),
-                    "speaker": None,
-                    "text": str(segment.text),
-                }
-                for segment in raw_segments
-            ]
-            text = "".join(segment["text"] for segment in segments).strip()
-            return text, segments
+            emitted = False
+            for attempt in range(2):
+                self.raise_if_cancelled()
+                try:
+                    raw_segments, _info = self.model.transcribe(
+                        str(audio_path),
+                        # Whisper accepts an ISO 639 language, not a regional BCP 47 tag.
+                        language=language.split("-", 1)[0] if language else None,
+                        hotwords=prompt if prompt else None,
+                    )
+                    for segment in raw_segments:
+                        self.raise_if_cancelled()
+                        value = {
+                            "start": float(segment.start),
+                            "end": float(segment.end),
+                            "speaker": None,
+                            "text": str(segment.text),
+                        }
+                        emitted = True
+                        yield value
+                    return
+                except Exception as exc:
+                    self.raise_if_cancelled()
+                    if (
+                        attempt != 0 or emitted or self.device_policy != "auto"
+                        or self.device != "cuda" or self._model_source is None
+                        or not self._is_cuda_failure(exc)
+                    ):
+                        raise
+                    # Restart only before publishing any segment: consumers must
+                    # never receive duplicated/mixed GPU and CPU output.
+                    log_exception(exc, "transcribe")
+                    self._retry_on_cpu()
+        except GeneratorExit:
+            # A consumer stopped reading; that is not a transcription failure.
+            raise
+        except BackendError:
+            raise
         except BaseException as exc:
-            raise map_backend_exception(exc, "transcribe", "faster-whisper") from exc
+            raise map_backend_exception(exc, "transcribe", "faster-whisper", device=self.device) from exc
+
+    @staticmethod
+    def _is_cuda_failure(exc: Exception) -> bool:
+        current: BaseException | None = exc
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, BackendError):
+                return current.code == "gpu_oom"
+            diagnostic = str(current).lower()
+            if any(marker in diagnostic for marker in (
+                "cuda", "cudnn", "cublas", "curand", "nvrtc", "nvcuda", "out of memory",
+            )):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    def _retry_on_cpu(self) -> None:
+        from faster_whisper import WhisperModel
+
+        self.raise_if_cancelled()
+        previous = self.model
+        try:
+            # Reuse the exact resolved snapshot rather than resolving/downloading
+            # another model. Preserve the old model if CPU initialization fails.
+            self.model = WhisperModel(self._model_source, device="cpu", compute_type="int8")
+            self._warm_up()
+            self.raise_if_cancelled()
+        except BaseException as exc:
+            self.model = previous
+            if isinstance(exc, BackendError):
+                raise
+            raise map_backend_exception(exc, "transcribe", "faster-whisper", device="cpu") from exc
+        self.device = "cpu"
+        self.compute_type = "int8"
 
 
 class OpenAICompatibleBackend(ProgressReporting):
@@ -438,6 +777,8 @@ class OpenAICompatibleBackend(ProgressReporting):
     credentials are read from the environment so they are not part of worker
     protocol messages or diagnostic output.
     """
+
+    backend_name = "openai-compatible"
 
     def __init__(self) -> None:
         self.base_url = os.environ.get("ASR_API_BASE_URL", "https://api.openai.com/v1").rstrip("/")
@@ -495,8 +836,12 @@ class OpenAICompatibleBackend(ProgressReporting):
         if prompt:
             data["prompt"] = prompt
         if language:
-            data["language"] = language
+            # The Audio Transcriptions API accepts the base language only.
+            data["language"] = language.split("-", 1)[0]
         media_type = mimetypes.guess_type(audio_path.name)[0] or "application/octet-stream"
+        # An HTTP request in flight cannot be interrupted; the worker discards
+        # its result when the request was cancelled meanwhile.
+        self.raise_if_cancelled()
         try:
             with audio_path.open("rb") as audio:
                 response = self.client.post(

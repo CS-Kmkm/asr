@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   frontend:
     runs-on: ubuntu-latest
@@ -18,6 +21,9 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec tsc --noEmit
+      - run: pnpm test
+      - run: node --test scripts/test-*.mjs
+      - run: pnpm build
 
   rust:
     runs-on: windows-latest
@@ -30,11 +36,21 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --lib
+      - name: Repeat storage tests (Windows file-deletion timing)
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 10; $i++) {
+            cargo test --lib --quiet storage::
+            if ($LASTEXITCODE -ne 0) { Write-Error "storage tests failed on repeat $i"; exit 1 }
+          }
 
   python-worker:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -42,3 +58,18 @@ jobs:
           version: latest
       - run: uv sync --extra serve
       - run: uv run --with pytest pytest asr_worker/tests -q
+
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.17.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec tauri build --no-bundle

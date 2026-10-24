@@ -1,8 +1,11 @@
 //! Opt-in real-time replay through the actual warmed worker and segmentation
 //! policy. Input is synthetic/reference PCM, never microphone or history data.
 use super::*;
-use crate::audio::{AudioSnapshot, TARGET_SAMPLE_RATE};
+use crate::asr::JsonlTranscriber;
+use crate::audio::{AudioSnapshot, CaptureConfig, TARGET_SAMPLE_RATE};
+use crate::{worker_command_for_settings, ASR_MODEL_LOAD_TIMEOUT, ASR_REQUEST_TIMEOUT};
 use serde_json::json;
+use std::{fs, path::PathBuf};
 
 #[tokio::test]
 #[ignore = "requires ASR_LIVE_BENCH_DIR with speech.f32; uses the installed faster-whisper model"]
@@ -12,8 +15,10 @@ async fn compare_segmentation_on_reference_audio() {
     let bytes = fs::read(directory.join("speech.f32")).unwrap();
     assert_eq!(bytes.len() % 4, 0);
     let samples: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect();
     let config = CaptureConfig {
         artifact_directory: Some(directory.clone()),
