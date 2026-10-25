@@ -183,7 +183,7 @@ fn select_child_values(
                     || (worker
                         && matches!(
                             name.to_ascii_uppercase().as_str(),
-                            "HF_TOKEN" | "HUGGING_FACE_HUB_TOKEN"
+                            "HF_TOKEN" | "HUGGING_FACE_HUB_TOKEN" | "ASR_MAX_NEW_TOKENS"
                         )))
         })
         .collect()
@@ -192,6 +192,22 @@ fn select_child_values(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_receives_decode_budget_but_helpers_and_other_token_names_do_not() {
+        let values = [
+            (OsString::from("ASR_MAX_NEW_TOKENS"), OsString::from("4096")),
+            (
+                OsString::from("ASR_OTHER_TOKEN"),
+                OsString::from("synthetic-secret"),
+            ),
+        ];
+        assert!(select_child_values(values.clone(), false).is_empty());
+        assert_eq!(
+            select_child_values(values, true),
+            vec![(OsString::from("ASR_MAX_NEW_TOKENS"), OsString::from("4096")),]
+        );
+    }
 
     #[test]
     fn helper_commands_receive_only_the_filtered_environment() {
