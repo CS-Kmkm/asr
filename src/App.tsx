@@ -232,6 +232,8 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const historyTextRequestRef = useRef(0);
   const historyTextPendingSourceRef = useRef<number | null>(null);
   const [model, setModel] = useState<ModelStatus | null>(null);
+  const modelPreparationActiveRef = useRef(false);
+  const modelStatusRevisionRef = useRef(0);
   const [modelLoading, setModelLoading] = useState(false);
   const [modelProgress, setModelProgress] = useState<ModelProgress | null>(null);
   const [progressNoticeHidden, setProgressNoticeHidden] = useState(false);
@@ -245,6 +247,18 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const [inactiveShortcuts, setInactiveShortcuts] = useState<string[]>([]);
   const showNotice = (message: string, severity: Notice["severity"] = "info") =>
     pushNotice({ message, severity });
+  const applyModelStatus = (next: ModelStatus) => {
+    modelStatusRevisionRef.current += 1;
+    modelPreparationActiveRef.current = next.state === "loading";
+    setModel(next);
+    setProgressNoticeHidden(false);
+    if (next.state === "loading") {
+      pushNotice({ kind: "model_loading", message: "Loading the speech model.", severity: "info" });
+    } else {
+      setModelProgress(null);
+      removeNoticeKinds(MODEL_PREPARATION_KINDS);
+    }
+  };
   const { settings, settingsRef, settingsLoaded, editSettingsLocally, settingsReady, queueSettingsSave } = useSettings({
     onLanguageChange,
     onSetupNeeded: () => setPage("setup"),
@@ -267,6 +281,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   }, [historyFilter]);
 
   useEffect(() => {
+    let active = true;
     void getStartupHotkeyWarning().then(setStartupHotkeyWarnings).catch(() => {});
     const applyAppState = (next: AppState) => {
       const id = next.operationId;
@@ -280,12 +295,11 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     Promise.all([
       getAppState(),
       listHistory(),
-      getModelStatus(),
       getGpuDiagnostics(),
       listDictionary(),
     ])
       .then(
-        ([nextState, nextHistory, nextModel, nextGpu, nextDictionary]) => {
+        ([nextState, nextHistory, nextGpu, nextDictionary]) => {
           applyAppState(nextState);
           if (historyRequestRef.current === 0 && historyFilterRef.current === "all") {
             setHistory(nextHistory);
@@ -293,38 +307,51 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             historyCursorRef.current = last ? { createdAt: last.createdAt, id: last.id } : null;
             setHistoryHasMore(nextHistory.length === 100);
           }
-          setModel(nextModel);
           setGpu(nextGpu);
           setDictionary(nextDictionary);
         },
       )
       .catch((error: unknown) => showNotice(String(error), "error"));
-    const listeners = Promise.all([
+    const modelListener = listen<ModelStatus>("model-status", (event) => {
+      applyModelStatus(event.payload);
+    });
+    const listeners = [
       listen<AppState>("app-state", (event) => applyAppState(event.payload)),
-      listen<ModelStatus>("model-status", (event) => {
-        setModel(event.payload);
-        setProgressNoticeHidden(false);
-        // Preparation is over once the worker reports an outcome, so its
-        // progress and its running commentary both stop here.
-        if (event.payload.state !== "loading") {
-          setModelProgress(null);
-          removeNoticeKinds(MODEL_PREPARATION_KINDS);
-        }
+      modelListener,
+      listen<ModelProgress>("model-progress", (event) => {
+        if (modelPreparationActiveRef.current) setModelProgress(event.payload);
       }),
-      listen<ModelProgress>("model-progress", (event) => setModelProgress(event.payload)),
       listen<GpuDiagnostics>("gpu-diagnostics", (event) => setGpu(event.payload)),
-      listen<{ kind: string; code?: string; outcome?: string; message: string }>("status", (event) =>
+      listen<{ kind: string; code?: string; outcome?: string; message: string }>("status", (event) => {
+        if (MODEL_PREPARATION_KINDS.includes(event.payload.kind) && !modelPreparationActiveRef.current) return;
         pushNotice({
           message: event.payload.message,
           code: event.payload.code,
           outcome: event.payload.outcome,
           severity: statusSeverity(event.payload.kind),
           kind: event.payload.kind,
-        }),
-      ),
-    ]);
+        });
+      }),
+    ];
+    const subscriptions = Promise.allSettled(listeners);
+    void subscriptions.then((results) => {
+      if (active) for (const result of results) {
+        if (result.status === "rejected") showNotice(String(result.reason), "error");
+      }
+    });
+    // Register first: otherwise ready can be lost between a loading snapshot
+    // and the asynchronous event subscription becoming active.
+    void modelListener.catch(() => {}).then(async () => {
+      if (!active) return;
+      const revision = modelStatusRevisionRef.current;
+      const snapshot = await getModelStatus();
+      if (active && modelStatusRevisionRef.current === revision) applyModelStatus(snapshot);
+    }).catch((error: unknown) => { if (active) showNotice(String(error), "error"); });
     return () => {
-      void listeners.then((unlisten) => unlisten.forEach((fn) => fn()));
+      active = false;
+      void subscriptions.then((results) => results.forEach((result) => {
+        if (result.status === "fulfilled") result.value();
+      }));
     };
   }, [onLanguageChange]);
 
@@ -529,7 +556,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       const outcome = await queueSettingsSave(configuration ?? {});
       if (!outcome.saved) throw outcome.error;
       const saved = outcome.settings;
-      setModel(await loadModel(saved.modelId, saved.modelQuantization));
+      applyModelStatus(await loadModel(saved.modelId, saved.modelQuantization));
       showNotice(t("Model loaded and ready."), "success");
     } catch (error) {
       showNotice(String(error), "error");

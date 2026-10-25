@@ -1,6 +1,7 @@
 ﻿import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, expect, test, vi } from "vitest";
 import App from "../App";
+import { listen } from "@tauri-apps/api/event";
 import { defaultSettings, getSettings, getShortcutWarning, updateSettings, listDictionaryCandidates,
   listHistory, listHistoryPage, deleteAllHistory, reprocessHistoryText, copyToClipboard, getGpuDiagnostics, getModelStatus, getStartupHotkeyWarning, stopRecording, loadModel, previewHistoryRetentionPurge } from "../api";
 import type { DictionaryCandidate, HistoryItem, Settings, SettingsSnapshot } from "../types";
@@ -581,6 +582,69 @@ test("confirming a delayed purge count preserves settings changed while waiting"
   await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(2));
   expect(stored.openaiCorrectionModel).toBe("changed-while-counting");
   expect(stored.historyRetention).toBe("one_week");
+});
+
+test("late preparation events cannot reopen progress after the model is ready", async () => {
+  render(<App />);
+  await navigate("Models");
+  await emit("model-status", { modelId: "mock", quantization: "4bit", installed: false, state: "loading", detail: "" });
+  await emit("model-status", { modelId: "mock", quantization: "4bit", installed: true, state: "ready", detail: "" });
+  await emit("model-progress", { stage: "warmup", model: null, completedBytes: null, totalBytes: null });
+  await emit("status", { kind: "model_downloading", message: "Downloading the speech model files. This runs once; later starts use the local cache." });
+  expect(screen.queryByRole("progressbar")).toBeNull();
+  expect(document.querySelector(".notice-message")).toBeNull();
+});
+
+test("a ready event wins over a delayed loading snapshot", async () => {
+  const snapshot = deferred<Awaited<ReturnType<typeof getModelStatus>>>();
+  vi.mocked(getModelStatus).mockReturnValue(snapshot.promise);
+  render(<App />);
+  await waitFor(() => expect(events.get("model-status")?.size).toBeGreaterThan(0));
+  await emit("model-status", { modelId: "mock", quantization: "4bit", installed: true, state: "ready", detail: "" });
+  await act(async () => snapshot.resolve({ modelId: "mock", quantization: "4bit", installed: false, state: "loading", detail: "" }));
+  await navigate("Models");
+  expect(screen.getByText("Ready")).toBeTruthy();
+  expect(screen.queryByRole("progressbar")).toBeNull();
+  expect(document.querySelector(".notice-message")).toBeNull();
+});
+
+test("the initial model snapshot is requested only after the status listener exists", async () => {
+  vi.mocked(getModelStatus).mockImplementation(async () => {
+    expect(events.get("model-status")?.size).toBeGreaterThan(0);
+    return { modelId: "mock", quantization: "4bit", installed: true, state: "ready", detail: "" };
+  });
+  render(<App />);
+  await navigate("Models");
+  await waitFor(() => expect(screen.getByText("Ready")).toBeTruthy());
+});
+
+test.each(["model", "unrelated"])("a failed %s subscription still allows the model snapshot", async (failure) => {
+  const implementation = vi.mocked(listen).getMockImplementation()! as typeof listen;
+  const failingEvent = failure === "model" ? "model-status" : "app-state";
+  const failingListen: typeof listen = (event, handler, options) =>
+    event === failingEvent
+      ? Promise.reject(new Error("test subscription failed"))
+      : implementation(event, handler, options);
+  vi.mocked(listen).mockImplementation(failingListen);
+  vi.mocked(getModelStatus).mockResolvedValue({ modelId: "mock", quantization: "4bit", installed: true, state: "ready", detail: "" });
+  try {
+    const view = render(<App />);
+    await navigate("Models");
+    await waitFor(() => expect(screen.getByText("Ready")).toBeTruthy());
+    view.unmount();
+    await act(async () => {});
+    expect([...events.values()].every((handlers) => handlers.size === 0)).toBe(true);
+  } finally {
+    vi.mocked(listen).mockImplementation(implementation);
+  }
+});
+
+test("native notice-before-status ordering still displays legitimate model loading", async () => {
+  render(<App />);
+  await navigate("Models");
+  await emit("status", { kind: "model_loading", message: "Loading the speech model." });
+  await emit("model-status", { modelId: "mock", quantization: "4bit", installed: false, state: "loading", detail: "" });
+  expect(document.querySelector(".notice-message")?.textContent).toBe("Loading the speech model.");
 });
 
 test("dismissing a preparation notice preserves the Models progress display", async () => {
