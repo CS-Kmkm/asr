@@ -285,4 +285,3 @@ export function RecordingOverlay() {
     </div>
   );
 }
-
