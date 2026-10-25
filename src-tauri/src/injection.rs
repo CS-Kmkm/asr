@@ -627,16 +627,6 @@ impl TargetText {
         self.before == other.before && self.selected == other.selected && self.after == other.after
     }
 
-    /// Occurrences of `text` anywhere in the readable content.
-    fn occurrences(&self, text: &str) -> usize {
-        [&self.before, &self.selected, &self.after]
-            .into_iter()
-            .map(String::as_str)
-            .collect::<String>()
-            .matches(text)
-            .count()
-    }
-
     fn replaced_with(&self, text: &str) -> Self {
         Self {
             identity: self.identity.clone(),

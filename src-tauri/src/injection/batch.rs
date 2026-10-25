@@ -325,12 +325,69 @@ fn collapse_selected<B: Backend>(backend: &B, target: &TargetWindow, selected: &
 /// (terminal output, a shifted window) does not count, so the old clipboard is
 /// never restored under a still-pending paste. Replacements keep the exact
 /// match their ranges depend on.
-fn shows_inserted_text(before: &TargetText, actual: &TargetText, text: &str) -> bool {
-    let text = normalize_text(text);
-    let inserted = text.trim();
-    !inserted.is_empty()
-        && actual.before.trim_end().ends_with(inserted)
-        && actual.occurrences(inserted) > before.occurrences(inserted)
+struct InsertedTextEvidence {
+    text: String,
+    prefix: Vec<usize>,
+    previous_count: usize,
+}
+
+impl InsertedTextEvidence {
+    fn new(before: &TargetText, text: &str) -> Option<Self> {
+        let text = normalize_text(text).trim().to_owned();
+        if text.is_empty() {
+            return None;
+        }
+        let bytes = text.as_bytes();
+        let mut prefix = vec![0; bytes.len()];
+        for index in 1..bytes.len() {
+            let mut matched = prefix[index - 1];
+            while matched > 0 && bytes[index] != bytes[matched] {
+                matched = prefix[matched - 1];
+            }
+            if bytes[index] == bytes[matched] {
+                matched += 1;
+            }
+            prefix[index] = matched;
+        }
+        let mut evidence = Self {
+            text,
+            prefix,
+            previous_count: 0,
+        };
+        evidence.previous_count = evidence.count(before);
+        Some(evidence)
+    }
+
+    /// Match the three adjacent ranges as one byte stream, without copying
+    /// the document. Reset after a match to preserve str::matches' disjoint
+    /// counting, including occurrences across selection/caret boundaries.
+    fn count(&self, state: &TargetText) -> usize {
+        let needle = self.text.as_bytes();
+        let mut matched = 0;
+        let mut count = 0;
+        for byte in state
+            .before
+            .bytes()
+            .chain(state.selected.bytes())
+            .chain(state.after.bytes())
+        {
+            while matched > 0 && byte != needle[matched] {
+                matched = self.prefix[matched - 1];
+            }
+            if byte == needle[matched] {
+                matched += 1;
+            }
+            if matched == needle.len() {
+                count += 1;
+                matched = 0;
+            }
+        }
+        count
+    }
+
+    fn confirms(&self, actual: &TargetText) -> bool {
+        actual.before.trim_end().ends_with(&self.text) && self.count(actual) > self.previous_count
+    }
 }
 
 /// Once any paste input is queued, its clipboard payload must remain intact
@@ -389,6 +446,9 @@ fn paste<B: Backend>(
     }
     clipboard.keep();
     let expected = before.replaced_with(text);
+    // Exact matches need no scan. Proxy confirmation builds its matcher and
+    // scans the unchanged baseline lazily once, rather than on every poll.
+    let evidence = std::cell::OnceCell::new();
     for attempt in 0..=VERIFY_ATTEMPTS {
         if attempt > 0 {
             backend.wait_for_target();
@@ -401,7 +461,10 @@ fn paste<B: Backend>(
         if backend.target_text(target).is_ok_and(|actual| {
             actual.same_content(&expected)
                 || (policy != SafetyPolicy::Destructive
-                    && shows_inserted_text(before, &actual, text))
+                    && evidence
+                        .get_or_init(|| InsertedTextEvidence::new(before, text))
+                        .as_ref()
+                        .is_some_and(|evidence| evidence.confirms(&actual)))
         }) {
             // Restoration failure cannot undo a confirmed edit and must never
             // initiate a second insertion; it is reported instead.
@@ -2790,6 +2853,49 @@ pub(super) mod tests {
             selected: String::new(),
             after: after.into(),
         }
+    }
+
+    #[test]
+    fn streaming_occurrence_counts_match_disjoint_string_matches_across_all_range_boundaries() {
+        for whole in [
+            "aaaaa",
+            "ababababa",
+            "かなかなかな",
+            "A😀e\u{301}日本😀",
+            "a\nb\na\nb",
+            "",
+        ] {
+            let boundaries: Vec<_> = whole
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain(std::iter::once(whole.len()))
+                .collect();
+            for &first in &boundaries {
+                for &second in boundaries.iter().filter(|&&index| index >= first) {
+                    let state = TargetText {
+                        identity: vec![1],
+                        before: whole[..first].into(),
+                        selected: whole[first..second].into(),
+                        after: whole[second..].into(),
+                    };
+                    for needle in [
+                        "a", "aa", "aba", "かな", "😀", "e\u{301}", "日本", "a\r\nb", "missing",
+                    ] {
+                        let evidence = InsertedTextEvidence::new(&state, needle).unwrap();
+                        assert_eq!(
+                            evidence.count(&state),
+                            whole.matches(evidence.text.as_str()).count(),
+                            "{whole:?} split {first}/{second}, needle {needle:?}"
+                        );
+                        assert!(
+                            !evidence.confirms(&state),
+                            "unchanged text must never confirm a paste"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(InsertedTextEvidence::new(&proxy_text("", ""), " \r\n\t").is_none());
     }
 
     #[test]
