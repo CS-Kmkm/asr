@@ -950,14 +950,20 @@ async fn start_owned_recording(
         };
     // Capture the target at the press: a model load may take minutes, and
     // the foreground window by then is not necessarily the one meant.
-    let target = (!dictation_test && mode != PipelineMode::Edit && mode != PipelineMode::Ask)
-        .then(|| {
-            SystemTextInjector::default()
-                .capture_target()
-                .map(|target| injection::recording_target(target, from_shortcut))
-                .map_err(command_error)
-        })
-        .transpose()?;
+    let target = if !dictation_test && mode != PipelineMode::Edit && mode != PipelineMode::Ask {
+        Some(
+            tokio::task::spawn_blocking(move || {
+                SystemTextInjector::default()
+                    .capture_target()
+                    .map(|target| injection::recording_target(target, from_shortcut))
+                    .map_err(command_error)
+            })
+            .await
+            .map_err(|_| "recording session task failed".to_owned())??,
+        )
+    } else {
+        None
+    };
     // The overlay appears on the monitor of the window this take targets.
     let ask_target = ask_session
         .as_ref()

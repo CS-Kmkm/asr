@@ -11,9 +11,9 @@ use windows::Win32::System::Ole::{
     SafeArrayDestroy, SafeArrayGetElement, SafeArrayGetLBound, SafeArrayGetUBound,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation8, IUIAutomation2, IUIAutomationElement, IUIAutomationTextPattern,
-    IUIAutomationTextRange, TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start,
-    TextUnit_Character, UIA_TextPatternId,
+    CUIAutomation8, IUIAutomation2, IUIAutomationElement, IUIAutomationTextEditPattern,
+    IUIAutomationTextPattern, IUIAutomationTextRange, TextPatternRangeEndpoint_End,
+    TextPatternRangeEndpoint_Start, TextUnit_Character, UIA_TextEditPatternId, UIA_TextPatternId,
 };
 
 const MAX_TEXT_UNITS: i32 = 1_048_576;
@@ -157,18 +157,51 @@ fn unavailable() -> InjectionError {
     InjectionError::BackendFailure("the focused control does not expose a verifiable text range")
 }
 
+fn focused_in_process(
+    automation: &IUIAutomation2,
+    process_id: u32,
+) -> Result<IUIAutomationElement, InjectionError> {
+    let element = unsafe { automation.GetFocusedElement() }.map_err(|_| unavailable())?;
+    if unsafe { element.CurrentProcessId() }.map_err(|_| unavailable())? != process_id as i32 {
+        return Err(InjectionError::TargetChanged);
+    }
+    Ok(element)
+}
+
+pub(super) fn is_password(process_id: u32) -> Result<bool, InjectionError> {
+    dispatch(move |automation, _deadline| {
+        unsafe { focused_in_process(automation, process_id)?.CurrentIsPassword() }
+            .map(|value| value.as_bool())
+            .map_err(|_| unavailable())
+    })
+}
+
+pub(super) fn ime_active(process_id: u32) -> Result<Option<bool>, InjectionError> {
+    dispatch(move |automation, _deadline| {
+        let element = focused_in_process(automation, process_id)?;
+        let pattern = match unsafe {
+            element.GetCurrentPatternAs::<IUIAutomationTextEditPattern>(UIA_TextEditPatternId)
+        } {
+            Ok(pattern) => pattern,
+            Err(_) => return Ok(None),
+        };
+        match unsafe { pattern.GetActiveComposition() } {
+            Ok(_) => Ok(Some(true)),
+            // The binding represents the documented null range as an empty
+            // interface error; unsupported/partial providers stay unknown.
+            Err(error) if error.code() == windows::core::Error::empty().code() => Ok(Some(false)),
+            Err(_) => Ok(None),
+        }
+    })
+}
+
 impl TextControl {
     fn focused(
         target: &TargetWindow,
         automation: &IUIAutomation2,
         deadline: Instant,
     ) -> Result<Self, InjectionError> {
-        let element = unsafe { automation.GetFocusedElement() }.map_err(|_| unavailable())?;
-        if unsafe { element.CurrentProcessId() }.map_err(|_| unavailable())?
-            != target.process_id as i32
-        {
-            return Err(InjectionError::TargetChanged);
-        }
+        let element = focused_in_process(automation, target.process_id)?;
         if unsafe { element.CurrentIsPassword() }
             .map_err(|_| unavailable())?
             .as_bool()

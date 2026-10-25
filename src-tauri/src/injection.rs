@@ -1002,15 +1002,8 @@ mod windows_backend {
         GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
         TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
     };
-    use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-        COINIT_APARTMENTTHREADED,
-    };
     use windows::Win32::System::Threading::{
         GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    use windows::Win32::UI::Accessibility::{
-        CUIAutomation, IUIAutomation, IUIAutomationTextEditPattern, UIA_TextEditPatternId,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
@@ -1096,58 +1089,12 @@ mod windows_backend {
         children
     }
 
-    struct ComGuard(bool);
-
-    impl Drop for ComGuard {
-        fn drop(&mut self) {
-            if self.0 {
-                unsafe { CoUninitialize() };
-            }
-        }
-    }
-
     fn uia_is_password(process_id: u32) -> Result<bool, ()> {
-        let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
-        let _guard = ComGuard(initialized);
-        let automation: IUIAutomation =
-            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
-                .map_err(|_| ())?;
-        let element = unsafe { automation.GetFocusedElement() }.map_err(|_| ())?;
-        let focused_process = unsafe { element.CurrentProcessId() }.map_err(|_| ())?;
-        if focused_process != process_id as i32 {
-            return Err(());
-        }
-        unsafe { element.CurrentIsPassword() }
-            .map(|value| value.as_bool())
-            .map_err(|_| ())
+        accessibility::is_password(process_id).map_err(|_| ())
     }
 
     fn uia_ime_composition_active(process_id: u32) -> Result<Option<bool>, ()> {
-        let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
-        let _guard = ComGuard(initialized);
-        let automation: IUIAutomation =
-            unsafe { CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) }
-                .map_err(|_| ())?;
-        let element = unsafe { automation.GetFocusedElement() }.map_err(|_| ())?;
-        let focused_process = unsafe { element.CurrentProcessId() }.map_err(|_| ())?;
-        if focused_process != process_id as i32 {
-            return Err(());
-        }
-        let pattern = match unsafe {
-            element.GetCurrentPatternAs::<IUIAutomationTextEditPattern>(UIA_TextEditPatternId)
-        } {
-            Ok(pattern) => pattern,
-            Err(_) => return Ok(None),
-        };
-        match unsafe { pattern.GetActiveComposition() } {
-            Ok(_) => Ok(Some(true)),
-            // The Windows binding represents the documented null range (no
-            // active conversion) as an empty-interface error.
-            Err(error) if error.code() == windows::core::Error::empty().code() => Ok(Some(false)),
-            // Providers that implement the pattern partially (E_NOTIMPL) know
-            // no more than one without it: the state is unknown.
-            Err(_) => Ok(None),
-        }
+        accessibility::ime_active(process_id).map_err(|_| ())
     }
 
     fn token_integrity_level(process: HANDLE) -> Result<u32, ()> {
@@ -1230,10 +1177,10 @@ mod windows_backend {
             integrity_result?;
 
             let control = focused_control(window, thread_id);
-            let is_secure = target::is_secure(
+            let is_secure = target::secure_after_password_query(
                 is_password_style(control),
                 is_known_credential_surface(control, hosted.is_some()),
-                uia_is_password(process_id).ok(),
+                uia_is_password(process_id),
             );
             Ok(TargetWindow {
                 window_handle: window.0 as isize,

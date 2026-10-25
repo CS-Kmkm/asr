@@ -1642,7 +1642,10 @@ pub(super) mod tests {
         fn capture_target(&self) -> Result<TargetWindow, InjectionError> {
             Ok(target())
         }
-        fn validate_target(&self, _: &TargetWindow) -> Result<(), InjectionError> {
+        fn validate_target(&self, target: &TargetWindow) -> Result<(), InjectionError> {
+            if target.is_secure {
+                return Err(InjectionError::SecureTarget);
+            }
             if let Some(on_validate) = &self.on_validate {
                 on_validate();
             }
@@ -2935,6 +2938,40 @@ pub(super) mod tests {
             selected: String::new(),
             after: after.into(),
         }
+    }
+
+    #[test]
+    fn unknown_password_state_copies_without_pasting_even_when_text_is_unreadable() {
+        let backend = MockBackend::new();
+        backend.text_readable.set(false);
+        let mut captured = target();
+        captured.is_secure =
+            crate::injection::target::secure_after_password_query(false, false, Err(()));
+        assert_eq!(
+            insert(
+                &backend,
+                InjectionOptions::default(),
+                "dictated text",
+                &captured
+            )
+            .unwrap(),
+            InsertResult::ClipboardOnly
+        );
+        assert_eq!(calls(&backend, "paste"), 0);
+        assert_eq!(&*backend.clipboard.borrow(), "dictated text");
+        captured.is_secure =
+            crate::injection::target::secure_after_password_query(false, false, Ok(false));
+        assert_eq!(
+            insert(
+                &backend,
+                InjectionOptions::default(),
+                "dictated text",
+                &captured
+            )
+            .unwrap(),
+            InsertResult::PasteUnverified
+        );
+        assert_eq!(calls(&backend, "paste"), 1);
     }
 
     #[test]

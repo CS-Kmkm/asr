@@ -56,9 +56,32 @@ pub(super) fn is_secure(
     style_password || uia_password == Some(true) || credential_surface && uia_password.is_none()
 }
 
+/// A bounded password query may fail because the shared worker is busy or
+/// its deadline expired. Preserve that uncertainty: only an explicit false
+/// property can permit a target without another protected-surface signal.
+pub(super) fn secure_after_password_query(
+    style_password: bool,
+    credential_surface: bool,
+    password_query: Result<bool, ()>,
+) -> bool {
+    password_query
+        .map(|password| is_secure(style_password, credential_surface, Some(password)))
+        .unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_password_query_failure_protects_rich_and_credential_controls() {
+        for credential in [false, true] {
+            assert!(secure_after_password_query(false, credential, Err(())));
+            assert!(secure_after_password_query(false, credential, Ok(true)));
+            assert!(!secure_after_password_query(false, credential, Ok(false)));
+            assert!(secure_after_password_query(true, credential, Ok(false)));
+        }
+    }
 
     fn child(class_name: &str, process_id: u32, thread_id: u32) -> ChildWindow {
         ChildWindow {
