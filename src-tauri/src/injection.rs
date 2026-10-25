@@ -619,6 +619,15 @@ struct TargetText {
     selected: String,
     after: String,
 }
+
+/// A contiguous window around a caret. Only a complete probe may authorize
+/// an exact document comparison; an incomplete one is positive evidence only.
+#[derive(Clone)]
+struct TextProbe {
+    state: TargetText,
+    complete: bool,
+}
+const TEXT_PROBE_UNITS: i32 = 4096;
 fn normalize_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
@@ -689,6 +698,12 @@ trait Backend {
     fn ime_composition_active(&self, target: &TargetWindow)
         -> Result<Option<bool>, InjectionError>;
     fn target_text(&self, target: &TargetWindow) -> Result<TargetText, InjectionError>;
+    fn target_text_probe(
+        &self,
+        _target: &TargetWindow,
+    ) -> Result<Option<TextProbe>, InjectionError> {
+        Ok(None)
+    }
     /// Inspect the selection independently of reading the full document.
     fn selection_is_empty(&self, target: &TargetWindow) -> Result<bool, InjectionError> {
         self.target_text(target)
@@ -823,6 +838,12 @@ pub(crate) mod test_backend {
         }
         fn target_text(&self, target: &TargetWindow) -> Result<TargetText, InjectionError> {
             delegate!(self, |b| b.target_text(target))
+        }
+        fn target_text_probe(
+            &self,
+            target: &TargetWindow,
+        ) -> Result<Option<TextProbe>, InjectionError> {
+            delegate!(self, |b| b.target_text_probe(target))
         }
         fn selection_is_empty(&self, target: &TargetWindow) -> Result<bool, InjectionError> {
             delegate!(self, |b| b.selection_is_empty(target))
@@ -969,7 +990,8 @@ use windows_backend::PlatformBackend;
 mod windows_backend {
     use super::{
         accessibility, clipboard, keys, target, Backend, ClipboardExclusion, InjectionError,
-        SafetyPolicy, TargetText, TargetWindow, UnrestoredClipboard, WriteError, INJECTION_MARKER,
+        SafetyPolicy, TargetText, TargetWindow, TextProbe, UnrestoredClipboard, WriteError,
+        INJECTION_MARKER,
     };
     use std::mem::{size_of, zeroed};
     use std::thread;
@@ -1250,6 +1272,13 @@ mod windows_backend {
         fn target_text(&self, target: &TargetWindow) -> Result<TargetText, InjectionError> {
             self.validate_target(target)?;
             accessibility::read(target)
+        }
+        fn target_text_probe(
+            &self,
+            target: &TargetWindow,
+        ) -> Result<Option<TextProbe>, InjectionError> {
+            self.validate_target(target)?;
+            accessibility::probe(target).map(Some)
         }
         fn selection_is_empty(&self, target: &TargetWindow) -> Result<bool, InjectionError> {
             self.validate_target(target)?;

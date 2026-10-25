@@ -1,4 +1,6 @@
-use super::{normalize_text, InjectionError, TargetText, TargetWindow};
+use super::{
+    normalize_text, InjectionError, TargetText, TargetWindow, TextProbe, TEXT_PROBE_UNITS,
+};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::System::Com::{
@@ -235,6 +237,80 @@ impl TextControl {
             after: read_range(&after)?,
         })
     }
+
+    fn probe(&self) -> Result<TextProbe, InjectionError> {
+        self.check_deadline()?;
+        let caret = self.selection()?;
+        if unsafe {
+            caret.CompareEndpoints(
+                TextPatternRangeEndpoint_Start,
+                &caret,
+                TextPatternRangeEndpoint_End,
+            )
+        }
+        .map_err(|_| unavailable())?
+            != 0
+        {
+            return Err(unavailable());
+        }
+        let document = unsafe { self.pattern.DocumentRange() }.map_err(|_| unavailable())?;
+        let before = unsafe { caret.Clone() }.map_err(|_| unavailable())?;
+        let after = unsafe { caret.Clone() }.map_err(|_| unavailable())?;
+        unsafe {
+            before
+                .MoveEndpointByUnit(
+                    TextPatternRangeEndpoint_Start,
+                    TextUnit_Character,
+                    -TEXT_PROBE_UNITS,
+                )
+                .map_err(|_| unavailable())?;
+            after
+                .MoveEndpointByUnit(
+                    TextPatternRangeEndpoint_End,
+                    TextUnit_Character,
+                    TEXT_PROBE_UNITS,
+                )
+                .map_err(|_| unavailable())?;
+        }
+        self.check_deadline()?;
+        let complete = unsafe {
+            before
+                .CompareEndpoints(
+                    TextPatternRangeEndpoint_Start,
+                    &document,
+                    TextPatternRangeEndpoint_Start,
+                )
+                .map_err(|_| unavailable())?
+                == 0
+                && after
+                    .CompareEndpoints(
+                        TextPatternRangeEndpoint_End,
+                        &document,
+                        TextPatternRangeEndpoint_End,
+                    )
+                    .map_err(|_| unavailable())?
+                    == 0
+        };
+        let read = |range: &IUIAutomationTextRange| -> Result<String, InjectionError> {
+            self.check_deadline()?;
+            let text = unsafe { range.GetText(TEXT_PROBE_UNITS + 1) }.map_err(|_| unavailable())?;
+            // Character units differ between providers. Reject truncation and
+            // fall back to the full reader instead of treating a prefix as a tail.
+            if text.len() > TEXT_PROBE_UNITS as usize {
+                return Err(unavailable());
+            }
+            Ok(normalize_text(&text.to_string()))
+        };
+        Ok(TextProbe {
+            state: TargetText {
+                identity: runtime_id(&self.element)?,
+                before: read(&before)?,
+                selected: String::new(),
+                after: read(&after)?,
+            },
+            complete,
+        })
+    }
 }
 
 fn runtime_id(element: &IUIAutomationElement) -> Result<Vec<i32>, InjectionError> {
@@ -299,6 +375,13 @@ pub(super) fn read(target: &TargetWindow) -> Result<TargetText, InjectionError> 
     let target = target.clone();
     dispatch(move |automation, deadline| {
         TextControl::focused(&target, automation, deadline)?.state()
+    })
+}
+
+pub(super) fn probe(target: &TargetWindow) -> Result<TextProbe, InjectionError> {
+    let target = target.clone();
+    dispatch(move |automation, deadline| {
+        TextControl::focused(&target, automation, deadline)?.probe()
     })
 }
 

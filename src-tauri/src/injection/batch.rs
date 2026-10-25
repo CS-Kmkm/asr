@@ -390,6 +390,39 @@ impl InsertedTextEvidence {
     }
 }
 
+/// A bounded window is a substring of the full readable state. More window
+/// occurrences than the *full* baseline therefore also satisfies the original
+/// full-state evidence rule. An ambiguous window requests the full reader;
+/// it never substitutes a local exact match for an exact document comparison.
+fn probe_confirmation(
+    probe: &TextProbe,
+    before: &TargetText,
+    expected: &TargetText,
+    inserted: &str,
+    evidence: &std::cell::OnceCell<Option<InsertedTextEvidence>>,
+) -> Option<bool> {
+    if probe.complete && probe.state.same_content(expected) {
+        return Some(true);
+    }
+    if !probe.state.selected.is_empty() {
+        return None;
+    }
+    if probe.state.before.trim_end().len() < inserted.len() {
+        return probe.complete.then_some(false);
+    }
+    if !probe.state.before.trim_end().ends_with(inserted) {
+        return Some(false);
+    }
+    if evidence
+        .get_or_init(|| InsertedTextEvidence::new(before, inserted))
+        .as_ref()
+        .is_some_and(|evidence| evidence.confirms(&probe.state))
+    {
+        return Some(true);
+    }
+    probe.complete.then_some(false)
+}
+
 /// Once any paste input is queued, its clipboard payload must remain intact
 /// until the target confirms the edit. Never substitute a retry or fallback.
 #[allow(clippy::too_many_arguments)]
@@ -449,6 +482,15 @@ fn paste<B: Backend>(
     // Exact matches need no scan. Proxy confirmation builds its matcher and
     // scans the unchanged baseline lazily once, rather than on every poll.
     let evidence = std::cell::OnceCell::new();
+    let probe_needle = std::cell::OnceCell::new();
+    let mut probe_enabled = policy != SafetyPolicy::Destructive
+        && before.selected.is_empty()
+        && text
+            .encode_utf16()
+            .take(TEXT_PROBE_UNITS as usize + 1)
+            .count()
+            <= TEXT_PROBE_UNITS as usize
+        && !text.trim().is_empty();
     for attempt in 0..=VERIFY_ATTEMPTS {
         if attempt > 0 {
             backend.wait_for_target();
@@ -458,13 +500,40 @@ fn paste<B: Backend>(
         {
             break;
         }
-        if backend.target_text(target).is_ok_and(|actual| {
-            actual.same_content(&expected)
-                || (policy != SafetyPolicy::Destructive
-                    && evidence
-                        .get_or_init(|| InsertedTextEvidence::new(before, text))
-                        .as_ref()
-                        .is_some_and(|evidence| evidence.confirms(&actual)))
+        let confirmed = if probe_enabled {
+            match backend.target_text_probe(target) {
+                Ok(Some(probe)) if probe.complete && probe.state.same_content(&expected) => {
+                    Some(true)
+                }
+                Ok(Some(probe)) => {
+                    let inserted =
+                        probe_needle.get_or_init(|| normalize_text(text).trim().to_owned());
+                    let decision =
+                        probe_confirmation(&probe, before, &expected, inserted, &evidence);
+                    if decision.is_none() {
+                        probe_enabled = false;
+                    }
+                    decision
+                }
+                // Unsupported, noncaret, truncated, timed-out or ambiguous
+                // probes cost at most one attempt before using the old reader.
+                _ => {
+                    probe_enabled = false;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if confirmed.unwrap_or_else(|| {
+            backend.target_text(target).is_ok_and(|actual| {
+                actual.same_content(&expected)
+                    || (policy != SafetyPolicy::Destructive
+                        && evidence
+                            .get_or_init(|| InsertedTextEvidence::new(before, text))
+                            .as_ref()
+                            .is_some_and(|evidence| evidence.confirms(&actual)))
+            })
         }) {
             // Restoration failure cannot undo a confirmed edit and must never
             // initiate a second insertion; it is reported instead.
@@ -1473,6 +1542,9 @@ pub(super) mod tests {
         delete_accepted: Cell<bool>,
         pub(crate) text_readable: Cell<bool>,
         text_reads: Cell<usize>,
+        probe_reads: Cell<usize>,
+        probe_state: RefCell<Option<TextProbe>>,
+        probe_fails: Cell<bool>,
         selection_readable: Cell<bool>,
         paste_accepted: Cell<bool>,
         pending: RefCell<Option<String>>,
@@ -1518,6 +1590,9 @@ pub(super) mod tests {
                 delete_accepted: Cell::new(true),
                 text_readable: Cell::new(true),
                 text_reads: Cell::new(0),
+                probe_reads: Cell::new(0),
+                probe_state: RefCell::new(None),
+                probe_fails: Cell::new(false),
                 selection_readable: Cell::new(true),
                 paste_accepted: Cell::new(true),
                 pending: RefCell::new(None),
@@ -1587,6 +1662,13 @@ pub(super) mod tests {
         }
         fn focus_identity(&self, _: &TargetWindow) -> Result<Vec<i32>, InjectionError> {
             Ok(self.text.borrow().identity.clone())
+        }
+        fn target_text_probe(&self, _: &TargetWindow) -> Result<Option<TextProbe>, InjectionError> {
+            self.probe_reads.set(self.probe_reads.get() + 1);
+            if self.probe_fails.get() {
+                return Err(InjectionError::BackendFailure("probe unavailable"));
+            }
+            Ok(self.probe_state.borrow().clone())
         }
         fn target_text(&self, _: &TargetWindow) -> Result<TargetText, InjectionError> {
             self.text_reads.set(self.text_reads.get() + 1);
@@ -2853,6 +2935,221 @@ pub(super) mod tests {
             selected: String::new(),
             after: after.into(),
         }
+    }
+
+    #[test]
+    fn bounded_probe_never_uses_a_partial_exact_match_to_restore_clipboard() {
+        // Insertion can retain the same disjoint count when it splits an old
+        // match. A coincidentally identical *window* must request the full read.
+        let before = proxy_text("a", "ba");
+        let expected = before.replaced_with("aba");
+        let probe = TextProbe {
+            state: expected.clone(),
+            complete: false,
+        };
+        assert_eq!(
+            probe_confirmation(
+                &probe,
+                &before,
+                &expected,
+                "aba",
+                &std::cell::OnceCell::new()
+            ),
+            None
+        );
+        let complete = TextProbe {
+            complete: true,
+            ..probe
+        };
+        assert_eq!(
+            probe_confirmation(
+                &complete,
+                &before,
+                &expected,
+                "aba",
+                &std::cell::OnceCell::new()
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn every_decisive_partial_probe_agrees_with_the_previous_full_reader_rule() {
+        for needle in ["aba", "かな", "😀e\u{301}"] {
+            for (prefix, suffix) in [("prefix ", " suffix"), ("aba ", "aba")] {
+                let before = proxy_text(prefix, suffix);
+                let expected = before.replaced_with(needle);
+                let evidence = std::cell::OnceCell::new();
+                for actual_before in [
+                    format!("prefix {needle}"),
+                    format!("{needle}x{needle}{needle} \n"),
+                    "waiting prefix".into(),
+                ] {
+                    for actual_after in ["", " suffix", needle] {
+                        let full = proxy_text(&actual_before, actual_after);
+                        let baseline_count = format!("{prefix}{suffix}").matches(needle).count();
+                        let old_rule = full.same_content(&expected)
+                            || (full.before.trim_end().ends_with(needle)
+                                && format!("{actual_before}{actual_after}")
+                                    .matches(needle)
+                                    .count()
+                                    > baseline_count);
+                        for start in actual_before
+                            .char_indices()
+                            .map(|(index, _)| index)
+                            .chain(std::iter::once(actual_before.len()))
+                        {
+                            for end in actual_after
+                                .char_indices()
+                                .map(|(index, _)| index)
+                                .chain(std::iter::once(actual_after.len()))
+                            {
+                                let window = TextProbe {
+                                    state: proxy_text(
+                                        &actual_before[start..],
+                                        &actual_after[..end],
+                                    ),
+                                    complete: false,
+                                };
+                                if let Some(decision) = probe_confirmation(
+                                    &window, &before, &expected, needle, &evidence,
+                                ) {
+                                    assert_eq!(decision, old_rule, "{needle:?}, window {start}/{end}, full {actual_before:?}/{actual_after:?}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_confirmation_saves_a_full_read_and_ambiguous_counts_fall_back() {
+        let plain = MockBackend::new();
+        assert_eq!(
+            insert(&plain, InjectionOptions::default(), "novel text", &target()).unwrap(),
+            InsertResult::ClipboardPaste
+        );
+        let bounded = MockBackend::new();
+        *bounded.probe_state.borrow_mut() = Some(TextProbe {
+            state: proxy_text("fix novel text", " suf"),
+            complete: false,
+        });
+        assert_eq!(
+            insert(
+                &bounded,
+                InjectionOptions::default(),
+                "novel text",
+                &target()
+            )
+            .unwrap(),
+            InsertResult::ClipboardPaste
+        );
+        assert_eq!(bounded.content(), plain.content());
+        assert_eq!(bounded.text_reads.get() + 1, plain.text_reads.get());
+        assert_eq!(bounded.probe_reads.get(), 1);
+
+        let ambiguous = MockBackend::new();
+        *ambiguous.text.borrow_mut() = proxy_text("a", "ba");
+        *ambiguous.probe_state.borrow_mut() = Some(TextProbe {
+            state: proxy_text("aaba", "ba"),
+            complete: false,
+        });
+        assert_eq!(
+            insert(&ambiguous, InjectionOptions::default(), "aba", &target()).unwrap(),
+            InsertResult::ClipboardPaste
+        );
+        assert_eq!(ambiguous.content(), "aababa");
+        assert!(ambiguous.calls.borrow().contains(&"restore"));
+    }
+
+    #[test]
+    fn pending_probe_without_suffix_never_restores_or_polls_full_text() {
+        let backend = MockBackend::new();
+        *backend.probe_state.borrow_mut() = Some(TextProbe {
+            state: proxy_text("prefix still pending", " suffix"),
+            complete: false,
+        });
+        assert_eq!(
+            insert(
+                &backend,
+                InjectionOptions::default(),
+                "novel text",
+                &target()
+            )
+            .unwrap(),
+            InsertResult::PasteUnverified
+        );
+        assert_eq!(backend.probe_reads.get(), VERIFY_ATTEMPTS + 1);
+        assert!(backend.text_reads.get() < backend.probe_reads.get());
+        assert!(!backend.calls.borrow().contains(&"restore"));
+        assert_eq!(&*backend.clipboard.borrow(), "novel text");
+    }
+
+    #[test]
+    fn unavailable_or_ambiguous_probes_are_attempted_only_once_per_paste() {
+        for failure in [false, true] {
+            let mut backend = MockBackend::new();
+            backend.probe_fails.set(failure);
+            backend.settle_after = VERIFY_ATTEMPTS + 2;
+            assert_eq!(
+                insert(
+                    &backend,
+                    InjectionOptions::default(),
+                    "novel text",
+                    &target()
+                )
+                .unwrap(),
+                InsertResult::PasteUnverified
+            );
+            assert_eq!(backend.probe_reads.get(), 1);
+        }
+        let mut backend = MockBackend::new();
+        backend.settle_after = VERIFY_ATTEMPTS + 2;
+        *backend.text.borrow_mut() = proxy_text("a", "ba");
+        *backend.probe_state.borrow_mut() = Some(TextProbe {
+            state: proxy_text("aaba", "ba"),
+            complete: false,
+        });
+        assert_eq!(
+            insert(&backend, InjectionOptions::default(), "aba", &target()).unwrap(),
+            InsertResult::PasteUnverified
+        );
+        assert_eq!(backend.probe_reads.get(), 1);
+        assert!(!backend.calls.borrow().contains(&"restore"));
+    }
+
+    #[test]
+    fn short_or_whitespace_probe_tails_request_the_full_reader() {
+        let before = proxy_text("prefix", "suffix");
+        let expected = before.replaced_with("long sample");
+        for tail in ["ple", "    "] {
+            let probe = TextProbe {
+                state: proxy_text(tail, "suffix"),
+                complete: false,
+            };
+            assert_eq!(
+                probe_confirmation(
+                    &probe,
+                    &before,
+                    &expected,
+                    "long sample",
+                    &std::cell::OnceCell::new()
+                ),
+                None
+            );
+        }
+        let backend = MockBackend::new();
+        *backend.probe_state.borrow_mut() = Some(TextProbe {
+            state: proxy_text("unused", "unused"),
+            complete: false,
+        });
+        assert_eq!(
+            insert(&backend, InjectionOptions::default(), " \r\n ", &target()).unwrap(),
+            InsertResult::ClipboardPaste
+        );
+        assert_eq!(backend.probe_reads.get(), 0);
     }
 
     #[test]
