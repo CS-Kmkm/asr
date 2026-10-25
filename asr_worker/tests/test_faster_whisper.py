@@ -17,6 +17,7 @@ from asr_worker.backends import (
     compute_max_new_tokens,
     create_backend,
     faster_whisper_compute_type,
+    map_backend_exception,
     wav_duration_seconds,
 )
 from asr_worker.download import FASTER_WHISPER_ALLOW_PATTERNS
@@ -341,6 +342,56 @@ class TranscribeWithFakeModuleTests(IsolatedWorkerTestCase):
                 FasterWhisperBackend()
         self.assertEqual(caught.exception.code, "invalid_device")
 
+    def test_load_oom_reports_the_device_that_failed_including_auto_cpu_fallback(self):
+        for policy, expected_devices, code in [("cpu", ["cpu"], "cpu_oom"), ("auto", ["cuda", "cpu"], "cpu_oom"), ("cuda", ["cuda"], "gpu_oom")]:
+            with self.subTest(policy=policy):
+                devices = []
+                class OomModel:
+                    def __init__(self, model_id, device, compute_type):
+                        devices.append(device)
+                        raise RuntimeError("out of memory")
+                modules = _install_fake_faster_whisper()
+                modules["faster_whisper"].WhisperModel = OomModel
+                modules["ctranslate2"].get_cuda_device_count = lambda: 1
+                with patch.dict(os.environ, {"ASR_DEVICE": policy}), patch.dict(sys.modules, modules):
+                    backend = FasterWhisperBackend()
+                    with self.assertRaises(BackendError) as caught:
+                        backend.load("4bit")
+                self.assertEqual(devices, expected_devices)
+                self.assertEqual(caught.exception.code, code)
+                self.assertIsNone(backend.model)
+                self.assertIsNone(backend.device)
+                self.assertIsNone(backend.compute_type)
+
+    def test_host_allocation_errors_always_report_system_memory(self):
+        for error in [MemoryError(), MemoryError("std::bad_alloc"), RuntimeError("bad allocation")]:
+            for device in ["cpu", "cuda", None]:
+                with self.subTest(error=type(error).__name__, message=str(error), device=device):
+                    self.assertEqual(map_backend_exception(error, "load", device=device).code, "cpu_oom")
+
+    def test_cuda_oom_does_not_contaminate_unrelated_cpu_load_error(self):
+        modules = _install_fake_faster_whisper()
+        modules["ctranslate2"].get_cuda_device_count = lambda: 1
+        def failed_model(model_id, device, compute_type):
+            raise RuntimeError("CUDA out of memory" if device == "cuda" else "corrupt snapshot")
+        modules["faster_whisper"].WhisperModel = failed_model
+        with patch.dict(os.environ, {"ASR_DEVICE": "auto"}), patch.dict(sys.modules, modules):
+            with self.assertRaises(BackendError) as caught:
+                FasterWhisperBackend().load("4bit")
+        self.assertEqual(caught.exception.code, "model_load_failed")
+
+    def test_explicit_cuda_allocation_and_suppressed_context_are_distinct(self):
+        error = MemoryError("std::bad_alloc: cudaErrorMemoryAllocation: out of memory")
+        self.assertEqual(map_backend_exception(error, "load", device="cuda").code, "gpu_oom")
+        try:
+            try:
+                raise RuntimeError("CUDA out of memory")
+            except RuntimeError:
+                raise RuntimeError("corrupt snapshot") from None
+        except RuntimeError as suppressed:
+            self.assertEqual(map_backend_exception(suppressed, "load", device="cpu").code, "model_load_failed")
+            self.assertFalse(FasterWhisperBackend._is_cuda_failure(suppressed))
+
     def test_auto_uses_cpu_when_cuda_discovery_raises(self) -> None:
         modules = _install_fake_faster_whisper()
         def failed_probe():
@@ -566,8 +617,9 @@ class InferenceFallbackTests(IsolatedWorkerTestCase):
         def cpu_failure():
             raise RuntimeError("CPU decode failed")
         backend, calls, initialized, _ = self.loaded(self.cuda_failure, cpu_failure)
-        with self.assertRaises(BackendError):
+        with self.assertRaises(BackendError) as caught:
             backend.transcribe(Path("audio.wav"), None)
+        self.assertEqual(caught.exception.code, "transcription_failed")
         self.assertEqual(len(calls), 2)
         self.assertEqual(len(initialized), 2)
         self.assertEqual(backend.device, "cpu")
@@ -592,6 +644,20 @@ class InferenceFallbackTests(IsolatedWorkerTestCase):
                     with self.assertRaises(BackendError) as caught:
                         backend.transcribe(Path("audio.wav"), None)
                 self.assertEqual(caught.exception.code, "cpu_oom")
+                self.assertIs(backend.model, previous)
+                self.assertEqual(backend.device, "cuda")
+                self.assertEqual(len(calls), 1)
+
+    def test_cpu_initialization_error_does_not_inherit_cuda_oom(self):
+        for phase in ["constructor", "warmup"]:
+            with self.subTest(phase=phase):
+                backend, calls, _, _ = self.loaded(self.cuda_failure)
+                previous = backend.model
+                patcher = patch("faster_whisper.WhisperModel", side_effect=RuntimeError("corrupt snapshot")) if phase == "constructor" else patch.object(backend, "_warm_up", side_effect=RuntimeError("invalid CPU configuration"))
+                with patcher:
+                    with self.assertRaises(BackendError) as caught:
+                        backend.transcribe(Path("audio.wav"), None)
+                self.assertEqual(caught.exception.code, "transcription_failed")
                 self.assertIs(backend.model, previous)
                 self.assertEqual(backend.device, "cuda")
                 self.assertEqual(len(calls), 1)

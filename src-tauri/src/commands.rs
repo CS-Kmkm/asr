@@ -170,7 +170,7 @@ pub(crate) fn failed_take_message(
         (TranscriptionFailure::TooLongForModel, None) => TRANSCRIPTION_TOO_LONG_FOR_MODEL,
         (_, Some(storage::FailedTakeRetention::Normal)) => TRANSCRIPTION_FAILED_SAVED_TO_HISTORY,
         (_, Some(storage::FailedTakeRetention::Temporary)) => TRANSCRIPTION_FAILED_KEPT_FOR_RETRY,
-        (_, None) => "Transcription failed. Check model and GPU diagnostics.",
+        (_, None) => "Transcription failed. Check the selected model and Diagnostics.",
     }
 }
 

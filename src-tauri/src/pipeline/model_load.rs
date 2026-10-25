@@ -14,6 +14,7 @@ pub(crate) fn model_load_failure_message(error: &AsrError) -> &'static str {
             "worker_setup_failed" => "Worker setup failed. Check the network, free disk space and write permission, then load the model again.",
             "worker_version_mismatch" | "unsupported_operation" => "The speech worker and app versions do not match. Update the app and run worker setup again.",
             "gpu_oom" | "cuda_oom" => "There is not enough GPU memory to load this model. Choose a smaller model or use faster-whisper on CPU.",
+            "cpu_oom" => "There is not enough system memory to load this model. Close other apps or choose a smaller model.",
             "gpu_unsupported" => "This model requires a supported CUDA GPU. Choose faster-whisper to use the CPU.",
             "backend_unavailable" => "The speech worker is missing required packages. Run worker setup, then try loading again.",
             "unsupported_quantization" => "This model does not support the selected quantization. Choose another quantization in Models.",
@@ -31,6 +32,19 @@ pub(crate) fn model_load_failure_message(error: &AsrError) -> &'static str {
 mod tests {
     use super::*;
     use crate::asr::WorkerError;
+
+    #[test]
+    fn cpu_load_exhaustion_does_not_suggest_gpu_remediation() {
+        let error = AsrError::Worker(WorkerError {
+            code: "cpu_oom".into(),
+            message: "private worker details".into(),
+        });
+        let message = model_load_failure_message(&error);
+        assert!(message.contains("system memory"));
+        assert!(!message.contains("GPU"));
+        assert!(!message.contains("private"));
+        assert!(crate::messages::code(message).is_some());
+    }
 
     #[test]
     fn model_load_failures_are_registered_and_do_not_echo_worker_or_os_details() {
@@ -51,6 +65,7 @@ mod tests {
         errors.extend(
             [
                 "gpu_oom",
+                "cpu_oom",
                 "cuda_oom",
                 "gpu_unsupported",
                 "backend_unavailable",

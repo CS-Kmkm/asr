@@ -1,4 +1,6 @@
 {
+  "There is not enough system memory to load this model. Close other apps or choose a smaller model.": {"code":"model_load_cpu_memory_exhausted","ja":"モデルの読み込みに必要なシステムメモリが不足しています。他のアプリを閉じるか、小さいモデルを選んでください。"},
+  "Transcription failed. Check the selected model and Diagnostics.": {"code":"asr_failed_check_model_and_diagnostics","ja":"文字起こしに失敗しました。選択したモデルと診断画面を確認してください。"},
   "Not enough system memory for speech recognition. Choose a smaller model or a shorter recording.": {"code":"asr_cpu_memory_exhausted","ja":"音声認識に必要なシステムメモリが不足しています。小さいモデルか短い録音でお試しください。"},
   "Not enough system memory for speech recognition. The recording was saved to History. Choose a smaller model before retrying.": {"code":"asr_cpu_memory_history_saved","ja":"音声認識に必要なシステムメモリが不足しています。録音は履歴に保存しました。小さいモデルを選んでから再試行してください。"},
   "Not enough system memory for speech recognition. The recording is kept in History for 24 hours. Choose a smaller model before retrying.": {"code":"asr_cpu_memory_history_temporary","ja":"音声認識に必要なシステムメモリが不足しています。録音は履歴に24時間保持します。小さいモデルを選んでから再試行してください。"},

@@ -2574,7 +2574,7 @@ fn without_keeping_failed_takes_only_history_with_audio_keeps_them() {
         assert_eq!(kept, None, "{settings:?}");
         assert_eq!(
             failed_take_message(kept, TranscriptionFailure::Retryable),
-            "Transcription failed. Check model and GPU diagnostics."
+            "Transcription failed. Check the selected model and Diagnostics."
         );
         assert!(storage
             .list_history(types::HistoryFilter::All, 10)

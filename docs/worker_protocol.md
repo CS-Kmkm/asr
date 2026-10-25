@@ -406,8 +406,8 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
 | `unsupported_quantization` | backends.py(各バックエンドの `load` / `faster_whisper_compute_type`) | `quantization` が許容集合 `{4bit, 8bit, bf16}` 外。 |
 | `unsupported_backend` | backends.py (`create_backend`) | 未知のバックエンド名。プロセス起動時 (`main`) に発生し、終了コード2でワーカーが起動失敗する(この場合プロトコル応答ではなくstderr出力)。 |
 | `backend_unavailable` | backends.py | faster-whisper、VibeVoice、HTTP バックエンドの必要パッケージがない。 |
-| `gpu_oom` | backends.py(例外マッピング / mock) | CPU推論・CPU再試行以外の文脈でメモリ不足を捕捉した。load/transcribe両方で発生しうる。 |
-| `cpu_oom` | backends.py(CPU推論 / CPU再試行の例外マッピング) | CPUでの推論・再試行の初期化やウォームアップ中にメモリ不足を捕捉した。小さいモデルや短い録音で再試行する。 |
+| `gpu_oom` | backends.py(例外マッピング / mock) | CPUロード・CPU推論・CPU再試行以外の文脈で GPU メモリ不足を捕捉した。ホストの割り当て失敗は `cpu_oom`。load/transcribe両方で発生しうる。 |
+| `cpu_oom` | backends.py(ホストメモリの例外マッピング) | CPUロード・推論・再試行中のメモリ不足、または CUDA/VibeVoice を含む処理のホスト割り当て失敗を捕捉した。小さいモデルや他アプリの終了で再試行する。推論中なら短い録音も検討する。 |
 | `invalid_decode_profile` | backends.py(faster-whisper生成時) | 起動時の設定エラー。stderrへ案内し終了コード2で終了する。JSONL応答はない。ASR_WHISPER_DECODE_PROFILEにはstandardかfastを指定する。 |
 | `gpu_unsupported` | backends.py (`VibeVoiceBackend.load`) | CUDA GPUが利用不可、またはモデルがCUDAに配置されなかった(CPUフォールバック無効)。 |
 | `hf_auth_required` | backends.py(例外マッピング) | Hugging Faceのgatedモデル、無効なトークン、または401/403応答によりモデルを取得できない。 |

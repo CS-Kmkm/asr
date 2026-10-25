@@ -247,12 +247,18 @@ def map_backend_exception(exc: BaseException, operation: str, backend_label: str
     details: list[str] = []
     current: BaseException | None = exc
     seen: set[int] = set()
+    host_memory_exhausted = False
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        host_memory_exhausted |= isinstance(current, MemoryError)
         details.extend((type(current).__name__.lower(), str(current).lower()))
-        current = current.__cause__ or current.__context__
+        current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
     diagnostic = "\n".join(details)
 
+    if "cuda" not in diagnostic and (
+        host_memory_exhausted or any(marker in diagnostic for marker in ("bad_alloc", "bad allocation"))
+    ):
+        return BackendError("cpu_oom", "Not enough system memory while operating the ASR model")
     if "out of memory" in diagnostic or "cuda oom" in diagnostic:
         if device == "cpu":
             return BackendError("cpu_oom", "Not enough system memory while operating the ASR model")
@@ -583,6 +589,7 @@ class FasterWhisperBackend(ProgressReporting):
                 "backend_unavailable",
                 "faster-whisper is not installed; install with: pip install faster-whisper",
             ) from exc
+        device: str | None = None
         try:
             import ctranslate2
 
@@ -598,6 +605,7 @@ class FasterWhisperBackend(ProgressReporting):
             compute_type = faster_whisper_compute_type(quantization, cuda=cuda)
             model_source = self._resolve_model_files()
             self.report_progress("load")
+            retry_on_cpu = False
             try:
                 self.model = WhisperModel(model_source, device=device, compute_type=compute_type)
                 self._warm_up()
@@ -607,6 +615,10 @@ class FasterWhisperBackend(ProgressReporting):
                 log_exception(exc, "load")
                 # CUDA libraries can be missing even when a driver reports a
                 # device. Exercise kernels before declaring the model ready.
+                retry_on_cpu = True
+            # Leave the CUDA exception handler before CPU work so an unrelated
+            # CPU failure does not inherit the earlier CUDA OOM as context.
+            if retry_on_cpu:
                 self.model = None
                 gc.collect()
                 self.report_progress("cpu_fallback")
@@ -623,7 +635,7 @@ class FasterWhisperBackend(ProgressReporting):
             self.model = None
             self.device = None
             self.compute_type = None
-            raise map_backend_exception(exc, "load", "faster-whisper") from exc
+            raise map_backend_exception(exc, "load", "faster-whisper", device=device) from exc
 
     def _warm_up(self) -> None:
         import numpy as np
@@ -729,7 +741,8 @@ class FasterWhisperBackend(ProgressReporting):
                     # Restart only before publishing any segment: consumers must
                     # never receive duplicated/mixed GPU and CPU output.
                     log_exception(exc, "transcribe")
-                    self._retry_on_cpu()
+                # No active CUDA exception context may contaminate CPU errors.
+                self._retry_on_cpu()
         except GeneratorExit:
             # A consumer stopped reading; that is not a transcription failure.
             raise
@@ -751,7 +764,7 @@ class FasterWhisperBackend(ProgressReporting):
                 "cuda", "cudnn", "cublas", "curand", "nvrtc", "nvcuda", "out of memory",
             )):
                 return True
-            current = current.__cause__ or current.__context__
+            current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
         return False
 
     def _retry_on_cpu(self) -> None:
