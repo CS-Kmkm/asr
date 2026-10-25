@@ -408,6 +408,7 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
 | `backend_unavailable` | backends.py | faster-whisper、VibeVoice、HTTP バックエンドの必要パッケージがない。 |
 | `gpu_oom` | backends.py(例外マッピング / mock) | CPU推論・CPU再試行以外の文脈でメモリ不足を捕捉した。load/transcribe両方で発生しうる。 |
 | `cpu_oom` | backends.py(CPU推論 / CPU再試行の例外マッピング) | CPUでの推論・再試行の初期化やウォームアップ中にメモリ不足を捕捉した。小さいモデルや短い録音で再試行する。 |
+| `invalid_decode_profile` | backends.py(faster-whisper生成時) | 起動時の設定エラー。stderrへ案内し終了コード2で終了する。JSONL応答はない。ASR_WHISPER_DECODE_PROFILEにはstandardかfastを指定する。 |
 | `gpu_unsupported` | backends.py (`VibeVoiceBackend.load`) | CUDA GPUが利用不可、またはモデルがCUDAに配置されなかった(CPUフォールバック無効)。 |
 | `hf_auth_required` | backends.py(例外マッピング) | Hugging Faceのgatedモデル、無効なトークン、または401/403応答によりモデルを取得できない。 |
 | `hf_repository_unavailable` | backends.py(例外マッピング) | Hugging FaceのモデルIDが存在しない、またはprivateモデルへの読取権限がない。 |

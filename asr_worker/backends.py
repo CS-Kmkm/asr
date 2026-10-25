@@ -569,6 +569,9 @@ class FasterWhisperBackend(ProgressReporting):
             raise BackendError("invalid_device", "ASR_DEVICE must be auto, cpu, or cuda")
         self.device: str | None = None
         self._model_source: str | None = None
+        self.decode_profile = os.environ.get("ASR_WHISPER_DECODE_PROFILE", "standard").strip().lower()
+        if self.decode_profile not in {"standard", "fast"}:
+            raise BackendError("invalid_decode_profile", "ASR_WHISPER_DECODE_PROFILE must be standard or fast")
 
     def load(self, quantization: str) -> None:
         if quantization not in QUANTIZATIONS:
@@ -702,6 +705,7 @@ class FasterWhisperBackend(ProgressReporting):
                         # Whisper accepts an ISO 639 language, not a regional BCP 47 tag.
                         language=language.split("-", 1)[0] if language else None,
                         hotwords=prompt if prompt else None,
+                        **({"beam_size": 1, "vad_filter": True} if self.decode_profile == "fast" else {}),
                     )
                     for segment in raw_segments:
                         self.raise_if_cancelled()

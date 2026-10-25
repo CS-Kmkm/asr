@@ -325,6 +325,7 @@ def run_transcribe_loop(
     audio_paths: list[Path],
     repeat: int,
     prompt: list[str] | None,
+    record_device: bool = False,
 ) -> list[dict[str, Any]]:
     """Run `repeat` transcriptions per audio file, return per-call records."""
     records: list[dict[str, Any]] = []
@@ -342,6 +343,13 @@ def run_transcribe_loop(
                     "text": response.get("text", ""),
                 }
             )
+            if record_device:
+                # Query after every inference: auto can switch device during a
+                # request. Health overhead is excluded from that request's timer.
+                response, _ = session.request({"command": "health"})
+                health = response.get("health", {})
+                records[-1]["device"] = health.get("device")
+                records[-1]["compute_type"] = health.get("computeType")
     return records
 
 
@@ -352,6 +360,12 @@ def worker_env(args: argparse.Namespace) -> dict[str, str]:
     # A piped Python stderr uses the Windows ANSI code page (cp932 on Japanese
     # systems); UTF-8 keeps warnings and tracebacks readable in failure reports.
     env.setdefault("PYTHONIOENCODING", "utf-8")
+    profile = getattr(args, "whisper_profile", "standard")
+    if args.backend == "faster-whisper":
+        # An explicit profile prevents ambient settings from contaminating A/B runs.
+        env["ASR_WHISPER_DECODE_PROFILE"] = profile
+    elif profile != "standard":
+        raise BenchError("--whisper-profile fast requires --backend faster-whisper")
     return env
 
 
@@ -372,7 +386,7 @@ def run_benchmark(args: argparse.Namespace, audio_paths: list[Path]) -> dict[str
             cold_load_ms.append(load_wall_ms)
             # One transcription per audio file counts as the "cold path"
             # (process start + load + first transcription).
-            cold_records.extend(run_transcribe_loop(session, audio_paths, 1, args.prompt))
+            cold_records.extend(run_transcribe_loop(session, audio_paths, 1, args.prompt, getattr(args, "record_device", False)))
             if cold_i == 0:
                 model_name = load_resp.get("model", "?")
 
@@ -382,11 +396,14 @@ def run_benchmark(args: argparse.Namespace, audio_paths: list[Path]) -> dict[str
             {"command": "load", "quantization": args.quantization}
         )
         model_name = warm_load_resp.get("model", "?")
-        warm_records = run_transcribe_loop(session, audio_paths, args.repeat, args.prompt)
+        warm_records = run_transcribe_loop(session, audio_paths, args.repeat, args.prompt, getattr(args, "record_device", False))
 
     return {
         "config": {
             "backend": args.backend,
+            "whisper_decode_profile": env.get("ASR_WHISPER_DECODE_PROFILE") if args.backend == "faster-whisper" else None,
+            "device_policy": env.get("ASR_DEVICE", "auto"),
+            "record_device": getattr(args, "record_device", False),
             "quantization": args.quantization,
             "worker_cmd": cmd,
             "audio": [str(p) for p in audio_paths],
@@ -475,6 +492,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--backend", default="mock", help="worker backend (default: mock)")
     parser.add_argument("--quantization", default="4bit", help="model quantization (default: 4bit)")
+    parser.add_argument("--whisper-profile", choices=["standard", "fast"], default="standard", help="faster-whisper decode profile; fast uses beam_size=1 and VAD (experimental, default: standard)")
     parser.add_argument(
         "--audio",
         action="append",
@@ -509,6 +527,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         help=f"per-request timeout in seconds (default: {DEFAULT_TIMEOUT_S:.0f})",
     )
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a markdown summary")
+    parser.add_argument("--output", metavar="PATH", help="write UTF-8 results to a new file; existing files are never overwritten")
+    parser.add_argument("--record-device", action="store_true", help="query worker health after every transcription and record actual device/compute type (requires health support)")
     parser.add_argument(
         "--smoke",
         action="store_true",
@@ -522,6 +542,13 @@ def main(argv: list[str] | None = None) -> int:
     args.prompt = args.prompt or None
 
     try:
+        if args.output:
+            try:
+                # Reserve the destination before any model work. Exclusive
+                # creation also closes the check/write race against another run.
+                args.output_stream = Path(args.output).open("x", encoding="utf-8", newline="\n")
+            except OSError as exc:
+                raise BenchError("could not create a new result file; check its path and permissions") from exc
         if args.smoke:
             with tempfile.TemporaryDirectory(prefix="bench_asr_smoke_") as tmp:
                 wav_path = Path(tmp) / "smoke_sine.wav"
@@ -560,13 +587,32 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("[bench_asr] interrupted", file=sys.stderr)
         return 130
+    finally:
+        stream = getattr(args, "output_stream", None)
+        if stream is not None:
+            with contextlib.suppress(OSError):
+                stream.close()
 
 
 def _emit(result: dict[str, Any], args: argparse.Namespace) -> None:
-    if args.json:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+    rendered = json.dumps(result, ensure_ascii=False, indent=2) if args.json else render_markdown(result)
+    output = getattr(args, "output", None)
+    if output:
+        try:
+            reserved = getattr(args, "output_stream", None)
+            if reserved is not None:
+                reserved.write(rendered + "\n")
+                reserved.flush()
+            else:
+                with Path(output).open("x", encoding="utf-8", newline="\n") as stream:
+                    stream.write(rendered + "\n")
+        except OSError as exc:
+            # Preserve measured output on stdout if storage fails mid-run.
+            if getattr(args, "output_stream", None) is not None:
+                print(rendered)
+            raise BenchError("could not create a new result file; check its path and permissions") from exc
     else:
-        print(render_markdown(result))
+        print(rendered)
 
 
 if __name__ == "__main__":

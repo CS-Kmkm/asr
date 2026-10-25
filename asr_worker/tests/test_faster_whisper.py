@@ -159,6 +159,7 @@ class _FakeWhisperModel:
             "audio_path": audio_path,
             "language": language,
             "hotwords": hotwords,
+            **kwargs,
         }
         segments = [
             _FakeSegment(0.0, 1.5, " Hello"),
@@ -419,6 +420,28 @@ class TranscribeWithFakeModuleTests(IsolatedWorkerTestCase):
             backend.transcribe(Path("audio.wav"), None)
         self.assertIsNone(_FakeWhisperModel.last_transcribe_kwargs["hotwords"])
 
+    def test_fast_profile_is_explicit_and_standard_keeps_library_decode_defaults(self):
+        for profile in ["standard", "fast"]:
+            with self.subTest(profile=profile), patch.dict(os.environ, {"ASR_WHISPER_DECODE_PROFILE": profile}), patch.dict(sys.modules, _install_fake_faster_whisper()):
+                backend = FasterWhisperBackend()
+                backend.load("4bit")
+                backend.transcribe(Path("audio.wav"), "dictionary", "ja-JP")
+                options = _FakeWhisperModel.last_transcribe_kwargs
+                self.assertEqual(options["language"], "ja")
+                self.assertEqual(options["hotwords"], "dictionary")
+                if profile == "fast":
+                    self.assertEqual(options["beam_size"], 1)
+                    self.assertTrue(options["vad_filter"])
+                else:
+                    self.assertNotIn("beam_size", options)
+                    self.assertNotIn("vad_filter", options)
+
+    def test_unknown_decode_profile_is_rejected_before_loading(self):
+        with patch.dict(os.environ, {"ASR_WHISPER_DECODE_PROFILE": "unknown"}):
+            with self.assertRaises(BackendError) as caught:
+                FasterWhisperBackend()
+        self.assertEqual(caught.exception.code, "invalid_decode_profile")
+
     def test_regional_locale_uses_supported_base_language(self) -> None:
         backend = FasterWhisperBackend()
         with patch.dict(sys.modules, _install_fake_faster_whisper()):
@@ -492,6 +515,14 @@ class InferenceFallbackTests(IsolatedWorkerTestCase):
         self.assertEqual(backend.transcribe(Path("audio.wav"), None)[0], "CPU result")
         self.assertEqual(len(calls), 2)
         self.assertEqual(len(initialized), 2)
+
+    def test_fast_options_survive_the_cpu_inference_retry(self):
+        with patch.dict(os.environ, {"ASR_WHISPER_DECODE_PROFILE": "fast"}):
+            backend, calls, _, _ = self.loaded(self.cuda_failure)
+        backend.transcribe(Path("audio.wav"), "dictionary", "ja-JP")
+        self.assertEqual([call[0] for call in calls], ["cuda", "cpu"])
+        self.assertTrue(all(call[2]["beam_size"] == 1 and call[2]["vad_filter"] for call in calls))
+        self.assertEqual(calls[0][1:], calls[1][1:])
 
     def test_failure_after_publishing_a_segment_never_mixes_in_cpu_output(self):
         def partial_failure():
