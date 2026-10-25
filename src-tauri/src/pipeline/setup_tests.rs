@@ -3,7 +3,7 @@ use super::{PipelineContext, RecordedTake};
 use crate::{
     commands::{commit_dictation_output, report_clipboard_not_restored, CommittedOutput},
     emit_stage, emit_state,
-    injection::{InsertResult, SystemTextInjector, TextInjector},
+    injection::{InjectionError, InsertResult, SystemTextInjector, TextInjector},
     live_dictation::LiveDraft,
     recording_overlay,
     state::{AppState, TerminalPhaseGuard},
@@ -71,11 +71,27 @@ fn insertion_message(result: InsertResult) -> &'static str {
     }
 }
 
+const CLIPBOARD_PROTECTED: &str = "Insertion test stopped because your clipboard could not be saved for restoring. Copy a short plain-text sample and try again. Your clipboard was left unchanged.";
+const CLIPBOARD_BUSY: &str = "Insertion test could not access the clipboard. Close any clipboard menu and try again.";
+
+fn injection_failure_message(error: InjectionError) -> &'static str {
+    match error {
+        InjectionError::ClipboardProtected | InjectionError::ClipboardUnpreservable => {
+            CLIPBOARD_PROTECTED
+        }
+        InjectionError::ClipboardUnavailable => CLIPBOARD_BUSY,
+        _ => "Insertion test failed. Choose an editable field in another app and try again.",
+    }
+}
+
 fn insertion_failure_message(error: &str) -> &'static str {
-    if error == "Choose another app for the insertion test." {
-        "Choose another app for the insertion test."
-    } else {
-        "Insertion test failed. Choose an editable field in another app and try again."
+    match error {
+        "Choose another app for the insertion test." => {
+            "Choose another app for the insertion test."
+        }
+        CLIPBOARD_PROTECTED => CLIPBOARD_PROTECTED,
+        CLIPBOARD_BUSY => CLIPBOARD_BUSY,
+        _ => "Insertion test failed. Choose an editable field in another app and try again.",
     }
 }
 
@@ -156,7 +172,9 @@ pub(crate) async fn run_insertion(app: AppHandle, id: u64, cancel: watch::Receiv
                 report_clipboard_not_restored(&commit_app);
             }
             match result {
-                CommittedOutput::Ran(result) => result.map_err(crate::command_error),
+                CommittedOutput::Ran(result) => {
+                    result.map_err(|error| injection_failure_message(error).to_owned())
+                }
                 CommittedOutput::Cancelled => Err("Setup test cancelled.".into()),
                 CommittedOutput::Refused(error) => Err(error.into()),
             }
@@ -235,6 +253,20 @@ mod tests {
             let message = insertion_failure_message(error);
             assert!(crate::messages::code(message).is_some());
             assert!(!message.contains("sentinel"));
+        }
+    }
+
+    #[test]
+    fn clipboard_setup_failures_keep_specific_registered_remediation() {
+        for (error, expected) in [
+            (InjectionError::ClipboardProtected, CLIPBOARD_PROTECTED),
+            (InjectionError::ClipboardUnpreservable, CLIPBOARD_PROTECTED),
+            (InjectionError::ClipboardUnavailable, CLIPBOARD_BUSY),
+        ] {
+            let message = injection_failure_message(error);
+            assert_eq!(message, expected);
+            assert_eq!(insertion_failure_message(message), expected);
+            assert!(crate::messages::code(message).is_some());
         }
     }
 }

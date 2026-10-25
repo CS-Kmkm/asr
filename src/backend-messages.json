@@ -1,4 +1,7 @@
 {
+  "Insertion test stopped because your clipboard could not be saved for restoring. Copy a short plain-text sample and try again. Your clipboard was left unchanged.": {"code":"setup_clipboard_restore_protected","ja":"復元用にクリップボードを保存できなかったため、文字挿入テストを中止しました。短い文字列をコピーして、もう一度お試しください。クリップボードは変更していません。"},
+  "Insertion test could not access the clipboard. Close any clipboard menu and try again.": {"code":"setup_clipboard_busy","ja":"クリップボードにアクセスできませんでした。クリップボードのメニューなどを閉じて、文字挿入テストをやり直してください。"},
+  "local operation failed: the clipboard was left unchanged because it could not be saved for restoring": {"code":"clipboard_restore_protected_legacy","ja":"復元用にクリップボードを保存できなかったため、処理を中止しました。クリップボードは変更していません。"},
   "There is not enough system memory to load this model. Close other apps or choose a smaller model.": {"code":"model_load_cpu_memory_exhausted","ja":"モデルの読み込みに必要なシステムメモリが不足しています。他のアプリを閉じるか、小さいモデルを選んでください。"},
   "Transcription failed. Check the selected model and Diagnostics.": {"code":"asr_failed_check_model_and_diagnostics","ja":"文字起こしに失敗しました。選択したモデルと診断画面を確認してください。"},
   "Not enough system memory for speech recognition. Choose a smaller model or a shorter recording.": {"code":"asr_cpu_memory_exhausted","ja":"音声認識に必要なシステムメモリが不足しています。小さいモデルか短い録音でお試しください。"},
