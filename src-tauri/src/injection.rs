@@ -4,6 +4,7 @@
 use crate::input_monitor::InputMonitor;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use tokio::sync::watch;
 
 #[cfg(all(test, target_os = "windows"))]
@@ -628,6 +629,18 @@ struct TextProbe {
     complete: bool,
 }
 const TEXT_PROBE_UNITS: i32 = 4096;
+
+fn with_verification_deadline<T>(deadline: Instant, run: impl FnOnce() -> T) -> T {
+    #[cfg(target_os = "windows")]
+    {
+        accessibility::with_deadline(deadline, run)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = deadline;
+        run()
+    }
+}
 fn normalize_text(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }

@@ -2,6 +2,7 @@ use super::*;
 use tokio::sync::watch;
 
 const VERIFY_ATTEMPTS: usize = 50;
+const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GuardMoment {
@@ -272,34 +273,55 @@ fn select_verified<B: Backend>(
     let Some(selected) = before.select_recent(text) else {
         return Selection::NotRequested;
     };
-    if !safe(backend, target, activity, SafetyPolicy::Destructive)
-        || !backend
-            .target_text(target)
-            .is_ok_and(|actual| actual.same_content(before))
-        || !backend.select_recent(target, before, text).unwrap_or(false)
-    {
-        return Selection::NotRequested;
+    let request = with_verification_deadline(Instant::now() + VERIFY_TIMEOUT, || {
+        if !safe(backend, target, activity, SafetyPolicy::Destructive)
+            || !backend
+                .target_text(target)
+                .is_ok_and(|actual| actual.same_content(before))
+        {
+            return Ok(false);
+        }
+        backend.select_recent(target, before, text)
+    });
+    match request {
+        Ok(false) => return Selection::NotRequested,
+        // Select may already have reached the provider when its reply times out.
+        Err(_) => return Selection::Unconfirmed(selected),
+        Ok(true) => {}
     }
-    for attempt in 0..=VERIFY_ATTEMPTS {
-        if attempt > 0 {
-            backend.wait_for_target();
+    // Confirmation has its own bounded stage after the request. A slow Select
+    // must not consume the time reserved for observing an asynchronous change.
+    let deadline = Instant::now() + VERIFY_TIMEOUT;
+    with_verification_deadline(deadline, || {
+        for attempt in 0..=VERIFY_ATTEMPTS {
+            if Instant::now() >= deadline {
+                break;
+            }
+            if attempt > 0 {
+                backend.wait_for_target();
+            }
+            if Instant::now() >= deadline
+                || !safe(backend, target, activity, SafetyPolicy::Destructive)
+            {
+                return Selection::Unconfirmed(selected);
+            }
+            if Instant::now() >= deadline {
+                return Selection::Unconfirmed(selected);
+            }
+            let Ok(actual) = backend.target_text(target) else {
+                return Selection::Unconfirmed(selected);
+            };
+            if actual.same_content(&selected) {
+                return Selection::Confirmed(selected);
+            }
+            // Only the unchanged caret state may precede the requested selection.
+            // An unrelated edit or selection must never authorize replacement.
+            if !actual.same_content(before) {
+                return Selection::Unconfirmed(selected);
+            }
         }
-        if !safe(backend, target, activity, SafetyPolicy::Destructive) {
-            return Selection::Unconfirmed(selected);
-        }
-        let Ok(actual) = backend.target_text(target) else {
-            return Selection::Unconfirmed(selected);
-        };
-        if actual.same_content(&selected) {
-            return Selection::Confirmed(selected);
-        }
-        // Only the unchanged caret state may precede the requested selection.
-        // An unrelated edit or selection must never authorize replacement.
-        if !actual.same_content(before) {
-            return Selection::Unconfirmed(selected);
-        }
-    }
-    Selection::Unconfirmed(selected)
+        Selection::Unconfirmed(selected)
+    })
 }
 
 /// Returns a selection this module requested to a caret at its end, where
@@ -478,70 +500,107 @@ fn paste<B: Backend>(
         return clipboard.copy(text);
     }
     clipboard.keep();
-    let expected = before.replaced_with(text);
-    // Exact matches need no scan. Proxy confirmation builds its matcher and
-    // scans the unchanged baseline lazily once, rather than on every poll.
-    let evidence = std::cell::OnceCell::new();
-    let probe_needle = std::cell::OnceCell::new();
-    let mut probe_enabled = policy != SafetyPolicy::Destructive
-        && before.selected.is_empty()
-        && text
-            .encode_utf16()
-            .take(TEXT_PROBE_UNITS as usize + 1)
-            .count()
-            <= TEXT_PROBE_UNITS as usize
-        && !text.trim().is_empty();
-    for attempt in 0..=VERIFY_ATTEMPTS {
-        if attempt > 0 {
-            backend.wait_for_target();
-        }
-        if cancel.is_some_and(|receiver| *receiver.borrow())
-            || !safe_after_injected_paste(backend, target, activity, policy)
-        {
-            break;
-        }
-        let confirmed = if probe_enabled {
-            match backend.target_text_probe(target) {
-                Ok(Some(probe)) if probe.complete && probe.state.same_content(&expected) => {
-                    Some(true)
-                }
-                Ok(Some(probe)) => {
-                    let inserted =
-                        probe_needle.get_or_init(|| normalize_text(text).trim().to_owned());
-                    let decision =
-                        probe_confirmation(&probe, before, &expected, inserted, &evidence);
-                    if decision.is_none() {
-                        probe_enabled = false;
-                    }
-                    decision
-                }
-                // Unsupported, noncaret, truncated, timed-out or ambiguous
-                // probes cost at most one attempt before using the old reader.
-                _ => {
-                    probe_enabled = false;
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        if confirmed.unwrap_or_else(|| {
-            backend.target_text(target).is_ok_and(|actual| {
-                actual.same_content(&expected)
-                    || (policy != SafetyPolicy::Destructive
-                        && evidence
-                            .get_or_init(|| InsertedTextEvidence::new(before, text))
-                            .as_ref()
-                            .is_some_and(|evidence| evidence.confirms(&actual)))
-            })
-        }) {
-            // Restoration failure cannot undo a confirmed edit and must never
-            // initiate a second insertion; it is reported instead.
-            clipboard.restore();
-            return Ok(InsertResult::ClipboardPaste);
-        }
+    if verify_paste(
+        backend,
+        target,
+        before,
+        text,
+        activity,
+        policy,
+        cancel,
+        Instant::now() + VERIFY_TIMEOUT,
+    ) {
+        // Restoration failure cannot undo a confirmed edit or initiate a retry.
+        clipboard.restore();
+        return Ok(InsertResult::ClipboardPaste);
     }
     Ok(InsertResult::PasteUnverified)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_paste<B: Backend>(
+    backend: &B,
+    target: &TargetWindow,
+    before: &TargetText,
+    text: &str,
+    activity: Option<(&InputMonitor, u64)>,
+    policy: SafetyPolicy,
+    cancel: Option<&watch::Receiver<bool>>,
+    deadline: Instant,
+) -> bool {
+    with_verification_deadline(deadline, || {
+        let expected = before.replaced_with(text);
+        // Exact matches need no scan. Proxy confirmation builds its matcher and
+        // scans the unchanged baseline lazily once, rather than on every poll.
+        let evidence = std::cell::OnceCell::new();
+        let probe_needle = std::cell::OnceCell::new();
+        let mut probe_enabled = policy != SafetyPolicy::Destructive
+            && before.selected.is_empty()
+            && text
+                .encode_utf16()
+                .take(TEXT_PROBE_UNITS as usize + 1)
+                .count()
+                <= TEXT_PROBE_UNITS as usize
+            && !text.trim().is_empty();
+        for attempt in 0..=VERIFY_ATTEMPTS {
+            if Instant::now() >= deadline {
+                break;
+            }
+            if attempt > 0 {
+                backend.wait_for_target();
+            }
+            if Instant::now() >= deadline
+                || cancel.is_some_and(|receiver| *receiver.borrow())
+                || !safe_after_injected_paste(backend, target, activity, policy)
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            let confirmed = if probe_enabled {
+                match backend.target_text_probe(target) {
+                    Ok(Some(probe)) if probe.complete && probe.state.same_content(&expected) => {
+                        Some(true)
+                    }
+                    Ok(Some(probe)) => {
+                        let inserted =
+                            probe_needle.get_or_init(|| normalize_text(text).trim().to_owned());
+                        let decision =
+                            probe_confirmation(&probe, before, &expected, inserted, &evidence);
+                        if decision.is_none() {
+                            probe_enabled = false;
+                        }
+                        decision
+                    }
+                    // Unsupported, noncaret, truncated, timed-out or ambiguous
+                    // probes cost at most one attempt before using the old reader.
+                    _ => {
+                        probe_enabled = false;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            if confirmed.unwrap_or_else(|| {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                backend.target_text(target).is_ok_and(|actual| {
+                    actual.same_content(&expected)
+                        || (policy != SafetyPolicy::Destructive
+                            && evidence
+                                .get_or_init(|| InsertedTextEvidence::new(before, text))
+                                .as_ref()
+                                .is_some_and(|evidence| evidence.confirms(&actual)))
+                })
+            }) {
+                return true;
+            }
+        }
+        false
+    })
 }
 
 fn paste_unverified<B: Backend>(
@@ -1068,31 +1127,42 @@ pub(super) fn retract<B: Backend>(
         return Ok(session.result);
     }
     let expected = selected.replaced_with("");
-    for attempt in 0..=VERIFY_ATTEMPTS {
-        if attempt > 0 {
-            backend.wait_for_target();
+    let deadline = Instant::now() + VERIFY_TIMEOUT;
+    with_verification_deadline(deadline, || {
+        for attempt in 0..=VERIFY_ATTEMPTS {
+            if Instant::now() >= deadline {
+                break;
+            }
+            if attempt > 0 {
+                backend.wait_for_target();
+            }
+            if Instant::now() >= deadline
+                || !safe(
+                    backend,
+                    &session.target,
+                    activity,
+                    SafetyPolicy::Destructive,
+                )
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            if backend
+                .target_text(&session.target)
+                .is_ok_and(|actual| actual.same_content(&expected))
+            {
+                session.displayed.clear();
+                session.replacement = Some(ReplacementRange {
+                    after: expected,
+                    checkpoint,
+                });
+                session.result = InsertResult::ClipboardPaste;
+                break;
+            }
         }
-        if !safe(
-            backend,
-            &session.target,
-            activity,
-            SafetyPolicy::Destructive,
-        ) {
-            break;
-        }
-        if backend
-            .target_text(&session.target)
-            .is_ok_and(|actual| actual.same_content(&expected))
-        {
-            session.displayed.clear();
-            session.replacement = Some(ReplacementRange {
-                after: expected,
-                checkpoint,
-            });
-            session.result = InsertResult::ClipboardPaste;
-            break;
-        }
-    }
+    });
     Ok(session.result)
 }
 
@@ -1550,11 +1620,14 @@ pub(super) mod tests {
         pending: RefCell<Option<String>>,
         pending_selection: RefCell<Option<TargetText>>,
         selection_settle_after: usize,
+        selection_request_delay: std::time::Duration,
+        selection_request_fails: bool,
         selection_waits: Cell<usize>,
         on_selection_wait: Option<MockHook>,
         exclusions: RefCell<Vec<ClipboardExclusion>>,
         settle_after: usize,
         waits: Cell<usize>,
+        wait_delay: std::time::Duration,
         change_clipboard_on_paste: bool,
         change_identity_on_paste: bool,
         on_paste: Option<Box<dyn Fn() + Send>>,
@@ -1598,11 +1671,14 @@ pub(super) mod tests {
                 pending: RefCell::new(None),
                 pending_selection: RefCell::new(None),
                 selection_settle_after: 0,
+                selection_request_delay: std::time::Duration::ZERO,
+                selection_request_fails: false,
                 selection_waits: Cell::new(0),
                 on_selection_wait: None,
                 exclusions: RefCell::new(Vec::new()),
                 settle_after: 0,
                 waits: Cell::new(0),
+                wait_delay: std::time::Duration::ZERO,
                 change_clipboard_on_paste: false,
                 change_identity_on_paste: false,
                 on_paste: None,
@@ -1695,6 +1771,7 @@ pub(super) mod tests {
             text: &str,
         ) -> Result<bool, InjectionError> {
             self.calls.borrow_mut().push("select");
+            std::thread::sleep(self.selection_request_delay);
             let Some(selected) = state.select_recent(text) else {
                 return Ok(false);
             };
@@ -1703,7 +1780,13 @@ pub(super) mod tests {
             } else {
                 *self.pending_selection.borrow_mut() = Some(selected);
             }
-            Ok(true)
+            if self.selection_request_fails {
+                Err(InjectionError::BackendFailure(
+                    "selection reply unavailable",
+                ))
+            } else {
+                Ok(true)
+            }
         }
         fn clipboard_snapshot(&self) -> Result<Self::Clipboard, InjectionError> {
             if let Some(on_snapshot) = &self.on_snapshot {
@@ -1805,6 +1888,9 @@ pub(super) mod tests {
             self.not_restored.set(self.not_restored.get() + 1);
         }
         fn wait_for_target(&self) {
+            if !self.wait_delay.is_zero() {
+                std::thread::sleep(self.wait_delay);
+            }
             if self.pending_selection.borrow().is_some() {
                 self.selection_waits.set(self.selection_waits.get() + 1);
                 if self.selection_waits.get() == 1 {
@@ -2938,6 +3024,85 @@ pub(super) mod tests {
             selected: String::new(),
             after: after.into(),
         }
+    }
+
+    #[test]
+    fn slow_selection_request_keeps_a_separate_confirmation_window() {
+        let mut backend = MockBackend::new();
+        backend.text.borrow_mut().before = "prefix draft".into();
+        let before = backend.text.borrow().clone();
+        backend.selection_request_delay = VERIFY_TIMEOUT + std::time::Duration::from_millis(20);
+        backend.selection_settle_after = 1;
+        assert!(matches!(
+            select_verified(&backend, &target(), &before, "draft", None),
+            Selection::Confirmed(_)
+        ));
+        assert_eq!(backend.selection_waits.get(), 1);
+    }
+
+    #[test]
+    fn uncertain_selection_reply_keeps_cleanup_ownership() {
+        let mut backend = MockBackend::new();
+        backend.text.borrow_mut().before = "prefix draft".into();
+        let before = backend.text.borrow().clone();
+        backend.selection_request_fails = true;
+        let Selection::Unconfirmed(requested) =
+            select_verified(&backend, &target(), &before, "draft", None)
+        else {
+            panic!("uncertain reply must retain the requested selection");
+        };
+        collapse_selected(&backend, &target(), &requested);
+        assert_eq!(calls(&backend, "collapse"), 1);
+        assert_eq!(backend.content(), "prefix draft suffix");
+        assert!(backend.text.borrow().selected.is_empty());
+    }
+
+    #[test]
+    fn expired_paste_confirmation_keeps_payload_without_a_second_paste() {
+        let mut backend = MockBackend::new();
+        backend.settle_after = VERIFY_ATTEMPTS + 1;
+        backend.wait_delay = VERIFY_TIMEOUT + std::time::Duration::from_millis(20);
+        assert_eq!(
+            insert(&backend, InjectionOptions::default(), "pending", &target()).unwrap(),
+            InsertResult::PasteUnverified
+        );
+        assert_eq!(calls(&backend, "paste"), 1);
+        assert_eq!(calls(&backend, "restore"), 0);
+        assert_eq!(&*backend.clipboard.borrow(), "pending");
+        assert_eq!(backend.waits.get(), 1);
+    }
+
+    #[test]
+    fn verification_deadline_stops_expired_and_slow_polling_without_more_reads() {
+        let mut backend = MockBackend::new();
+        let before = backend.text.borrow().clone();
+        assert!(!verify_paste(
+            &backend,
+            &target(),
+            &before,
+            "novel text",
+            None,
+            SafetyPolicy::Additive,
+            None,
+            Instant::now()
+        ));
+        assert_eq!(backend.text_reads.get(), 0);
+        assert_eq!(backend.probe_reads.get(), 0);
+        backend.wait_delay = std::time::Duration::from_millis(30);
+        assert!(!verify_paste(
+            &backend,
+            &target(),
+            &before,
+            "novel text",
+            None,
+            SafetyPolicy::Additive,
+            None,
+            Instant::now() + std::time::Duration::from_millis(10)
+        ));
+        assert!(backend.waits.get() <= 1);
+        assert!(backend.text_reads.get() <= 1);
+        assert_eq!(calls(&backend, "paste"), 0);
+        assert!(!backend.calls.borrow().contains(&"restore"));
     }
 
     #[test]

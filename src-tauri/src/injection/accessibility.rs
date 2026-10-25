@@ -1,6 +1,7 @@
 use super::{
     normalize_text, InjectionError, TargetText, TargetWindow, TextProbe, TEXT_PROBE_UNITS,
 };
+use std::cell::Cell;
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Win32::System::Com::{
@@ -18,6 +19,32 @@ use windows::Win32::UI::Accessibility::{
 
 const MAX_TEXT_UNITS: i32 = 1_048_576;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
+
+thread_local! {
+    static QUERY_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// Scope all synchronous guard/text queries on this caller to one deadline.
+/// Nested work can shorten a deadline but cannot extend its parent's budget.
+pub(super) fn with_deadline<T>(deadline: Instant, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Instant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            QUERY_DEADLINE.with(|slot| slot.set(self.0));
+        }
+    }
+    let previous = QUERY_DEADLINE.with(|slot| {
+        slot.replace(Some(
+            slot.get().map_or(deadline, |outer| outer.min(deadline)),
+        ))
+    });
+    let _restore = Restore(previous);
+    run()
+}
+
+fn bounded_deadline(default: Instant) -> Instant {
+    QUERY_DEADLINE.with(|slot| slot.get().map_or(default, |deadline| default.min(deadline)))
+}
 type Job = Box<dyn FnOnce(&IUIAutomation2, Instant) + Send>;
 struct Worker {
     sender: mpsc::SyncSender<Job>,
@@ -52,7 +79,10 @@ fn dispatch<T: Send + 'static>(
     run: impl FnOnce(&IUIAutomation2, Instant) -> Result<T, InjectionError> + Send + 'static,
 ) -> Result<T, InjectionError> {
     static WORKER: OnceLock<Mutex<Option<Arc<Worker>>>> = OnceLock::new();
-    let deadline = Instant::now() + OPERATION_TIMEOUT;
+    let deadline = bounded_deadline(Instant::now() + OPERATION_TIMEOUT);
+    if Instant::now() >= deadline {
+        return Err(unavailable());
+    }
     let slot = WORKER.get_or_init(|| Mutex::new(None));
     let mut held = slot.lock().map_err(|_| unavailable())?;
     if held.is_none() {
@@ -600,6 +630,36 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     static WORKER_TEST: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn deadline_scopes_only_shorten_and_restore_after_nested_work_or_panic() {
+        let ordinary = Instant::now() + Duration::from_secs(60);
+        let outer = Instant::now() + Duration::from_secs(2);
+        let inner = Instant::now() + Duration::from_secs(1);
+        assert_eq!(bounded_deadline(ordinary), ordinary);
+        with_deadline(outer, || {
+            assert_eq!(bounded_deadline(ordinary), outer);
+            with_deadline(ordinary, || assert_eq!(bounded_deadline(ordinary), outer));
+            with_deadline(inner, || assert_eq!(bounded_deadline(ordinary), inner));
+            assert_eq!(bounded_deadline(ordinary), outer);
+            let _ = std::panic::catch_unwind(|| {
+                with_deadline(inner, || panic!("deadline scope unwind"))
+            });
+            assert_eq!(bounded_deadline(ordinary), outer);
+            std::thread::spawn(move || assert_eq!(bounded_deadline(ordinary), ordinary))
+                .join()
+                .unwrap();
+        });
+        assert_eq!(bounded_deadline(ordinary), ordinary);
+    }
+
+    #[test]
+    fn expired_budget_never_initializes_or_queues_a_com_query() {
+        let result: Result<(), InjectionError> = with_deadline(Instant::now(), || {
+            dispatch(|_, _| panic!("expired query executed"))
+        });
+        assert!(result.is_err());
+    }
 
     #[test]
     fn pending_initializer_is_retained_across_timeouts_then_becomes_ready() {
