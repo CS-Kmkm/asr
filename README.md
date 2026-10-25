@@ -92,7 +92,7 @@ DictateではAI文章補正もオンにする必要があります。Ask・Edit�
 
 - Windows 11 and WebView2
 - Rust stable with the MSVC target and Visual Studio 2022 Build Tools
-- Node.js 20 or newer
+- Node.js 22 (CI uses 22)
 - uv（開発環境は `.python-version` の Python 3.12 を使用）
 - NVIDIA CUDA-capable GPU with 12 GB VRAM or more — **required only for the
   optional VibeVoice backend**; the default faster-whisper backend runs on CPU
@@ -143,11 +143,11 @@ downloads `large-v3-turbo` from Hugging Face on first load and uses the normal
 Hugging Face cache. The model is not bundled with the app.
 
 To use the optional VibeVoice backend (GPU required, long-form/high-accuracy),
-install its extra dependencies and select it in Settings:
+install its extra dependencies and select it on the Models page:
 
 ```powershell
 uv sync --extra vibevoice
-# then: Settings → ASR backend → VibeVoice (GPU)
+# then: Models → VibeVoice (GPU)
 ```
 
 For protocol-only development without a GPU:
