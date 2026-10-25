@@ -1613,6 +1613,88 @@ mod tests {
 
         const BOUNDED: Duration = Duration::from_secs(3);
 
+        #[tokio::test]
+        async fn real_faster_whisper_pipe_answers_before_stdin_closes() {
+            let Some(python) = python() else {
+                return;
+            };
+            let root = repository_root();
+            let mut spec = WorkerCommand::python(python)
+                .with_backend("faster-whisper")
+                .with_current_dir(&root);
+            spec.env
+                .push(("PYTHONPATH".into(), root.to_string_lossy().into_owned()));
+            let mut child = worker_process_command(&spec, true).spawn().unwrap();
+            let mut worker = RunningWorker {
+                stdin: child.stdin.take().unwrap(),
+                stdout: BufReader::new(child.stdout.take().unwrap()),
+                child,
+                partial_line: Vec::new(),
+                in_flight: false,
+            };
+            let hello = async {
+                worker
+                    .send(&json!({"id": 1, "command": "hello"}))
+                    .await
+                    .unwrap();
+                let line = worker.read_line(Duration::from_secs(5)).await.unwrap();
+                JsonlTranscriber::validate_hello(
+                    &JsonlTranscriber::validate_response(&line, &json!(1)).unwrap(),
+                )
+                .unwrap();
+                worker
+                    .send(&load_request(2, "invalid-test-format"))
+                    .await
+                    .unwrap();
+                let line = worker.read_line(Duration::from_secs(5)).await.unwrap();
+                assert!(
+                    matches!(JsonlTranscriber::validate_response(&line, &json!(2)), Err(AsrError::Worker(error)) if error.code == "unsupported_quantization")
+                );
+            };
+            let outcome = timeout(Duration::from_secs(15), hello).await;
+            worker.kill().await;
+            outcome.expect("interactive worker stalled without loading a model");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires an existing large-v3-turbo cache and optionally CUDA; never downloads"]
+        async fn cached_faster_whisper_load_through_native_client() {
+            let Some(python) = python() else {
+                return;
+            };
+            let root = repository_root();
+            let mut spec = WorkerCommand::python(python)
+                .with_backend("faster-whisper")
+                .with_current_dir(&root);
+            spec.env.extend([
+                ("PYTHONPATH".into(), root.to_string_lossy().into_owned()),
+                ("ASR_MODEL_ID".into(), "large-v3-turbo".into()),
+                ("ASR_DEVICE".into(), "auto".into()),
+                ("HF_HUB_OFFLINE".into(), "1".into()),
+                ("ASR_WORKER_PROGRESS".into(), "1".into()),
+            ]);
+            let client =
+                JsonlTranscriber::new(spec, Duration::from_secs(10), Duration::from_secs(60));
+            let mut progress = client.load_progress().unwrap();
+            let load = client.load("bf16");
+            tokio::pin!(load);
+            let outcome = loop {
+                tokio::select! {
+                    result = &mut load => break result,
+                    event = progress.recv() => eprintln!("native load stage: {}", event.unwrap().stage),
+                }
+            };
+            if outcome.is_ok() {
+                let health = client.health().await.unwrap();
+                eprintln!(
+                    "native load ready: {:?} {:?}",
+                    health.device, health.compute_type
+                );
+            }
+            client.shutdown().await.unwrap();
+            outcome.unwrap();
+        }
+
         fn repository_root() -> PathBuf {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()

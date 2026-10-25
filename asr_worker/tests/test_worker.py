@@ -7,6 +7,8 @@ import tempfile
 import subprocess
 import sys
 import unittest
+import queue
+import threading
 
 from asr_worker.tests.support import IsolatedWorkerTestCase
 from pathlib import Path
@@ -17,6 +19,82 @@ from asr_worker.worker import Worker, _configure_protocol_stdio, serve
 
 
 class WorkerTests(IsolatedWorkerTestCase):
+    def test_invalid_load_formats_do_not_initialize_native_dependencies(self) -> None:
+        calls = []
+        output = io.StringIO()
+        requests = [
+            {"id": 1, "command": "load", "quantization": ["4bit"]},
+            {"id": 2, "command": "load", "quantization": "invalid-test-format"},
+            {"id": 3, "command": "health"},
+            {"id": 4, "command": "shutdown"},
+        ]
+        serve(Worker(MockBackend()), [json.dumps(request) + "\n" for request in requests], output, initialize_load_runtime=lambda: calls.append(True))
+        responses = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(calls, [])
+        self.assertEqual(responses[0]["error"]["code"], "invalid_request")
+        self.assertEqual(responses[1]["error"]["code"], "unsupported_quantization")
+        self.assertTrue(responses[2]["ok"])
+
+    def test_native_initialization_is_load_only_and_failure_keeps_health_available(self) -> None:
+        for error, code in [(ImportError("private dependency detail"), "backend_unavailable"), (RuntimeError("private runtime detail"), "model_load_failed")]:
+            with self.subTest(code=code):
+                calls = []
+                def initialize():
+                    calls.append(True)
+                    raise error
+                requests = [json.dumps({"id": index, "command": command}) + "\n" for index, command in enumerate(["hello", "health", "load", "health", "shutdown"], 1)]
+                output = io.StringIO()
+                serve(Worker(MockBackend()), requests, output, initialize_load_runtime=initialize)
+                responses = [json.loads(line) for line in output.getvalue().splitlines()]
+                self.assertEqual([response["id"] for response in responses], [1, 2, 3, 4, 5])
+                self.assertEqual(calls, [True])
+                self.assertEqual(responses[2]["error"]["code"], code)
+                self.assertNotIn("private", output.getvalue())
+                self.assertTrue(all(response["ok"] for response in [*responses[:2], *responses[3:]]))
+
+    def test_native_runtime_initializes_before_model_load_with_open_stdin(self) -> None:
+        script = '''
+import asr_worker.worker as worker
+from asr_worker.backends import MockBackend
+class NumericalBackend(MockBackend):
+    def load(self, quantization):
+        import numpy
+        super().load(quantization)
+worker.create_backend = lambda name: NumericalBackend()
+raise SystemExit(worker.main(["--backend", "faster-whisper"]))
+'''
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[2],
+            env={**os.environ, "ASR_WORKER_PROGRESS": "0"},
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8",
+        )
+        responses = queue.Queue()
+        def read_responses():
+            for line in process.stdout:
+                responses.put(line)
+        reader = threading.Thread(target=read_responses, daemon=True)
+        reader.start()
+        try:
+            # Keep stdin open between requests: communicate() would hide the
+            # native import hang by allowing the input thread to reach EOF.
+            for request_id, command in enumerate(["hello", "load", "shutdown"], 1):
+                process.stdin.write(json.dumps({"id": request_id, "command": command}) + "\n")
+                process.stdin.flush()
+                response = json.loads(responses.get(timeout=15))
+                self.assertEqual(response["id"], request_id)
+                self.assertTrue(response["ok"], response)
+            self.assertEqual(process.wait(timeout=10), 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            reader.join(timeout=5)
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+
     def test_health_reports_runtime_without_loading_or_importing_model_packages(self) -> None:
         worker = Worker(MockBackend())
         def installed_version(name: str) -> str:

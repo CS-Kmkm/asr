@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, TextIO
 
-from .backends import Backend, BackendError, CancelCheck, cancelled_error, create_backend
+from .backends import Backend, BackendError, CancelCheck, QUANTIZATIONS, cancelled_error, create_backend
 from .diagnostics import log_exception
 
 PROTOCOL_VERSION = 1
@@ -295,6 +295,7 @@ def serve(
     output_stream: TextIO = sys.stdout,
     *,
     notify_progress: bool = True,
+    initialize_load_runtime: Callable[[], Any] | None = None,
 ) -> None:
     """Answer requests until EOF or `shutdown`.
 
@@ -314,6 +315,7 @@ def serve(
     requests: queue.Queue[Any] = queue.Queue()
 
     def read_requests() -> None:
+        nonlocal initialize_load_runtime
         try:
             for line in input_stream:
                 try:
@@ -324,6 +326,25 @@ def serve(
                 if _is_cancel(request):
                     write(registry.cancel(request))
                     continue
+                if (
+                    initialize_load_runtime is not None
+                    and isinstance(request, dict)
+                    and "id" in request
+                    and request.get("command", request.get("op")) == "load"
+                    and isinstance(request.get("quantization", "4bit"), str)
+                    and request.get("quantization", "4bit") in QUANTIZATIONS
+                ):
+                    # Do native initialization before this thread returns to
+                    # its blocking stdin read. Other requests (hello/health)
+                    # remain independent of numerical/model dependencies.
+                    try:
+                        initialize_load_runtime()
+                    except Exception as exc:
+                        log_exception(exc, "load")
+                        code = "backend_unavailable" if isinstance(exc, ImportError) else "model_load_failed"
+                        requests.put((None, error_response(request["id"], code, "Unable to initialize the numerical runtime. Run worker setup and try again.")))
+                        continue
+                    initialize_load_runtime = None
                 if isinstance(request, dict) and "id" in request:
                     registry.submit(_request_key(request["id"]))
                 requests.put((request, None))
@@ -423,6 +444,13 @@ def main(argv: list[str] | None = None) -> int:
                 _stdin_lines(),
                 output_stream=output,
                 notify_progress=os.environ.get("ASR_WORKER_PROGRESS") == "1",
+                # A first native NumPy import can hang on Windows while the
+                # input thread is already blocked waiting for another command.
+                initialize_load_runtime=(
+                    (lambda: importlib.import_module("numpy"))
+                    if os.name == "nt" and args.backend in {"faster-whisper", "vibevoice"}
+                    else None
+                ),
             )
     return 0
 
