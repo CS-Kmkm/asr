@@ -95,7 +95,7 @@ enum Finalization {
 
 pub(crate) struct LiveTask {
     stop: watch::Sender<bool>,
-    task: tauri::async_runtime::JoinHandle<LiveDraft>,
+    task: tokio::task::JoinHandle<LiveDraft>,
 }
 
 impl LiveTask {
@@ -375,7 +375,7 @@ pub(crate) fn start(
 ) -> LiveTask {
     draft.monitor.observe_cancellation(Some(cancel.clone()));
     let (stop, stopped) = watch::channel(false);
-    let task = tauri::async_runtime::spawn(async move {
+    let task = spawn_recording_owner(async move {
         if !preview_enabled {
             return draft;
         }
@@ -415,6 +415,19 @@ pub(crate) fn start(
         draft
     });
     LiveTask { stop, task }
+}
+
+/// One blocking worker owns a recording's serial live loop. UIA, clipboard
+/// waits, temporary-file cleanup and draft teardown stay off runtime workers;
+/// asynchronous ASR and timers still use the originating runtime. Stop joins
+/// this owner before finalization, so no queued update outlives its draft.
+pub(crate) fn spawn_recording_owner<F>(work: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || runtime.block_on(work))
 }
 
 /// Why live recognition ended early. Only a recognition failure leaves the
@@ -1399,6 +1412,77 @@ mod tests {
             snapshots: AtomicUsize::new(0),
             stages: vec![],
         }))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_live_updates_keep_runtime_responsive_and_stop_joins_the_owner() {
+        for cancelling in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().to_owned();
+            let runtime_thread = std::thread::current().id();
+            let (entered, waiting) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let (stop, stopped) = watch::channel(false);
+            let (cancel_tx, cancel) = watch::channel(false);
+            let owner = spawn_recording_owner(async move {
+                let audio = voiced_capture(&path);
+                let recognizer = ScriptedRecognizer {
+                    calls: AtomicUsize::new(0),
+                    script: vec![Some("live sample")],
+                };
+                let mut entered = Some(entered);
+                let blocked = std::sync::Mutex::new(blocked);
+                let mut updates = 0;
+                let result = run(
+                    &audio,
+                    &recognizer,
+                    None,
+                    None,
+                    cancel,
+                    stopped,
+                    Duration::from_millis(1),
+                    |_| {
+                        updates += 1;
+                        assert_ne!(std::thread::current().id(), runtime_thread);
+                        entered.take().unwrap().send(()).unwrap();
+                        // Stand in for a slow synchronous UIA/clipboard operation.
+                        blocked
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(3))
+                            .unwrap();
+                    },
+                )
+                .await;
+                (result, updates, recognizer.calls.load(Ordering::SeqCst))
+            });
+            tokio::time::timeout(Duration::from_secs(3), waiting)
+                .await
+                .unwrap()
+                .unwrap();
+            // A single runtime thread must still process timers and cancellation
+            // while the update is blocked, with no additional inference queued.
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                tokio::time::sleep(Duration::from_millis(10)),
+            )
+            .await
+            .unwrap();
+            if cancelling {
+                cancel_tx.send_replace(true);
+            } else {
+                stop.send_replace(true);
+            }
+            assert!(!owner.is_finished());
+            release.send(()).unwrap();
+            let (result, updates, calls) = tokio::time::timeout(Duration::from_secs(3), owner)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result, Ok(()));
+            assert_eq!((updates, calls), (1, 1));
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
     }
 
     #[tokio::test]

@@ -1332,12 +1332,30 @@ pub(crate) async fn stop_recording(
 
 pub(crate) async fn stop_recording_for(
     app: AppHandle,
-    services: State<'_, Services>,
-    state: State<'_, AppState>,
-    storage: State<'_, Storage>,
+    _services: State<'_, Services>,
+    _state: State<'_, AppState>,
+    _storage: State<'_, Storage>,
     reason: StopReason,
 ) -> Result<RecordingResult, String> {
-    crate::pipeline::stop::run(&app, &services, &state, &storage, reason).await
+    spawn_owned_stop(async move {
+        let services = app.state::<Services>();
+        let state = app.state::<AppState>();
+        let storage = app.state::<Storage>();
+        crate::pipeline::stop::run(&app, &services, &state, &storage, reason).await
+    })
+    .await
+    .map_err(|_| "recording stop task failed".to_owned())?
+}
+
+/// The stop owns its lifecycle guards until all blocking workers join, even
+/// when its IPC/native waiter is dropped. A dropped JoinHandle detaches this
+/// task; cancellation must go through the identity-bound lifecycle channel.
+fn spawn_owned_stop<F>(work: F) -> tokio::task::JoinHandle<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::spawn(work)
 }
 
 /// An output step saw the cancel and stopped before it pasted or kept a
@@ -3669,6 +3687,74 @@ mod tests {
         assert_eq!(edit_session, None::<()>);
         assert!(ask_session.is_none());
         assert_eq!(target.as_deref(), Some("ja"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn aborting_stop_waiter_does_not_release_its_detached_blocking_finalizer() {
+        let lifecycle = Arc::new(PipelineLifecycle::default());
+        let id = lifecycle.begin_start(PipelineMode::Dictate).unwrap();
+        lifecycle.mark_recording(id).unwrap();
+        lifecycle.begin_processing().unwrap();
+        let state = Arc::new(AppState::default());
+        state.transition(AppPhase::Processing, None);
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (released, release) = std::sync::mpsc::channel();
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let work_lifecycle = Arc::clone(&lifecycle);
+        let work_state = Arc::clone(&state);
+        let waiter = tokio::spawn(async move {
+            spawn_owned_stop(async move {
+                {
+                    let _owner = PipelineGuard {
+                        lifecycle: &work_lifecycle,
+                        id,
+                    };
+                    let _terminal = crate::state::TerminalPhaseGuard::new(
+                        &work_state,
+                        &work_lifecycle,
+                        id,
+                        "Dictation cancelled.",
+                        |phase, message| {
+                            work_state.transition(phase, Some(message.into()));
+                        },
+                    );
+                    let worker_lifecycle = Arc::clone(&work_lifecycle);
+                    let result = crate::live_dictation::spawn_recording_owner(async move {
+                        entered.send(()).unwrap();
+                        release.recv_timeout(Duration::from_secs(3)).unwrap();
+                        worker_lifecycle.commit_side_effect(id, || -> Result<(), String> {
+                            panic!("cancelled finalizer must not paste")
+                        })
+                    })
+                    .await
+                    .unwrap();
+                    assert!(result.is_err());
+                }
+                done.send(()).unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(3), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(lifecycle.phase(), PipelinePhase::Processing);
+        assert_eq!(state.phase(), Some(AppPhase::Processing));
+        assert!(lifecycle.begin_start(PipelineMode::Dictate).is_err());
+        lifecycle.cancel_for(Some(id)).unwrap();
+        released.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), finished)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lifecycle.phase(), PipelinePhase::Idle);
+        assert_eq!(state.phase(), Some(AppPhase::Idle));
+        let next = lifecycle.begin_start(PipelineMode::Dictate).unwrap();
+        assert_ne!(id, next);
+        assert!(!lifecycle.is_cancelled(next));
     }
 
     #[tokio::test]

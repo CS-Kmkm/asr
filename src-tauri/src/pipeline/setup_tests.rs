@@ -142,10 +142,11 @@ pub(crate) async fn run_insertion(app: AppHandle, id: u64, cancel: watch::Receiv
         .await
         .map_err(|_| "Setup test failed.".to_owned())??;
         draft.monitor.observe_cancellation(Some(cancel.clone()));
-        draft.settle_before_final(&cancel).await;
         let commit_app = app.clone();
         let result_text = text.clone();
+        let runtime = tokio::runtime::Handle::current();
         let result = tokio::task::spawn_blocking(move || {
+            runtime.block_on(draft.settle_before_final(&cancel));
             let services = commit_app.state::<Services>();
             let result = commit_dictation_output(&services.lifecycle, id, || {
                 draft.finish(&result_text, &cancel)

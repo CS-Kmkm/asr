@@ -23,6 +23,35 @@ pub(crate) async fn finish(
     context: PipelineContext<'_>,
     take: RecordedTake,
 ) -> Result<RecordingResult, String> {
+    let app = context.app.clone();
+    let operation_id = context.operation_id;
+    // The final raw-hypothesis update and every early-return draft drop can
+    // inspect UIA or restore a clipboard. Keep this whole owner off runtime
+    // workers, including while it awaits optional AI correction.
+    crate::live_dictation::spawn_recording_owner(async move {
+        let services = app.state::<crate::Services>();
+        let state = app.state::<crate::state::AppState>();
+        let storage = app.state::<crate::storage::Storage>();
+        finish_owned(
+            PipelineContext {
+                app: &app,
+                services: &services,
+                state: &state,
+                storage: &storage,
+                operation_id,
+            },
+            take,
+        )
+        .await
+    })
+    .await
+    .map_err(|_| "dictation finalization task failed".to_owned())?
+}
+
+async fn finish_owned(
+    context: PipelineContext<'_>,
+    take: RecordedTake,
+) -> Result<RecordingResult, String> {
     let PipelineContext {
         app,
         services,
@@ -253,16 +282,18 @@ pub(crate) async fn finish(
         },
     );
     let cancel = services.lifecycle.cancellation(operation_id)?;
-    // Settling awaits, so it runs before the commit, which must not.
-    if !translation_failed {
-        draft.settle_before_final(&cancel).await;
-    }
     // A cancel either wins before the paste or copy, or finds the dictation
     // committed and changes nothing.
     let app_for_insertion = app.clone();
     let text_for_insertion = final_text.clone();
-    let (draft, committed) = tokio::task::spawn_blocking(move || {
+    let runtime = tokio::runtime::Handle::current();
+    let (committed, clipboard_lost, insertion_detail) = tokio::task::spawn_blocking(move || {
         let services = app_for_insertion.state::<crate::Services>();
+        // Readiness may synchronously query UIA; await quiet input on this
+        // blocking owner before taking the irreversible commit fence.
+        if !translation_failed {
+            runtime.block_on(draft.settle_before_final(&cancel));
+        }
         let committed = commit_dictation_output(&services.lifecycle, operation_id, || {
             if translation_failed {
                 draft
@@ -273,7 +304,24 @@ pub(crate) async fn finish(
                 draft.finish(&text_for_insertion, &cancel)
             }
         });
-        (draft, committed)
+        let clipboard_lost = draft.injector.take_clipboard_not_restored();
+        let insertion_detail = match &committed {
+            CommittedOutput::Ran(Ok(_)) if translation_failed => Some("translation_failed"),
+            CommittedOutput::Ran(Ok(result)) => draft
+                .diagnose(*result)
+                .or(InsertionDetail::for_confirmed_paste(
+                    *result,
+                    clipboard_lost,
+                ))
+                .map(InsertionDetail::code),
+            CommittedOutput::Ran(Err(error)) => {
+                InsertionDetail::from_error(error).map(InsertionDetail::code)
+            }
+            _ => None,
+        };
+        recording_overlay::set_phase(&app_for_insertion, &AppPhase::Completed);
+        drop(draft);
+        (committed, clipboard_lost, insertion_detail)
     })
     .await
     .map_err(|_| "dictation insertion task failed".to_owned())?;
@@ -286,25 +334,6 @@ pub(crate) async fn finish(
         // incomplete dictation.
         CommittedOutput::Refused(error) => return Err(error.into()),
     };
-    // Diagnose before the draft stops its input monitor. Fixed codes only.
-    let clipboard_lost = draft.injector.take_clipboard_not_restored();
-    let insertion_detail = match &insertion_result {
-        Ok(_) if translation_failed => Some("translation_failed"),
-        Ok(result) => draft
-            .diagnose(*result)
-            .or(InsertionDetail::for_confirmed_paste(
-                *result,
-                clipboard_lost,
-            ))
-            .map(InsertionDetail::code),
-        Err(error) => InsertionDetail::from_error(error).map(InsertionDetail::code),
-    };
-    // Insertion has returned; helper shutdown and persistence are not insertion.
-    // This only hides the overlay. The result below still determines success.
-    recording_overlay::set_phase(app, &AppPhase::Completed);
-    // The helper observes input only while a provisional replacement session
-    // can still mutate the target. Stop it before persisting the result.
-    drop(draft);
     if insertion_result == Err(injection::InjectionError::Cancelled) {
         emit_state(app, state, AppPhase::Idle, cancel_message);
         if clipboard_lost {
