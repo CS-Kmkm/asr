@@ -72,7 +72,8 @@ fn insertion_message(result: InsertResult) -> &'static str {
 }
 
 const CLIPBOARD_PROTECTED: &str = "Insertion test stopped because your clipboard could not be saved for restoring. Copy a short plain-text sample and try again. Your clipboard was left unchanged.";
-const CLIPBOARD_BUSY: &str = "Insertion test could not access the clipboard. Close any clipboard menu and try again.";
+const CLIPBOARD_BUSY: &str =
+    "Insertion test could not access the clipboard. Close any clipboard menu and try again.";
 
 fn injection_failure_message(error: InjectionError) -> &'static str {
     match error {
