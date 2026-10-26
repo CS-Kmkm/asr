@@ -539,3 +539,9 @@ Full usage and Phase 0 gate criteria are documented in
   are re-registered on launch. If another app holds a saved hotkey, the app
   names the action that stays unavailable; saving other settings still works,
   while choosing a new hotkey that cannot be registered is rejected.
+
+## License
+
+本プロジェクトの独自コードは [MIT License](LICENSE) で公開します。
+同梱の VibeVoice 参考サンプルには[上流の著作権表示とMITライセンス](docs/reference/vibevoice-samples/LICENSE)を保持しています。
+外部の依存パッケージ、ダウンロードするモデル・音声データには、それぞれのライセンスが適用されます。
