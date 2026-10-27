@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Empty } from "../components/ui";
+import { Empty, HelpHint, IconButton } from "../components/ui";
 import type { DictionaryCandidate, DictionaryEntry, DictionaryEntryInput } from "../types";
 import { useI18n } from "../i18n";
 
@@ -36,7 +36,10 @@ export function DictionaryPage({ entries, candidates, onAdd, onUpdate, onDelete,
 }) {
   const { t } = useI18n();
   const [form, setForm] = useState<Form>(emptyForm);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const editorRef = useRef<HTMLFormElement>(null);
   const [editing, setEditing] = useState<number | null>(null);
+  useEffect(() => { if (editorOpen) editorRef.current?.querySelector<HTMLInputElement>("input")?.focus(); }, [editorOpen, editing]);
   const [query, setQuery] = useState("");
   const [source, setSource] = useState<"all" | "manual" | "auto">("all");
   const [importError, setImportError] = useState(false);
@@ -58,9 +61,10 @@ export function DictionaryPage({ entries, candidates, onAdd, onUpdate, onDelete,
     const priority = parsePriority(form.priority, storedPriority);
     if (priority === null) return;
     const ok = editing === null ? await onAdd(toInput(form, priority)) : await onUpdate(editing, toInput(form, priority));
-    if (ok) { setForm(emptyForm); setEditing(null); }
+    if (ok) { setForm(emptyForm); setEditing(null); setEditorOpen(false); }
   }
   function edit(entry: DictionaryEntry) {
+    setEditorOpen(true);
     setEditing(entry.id);
     setForm({ reading: entry.reading, surface: entry.surface, category: entry.category ?? "", aliases: entry.aliases.join("\n"), priority: String(entry.priority), appScope: entry.appScope ?? "" });
   }
@@ -84,17 +88,22 @@ export function DictionaryPage({ entries, candidates, onAdd, onUpdate, onDelete,
     await onImport(csv);
   }
   return <section className="panel compact-page-panel">
-    <div className="setting-row"><div><strong>{t("Import CSV")}</strong><p>{t("CSV format help")}</p></div><div><input ref={importInput} type="file" accept=".csv,text/csv" onChange={(event) => void importFile(event.target.files?.[0])} /></div></div>
+    <div className="dictionary-toolbar">
+      <input type="search" aria-label={t("Search dictionary")} placeholder={t("Search dictionary")} value={query} onChange={(event) => setQuery(event.target.value)} />
+      <select aria-label={t("Dictionary source")} value={source} onChange={(event) => setSource(event.target.value as typeof source)}><option value="all">{t("All")}</option><option value="auto">{t("Auto-added")}</option><option value="manual">{t("Manually-added")}</option></select>
+      {!editorOpen && <IconButton icon="add" label={t("Add entry")} className="primary" onClick={() => { setEditing(null); setForm(emptyForm); setEditorOpen(true); }} />}
+    </div>
+    <details className="utility-disclosure"><summary>{t("Import CSV")}</summary><HelpHint label={t("Import CSV")}>{t("CSV format help")}</HelpHint><input aria-label={t("Import CSV")} ref={importInput} type="file" accept=".csv,text/csv" onChange={(event) => void importFile(event.target.files?.[0])} /></details>
     {importError && <p role="alert">{t("CSV encoding error")}</p>}
-    <form className="steps dictionary-form" onSubmit={(event) => void submit(event)}>
-      {([ ["Reading", "reading", true], ["Surface", "surface", true], ["Category", "category", false], ["Aliases", "aliases", false], ["Scope", "appScope", false] ] as const).map(([label, key, required]) => <div className="setting-row" key={key}><div><strong>{t(label)}</strong>{key === "aliases" && <p>{t("One alias per line")}</p>}</div>{key === "aliases" ? <textarea aria-label={t(label)} value={form.aliases} onChange={(event) => setForm({ ...form, aliases: event.target.value })} /> : <input aria-label={t(label)} value={form[key]} required={required} onChange={(event) => setForm({ ...form, [key]: event.target.value })} />}</div>)}
+    <form ref={editorRef} hidden={!editorOpen} className="steps dictionary-form" onSubmit={(event) => void submit(event)}>
+      {([ ["Reading", "reading", true], ["Surface", "surface", true], ["Category", "category", false], ["Aliases", "aliases", false], ["Scope", "appScope", false] ] as const).map(([label, key, required]) => <div className="setting-row" key={key}><div className="setting-title"><strong>{t(label)}</strong>{key === "aliases" && <HelpHint label={t(label)}>{t("One alias per line")}</HelpHint>}</div>{key === "aliases" ? <textarea aria-label={t(label)} placeholder={t("One alias per line")} value={form.aliases} onChange={(event) => setForm({ ...form, aliases: event.target.value })} /> : <input aria-label={t(label)} value={form[key]} required={required} onChange={(event) => setForm({ ...form, [key]: event.target.value })} />}</div>)}
       <div className="setting-row"><div><strong>{t("Priority")}</strong></div><input ref={priorityInput} type="number" step={1} min={Math.min(PRIORITY_MIN, storedPriority ?? 0)} max={Math.max(PRIORITY_MAX, storedPriority ?? 0)} aria-label={t("Priority")} aria-invalid={priorityInvalid} value={form.priority} onChange={(event) => setForm({ ...form, priority: event.target.value })} /></div>
       {priorityInvalid && <p className="settings-error" role="alert">{priorityMessage}</p>}
-      <div><button className="primary" type="submit">{editing === null ? t("Add entry") : t("Save entry")}</button>{editing !== null && <button className="secondary" type="button" onClick={() => { setEditing(null); setForm(emptyForm); }}>{t("Cancel")}</button>}</div>
+      <div><IconButton icon={editing === null ? "add" : "save"} label={editing === null ? t("Add entry") : t("Save entry")} className="primary" type="submit" /><IconButton icon="close" label={t("Cancel")} type="button" onClick={() => { setEditing(null); setForm(emptyForm); setEditorOpen(false); }} /></div>
     </form>
 
-    <div className="setting-row"><input aria-label={t("Search dictionary")} placeholder={t("Search dictionary")} value={query} onChange={(event) => setQuery(event.target.value)} /><select value={source} onChange={(event) => setSource(event.target.value as typeof source)}><option value="all">{t("All")}</option><option value="auto">{t("Auto-added")}</option><option value="manual">{t("Manually-added")}</option></select></div>
-    {candidates.length > 0 && <div className="history-list"><h2>{t("Suggested spellings")}</h2>{candidates.map((candidate) => <div className="setting-row" key={candidate.id}><div><strong>{candidate.preferredSpan}</strong><p>{candidate.originalSpan} → {candidate.preferredSpan}</p></div><div><button className="primary" onClick={() => onConfirmCandidate(candidate.id)}>{t("Confirm")}</button><button className="secondary" onClick={() => onRejectCandidate(candidate.id)}>{t("Reject")}</button></div></div>)}</div>}
-    {entries.length === 0 ? <Empty title={t("No dictionary entries yet")} detail={t("Add proper nouns and terms to improve recognition accuracy.")} /> : visible.length === 0 ? <Empty title={t("No matching dictionary entries")} detail={t("Change the search text or source filter.")} /> : <div className="history-list">{visible.map((entry) => <div key={entry.id} className="setting-row"><div><strong>{entry.surface}</strong><p>{entry.reading}{entry.category ? ` · ${entry.category}` : ""}{entry.aliases.length ? ` · ${t("aliases:")} ${entry.aliases.join(", ")}` : ""}{` · ${t("priority")} ${entry.priority} · ${t(entry.source === "auto" ? "Auto-added" : "Manually-added")}`}</p>{entry.appScope && <small>{t("scope:")} {entry.appScope}</small>}</div><div><button className="secondary" onClick={() => edit(entry)}>{t("Edit")}</button><button className="secondary" onClick={() => { if (window.confirm(`${t("Delete dictionary entry")}: “${entry.surface}”`)) onDelete(entry.id); }}>{t("Delete")}</button></div></div>)}</div>}
+
+    {candidates.length > 0 && <div className="history-list"><h2>{t("Suggested spellings")}</h2>{candidates.map((candidate) => <div className="setting-row" key={candidate.id}><div><strong>{candidate.preferredSpan}</strong><p>{candidate.originalSpan} → {candidate.preferredSpan}</p></div><div><IconButton icon="check" label={t("Confirm")} context={`${candidate.originalSpan} → ${candidate.preferredSpan}`} className="primary" onClick={() => onConfirmCandidate(candidate.id)} /><IconButton icon="close" label={t("Reject")} context={`${candidate.originalSpan} → ${candidate.preferredSpan}`} onClick={() => onRejectCandidate(candidate.id)} /></div></div>)}</div>}
+    {entries.length === 0 ? <Empty title={t("No dictionary entries yet")} /> : visible.length === 0 ? <Empty title={t("No matching dictionary entries")} /> : <div className="history-list">{visible.map((entry) => <div key={entry.id} className="setting-row"><div><strong>{entry.surface}</strong><p>{entry.reading}{entry.category ? ` · ${entry.category}` : ""}{entry.aliases.length ? ` · ${t("aliases:")} ${entry.aliases.join(", ")}` : ""}{` · ${t("priority")} ${entry.priority} · ${t(entry.source === "auto" ? "Auto-added" : "Manually-added")}`}</p>{entry.appScope && <small>{t("scope:")} {entry.appScope}</small>}</div><div><IconButton icon="writing" label={t("Edit")} context={`${entry.surface} (${entry.reading})${entry.appScope ? ` · ${entry.appScope}` : ""}`} onClick={() => edit(entry)} /><IconButton icon="trash" label={t("Delete")} context={`${entry.surface} (${entry.reading})${entry.appScope ? ` · ${entry.appScope}` : ""}`} className="danger-button" onClick={() => { if (window.confirm(`${t("Delete dictionary entry")}: “${entry.surface}”`)) onDelete(entry.id); }} /></div></div>)}</div>}
   </section>;
 }

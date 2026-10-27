@@ -1,9 +1,9 @@
-﻿import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+﻿import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, expect, test, vi } from "vitest";
 import App from "../App";
 import { listen } from "@tauri-apps/api/event";
 import { defaultSettings, getSettings, getShortcutWarning, updateSettings, listDictionaryCandidates,
-  listHistory, listHistoryPage, deleteAllHistory, reprocessHistoryText, copyToClipboard, getGpuDiagnostics, getModelStatus, getStartupHotkeyWarning, stopRecording, loadModel, previewHistoryRetentionPurge } from "../api";
+  listHistory, listHistoryPage, deleteAllHistory, reprocessHistoryText, copyToClipboard, getGpuDiagnostics, getModelStatus, getStartupHotkeyWarning, stopRecording, loadModel, previewHistoryRetentionPurge, getProviderCredentials } from "../api";
 import type { DictionaryCandidate, HistoryItem, Settings, SettingsSnapshot } from "../types";
 
 const events = vi.hoisted(() => new Map<string, Set<(event: { payload: unknown }) => void>>());
@@ -31,6 +31,7 @@ vi.mock("../api", async (original) => {
     getAppState: async () => ({ phase: "idle", stage: "idle", operation: null, operationId: null, message: null, messageCode: null, lastResult: null }),
     getModelStatus: vi.fn(async () => ({ modelId: null, quantization: "4bit", installed: false, state: "not_configured", detail: "" })),
     getGpuDiagnostics: vi.fn(async () => null),
+    getProviderCredentials: vi.fn(async () => []),
     listAudioDevices: async () => [],
     listHistory,
     deleteAllHistory: vi.fn(async () => 0),
@@ -60,12 +61,14 @@ beforeEach(() => {
   vi.mocked(listHistoryPage).mockReset().mockImplementation(async (filter, options) => ({ items: await listHistory(filter, options), retainedIds: options?.knownIds ?? [] }));
   vi.mocked(getGpuDiagnostics).mockResolvedValue({ status: "unavailable", adapterName: null, driverVersion: null, memoryTotalMb: null, recommendation: "" });
   vi.mocked(getModelStatus).mockResolvedValue({ modelId: null, quantization: "4bit", installed: false, state: "not_configured", detail: "" });
+  vi.mocked(getProviderCredentials).mockResolvedValue([]);
   vi.spyOn(window, "confirm").mockReturnValue(true);
 });
 
 async function openSettings() {
   render(<App />);
   fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+  fireEvent.click(screen.getByRole("button", { name: "Writing and translation" }));
   await screen.findByDisplayValue(settings.openaiCorrectionModel);
 }
 
@@ -77,6 +80,7 @@ test("browser startup renders the real Settings page without a false shortcut al
 test("Settings shows the inactive shortcut names when native registration failed", async () => {
   vi.mocked(getShortcutWarning).mockResolvedValue(["Voice Translate (Ctrl+Shift+Y)", "Ask Anything (Ctrl+Shift+A)"]);
   await openSettings();
+  fireEvent.click(screen.getByRole("button", { name: "Shortcuts" }));
   await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("Inactive shortcuts: Voice Translate (Ctrl+Shift+Y), Ask Anything (Ctrl+Shift+A)"));
   expect(screen.getByRole("alert").textContent).toContain("Some saved shortcuts could not be activated at startup.");
 });
@@ -130,7 +134,10 @@ async function phase(value: string) {
   await emit("app-state", { phase: value, stage: value, operation: "dictate", operationId: 1, message: null, messageCode: null, lastResult: null });
 }
 async function navigate(name: string) {
-  fireEvent.click(await screen.findByRole("button", { name }));
+  if (["Privacy", "Models", "Setup", "Diagnostics"].includes(name) && !screen.queryByRole("button", { name })) {
+    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+  }
+  fireEvent.click(await screen.findByRole("button", { name: name === "Status" ? "Home" : name }));
 }
 async function changeRetention(value: string) {
   await navigate("Privacy");
@@ -224,6 +231,74 @@ function history(id: number): HistoryItem {
     createdAt: "2026-10-23T00:00:00Z", hasAudio: false, retryOfId: null, insertionResult: null,
     insertionDetail: null, expiresAt: null };
 }
+
+test("home offers direct copy and task navigation without secondary settings links", async () => {
+  render(<App />);
+  const nav = within(await screen.findByRole("navigation", { name: "Main navigation" }));
+  expect(nav.queryByRole("button", { name: "Models" })).toBeNull();
+  await emit("app-state", { phase: "completed", stage: "completed", lastResult: "A useful result" });
+  fireEvent.click(within(screen.getByRole("article", { name: "Latest result" })).getByRole("button", { name: "Copy" }));
+  await waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith("A useful result"));
+  fireEvent.click(screen.getByRole("button", { name: "View history" }));
+  expect(screen.getByRole("searchbox", { name: "Search history" })).toBeTruthy();
+});
+
+test("settings categories preserve shortcut drafts and expose only the active controls", async () => {
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+  expect(screen.getByRole("button", { name: "Settings" }).hasAttribute("aria-expanded")).toBe(false);
+  expect(screen.getByRole("combobox", { name: "Microphone" })).toBeTruthy();
+  expect(screen.queryByRole("combobox", { name: "Language" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Shortcuts" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Dictation shortcuts 1" }), { target: { value: "Ctrl+Alt+D" } });
+  document.documentElement.scrollTop = 600;
+  document.body.scrollTop = 600;
+  fireEvent.click(screen.getByRole("button", { name: "General" }));
+  expect(document.documentElement.scrollTop).toBe(0);
+  expect(document.body.scrollTop).toBe(0);
+  expect(screen.getByRole("combobox", { name: "Language" })).toBeTruthy();
+  expect(screen.queryByRole("textbox", { name: "Dictation shortcuts 1" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Models" }));
+  fireEvent.click(screen.getByRole("button", { name: "Shortcuts" }));
+  expect(screen.getByRole("textbox", { name: "Dictation shortcuts 1" })).toHaveProperty("value", "Ctrl+Alt+D");
+  expect(updateSettings).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Save shortcuts" }));
+  await waitFor(() => expect(updateSettings).toHaveBeenCalledWith(expect.objectContaining({ shortcuts: expect.objectContaining({ dictate: ["Ctrl+Alt+D"] }) })));
+});
+
+test("each history entry keeps its own reprocessing choices", async () => {
+  settings.translationTargetLanguages = ["en", "ja"];
+  settings.translationTargetLanguage = "en";
+  vi.mocked(listHistory).mockResolvedValue([history(1), history(2)]);
+  vi.mocked(reprocessHistoryText).mockResolvedValue({ text: "translated", insertion: "history_only", durationMs: 0, latencyMs: 1 });
+  render(<App />);
+  await navigate("History");
+  await screen.findByText("Transcript-1");
+  const rows = document.querySelectorAll<HTMLElement>(".history-list > article");
+  for (const row of rows) fireEvent.click(within(row).getByText("Reprocess text"));
+  fireEvent.change(within(rows[0]).getByRole("combobox", { name: "Translation target" }), { target: { value: "ja" } });
+  expect(within(rows[1]).getByRole("combobox", { name: "Translation target" })).toHaveProperty("value", "en");
+  fireEvent.click(within(rows[0]).getByRole("button", { name: "Translate to…" }));
+  await waitFor(() => expect(reprocessHistoryText).toHaveBeenCalledWith(1, { kind: "translate", target: "ja" }));
+});
+
+test("model configuration and unsaved API key drafts survive settings category changes", async () => {
+  vi.mocked(getProviderCredentials).mockResolvedValue([
+    { provider: "openai", alias: settings.openaiApiKeyEnvVar, source: "missing", storeAvailable: true },
+  ]);
+  render(<App />);
+  await navigate("Models");
+  const key = screen.getByLabelText("OpenAI API key");
+  await waitFor(() => expect(key).toHaveProperty("disabled", false));
+  fireEvent.change(key, { target: { value: "test-only-unsaved-key" } });
+  fireEvent.change(screen.getByRole("combobox", { name: "ASR backend" }), { target: { value: "builtin:vibevoice" } });
+  await navigate("Privacy");
+  expect(key.closest("[hidden]")).not.toBeNull();
+  await navigate("Models");
+  expect(screen.getByLabelText("OpenAI API key")).toHaveProperty("value", "test-only-unsaved-key");
+  expect(screen.getByRole("combobox", { name: "ASR backend" })).toHaveProperty("value", "builtin:vibevoice");
+  expect(updateSettings).not.toHaveBeenCalled();
+});
 test("History entry and shortcut completion refresh retained rows", async () => {
   vi.mocked(listHistory).mockResolvedValue([history(1)]);
   render(<App />);
@@ -276,7 +351,7 @@ test("History appends the next page and changing filter keeps the submitted quer
   fireEvent.change(screen.getByRole("searchbox", { name: "Search history" }), { target: { value: "  日本語  " } });
   fireEvent.click(screen.getByRole("button", { name: "Search" }));
   await waitFor(() => expect(listHistory).toHaveBeenCalledWith("all", { query: "日本語", before: null, knownIds: [] }));
-  fireEvent.change(screen.getByRole("combobox", { name: "History filter" }), { target: { value: "translate" } });
+  fireEvent.click(within(screen.getByRole("group", { name: "History filter" })).getByRole("button", { name: "Translate" }));
   expect(await screen.findByText("Transcript-700")).toBeTruthy();
   expect(listHistory).toHaveBeenLastCalledWith("translate", { query: "日本語", before: null, knownIds: [] });
   expect(screen.queryByText("Transcript-1")).toBeNull();
@@ -332,9 +407,10 @@ test("History without audio supports raw copy, explicit profile correction and t
   render(<App />);
   await navigate("History");
   const correct = await screen.findByRole("button", { name: "Re-correct" });
-  expect((screen.getByRole("button", { name: "Retry" }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole("button", { name: /^Retry:/ }) as HTMLButtonElement).disabled).toBe(true);
   expect((correct as HTMLButtonElement).disabled).toBe(false);
-  fireEvent.click(screen.getByRole("button", { name: "Copy raw" }));
+  fireEvent.click(screen.getByRole("button", { name: /^Copy raw:/ }));
+  expect(screen.getByRole("button", { name: /^Copy raw:/ }).getAttribute("aria-label")).toContain("old processed text");
   await waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith("Transcript-12"));
   fireEvent.change(screen.getByRole("combobox", { name: "Correction profile" }), { target: { value: "global" } });
   fireEvent.click(correct);
@@ -354,13 +430,13 @@ test("History exposes returned text for copying even under a filter and source-o
   vi.mocked(reprocessHistoryText).mockResolvedValueOnce({ text: "new corrected output", insertion: "history_only", durationMs: 0, latencyMs: 1 });
   render(<App />);
   await navigate("History");
-  fireEvent.change(screen.getByRole("combobox", { name: "History filter" }), { target: { value: "ask" } });
+  fireEvent.click(within(screen.getByRole("group", { name: "History filter" })).getByRole("button", { name: "Ask" }));
   fireEvent.change(screen.getByRole("searchbox", { name: "Search history" }), { target: { value: "selected operand" } });
   fireEvent.click(screen.getByRole("button", { name: "Search" }));
   fireEvent.click(await screen.findByRole("button", { name: "Re-correct" }));
   const result = await screen.findByRole("region", { name: "Reprocessed result" });
   expect(result.textContent).toContain("new corrected output");
-  expect((screen.getByRole("combobox", { name: "History filter" }) as HTMLSelectElement).value).toBe("ask");
+  expect(within(screen.getByRole("group", { name: "History filter" })).getByRole("button", { name: "Ask" }).getAttribute("aria-pressed")).toBe("true");
   expect((screen.getByRole("searchbox", { name: "Search history" }) as HTMLInputElement).value).toBe("selected operand");
   fireEvent.click(screen.getByRole("button", { name: "Copy result" }));
   await waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith("new corrected output"));
@@ -492,6 +568,7 @@ test("model configuration waits for preceding settings saves before loading", as
   const first = deferred<SettingsSnapshot>(), second = deferred<SettingsSnapshot>();
   vi.mocked(updateSettings).mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
   await openSettings();
+  fireEvent.click(screen.getByRole("button", { name: "Input settings" }));
   fireEvent.click(screen.getByRole("button", { name: "Interaction sounds" }));
   await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
   await navigate("Models");
@@ -512,6 +589,7 @@ test("custom model creation waits for queued settings and preserves their values
   const first = deferred<SettingsSnapshot>(), second = deferred<SettingsSnapshot>();
   vi.mocked(updateSettings).mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
   await openSettings();
+  fireEvent.click(screen.getByRole("button", { name: "Input settings" }));
   fireEvent.click(screen.getByRole("button", { name: "Interaction sounds" }));
   await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
   await navigate("Models");
@@ -575,6 +653,7 @@ test("confirming a delayed purge count preserves settings changed while waiting"
   fireEvent.change(screen.getByRole("combobox", { name: "History retention" }), { target: { value: "one_week" } });
   await waitFor(() => expect(previewHistoryRetentionPurge).toHaveBeenCalled());
   await navigate("Settings");
+  fireEvent.click(screen.getByRole("button", { name: "Writing and translation" }));
   const model = screen.getByRole("textbox", { name: "OpenAI model" });
   fireEvent.change(model, { target: { value: "changed-while-counting" } }); fireEvent.blur(model);
   await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));

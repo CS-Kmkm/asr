@@ -14,9 +14,10 @@ export const validateLocalEndpoint: FieldValidation = (value) => {
   return "Use a numeric loopback HTTP(S) endpoint ending in /v1.";
 };
 
-export function CommitField({ label, value, onCommit, validate, multiline = false, placeholder, maxLength = 512, type = "text" }: {
+export function CommitField({ label, value, onCommit, validate, multiline = false, placeholder, maxLength = 512, type = "text", id, "aria-describedby": describedBy }: {
   label: string; value: string; onCommit: (value: string) => void;
   validate?: FieldValidation; multiline?: boolean; placeholder?: string; maxLength?: number; type?: "text" | "number";
+  id?: string; "aria-describedby"?: string;
 }) {
   const { t } = useI18n();
   const [draft, setDraft] = useState(value);
@@ -37,7 +38,7 @@ export function CommitField({ label, value, onCommit, validate, multiline = fals
     if (!error && candidate !== value) onCommit(candidate);
   }
   const props = {
-    "aria-label": label, "aria-invalid": Boolean(error), "aria-describedby": error ? errorId : undefined,
+    id, "aria-label": label, "aria-invalid": Boolean(error), "aria-describedby": [describedBy, error ? errorId : undefined].filter(Boolean).join(" ") || undefined,
     value: draft, placeholder, maxLength,
     onChange: (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => { setDraft(event.target.value); setError(null); },
     onCompositionStart: () => { composing.current = true; },
@@ -65,7 +66,7 @@ export function CommitField({ label, value, onCommit, validate, multiline = fals
   </div>;
 }
 
-export function GainSlider({ value, onCommit, label }: { value: number; onCommit: (value: number) => void; label: string }) {
+export function GainSlider({ value, onCommit, label, id, "aria-describedby": describedBy }: { value: number; onCommit: (value: number) => void; label: string; id?: string; "aria-describedby"?: string }) {
   const [draft, setDraft] = useState(value);
   const latest = useRef(value);
   const committed = useRef(value);
@@ -76,8 +77,32 @@ export function GainSlider({ value, onCommit, label }: { value: number; onCommit
       onCommit(latest.current);
     }
   }
-  return <label className="range-control"><input aria-label={label} type="range" min="25" max="400" step="5" value={draft}
+  return <label className="range-control"><input id={id} aria-label={label} aria-describedby={describedBy} type="range" min="25" max="400" step="5" value={draft}
     onPointerDown={(event) => event.currentTarget.setPointerCapture?.(event.pointerId)}
     onChange={(event) => { const next = Number(event.target.value); latest.current = next; setDraft(next); }}
     onPointerUp={commit} onPointerCancel={commit} onKeyUp={commit} onBlur={commit} /><output>{draft}%</output></label>;
+}
+
+export function StepSlider<T extends string>({ value, options, onCommit, label, id, "aria-describedby": describedBy }: {
+  value: T; options: readonly { value: T; label: string }[]; onCommit: (value: T) => void; label: string; id?: string; "aria-describedby"?: string;
+}) {
+  const [draft, setDraft] = useState(value);
+  const latest = useRef(value);
+  const committed = useRef(value);
+  useEffect(() => { setDraft(value); latest.current = value; committed.current = value; }, [value]);
+  const index = Math.max(0, options.findIndex(option => option.value === draft));
+  function commit() {
+    if (latest.current !== committed.current) { committed.current = latest.current; onCommit(latest.current); }
+  }
+  return <div className="step-slider">
+    <div className="step-slider-track">
+      <input id={id} type="range" aria-label={label} aria-describedby={describedBy} aria-valuetext={options[index]?.label}
+        min={0} max={options.length - 1} step={1} value={index}
+        onPointerDown={event => event.currentTarget.setPointerCapture?.(event.pointerId)}
+        onChange={event => { const next = options[Number(event.target.value)]?.value; if (next !== undefined) { latest.current = next; setDraft(next); } }}
+        onPointerUp={commit} onPointerCancel={commit} onKeyUp={commit} onBlur={commit} />
+      <div className="step-slider-ticks" aria-hidden="true">{options.map(option => <span key={option.value} />)}</div>
+    </div>
+    <output>{options[index]?.label}</output>
+  </div>;
 }

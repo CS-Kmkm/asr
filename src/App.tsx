@@ -55,7 +55,9 @@ import type {
 import { ModelProgressBar } from "./components/ui";
 import { DashboardPage } from "./pages/DashboardPage";
 import { SetupPage } from "./pages/SetupPage";
-import { SettingsPage } from "./pages/SettingsPage";
+import { ApiKeySettings } from "./components/ApiKeySettings";
+import { SettingsPage, type SettingsSection } from "./pages/SettingsPage";
+import { Icon, type IconName } from "./components/Icon";
 import { ModelsPage } from "./pages/ModelsPage";
 import { HistoryPage } from "./pages/HistoryPage";
 import { DictionaryPage } from "./pages/DictionaryPage";
@@ -86,7 +88,7 @@ type Page =
   | "diagnostics";
 
 const pages: Array<{ id: Page; label: MessageKey }> = [
-  { id: "dashboard", label: "Status" },
+  { id: "dashboard", label: "Home" },
   { id: "setup", label: "Setup" },
   { id: "models", label: "Models" },
   { id: "settings", label: "Settings" },
@@ -94,6 +96,17 @@ const pages: Array<{ id: Page; label: MessageKey }> = [
   { id: "dictionary", label: "Dictionary" },
   { id: "privacy", label: "Privacy" },
   { id: "diagnostics", label: "Diagnostics" },
+];
+
+const primaryPages = pages.filter(item => ["dashboard", "history", "dictionary"].includes(item.id));
+const pageIcons: Record<Page, IconName> = { dashboard: "home", history: "history", dictionary: "dictionary", settings: "settings", models: "model", privacy: "shield", setup: "setup", diagnostics: "diagnostics" };
+const settingsPages: Array<{ id: Page; section?: SettingsSection; label: MessageKey; navLabel?: MessageKey; icon: IconName }> = [
+  { id: "settings", section: "input", label: "Input settings", icon: "microphone" },
+  { id: "settings", section: "shortcuts", label: "Voice mode shortcuts", navLabel: "Shortcuts", icon: "keyboard" },
+  { id: "settings", section: "writing", label: "Writing and translation", icon: "writing" },
+  { id: "models", label: "Models", icon: "model" },
+  { id: "privacy", label: "Privacy", icon: "shield" },
+  { id: "settings", section: "general", label: "General", icon: "appearance" },
 ];
 
 const phaseMessageKeys: Record<AppState["phase"], MessageKey> = {
@@ -205,6 +218,14 @@ export default function App() {
 function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Settings["uiLanguage"]) => void }) {
   const { language, t } = useI18n();
   const [page, setPage] = useState<Page>("dashboard");
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("input");
+  const settingsArea = !primaryPages.some(item => item.id === page);
+  const pageLabel = settingsPages.find(item => item.id === page && (!item.section || item.section === settingsSection))?.label
+    ?? pages.find(item => item.id === page)?.label ?? "Home";
+  useEffect(() => {
+    document.documentElement.scrollTop = 0;
+    document.body.scrollTop = 0;
+  }, [page, settingsSection]);
   const [state, setState] = useState<AppState>({
     phase: "idle",
     stage: "idle",
@@ -712,33 +733,35 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       <aside>
         <div className="brand">
           <span className="brand-mark">LV</span>
-          <div>
+          <div className="sr-only">
             <strong>{t("Local Voice")}</strong>
             <small>{t("Windows input")}</small>
           </div>
         </div>
-        <nav>
-          {pages.map((item) => (
-            <button
-              key={item.id}
-              className={page === item.id ? "active" : ""}
-              aria-current={page === item.id ? "page" : undefined}
-              onClick={() => setPage(item.id)}
-            >
-              {t(item.label)}
-            </button>
+        <nav aria-label={t("Main navigation")}>
+          {primaryPages.map(item => (
+            <button key={item.id} aria-label={t(item.label)} title={t(item.label)} className={page === item.id ? "active" : ""} aria-current={page === item.id ? "page" : undefined} onClick={() => setPage(item.id)}><Icon name={pageIcons[item.id]} /></button>
           ))}
+          <div className="nav-divider" />
+          <button aria-label={t("Settings")} title={t("Settings")} className={settingsArea ? "active" : ""} onClick={() => setPage("settings")}><Icon name="settings" /></button>
+          {settingsArea && <div className="settings-nav">
+            {settingsPages.map(item => {
+              const active = page === item.id && (!item.section || settingsSection === item.section);
+              return <button key={item.section ?? item.id} aria-label={t(item.navLabel ?? item.label)} title={t(item.navLabel ?? item.label)} className={active ? "active" : ""} aria-current={active ? "page" : undefined} onClick={() => {
+                if (item.section) setSettingsSection(item.section);
+                setPage(item.id);
+              }}><Icon name={item.icon} /></button>;
+            })}
+            <div className="nav-divider" />
+            {pages.filter(item => ["setup", "diagnostics"].includes(item.id)).map(item => <button key={item.id} aria-label={t(item.label)} title={t(item.label)} className={page === item.id ? "active" : ""} aria-current={page === item.id ? "page" : undefined} onClick={() => setPage(item.id)}><Icon name={pageIcons[item.id]} /></button>)}
+          </div>}
         </nav>
-        <div className="local-badge">
-          <span /> {t("Local processing default")}
-        </div>
       </aside>
 
       <main>
         <header>
           <div>
-            <p className="eyebrow">{t("LOCAL AI VOICE INPUT")}</p>
-            <h1>{t(pages.find((item) => item.id === page)?.label ?? "Status")}</h1>
+            <h1>{t(pageLabel)}</h1>
           </div>
           <div className={`status-pill ${state.phase}`}>
             <span />
@@ -750,7 +773,10 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
           <DashboardPage
             state={localizedState}
             settings={settings}
-            history={history}
+            onOpenModels={() => setPage("models")}
+            onOpenPrivacy={() => setPage("privacy")}
+            onOpenHistory={() => setPage("history")}
+            onOpenShortcuts={() => { setSettingsSection("shortcuts"); setPage("settings"); }}
             model={model}
             statusLabel={statusLabel}
             recordingAction={recordingAction}
@@ -784,8 +810,9 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
           />
         )}
 
-        {page === "settings" && (
+        {settingsArea && (
         <SettingsPage
+            section={page === "settings" ? settingsSection : "none"}
             settings={settings}
             devices={devices}
             onRefreshDevices={() => void refreshDevices()}
@@ -794,8 +821,8 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
           />
         )}
 
-        {page === "models" && (
-          <ModelsPage
+        {settingsArea && (
+          <div className="settings-stack" hidden={page !== "models"}><ModelsPage
             onOpenLogs={() => void openLogs()}
             gpu={gpu}
             settings={settings}
@@ -806,7 +833,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             onConfigureModel={(configuration) => void prepareModel(configuration)}
             onSaveCustomModel={saveCustomModel}
             onDiagnoseGpu={() => void diagnoseGpu()}
-          />
+          /><ApiKeySettings settings={settings} /></div>
         )}
 
         {page === "history" && (

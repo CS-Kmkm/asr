@@ -1,7 +1,7 @@
 import { ShortcutField } from "../components/ShortcutField";
 import { useState } from "react";
 import { SetupTests } from "../components/SetupTests";
-import { ModelProgressBar, SettingRow } from "../components/ui";
+import { HelpHint, IconButton, ModelProgressBar, SettingRow } from "../components/ui";
 import type { AppState, AudioDevice, GpuDiagnostics, ModelProgress, Settings, UiLanguage } from "../types";
 import { translateAppMessage, useI18n, type MessageKey } from "../i18n";
 
@@ -59,15 +59,13 @@ export function SetupPage({
   const [testing, setTesting] = useState(false);
   return (
     <section className="panel">
-      <p className="eyebrow">{t("FIRST RUN")}</p>
-      <h2>{t("Configure local dictation")}</h2>
-      <p className="lead">{t("Speech recognition is local by default. Cloud services require consent; downloads begin only when you load a model.")}</p>
-      <div className="steps">
+      <div className="setting-title section-title"><h2>{t("Configure local dictation")}</h2><HelpHint label={t("Configure local dictation")}>{t("Speech recognition is local by default. Cloud services require consent; downloads begin only when you load a model.")}</HelpHint></div>
+      <div className="setup-step"><h3><span>1</span>{t("Microphone and shortcut")}</h3><div className="steps">
         <SettingRow
           title={t("Microphone")}
           detail={t("Captured only while recording.")}
           control={
-            <div><select
+            <div className="inline-control"><select
               value={settings.microphoneId ?? ""}
               onChange={(e) =>
                 onSettingsChange({ ...settings, microphoneId: e.target.value || null })
@@ -81,7 +79,7 @@ export function SetupPage({
                   {device.isDefault ? ` (${t("default")})` : ""}
                 </option>
               ))}
-            </select>{onRefreshDevices && <button type="button" className="secondary" onClick={onRefreshDevices}>{t("Refresh microphones")}</button>}</div>
+            </select>{onRefreshDevices && <IconButton icon="refresh" label={t("Refresh microphones")} onClick={onRefreshDevices} />}</div>
           }
         />
         <SettingRow
@@ -91,6 +89,8 @@ export function SetupPage({
             <ShortcutField label={t("Global hotkey")} value={settings.shortcuts.dictate[0]} onChange={(value) => onSettingsChange({ ...settings, shortcuts: { ...settings.shortcuts, dictate: [value, ...settings.shortcuts.dictate.slice(1)] } })} />
           }
         />
+      </div></div>
+      <div className="setup-step"><h3><span>2</span>{t("Prepare speech model")}</h3><div className="steps">
         <SettingRow
           title={t("ASR model")}
           detail={t("Choose a speech backend on the Models page, then load it explicitly before finishing setup.")}
@@ -100,7 +100,7 @@ export function SetupPage({
             </button>
           }
         />
-        <SettingRow
+        <details className="utility-disclosure"><summary>{t("GPU")}</summary>        <SettingRow
           title={t("GPU")}
           detail={gpuSummary(gpu, t, language)}
           control={
@@ -109,16 +109,22 @@ export function SetupPage({
             </button>
           }
         />
+</details>
         {onLoadModel && <SettingRow title={t("Download and load speech model")}
           detail={t("This action may download model files. Progress and download size appear while the model is prepared.")}
           control={<button className="secondary" disabled={modelLoading} onClick={onLoadModel}>{t("Download and load speech model")}</button>} />}
       </div>
       {progress && <ModelProgressBar progress={progress} />}
+      </div>
+      <div className="setup-step"><h3><span>3</span>{t("Check your setup")}</h3>
       {appState && onPrepareTest && <SetupTests state={appState} modelReady={modelReady} disabled={testsDisabled || modelLoading} onPrepare={onPrepareTest} onBusyChange={setTesting} />}
-      {!modelReady && <p>{t("Load the selected speech model before finishing setup.")}</p>}
+      </div>
+      <div className="action-icons">
       <button className="primary" disabled={!modelReady || modelLoading || testing} onClick={onFinish}>
         {t("Finish setup")}
       </button>
+      {!modelReady && <HelpHint label={t("Finish setup")}>{t("Load the selected speech model before finishing setup.")}</HelpHint>}
+      </div>
     </section>
   );
 }

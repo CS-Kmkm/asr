@@ -36,10 +36,11 @@ function purgeCountWithin(next: HistoryRetention, timeoutMs: number) {
 
 // Callers disable it until the stored retention is known; otherwise the
 // comparison would run against the default value and could skip the prompt.
-export function HistoryRetentionSelect({ value, disabled = false, onChange }: {
+export function HistoryRetentionSelect({ value, disabled = false, onChange, id, "aria-describedby": describedBy }: {
   value: HistoryRetention;
   disabled?: boolean;
   onChange: (value: HistoryRetention) => void;
+  id?: string; "aria-describedby"?: string;
 }) {
   const { t } = useI18n();
   const current = useRef(value);
@@ -85,7 +86,7 @@ export function HistoryRetentionSelect({ value, disabled = false, onChange }: {
     }
   }
 
-  return <select value={value} disabled={disabled || counting} aria-busy={counting} aria-label={t("History retention")} onChange={(event) => {
+  return <select id={id} aria-describedby={describedBy} value={value} disabled={disabled || counting} aria-busy={counting} aria-label={t("History retention")} onChange={(event) => {
     const next = event.target.value as HistoryRetention;
     if (shortensHistoryRetention(value, next)) void confirmShortening(next);
     else onChange(next);

@@ -1,6 +1,6 @@
 import { act, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { CommitField, GainSlider, validateEnvironmentName, validateModel } from "../components/CommitField";
+import { CommitField, GainSlider, StepSlider, validateEnvironmentName, validateModel } from "../components/CommitField";
 import { normalizeShortcutText, ShortcutField, shortcutFromEvent } from "../components/ShortcutField";
 import { AiCorrectionSettings } from "../components/AiCorrectionSettings";
 import { SettingsPage } from "../pages/SettingsPage";
@@ -88,6 +88,43 @@ test("gain commits only once after dragging and once after a keyboard adjustment
   expect(save.mock.calls).toEqual([[200], [205]]);
 });
 
+test("discrete sliders map stored values, defer commits and accept external updates", () => {
+  const save = vi.fn();
+  const options = [{ value: "off", label: "Off" }, { value: "low", label: "Low" }, { value: "medium", label: "Medium" }, { value: "high", label: "High" }] as const;
+  const view = render(<StepSlider label="Noise" value="off" options={options} onCommit={save} />);
+  const slider = screen.getByRole("slider", { name: "Noise" });
+  fireEvent.change(slider, { target: { value: "1" } });
+  fireEvent.change(slider, { target: { value: "3" } });
+  expect(slider.getAttribute("aria-valuetext")).toBe("High");
+  expect(save).not.toHaveBeenCalled();
+  fireEvent.pointerUp(slider); fireEvent.blur(slider);
+  expect(save.mock.calls).toEqual([["high"]]);
+  fireEvent.change(slider, { target: { value: "2" } }); fireEvent.keyUp(slider, { key: "ArrowLeft" });
+  expect(save.mock.calls).toEqual([["high"], ["medium"]]);
+  view.rerender(<StepSlider label="Noise" value="low" options={options} onCommit={save} />);
+  expect(slider).toHaveProperty("value", "1");
+  expect(slider.getAttribute("aria-valuetext")).toBe("Low");
+  fireEvent.blur(slider);
+  expect(save).toHaveBeenCalledTimes(2);
+});
+
+test("noise and reasoning sliders preserve every existing enum value", () => {
+  const save = vi.fn();
+  const view = render(<I18nProvider language="en"><SettingsPage section="input" settings={defaultSettings} onSave={save} devices={[]} recording={false} /></I18nProvider>);
+  const noise = screen.getByRole("slider", { name: "Noise suppression" });
+  for (const [index, noiseSuppression] of ["off", "low", "medium", "high"].entries()) {
+    fireEvent.change(noise, { target: { value: String(index) } }); fireEvent.pointerUp(noise);
+    if (noiseSuppression !== defaultSettings.noiseSuppression || index > 0) expect(save).toHaveBeenLastCalledWith({ noiseSuppression });
+  }
+  view.rerender(<I18nProvider language="en"><AiCorrectionSettings settings={{ ...defaultSettings, correctionProvider: "openai" }} onSave={save} /></I18nProvider>);
+  const reasoning = screen.getByRole("slider", { name: "Reasoning effort" });
+  save.mockClear();
+  for (const [index, openaiReasoningEffort] of ["none", "low", "medium", "high", "xhigh", "max"].entries()) {
+    fireEvent.change(reasoning, { target: { value: String(index) } }); fireEvent.keyUp(reasoning, { key: "ArrowRight" });
+    if (openaiReasoningEffort !== defaultSettings.openaiReasoningEffort || index > 0) expect(save).toHaveBeenLastCalledWith({ openaiReasoningEffort });
+  }
+});
+
 test("recorder normalizes physical keys and legacy aliases", async () => {
   expect(shortcutFromEvent({ code: "KeyA", ctrlKey: true, altKey: false, shiftKey: true, metaKey: false })).toBe("Ctrl+Shift+A");
   expect(normalizeShortcutText("shift+control+KeyA")).toBe("Ctrl+Shift+A");
@@ -125,6 +162,21 @@ test("errors survive later success; queued success expires after dismissal", () 
   expect(result.current.notice).toBeNull();
 });
 
+test("shortcut icon switches to cancel and releases capture without restarting", async () => {
+  render(<I18nProvider language="en"><ShortcutField label="Shortcut" value="Ctrl+T" onChange={vi.fn()} /></I18nProvider>);
+  const record = screen.getByRole("button", { name: "Record shortcut" });
+  expect(record.textContent).toBe("");
+  expect(record.title).toBe("Record shortcut");
+  await act(async () => { fireEvent.click(record); });
+  const cancel = screen.getByRole("button", { name: "Cancel" });
+  expect(cancel.title).toBe("Cancel");
+  expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "Shortcut" }));
+  expect(fireEvent.mouseDown(cancel)).toBe(false);
+  await act(async () => { fireEvent.click(cancel); });
+  expect(screen.getByRole("button", { name: "Record shortcut" })).toBeTruthy();
+  expect(vi.mocked(setShortcutCapture).mock.calls.map(([, active]) => active)).toEqual([true, false]);
+});
+
 test("a recorder unmounted during activation releases the late native lease", async () => {
   let complete!: () => void;
   vi.mocked(setShortcutCapture).mockImplementationOnce(() => new Promise<void>((resolve) => { complete = resolve; }));
@@ -137,9 +189,58 @@ test("a recorder unmounted during activation releases the late native lease", as
 });
 
 test("grouped selects and profile guidance have distinct accessible names", () => {
-  render(<I18nProvider language="en"><SettingsPage settings={{ ...defaultSettings, globalStyleProfile: { formality: "formal", detail: "concise", guidance: "" } }} onSave={vi.fn()} devices={[]} recording={false} /></I18nProvider>);
-  for (const name of ["Current translation target", "Language to add", "Global profile formality", "Global profile detail"]) expect(screen.getByRole("combobox", { name })).toBeTruthy();
+  render(<I18nProvider language="en"><SettingsPage settings={{ ...defaultSettings, personalizationEnabled: true, globalStyleProfile: { formality: "formal", detail: "concise", guidance: "" } }} onSave={vi.fn()} devices={[]} recording={false} /></I18nProvider>);
+  for (const name of ["Current translation target", "Translation source language", "Global profile formality", "Global profile detail"]) expect(screen.getByRole("combobox", { name })).toBeTruthy();
   expect(screen.getByRole("textbox", { name: "Global profile guidance" })).toBeTruthy();
+});
+
+test("disabled personalization collapses its editor while preserving the guidance draft", () => {
+  const save = vi.fn();
+  const settings = { ...defaultSettings, globalStyleProfile: { formality: "formal" as const, detail: "concise" as const, guidance: "Saved" } };
+  const view = (enabled: boolean) => <I18nProvider language="en"><SettingsPage section="writing" settings={{ ...settings, personalizationEnabled: enabled }} onSave={save} devices={[]} recording={false} /></I18nProvider>;
+  const app = render(view(false));
+  expect(screen.queryByRole("combobox", { name: "Global style preset" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Personalization" }));
+  expect(save).toHaveBeenCalledExactlyOnceWith({ personalizationEnabled: true });
+  app.rerender(view(true));
+  fireEvent.change(screen.getByRole("textbox", { name: "Global profile guidance" }), { target: { value: "Draft" } });
+  app.rerender(view(false));
+  expect(screen.queryByRole("textbox", { name: "Global profile guidance" })).toBeNull();
+  app.rerender(view(true));
+  expect(screen.getByRole("textbox", { name: "Global profile guidance" })).toHaveProperty("value", "Draft");
+  expect(save).toHaveBeenCalledTimes(1);
+});
+
+test("translation settings choose a distinct pair and swap direction atomically", () => {
+  const save = vi.fn();
+  const view = (settings = defaultSettings) => <I18nProvider language="en"><SettingsPage section="writing" settings={settings} onSave={save} devices={[]} recording={false} /></I18nProvider>;
+  const app = render(view());
+  const source = screen.getByRole("combobox", { name: "Translation source language" }) as HTMLSelectElement;
+  const target = screen.getByRole("combobox", { name: "Current translation target" }) as HTMLSelectElement;
+  expect(source.value).toBe("ja"); expect(target.value).toBe("en");
+  expect([...source.options].some(option => option.value === "en")).toBe(false);
+  expect([...target.options].some(option => option.value === "ja")).toBe(false);
+  expect(screen.queryByRole("button", { name: "Add language" })).toBeNull();
+  expect(save).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Swap languages" }));
+  expect(save).toHaveBeenLastCalledWith({ translationTargetLanguages: ["en", "ja"], translationTargetLanguage: "ja" });
+  app.rerender(view({ ...defaultSettings, translationTargetLanguage: "ja" }));
+  expect(source.value).toBe("en"); expect(target.value).toBe("ja");
+  fireEvent.change(source, { target: { value: "fr" } });
+  expect(save).toHaveBeenLastCalledWith({ translationTargetLanguages: ["fr", "ja"], translationTargetLanguage: "ja" });
+  fireEvent.change(target, { target: { value: "ko" } });
+  expect(save).toHaveBeenLastCalledWith({ translationTargetLanguages: ["en", "ko"], translationTargetLanguage: "ko" });
+});
+
+test.each([{ candidates: ["ja"] }, { candidates: ["en", "ja", "fr"] }])("legacy translation candidates render without saving and normalize on interaction (%j)", ({ candidates }) => {
+  const save = vi.fn();
+  const target = candidates[candidates.length - 1];
+  render(<I18nProvider language="en"><SettingsPage section="writing" settings={{ ...defaultSettings, translationTargetLanguages: candidates, translationTargetLanguage: target }} onSave={save} devices={[]} recording={false} /></I18nProvider>);
+  const source = screen.getByRole("combobox", { name: "Translation source language" }) as HTMLSelectElement;
+  expect(source.value).not.toBe(target);
+  expect(save).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole("button", { name: "Swap languages" }));
+  expect(save).toHaveBeenCalledExactlyOnceWith({ translationTargetLanguages: [target, source.value], translationTargetLanguage: source.value });
 });
 
 test("overlapping recorder starts keep only the latest activation when IPC completes in reverse", async () => {

@@ -1,5 +1,5 @@
-import { SettingRow, Toggle } from "./ui";
-import { CommitField, validateModel, validateEnvironmentName, validateLocalEndpoint } from "./CommitField";
+import { HelpHint, SettingRow, Toggle } from "./ui";
+import { CommitField, StepSlider, validateModel, validateEnvironmentName, validateLocalEndpoint } from "./CommitField";
 import type { Settings } from "../types";
 import { useI18n } from "../i18n";
 
@@ -16,14 +16,15 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
       <div className="ai-correction-header">
         <div>
       <h2>{t("AI text correction")}</h2>
-          <p className="muted">
-            {t("Dictation sends its transcript to the selected provider only when AI correction is on. Voice and selected-text Translate send text whenever used. Speak to edit sends selected source text and the transcribed spoken instruction whenever used. Ask sends only the transcribed spoken instruction to the selected provider for planning; answer generation using a selection also sends that selected source text with the instruction. Translate, Speak to edit, and Ask work even when Dictation AI correction is off. These text-processing requests do not send audio, but the selected ASR backend may.")}
-          </p>
         </div>
         <div className="ai-correction-master">
           <span className={`ai-correction-status ${settings.textCorrectionEnabled ? "on" : ""}`}>
             {status}
           </span>
+          <HelpHint label={t("AI text correction")}>{[settings.textCorrectionEnabled
+            ? t("AI correction is applied before text is inserted. If the API fails, the original transcript is used.")
+            : t("AI correction requests are disabled for Dictation. Translate, Speak to edit, and Ask still use the selected provider when invoked."),
+            t("Dictation sends its transcript to the selected provider only when AI correction is on. Voice and selected-text Translate send text whenever used. Speak to edit sends selected source text and the transcribed spoken instruction whenever used. Ask sends only the transcribed spoken instruction to the selected provider for planning; answer generation using a selection also sends that selected source text with the instruction. Translate, Speak to edit, and Ask work even when Dictation AI correction is off. These text-processing requests do not send audio, but the selected ASR backend may.")].join("\n\n")}</HelpHint>
           <Toggle
             checked={settings.textCorrectionEnabled}
             onChange={(value) => onSave({ textCorrectionEnabled: value })}
@@ -31,15 +32,9 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
           />
         </div>
       </div>
-      <p className="ai-correction-master-detail">
-        {settings.textCorrectionEnabled
-          ? t("AI correction is applied before text is inserted. If the API fails, the original transcript is used.")
-          : t("AI correction requests are disabled for Dictation. Translate, Speak to edit, and Ask still use the selected provider when invoked.")}
-      </p>
 
       <SettingRow
         title={t("Provider")}
-        detail={t("Choose the API used for correction. This can be configured while correction is off.")}
         control={
           <select
             value={settings.correctionProvider}
@@ -57,7 +52,11 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
       />
       <SettingRow
         title={t("Correction mode")}
-        detail={t("Conservative keeps utterance order. Intent-aware may reorganize phrasing within this transcript; it is instructed not to add details, does not learn automatically, and uses no context beyond the current transcript and profile. Only intent-aware results are checked for changed numbers, URLs, backtick code, and uncertainty markers; a failed check inserts the original transcript. Names and other details are not checked.")}
+        detail={settings.correctionMode === "intent_aware"
+          ? t("Intent-aware: limited checks; names are unchecked. Failed checks keep the original.")
+          : t("Keep utterance order; intent-aware may reorganize phrasing.")}
+        detailMode={settings.correctionMode === "intent_aware" ? "inline" : "hint"}
+        help={t("Conservative keeps utterance order. Intent-aware may reorganize phrasing within this transcript; it is instructed not to add details, does not learn automatically, and uses no context beyond the current transcript and profile. Only intent-aware results are checked for changed numbers, URLs, backtick code, and uncertainty markers; a failed check inserts the original transcript. Names and other details are not checked.")}
         control={
           <select
             value={settings.correctionMode}
@@ -72,7 +71,6 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
       />
       <div className="correction-options-heading">
         <strong>{t("Automatic editing")}</strong>
-        <p>{t("Each operation is independently applied when AI text correction is enabled.")}</p>
       </div>
       <SettingRow
         title={t("Remove filler words")}
@@ -137,22 +135,9 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
             title={t("Reasoning effort")}
             detail={t("Choose the quality, latency, and cost tradeoff. None is fastest; high and above spend more time reasoning. Availability depends on the selected model.")}
             control={
-              <select
-                value={settings.openaiReasoningEffort}
-                onChange={(event) =>
-                  onSave({
-                    openaiReasoningEffort: event.target
-                      .value as Settings["openaiReasoningEffort"],
-                  })
-                }
-              >
-                <option value="none">{t("None — fastest")}</option>
-                <option value="low">{t("Low")}</option>
-                <option value="medium">{t("Medium — balanced")}</option>
-                <option value="high">{t("High")}</option>
-                <option value="xhigh">{t("XHigh")}</option>
-                <option value="max">{t("Max — quality first")}</option>
-              </select>
+              <StepSlider label={t("Reasoning effort")} value={settings.openaiReasoningEffort}
+                options={[{ value: "none", label: t("None — fastest") }, { value: "low", label: t("Low") }, { value: "medium", label: t("Medium — balanced") }, { value: "high", label: t("High") }, { value: "xhigh", label: t("XHigh") }, { value: "max", label: t("Max — quality first") }] as const}
+                onCommit={openaiReasoningEffort => onSave({ openaiReasoningEffort })} />
             }
           />
           <SettingRow
