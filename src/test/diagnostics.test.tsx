@@ -66,3 +66,19 @@ test("browser diagnostics do not invent a connected database", async () => {
   expect(screen.getAllByText("未確認").length).toBeGreaterThan(0);
   expect((screen.getByRole("button", { name: "診断結果をコピー" }) as HTMLButtonElement).disabled).toBe(true);
 });
+
+test("wide metric tables have independently focusable scroll regions with intact long codes", async () => {
+  const code = "long_diagnostic_code_".repeat(30);
+  vi.mocked(getStorageDiagnostics).mockResolvedValue({ ...report, outcomes: [{ ...report.outcomes[0], code }] });
+  show();
+  const tables = await screen.findAllByRole("table");
+  expect(tables).toHaveLength(2);
+  for (const table of tables) {
+    const region = table.closest(".diagnostics-table-scroll")!;
+    expect(region.getAttribute("role")).toBe("region");
+    expect(region.getAttribute("tabindex")).toBe("0");
+    expect(region.getAttribute("aria-label")).toBe(table.querySelector("caption")?.textContent);
+  }
+  expect(within(tables[1]).getByText(code)).toBeTruthy();
+  expect(getWorkerHealth).not.toHaveBeenCalled();
+});
