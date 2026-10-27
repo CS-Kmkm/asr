@@ -5,6 +5,13 @@
 
 | 分類 | 契約 | 扱い |
 |---|---|---|
+| active | [UI review fixes](ui-review-fixes.md) | Four findings fixed; 155 tests/build/review passed; native keyboard/layout verification pending |
+| active | [Remaining explanation cleanup](ui-explanation-cleanup.md) | Redundant copy removed/help consolidated; tests/build/review passed; native visual verification pending |
+| active | [Screen density pass](ui-density-pass.md) | Horizontal groups and compact spacing implemented; 151 tests/build/review passed; native visual verification pending |
+| active | [Translation language pair](translation-pair-ui.md) | Pair controls implemented; 150 tests/build/review passed; native visual verification pending |
+| active | [Icon controls and diagnostics](ui-icons-and-diagnostics.md) | Implementation, automated checks and independent review complete; native visual verification pending due to Computer Use connection failure |
+| completed | [Progressive settings help — #72](ui-progressive-help.md) | Hover/focus help and concise settings copy verified; uncommitted |
+| completed | [UI refinement — #72](ui-refinement.md) | Implementation, automated checks and native visual validation complete; uncommitted |
 | active | [未解決 issue の対応](issue-58-64-error-and-model-loading.md) | 現在の実装、自動検証、実機確認の残件を管理 |
 | archived | 上記以外の契約 | 統合済みの作業、旧設計、当時の調査・検証の記録 |
 
