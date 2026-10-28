@@ -5,6 +5,7 @@
 
 | 分類 | 契約 | 扱い |
 |---|---|---|
+| active | [UI polish pass](ui-polish-pass.md) | Remaining inconsistencies fixed; 160 tests/build/review passed; native visual verification pending |
 | active | [UI review fixes](ui-review-fixes.md) | Four findings fixed; 155 tests/build/review passed; native keyboard/layout verification pending |
 | active | [Remaining explanation cleanup](ui-explanation-cleanup.md) | Redundant copy removed/help consolidated; tests/build/review passed; native visual verification pending |
 | active | [Screen density pass](ui-density-pass.md) | Horizontal groups and compact spacing implemented; 151 tests/build/review passed; native visual verification pending |
