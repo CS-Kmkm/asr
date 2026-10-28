@@ -82,11 +82,12 @@ test("the Privacy page explains and toggles failed-take retention next to Histor
   const titles = rows.map((row) => row.props.title);
   assert.deepEqual(titles.slice(0, 3), ["Delete audio after processing", "History retention", KEEP_TITLE]);
   const keep = rows[2];
-  assert.match(keep.props.detail, /24 hours/);
-  assert.match(keep.props.detail, /History retention is Never/);
-  assert.match(keep.props.detail, /Delete audio after processing is on/);
-  assert.match(keep.props.detail, /for Edit, the selected text/);
-  assert.match(rows[0].props.detail, /except failed recordings kept by the setting below/);
+  assert.match(keep.props.detail, /retained even with History off/);
+  assert.match(keep.props.help, /24 hours/);
+  assert.match(keep.props.help, /History retention is Never/);
+  assert.match(keep.props.help, /Delete audio after processing is on/);
+  assert.match(keep.props.help, /for Edit, the selected text/);
+  assert.match(rows[0].props.help, /except failed recordings kept by the setting below/);
   assert.equal(keep.props.control.props.checked, true);
   keep.props.control.props.onChange(false);
   assert.deepEqual(patches, [{ keepFailedTakes: false }]);
@@ -129,30 +130,33 @@ test("cloud consent is explicit, revocable and scoped to the speech endpoint", (
 test("Dashboard distinguishes local, cloud speech and cloud AI settings", () => {
   const { DashboardPage } = load("../src/pages/DashboardPage.tsx", {
     "../components/RecordingLevel": { RecordingLevel: "recording-level" },
-    "../components/ui": { InfoCard: "card" },
-    "../i18n": { useI18n: () => ({ t: (key) => key }) },
+    "../components/ui": { HelpHint: "help", IconButton: "icon-button" },
+    "../i18n": { useI18n: () => ({ language: "en", t: (key) => key }), translateAppMessage: (_language, message) => message },
   });
-  const render = (settings) => {
-    const tree = DashboardPage({ settings, state: { phase: "idle", lastResult: null }, history: [], level: {}, model: null });
-    return tree.props.children.flat().find((node) => node?.type === "card" && node.props.label === "PRIVACY").props;
+  const flow = (settings) => {
+    const tree = DashboardPage({ settings, state: { phase: "idle", lastResult: null }, model: null, statusLabel: "Idle", recordingAction: false });
+    const rows = nodes(tree).find((node) => node.type === "dl").props.children;
+    return Object.fromEntries(rows.map((row) => row.props.children.map(text)));
   };
-  assert.equal(render({ ...defaultSettings, correctionProvider: "local" }).value, "Local only");
-  assert.equal(render({ ...defaultSettings, correctionProvider: "gemini" }).warning, false);
-  assert.equal(render({ ...defaultSettings, correctionProvider: "gemini", cloudConsents: ["gemini"] }).warning, true);
-  assert.match(render({ ...defaultSettings, asrBackend: "openai-compatible", cloudConsents: [`asr:${defaultSettings.apiBaseUrl}`] }).detail, /Recordings are sent/);
-  const mixed = render({ ...defaultSettings, asrBackend: "openai-compatible", cloudConsents: ["openai"] });
-  assert.match(mixed.detail, /Cloud speech is blocked/);
-  assert.doesNotMatch(mixed.detail, /recognition stays local/);
-  const both = render({ ...defaultSettings, asrBackend: "openai-compatible", cloudConsents: ["openai", `asr:${defaultSettings.apiBaseUrl}`] });
-  assert.match(both.detail, /Recordings are sent/);
-  assert.match(both.detail, /AI modes send text/);
+  const local = flow({ ...defaultSettings, correctionProvider: "local" });
+  assert.equal(local["Speech recognition"], "Local only");
+  assert.equal(local["AI text processing"], "Local only");
+  assert.equal(flow({ ...defaultSettings, correctionProvider: "gemini" })["AI text processing"], "Cloud consent required");
+  assert.equal(flow({ ...defaultSettings, correctionProvider: "gemini", cloudConsents: ["gemini"] })["AI text processing"], "Cloud");
+  assert.equal(flow({ ...defaultSettings, asrBackend: "openai-compatible", cloudConsents: [`asr:${defaultSettings.apiBaseUrl}`] })["Speech recognition"], "Cloud");
+  const mixed = flow({ ...defaultSettings, asrBackend: "openai-compatible", correctionProvider: "openai", cloudConsents: ["openai"] });
+  assert.equal(mixed["Speech recognition"], "Cloud consent required");
+  assert.equal(mixed["AI text processing"], "Cloud");
+  const both = flow({ ...defaultSettings, asrBackend: "openai-compatible", correctionProvider: "openai", cloudConsents: ["openai", `asr:${defaultSettings.apiBaseUrl}`] });
+  assert.deepEqual(both, { "Speech recognition": "Cloud", "AI text processing": "Cloud" });
 });
 
 function historyPage(settings, history) {
   const { HistoryPage } = load("../src/pages/HistoryPage.tsx", {
     react: hooks,
-    "../components/ui": { Empty: "empty" },
+    "../components/ui": { Empty: "empty", HelpHint: "help", IconButton: "icon-button" },
     "../components/HistoryRetentionSelect": { HistoryRetentionSelect: "retention-select" },
+    "../types": load("../src/types.ts"),
     "../i18n": { ...i18n, insertionDetailLabels: {}, insertionOutcomeLabels: {} },
   });
   const noop = () => {};
@@ -185,7 +189,7 @@ test("History off still lists failed takes kept for Retry", () => {
   assert.equal(listed.some((node) => node.type === "empty"), false);
   assert.ok(listed.some((node) => text(node) === "History is off. Failed recordings (and, for Edit, the selected text) are kept here for 24 hours so you can retry them."));
   assert.ok(listed.some((node) => node.type === "small" && text(node).startsWith("Deleted automatically:")));
-  const retry = listed.find((node) => node.type === "button" && text(node) === "Retry");
+  const retry = listed.find((node) => node.type === "icon-button" && node.props.label === "Retry");
   assert.equal(retry.props.disabled, false);
 });
 
