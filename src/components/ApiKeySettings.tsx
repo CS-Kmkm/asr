@@ -1,11 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { getProviderCredentials, updateProviderCredential } from "../api";
 import { useI18n } from "../i18n";
 import type { CredentialProvider, CredentialStatus, Settings } from "../types";
+import { HelpHint, IconButton } from "./ui";
 
 const providers = ["openai", "gemini", "speech"] as const;
 
 export function ApiKeySettings({ settings }: { settings: Settings }) {
+  const fieldId = useId();
   const { t } = useI18n();
   const [statuses, setStatuses] = useState<CredentialStatus[]>([]);
   const [drafts, setDrafts] = useState<Record<CredentialProvider, string>>({ openai: "", gemini: "", speech: "" });
@@ -68,19 +70,20 @@ export function ApiKeySettings({ settings }: { settings: Settings }) {
     finally { if (id === generation.current) setWriting(false); }
   }
 
-  return <section className="panel">
-    <h2>{t("Provider API keys")}</h2>
-    <p>{t("Keys saved here use Windows Credential Manager and take effect without restarting. They are not saved in Settings or History. Environment and .env keys remain a fallback. Finish voice operations before changing keys.")}</p>
+  return <section className="panel api-key-settings">
+    <div className="setting-title section-title"><h2>{t("Provider API keys")}</h2><HelpHint label={t("Provider API keys")}>{t("Keys saved here use Windows Credential Manager and take effect without restarting. They are not saved in Settings or History. Environment and .env keys remain a fallback. Finish voice operations before changing keys.")}</HelpHint></div>
     {providers.map((provider) => {
       const status = statuses.find((entry) => entry.provider === provider && entry.alias === aliases[provider].trim().toUpperCase());
       const label = provider === "speech" ? t("Speech API key") : provider === "openai" ? t("OpenAI API key") : t("Gemini API key");
       const valid = /^[\x21-\x7e]{1,2048}$/.test(drafts[provider]);
-      return <form key={provider} onSubmit={(event) => { event.preventDefault(); if (!busy && valid && status?.storeAvailable) void update(provider, drafts[provider]); }}>
-        <label>{label}<input type="password" autoComplete="new-password" spellCheck={false} maxLength={2048} disabled={busy || !status?.storeAvailable} value={drafts[provider]} onChange={(event) => setDrafts((old) => ({ ...old, [provider]: event.target.value }))} /></label>
-        <p>{aliases[provider]} — {t(!status ? "Not checked" : status.source === "credential_manager" ? "Saved in Credential Manager" : status.source === "environment" ? "Environment fallback" : "Not configured")}</p>
-        {status && !status.storeAvailable && <p>{t("Credential Manager is unavailable in this environment.")}</p>}
-        <button type="submit" className="secondary" disabled={busy || !valid || !status?.storeAvailable}>{t("Save key")}</button>
-        <button type="button" className="secondary" disabled={busy || !status?.storeAvailable || status.source !== "credential_manager"} onClick={() => void update(provider, null)}>{t("Delete saved key")}</button>
+      return <form className="credential-row" key={provider} onSubmit={(event) => { event.preventDefault(); if (!busy && valid && status?.storeAvailable) void update(provider, drafts[provider]); }}>
+        <div className="credential-identity"><label htmlFor={`${fieldId}-${provider}`}>{label}</label>
+          <small id={`${fieldId}-${provider}-status`}>{aliases[provider]} — {t(!status ? "Not checked" : status.source === "credential_manager" ? "Saved in Credential Manager" : status.source === "environment" ? "Environment fallback" : "Not configured")}</small>
+        </div>
+        <input id={`${fieldId}-${provider}`} aria-describedby={`${fieldId}-${provider}-status`} type="password" autoComplete="new-password" spellCheck={false} maxLength={2048} disabled={busy || !status?.storeAvailable} value={drafts[provider]} onChange={(event) => setDrafts((old) => ({ ...old, [provider]: event.target.value }))} />
+        <IconButton icon="save" label={t("Save key")} type="submit" disabled={busy || !valid || !status?.storeAvailable} />
+        <IconButton icon="trash" label={t("Delete saved key")} className="danger-button" disabled={busy || !status?.storeAvailable || status.source !== "credential_manager"} onClick={() => void update(provider, null)} />
+        {status && !status.storeAvailable && <p className="credential-warning">{t("Credential Manager is unavailable in this environment.")}</p>}
       </form>;
     })}
     {notice && <p role="status">{t(notice === "saved" ? "API key saved" : "Saved key deleted. Environment fallback may still apply.")}</p>}

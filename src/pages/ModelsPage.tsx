@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
-import { ModelProgressBar, SettingRow } from "../components/ui";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { HelpHint, IconButton, ModelProgressBar, SettingRow } from "../components/ui";
 import type {
   AsrBackend,
   CustomModel,
@@ -74,6 +74,9 @@ export function ModelsPage({
   const [apiBaseUrl, setApiBaseUrl] = useState(settings.apiBaseUrl);
   const [apiKeyEnvVar, setApiKeyEnvVar] = useState(settings.apiKeyEnvVar);
   const [modalOpen, setModalOpen] = useState(false);
+  const modalRef = useRef<HTMLDialogElement>(null);
+  const launcherRef = useRef<HTMLSelectElement>(null);
+  const modelIdRef = useRef<HTMLInputElement>(null);
   const [draftBackend, setDraftBackend] = useState<AsrBackend>(settings.asrBackend);
   const [draftModelId, setDraftModelId] = useState("");
   const [savingCustomModel, setSavingCustomModel] = useState(false);
@@ -96,12 +99,15 @@ export function ModelsPage({
 
   useEffect(() => {
     if (!modalOpen) return;
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !savingCustomModel) setModalOpen(false);
+    const dialog = modalRef.current;
+    const launcher = launcherRef.current;
+    dialog?.showModal();
+    modelIdRef.current?.focus();
+    return () => {
+      dialog?.close();
+      if (launcher?.isConnected) launcher.focus();
     };
-    document.addEventListener("keydown", closeOnEscape);
-    return () => document.removeEventListener("keydown", closeOnEscape);
-  }, [modalOpen, savingCustomModel]);
+  }, [modalOpen]);
 
   const customModels = useMemo(() => {
     const saved = [...settings.customModels];
@@ -148,17 +154,15 @@ export function ModelsPage({
   return (
     <section className="grid">
       <article className="panel span-2">
-        <p className="eyebrow">{t("ASR BACKEND")}</p>
-        <h2>{t("Select a backend and load it")}</h2>
-        <p className="lead">
-          {t("Choose a local model or an OpenAI-compatible transcription endpoint. Local model files are downloaded on first use and cached.")}
-        </p>
+        <div className="setting-title section-title"><h2>{t("ASR model")}</h2>{backend !== "openai-compatible" && <HelpHint label={t("ASR model")}>{t("First load may download a model.")}</HelpHint>}</div>
+
         <div className="steps model-settings">
           <SettingRow
             title={t("ASR backend")}
             detail={localizedBackendDetails[backend]}
             control={
               <select
+                ref={launcherRef}
                 value={selectedValue}
                 onChange={(event) => {
                   const value = event.target.value;
@@ -203,7 +207,7 @@ export function ModelsPage({
               </select>
             }
           />
-          {backend === "faster-whisper" && <SettingRow title={t("Speech device")} detail={t("Auto retries caught CUDA failures on CPU. Explicit CUDA reports an error instead. The environment option preserves ASR_DEVICE.")}
+          {backend === "faster-whisper" && <SettingRow title={t("Speech device")} help={t("Auto retries caught CUDA failures on CPU. Explicit CUDA reports an error instead. The environment option preserves ASR_DEVICE.")}
             control={<select aria-label={t("Speech device")} value={device ?? ""} onChange={(event) => setDevice((event.target.value || null) as Settings["asrDevice"])}>
               <option value="">{t("Environment (auto by default)")}</option>
               <option value="auto">{t("Auto (CUDA with CPU fallback)")}</option>
@@ -256,7 +260,7 @@ export function ModelsPage({
             />
           )}
         </div>
-        <button
+        <div className="model-load-actions"><button
           className="primary"
           onClick={() =>
             onConfigureModel({
@@ -274,39 +278,34 @@ export function ModelsPage({
         </button>
         {model && <div role={model.state === "error" ? "alert" : "status"}>
           <strong>{t(model.state === "ready" ? "Ready" : model.state === "loading" ? "Model loading" : model.state === "error" ? "Model error" : "Model not loaded")}</strong>
-          <p>{translateAppMessage(language, model.detail)}</p>
+          {model.state === "error" || model.state === "loading" ? <p>{translateAppMessage(language, model.detail)}</p>
+            : <HelpHint label={t("ASR model")}>{[translateAppMessage(language, model.detail), t("If recording starts before loading, Local Voice automatically prepares the selected backend.")].filter(Boolean).join("\n\n")}</HelpHint>}
           {model.state === "error" && onOpenLogs && <button className="secondary" onClick={onOpenLogs}>{t("Open diagnostic logs")}</button>}
         </div>}
+        </div>
         {progress && <ModelProgressBar progress={progress} />}
-        <p className="model-note">
-          {t("If recording starts before loading, Local Voice automatically prepares the selected backend.")}
-        </p>
       </article>
 
-      <article className="panel span-2">
-        <p className="eyebrow">{t("GPU")}</p>
+      <details className="panel span-2 utility-disclosure"><summary>{t("GPU")}</summary>
         <h2>{gpu?.adapterName ?? t("Not checked")}</h2>
-        <p>{gpu ? translateAppMessage(language, gpu.recommendation) : t("Run diagnostics to check NVIDIA availability and VRAM.")}</p>
+        {gpu && <p>{translateAppMessage(language, gpu.recommendation)}</p>}
         {gpu?.memoryTotalMb && <strong>{gpu.memoryTotalMb} MB VRAM</strong>}
         <br />
         <button className="secondary" onClick={onDiagnoseGpu}>
           {t("Run diagnostics")}
         </button>
-      </article>
+      </details>
 
       {modalOpen && (
-        <div className="modal-backdrop" onMouseDown={() => !savingCustomModel && setModalOpen(false)}>
+        <dialog ref={modalRef} className="model-dialog" aria-labelledby="additional-model-title"
+          onCancel={event => { event.preventDefault(); if (!savingCustomModel) setModalOpen(false); }}
+          onMouseDown={event => { if (event.target === event.currentTarget && !savingCustomModel) setModalOpen(false); }}>
           <div
             className="modal-card"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="additional-model-title"
             onMouseDown={(event) => event.stopPropagation()}
           >
             <form onSubmit={(event) => void saveAdditionalModel(event)}>
-              <p className="eyebrow">{t("ADDITIONAL MODEL")}</p>
               <h2 id="additional-model-title">{t("Add an ASR model")}</h2>
-              <p>{t("The model will be saved and available from the ASR backend list.")}</p>
               <label className="modal-field">
                   <strong>{t("Model type")}</strong>
                 <select
@@ -323,6 +322,7 @@ export function ModelsPage({
               <label className="modal-field">
                   <strong>{t("Model ID")}</strong>
                 <input
+                  ref={modelIdRef}
                   value={draftModelId}
                   placeholder={
                     draftBackend === "openai-compatible"
@@ -335,25 +335,19 @@ export function ModelsPage({
                 />
               </label>
               <div className="modal-actions">
-                <button
-                  type="button"
-                  className="secondary"
+                <IconButton icon="close" label={t("Cancel")}
                   onClick={() => setModalOpen(false)}
                   disabled={savingCustomModel}
-                >
-                  {t("Cancel")}
-                </button>
-                <button
+                />
+                <IconButton icon="add" label={savingCustomModel ? t("Saving...") : t("Add Model")}
                   type="submit"
                   className="primary"
                   disabled={savingCustomModel || !draftModelId.trim()}
-                >
-                  {savingCustomModel ? t("Saving...") : t("Add Model")}
-                </button>
+                />
               </div>
             </form>
           </div>
-        </div>
+        </dialog>
       )}
     </section>
   );

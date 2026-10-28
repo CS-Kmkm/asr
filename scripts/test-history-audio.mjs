@@ -75,7 +75,6 @@ function nodes(tree) {
   })(tree);
   return found;
 }
-const text = (node) => [node.props.children].flat().filter((part) => typeof part === "string").join("");
 
 // Renders the History page once and returns its Play and Download handlers
 // together with what they did to the stubbed DOM.
@@ -95,8 +94,9 @@ function historyPage(onLoadAudio) {
   };
   const { HistoryPage } = load("../src/pages/HistoryPage.tsx", {
     react: { useState: (initial) => [initial, (value) => effects.states.push(value)], useEffect() {} },
-    "../components/ui": { Empty: "empty" },
+    "../components/ui": { Empty: "empty", HelpHint: "help", IconButton: "icon-button" },
     "../components/HistoryRetentionSelect": { HistoryRetentionSelect: "retention-select" },
+    "../types": load("../src/types.ts"),
     "../i18n": { useI18n: () => ({ language: "en", t: (key) => key }), insertionDetailLabels: {}, insertionOutcomeLabels: {} },
   }, globals);
   const noop = () => {};
@@ -105,7 +105,7 @@ function historyPage(onLoadAudio) {
     filter: "all", onSave: noop, onFilter: noop, onCopyItem: noop, onRetry: noop, onDelete: noop,
     onDeleteAll: noop, onLoadAudio, onAudioError: () => effects.errors++, retryActive: false, onCancelRetry: noop,
   });
-  const button = (label) => nodes(tree).find((node) => node.type === "button" && text(node) === label);
+  const button = (label) => nodes(tree).find((node) => node.type === "icon-button" && node.props.label === label);
   return { effects, play: () => button("Play").props.onClick(), download: () => button("Download").props.onClick() };
 }
 const settle = async () => { for (let i = 0; i < 4; i++) await new Promise(setImmediate); };

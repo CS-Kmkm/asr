@@ -1,0 +1,11 @@
+# Translation language pair UI
+
+Goal: Replace the multi-target list in writing settings with two language selectors, a directional arrow and a right-edge swap icon.
+
+Scope: SettingsPage translation controls, shared swap icon, localized labels/help, layout and behavior tests. Reuse existing translationTargetLanguages and translationTargetLanguage persistence and backend cycling. Input language remains automatically detected; the left selector chooses the reverse direction's target, not an ASR restriction. Do not change global speech locale or translation/history provider behavior.
+
+Acceptance: Exactly two distinct supported language selections; swap atomically saves the reverse target and pair; either selector atomically saves the pair/current target; existing singleton or multi-target settings can render without an unsolicited save and normalize to the chosen pair on interaction. No language-add/reorder/delete controls. Preserve provider disclosure. Test direction, distinctness, persisted external updates, legacy values, and no unrelated setting changes. Run relevant/full frontend tests, build, diff check and independent review. Native visual verification depends on Computer Use availability.
+
+Implementation: Two distinct language selectors, directional arrow and rightmost swap icon replace list/add/reorder/delete controls. Pair edits and swapping save both candidates and the active target atomically. Global speech locale and backend behavior/schema remain unchanged; source input is still automatically detected. Existing singleton/multi-target settings render without an unsolicited save, then become a pair when explicitly edited/swapped. External settings changes update both selections.
+
+Validation: 150 tests across 17 files passed, including exact pair writes, swapping, exclusion of equal languages, external updates and legacy singleton/multi-target behavior. TypeScript/Vite build and diff check passed. Logs: .ai/test-results/ui-translation-pair-tests.log and ui-translation-pair-build.log. Independent review identified an old select-adjacent-button top margin applying to swap; the old rule now excludes translation-pair, and the reviewer confirmed no remaining actionable finding. Native visual verification remains pending because Computer Use's native pipe is unavailable. No commit/push authorized.

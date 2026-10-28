@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { setShortcutCapture } from "../api";
 import { translateAppMessage, useI18n } from "../i18n";
+import { Icon } from "./Icon";
 
 const keyNames: Record<string, string> = { Escape: "Esc", Space: "Space", ArrowUp: "Up", ArrowDown: "Down", ArrowLeft: "Left", ArrowRight: "Right" };
 function keyName(code: string): string | null {
@@ -32,9 +33,10 @@ export function normalizeShortcutText(text: string): string | null {
 
 let newestCapture = 0;
 let activeRecorder: { id: number; release: () => void } | null = null;
-export function ShortcutField({ label, value, onChange, onKeyDown, conflict = false }: {
+export function ShortcutField({ label, value, onChange, onKeyDown, conflict = false, id, "aria-describedby": describedBy }: {
   label: string; value: string; onChange: (value: string) => void;
   onKeyDown?: (event: KeyboardEvent<HTMLInputElement>) => void; conflict?: boolean;
+  id?: string; "aria-describedby"?: string;
 }) {
   const { t, language } = useI18n();
   const [recording, setRecording] = useState(false);
@@ -85,7 +87,7 @@ export function ShortcutField({ label, value, onChange, onKeyDown, conflict = fa
     } catch (error) { if (lease.current === id) { lease.current = null; setError(String(error)); } }
   }
   return <div className="shortcut-field">
-    <input ref={input} aria-label={label} value={value} readOnly={recording} aria-invalid={invalid || conflict || Boolean(error)}
+    <input ref={input} id={id} aria-label={label} aria-describedby={describedBy} value={value} readOnly={recording} aria-invalid={invalid || conflict || Boolean(error)}
       placeholder={recording ? t("Press a key combination") : undefined}
       onChange={(event) => { setError(null); onChange(event.target.value); }}
       onBlur={() => { if (recording) finish(); }}
@@ -98,7 +100,13 @@ export function ShortcutField({ label, value, onChange, onKeyDown, conflict = fa
         if (chord) finish(chord);
         else if (!["Control", "Alt", "Shift", "Meta"].includes(event.key)) setError(t("Unsupported shortcut key"));
       }} />
-    <button type="button" className="secondary" onClick={() => recording ? finish() : void start()}>{recording ? t("Cancel") : t("Record shortcut")}</button>
+    <button type="button" className={`icon-button${recording ? " primary" : ""}`}
+      aria-label={recording ? t("Cancel") : t("Record shortcut")}
+      title={recording ? t("Cancel") : t("Record shortcut")}
+      onMouseDown={event => { if (recording) event.preventDefault(); }}
+      onClick={() => recording ? finish() : void start()}>
+      <Icon name={recording ? "close" : "keyboard"} />
+    </button>
     {recording && <span role="status">{t("Press a key combination")}</span>}
     {(error || conflict || invalid) && <p className="settings-warning" role="alert">{error ? translateAppMessage(language, error) : invalid ? t("Unsupported shortcut key") : t("Shortcuts must be non-empty and unique across all actions.")}</p>}
   </div>;

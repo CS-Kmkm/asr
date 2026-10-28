@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { ModelProgressBar } from "../components/ui";
 import { expect, test, vi } from "vitest";
 import { defaultSettings } from "../api";
@@ -57,4 +57,38 @@ test("Models applies the selected speech device and tracks confirmed settings ch
   expect(configure).toHaveBeenLastCalledWith(expect.objectContaining({ asrDevice: null }));
   app.rerender(<I18nProvider language="en"><ModelsPage {...props} settings={{ ...defaultSettings, asrBackend: "vibevoice" }} /></I18nProvider>);
   expect(screen.queryByRole("combobox", { name: "Speech device" })).toBeNull();
+});
+
+test("custom model dialog uses native modal lifecycle and restores launcher focus on cancel", () => {
+  const show = vi.spyOn(HTMLDialogElement.prototype, "showModal");
+  const close = vi.spyOn(HTMLDialogElement.prototype, "close");
+  render(<I18nProvider language="en"><ModelsPage settings={defaultSettings} gpu={null} asrBackendOptions={[{ value: "faster-whisper", label: "Whisper model" }]} modelLoading={false} onConfigureModel={vi.fn()} onSaveCustomModel={async () => true} onDiagnoseGpu={vi.fn()} /></I18nProvider>);
+  const launcher = screen.getByRole("combobox", { name: "ASR backend" });
+  act(() => launcher.focus());
+  fireEvent.change(launcher, { target: { value: "__additional_model__" } });
+  const dialog = screen.getByRole("dialog", { name: "Add an ASR model" });
+  expect(show).toHaveBeenCalledOnce();
+  expect(dialog.hasAttribute("open")).toBe(true);
+  expect(document.activeElement).toBe(within(dialog).getByRole("textbox", { name: "Model ID" }));
+  fireEvent(dialog, new Event("cancel", { cancelable: true }));
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(close).toHaveBeenCalledOnce();
+  expect(document.activeElement).toBe(launcher);
+  show.mockRestore(); close.mockRestore();
+});
+
+test("saving a custom model guards dismissal and restores focus after success", async () => {
+  let saved!: (value: boolean) => void;
+  render(<I18nProvider language="en"><ModelsPage settings={defaultSettings} gpu={null} asrBackendOptions={[{ value: "faster-whisper", label: "Whisper model" }]} modelLoading={false} onConfigureModel={vi.fn()} onSaveCustomModel={() => new Promise(resolve => { saved = resolve; })} onDiagnoseGpu={vi.fn()} /></I18nProvider>);
+  const launcher = screen.getByRole("combobox", { name: "ASR backend" });
+  fireEvent.change(launcher, { target: { value: "__additional_model__" } });
+  const dialog = screen.getByRole("dialog");
+  fireEvent.change(within(dialog).getByRole("textbox", { name: "Model ID" }), { target: { value: "model-id" } });
+  fireEvent.click(within(dialog).getByRole("button", { name: "Add Model" }));
+  fireEvent(dialog, new Event("cancel", { cancelable: true }));
+  fireEvent.mouseDown(dialog);
+  expect(screen.getByRole("dialog")).toBe(dialog);
+  await act(async () => saved(true));
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(document.activeElement).toBe(launcher);
 });

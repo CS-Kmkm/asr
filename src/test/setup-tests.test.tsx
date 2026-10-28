@@ -47,7 +47,7 @@ test("automatic completion displays raw text and copies it without requiring a s
   await waitFor(() => expect(startDictationTest).toHaveBeenCalledOnce());
   app.update({ ...idle, phase: "completed", stage: "completed", operationId: 7, lastResult: "recognized sample" });
   expect(await screen.findByText("recognized sample")).toBeTruthy();
-  fireEvent.click(screen.getByText("Copy result"));
+  fireEvent.click(screen.getByRole("button", { name: "Copy result" }));
   await waitFor(() => expect(copyToClipboard).toHaveBeenCalledWith("recognized sample"));
 });
 

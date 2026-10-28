@@ -123,6 +123,11 @@ export const speechLocaleRegistry = [
   { tag: "pt-PT", label: "Portuguese (Portugal)" },
 ] as const;
 export type SpeechLocale = (typeof speechLocaleRegistry)[number]["tag"];
+/** Translation target codes the UI offers, with their English catalogue labels. */
+export const translationLanguageRegistry = [
+  { code: "en", label: "English" }, { code: "ja", label: "Japanese" }, { code: "zh", label: "Chinese" }, { code: "es", label: "Spanish" },
+  { code: "fr", label: "French" }, { code: "pt", label: "Portuguese" }, { code: "de", label: "German" }, { code: "ko", label: "Korean" },
+] as const;
 export type HistoryRetention = "never" | "24_hours" | "one_week" | "one_month" | "three_months" | "one_year" | "forever";
 
 export type HistoryTextAction = { kind: "correct"; profile: string | null } | { kind: "translate"; target: string };

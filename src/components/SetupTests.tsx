@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { cancelSetupTest, copyToClipboard, startDictationTest, stopDictationTest, testInsertion } from "../api";
 import { translateAppMessage, useI18n } from "../i18n";
 import type { AppState } from "../types";
+import { HelpHint, IconButton } from "./ui";
 
 export function SetupTests({ state, modelReady, disabled, onPrepare, onBusyChange }: {
   state: AppState; modelReady: boolean; disabled: boolean;
@@ -54,15 +55,14 @@ export function SetupTests({ state, modelReady, disabled, onPrepare, onBusyChang
     finally { if (mounted.current) setCancelling(false); }
   }
   return <fieldset className="setup-tests">
-    <legend>{t("Try dictation and insertion")}</legend>
-    <p>{t("Dictation tests show raw recognized text without AI correction, insertion or History. Cloud speech still requires consent.")}</p>
+    <legend>{t("Try dictation and insertion")} <HelpHint label={t("Try dictation and insertion")}>{t("Dictation tests show raw recognized text without AI correction, insertion or History. Cloud speech still requires consent.")}</HelpHint></legend>
     <button type="button" disabled={disabled || pending || active || busy || !modelReady} onClick={() => { void run(() => start(false)); }}>{t("Test dictation")}</button>
     <button type="button" disabled={pending || cancelling || !ours || !active || state.phase !== "recording" || state.operation !== "dictation_test"} onClick={() => { void run(async () => { await stopDictationTest(ownedId!); }); }}>{t("Stop test and transcribe")}</button>
-    <p>{t("Insertion test: switch to a text field in another app within 3 seconds. A fixed sample will be pasted there.")}</p>
+    <p className="compact-note">{t("Switch to another app's text field within 3 seconds; a sample will be inserted.")}</p>
     <button type="button" disabled={disabled || pending || active || busy} onClick={() => { void run(() => start(true)); }}>{t("Test insertion")}</button>
     <button type="button" disabled={cancelling || !active} onClick={() => { void cancel(); }}>{t("Cancel test")}</button>
     {ours && state.message && <p role="status">{translateAppMessage(language, state.message, state.messageCode)}</p>}
-    {result !== null && <div><pre>{result}</pre><button type="button" disabled={pending} onClick={() => { void run(() => copyToClipboard(result)); }}>{t("Copy result")}</button></div>}
+    {result !== null && <div><pre>{result}</pre><IconButton icon="copy" label={t("Copy result")} disabled={pending} onClick={() => { void run(() => copyToClipboard(result)); }} /></div>}
     {error && <p role="alert">{t("Setup test failed. Check the app status and try again.")}</p>}
   </fieldset>;
 }

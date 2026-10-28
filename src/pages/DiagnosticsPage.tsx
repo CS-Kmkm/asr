@@ -1,4 +1,4 @@
-import { InfoCard } from "../components/ui";
+import { HelpHint, IconButton, InfoCard } from "../components/ui";
 import { useEffect, useState } from "react";
 import { copyToClipboard, getStorageDiagnostics, getWorkerHealth } from "../api";
 import type { AppState, GpuDiagnostics, StorageDiagnostics, WorkerHealth } from "../types";
@@ -62,34 +62,28 @@ export function DiagnosticsPage({
     catch { setWorkerFailed(true); }
     finally { setWorkerChecking(false); }
   }
-  return (
-    <section className="panel">
-      <p className="lead">{t("Copied diagnostics contain status codes, software versions and hardware metadata. Audio, transcripts, clipboard contents, window titles, paths and API keys are excluded.")}</p>
-      <div className="diagnostic-grid">
-        <InfoCard label={t("DATABASE")} value={t(failed || report?.databaseOk === false ? "Database check failed" : report?.databaseOk ? "Connected" : "Not checked")} detail={report ? `${t("Schema version")}: ${report.schemaVersion}` : t("Run database check")} />
-        <InfoCard
-          label={t("APP STATE")}
-          value={statusLabel}
-          detail={`${t("Updated")} ${new Date(state.updatedAt).toLocaleTimeString()}`}
-        />
-        <InfoCard
-          label={t("GPU")}
-          value={gpu ? t(gpu.status === "available" ? "Available" : gpu.status === "unsupported" ? "Unsupported" : "Unavailable") : t("Not checked")}
-          detail={gpu?.adapterName ?? t("Run the hardware probe")}
-        />
+  return <section className="diagnostics-page">
+    <div className="diagnostics-actions">
+      <IconButton icon="model" label={t("Run GPU probe")} onClick={onDiagnoseGpu} />
+      {onOpenLogs && <IconButton icon="folder" label={t("Open diagnostic logs")} onClick={onOpenLogs} />}
+      <IconButton icon="database" label={t("Run database check")} disabled={checking} onClick={() => void refresh()} />
+      <IconButton icon="copy" label={t("Copy diagnostics")} disabled={!report || checking} onClick={() => void copyReport()} />
+      <HelpHint label={t("Copy diagnostics")}>{t("Copied diagnostics contain status codes, software versions and hardware metadata. Audio, transcripts, clipboard contents, window titles, paths and API keys are excluded.")}</HelpHint>
+      {copyStatus && <span role="status">{t(copyStatus === "copied" ? "Diagnostics copied" : "Diagnostics could not be copied")}</span>}
+    </div>
+    <div className="diagnostic-grid">
+      <InfoCard label={t("DATABASE")} value={t(failed || report?.databaseOk === false ? "Database check failed" : report?.databaseOk ? "Connected" : "Not checked")} detail={report ? `${t("Schema version")}: ${report.schemaVersion}` : t("Run database check")} />
+      <InfoCard label={t("APP STATE")} value={statusLabel} detail={`${t("Updated")} ${new Date(state.updatedAt).toLocaleTimeString()}`} />
+      <InfoCard label={t("GPU")} value={gpu ? t(gpu.status === "available" ? "Available" : gpu.status === "unsupported" ? "Unsupported" : "Unavailable") : t("Not checked")} detail={gpu?.adapterName ?? t("Run the hardware probe")} />
+    </div>
+
+    <section className="diagnostics-section">
+      <div className="section-heading">
+        <div className="setting-title section-title"><h2>{t("Worker environment")}</h2><HelpHint label={t("Worker environment")}>{t("This check starts a temporary worker if needed and may prepare dependencies. It does not load or restore a model. The Python path is shown locally and excluded from copied diagnostics.")}</HelpHint></div>
+        <IconButton icon="refresh" label={t("Check worker environment")} disabled={workerChecking} onClick={() => void checkWorker()} />
       </div>
-      <button className="secondary" onClick={onDiagnoseGpu}>
-        {t("Run GPU probe")}
-      </button>
-      {onOpenLogs && <button className="secondary" onClick={onOpenLogs}>{t("Open diagnostic logs")}</button>}
-      <button className="secondary" disabled={checking} onClick={() => void refresh()}>{t("Run database check")}</button>
-      <button className="secondary" disabled={!report || checking} onClick={() => void copyReport()}>{t("Copy diagnostics")}</button>
-      {copyStatus && <p role="status">{t(copyStatus === "copied" ? "Diagnostics copied" : "Diagnostics could not be copied")}</p>}
-      <h2>{t("Worker environment")}</h2>
-      <p>{t("This check starts a temporary worker if needed and may prepare dependencies. It does not load or restore a model. The Python path is shown locally and excluded from copied diagnostics.")}</p>
-      <button className="secondary" disabled={workerChecking} onClick={() => void checkWorker()}>{t("Check worker environment")}</button>
       {workerFailed && <p role="alert">{t("The worker health check could not be completed.")}</p>}
-      {!worker ? <p>{t("Not checked")}</p> : <dl>
+      {!worker ? <p className="compact-note">{t("Not checked")}</p> : <dl className="diagnostic-facts">
         <dt>{t("Python path")}</dt><dd>{worker.pythonPath}</dd>
         <dt>Python</dt><dd>{worker.pythonVersion}</dd>
         <dt>faster-whisper</dt><dd>{worker.fasterWhisperVersion ?? t("Not installed")}</dd>
@@ -99,25 +93,30 @@ export function DiagnosticsPage({
         <dt>{t("Selected device")}</dt><dd>{worker.device ?? t("Not checked")}</dd>
         <dt>{t("Compute type")}</dt><dd>{worker.computeType ?? t("Not checked")}</dd>
       </dl>}
-      <h2>{t("Retained performance metrics")}</h2>
-      <p>{t("Timings include successes and failures with a recorded duration. Percentiles use nearest rank. History retention and deletion also apply to these metrics.")}</p>
-      <p>{t("Custom model identifiers are grouped as other to exclude local paths from diagnostics.")}</p>
+    </section>
+
+    <section className="diagnostics-section">
+      <div className="setting-title section-title"><h2>{t("Retained performance metrics")}</h2><HelpHint label={t("Retained performance metrics")}>{[t("Timings include successes and failures with a recorded duration. Percentiles use nearest rank. History retention and deletion also apply to these metrics."), t("Custom model identifiers are grouped as other to exclude local paths from diagnostics.")].join("\n\n")}</HelpHint></div>
       {!report ? <p>{t("Not checked")}</p> : !report.summaries.length ? <p>{t("No retained metrics")}</p> : <>
-        <table>
-          <caption>{t("Performance by mode, category and provider")}</caption>
-          <thead><tr>{(["Event", "Mode", "App category", "Provider", "Samples", "Successes", "Timed samples", "p50 (ms)", "p95 (ms)"] as const).map((label) => <th scope="col" key={label}>{t(label)}</th>)}</tr></thead>
-          <tbody>{report.summaries.map((row) => <tr key={JSON.stringify([row.eventType, row.mode, row.appCategory, row.provider])}>
-            <th scope="row">{row.eventType}</th><td>{row.mode ?? "—"}</td><td>{row.appCategory ?? "—"}</td><td>{row.provider ?? "—"}</td><td>{row.count}</td><td>{row.successes}</td><td>{row.timedCount}</td><td>{row.p50Ms ?? "—"}</td><td>{row.p95Ms ?? "—"}</td>
-          </tr>)}</tbody>
-        </table>
-        <table>
-          <caption>{t("Outcome codes")}</caption>
-          <thead><tr>{(["Event", "Mode", "App category", "Provider", "Outcome", "Code", "Samples"] as const).map((label) => <th scope="col" key={label}>{t(label)}</th>)}</tr></thead>
-          <tbody>{report.outcomes.map((row) => <tr key={JSON.stringify([row.eventType, row.mode, row.appCategory, row.provider, row.success, row.code])}>
-            <th scope="row">{row.eventType}</th><td>{row.mode ?? "—"}</td><td>{row.appCategory ?? "—"}</td><td>{row.provider ?? "—"}</td><td>{t(row.success ? "Success" : "Failure")}</td><td>{row.code ?? "—"}</td><td>{row.count}</td>
-          </tr>)}</tbody>
-        </table>
+        <div className="diagnostics-table-scroll" role="region" aria-label={t("Performance by mode, category and provider")} tabIndex={0}>
+          <table className="metric-summary">
+            <caption>{t("Performance by mode, category and provider")}</caption>
+            <thead><tr>{(["Event", "Mode", "App category", "Provider", "Samples", "Successes", "Timed samples", "p50 (ms)", "p95 (ms)"] as const).map(label => <th scope="col" key={label}>{t(label)}</th>)}</tr></thead>
+            <tbody>{report.summaries.map(row => <tr key={JSON.stringify([row.eventType, row.mode, row.appCategory, row.provider])}>
+              <th scope="row">{row.eventType}</th><td>{row.mode ?? "—"}</td><td>{row.appCategory ?? "—"}</td><td>{row.provider ?? "—"}</td><td>{row.count}</td><td>{row.successes}</td><td>{row.timedCount}</td><td>{row.p50Ms ?? "—"}</td><td>{row.p95Ms ?? "—"}</td>
+            </tr>)}</tbody>
+          </table>
+        </div>
+        <div className="diagnostics-table-scroll" role="region" aria-label={t("Outcome codes")} tabIndex={0}>
+          <table className="metric-outcomes">
+            <caption>{t("Outcome codes")}</caption>
+            <thead><tr>{(["Event", "Mode", "App category", "Provider", "Outcome", "Code", "Samples"] as const).map(label => <th scope="col" key={label}>{t(label)}</th>)}</tr></thead>
+            <tbody>{report.outcomes.map(row => <tr key={JSON.stringify([row.eventType, row.mode, row.appCategory, row.provider, row.success, row.code])}>
+              <th scope="row">{row.eventType}</th><td>{row.mode ?? "—"}</td><td>{row.appCategory ?? "—"}</td><td>{row.provider ?? "—"}</td><td>{t(row.success ? "Success" : "Failure")}</td><td>{row.code ?? "—"}</td><td>{row.count}</td>
+            </tr>)}</tbody>
+          </table>
+        </div>
       </>}
     </section>
-  );
+  </section>;
 }

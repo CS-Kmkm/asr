@@ -45,7 +45,7 @@ function pageFixture(initial: Partial<Settings> = {}, optimistic = true) {
  escWarnings() { return queries.queryAllByRole("note").length; },
  };
 }
-function profileFixture(initial: Partial<Settings> = {}) { return pageFixture(initial); }
+function profileFixture(initial: Partial<Settings> = {}) { return pageFixture({ personalizationEnabled: true, ...initial }); }
 function shortcutFixture(settings: Settings = structuredClone(defaultSettings)) { const page=pageFixture(settings,false);return {...page,settings,blur:page.shortcutBlur,key:page.shortcutKey,value:page.shortcutValue}; }
 function microphoneFixture() {
  pageFixture();
