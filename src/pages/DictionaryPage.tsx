@@ -1,139 +1,109 @@
-import { useState } from "react";
-import { Empty } from "../components/ui";
-import type { DictionaryEntry, DictionaryEntryInput } from "../types";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Empty, HelpHint, IconButton } from "../components/ui";
+import type { DictionaryCandidate, DictionaryEntry, DictionaryEntryInput } from "../types";
 import { useI18n } from "../i18n";
 
-const EMPTY_FORM = {
-  reading: "",
-  surface: "",
-  category: "",
-  aliases: "",
-  priority: "0",
-};
+const emptyForm = { reading: "", surface: "", category: "", aliases: "", priority: "0", appScope: "" };
+type Form = typeof emptyForm;
 
-export function DictionaryPage({
-  entries,
-  onAdd,
-  onDelete,
-}: {
-  entries: DictionaryEntry[];
+// The backend stores priority as i64; a fractional or unsafe number would
+// otherwise fail deserialization with an untranslated error. New values must
+// fall in this range, but an entry's stored priority (for example from CSV
+// import) is kept as is so editing another field still saves.
+export const PRIORITY_MIN = -1_000_000;
+export const PRIORITY_MAX = 1_000_000;
+export function parsePriority(value: string, stored: number | null = null): number | null {
+  if (!value.trim()) return null;
+  const priority = Number(value);
+  if (!Number.isSafeInteger(priority)) return null;
+  return priority === stored || (priority >= PRIORITY_MIN && priority <= PRIORITY_MAX) ? priority : null;
+}
+
+function toInput(form: Form, priority: number): DictionaryEntryInput {
+  return {
+    reading: form.reading.trim(), surface: form.surface.trim(), category: form.category.trim() || null,
+    aliases: form.aliases.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+    priority, appScope: form.appScope.trim() || null,
+  };
+}
+
+export function DictionaryPage({ entries, candidates, onAdd, onUpdate, onDelete, onImport, onConfirmCandidate, onRejectCandidate }: {
+  entries: DictionaryEntry[]; candidates: DictionaryCandidate[];
   onAdd: (entry: DictionaryEntryInput) => Promise<boolean>;
-  onDelete: (id: number) => void;
+  onUpdate: (id: number, entry: DictionaryEntryInput) => Promise<boolean>;
+  onDelete: (id: number) => void; onImport: (csv: string) => Promise<boolean>;
+  onConfirmCandidate: (id: number) => void; onRejectCandidate: (id: number) => void;
 }) {
   const { t } = useI18n();
-  const [form, setForm] = useState(EMPTY_FORM);
+  const [form, setForm] = useState<Form>(emptyForm);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const editorRef = useRef<HTMLFormElement>(null);
+  const [editing, setEditing] = useState<number | null>(null);
+  useEffect(() => { if (editorOpen) editorRef.current?.querySelector<HTMLInputElement>("input")?.focus(); }, [editorOpen, editing]);
+  const [query, setQuery] = useState("");
+  const [source, setSource] = useState<"all" | "manual" | "auto">("all");
+  const [importError, setImportError] = useState(false);
+  const importInput = useRef<HTMLInputElement>(null);
+  const priorityInput = useRef<HTMLInputElement>(null);
+  const storedPriority = editing === null ? null : entries.find((entry) => entry.id === editing)?.priority ?? null;
+  const priorityInvalid = parsePriority(form.priority, storedPriority) === null;
+  const priorityMessage = t("Priority must be a whole number from -1000000 to 1000000.");
+  // Native step/min/max checks block submission before onSubmit runs, so a
+  // custom validity message keeps that native prompt translated too.
+  useEffect(() => priorityInput.current?.setCustomValidity(priorityInvalid ? priorityMessage : ""), [priorityInvalid, priorityMessage]);
+  const visible = useMemo(() => {
+    const needle = query.trim().toLocaleLowerCase();
+    return entries.filter((entry) => (source === "all" || entry.source === source) && (!needle || [entry.reading, entry.surface, entry.category ?? "", entry.aliases.join(" "), entry.appScope ?? ""].some((value) => value.toLocaleLowerCase().includes(needle))));
+  }, [entries, query, source]);
 
-  async function handleSubmit(event: React.FormEvent) {
+  async function submit(event: React.FormEvent) {
     event.preventDefault();
-    const aliases = form.aliases
-      .split(",")
-      .map((value) => value.trim())
-      .filter((value) => value.length > 0);
-    const priority = Number(form.priority);
-    const input: DictionaryEntryInput = {
-      reading: form.reading.trim(),
-      surface: form.surface.trim(),
-      category: form.category.trim() || null,
-      aliases,
-      priority: Number.isFinite(priority) ? priority : 0,
-    };
-    const ok = await onAdd(input);
-    if (ok) setForm(EMPTY_FORM);
+    const priority = parsePriority(form.priority, storedPriority);
+    if (priority === null) return;
+    const ok = editing === null ? await onAdd(toInput(form, priority)) : await onUpdate(editing, toInput(form, priority));
+    if (ok) { setForm(emptyForm); setEditing(null); setEditorOpen(false); }
   }
+  function edit(entry: DictionaryEntry) {
+    setEditorOpen(true);
+    setEditing(entry.id);
+    setForm({ reading: entry.reading, surface: entry.surface, category: entry.category ?? "", aliases: entry.aliases.join("\n"), priority: String(entry.priority), appScope: entry.appScope ?? "" });
+  }
+  async function importFile(file: File | undefined) {
+    if (!file) return;
+    let csv: string;
+    try {
+      const bytes = await file.arrayBuffer();
+      try {
+        csv = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      } catch {
+        csv = new TextDecoder("shift_jis", { fatal: true }).decode(bytes);
+      }
+    } catch {
+      setImportError(true);
+      return;
+    } finally {
+      if (importInput.current) importInput.current.value = "";
+    }
+    setImportError(false);
+    await onImport(csv);
+  }
+  return <section className="panel compact-page-panel">
+    <div className="dictionary-toolbar">
+      <input type="search" aria-label={t("Search dictionary")} placeholder={t("Search dictionary")} value={query} onChange={(event) => setQuery(event.target.value)} />
+      <select aria-label={t("Dictionary source")} value={source} onChange={(event) => setSource(event.target.value as typeof source)}><option value="all">{t("All")}</option><option value="auto">{t("Auto-added")}</option><option value="manual">{t("Manually-added")}</option></select>
+      {!editorOpen && <IconButton icon="add" label={t("Add entry")} className="primary" onClick={() => { setEditing(null); setForm(emptyForm); setEditorOpen(true); }} />}
+    </div>
+    <details className="utility-disclosure"><summary>{t("Import CSV")}</summary><HelpHint label={t("Import CSV")}>{t("CSV format help")}</HelpHint><input aria-label={t("Import CSV")} ref={importInput} type="file" accept=".csv,text/csv" onChange={(event) => void importFile(event.target.files?.[0])} /></details>
+    {importError && <p role="alert">{t("CSV encoding error")}</p>}
+    <form ref={editorRef} hidden={!editorOpen} className="steps dictionary-form" onSubmit={(event) => void submit(event)}>
+      {([ ["Reading", "reading", true], ["Surface", "surface", true], ["Category", "category", false], ["Aliases", "aliases", false], ["Scope", "appScope", false] ] as const).map(([label, key, required]) => <div className="setting-row" key={key}><div className="setting-title"><strong>{t(label)}</strong>{key === "aliases" && <HelpHint label={t(label)}>{t("One alias per line")}</HelpHint>}</div>{key === "aliases" ? <textarea aria-label={t(label)} placeholder={t("One alias per line")} value={form.aliases} onChange={(event) => setForm({ ...form, aliases: event.target.value })} /> : <input aria-label={t(label)} value={form[key]} required={required} onChange={(event) => setForm({ ...form, [key]: event.target.value })} />}</div>)}
+      <div className="setting-row"><div><strong>{t("Priority")}</strong></div><input ref={priorityInput} type="number" step={1} min={Math.min(PRIORITY_MIN, storedPriority ?? 0)} max={Math.max(PRIORITY_MAX, storedPriority ?? 0)} aria-label={t("Priority")} aria-invalid={priorityInvalid} value={form.priority} onChange={(event) => setForm({ ...form, priority: event.target.value })} /></div>
+      {priorityInvalid && <p className="settings-error" role="alert">{priorityMessage}</p>}
+      <div><IconButton icon={editing === null ? "add" : "save"} label={editing === null ? t("Add entry") : t("Save entry")} className="primary" type="submit" /><IconButton icon="close" label={t("Cancel")} type="button" onClick={() => { setEditing(null); setForm(emptyForm); setEditorOpen(false); }} /></div>
+    </form>
 
-  return (
-    <section className="panel compact-page-panel">
-      <form className="steps dictionary-form" onSubmit={(e) => void handleSubmit(e)}>
-        <div className="setting-row">
-          <div>
-          <strong>{t("Reading")}</strong>
-            <p>{t("How the term is spoken (e.g. かな or romaji).")}</p>
-          </div>
-          <input
-            value={form.reading}
-            onChange={(e) => setForm({ ...form, reading: e.target.value })}
-            required
-          />
-        </div>
-        <div className="setting-row">
-          <div>
-          <strong>{t("Surface")}</strong>
-            <p>{t("The exact text to produce when recognized.")}</p>
-          </div>
-          <input
-            value={form.surface}
-            onChange={(e) => setForm({ ...form, surface: e.target.value })}
-            required
-          />
-        </div>
-        <div className="setting-row">
-          <div>
-          <strong>{t("Category")}</strong>
-            <p>{t("Optional grouping label.")}</p>
-          </div>
-          <input
-            value={form.category}
-            onChange={(e) => setForm({ ...form, category: e.target.value })}
-          />
-        </div>
-        <div className="setting-row">
-          <div>
-          <strong>{t("Aliases")}</strong>
-            <p>{t("Optional, comma-separated alternative surfaces.")}</p>
-          </div>
-          <input
-            value={form.aliases}
-            onChange={(e) => setForm({ ...form, aliases: e.target.value })}
-          />
-        </div>
-        <div className="setting-row">
-          <div>
-          <strong>{t("Priority")}</strong>
-            <p>{t("Higher values win when readings collide.")}</p>
-          </div>
-          <input
-            type="number"
-            value={form.priority}
-            onChange={(e) => setForm({ ...form, priority: e.target.value })}
-          />
-        </div>
-        <button className="primary" type="submit">
-          {t("Add entry")}
-        </button>
-      </form>
 
-      {entries.length === 0 ? (
-        <Empty
-          title={t("No dictionary entries yet")}
-          detail={t("Add proper nouns and terms to improve recognition accuracy.")}
-        />
-      ) : (
-        <div className="history-list">
-          {entries.map((entry) => (
-            <div key={entry.id} className="setting-row">
-              <div>
-                <strong>{entry.surface}</strong>
-                <p>
-                  {entry.reading}
-                  {entry.category ? ` · ${entry.category}` : ""}
-                  {entry.aliases.length > 0 ? ` · ${t("aliases:")} ${entry.aliases.join(", ")}` : ""}
-                  {` · ${t("priority")} ${entry.priority}`}
-                </p>
-              </div>
-              <button
-                className="secondary"
-                onClick={() => {
-                  if (window.confirm(`${t("Delete dictionary entry")}: “${entry.surface}”`)) {
-                    onDelete(entry.id);
-                  }
-                }}
-              >
-                {t("Delete")}
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-    </section>
-  );
+    {candidates.length > 0 && <div className="history-list"><h2>{t("Suggested spellings")}</h2>{candidates.map((candidate) => <div className="setting-row" key={candidate.id}><p className="candidate-spans"><span>{candidate.originalSpan}</span> → <strong>{candidate.preferredSpan}</strong></p><div><IconButton icon="check" label={t("Confirm")} context={`${candidate.originalSpan} → ${candidate.preferredSpan}`} className="primary" onClick={() => onConfirmCandidate(candidate.id)} /><IconButton icon="close" label={t("Reject")} context={`${candidate.originalSpan} → ${candidate.preferredSpan}`} onClick={() => onRejectCandidate(candidate.id)} /></div></div>)}</div>}
+    {entries.length === 0 ? <Empty icon="dictionary" title={t("No dictionary entries yet")} /> : visible.length === 0 ? <Empty icon="search" title={t("No matching dictionary entries")} /> : <div className="history-list">{visible.map((entry) => <div key={entry.id} className="setting-row"><div className="dictionary-entry"><div className="dictionary-entry-title"><strong>{entry.surface}</strong>{entry.source === "auto" && <span className="entry-badge">{t("Auto-added")}</span>}{entry.priority !== 0 && <span className="entry-badge">{t("priority")} {entry.priority}</span>}{entry.appScope && <span className="entry-badge">{t("scope:")} {entry.appScope}</span>}</div><p>{entry.reading}{entry.category ? ` · ${entry.category}` : ""}{entry.aliases.length ? ` · ${t("aliases:")} ${entry.aliases.join(", ")}` : ""}</p></div><div><IconButton icon="writing" label={t("Edit")} context={`${entry.surface} (${entry.reading})${entry.appScope ? ` · ${entry.appScope}` : ""}`} onClick={() => edit(entry)} /><IconButton icon="trash" label={t("Delete")} context={`${entry.surface} (${entry.reading})${entry.appScope ? ` · ${entry.appScope}` : ""}`} className="danger-button" onClick={() => { if (window.confirm(`${t("Delete dictionary entry")}: “${entry.surface}”`)) onDelete(entry.id); }} /></div></div>)}</div>}
+  </section>;
 }

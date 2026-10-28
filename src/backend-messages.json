@@ -1,0 +1,928 @@
+{
+  "Insertion test stopped because your clipboard could not be saved for restoring. Copy a short plain-text sample and try again. Your clipboard was left unchanged.": {"code":"setup_clipboard_restore_protected","ja":"復元用にクリップボードを保存できなかったため、文字挿入テストを中止しました。短い文字列をコピーして、もう一度お試しください。クリップボードは変更していません。"},
+  "Insertion test could not access the clipboard. Close any clipboard menu and try again.": {"code":"setup_clipboard_busy","ja":"クリップボードにアクセスできませんでした。クリップボードのメニューなどを閉じて、文字挿入テストをやり直してください。"},
+  "local operation failed: the clipboard was left unchanged because it could not be saved for restoring": {"code":"clipboard_restore_protected_legacy","ja":"復元用にクリップボードを保存できなかったため、処理を中止しました。クリップボードは変更していません。"},
+  "There is not enough system memory to load this model. Close other apps or choose a smaller model.": {"code":"model_load_cpu_memory_exhausted","ja":"モデルの読み込みに必要なシステムメモリが不足しています。他のアプリを閉じるか、小さいモデルを選んでください。"},
+  "Transcription failed. Check the selected model and Diagnostics.": {"code":"asr_failed_check_model_and_diagnostics","ja":"文字起こしに失敗しました。選択したモデルと診断画面を確認してください。"},
+  "Not enough system memory for speech recognition. Choose a smaller model or a shorter recording.": {"code":"asr_cpu_memory_exhausted","ja":"音声認識に必要なシステムメモリが不足しています。小さいモデルか短い録音でお試しください。"},
+  "Not enough system memory for speech recognition. The recording was saved to History. Choose a smaller model before retrying.": {"code":"asr_cpu_memory_history_saved","ja":"音声認識に必要なシステムメモリが不足しています。録音は履歴に保存しました。小さいモデルを選んでから再試行してください。"},
+  "Not enough system memory for speech recognition. The recording is kept in History for 24 hours. Choose a smaller model before retrying.": {"code":"asr_cpu_memory_history_temporary","ja":"音声認識に必要なシステムメモリが不足しています。録音は履歴に24時間保持します。小さいモデルを選んでから再試行してください。"},
+  "Insertion test failed. Choose an editable field in another app and try again.": {"code":"setup_insertion_test_failed","ja":"文字挿入テストに失敗しました。別アプリの編集可能な入力欄を選び、もう一度お試しください。"},
+  "Dictation test completed without inserting text.": {"code":"setup_dictation_test_completed","ja":"音声認識テストが完了しました。文字挿入は行っていません。"},
+  "Switch to another app within 3 seconds to test insertion.": {"code":"setup_insertion_test_waiting","ja":"3秒以内に別アプリへ切り替えて、文字挿入を試してください。"},
+  "Insertion test completed.": {"code":"setup_insertion_test_completed","ja":"文字挿入テストが完了しました。"},
+  "The test text is on the clipboard; automatic insertion was skipped.": {"code":"setup_insertion_test_clipboard","ja":"テスト文をクリップボードにコピーしました。自動挿入は行っていません。"},
+  "The test paste was sent. Check the target app before pasting again.": {"code":"setup_insertion_test_unverified","ja":"テストの貼り付け操作を送りました。再度貼り付ける前に、対象アプリを確認してください。"},
+  "Setup test cancelled.": {"code":"setup_test_cancelled","ja":"テストをキャンセルしました。"},
+  "Choose another app for the insertion test.": {"code":"setup_test_target_required","ja":"文字挿入テストでは、別アプリへ切り替えてください。"},
+  "No dictation test is recording.": {"code":"setup_no_dictation_test","ja":"音声認識テストの録音は行われていません。"},
+  "Setup test failed.": {"code":"setup_test_failed","ja":"テストに失敗しました。"},
+  "Release the held shortcut before changing shortcut settings.": {
+    "code": "shortcut_settings_held",
+    "ja": "押しているショートカットを離してから、ショートカットの設定を変更してください。"
+  },
+  "Shortcut settings could not be loaded. Open Settings and try again.": {
+    "code": "shortcut_settings_unavailable",
+    "ja": "ショートカットの設定を読み込めませんでした。設定を開き、もう一度お試しください。"
+  },
+  "Configure a valid AI model in Settings before recording.": {
+    "code": "ai_invalid_model_configuration",
+    "ja": "録音前に、設定で有効なAIモデルを指定してください。"
+  },
+  "Conservative AI correction changed the transcript too much.": {
+    "code": "ai_conservative_content_changed",
+    "ja": "保守的なAI修正で元の文字起こしから大きな変更があったため、修正結果を採用しませんでした。"
+  },
+  "The diagnostics folder could not be opened.": {
+    "code": "diagnostics_folder_open_failed",
+    "ja": "診断ログのフォルダーを開けませんでした。"
+  },
+  "Transcribing with the configured speech provider.": {
+    "code": "transcribing_with_speech_provider",
+    "ja": "設定された音声認識プロバイダーで文字起こししています。"
+  },
+  "AI correction failed; using the original transcript. Error kind: {kind}.": {
+    "code": "ai_correction_failure_kind",
+    "ja": "AI修正に失敗したため、元の文字起こしを使用します。エラー種別：{kind}。"
+  },
+  "AI correction failed; using the original transcript. HTTP status {}.": {
+    "code": "ai_correction_http_status",
+    "ja": "AI修正に失敗したため、元の文字起こしを使用します。HTTPステータス：{}。"
+  },
+  "Autostart update failed: {error}": {
+    "code": "autostart_update_failed",
+    "ja": "自動起動の更新に失敗しました：{error}"
+  },
+  "Downloading the speech model files. This runs once; later starts use the local cache.": {
+    "code": "model_downloading",
+    "ja": "音声モデルをダウンロードしています。初回のみ実行し、次回以降はローカルキャッシュを使用します。"
+  },
+  "Draft insertion failed; the transcript is available in this app. {error}": {
+    "code": "draft_insertion_failed_detail",
+    "ja": "下書きを挿入できませんでした。文字起こしはこのアプリで確認できます。{error}"
+  },
+  "Microphone test failed. {error}": {
+    "code": "microphone_test_failed_detail",
+    "ja": "マイクのテストに失敗しました。{error}"
+  },
+  "Stale temporary audio cleanup failed.": {
+    "code": "stale_temporary_audio_cleanup_failed",
+    "ja": "古い一時音声ファイルの削除に失敗しました。"
+  },
+  "The AI provider API key is not set. Check the API key in Settings.": {
+    "code": "ai_missing_api_key",
+    "ja": "AIプロバイダーのAPIキーが設定されていません。設定のAPIキーを確認してください。"
+  },
+  "The AI provider rejected the API key. Check the API key in Settings.": {
+    "code": "ai_invalid_api_key",
+    "ja": "AIプロバイダーがAPIキーを拒否しました。設定のAPIキーを確認してください。"
+  },
+  "The AI provider rate limit was reached. Try again later.": {
+    "code": "ai_rate_limited",
+    "ja": "AIプロバイダーの利用上限に達しました。時間をおいて再試行してください。"
+  },
+  "The AI provider could not be reached. Check the connection and provider endpoint.": {
+    "code": "ai_unreachable",
+    "ja": "AIプロバイダーに接続できませんでした。接続状態と送信先を確認してください。"
+  },
+  "The AI provider returned an unusable response.": {
+    "code": "ai_invalid_response",
+    "ja": "AIプロバイダーの応答を利用できませんでした。"
+  },
+  "The local AI model reached its output token limit. Increase the local output token limit.": {
+    "code": "ai_output_limit",
+    "ja": "ローカルAIモデルの出力上限に達しました。ローカルの出力トークン上限を増やしてください。"
+  },
+  "The AI provider reached its output token limit. Lower the reasoning effort or choose a different model.": {
+    "code": "ai_provider_output_limit",
+    "ja": "AIプロバイダーの出力上限に達しました。推論の強さを下げるか、別のモデルを選んでください。"
+  },
+  "AI correction changed protected transcript content.": {
+    "code": "ai_protected_content_changed",
+    "ja": "AI修正で、保護対象の文字起こし内容が変更されました。"
+  },
+  "Allow this AI provider in Privacy before sending text.": {
+    "code": "ai_consent_required",
+    "ja": "テキストを送信する前に、プライバシー画面でこのAIプロバイダーの利用に同意してください。"
+  },
+  "The local AI endpoint URL is invalid. Check Settings.": {
+    "code": "ai_invalid_endpoint",
+    "ja": "ローカルAIの送信先URLが不正です。設定を確認してください。"
+  },
+  "The selected AI provider is not supported.": {
+    "code": "ai_unsupported_provider",
+    "ja": "選択したAIプロバイダーに対応していません。"
+  },
+  "The spoken edit instruction is empty.": {
+    "code": "ai_empty_edit_instruction",
+    "ja": "音声による編集指示が空です。"
+  },
+  "The AI request was cancelled.": {
+    "code": "ai_cancelled",
+    "ja": "AIへのリクエストをキャンセルしました。"
+  },
+  "The AI provider returned an error. Check the provider settings.": {
+    "code": "ai_provider_error",
+    "ja": "AIプロバイダーがエラーを返しました。プロバイダーの設定を確認してください。"
+  },
+  "Using the original transcript.": {
+    "code": "outcome_using_transcript",
+    "ja": "元の文字起こしを使用します。"
+  },
+  "The original selection was not changed.": {
+    "code": "outcome_unchanged_selection",
+    "ja": "元の選択範囲は変更されていません。"
+  },
+  "No action was taken.": {
+    "code": "outcome_no_action",
+    "ja": "操作は実行されていません。"
+  },
+  "Load the selected speech model before finishing setup.": {
+    "code": "load_the_selected_speech_model_before_finishing_setup",
+    "ja": "選択した音声モデルを読み込んでからセットアップを完了してください。"
+  },
+  "Allow this cloud speech provider in Privacy before sending audio.": {
+    "code": "allow_this_cloud_speech_provider_in_privacy_before_sending_audio",
+    "ja": "音声を送信する前に、プライバシー画面でこのクラウド音声プロバイダーの利用に同意してください。"
+  },
+  "Invalid cloud provider consent.": {
+    "code": "invalid_cloud_provider_consent",
+    "ja": "クラウドプロバイダーの同意設定が不正です。"
+  },
+  "AI correction failed because the AI provider rejected the API key; using the original transcript. Check the API key in Settings.": {
+    "code": "ai_correction_failed_because_the_ai_provider_rejected_the_api_key_using_the_original_transcript_chec",
+    "ja": "AIプロバイダーがAPIキーを拒否したため、AI修正に失敗しました。元の文字起こしを使用します。設定のAPIキーを確認してください。"
+  },
+  "Editing failed because the AI provider rejected the API key. Check the API key in Settings. The original selection was not changed.": {
+    "code": "editing_failed_because_the_ai_provider_rejected_the_api_key_check_the_api_key_in_settings_the_origin",
+    "ja": "AIプロバイダーがAPIキーを拒否したため、編集に失敗しました。設定のAPIキーを確認してください。元の選択範囲は変更されていません。"
+  },
+  "The result completed, but History could not be saved.": {
+    "code": "the_result_completed_but_history_could_not_be_saved",
+    "ja": "結果は完了しましたが、履歴を保存できませんでした。"
+  },
+  "History text was saved, but the recording could not be retained.": {
+    "code": "history_text_was_saved_but_the_recording_could_not_be_retained",
+    "ja": "履歴のテキストは保存しましたが、録音は保存できませんでした。"
+  },
+  "History text was saved, but the recording and usage metrics could not be retained.": {
+    "code": "history_text_was_saved_but_the_recording_and_usage_metrics_could_not_be_retained",
+    "ja": "履歴のテキストは保存しましたが、録音と使用状況の記録は保存できませんでした。"
+  },
+  "Ask Anything": {
+    "code": "ask_anything",
+    "ja": "何でも質問"
+  },
+  "Recording an Ask instruction.": {
+    "code": "recording_an_ask_instruction",
+    "ja": "質問・操作の音声指示を録音中です。"
+  },
+  "Ask cancelled.": {
+    "code": "ask_cancelled",
+    "ja": "質問・操作をキャンセルしました。"
+  },
+  "Choosing a safe Ask action.": {
+    "code": "choosing_a_safe_ask_action",
+    "ja": "安全な操作を選択中です。"
+  },
+  "Ask needs clarification.": {
+    "code": "ask_needs_clarification",
+    "ja": "操作には確認が必要です。"
+  },
+  "Ask needs clarification; the prompt is on the clipboard.": {
+    "code": "ask_needs_clarification_the_prompt_is_on_the_clipboard",
+    "ja": "確認事項をクリップボードに保存しました。"
+  },
+  "Please name the target language, for example: translate to English.": {
+    "code": "please_name_the_target_language_for_example_translate_to_english",
+    "ja": "翻訳先の言語を指定してください。例: translate to English。"
+  },
+  "No Ask instruction was captured.": {
+    "code": "no_ask_instruction_was_captured",
+    "ja": "Ask の音声指示を取得できませんでした。"
+  },
+  "Ask session is unavailable.": {
+    "code": "ask_session_is_unavailable",
+    "ja": "Ask セッションを利用できません。"
+  },
+  "Ask planning failed without taking an action": {
+    "code": "ask_planning_failed_without_taking_an_action",
+    "ja": "Ask の計画に失敗しました。操作は実行されていません。"
+  },
+  "Ask planner returned an invalid action": {
+    "code": "ask_planner_returned_an_invalid_action",
+    "ja": "Ask の計画結果が無効です。操作は実行されていません。"
+  },
+  "Ask action was blocked by context policy": {
+    "code": "ask_action_was_blocked_by_context_policy",
+    "ja": "現在の入力内容では Ask の操作を実行できません。"
+  },
+  "Ask search query was invalid": {
+    "code": "ask_search_query_was_invalid",
+    "ja": "Ask の検索語句が無効です。"
+  },
+  "Ask generation failed without taking an action": {
+    "code": "ask_generation_failed_without_taking_an_action",
+    "ja": "Ask の文章生成に失敗しました。操作は実行されていません。"
+  },
+  "The fixed search could not be opened.": {
+    "code": "the_fixed_search_could_not_be_opened",
+    "ja": "検索ページを開けませんでした。"
+  },
+  "Opening the requested fixed search.": {
+    "code": "opening_the_requested_fixed_search",
+    "ja": "指定された検索を開いています。"
+  },
+  "Ask insertion could not be confirmed; the result remains on the clipboard.": {
+    "code": "ask_insertion_could_not_be_confirmed_the_result_remains_on_the_clipboard",
+    "ja": "入力を確認できませんでした。結果はクリップボードにあります。"
+  },
+  "Ask result is on the clipboard.": {
+    "code": "ask_result_is_on_the_clipboard",
+    "ja": "結果はクリップボードにあります。"
+  },
+  "The Ask result could not be inserted or copied to the clipboard; it is available in this app.": {
+    "code": "the_ask_result_could_not_be_inserted_or_copied_to_the_clipboard_it_is_available_in_this_app",
+    "ja": "結果を挿入もコピーもできませんでした。結果はこのアプリで確認できます。"
+  },
+  "Your clipboard could not be saved for restoring, so it was left unchanged; the Ask result is available in this app.": {
+    "code": "your_clipboard_could_not_be_saved_for_restoring_so_it_was_left_unchanged_the_ask_result_is_available",
+    "ja": "クリップボードの内容を復元用に保存できないため、クリップボードは変更していません。結果はこのアプリで確認できます。"
+  },
+  "Ask completed.": {
+    "code": "ask_completed",
+    "ja": "質問・操作が完了しました。"
+  },
+  "Debug builds do not change startup at Windows sign-in; only the setting was saved.": {
+    "code": "debug_builds_do_not_change_startup_at_windows_sign_in_only_the_setting_was_saved",
+    "ja": "debug ビルドは Windows サインイン時の自動起動を変更しません。設定の保存のみ行いました。"
+  },
+  "Text was published, but History and usage metrics could not be saved.": {
+    "code": "text_was_published_but_history_and_usage_metrics_could_not_be_saved",
+    "ja": "テキストは出力されましたが、履歴と使用状況の記録を保存できませんでした。"
+  },
+  "scope:": {
+    "code": "scope",
+    "ja": "スコープ:"
+  },
+  "aliases:": {
+    "code": "aliases",
+    "ja": "別名:"
+  },
+  "Restore clipboard": {
+    "code": "restore_clipboard",
+    "ja": "クリップボードを復元"
+  },
+  "Stop and transcribe": {
+    "code": "stop_and_transcribe",
+    "ja": "停止して文字起こし"
+  },
+  "Delete audio after processing": {
+    "code": "delete_audio_after_processing",
+    "ja": "処理後に音声を削除"
+  },
+  "History retention": {
+    "code": "history_retention",
+    "ja": "履歴の保持期間"
+  },
+  "24 hours": {
+    "code": "24_hours",
+    "ja": "24時間"
+  },
+  "OpenAI model": {
+    "code": "openai_model",
+    "ja": "OpenAIモデル"
+  },
+  "OpenAI API key environment variable": {
+    "code": "openai_api_key_environment_variable",
+    "ja": "OpenAI APIキー環境変数"
+  },
+  "Gemini model": {
+    "code": "gemini_model",
+    "ja": "Geminiモデル"
+  },
+  "Gemini API key environment variable": {
+    "code": "gemini_api_key_environment_variable",
+    "ja": "Gemini APIキー環境変数"
+  },
+  "Local Voice": {
+    "code": "local_voice",
+    "ja": "Local Voice"
+  },
+  "API key environment variable": {
+    "code": "api_key_environment_variable",
+    "ja": "APIキー環境変数"
+  },
+  "ASR backend": {
+    "code": "asr_backend",
+    "ja": "音声認識バックエンド"
+  },
+  "API base URL": {
+    "code": "api_base_url",
+    "ja": "APIベースURL"
+  },
+  "Downloading the speech model files.": {
+    "code": "downloading_the_speech_model_files",
+    "ja": "音声モデルをダウンロードしています。"
+  },
+  "Loading the speech model.": {
+    "code": "loading_the_speech_model",
+    "ja": "音声モデルを読み込んでいます。"
+  },
+  "Speech model loading was cancelled.": {
+    "code": "speech_model_loading_was_cancelled",
+    "ja": "音声モデルの読み込みを中止しました。"
+  },
+  "30 days": {
+    "code": "30_days",
+    "ja": "30日"
+  },
+  "Recording from the selected microphone.": {
+    "code": "recording_from_the_selected_microphone",
+    "ja": "選択したマイクで録音しています。"
+  },
+  "Live transcription failed. The full recording will be transcribed after stopping.": {
+    "code": "live_transcription_failed_the_full_recording_will_be_transcribed_after_stopping",
+    "ja": "録音中の文字起こしに失敗しました。停止後に録音全体を文字起こしします。"
+  },
+  "Live text insertion paused. The final result will remain available in this app.": {
+    "code": "live_text_insertion_paused_the_final_result_will_remain_available_in_this_app",
+    "ja": "入力先への逐次挿入を中断しました。最終結果はこのアプリで確認できます。"
+  },
+  "No recording is active. Start a new recording.": {
+    "code": "no_recording_is_active_start_a_new_recording",
+    "ja": "録音中ではありません。新しい録音を開始してください。"
+  },
+  "Stopping recording and preparing audio.": {
+    "code": "stopping_recording_and_preparing_audio",
+    "ja": "録音を停止し、音声を準備しています。"
+  },
+  "Recording could not be completed. Start a new recording and try again.": {
+    "code": "recording_could_not_be_completed_start_a_new_recording_and_try_again",
+    "ja": "録音を完了できませんでした。新しい録音を開始して再試行してください。"
+  },
+  "No usable speech was captured. Start a new recording and try again.": {
+    "code": "no_usable_speech_was_captured_start_a_new_recording_and_try_again",
+    "ja": "使用できる音声を取得できませんでした。新しい録音を開始して再試行してください。"
+  },
+  "Transcribing locally.": {
+    "code": "transcribing_locally",
+    "ja": "ローカルで文字起こししています。"
+  },
+  "Dictation cancelled.": {
+    "code": "dictation_cancelled",
+    "ja": "音声入力をキャンセルしました。"
+  },
+  "Transcription failed. Check model and GPU diagnostics.": {
+    "code": "transcription_failed_check_model_and_gpu_diagnostics",
+    "ja": "文字起こしに失敗しました。モデルとGPU診断を確認してください。"
+  },
+  "Transcription failed. The recording was saved to History, where you can retry it.": {
+    "code": "transcription_failed_the_recording_was_saved_to_history_where_you_can_retry_it",
+    "ja": "文字起こしに失敗しました。録音は履歴に保存したので、履歴から再試行できます。"
+  },
+  "Transcription failed. The recording is kept in History for 24 hours, where you can retry it.": {
+    "code": "transcription_failed_the_recording_is_kept_in_history_for_24_hours_where_you_can_retry_it",
+    "ja": "文字起こしに失敗しました。録音は履歴に24時間保持されるので、履歴から再試行できます。"
+  },
+  "The recording was too long for this speech model. Retrying with the same model will fail the same way; record shorter clips or switch to faster-whisper.": {
+    "code": "the_recording_was_too_long_for_this_speech_model_retrying_with_the_same_model_will_fail_the_same_way",
+    "ja": "録音がこの音声認識モデルには長すぎました。同じモデルで再試行しても同様に失敗します。録音を短く区切るか、faster-whisper に切り替えてください。"
+  },
+  "The recording was too long for this speech model. It was saved to History, but retrying with the same model will fail the same way; switch to faster-whisper before retrying, or record shorter clips.": {
+    "code": "the_recording_was_too_long_for_this_speech_model_it_was_saved_to_history_but_retrying_with_the_same_",
+    "ja": "録音がこの音声認識モデルには長すぎました。録音は履歴に保存しましたが、同じモデルで再試行しても同様に失敗します。faster-whisper に切り替えてから再試行するか、録音を短く区切ってください。"
+  },
+  "Transcription failed": {
+    "code": "transcription_failed",
+    "ja": "文字起こし失敗"
+  },
+  "Live transcription stopped because the microphone input failed.": {
+    "code": "live_transcription_stopped_because_the_microphone_input_failed",
+    "ja": "マイク入力が途切れたため、録音中の文字起こしを停止しました。"
+  },
+  "The microphone was disconnected, so recording stopped. The audio captured before the disconnection is being transcribed.": {
+    "code": "the_microphone_was_disconnected_so_recording_stopped_the_audio_captured_before_the_disconnection_is_",
+    "ja": "マイクが切断されたため、録音を停止しました。切断までに録音した音声を文字起こししています。"
+  },
+  "The microphone was disconnected before usable speech was captured. Check the microphone and start a new recording.": {
+    "code": "the_microphone_was_disconnected_before_usable_speech_was_captured_check_the_microphone_and_start_a_n",
+    "ja": "使用できる音声を取得する前にマイクが切断されました。マイクを確認して、新しい録音を開始してください。"
+  },
+  "Recording reached the 15-minute limit and stopped. The audio is being transcribed.": {
+    "code": "recording_reached_the_15_minute_limit_and_stopped_the_audio_is_being_transcribed",
+    "ja": "録音が上限の15分に達したため停止しました。音声を文字起こししています。"
+  },
+  "Microphone disconnected. Transcribing what was captured.": {
+    "code": "microphone_disconnected_transcribing_what_was_captured",
+    "ja": "マイクが切断されました。録音できた分を文字起こししています。"
+  },
+  "Recording limit reached. Transcribing.": {
+    "code": "recording_limit_reached_transcribing",
+    "ja": "録音の上限に達しました。文字起こししています。"
+  },
+  "Finish the current recording or processing before changing the speech model.": {
+    "code": "finish_the_current_recording_or_processing_before_changing_the_speech_model",
+    "ja": "音声認識モデルを変更する前に、現在の録音または処理を終えてください。"
+  },
+  "The speech model is being changed. Try again in a moment.": {
+    "code": "the_speech_model_is_being_changed_try_again_in_a_moment",
+    "ja": "音声認識モデルを変更しています。しばらくしてから再試行してください。"
+  },
+  "Temporary audio cleanup failed.": {
+    "code": "temporary_audio_cleanup_failed",
+    "ja": "一時音声の削除に失敗しました。"
+  },
+  "Retrying the saved recording.": {
+    "code": "retrying_the_saved_recording",
+    "ja": "保存された録音を再試行しています。"
+  },
+  "History retry failed.": {
+    "code": "history_retry_failed",
+    "ja": "履歴の再試行に失敗しました。"
+  },
+  "History retry cancelled.": {
+    "code": "history_retry_cancelled",
+    "ja": "履歴の再試行をキャンセルしました。"
+  },
+  "History retry completed without inserting text.": {
+    "code": "history_retry_completed_without_inserting_text",
+    "ja": "履歴の再試行が完了しました。テキストは挿入していません。"
+  },
+  "Temporary retry audio cleanup failed.": {
+    "code": "temporary_retry_audio_cleanup_failed",
+    "ja": "再試行用の一時音声の削除に失敗しました。"
+  },
+  "Some settings could not be read, so defaults are used for them. The stored settings were not changed.": {
+    "code": "some_settings_could_not_be_read_so_defaults_are_used_for_them_the_stored_settings_were_not_changed",
+    "ja": "一部の設定を読み取れなかったため、それらには既定値を使用しています。保存されている設定は変更していません。"
+  },
+  "Correcting the transcript with the configured AI provider.": {
+    "code": "correcting_the_transcript_with_the_configured_ai_provider",
+    "ja": "設定されたAIプロバイダーで文字起こしを修正しています。"
+  },
+  "Inserting the provisional transcript into the captured target.": {
+    "code": "inserting_the_provisional_transcript_into_the_captured_target",
+    "ja": "取得した入力先へ暫定の文字起こしを挿入しています。"
+  },
+  "Draft insertion failed; the transcript is available in this app.": {
+    "code": "draft_insertion_failed_the_transcript_is_available_in_this_app",
+    "ja": "暫定テキストの挿入に失敗しました。文字起こしはこのアプリで確認できます。"
+  },
+  "Finalizing the provisional text in the captured target.": {
+    "code": "finalizing_the_provisional_text_in_the_captured_target",
+    "ja": "入力先の仮テキストを確定しています。"
+  },
+  "Inserting into the captured target.": {
+    "code": "inserting_into_the_captured_target",
+    "ja": "取得した入力先へ挿入しています。"
+  },
+  "Pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard).": {
+    "code": "pasted_this_field_cannot_confirm_the_result_press_ctrl_v_only_if_the_text_did_not_appear_it_is_on_th",
+    "ja": "貼り付けました。この入力欄では結果を自動確認できません。文字が入っていない場合だけ Ctrl+V で貼り付けてください（クリップボードにあります）。"
+  },
+  "The provisional text could not be safely replaced; the final result remains on the clipboard.": {
+    "code": "the_provisional_text_could_not_be_safely_replaced_the_final_result_remains_on_the_clipboard",
+    "ja": "仮テキストを安全に置換できませんでした。最終結果はクリップボードに残っています。"
+  },
+  "Automatic insertion failed; the result remains on the clipboard.": {
+    "code": "automatic_insertion_failed_the_result_remains_on_the_clipboard",
+    "ja": "自動挿入に失敗しました。結果はクリップボードに残っています。"
+  },
+  "AI correction failed; the original transcript was inserted.": {
+    "code": "ai_correction_failed_the_original_transcript_was_inserted",
+    "ja": "AI修正に失敗したため、元の文字起こしを挿入しました。"
+  },
+  "AI correction stopped at the local output token limit; using the original transcript. Increase the local output token limit.": {
+    "code": "ai_correction_stopped_at_the_local_output_token_limit_using_the_original_transcript_increase_the_loc",
+    "ja": "ローカル出力トークン上限に達したためAI修正を中止し、元の文字起こしを使用します。ローカル出力トークン上限を増やしてください。"
+  },
+  "AI correction stopped at the local output token limit; the original transcript was inserted. Increase the local output token limit.": {
+    "code": "ai_correction_stopped_at_the_local_output_token_limit_the_original_transcript_was_inserted_increase_",
+    "ja": "ローカル出力トークン上限に達したためAI修正を中止し、元の文字起こしを挿入しました。ローカル出力トークン上限を増やしてください。"
+  },
+  "AI correction stopped at the AI provider's output token limit; using the original transcript. Lower the reasoning effort or choose a different model.": {
+    "code": "ai_correction_stopped_at_the_ai_provider_s_output_token_limit_using_the_original_transcript_lower_th",
+    "ja": "AIプロバイダーの出力トークン上限に達したためAI修正を中止し、元の文字起こしを使用します。推論量を下げるか、別のモデルを選択してください。"
+  },
+  "AI correction stopped at the AI provider's output token limit; the original transcript was inserted. Lower the reasoning effort or choose a different model.": {
+    "code": "ai_correction_stopped_at_the_ai_provider_s_output_token_limit_the_original_transcript_was_inserted_l",
+    "ja": "AIプロバイダーの出力トークン上限に達したためAI修正を中止し、元の文字起こしを挿入しました。推論量を下げるか、別のモデルを選択してください。"
+  },
+  "Dictation inserted successfully.": {
+    "code": "dictation_inserted_successfully",
+    "ja": "音声入力を挿入しました。"
+  },
+  "Translation settings are unavailable.": {
+    "code": "translation_settings_are_unavailable",
+    "ja": "翻訳設定を読み込めませんでした。"
+  },
+  "Select text in a supported foreground edit control.": {
+    "code": "select_text_in_a_supported_foreground_edit_control",
+    "ja": "対応する前面の編集欄でテキストを選択してください。"
+  },
+  "Translation could not monitor the target safely.": {
+    "code": "translation_could_not_monitor_the_target_safely",
+    "ja": "対象を安全に監視できないため、翻訳を中止しました。"
+  },
+  "Translation failed; the selected text was not changed.": {
+    "code": "translation_failed_the_selected_text_was_not_changed",
+    "ja": "翻訳に失敗しました。選択したテキストは変更していません。"
+  },
+  "The target changed; the translation remains on the clipboard.": {
+    "code": "the_target_changed_the_translation_remains_on_the_clipboard",
+    "ja": "入力対象が変更されたため、翻訳結果はクリップボードに残っています。"
+  },
+  "Translation inserted.": {
+    "code": "translation_inserted",
+    "ja": "翻訳結果を挿入しました。"
+  },
+  "Local correction model": {
+    "code": "local_correction_model",
+    "ja": "ローカル修正モデル"
+  },
+  "Recording speech to translate.": {
+    "code": "recording_speech_to_translate",
+    "ja": "翻訳する音声を録音しています。"
+  },
+  "Translating speech to the selected language.": {
+    "code": "translating_speech_to_the_selected_language",
+    "ja": "選択した言語へ音声を翻訳しています。"
+  },
+  "Translation cancelled.": {
+    "code": "translation_cancelled",
+    "ja": "音声翻訳をキャンセルしました。"
+  },
+  "Translation failed; the raw transcript remains on the clipboard.": {
+    "code": "translation_failed_the_raw_transcript_remains_on_the_clipboard",
+    "ja": "翻訳に失敗しました。元の文字起こしはクリップボードに残っています。"
+  },
+  "The translation target language was unavailable; the raw transcript remains on the clipboard.": {
+    "code": "the_translation_target_language_was_unavailable_the_raw_transcript_remains_on_the_clipboard",
+    "ja": "翻訳先の言語を取得できませんでした。元の文字起こしはクリップボードに残っています。"
+  },
+  "The translation target language was unavailable and the clipboard could not be updated; the raw transcript remains available in this app.": {
+    "code": "the_translation_target_language_was_unavailable_and_the_clipboard_could_not_be_updated_the_raw_trans",
+    "ja": "翻訳先の言語を取得できず、クリップボードも更新できませんでした。元の文字起こしはこのアプリで確認できます。"
+  },
+  "Translation pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard).": {
+    "code": "translation_pasted_this_field_cannot_confirm_the_result_press_ctrl_v_only_if_the_text_did_not_appear",
+    "ja": "翻訳結果を貼り付けました。この入力欄では結果を自動確認できません。文字が入っていない場合だけ Ctrl+V で貼り付けてください（クリップボードにあります）。"
+  },
+  "Voice translation inserted.": {
+    "code": "voice_translation_inserted",
+    "ja": "音声翻訳結果を挿入しました。"
+  },
+  "Selected text": {
+    "code": "selected_text",
+    "ja": "選択テキスト"
+  },
+  "Recording an edit instruction.": {
+    "code": "recording_an_edit_instruction",
+    "ja": "編集指示を録音しています。"
+  },
+  "Applying the spoken edit instruction.": {
+    "code": "applying_the_spoken_edit_instruction",
+    "ja": "音声編集指示を適用しています。"
+  },
+  "Replacing the original selection.": {
+    "code": "replacing_the_original_selection",
+    "ja": "元の選択範囲を置換しています。"
+  },
+  "Editing cancelled.": {
+    "code": "editing_cancelled",
+    "ja": "音声編集をキャンセルしました。"
+  },
+  "Editing failed because the AI provider API key is not set. The original selection was not changed.": {
+    "code": "editing_failed_because_the_ai_provider_api_key_is_not_set_the_original_selection_was_not_changed",
+    "ja": "AIプロバイダーのAPIキーが設定されていないため、編集に失敗しました。元の選択範囲は変更されていません。"
+  },
+  "Editing failed because the AI provider rate limit was reached. Try again later. The original selection was not changed.": {
+    "code": "editing_failed_because_the_ai_provider_rate_limit_was_reached_try_again_later_the_original_selection",
+    "ja": "AIプロバイダーの利用上限に達したため、編集に失敗しました。時間をおいて再試行してください。元の選択範囲は変更されていません。"
+  },
+  "Editing failed because the AI provider returned an error. The original selection was not changed.": {
+    "code": "editing_failed_because_the_ai_provider_returned_an_error_the_original_selection_was_not_changed",
+    "ja": "AIプロバイダーがエラーを返したため、編集に失敗しました。元の選択範囲は変更されていません。"
+  },
+  "Editing failed because the AI provider could not be reached. The original selection was not changed.": {
+    "code": "editing_failed_because_the_ai_provider_could_not_be_reached_the_original_selection_was_not_changed",
+    "ja": "AIプロバイダーに接続できなかったため、編集に失敗しました。元の選択範囲は変更されていません。"
+  },
+  "Editing failed because the local AI endpoint URL is invalid. The original selection was not changed.": {
+    "code": "editing_failed_because_the_local_ai_endpoint_url_is_invalid_the_original_selection_was_not_changed",
+    "ja": "ローカルAIのエンドポイントURLが不正なため、編集に失敗しました。元の選択範囲は変更されていません。"
+  },
+  "Editing stopped at the local output token limit. The original selection was not changed. Increase the local output token limit.": {
+    "code": "editing_stopped_at_the_local_output_token_limit_the_original_selection_was_not_changed_increase_the_",
+    "ja": "ローカル出力トークン上限に達したため、編集を中止しました。元の選択範囲は変更されていません。ローカル出力トークン上限を増やしてください。"
+  },
+  "Editing stopped at the AI provider's output token limit. The original selection was not changed. Lower the reasoning effort or choose a different model.": {
+    "code": "editing_stopped_at_the_ai_provider_s_output_token_limit_the_original_selection_was_not_changed_lower",
+    "ja": "AIプロバイダーの出力トークン上限に達したため、編集を中止しました。元の選択範囲は変更されていません。推論量を下げるか、別のモデルを選択してください。"
+  },
+  "Editing failed because the AI provider returned an unusable response. The original selection was not changed.": {
+    "code": "editing_failed_because_the_ai_provider_returned_an_unusable_response_the_original_selection_was_not_",
+    "ja": "AIプロバイダーの応答を利用できなかったため、編集に失敗しました。元の選択範囲は変更されていません。"
+  },
+  "Editing failed because the selected AI provider is not supported. The original selection was not changed.": {
+    "code": "editing_failed_because_the_selected_ai_provider_is_not_supported_the_original_selection_was_not_chan",
+    "ja": "選択中のAIプロバイダーに対応していないため、編集に失敗しました。元の選択範囲は変更されていません。"
+  },
+  "No edit instruction was captured; the original selection was not changed.": {
+    "code": "no_edit_instruction_was_captured_the_original_selection_was_not_changed",
+    "ja": "編集指示を認識できませんでした。元の選択範囲は変更されていません。"
+  },
+  "The edit was completed, but history could not be saved.": {
+    "code": "the_edit_was_completed_but_history_could_not_be_saved",
+    "ja": "編集は完了しましたが、履歴を保存できませんでした。"
+  },
+  "The edit was completed, but history and usage metrics could not be saved.": {
+    "code": "the_edit_was_completed_but_history_and_usage_metrics_could_not_be_saved",
+    "ja": "編集は完了しましたが、履歴と利用状況の記録を保存できませんでした。"
+  },
+  "The edit was completed, but usage metrics could not be saved.": {
+    "code": "the_edit_was_completed_but_usage_metrics_could_not_be_saved",
+    "ja": "編集は完了しましたが、利用状況の記録を保存できませんでした。"
+  },
+  "The edit remains on the clipboard, but history could not be saved.": {
+    "code": "the_edit_remains_on_the_clipboard_but_history_could_not_be_saved",
+    "ja": "編集結果はクリップボードに残っていますが、履歴を保存できませんでした。"
+  },
+  "The edit remains on the clipboard, but history and usage metrics could not be saved.": {
+    "code": "the_edit_remains_on_the_clipboard_but_history_and_usage_metrics_could_not_be_saved",
+    "ja": "編集結果はクリップボードに残っていますが、履歴と利用状況の記録を保存できませんでした。"
+  },
+  "The edit remains on the clipboard, but usage metrics could not be saved.": {
+    "code": "the_edit_remains_on_the_clipboard_but_usage_metrics_could_not_be_saved",
+    "ja": "編集結果はクリップボードに残っていますが、利用状況の記録を保存できませんでした。"
+  },
+  "Selected text updated.": {
+    "code": "selected_text_updated",
+    "ja": "選択テキストを更新しました。"
+  },
+  "Automatic replacement was skipped; the edit remains on the clipboard.": {
+    "code": "automatic_replacement_was_skipped_the_edit_remains_on_the_clipboard",
+    "ja": "自動置換を見送りました。編集結果はクリップボードに残っています。"
+  },
+  "The edit paste could not be confirmed; the result remains on the clipboard.": {
+    "code": "the_edit_paste_could_not_be_confirmed_the_result_remains_on_the_clipboard",
+    "ja": "編集結果の貼り付けを確認できませんでした。結果はクリップボードに残っています。"
+  },
+  "Speak to edit could not monitor the original selection safely.": {
+    "code": "speak_to_edit_could_not_monitor_the_original_selection_safely",
+    "ja": "元の選択範囲を安全に監視できないため、音声編集を開始できませんでした。"
+  },
+  "Microphone test failed.": {
+    "code": "microphone_test_failed",
+    "ja": "マイクテストに失敗しました。"
+  },
+  "Microphone test could not start.": {
+    "code": "microphone_test_could_not_start",
+    "ja": "マイクテストを開始できませんでした。"
+  },
+  "Microphone test could not stop.": {
+    "code": "microphone_test_could_not_stop",
+    "ja": "マイクテストを停止できませんでした。"
+  },
+  "microphone test requires an idle recording pipeline": {
+    "code": "microphone_test_requires_an_idle_recording_pipeline",
+    "ja": "録音中はマイクテストを実行できません。"
+  },
+  "microphone test was interrupted by recording": {
+    "code": "microphone_test_was_interrupted_by_recording",
+    "ja": "録音が開始されたため、マイクテストを中断しました。"
+  },
+  "theme must be system, light, or dark": {
+    "code": "theme_must_be_system_light_or_dark",
+    "ja": "テーマはシステム、ライト、ダークから選択してください。"
+  },
+  "ui language must be en or ja": {
+    "code": "ui_language_must_be_en_or_ja",
+    "ja": "アプリの言語は英語または日本語から選択してください。"
+  },
+  "speech locale is unsupported": {
+    "code": "speech_locale_is_unsupported",
+    "ja": "選択した音声言語はサポートされていません。"
+  },
+  "Some saved shortcuts could not be activated at startup. Change them in Settings and restart to verify.": {
+    "code": "some_saved_shortcuts_could_not_be_activated_at_startup_change_them_in_settings_and_restart_to_verify",
+    "ja": "起動時に一部のショートカットを有効にできませんでした。設定で変更し、再起動して確認してください。"
+  },
+  "shortcut cannot be empty": {
+    "code": "shortcut_cannot_be_empty",
+    "ja": "ショートカットは空欄にできません。"
+  },
+  "shortcuts must be unique across all actions": {
+    "code": "shortcuts_must_be_unique_across_all_actions",
+    "ja": "すべての操作でショートカットを重複させないでください。"
+  },
+  "each voice mode requires one to four shortcuts": {
+    "code": "each_voice_mode_requires_one_to_four_shortcuts",
+    "ja": "各音声モードには1～4個のショートカットが必要です。"
+  },
+  "hotkey is invalid": {
+    "code": "hotkey_is_invalid",
+    "ja": "ショートカットが無効です。"
+  },
+  "shortcut registration failed:": {
+    "code": "shortcut_registration_failed",
+    "ja": "ショートカットの登録に失敗しました:"
+  },
+  "shortcut removal failed:": {
+    "code": "shortcut_removal_failed",
+    "ja": "ショートカットの解除に失敗しました:"
+  },
+  "shortcut restoration failed, restart required:": {
+    "code": "shortcut_restoration_failed_restart_required",
+    "ja": "ショートカットを元に戻せませんでした。再起動が必要です:"
+  },
+  "The original selection was not changed, and the clipboard is unavailable; the edit is available in this app.": {
+    "code": "the_original_selection_was_not_changed_and_the_clipboard_is_unavailable_the_edit_is_available_in_thi",
+    "ja": "元の選択範囲は変更されていません。クリップボードも利用できないため、編集結果はこのアプリで確認できます。"
+  },
+  "Text was published, but History could not be saved.": {
+    "code": "text_was_published_but_history_could_not_be_saved",
+    "ja": "テキストは出力されましたが、履歴を保存できませんでした。"
+  },
+  "Text was published, but usage metrics could not be saved.": {
+    "code": "text_was_published_but_usage_metrics_could_not_be_saved",
+    "ja": "テキストは出力されましたが、使用状況の記録を保存できませんでした。"
+  },
+  "Voice Translate": {
+    "code": "voice_translate",
+    "ja": "音声翻訳"
+  },
+  "Speak to edit": {
+    "code": "speak_to_edit",
+    "ja": "音声編集"
+  },
+  "Selected-text translation": {
+    "code": "selected_text_translation",
+    "ja": "選択テキスト翻訳"
+  },
+  "Insertion failed; the result is available in this app.": {
+    "code": "insertion_failed_the_result_is_available_in_this_app",
+    "ja": "挿入できませんでした。結果はこのアプリで確認できます。"
+  },
+  "The live draft could not be confirmed, so it was not replaced; the final result is available in this app.": {
+    "code": "the_live_draft_could_not_be_confirmed_so_it_was_not_replaced_the_final_result_is_available_in_this_a",
+    "ja": "ライブ入力の下書きを確認できなかったため置き換えていません。最終結果はこのアプリで確認できます。"
+  },
+  "Not inserted": {
+    "code": "not_inserted",
+    "ja": "挿入失敗"
+  },
+  "Your previous clipboard contents could not be restored.": {
+    "code": "your_previous_clipboard_contents_could_not_be_restored",
+    "ja": "元のクリップボードの内容は復元できませんでした。"
+  },
+  "The translation could not be inserted or copied to the clipboard; it is available in this app.": {
+    "code": "the_translation_could_not_be_inserted_or_copied_to_the_clipboard_it_is_available_in_this_app",
+    "ja": "翻訳結果を挿入もコピーもできませんでした。結果はこのアプリで確認できます。"
+  },
+  "Preparing the speech model. Recording starts when it is ready.": {
+    "code": "preparing_the_speech_model_recording_starts_when_it_is_ready",
+    "ja": "音声認識モデルを準備しています。準備ができたら録音を開始します。"
+  },
+  "another voice mode is already recording": {
+    "code": "another_voice_mode_is_already_recording",
+    "ja": "別の音声モードで録音中です。"
+  },
+  "No target window was found. Click where the text should go, then try again.": {
+    "code": "no_target_window_was_found_click_where_the_text_should_go_then_try_again",
+    "ja": "入力先のウィンドウが見つかりません。入力したい場所をクリックしてから、もう一度お試しください。"
+  },
+  "Password and other protected fields cannot receive dictated text.": {
+    "code": "password_and_other_protected_fields_cannot_receive_dictated_text",
+    "ja": "パスワードなどの保護された入力欄には音声入力できません。"
+  },
+  "The target app runs with higher privileges, so this app cannot type into it.": {
+    "code": "the_target_app_runs_with_higher_privileges_so_this_app_cannot_type_into_it",
+    "ja": "入力先のアプリが高い権限で実行されているため、このアプリから入力できません。"
+  },
+  "The selected microphone was not found. Check the microphone in Settings.": {
+    "code": "the_selected_microphone_was_not_found_check_the_microphone_in_settings",
+    "ja": "選択したマイクが見つかりません。設定でマイクを確認してください。"
+  },
+  "The microphone could not be opened. Check the microphone in Settings.": {
+    "code": "the_microphone_could_not_be_opened_check_the_microphone_in_settings",
+    "ja": "マイクを開けませんでした。設定でマイクを確認してください。"
+  },
+  "Selected microphone not found. Using the default.": {
+    "code": "selected_microphone_not_found_using_the_default",
+    "ja": "選択したマイクがないため、既定のマイクを使用中"
+  },
+  "The selected microphone was not found, so this recording uses the default microphone. The saved microphone setting was not changed.": {
+    "code": "the_selected_microphone_was_not_found_so_this_recording_uses_the_default_microphone_the_saved_microp",
+    "ja": "選択したマイクが見つからないため、この録音では既定のマイクを使用しています。保存したマイクの設定は変更していません。"
+  },
+  "Recording from the default microphone.": {
+    "code": "recording_from_the_default_microphone",
+    "ja": "既定のマイクで録音しています。"
+  },
+  "Translating the selected text.": {
+    "code": "translating_the_selected_text",
+    "ja": "選択したテキストを翻訳しています。"
+  },
+  "Selected-text translation cancelled.": {
+    "code": "selected_text_translation_cancelled",
+    "ja": "選択テキストの翻訳をキャンセルしました。"
+  },
+  "A CUDA GPU with 12 GB or more is suitable for VibeVoice; faster-whisper also runs without a GPU.": {
+    "code": "gpu_suitable_for_vibevoice",
+    "ja": "VRAMが12GB以上のCUDA GPUはVibeVoiceに適しています。faster-whisperはGPUなしでも動作します。"
+  },
+  "VibeVoice may exceed available VRAM; a CUDA GPU with 12 GB or more is recommended only for VibeVoice. faster-whisper runs without a GPU.": {
+    "code": "gpu_vibevoice_vram_warning",
+    "ja": "VibeVoiceは利用可能なVRAMを超える可能性があります。VibeVoiceにはVRAMが12GB以上のCUDA GPUを推奨します。faster-whisperはGPUなしでも動作します。"
+  },
+  "NVIDIA diagnostics unavailable. A CUDA GPU with 12 GB or more is recommended only for VibeVoice; faster-whisper runs without a GPU.": {
+    "code": "gpu_nvidia_diagnostics_unavailable",
+    "ja": "NVIDIAの診断を利用できません。VibeVoiceにはVRAMが12GB以上のCUDA GPUを推奨します。faster-whisperはGPUなしでも動作します。"
+  },
+  "GPU diagnostics could not be completed.": {
+    "code": "gpu_diagnostics_incomplete",
+    "ja": "GPU診断を完了できませんでした。"
+  },
+  "Speech model loading timed out. Check the network and model files, then try again.": {
+    "code": "model_load_timeout",
+    "ja": "音声モデルの読み込みがタイムアウトしました。ネットワークとモデルファイルを確認して、再試行してください。"
+  },
+  "The speech worker stopped while loading the model. Restart the app and try a smaller model.": {
+    "code": "model_load_worker_stopped",
+    "ja": "モデルの読み込み中に音声ワーカーが停止しました。アプリを再起動し、より小さいモデルを試してください。"
+  },
+  "The speech worker could not be found. Run worker setup, then try loading again.": {
+    "code": "model_load_worker_missing",
+    "ja": "音声ワーカーが見つかりません。ワーカーのセットアップを行ってから、読み込みを再試行してください。"
+  },
+  "The speech worker could not communicate correctly. Restart the app, then try loading again.": {
+    "code": "model_load_communication_failed",
+    "ja": "音声ワーカーと正常に通信できませんでした。アプリを再起動して、読み込みを再試行してください。"
+  },
+  "There is not enough GPU memory to load this model. Choose a smaller model or use faster-whisper on CPU.": {
+    "code": "model_load_gpu_memory",
+    "ja": "モデルを読み込むためのGPUメモリが不足しています。より小さいモデルを選ぶか、faster-whisperをCPUで使用してください。"
+  },
+  "This model requires a supported CUDA GPU. Choose faster-whisper to use the CPU.": {
+    "code": "model_load_gpu_unsupported",
+    "ja": "このモデルには対応するCUDA GPUが必要です。CPUを使用するにはfaster-whisperを選んでください。"
+  },
+  "The speech worker is missing required packages. Run worker setup, then try loading again.": {
+    "code": "model_load_dependencies_missing",
+    "ja": "音声ワーカーに必要なパッケージが不足しています。ワーカーのセットアップを行ってから、読み込みを再試行してください。"
+  },
+  "This model does not support the selected quantization. Choose another quantization in Models.": {
+    "code": "model_load_quantization_unsupported",
+    "ja": "このモデルは選択した量子化に対応していません。Modelsで別の量子化を選んでください。"
+  },
+  "Model download requires Hugging Face access. Check HF_TOKEN and the model access permission, then restart the app.": {
+    "code": "model_load_hf_auth_required",
+    "ja": "モデルのダウンロードにはHugging Faceへのアクセス権が必要です。HF_TOKENとモデルの利用権限を確認し、アプリを再起動してください。"
+  },
+  "Hugging Face is limiting model downloads. Wait and try again; set HF_TOKEN for higher limits.": {
+    "code": "model_load_hf_rate_limited",
+    "ja": "Hugging Faceがモデルのダウンロードを制限しています。時間を置いて再試行してください。HF_TOKENを設定すると上限が増える場合があります。"
+  },
+  "The model repository is unavailable. Check the model ID and Hugging Face access permission.": {
+    "code": "model_load_repository_unavailable",
+    "ja": "モデルのリポジトリを利用できません。モデルIDとHugging Faceのアクセス権を確認してください。"
+  },
+  "The model download failed. Check the network connection and try again.": {
+    "code": "model_load_download_failed",
+    "ja": "モデルのダウンロードに失敗しました。ネットワーク接続を確認して再試行してください。"
+  },
+  "The speech provider configuration is invalid. Check its endpoint and API key in Models.": {
+    "code": "model_load_provider_configuration",
+    "ja": "音声プロバイダーの設定が正しくありません。Modelsで接続先とAPIキーを確認してください。"
+  },
+  "The speech model could not be loaded. Check worker setup and the model configuration, then try again.": {
+    "code": "model_load_failed",
+    "ja": "音声モデルを読み込めませんでした。ワーカーのセットアップとモデル設定を確認し、再試行してください。"
+  },
+  "The speech worker and app versions do not match. Update the app and run worker setup again.": {
+    "code": "model_load_worker_version_mismatch",
+    "ja": "音声ワーカーとアプリのバージョンが一致しません。アプリを更新し、ワーカーのセットアップをやり直してください。"
+  },
+  "Worker setup requires uv. Install uv or set ASR_UV to its executable, then load the model again.": {
+    "code": "worker_setup_unavailable",
+    "ja": "ワーカーのセットアップには uv が必要です。uv をインストールするか ASR_UV に実行ファイルを指定し、モデルを再読み込みしてください。"
+  },
+  "Worker setup failed. Check the network, free disk space and write permission, then load the model again.": {
+    "code": "worker_setup_failed",
+    "ja": "ワーカーのセットアップに失敗しました。ネットワーク、ディスクの空き容量と書き込み権限を確認し、モデルを再読み込みしてください。"
+  },
+  "Preparing the speech worker environment. Dependencies are downloaded on first setup.": {
+    "code": "worker_setup_preparing",
+    "ja": "音声ワーカーの環境を準備しています。初回セットアップでは依存パッケージをダウンロードします。"
+  },
+  "Speech worker files are missing. Reinstall the app, or run uv sync from the development checkout.": {
+    "code": "worker_source_missing",
+    "ja": "音声ワーカーのファイルがありません。アプリを再インストールするか、開発用チェックアウトで uv sync を実行してください。"
+  },
+  "Finish the current recording before recording a shortcut.": {
+    "code": "shortcut_capture_busy",
+    "ja": "ショートカットを記録する前に、現在の録音・処理を終了してください。"
+  }
+}

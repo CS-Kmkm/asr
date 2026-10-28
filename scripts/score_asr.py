@@ -66,10 +66,11 @@ from typing import Any, Iterable
 
 # Punctuation we strip when --strip-punctuation is active. Covers ASCII and the
 # common Japanese full-width marks; not exhaustive but matches docs §3.4 intent
-# ("空白除去 ... 句読点の扱いを明文化して固定").
+# ("空白除去 ... 句読点の扱いを明文化して固定"). The long vowel mark ー (U+30FC)
+# is deliberately absent: it is part of a word, so ビール and ビル must differ.
 _PUNCT_CHARS = set(
     "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
-    "、。，．・「」『』（）〔〕［］｛｝〈〉《》【】〜ー―‐-…！？："
+    "、。，．・「」『』（）〔〕［］｛｝〈〉《》【】〜―‐-…！？："
     "；＂＇｀＾～＿｜＠＃＄％＆＊＋／＜＝＞｟｠｢｣､｡･"
     "“”‘’«»"
 )
@@ -555,6 +556,9 @@ def run_self_test() -> int:
     # empty reference, non-empty hyp -> 1.0
     check("empty ref nonempty hyp -> 1.0", cer_stats("", "x")["cer"], 1.0)
     check("empty ref empty hyp -> 0.0", cer_stats("", "")["cer"], 0.0)
+    # The long vowel mark is part of the word, not punctuation.
+    check("long vowel mark kept (beer vs bill in katakana) -> 1/3", cer_stats("ビール", "ビル")["cer"], 1 / 3)
+    check("half-width long vowel mark NFKC-matches CER=0", cer_stats("ビール", "ﾋﾞｰﾙ")["cer"], 0.0)
 
     print("WER:")
     check("exact match WER=0", wer_stats("the cat sat", "the cat sat")["wer"], 0.0)

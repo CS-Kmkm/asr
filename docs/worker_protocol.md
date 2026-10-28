@@ -18,6 +18,8 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
 
 - 通信路はワーカープロセスの **stdin / stdout** である。stderrは診断ログ専用であり、
   プロトコルメッセージを含まない。
+- JSONL用に元のstdoutのfdを複製し、通常のPython出力とネイティブのfd 1はstderrへ向ける。
+  応答・進捗・キャンセル応答は同じロック付きwriterから出力する。
 - **1行に1メッセージ**(JSON Lines)。リクエスト・レスポンスはいずれも単一のJSONオブジェクトで、
   末尾に改行 (`\n`) を付与して送出する。
 - 文字エンコーディングは **UTF-8** である。ワーカーは `ensure_ascii=False` で応答を直列化するため、
@@ -28,6 +30,10 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
 - 1リクエストにつき必ず1レスポンスが返る、同期的な request/response 往復モデルである
   (ADR-0002 のbatch方式に対応)。ただし `load` に限り、レスポンスの前に同一 `id` の
   **進捗通知行**(`event: "progress"`、`ok` を持たない)が0行以上先行しうる(§2.2.1)。
+- 例外として `cancel`(§2.5)だけは、別のリクエストの処理中に送ってよい。ワーカーは
+  stdin を専用スレッドで読み続け、`cancel` には即座に応答する。それ以外のリクエストは
+  受信順に1件ずつ処理し、受信順に応答する。`cancel` の応答と対象リクエストの応答の
+  順序は不定である。
 - Rust側はレスポンス1行のサイズに上限 (`MAX_RESPONSE_BYTES` = 8 MiB) を設けており、
   これを超える行はプロトコルエラーとして扱う。
 
@@ -43,7 +49,12 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
   プロトコル違反等で再spawnされた場合、ワーカー自身は前回のロード状態を記憶しない。
   Rust側 (`JsonlTranscriber`) が最後に成功した `load` の量子化設定 (`loaded_quantization`) を
   保持しており、再spawn時 (`ensure_running`) に自動的に `load` を再送してモデルロード状態を
-  再現する。ワーカープロトコルにはハンドシェイクや状態問い合わせの仕組みは存在しない。
+  再現する。この再ロードも、それを必要とした `transcribe` のキャンセル信号で中断できる。
+  ワーカー起動時には `hello`（§2.6）でバージョンを確認する。`health`（§2.7）で環境とモデル常駐状態を確認できる。
+- `load` が失敗した場合、ワーカーは以前のモデルを解放済みである(ロード前に `unload` する)
+  ため、Rust側は `loaded_quantization` を消去する。同じ量子化のモデルがすでに常駐している
+  ワーカーへの `load` は送らずに成功とする(再spawn時の自動再ロード後に、UIの読み込み操作が
+  二重にロードしないため)。
 
 ---
 
@@ -103,6 +114,11 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
 - faster-whisper: `"faster-whisper:<モデルID>"`(既定モデルID `large-v3-turbo`、
   環境変数 `ASR_FASTER_WHISPER_MODEL` で変更可)
 - mock: `"microsoft/VibeVoice-ASR-HF:mock"`
+- openai-compatible: `openai-compatible:<ASR_MODEL_ID>`（既定は `gpt-4o-mini-transcribe`）。
+
+ローカルバックエンドでも `ASR_MODEL_ID` が既定モデルより優先される。
+faster-whisper は `ASR_MODEL_ID`、`ASR_FASTER_WHISPER_MODEL`、
+`large-v3-turbo` の順で選択する。
 
 **JSON例:**
 
@@ -140,7 +156,7 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 |---|---|---|---|
 | `id` | リクエストと同一 | 必須 | 対象リクエストのエコーバック。 |
 | `event` | `"progress"` | 必須 | 通知行であることの識別子。 |
-| `stage` | `"download"` / `"load"` | 必須 | `download` はモデルファイル取得中、`load` はローカルのファイルをメモリへ読み込む段階。 |
+| `stage` | `"download"` / `"load"` / `"warmup"` / `"cpu_fallback"` | 必須 | ファイル取得、メモリ読み込み、ダミー音声での初期推論、CUDA失敗後のCPU準備を示す。 |
 | `model` | 文字列 | 任意 | ダウンロード対象のHugging Faceリポジトリ。 |
 | `completed_bytes` | 整数 | 任意 | ダウンロード済みバイト数(全ファイルの合計)。 |
 | `total_bytes` | 整数 / `null` | 任意 | 総バイト数。Hugging Faceがファイルメタデータを返すまでは不明であり `null` になる。 |
@@ -156,7 +172,9 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 バックエンドごとの挙動:
 
 - faster-whisper: モデルIDをHugging Faceリポジトリへ解決し、キャッシュ済みなら `download` を
-  通知せず `load` のみを通知する。未キャッシュなら `download` を通知し、
+  通知せず `load` のみを通知する。snapshotフォルダがあっても `config.json`・`model.bin`・
+  `vocabulary.*`(faster-whisper組み込みのモデル名に対応するリポジトリではさらに `tokenizer.json`)の
+  いずれかが欠けていれば(初回ダウンロードの中断)未キャッシュとみなし、欠けたファイルを取得する。未キャッシュなら `download` を通知し、
   `huggingface_hub.snapshot_download` の集約プログレスバーからバイト進捗を送出する
   (`completed_bytes` は転送方式により総量をわずかに超えうるため、表示側で丸める)。
 - VibeVoice: transformers の `from_pretrained` に進捗フックがないため、未キャッシュ時に
@@ -177,6 +195,7 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 | `command` | `"transcribe"` | 必須 | 操作名(`op` でも可)。 |
 | `audio_path` | 文字列(非空) | 必須 | 音声ファイルのパス。非空文字列でなければ `invalid_audio_path`、ファイルが存在しなければ `audio_not_found`。 |
 | `prompt` | 文字列 / 文字列リスト / `null` / 省略 | 任意 | 認識ヒント(辞書語など)。詳細は下記。 |
+| `language` | 文字列(32文字以下) / `null` / 省略 | 任意 | 音声の言語(例 `ja`、`en-GB`)。それ以外の型や長すぎる値は `invalid_request`。faster-whisper と openai-compatible は地域部分を除いたベース言語として渡す。VibeVoice は transformers の `apply_transcription_request` が言語引数を持たないため無視する。 |
 
 **`prompt` の扱い:**
 
@@ -191,6 +210,7 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 
 - VibeVoice: 認識リクエストの `prompt` として処理に渡される。
 - faster-whisper: 非空のときのみ `hotwords` として渡される(空文字列は `hotwords=None` 扱い)。
+- openai-compatible: 非空のとき `POST /audio/transcriptions` の `prompt` フォーム項目として渡される。
 
 **成功レスポンスフィールド:**
 
@@ -212,9 +232,10 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 | `speaker` | 任意 / `null` | 話者識別子。VibeVoiceは話者番号等を返しうる。faster-whisperおよびエラーフォールバックでは `null`。Rust側では `Option<Value>` として保持され、型を限定しない。 |
 | `text` | 文字列 | セグメントのテキスト。 |
 
-`text` 全文の組み立て規則はバックエンドにより異なる(VibeVoiceは各セグメントを半角空白で連結、
-faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレスポンスでは確定済みの
-`text` フィールドとして返る。
+`text` 全文の組み立て規則はバックエンドにより異なる(VibeVoiceは各セグメントを `strip()` して
+連結し、境界の片側が漢字・かな・全角記号などの空白を置かない文字なら区切りなし、それ以外は
+半角空白1つを挟む。faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレスポンスでは
+確定済みの `text` フィールドとして返る。
 
 **JSON例:**
 
@@ -268,6 +289,106 @@ faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレ�
 
 ---
 
+### 2.5 cancel 操作(実装済み)
+
+処理中のリクエストの中断を依頼する。Rust側は `transcribe` の応答待ちを放棄するときにだけ送る
+(§4.3)。`cancel` は応答待ちのリクエストがあっても送ってよい唯一の操作である。
+
+**リクエストフィールド:**
+
+| フィールド | 型 | 必須 | 説明 |
+|---|---|---|---|
+| `id` | 任意 | 必須 | このキャンセル要求自体の識別子。 |
+| `command` | `"cancel"` | 必須 | 操作名(`op` でも可)。 |
+| `target_id` | 任意 | 必須 | 中断したいリクエストの `id`。欠落で `invalid_request`。 |
+
+**成功レスポンスフィールド:**
+
+| フィールド | 型 | 説明 |
+|---|---|---|
+| `id` | リクエストと同一 | エコーバック。 |
+| `ok` | `true` | 受理。 |
+| `cancelled` | 真偽値 | `target_id` が受信済みで未応答だったか。`false` は対象がすでに応答済み(または不明)であることを示す。 |
+
+**対象リクエストの扱い:**
+
+- 対象が `transcribe` なら、ワーカーはバックエンドに中断を通知し、`cancelled` エラーで応答する。
+  中断点はバックエンドに依存する:
+  - faster-whisper: セグメントの境界(`transcribe` はセグメントを遅延生成する)。
+  - VibeVoice: transformers の `StoppingCriteria` により次のトークン生成で `generate` を止める。
+    途中までの出力は解析しない。
+  - openai-compatible: 送信済みのHTTPリクエストは中断できないため、完了を待ってから結果を
+    破棄する(送信前にキャンセル済みなら送信しない)。
+  - mock: 保持中(後述のテスト用フック)なら即座に中断する。
+- 中断できなかったバックエンドが認識を完了した場合も、結果は返さず `cancelled` エラーで応答する。
+- 対象が `transcribe` 以外(`load` など)の場合は中断せず、通常どおり応答する。
+- **対象リクエストへの応答は必ず1行返る。** したがってクライアントは `cancel` の応答と
+  対象の応答の両方を読み終えるまで、次のリクエストを送ってはならない。
+
+```json
+→ {"id": 5, "command": "transcribe", "audio_path": "..."}
+→ {"id": 6, "command": "cancel", "target_id": 5}
+← {"id": 6, "ok": true, "cancelled": true}
+← {"id": 5, "ok": false, "error": {"code": "cancelled", "message": "Transcription was cancelled"}}
+```
+
+**後方互換:** `cancel` を知らない旧ワーカーは、処理中の `transcribe` を完了してから `cancel` を
+`unsupported_operation` エラー(`id` は `cancel` の `id`)として応答する。Rust側は §4.3 の手順で
+両方の応答を同じように読み捨てるため、旧ワーカーとも安全に動作する(猶予期間内に認識が
+終わらなければ従来どおりkillする)。
+
+#### 2.5.1 mock バックエンドのテスト用フック
+
+モデルをダウンロードせずにプロセスのライフサイクルを検証するため、mock バックエンドは次の
+環境変数を解釈する(`src-tauri/src/asr.rs` のプロセステストと `asr_worker/tests/test_cancel.py`
+が使用する)。
+
+| 環境変数 | 挙動 |
+|---|---|
+| `ASR_WORKER_MOCK_HOLD_FILE` | このファイルが存在する間、`load`・`transcribe`・`unload` が待機する。`transcribe` の待機はキャンセルで中断する。 |
+| `ASR_WORKER_MOCK_IGNORE_CANCEL=1` | 待機中の `transcribe` がキャンセルを無視する(中断できないバックエンドや旧ワーカーの再現)。 |
+| `ASR_WORKER_MOCK_CRASH_FILE` | `transcribe` がこのファイルを見つけると削除してプロセスを終了する(1回だけクラッシュする)。 |
+| `ASR_WORKER_MOCK_EVENT_LOG` | `<pid> <event>` 形式で `load <量子化>`・`transcribe`・`cancelled` を追記する。 |
+
+---
+
+### 2.6 hello 操作（実装済み）
+
+Rust はワーカー起動直後、モデルを読み込む前に次の要求を送る。
+
+```json
+→ {"id": 1, "command": "hello"}
+← {"id": 1, "ok": true, "protocol_version": 1, "worker_version": "0.1.0"}
+```
+
+`hello` はモデルを読み込まない。デスクトップは protocol_version=1 と
+アプリの package version に一致する worker_version を要求する。不一致・欠落・
+旧ワーカーの unsupported_operation はモデルのロード前にエラーとなる。
+応答待ちは10秒に制限し、キャンセル・設定変更・終了時にはワーカーを停止する。
+
+配布版は起動前に uv で環境を準備する。この間 Rust が `stage: "setup"` の
+model-progress を発行する。これは Python の JSONL 通知ではない。
+
+### 2.7 health 操作（実装済み）
+
+```json
+→ {"id": 2, "command": "health"}
+← {"id": 2, "ok": true, "health": {"pythonPath": "C:/runtime/python.exe", "pythonVersion": "3.12.8", "fasterWhisperVersion": "1.2.0", "ctranslate2Version": "4.6.0", "backend": "faster-whisper", "loaded": true, "device": "cpu", "computeType": "int8"}}
+```
+
+実行中のPythonのパス・バージョンとインストール済みパッケージのバージョンを返す。
+任意パッケージが未インストールならそのバージョンは `null` となる。`health` 自体はモデルを
+ロードせず、文字起こしも行わない。未ロード時やリモートAPIなど実行デバイスを報告できない場合、
+`device` / `computeType` は `null`。ロード済みのローカルバックエンドでは、成功したロードで
+選択したデバイスと計算形式（CPUフォールバックが起きた場合はその値）を返す。
+リモートサーバーのGPUを推測しない。
+
+デスクトップからの明示的な検査は、稼働中のワーカーがなければ一時ワーカーを起動する。
+起動時のuv環境構築は行われる場合があるが、この検査からモデルのロードや復元は行わない。
+一時ワーカーは検査後に終了し、次の通常処理が必要なら以前のモデルを復元する。
+検査全体は60秒、要求送信後の応答は10秒を
+上限とする。Pythonのパスはローカル画面だけに表示し、コピーする診断結果からは除外する。
+
 ## 3. エラーコード一覧
 
 `error.code` は実装上の文字列定数であり、以下が全コードである。`message` は人間可読の
@@ -275,16 +396,19 @@ faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレ�
 
 | コード | 発生箇所 | 発生条件 |
 |---|---|---|
-| `invalid_request` | worker.py | リクエストがJSONオブジェクトでない / `id` が欠落 / `quantization` が文字列でない / `prompt` の型が不正(非文字列要素を含むリスト、文字列・リスト・null以外)。 |
+| `invalid_request` | worker.py | リクエストがJSONオブジェクトでない / `id` が欠落 / `quantization` が文字列でない / `prompt` の型が不正(非文字列要素を含むリスト、文字列・リスト・null以外) / `language` が文字列・null 以外、または32文字超。 |
 | `invalid_json` | worker.py (`serve`) | 受信行がJSONとして解釈できない(`JSONDecodeError`)。`id` は `null`。 |
 | `model_not_loaded` | worker.py | `load` 成功前に `transcribe` を要求した。 |
 | `invalid_audio_path` | worker.py | `audio_path` が非空文字列でない。 |
 | `audio_not_found` | worker.py | `audio_path` が示すパスが存在しない、またはファイルでない。 |
-| `unsupported_operation` | worker.py | `command`/`op` が `load`/`transcribe`/`shutdown` のいずれでもない。 |
+| `unsupported_operation` | worker.py | `command`/`op` が `hello`/`health`/`load`/`transcribe`/`cancel`/`shutdown` のいずれでもない。 |
+| `cancelled` | worker.py / backends.py | `cancel`(§2.5)で中断された `transcribe`。中断できずに完了した場合も結果を破棄してこのコードを返す。 |
 | `unsupported_quantization` | backends.py(各バックエンドの `load` / `faster_whisper_compute_type`) | `quantization` が許容集合 `{4bit, 8bit, bf16}` 外。 |
 | `unsupported_backend` | backends.py (`create_backend`) | 未知のバックエンド名。プロセス起動時 (`main`) に発生し、終了コード2でワーカーが起動失敗する(この場合プロトコル応答ではなくstderr出力)。 |
-| `backend_unavailable` | backends.py (`FasterWhisperBackend.load`) | `faster_whisper` パッケージが未インストール(ImportError)。 |
-| `gpu_oom` | backends.py(例外マッピング / mock) | 例外メッセージに "out of memory" または "cuda oom" を含む(load/transcribe両方で発生しうる)。 |
+| `backend_unavailable` | backends.py | faster-whisper、VibeVoice、HTTP バックエンドの必要パッケージがない。 |
+| `gpu_oom` | backends.py(例外マッピング / mock) | CPUロード・CPU推論・CPU再試行以外の文脈で GPU メモリ不足を捕捉した。ホストの割り当て失敗は `cpu_oom`。load/transcribe両方で発生しうる。 |
+| `cpu_oom` | backends.py(ホストメモリの例外マッピング) | CPUロード・推論・再試行中のメモリ不足、または CUDA/VibeVoice を含む処理のホスト割り当て失敗を捕捉した。小さいモデルや他アプリの終了で再試行する。推論中なら短い録音も検討する。 |
+| `invalid_decode_profile` | backends.py(faster-whisper生成時) | 起動時の設定エラー。stderrへ案内し終了コード2で終了する。JSONL応答はない。ASR_WHISPER_DECODE_PROFILEにはstandardかfastを指定する。 |
 | `gpu_unsupported` | backends.py (`VibeVoiceBackend.load`) | CUDA GPUが利用不可、またはモデルがCUDAに配置されなかった(CPUフォールバック無効)。 |
 | `hf_auth_required` | backends.py(例外マッピング) | Hugging Faceのgatedモデル、無効なトークン、または401/403応答によりモデルを取得できない。 |
 | `hf_repository_unavailable` | backends.py(例外マッピング) | Hugging FaceのモデルIDが存在しない、またはprivateモデルへの読取権限がない。 |
@@ -292,6 +416,14 @@ faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレ�
 | `hf_download_failed` | backends.py(例外マッピング) | Hugging Faceへの接続、名前解決、またはダウンロードが失敗した。 |
 | `model_load_failed` | backends.py(例外マッピング) | `load` 中の予期しない例外(OOM以外)。 |
 | `transcription_failed` | backends.py(例外マッピング) | `transcribe` 中の予期しない例外(OOM以外)。 |
+| `transcript_truncated` | backends.py (`VibeVoiceBackend.transcribe`) | 生成が `max_new_tokens`(音声長からの推定、上限 `VIBEVOICE_MAX_NEW_TOKENS` = (15分の録音上限 + 60秒) × 40 + 128 = 38528、`ASR_MAX_NEW_TOKENS` で上書き可)に達し、終端トークンなしで打ち切られた。途中までの出力は返さない(長尺録音の分割または `ASR_MAX_NEW_TOKENS` の引き上げが必要)。 |
+| `missing_api_key` | backends.py | HTTP バックエンドの API キーが未設定。 |
+| `invalid_api_config` | backends.py | API の URL、タイムアウトなどの設定が不正。 |
+| `invalid_device` | backends.py | `ASR_DEVICE` が不正。`auto`・`cpu`・`cuda` のいずれかを指定する。 |
+| `api_request_failed` | backends.py | HTTP 接続または API のステータスが失敗。 |
+| `invalid_api_response` | backends.py | API 応答に有効な text がない。 |
+| `serve_dependencies_missing` | api.py | HTTP サーバー用の追加依存が未インストール。 |
+| `serve_auth_required` | api.py | 非loopbackへ公開する場合は `ASR_SERVE_API_KEY` が必要。 |
 | `internal_error` | worker.py | 上記のいずれにも該当しない予期しない例外を `handle` が捕捉した場合の包括フォールバック。 |
 
 補足:
@@ -299,11 +431,41 @@ faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレ�
 - `unsupported_backend` は起動時のバックエンド生成失敗としてのみ発生し、ワーカーは
   終了コード2で即時終了する。これはプロトコル上のレスポンスではなく、起動時の失敗である。
 - `BackendError` として送出されたコード(`unsupported_quantization`, `backend_unavailable`,
-  `gpu_oom`, `gpu_unsupported`, `hf_auth_required`, `hf_repository_unavailable`,
-  `hf_rate_limited`, `hf_download_failed`, `model_load_failed`, `transcription_failed`)は
+  `gpu_oom`, `cpu_oom`, `gpu_unsupported`, `hf_auth_required`, `hf_repository_unavailable`,
+  `hf_rate_limited`, `hf_download_failed`, `model_load_failed`, `transcription_failed`,
+  `transcript_truncated`)は
   `handle` 内で捕捉され、そのコードのままレスポンスに反映される。
-- それ以外の想定外例外はすべて `internal_error` に丸められ、詳細はstderrにのみ出力される
-  (`message` には例外の内部詳細を含めない)。
+- それ以外の想定外例外は `internal_error` に丸める。stderrには `ASR_DIAGNOSTIC` で始まる
+  構造化された例外チェーンとスタック位置を出力する。任意の例外メッセージ、ソース行、ローカル変数、
+  例外に含まれるユーザーのパスは保存せず、cuBLAS不足など既知の原因だけを固定のhintで示す。
+  Rustはこの形式を検証・再構成し、任意のライブラリ出力を破棄する。ログはアプリのログディレクトリの
+  `asr-worker.log` に保存し、1MiBで1世代ローテーションする。Modelsのエラー表示とDiagnosticsから
+  フォルダーを開ける。プロトコルの `message` に内部例外の詳細は含めない。
+  同じログには起動時のworkerルート・設定ファイル・データベースのパスも記録するため、
+  ログ共有時にはこの起動メタデータが含まれる点を確認する。
+
+### 3.1 デバイス準備とローカルHTTPサーバー
+
+faster-whisperの `ASR_DEVICE=auto|cpu|cuda` は既定で `auto`。
+ロード後に0.5秒の無音を実際にデコードし、結果を破棄する。`auto` でCUDAの生成・ウォームアップが
+Python例外として失敗した場合はCPU/int8で1回再試行する。`cpu` はCUDAを照会せず、`cuda` は
+CPUへ切り替えない。ネイティブライブラリのプロセスabortはPython例外として捕捉できないため、
+実機での確認を要する。VibeVoiceにはこのCPU経路はない。通常の文字起こしのデコード設定は維持する。
+
+`auto` の文字起こし中に捕捉したCUDA/DLL・メモリ不足の例外でも、内部のセグメント
+イテレーターがまだ1つも返していなければ、同じモデルファイルと音声・辞書・言語で
+CPU/int8へ1回だけ切り替える。JSONLの応答は全セグメントを集約してから返す。
+CPUでも失敗した場合はエラーを返す。キャンセル済みの要求、CUDAと無関係なエラー、
+内部でセグメントを取得した後の失敗では再試行しない。切り替え後のdevice/compute typeはhealthで
+確認できる。推論中はload用のprogress eventを発行しない。
+
+`--serve` で非loopbackへbindする場合は `ASR_SERVE_API_KEY` を必須とする。
+Hostはloopback名・bind先・`ASR_SERVE_ALLOWED_HOSTS` の明示的な追加名に限り、Originがある場合は
+同一オリジンだけを受け付ける。キーがある場合はhealthを含む全HTTP要求を本文の読み取り前に認証する。
+音声ファイルは25MiB、要求全体はその上限+64KiBのmultipart用領域までとする。
+実際の受信量を数え、上限超過はmultipartの解析や一時ファイル作成より前に413で拒否する。
+受信量の確認中は上限内のメモリを使用し、file partは1個、通常フィールドは8個までに制限する。
+
 
 ---
 
@@ -321,8 +483,9 @@ faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレ�
 - レスポンスが時間内に得られない場合 `AsrError::Timeout` となる。
 - タイムアウトは **1行の受信ごと**に適用される。したがって進捗通知(§2.2.1)を受信すると
   待機時間はリセットされる。
-- `shutdown` ではレスポンス交換とは別に、プロセス終了の待機にも同じタイムアウトを適用する。
-  時間内に終了しない場合はプロセスをkillする。
+- `shutdown` ではレスポンス交換と、その後のプロセス終了の待機にそれぞれ `SHUTDOWN_TIMEOUT`
+  (5秒)を適用する。レスポンス交換が時間内に終わらなければ終了を待たずにkillし、終了待ちが
+  時間切れの場合もkillする。
 
 ### 4.1.1 進捗通知の扱い
 
@@ -348,37 +511,88 @@ faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレ�
   成功レスポンスを `Transcript` にデシリアライズできない。
 - `AsrError::Crashed` — レスポンス読み取りでEOF(ワーカーが応答なしに終了)。
 - `AsrError::Timeout` — 上記タイムアウト。
-- `AsrError::Cancelled` — キャンセル信号により進行中リクエストを放棄(後述)。
+
+さらに次の場合もワーカーをkillする:
+
+- キャンセルした `transcribe` の応答が猶予期間内に揃わない(§4.3)。
+- キャンセルされた `load`、およびキャンセルされた再spawn時の自動再ロード(§4.5)。
+- `shutdown` / `reconfigure` が処理中のリクエストに割り込んだ(§4.5)。
 
 一方、`AsrError::Worker`(`ok:false` のワーカー報告エラー)は **リセットを引き起こさない**。
-ワーカープロセスは正常に応答しており、再利用可能とみなす。
+ワーカープロセスは正常に応答しており、再利用可能とみなす。`transcribe` のキャンセル自体も
+リセットを引き起こさない。
+
+Rust側はモデルの常駐状態を `Transcriber::model_residency`(`watch` チャネルの
+`ModelResidency`)で通知する。ロード成功ごとに新しい世代番号の `Resident`、リセットで
+`Absent`、再spawn時の自動再ロード中は `Restoring` になる。デスクトップ側はロード成功後に
+これを監視し続け、`Absent` ならモデルステータスを `not_loaded` に、`Restoring` なら
+`loading` にして「Loading the speech model.」と進捗(`model-progress`)を表示し、再び
+`Resident` になれば `ready` に戻す。監視は、別のロードや設定保存がステータスを
+書き換えた時点で終わる(ステータスの値ではなく、どのロードが書いたかで判定する)。
+次の録音・Retry・停止時の認識は `ready` でないモデルを読み込み直す。
 
 ### 4.3 キャンセル(現行の実装)
 
 - `transcribe` は `watch::Receiver<bool>` のキャンセル信号を受け取る。
-- 信号が立つと、Rust側は進行中の `exchange`(ワーカー応答待ち)を `tokio::select!` で放棄し、
-  `AsrError::Cancelled` を返す。これは 4.2 によりワーカーのkill・再spawn・モデル再ロードを
-  引き起こす。
-- **ワーカープロトコル自体にcancel操作は存在しない。** 進行中の `transcribe` を
-  ワーカー側で中断する手段はなく、放棄されたリクエストの認識処理はワーカープロセスの
-  終了(kill)によって停止する。これがR-006のEscキャンセル要件に対する現行の実現手段である。
+- 信号が立つと、Rust側は応答待ちを放棄して **即座に** `AsrError::Cancelled` を返す。
+  呼び出し側(Escによる録音キャンセル、ライブ認識の停止)は再ロードを待たない。
+- 放棄したリクエストの後始末は、ワーカーの状態ロックを保持したバックグラウンドタスクが行う:
+  1. `cancel`(§2.5)を送る。
+  2. 対象リクエストの応答(進捗通知以外の行)と `cancel` の応答を、順不同で両方読み捨てる。
+  3. 猶予期間 `CANCEL_GRACE`(3秒)内に揃えばワーカーとロード済みモデルをそのまま使い続ける。
+     揃わない、想定外の行が来る、または `shutdown` / `reconfigure` が割り込んだ場合はkillする
+     (次のリクエストで再spawn・再ロード。§4.2)。
+- 次のリクエストは後始末が終わるまでロック待ちになる(最長で猶予期間+kill)。
+- 応答待ちを放棄しても、読みかけの行はワーカーごとのバッファに残り、後始末がその続きから
+  読む。ストリームの同期は崩れない。
+- キャンセル信号の送信側が破棄された(`changed()` が `Err` を返す)場合はキャンセル不能に
+  なっただけとみなし、同じ応答の待機を続ける。**リクエストを再送することはない。**
+- これがR-006のEscキャンセル要件の実現手段である。ライブ認識のキャンセルでもワーカーは
+  生き残るため、直後の録音でモデル再ロードによる停止は起きない。
 
 ### 4.4 shutdownの待機
 
 - `shutdown` 送信後、Rust側はレスポンス交換に続けてプロセス終了 (`child.wait()`) を
   タイムアウト付きで待機する。
-- 時間内に終了しない場合はkillしてから再度 `wait` する。
+- レスポンス交換が時間内に終わらなければ、終了を待たずにkillする。終了待ちが時間切れの
+  場合もkillしてから再度 `wait` する。
+
+### 4.5 ロードのキャンセルと割り込み
+
+- `load` は応答待ちの間、ワーカーの状態ロックを保持する(初回ダウンロードでは長時間に及ぶ)。
+  ロックの取得待ち自体もキャンセル信号と割り込みで中断できる。
+- `Transcriber::load_cancellable` はキャンセル信号を受け取る。デスクトップ側は停止時の認識と
+  Retry が必要とするロードにパイプライン操作のキャンセル信号を渡すため、Escでダウンロードや
+  読み込みを中断できる。録音開始が必要とするロードは独立したタスクとして実行し、Escは開始の
+  待機だけを止める(ロードやダウンロードは続き、次の開始で使われる。中断できるのは終了と
+  モデル変更による割り込みだけ)。ロードには安全な中断点がないため、キャンセル
+  されたロードはワーカーをkillし、`loaded_quantization` を消去して `Cancelled` を返す。
+- 応答を待っていた側のfutureが破棄された場合(終了時にabortされた起動時ロードなど)、
+  ワーカーは処理中のまま古い応答を出力しうる。次にロックを取ったリクエストや `shutdown()` は
+  このワーカーを再利用も `shutdown` 送信もせず、即座にkillする。
+- `shutdown()` と `reconfigure()` は状態ロックを取る前に割り込み信号(`watch` の世代番号)を
+  進める。ロックを保持中のリクエスト(ロード、再ロード、応答待ち、キャンセルの後始末)は
+  これを見てワーカーをkillしロックを解放するため、終了処理やモデル変更の保存がダウンロード
+  完了まで待たされることはない。ロック待ちだったリクエストも `Cancelled` で終わる。
+- デスクトップ側のロードは、ワーカーの状態ロックを得た時点(`Transcriber::load_when_started`
+  の `started` コールバック)でモデルステータスを引き継ぎ、以後はステータスを引き継いでいる
+  間だけ結果を表示する。先行ロード(起動時のダウンロードなど)の後ろで待っている間に
+  キャンセルされたロードはステータスに触れないため、先行ロードの完了がそのまま表示される。
+- キャンセルや割り込みで中断されたロードについて、デスクトップ側はモデルステータスを
+  (ステータスをまだ引き継いでいれば)`not_loaded` に戻し、エラーとしては扱わない。
 
 ---
 
-## 5. v2拡張提案(未実装)
+## 5. 過去の v2 拡張案
 
-> 本節の内容は **すべて未実装の提案**である。現行 (v1) のワーカーおよびRustクライアントは
-> いずれの機能も備えていない。設計レビューで指摘された3点
+以下は当初の設計案の記録。現在は hello（§2.6）、進捗通知（§2.2.1）、
+cancel（§2.5）を v1 の追加操作として実装している。実装上の仕様は §1〜4 を優先する。
+
+> 本節は設計レビューで指摘された3点
 > (バージョンハンドシェイクなし / 進捗イベントなし / キャンセル不能)への対応案を記す。
 >
-> 例外として、進捗イベントのうち **`load` の進捗通知のみ実装済み**であり、仕様は §2.2.1 に
-> ある。本節 5.2 が扱う `transcribe` の進捗は引き続き未実装である。
+> 実装状況: **`load` の進捗通知**(§2.2.1)と **`cancel` 操作**(§2.5、§5.3 の案A)は
+> 実装済みである。5.1 のハンドシェイクと 5.2 の `transcribe` 進捗は未実装である。
 
 ### 5.1 バージョンハンドシェイク(hello / capabilities)
 
@@ -399,6 +613,11 @@ faster-whisperは空文字で連結し前後を `strip()`)が、いずれもレ�
   例えば `progress` や `cancel` が含まれなければ現行 (v1) の挙動にフォールバックする。
 - v1ワーカーは `hello` を未知の操作として `unsupported_operation` を返すため、
   クライアントは「v1ワーカーである」と判別でき、後方互換を保てる。
+- **`cancel` の導入にハンドシェイクは不要と判断した。** `cancel` を知らないワーカーも
+  `unsupported_operation` で必ず1行応答し、クライアントは対象と `cancel` の両応答を読み捨てる
+  手順(§4.3)をワーカーの対応状況に関係なく適用できる。非対応ワーカーで失うのは早期中断だけで、
+  その場合も猶予期間後のkillという従来の挙動に戻るにすぎない。折衝で得られるのは「猶予期間を
+  待たずにkillする」判断だけであり、spawnごとの往復と互換管理の複雑さに見合わない。
 
 ### 5.2 transcribe の進捗イベント
 
@@ -459,7 +678,23 @@ R-006 はEscキャンセルを要求する。実装計画書 §R-006 設計注�
 - **欠点:** キャンセルのたびにモデル再ロードが発生し、その遅延(数秒〜数十秒、量子化と
   モデルサイズに依存)の間は次の認識を開始できない。頻繁なキャンセルでコストが累積する。
 
-#### 推奨
+#### 採用(2026-10、issue #38)
+
+ライブ推論の導入でリクエストが録音時間の大部分を占めるようになり、「認識は短く、キャンセルは
+まれ」という下記推奨の前提が崩れた(Esc直後の録音がモデル再ロードで数秒以上止まる)。
+そこで **案Aを、案Bをフォールバックとして残す形で実装した**(§2.5、§4.3)。
+
+- 読み取りと処理の分離: ワーカーは stdin を専用スレッドで読み、処理は従来どおり1件ずつ行う。
+- 協調的中断: faster-whisper はセグメント境界、VibeVoice は `StoppingCriteria` で止まる。
+  中断できないバックエンド(openai-compatible)は完了後に結果を破棄する。
+- 中断後のモデル状態: どちらも生成やセグメント反復を通常の終了と同じ経路で打ち切るだけで、
+  ロード済みの重みには触れない。
+- 猶予期間内に確認できない場合は案Bと同じくkillする。
+- バージョン折衝は導入しない(§5.1 末尾)。
+
+以下は採用前の比較時点の推奨であり、経緯として残す。
+
+#### 推奨(採用前)
 
 **当面は案B(現行のkill+再spawn+再ロード)を正式な仕様として維持することを推奨する。**
 

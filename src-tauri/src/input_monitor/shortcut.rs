@@ -9,6 +9,43 @@ pub(super) struct ShortcutFilter {
     consumed: bool,
 }
 
+/// All chords for the active mode are control input. The first chord is the
+/// one that started recording, so its still-held modifiers are ignored.
+pub(super) struct ShortcutFilters(Vec<ShortcutFilter>);
+
+impl ShortcutFilters {
+    pub(super) fn parse(primary: &str, alternatives: &[String]) -> Option<Self> {
+        let mut filters = vec![ShortcutFilter::parse(primary)?];
+        for alternative in alternatives {
+            let filter = ShortcutFilter::parse(alternative)?;
+            if !filters.iter().any(|existing| {
+                existing.key == filter.key && existing.modifiers == filter.modifiers
+            }) {
+                filters.push(filter);
+            }
+        }
+        Some(Self(filters))
+    }
+
+    pub(super) fn initialize(&mut self, from_shortcut: bool, is_down: impl Fn(u32) -> bool) {
+        for (index, filter) in self.0.iter_mut().enumerate() {
+            filter.initialize(from_shortcut && index == 0, &is_down);
+        }
+    }
+
+    pub(super) fn event(&mut self, vk: u32, down: bool) -> bool {
+        let mut activity = true;
+        for filter in &mut self.0 {
+            activity &= filter.event(vk, down);
+        }
+        activity
+    }
+
+    pub(super) fn pending(&self) -> bool {
+        self.0.iter().any(ShortcutFilter::pending)
+    }
+}
+
 impl ShortcutFilter {
     pub(super) fn parse(value: &str) -> Option<Self> {
         let shortcut = crate::parse_shortcut(value).ok()?.into_string();
@@ -183,6 +220,21 @@ fn virtual_key(code: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alternate_mode_chord_is_control_input() {
+        let mut filters =
+            ShortcutFilters::parse("Ctrl+Shift+Space", &["Ctrl+Alt+V".into()]).unwrap();
+        for vk in [0xA2, 0xA4, 0x56] {
+            assert!(!filters.event(vk, true));
+        }
+        for vk in [0x56, 0xA4, 0xA2] {
+            assert!(!filters.event(vk, false));
+        }
+        assert!(!filters.pending());
+        assert!(!filters.event(0xA2, true));
+        assert!(filters.event(0x58, true));
+    }
 
     #[test]
     fn only_exact_chord_is_consumed_and_pending_ends_after_release() {

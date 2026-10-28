@@ -8,10 +8,16 @@ export type AppPhase =
 
 export interface AppState {
   phase: AppPhase;
+  stage: AppStage;
+  operation: "recording" | "selected_text" | "retry" | "dictation_test" | "insertion_test" | null;
+  operationId: number | null;
   message: string | null;
+  messageCode: string | null;
   lastResult: string | null;
   updatedAt: string;
 }
+
+export type AppStage = "idle" | "preparing_model" | "recording" | "finishing_audio" | "transcribing" | "translating" | "correcting" | "planning" | "inserting" | "updating_text" | "retrying" | "completed" | "error";
 
 export interface AudioDevice {
   id: string;
@@ -33,22 +39,34 @@ export interface RecordingResult {
 
 export interface Settings {
   uiLanguage: UiLanguage;
+  theme: Theme;
+  interactionSounds: boolean;
+  speechLocale: SpeechLocale | null;
   setupComplete: boolean;
-  hotkey: string;
+  cloudConsents: string[];
+  livePreviewEnabled: boolean | null;
+  cloudLivePreviewEnabled: boolean;
+  shortcuts: Record<ShortcutMode, string[]>;
+  holdToTalk: Record<ShortcutMode, boolean>;
   translationHotkey: string;
   translationInstruction: string;
+  translationTargetLanguages: string[];
+  translationTargetLanguage: string;
   microphoneId: string | null;
-  historyEnabled: boolean;
-  historyRetentionDays: number;
+  historyRetention: HistoryRetention;
   deleteAudioAfterProcessing: boolean;
+  /** Keep a failed take with its audio for 24 hours for Retry, even where History or audio retention is off. */
+  keepFailedTakes: boolean;
   autoStart: boolean;
   clipboardRestore: boolean;
+  liveTargetInsertion: boolean;
   noiseSuppression: NoiseSuppression;
   inputGainPercent: number;
   automaticGain: boolean;
   modelId: string | null;
   modelQuantization: ModelQuantization;
   asrBackend: AsrBackend;
+  asrDevice: "auto" | "cpu" | "cuda" | null;
   apiBaseUrl: string;
   apiKeyEnvVar: string;
   textCorrectionEnabled: boolean;
@@ -58,21 +76,68 @@ export interface Settings {
   openaiApiKeyEnvVar: string;
   geminiCorrectionModel: string;
   geminiApiKeyEnvVar: string;
+  localCorrectionBaseUrl: string;
+  localCorrectionModel: string;
+  localCorrectionMaxTokens: number;
   correctionInstruction: string;
+  correctionMode: CorrectionMode;
   correctionRemoveFillers: boolean;
   correctionRemoveRepetitions: boolean;
   correctionResolveSelfCorrections: boolean;
   correctionAutoFormat: boolean;
   correctionImproveClarity: boolean;
   customModels: CustomModel[];
+  personalizationEnabled: boolean;
+  globalStyleProfile: StyleProfile | null;
+  scopedStyleProfiles: ScopedStyleProfile[];
 }
+/**
+ * Stored settings with the backend revision of the write that stored them.
+ * Revisions only grow, so a newer snapshot is one with a higher revision.
+ */
+export interface SettingsSnapshot { settings: Settings; revision: number; }
+export interface StyleProfile { formality: "formal" | "casual"; detail: "concise" | "detailed"; guidance?: string | null; }
+export interface ScopedStyleProfile { scope: string; profile: StyleProfile; }
+export interface RecentApp { appKey: string; category: string; }
 
-export type UiLanguage = "en" | "ja";
+export const uiLocaleRegistry = [
+  { tag: "en", label: "English" },
+  { tag: "ja", label: "Japanese" },
+] as const;
+export type UiLanguage = (typeof uiLocaleRegistry)[number]["tag"];
+export type Theme = "system" | "light" | "dark";
+export type ShortcutMode = "dictate" | "translate" | "ask" | "edit";
+export const speechLocaleRegistry = [
+  { tag: "ja-JP", label: "Japanese (Japan)" },
+  { tag: "en-US", label: "English (United States)" },
+  { tag: "en-GB", label: "English (United Kingdom)" },
+  { tag: "zh-CN", label: "Chinese (Simplified)" },
+  { tag: "zh-TW", label: "Chinese (Traditional)" },
+  { tag: "ko-KR", label: "Korean (South Korea)" },
+  { tag: "es-ES", label: "Spanish (Spain)" },
+  { tag: "es-MX", label: "Spanish (Mexico)" },
+  { tag: "fr-FR", label: "French (France)" },
+  { tag: "fr-CA", label: "French (Canada)" },
+  { tag: "de-DE", label: "German (Germany)" },
+  { tag: "pt-BR", label: "Portuguese (Brazil)" },
+  { tag: "pt-PT", label: "Portuguese (Portugal)" },
+] as const;
+export type SpeechLocale = (typeof speechLocaleRegistry)[number]["tag"];
+/** Translation target codes the UI offers, with their English catalogue labels. */
+export const translationLanguageRegistry = [
+  { code: "en", label: "English" }, { code: "ja", label: "Japanese" }, { code: "zh", label: "Chinese" }, { code: "es", label: "Spanish" },
+  { code: "fr", label: "French" }, { code: "pt", label: "Portuguese" }, { code: "de", label: "German" }, { code: "ko", label: "Korean" },
+] as const;
+export type HistoryRetention = "never" | "24_hours" | "one_week" | "one_month" | "three_months" | "one_year" | "forever";
+
+export type HistoryTextAction = { kind: "correct"; profile: string | null } | { kind: "translate"; target: string };
+export type HistoryFilter = "all" | "dictate" | "translate" | "edit" | "ask";
 
 export type AsrBackend = "vibevoice" | "faster-whisper" | "openai-compatible";
 export type ModelQuantization = "4bit" | "8bit" | "bf16";
 export type NoiseSuppression = "off" | "low" | "medium" | "high";
-export type CorrectionProvider = "openai" | "gemini";
+export type CorrectionProvider = "openai" | "gemini" | "local";
+export type CorrectionMode = "conservative" | "intent_aware";
 export type OpenAIReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface CustomModel {
@@ -84,17 +149,35 @@ export interface HistoryItem {
   id: number;
   transcriptText: string;
   processedText: string | null;
+  sourceText: string | null;
+  instructionText: string | null;
+  actionKind: string | null;
+  searchSite: string | null;
   mode: string;
   asrProvider: string;
   llmProvider: string | null;
+  targetLanguage: string | null;
   appCategory: string | null;
   durationMs: number | null;
   latencyMs: number | null;
   createdAt: string;
+  hasAudio: boolean;
+  retryOfId: number | null;
+  insertionResult: string | null;
+  insertionDetail: string | null;
+  /** Set only on a failed take kept for Retry outside the History settings: when it is deleted. */
+  expiresAt: string | null;
+}
+
+export interface HistoryAudioPayload {
+  bytes: ArrayBuffer;
+  filename: string;
+  mimeType: string;
 }
 
 export interface ModelStatus {
   modelId: string | null;
+  quantization: string;
   installed: boolean;
   state: "not_configured" | "not_installed" | "not_loaded" | "loading" | "ready" | "error";
   detail: string;
@@ -104,7 +187,7 @@ export interface ModelStatus {
 // absent until the download size is known, and for backends that cannot
 // measure it.
 export interface ModelProgress {
-  stage: "download" | "load";
+  stage: "setup" | "download" | "load" | "warmup" | "cpu_fallback";
   model: string | null;
   completedBytes: number | null;
   totalBytes: number | null;
@@ -118,6 +201,50 @@ export interface GpuDiagnostics {
   recommendation: string;
 }
 
+export interface StorageDiagnostics {
+  databaseOk: boolean;
+  schemaVersion: number;
+  summaries: {
+    eventType: string;
+    provider: string | null;
+    mode: string | null;
+    appCategory: string | null;
+    count: number;
+    successes: number;
+    timedCount: number;
+    p50Ms: number | null;
+    p95Ms: number | null;
+  }[];
+  outcomes: {
+    eventType: string;
+    provider: string | null;
+    mode: string | null;
+    appCategory: string | null;
+    success: boolean;
+    code: string | null;
+    count: number;
+  }[];
+}
+
+export interface WorkerHealth {
+  pythonPath: string;
+  pythonVersion: string;
+  fasterWhisperVersion: string | null;
+  ctranslate2Version: string | null;
+  backend: string;
+  loaded: boolean;
+  device: string | null;
+  computeType: string | null;
+}
+
+export type CredentialProvider = "openai" | "gemini" | "speech";
+export interface CredentialStatus {
+  provider: CredentialProvider;
+  alias: string;
+  source: "credential_manager" | "environment" | "missing";
+  storeAvailable: boolean;
+}
+
 export interface DictionaryEntry {
   id: number;
   reading: string;
@@ -126,6 +253,7 @@ export interface DictionaryEntry {
   aliases: string[];
   priority: number;
   appScope: string | null;
+  source: "manual" | "auto";
   createdAt: string;
 }
 
@@ -136,4 +264,14 @@ export interface DictionaryEntryInput {
   aliases?: string[];
   priority?: number;
   appScope?: string | null;
+}
+
+export interface DictionaryCandidate {
+  id: number;
+  originalSpan: string;
+  preferredSpan: string;
+  /** Fixed marker of the rule-based detector, not a measured probability; do not display it as one. */
+  confidence: number;
+  historyId: number | null;
+  createdAt: string;
 }

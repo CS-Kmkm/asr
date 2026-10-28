@@ -1,0 +1,11 @@
+# Remaining explanatory copy cleanup
+
+Goal: Remove redundant persistent explanations left after the earlier progressive-help pass.
+
+Scope: Inspect page/component paragraphs and empty-state details. Remove instructions already expressed by headings, actions or state; move optional information into question-mark help. Keep errors, progress/state, credential sources, deletion/retention consequences, cloud consent notices and the timed insertion-test instruction visible. Preserve behavior, accessible labels and form state. No blanket CSS hiding of paragraphs.
+
+Acceptance: Setup intro/test mechanics, model registration/loading instructions, duplicated diagnostics/profile explanations, ordinary empty-state guidance and reprocessing explanations no longer create persistent paragraphs; useful mechanics remain reachable via help. Check critical visible copy and full tests/build/diff plus independent audit. Native visual verification remains limited by the missing Computer Use pipe.
+
+Implementation: Removed duplicate AI/profile/diagnostics paragraphs and model-registration instructions. Setup intro, completion prerequisite, test mechanics, model download guidance, CSV format and history reprocessing mechanics use question-mark help. Ordinary empty-state instructions are removed; result state uses concise text. Translation shows provider identity with optional behavior help. Alias formatting has both a placeholder and adjacent help so populated entries retain access to the newline rule. Retention/deletion consequences, cloud consent notices, runtime errors/status and the shortened 3-second insertion instruction remain visible.
+
+Validation: Full 151 tests across 17 files passed before the alias-help regression fix; all five dictionary tests passed after it, including a new populated-alias help case. Final TypeScript/Vite build and diff check passed. Logs .ai/test-results/ui-explanation-tests.log, ui-explanation-alias-tests.log and ui-explanation-build.log. Independent reviewer identified placeholder-only alias help, confirmed the adjacent HelpHint fix and reported no remaining confirmed issue. Native visual verification remains pending due to the missing Computer Use pipe. Prior uncommitted work retained; no commit/push authorized.

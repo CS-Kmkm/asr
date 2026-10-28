@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "ask-answer",
+  "description": "Answer display, copy and dismiss only",
+  "windows": ["ask-answer"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten", "allow-get-ui-preferences", "allow-get-ask-answer", "allow-dismiss-ask-answer", "allow-copy-to-clipboard"]
+}

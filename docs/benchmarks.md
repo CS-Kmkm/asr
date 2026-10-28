@@ -282,6 +282,7 @@ uv run python scripts\bench_asr.py --repeat 10 --audio bench_audio\ja_3s.wav `
 |---|---|---|
 | `--backend` | `mock` | ワーカーのバックエンド(`asr_worker --backend` に渡る) |
 | `--quantization` | `4bit` | `load` に渡す量子化 |
+| `--whisper-profile` | `standard` | faster-whisperのみ。実験用`fast`はbeam_size=1とVADを指定 |
 | `--audio WAV` | (なし) | 計測対象 WAV。複数指定可(繰り返し) |
 | `--repeat` | `5` | warm の 1 音声あたり反復回数 |
 | `--cold-runs` | `1` | プロセス再起動込み cold 計測の回数 |
@@ -289,6 +290,8 @@ uv run python scripts\bench_asr.py --repeat 10 --audio bench_audio\ja_3s.wav `
 | `--worker-cmd ...` | (なし) | 既定起動コマンドを上書き(以降の全トークン) |
 | `--timeout` | `300` | リクエストごとのタイムアウト秒(ハング防止) |
 | `--json` | off | markdown 要約の代わりに JSON を出力 |
+| `--output PATH` | (なし) | 結果を新しいUTF-8ファイルへ保存。既存ファイルは上書きしない |
+| `--record-device` | off | 各認識後のhealthから実device/compute typeを記録。対応ワーカーが必要 |
 | `--smoke` | off | サイン波 WAV を生成し mock で自己完結計測 |
 
 ### 5.6 出力の読み方とゲートへの転記
@@ -306,3 +309,37 @@ uv run python scripts\bench_asr.py --repeat 10 --audio bench_audio\ja_3s.wav `
   (ハングしない)。ワーカーの stderr 末尾もエラーに含めて表示する。
 - ワーカーがエラー応答(`ok:false`)を返した場合は、その `code`/`message` を表示して
   終了コード 1 で停止する(例: `gpu_oom`, `model_load_failed`)。
+
+### 5.8 実験用Fastプロファイルの比較
+
+既定の`standard`はライブラリのデコード設定を維持する。`fast`は`beam_size=1`と
+`vad_filter=True`だけを変更する実験用の選択であり、アプリの既定には採用していない。
+ワーカー単体では`ASR_WHISPER_DECODE_PROFILE=standard|fast`で指定できる。
+ベンチマークの`--whisper-profile`は環境変数より優先され、選択をJSONのconfigに記録する。
+
+同じモデル・デバイス・量子化・辞書・録音を使い、変更する条件をプロファイルだけにする。
+以下は既存の評価録音を使う例。録音は別途準備し、参照台本や既存の結果は変更しない。
+CPU比較は`ASR_DEVICE=cpu`、GPU比較は`cuda`で固定し、`auto`の切り替えを比較に混ぜない。
+
+```powershell
+$taskRunDir = Join-Path .diagnostics ("fast-profile-" + (Get-Date -Format yyyyMMdd-HHmmss-fff))
+New-Item -ItemType Directory -Path $taskRunDir -ErrorAction Stop | Out-Null
+$taskPreviousDevice = $env:ASR_DEVICE
+try {
+  $env:ASR_DEVICE = "cpu"
+  uv run scripts/bench_asr.py --backend faster-whisper --audio bench_audio/quiet/ja_short_01.wav --repeat 10 --whisper-profile standard --record-device --json --output (Join-Path $taskRunDir standard.json)
+  if ($LASTEXITCODE -ne 0) { throw "Standard benchmark failed" }
+  uv run scripts/bench_asr.py --backend faster-whisper --audio bench_audio/quiet/ja_short_01.wav --repeat 10 --whisper-profile fast --record-device --json --output (Join-Path $taskRunDir fast.json)
+  if ($LASTEXITCODE -ne 0) { throw "Fast benchmark failed" }
+} finally { $env:ASR_DEVICE = $taskPreviousDevice }
+uv run scripts/score_asr.py --bench (Join-Path $taskRunDir standard.json) --ref docs/eval_set/references.json --terms docs/eval_set/terms.txt
+uv run scripts/score_asr.py --bench (Join-Path $taskRunDir fast.json) --ref docs/eval_set/references.json --terms docs/eval_set/terms.txt
+```
+
+実行順を逆にした比較も新しい結果フォルダーへ保存する。日本語・英語・混在、短文・長文と
+静音・雑音の条件でCER/WER、固有名詞、warmのp50/p95を照合してから採否を判断する。
+JSONの各sampleにある`device`と`compute_type`が両条件で一致していることも確認する。
+healthの時間は認識の計測値に含めない。保存先は計測前に排他的に作成し、計測中の書き込みに
+失敗した場合は結果をコンソールにも出力する。計測が途中で失敗すると、予約した空ファイルが
+残る場合があるため、再実行には新しい保存先を指定する。
+mockのsmokeテストは計測経路だけを確認し、速度・精度の採否根拠には使わない。

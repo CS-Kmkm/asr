@@ -9,20 +9,90 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{broadcast, watch, Mutex};
+use tokio::sync::{broadcast, watch, Mutex, OwnedMutexGuard};
 use tokio::time::timeout;
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const PROTOCOL_VERSION: u64 = 1;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a cancelled transcription may take to confirm a protocol
+/// `cancel` before its worker is killed instead (which costs a model reload
+/// on the next request). Backends stop at their next segment or token.
+const CANCEL_GRACE: Duration = Duration::from_secs(3);
 /// Progress notifications are advisory, so a slow subscriber may drop them
 /// rather than delay the load it is reporting on.
 const PROGRESS_CHANNEL_CAPACITY: usize = 32;
+/// The worker reports no progress while it transcribes, so the response
+/// timeout bounds the whole inference. Long recordings (or slow CPU backends)
+/// get this many seconds per second of audio instead of the fixed minimum.
+const TRANSCRIBE_TIMEOUT_PER_AUDIO_SECOND: u32 = 4;
+/// Canonical PCM WAV header size written by the audio pipeline.
+const WAV_HEADER_BYTES: u64 = 44;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Response timeout for transcribing `audio` worth of speech: never below the
+/// configured `minimum`, otherwise proportional to the recording length.
+pub(crate) fn transcription_timeout(minimum: Duration, audio: Duration) -> Duration {
+    minimum.max(audio.saturating_mul(TRANSCRIBE_TIMEOUT_PER_AUDIO_SECOND))
+}
+
+/// Audio length of a PCM WAV, from its header byte rate and the file size.
+/// Anything that is not a readable RIFF/WAVE file yields `None`.
+fn wav_duration(header: &[u8], file_len: u64) -> Option<Duration> {
+    if header.len() < WAV_HEADER_BYTES as usize
+        || &header[0..4] != b"RIFF"
+        || &header[8..12] != b"WAVE"
+    {
+        return None;
+    }
+    let byte_rate = u32::from_le_bytes(header[28..32].try_into().ok()?);
+    if byte_rate == 0 {
+        return None;
+    }
+    let audio_bytes = file_len.saturating_sub(WAV_HEADER_BYTES);
+    Some(Duration::from_secs_f64(
+        audio_bytes as f64 / f64::from(byte_rate),
+    ))
+}
+
+fn wav_file_duration(path: &Path) -> Option<Duration> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    let mut header = [0u8; WAV_HEADER_BYTES as usize];
+    file.read_exact(&mut header).ok()?;
+    wav_duration(&header, file_len)
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct WorkerCommand {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Working directory for the worker. `python -m` puts it first on
+    /// `sys.path`, so it must not be the inherited working directory.
+    pub current_dir: Option<PathBuf>,
+    /// Model configuration identity, even though quantization is sent by JSONL.
+    pub quantization: Option<String>,
+    pub(crate) provision: Option<crate::worker_setup::Provision>,
+    pub(crate) source_required: bool,
+}
+
+impl fmt::Debug for WorkerCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkerCommand")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field(
+                "environment_names",
+                &self.env.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            )
+            .field("current_dir", &self.current_dir)
+            .field("quantization", &self.quantization)
+            .field("provision", &self.provision)
+            .field("source_required", &self.source_required)
+            .finish()
+    }
 }
 
 impl WorkerCommand {
@@ -42,12 +112,21 @@ impl WorkerCommand {
                 // Notifications are sent only to a client that asks for them.
                 ("ASR_WORKER_PROGRESS".into(), "1".into()),
             ],
+            current_dir: None,
+            quantization: None,
+            provision: None,
+            source_required: false,
         }
     }
 
     pub fn with_backend(mut self, backend: &str) -> Self {
         self.args.push("--backend".into());
         self.args.push(backend.to_owned());
+        self
+    }
+
+    pub fn with_current_dir(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.current_dir = Some(directory.into());
         self
     }
 }
@@ -66,6 +145,68 @@ pub struct Transcript {
     pub segments: Vec<Segment>,
     pub model: String,
     pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerHealth {
+    pub python_path: String,
+    pub python_version: String,
+    pub faster_whisper_version: Option<String>,
+    pub ctranslate2_version: Option<String>,
+    pub backend: String,
+    pub loaded: bool,
+    pub device: Option<String>,
+    pub compute_type: Option<String>,
+}
+
+impl WorkerHealth {
+    fn parse(response: &Value) -> Result<Self, AsrError> {
+        let health: Self =
+            serde_json::from_value(response.get("health").cloned().unwrap_or(Value::Null))
+                .map_err(|_| AsrError::Protocol("invalid worker health response".into()))?;
+        let text_ok = |text: &str, limit| {
+            !text.is_empty() && text.len() <= limit && !text.chars().any(char::is_control)
+        };
+        if !text_ok(&health.python_path, 32_768)
+            || !text_ok(&health.python_version, 128)
+            || [&health.faster_whisper_version, &health.ctranslate2_version]
+                .iter()
+                .any(|v| v.as_deref().is_some_and(|v| !text_ok(v, 128)))
+            || ![
+                "mock",
+                "faster-whisper",
+                "vibevoice",
+                "openai-compatible",
+                "unknown",
+            ]
+            .contains(&health.backend.as_str())
+            || health
+                .device
+                .as_deref()
+                .is_some_and(|v| !["cpu", "cuda"].contains(&v))
+            || health.compute_type.as_deref().is_some_and(|v| {
+                ![
+                    "int8",
+                    "int8_float16",
+                    "int8_float32",
+                    "int8_bfloat16",
+                    "int16",
+                    "float16",
+                    "float32",
+                    "bfloat16",
+                    "4bit",
+                    "8bit",
+                    "bf16",
+                ]
+                .contains(&v)
+            })
+            || (!health.loaded && (health.device.is_some() || health.compute_type.is_some()))
+        {
+            return Err(AsrError::Protocol("invalid worker health response".into()));
+        }
+        Ok(health)
+    }
 }
 
 /// Progress the worker reports while a `load` request is still running.
@@ -114,70 +255,431 @@ pub enum AsrError {
 }
 
 #[async_trait]
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates must_use on boxed futures; required on its generated methods on newer Clippy."
+)]
 pub trait Transcriber: Send + Sync {
+    async fn health(&self) -> Result<WorkerHealth, AsrError> {
+        Err(AsrError::Protocol("worker health is unavailable".into()))
+    }
     async fn load(&self, quantization: &str) -> Result<(), AsrError>;
+    /// `load` that gives up with `AsrError::Cancelled` once `cancel` turns
+    /// true, for example when the recording that needs the model is cancelled.
+    async fn load_cancellable(
+        &self,
+        quantization: &str,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<(), AsrError> {
+        let _ = cancel;
+        self.load(quantization).await
+    }
+    /// `load`, optionally cancellable, that calls `started` once the load
+    /// has the worker to itself (any load ahead of it has finished). A load
+    /// cancelled while still waiting returns without calling it.
+    async fn load_when_started(
+        &self,
+        quantization: &str,
+        cancel: Option<watch::Receiver<bool>>,
+        started: &(dyn Fn() + Send + Sync),
+    ) -> Result<(), AsrError> {
+        started();
+        match cancel {
+            Some(cancel) => self.load_cancellable(quantization, cancel).await,
+            None => self.load(quantization).await,
+        }
+    }
     async fn transcribe(
         &self,
         audio_path: &Path,
         prompt: Option<&str>,
         cancel: watch::Receiver<bool>,
     ) -> Result<Transcript, AsrError>;
+    async fn transcribe_with_locale(
+        &self,
+        audio_path: &Path,
+        prompt: Option<&str>,
+        locale: Option<&str>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Transcript, AsrError> {
+        let _ = locale;
+        self.transcribe(audio_path, prompt, cancel).await
+    }
     async fn shutdown(&self) -> Result<(), AsrError>;
     /// Reconfigure the worker command (for example when the ASR backend
     /// setting changes) and tear down any running worker so the next request
-    /// spawns with the new command.
+    /// spawns with the new command. A request in flight, such as a model
+    /// download, is abandoned instead of delaying the change. Reconfiguring
+    /// with the current command changes nothing and interrupts nothing.
     async fn reconfigure(&self, command: WorkerCommand);
     /// Subscribe to the progress the worker reports during a model load.
     fn load_progress(&self) -> Option<broadcast::Receiver<LoadProgress>> {
         None
     }
+    /// Whether the loaded model is in memory (see `ModelResidency`). A
+    /// transcriber that does not track this returns `None`.
+    fn model_residency(&self) -> Option<watch::Receiver<ModelResidency>> {
+        None
+    }
+}
+
+/// What the worker holds, as seen by the desktop's model status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelResidency {
+    /// No model: nothing loaded yet, a failed load, or a reset worker.
+    Absent,
+    /// A respawned worker is reloading the model it held before a reset.
+    /// The worker's progress notifications are relayed meanwhile.
+    Restoring,
+    /// Loaded; every successful load or restore gets a new generation.
+    Resident(u64),
 }
 
 struct RunningWorker {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// The start of a line whose read was abandoned by a cancelled wait. The
+    /// next read continues the same line, so giving up on a response never
+    /// desynchronizes the stream.
+    partial_line: Vec<u8>,
+    /// A request was sent and its response not yet read. Still set when the
+    /// waiting future was dropped (for example an aborted startup load): the
+    /// worker is busy and its stream holds a stale response, so it is killed
+    /// rather than reused or asked to shut down.
+    in_flight: bool,
+}
+
+impl RunningWorker {
+    async fn send(&mut self, message: &Value) -> Result<(), AsrError> {
+        let mut encoded =
+            serde_json::to_vec(message).map_err(|error| AsrError::Protocol(error.to_string()))?;
+        encoded.push(b'\n');
+        self.in_flight = true;
+        self.stdin.write_all(&encoded).await?;
+        self.stdin.flush().await?;
+        Ok(())
+    }
+
+    /// Read one complete line. Cancel-safe: a read dropped midway keeps what
+    /// it consumed in `partial_line`.
+    async fn read_line(&mut self, line_timeout: Duration) -> Result<Vec<u8>, AsrError> {
+        loop {
+            let limit = (MAX_RESPONSE_BYTES + 1).saturating_sub(self.partial_line.len());
+            let read = timeout(
+                line_timeout,
+                (&mut self.stdout)
+                    .take(limit as u64)
+                    .read_until(b'\n', &mut self.partial_line),
+            )
+            .await
+            .map_err(|_| AsrError::Timeout)??;
+            if self.partial_line.len() > MAX_RESPONSE_BYTES {
+                self.partial_line.clear();
+                return Err(AsrError::Protocol(
+                    "worker response exceeded size limit".into(),
+                ));
+            }
+            if self.partial_line.ends_with(b"\n") {
+                return Ok(std::mem::take(&mut self.partial_line));
+            }
+            if read == 0 {
+                let _ = self.child.wait().await;
+                return Err(AsrError::Crashed);
+            }
+        }
+    }
+
+    async fn kill(&mut self) {
+        let _ = self.child.kill().await;
+        let _ = self.child.wait().await;
+    }
 }
 
 struct State {
     command: WorkerCommand,
     running: Option<RunningWorker>,
+    /// Quantization of the model the running worker holds (or held before a
+    /// crash, so a respawn can restore it). `None` after a failed load.
     loaded_quantization: Option<String>,
+    residency: watch::Sender<ModelResidency>,
+    load_generation: u64,
+}
+
+impl State {
+    fn mark_resident(&mut self) {
+        self.load_generation += 1;
+        self.residency
+            .send_replace(ModelResidency::Resident(self.load_generation));
+    }
+
+    fn mark_not_resident(&self) {
+        self.residency.send_if_modified(|residency| {
+            let changed = *residency != ModelResidency::Absent;
+            *residency = ModelResidency::Absent;
+            changed
+        });
+    }
+
+    /// Kill the worker. The next request spawns a new one and reloads the
+    /// model it held.
+    async fn reset(&mut self) {
+        if let Some(mut worker) = self.running.take() {
+            worker.kill().await;
+        }
+        self.mark_not_resident();
+    }
+
+    /// Kill a worker whose last response was abandoned without a drain. A
+    /// restore abandoned the same way left no worker behind.
+    async fn discard_abandoned_worker(&mut self) {
+        match &self.running {
+            Some(worker) if worker.in_flight => self.reset().await,
+            Some(_) => {}
+            None => self.mark_not_resident(),
+        }
+    }
+}
+
+/// Why a wait for the worker ended without its response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Interruption {
+    /// The request's own cancel signal turned true.
+    Cancelled,
+    /// `shutdown` or `reconfigure` needs the worker.
+    Interrupted,
+}
+
+fn cancel_requested(cancel: &Option<watch::Receiver<bool>>) -> bool {
+    cancel.as_ref().is_some_and(|receiver| *receiver.borrow())
+}
+
+async fn cancel_changed(
+    cancel: Option<&mut watch::Receiver<bool>>,
+) -> Result<(), watch::error::RecvError> {
+    match cancel {
+        Some(receiver) => receiver.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Await `operation` unless the request is cancelled or the transcriber is
+/// interrupted first.
+///
+/// A dropped cancel sender only means nobody can cancel any more: the wait
+/// continues on the same future, so the request is never sent twice.
+async fn until_cancelled<T>(
+    operation: impl std::future::Future<Output = T>,
+    cancel: &mut Option<watch::Receiver<bool>>,
+    interrupt: &mut watch::Receiver<u64>,
+) -> Result<T, Interruption> {
+    if cancel_requested(cancel) {
+        return Err(Interruption::Cancelled);
+    }
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            output = &mut operation => return Ok(output),
+            _ = interrupt.changed() => return Err(Interruption::Interrupted),
+            changed = cancel_changed(cancel.as_mut()) => match changed {
+                Ok(()) if cancel_requested(cancel) => return Err(Interruption::Cancelled),
+                Ok(()) => {}
+                Err(_) => *cancel = None,
+            },
+        }
+    }
+}
+
+/// Ask the worker to cancel request `target_id`, then consume its reply and
+/// the cancel's own reply, in either order.
+///
+/// A worker that predates `cancel` keeps transcribing and answers the cancel
+/// with `unsupported_operation` afterwards, so it is drained the same way as
+/// long as it finishes within the caller's grace period.
+async fn drain_cancelled(
+    worker: &mut RunningWorker,
+    target_id: &Value,
+    cancel_id: u64,
+    line_timeout: Duration,
+) -> Result<(), AsrError> {
+    worker
+        .send(&json!({"id": cancel_id, "command": "cancel", "target_id": target_id}))
+        .await?;
+    let cancel_id = json!(cancel_id);
+    let (mut target_answered, mut cancel_answered) = (false, false);
+    while !(target_answered && cancel_answered) {
+        let line = worker.read_line(line_timeout).await?;
+        let message: Value =
+            serde_json::from_slice(&JsonlTranscriber::sanitize_response_unicode(&line))
+                .map_err(|error| AsrError::Protocol(error.to_string()))?;
+        let id = message.get("id");
+        if id == Some(target_id) {
+            // Progress notifications for the target carry no outcome.
+            target_answered |= message.get("ok").is_some();
+        } else if id == Some(&cancel_id) {
+            cancel_answered = true;
+        } else {
+            return Err(AsrError::Protocol(
+                "unexpected worker message while cancelling".into(),
+            ));
+        }
+    }
+    worker.in_flight = false;
+    Ok(())
 }
 
 pub struct JsonlTranscriber {
     request_timeout: Duration,
     load_timeout: Duration,
+    cancel_grace: Duration,
+    shutdown_timeout: Duration,
     next_id: AtomicU64,
     state: Arc<Mutex<State>>,
     progress: broadcast::Sender<LoadProgress>,
+    /// Bumped by `shutdown` and `reconfigure` before they wait for the state
+    /// lock, so whatever holds it (a model download, a cancelled request
+    /// being drained) kills the worker and lets go instead of blocking them.
+    interrupt: watch::Sender<u64>,
+    residency: watch::Receiver<ModelResidency>,
+    /// The command `State` runs, readable without the state lock. A running
+    /// load holds that lock, so `reconfigure` compares against this copy to
+    /// leave the load alone when the command is unchanged. Held through a
+    /// whole reconfiguration, so concurrent ones apply in order and the copy
+    /// never disagrees with `State::command` once they finish.
+    configured_command: Mutex<WorkerCommand>,
+}
+
+/// Build the worker process command: the discovered working directory, no
+/// console window, and stderr routed to the worker log (`log_stderr`),
+/// inherited in debug builds, or discarded in release builds.
+fn worker_process_command(command_spec: &WorkerCommand, log_stderr: bool) -> Command {
+    let mut command = Command::new(&command_spec.program);
+    command
+        .env_clear()
+        .envs(crate::environment::worker_environment())
+        .args(&command_spec.args)
+        .envs(
+            command_spec
+                .env
+                .iter()
+                .filter(|(name, _)| {
+                    if name == "ASR_API_KEY" {
+                        command_spec
+                            .args
+                            .windows(2)
+                            .any(|pair| pair == ["--backend", "openai-compatible"])
+                    } else {
+                        !crate::environment::is_provider_key(name)
+                    }
+                })
+                .cloned(),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(if log_stderr {
+            Stdio::piped()
+        } else if cfg!(debug_assertions) {
+            Stdio::inherit()
+        } else {
+            // A GUI-subsystem parent has no stderr to inherit; Python would
+            // then see sys.stderr as None, and diagnostics written to it
+            // could end up on stdout and corrupt the JSONL protocol.
+            Stdio::null()
+        })
+        .kill_on_drop(true);
+    if let Some(directory) = &command_spec.current_dir {
+        command.current_dir(directory);
+    }
+    // The release app has no console for the Python worker to share, so
+    // it would otherwise open a console window of its own.
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
 }
 
 impl JsonlTranscriber {
     pub fn new(command: WorkerCommand, request_timeout: Duration, load_timeout: Duration) -> Self {
+        let (residency, residency_receiver) = watch::channel(ModelResidency::Absent);
         Self {
             request_timeout,
             load_timeout,
+            cancel_grace: CANCEL_GRACE,
+            shutdown_timeout: SHUTDOWN_TIMEOUT,
             next_id: AtomicU64::new(1),
+            configured_command: Mutex::new(command.clone()),
             state: Arc::new(Mutex::new(State {
                 command,
                 running: None,
                 loaded_quantization: None,
+                residency,
+                load_generation: 0,
             })),
             progress: broadcast::channel(PROGRESS_CHANNEL_CAPACITY).0,
+            interrupt: watch::channel(0).0,
+            residency: residency_receiver,
         }
     }
 
-    async fn spawn(&self, command_spec: &WorkerCommand) -> Result<RunningWorker, AsrError> {
-        let mut command = Command::new(&command_spec.program);
-        command
-            .args(&command_spec.args)
-            .envs(command_spec.env.iter().cloned())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
+    #[cfg(test)]
+    fn with_grace_periods(mut self, cancel_grace: Duration, shutdown_timeout: Duration) -> Self {
+        self.cancel_grace = cancel_grace;
+        self.shutdown_timeout = shutdown_timeout;
+        self
+    }
+
+    fn next_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn interrupt_running_request(&self) {
+        self.interrupt
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    async fn spawn(
+        &self,
+        command_spec: &WorkerCommand,
+        cancel: &mut Option<watch::Receiver<bool>>,
+        interrupt: &mut watch::Receiver<u64>,
+    ) -> Result<RunningWorker, AsrError> {
+        if command_spec.source_required
+            && !command_spec
+                .current_dir
+                .as_ref()
+                .is_some_and(|root| root.join("asr_worker/__main__.py").is_file())
+        {
+            return Err(AsrError::Worker(WorkerError {
+                code: "worker_source_missing".into(),
+                message: "Speech worker resources are missing".into(),
+            }));
+        }
+        if let Some(provision) = &command_spec.provision {
+            let _ = self.progress.send(LoadProgress {
+                stage: "setup".into(),
+                model: None,
+                completed_bytes: None,
+                total_bytes: None,
+            });
+            until_cancelled(
+                timeout(self.load_timeout, provision.prepare()),
+                cancel,
+                interrupt,
+            )
+            .await
+            .map_err(|_| AsrError::Cancelled)?
+            .map_err(|_| AsrError::Timeout)??;
+        }
+        // stderr carries the worker's internal_error details; persist it to the
+        // rotating worker log when the app installed one.
+        let mut command = worker_process_command(command_spec, crate::worker_log::is_installed());
         let mut child = command.spawn()?;
+        if let Some(stderr) = child.stderr.take() {
+            crate::worker_log::mark_worker_start();
+            tokio::spawn(crate::worker_log::pump(stderr));
+        }
         let stdin = child
             .stdin
             .take()
@@ -186,56 +688,70 @@ impl JsonlTranscriber {
             .stdout
             .take()
             .ok_or_else(|| AsrError::Protocol("worker stdout unavailable".into()))?;
-        Ok(RunningWorker {
+        let mut worker = RunningWorker {
             child,
             stdin,
             stdout: BufReader::new(stdout),
-        })
+            partial_line: Vec::new(),
+            in_flight: false,
+        };
+        let id = self.next_id();
+        let hello = async {
+            worker.send(&json!({"id": id, "command": "hello"})).await?;
+            let response = self
+                .read_response(&mut worker, &json!(id), HANDSHAKE_TIMEOUT)
+                .await?;
+            Self::validate_hello(&response)
+        };
+        let result =
+            match until_cancelled(timeout(HANDSHAKE_TIMEOUT, hello), cancel, interrupt).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(AsrError::Timeout),
+                Err(_) => Err(AsrError::Cancelled),
+            };
+        if let Err(error) = result {
+            worker.kill().await;
+            return Err(error);
+        }
+        Ok(worker)
     }
 
-    async fn exchange(
+    fn validate_hello(response: &Value) -> Result<(), AsrError> {
+        if response.get("protocol_version").and_then(Value::as_u64) != Some(PROTOCOL_VERSION)
+            || response.get("worker_version").and_then(Value::as_str)
+                != Some(env!("CARGO_PKG_VERSION"))
+        {
+            return Err(AsrError::Worker(WorkerError {
+                code: "worker_version_mismatch".into(),
+                message: "Speech worker and app versions do not match".into(),
+            }));
+        }
+        Ok(())
+    }
+
+    /// Read the response to `expected_id`, relaying the progress
+    /// notifications that precede it.
+    async fn read_response(
         &self,
         worker: &mut RunningWorker,
-        request: &Value,
+        expected_id: &Value,
         response_timeout: Duration,
     ) -> Result<Value, AsrError> {
-        let expected_id = request.get("id").cloned().unwrap_or(Value::Null);
-        let mut encoded =
-            serde_json::to_vec(request).map_err(|error| AsrError::Protocol(error.to_string()))?;
-        encoded.push(b'\n');
-        worker.stdin.write_all(&encoded).await?;
-        worker.stdin.flush().await?;
-
         // A request may be preceded by progress notifications carrying the same
         // id; the response is the first line that reports an outcome.
         loop {
-            let mut line = Vec::new();
-            let read = timeout(
-                response_timeout,
-                (&mut worker.stdout)
-                    .take((MAX_RESPONSE_BYTES + 1) as u64)
-                    .read_until(b'\n', &mut line),
-            )
-            .await
-            .map_err(|_| AsrError::Timeout)??;
-            if read == 0 {
-                let _ = worker.child.wait().await;
-                return Err(AsrError::Crashed);
-            }
-            if line.len() > MAX_RESPONSE_BYTES || !line.ends_with(b"\n") {
-                return Err(AsrError::Protocol(
-                    "worker response exceeded size limit".into(),
-                ));
-            }
-            match Self::parse_progress(&line, &expected_id) {
+            let line = worker.read_line(response_timeout).await?;
+            match Self::parse_progress(&line, expected_id) {
                 Some(progress) => {
                     let _ = self.progress.send(progress);
                 }
-                None => return Self::validate_response(&line, &expected_id),
+                None => {
+                    worker.in_flight = false;
+                    return Self::validate_response(&line, expected_id);
+                }
             }
         }
     }
-
     /// Recognize a progress notification for the request being awaited.
     ///
     /// Notifications repeat the request id and carry `event` instead of `ok`,
@@ -347,91 +863,296 @@ impl JsonlTranscriber {
         u16::from_str_radix(text, 16).ok()
     }
 
+    /// Errors after which the worker's stream or process can no longer be
+    /// trusted. Cancellation is not one: a cancelled request is drained.
     fn requires_reset(error: &AsrError) -> bool {
         matches!(
             error,
-            AsrError::Io(_)
-                | AsrError::Protocol(_)
-                | AsrError::Crashed
-                | AsrError::Timeout
-                | AsrError::Cancelled
+            AsrError::Io(_) | AsrError::Protocol(_) | AsrError::Crashed | AsrError::Timeout
         )
     }
 
-    async fn ensure_running(&self, state: &mut State) -> Result<(), AsrError> {
+    /// Take the state lock unless the request is cancelled, or `shutdown` or
+    /// `reconfigure` takes over, while it waits (for example behind a model
+    /// download).
+    async fn lock_state(
+        &self,
+        cancel: &mut Option<watch::Receiver<bool>>,
+        interrupt: &mut watch::Receiver<u64>,
+    ) -> Result<OwnedMutexGuard<State>, AsrError> {
+        let state = until_cancelled(self.state.clone().lock_owned(), cancel, interrupt)
+            .await
+            .map_err(|_| AsrError::Cancelled)?;
+        let mut state = state;
+        if interrupt.has_changed().unwrap_or(true) || cancel_requested(cancel) {
+            return Err(AsrError::Cancelled);
+        }
+        state.discard_abandoned_worker().await;
+        Ok(state)
+    }
+
+    /// Spawn a worker when none is running and restore the model the previous
+    /// one held. The restore can be cancelled like the request that needs it.
+    async fn ensure_running(
+        &self,
+        state: &mut State,
+        cancel: &mut Option<watch::Receiver<bool>>,
+        interrupt: &mut watch::Receiver<u64>,
+    ) -> Result<(), AsrError> {
         if state.running.is_some() {
             return Ok(());
         }
-        let mut worker = self.spawn(&state.command).await?;
+        let mut worker = self.spawn(&state.command, cancel, interrupt).await?;
         if let Some(quantization) = state.loaded_quantization.clone() {
-            let request = json!({
-                "id": self.next_id.fetch_add(1, Ordering::Relaxed),
-                "command": "load",
-                "quantization": quantization,
-            });
-            self.exchange(&mut worker, &request, self.load_timeout)
-                .await?;
+            // The desktop shows this restore like a load, with its progress.
+            state.residency.send_replace(ModelResidency::Restoring);
+            let id = self.next_id();
+            let restored = match worker.send(&load_request(id, &quantization)).await {
+                Ok(()) => until_cancelled(
+                    self.read_response(&mut worker, &json!(id), self.load_timeout),
+                    cancel,
+                    interrupt,
+                )
+                .await
+                .unwrap_or(Err(AsrError::Cancelled)),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = restored {
+                worker.kill().await;
+                state.mark_not_resident();
+                return Err(error);
+            }
+            state.mark_resident();
         }
         state.running = Some(worker);
         Ok(())
     }
 
-    async fn reset_locked(state: &mut State) {
-        if let Some(mut worker) = state.running.take() {
-            let _ = worker.child.kill().await;
-            let _ = worker.child.wait().await;
+    async fn load_with(
+        &self,
+        quantization: &str,
+        mut cancel: Option<watch::Receiver<bool>>,
+        started: Option<&(dyn Fn() + Send + Sync)>,
+    ) -> Result<(), AsrError> {
+        let mut interrupt = self.interrupt.subscribe();
+        let mut state = self.lock_state(&mut cancel, &mut interrupt).await?;
+        // A queued load may carry settings from before a reconfiguration.
+        if state
+            .command
+            .quantization
+            .as_deref()
+            .is_some_and(|configured| configured != quantization)
+        {
+            return Err(AsrError::Cancelled);
         }
+        if let Some(started) = started {
+            started();
+        }
+        if state.running.is_some() && state.loaded_quantization.as_deref() == Some(quantization) {
+            // Already in memory, for example restored after a worker restart.
+            return Ok(());
+        }
+        if state.running.is_none() {
+            // This load replaces whatever a respawn would have restored.
+            state.running = Some(
+                self.spawn(&state.command, &mut cancel, &mut interrupt)
+                    .await?,
+            );
+        }
+        let id = self.next_id();
+        let worker = state.running.as_mut().expect("worker was spawned");
+        let result = match worker.send(&load_request(id, quantization)).await {
+            Ok(()) => {
+                until_cancelled(
+                    self.read_response(worker, &json!(id), self.load_timeout),
+                    &mut cancel,
+                    &mut interrupt,
+                )
+                .await
+            }
+            Err(error) => Ok(Err(error)),
+        };
+        match result {
+            Ok(Ok(_)) => {
+                state.loaded_quantization = Some(quantization.to_owned());
+                state.mark_resident();
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                // The worker unloads its previous model before loading.
+                state.loaded_quantization = None;
+                if Self::requires_reset(&error) {
+                    state.reset().await;
+                } else {
+                    state.mark_not_resident();
+                }
+                Err(error)
+            }
+            Err(_) => {
+                // A load has no safe point to stop at, so the worker goes.
+                state.loaded_quantization = None;
+                state.reset().await;
+                Err(AsrError::Cancelled)
+            }
+        }
+    }
+
+    async fn protocol_request(
+        &self,
+        request: Value,
+        cancel: watch::Receiver<bool>,
+        response_timeout: Duration,
+        restore_model: bool,
+    ) -> Result<Value, AsrError> {
+        let mut cancel = Some(cancel);
+        let mut interrupt = self.interrupt.subscribe();
+        let mut state = self.lock_state(&mut cancel, &mut interrupt).await?;
+        if !restore_model && state.running.is_none() {
+            // Diagnostics must not start a long model restore or publish
+            // Restoring. Keep this temporary worker owned by the future;
+            // kill_on_drop also handles an outer health deadline expiring.
+            let mut worker = self
+                .spawn(&state.command, &mut cancel, &mut interrupt)
+                .await?;
+            let id = request.get("id").cloned().unwrap_or(Value::Null);
+            let result = match worker.send(&request).await {
+                Ok(()) => until_cancelled(
+                    self.read_response(&mut worker, &id, response_timeout),
+                    &mut cancel,
+                    &mut interrupt,
+                )
+                .await
+                .unwrap_or(Err(AsrError::Cancelled)),
+                Err(error) => Err(error),
+            };
+            worker.kill().await;
+            return result;
+        }
+        self.ensure_running(&mut state, &mut cancel, &mut interrupt)
+            .await?;
+        let target_id = request.get("id").cloned().unwrap_or(Value::Null);
+        let worker = state.running.as_mut().expect("worker was ensured");
+        let outcome = match worker.send(&request).await {
+            Ok(()) => {
+                until_cancelled(
+                    self.read_response(worker, &target_id, response_timeout),
+                    &mut cancel,
+                    &mut interrupt,
+                )
+                .await
+            }
+            Err(error) => Ok(Err(error)),
+        };
+        match outcome {
+            Ok(result) => {
+                if result.as_ref().is_err_and(Self::requires_reset) {
+                    state.reset().await;
+                }
+                result
+            }
+            Err(Interruption::Interrupted) => {
+                state.reset().await;
+                Err(AsrError::Cancelled)
+            }
+            Err(Interruption::Cancelled) => {
+                self.drain_in_background(state, target_id, interrupt);
+                Err(AsrError::Cancelled)
+            }
+        }
+    }
+
+    /// Cancel the request in flight without delaying the caller, and keep the
+    /// worker (and its loaded model) when it confirms within the grace period.
+    /// The state lock travels with the drain, so the next request waits for
+    /// it instead of reading the abandoned response.
+    fn drain_in_background(
+        &self,
+        mut state: OwnedMutexGuard<State>,
+        target_id: Value,
+        mut interrupt: watch::Receiver<u64>,
+    ) {
+        let cancel_id = self.next_id();
+        let grace = self.cancel_grace;
+        tokio::spawn(async move {
+            let drained = match state.running.as_mut() {
+                Some(worker) => tokio::select! {
+                    drained = timeout(grace, drain_cancelled(worker, &target_id, cancel_id, grace)) => {
+                        matches!(drained, Ok(Ok(())))
+                    }
+                    _ = interrupt.changed() => false,
+                },
+                None => true,
+            };
+            if !drained {
+                state.reset().await;
+            }
+        });
     }
 
     async fn reset(&self) {
-        let mut state = self.state.lock().await;
-        Self::reset_locked(&mut state).await;
+        self.state.lock().await.reset().await;
     }
+}
 
-    async fn request(
-        &self,
-        request: Value,
-        mut cancel: Option<watch::Receiver<bool>>,
-        response_timeout: Duration,
-    ) -> Result<Value, AsrError> {
-        let mut state = self.state.lock().await;
-        self.ensure_running(&mut state).await?;
-        let worker = state.running.as_mut().expect("worker was ensured");
-        let result = if let Some(receiver) = cancel.as_mut() {
-            if *receiver.borrow() {
-                Err(AsrError::Cancelled)
-            } else {
-                tokio::select! {
-                    result = self.exchange(worker, &request, response_timeout) => result,
-                    changed = receiver.changed() => {
-                        match changed {
-                            Ok(()) if *receiver.borrow() => Err(AsrError::Cancelled),
-                            _ => self.exchange(worker, &request, response_timeout).await,
-                        }
-                    }
-                }
-            }
-        } else {
-            self.exchange(worker, &request, response_timeout).await
-        };
-        if result.as_ref().is_err_and(Self::requires_reset) {
-            Self::reset_locked(&mut state).await;
-        }
-        result
-    }
+fn load_request(id: u64, quantization: &str) -> Value {
+    json!({
+        "id": id,
+        "command": "load",
+        "quantization": quantization,
+    })
+}
+
+/// JSONL `transcribe` request. `language` carries the full speech locale tag
+/// (or null for automatic detection); the worker backend decides how much of
+/// it to honor.
+fn transcribe_request(
+    id: u64,
+    audio_path: &Path,
+    prompt: Option<&str>,
+    locale: Option<&str>,
+) -> Value {
+    json!({
+        "id": id,
+        "command": "transcribe",
+        "audio_path": audio_path,
+        "prompt": prompt,
+        "language": locale,
+    })
 }
 
 #[async_trait]
 impl Transcriber for JsonlTranscriber {
+    async fn health(&self) -> Result<WorkerHealth, AsrError> {
+        let (_sender, cancel) = watch::channel(false);
+        let response = self
+            .protocol_request(
+                json!({"id": self.next_id(), "command": "health"}),
+                cancel,
+                Duration::from_secs(10),
+                false,
+            )
+            .await?;
+        WorkerHealth::parse(&response)
+    }
     async fn load(&self, quantization: &str) -> Result<(), AsrError> {
-        let request = json!({
-            "id": self.next_id.fetch_add(1, Ordering::Relaxed),
-            "command": "load",
-            "quantization": quantization,
-        });
-        self.request(request, None, self.load_timeout).await?;
-        self.state.lock().await.loaded_quantization = Some(quantization.to_owned());
-        Ok(())
+        self.load_with(quantization, None, None).await
+    }
+
+    async fn load_cancellable(
+        &self,
+        quantization: &str,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<(), AsrError> {
+        self.load_with(quantization, Some(cancel), None).await
+    }
+
+    async fn load_when_started(
+        &self,
+        quantization: &str,
+        cancel: Option<watch::Receiver<bool>>,
+        started: &(dyn Fn() + Send + Sync),
+    ) -> Result<(), AsrError> {
+        self.load_with(quantization, cancel, Some(started)).await
     }
 
     async fn transcribe(
@@ -440,14 +1161,24 @@ impl Transcriber for JsonlTranscriber {
         prompt: Option<&str>,
         cancel: watch::Receiver<bool>,
     ) -> Result<Transcript, AsrError> {
-        let request = json!({
-            "id": self.next_id.fetch_add(1, Ordering::Relaxed),
-            "command": "transcribe",
-            "audio_path": audio_path,
-            "prompt": prompt,
-        });
+        self.transcribe_with_locale(audio_path, prompt, None, cancel)
+            .await
+    }
+
+    async fn transcribe_with_locale(
+        &self,
+        audio_path: &Path,
+        prompt: Option<&str>,
+        locale: Option<&str>,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Transcript, AsrError> {
+        let request = transcribe_request(self.next_id(), audio_path, prompt, locale);
+        let response_timeout = transcription_timeout(
+            self.request_timeout,
+            wav_file_duration(audio_path).unwrap_or_default(),
+        );
         let response = self
-            .request(request, Some(cancel), self.request_timeout)
+            .protocol_request(request, cancel, response_timeout, true)
             .await?;
         match serde_json::from_value(response) {
             Ok(transcript) => Ok(transcript),
@@ -459,23 +1190,29 @@ impl Transcriber for JsonlTranscriber {
     }
 
     async fn shutdown(&self) -> Result<(), AsrError> {
+        self.interrupt_running_request();
         let mut state = self.state.lock().await;
+        state.discard_abandoned_worker().await;
+        state.mark_not_resident();
         let Some(mut worker) = state.running.take() else {
             return Ok(());
         };
-        let request = json!({
-            "id": self.next_id.fetch_add(1, Ordering::Relaxed),
-            "command": "shutdown",
-        });
-        let exchange = timeout(
-            SHUTDOWN_TIMEOUT,
-            self.exchange(&mut worker, &request, SHUTDOWN_TIMEOUT),
-        )
+        let id = self.next_id();
+        let exchange = timeout(self.shutdown_timeout, async {
+            worker
+                .send(&json!({"id": id, "command": "shutdown"}))
+                .await?;
+            self.read_response(&mut worker, &json!(id), self.shutdown_timeout)
+                .await
+        })
         .await;
-        let wait = timeout(SHUTDOWN_TIMEOUT, worker.child.wait()).await;
-        if exchange.is_err() || wait.is_err() {
-            let _ = worker.child.kill().await;
-            let _ = worker.child.wait().await;
+        // A worker that did not answer is not waited for a second time.
+        let exited = exchange.is_ok()
+            && timeout(self.shutdown_timeout, worker.child.wait())
+                .await
+                .is_ok();
+        if !exited {
+            worker.kill().await;
         }
         match exchange {
             Ok(result) => result.map(|_| ()),
@@ -487,20 +1224,158 @@ impl Transcriber for JsonlTranscriber {
         Some(self.progress.subscribe())
     }
 
+    fn model_residency(&self) -> Option<watch::Receiver<ModelResidency>> {
+        Some(self.residency.clone())
+    }
+
     async fn reconfigure(&self, command: WorkerCommand) {
-        let mut state = self.state.lock().await;
-        if state.command == command {
+        let mut configured = self.configured_command.lock().await;
+        // An unchanged command keeps the worker, its loaded model and any
+        // request in flight (such as a model download).
+        if *configured == command {
             return;
         }
-        Self::reset_locked(&mut state).await;
-        state.loaded_quantization = None;
-        state.command = command;
+        self.interrupt_running_request();
+        let mut state = self.state.lock().await;
+        if state.command != command {
+            state.reset().await;
+            state.loaded_quantization = None;
+            state.command = command.clone();
+        }
+        *configured = command;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_command_debug_never_formats_environment_values() {
+        let mut command = WorkerCommand::python("python");
+        command
+            .env
+            .push(("ASR_API_KEY".into(), "synthetic-private-key".into()));
+        let debug = format!("{command:?}");
+        assert!(debug.contains("ASR_API_KEY"));
+        assert!(!debug.contains("synthetic-private-key"));
+    }
+
+    #[test]
+    fn worker_health_parsing_reports_runtime_and_rejects_untrusted_shapes() {
+        let response = json!({"health": {
+            "pythonPath": "C:/runtime/python.exe", "pythonVersion": "3.12.8",
+            "fasterWhisperVersion": "1.2.0", "ctranslate2Version": "4.6.0",
+            "backend": "faster-whisper", "loaded": true, "device": "cpu", "computeType": "int8"
+        }});
+        let health = WorkerHealth::parse(&response).unwrap();
+        assert_eq!(health.device.as_deref(), Some("cpu"));
+        assert_eq!(health.python_version, "3.12.8");
+        assert_eq!(serde_json::to_value(&health).unwrap(), response["health"]);
+        for (field, value) in [
+            ("loaded", json!(false)),
+            ("device", json!("unexpected")),
+            ("backend", json!("C:/private/model")),
+            ("pythonVersion", json!("bad\nversion")),
+            ("computeType", json!("secret")),
+            ("pythonPath", json!("x".repeat(32_769))),
+        ] {
+            let mut invalid = response.clone();
+            invalid["health"][field] = value;
+            assert!(WorkerHealth::parse(&invalid).is_err(), "{field}");
+        }
+        assert!(WorkerHealth::parse(&json!({"health": null})).is_err());
+    }
+
+    #[test]
+    fn worker_commands_never_inherit_text_provider_secrets() {
+        for backend in ["mock", "faster-whisper", "vibevoice", "openai-compatible"] {
+            let mut spec = WorkerCommand::python("python").with_backend(backend);
+            for name in ["OPENAI_API_KEY", "GEMINI_API_KEY", "ASR_API_KEY"] {
+                spec.env.push((name.into(), "synthetic-test-secret".into()));
+            }
+            let command = worker_process_command(&spec, false);
+            let keys = command
+                .as_std()
+                .get_envs()
+                .filter(|(_, value)| value.is_some())
+                .map(|(key, _)| key.to_string_lossy().to_string())
+                .collect::<Vec<_>>();
+            assert!(!keys
+                .iter()
+                .any(|key| key == "OPENAI_API_KEY" || key == "GEMINI_API_KEY"));
+            assert_eq!(
+                keys.iter().any(|key| key == "ASR_API_KEY"),
+                backend == "openai-compatible"
+            );
+        }
+    }
+
+    #[test]
+    fn transcription_timeout_scales_with_long_recordings_only() {
+        let minimum = Duration::from_secs(300);
+        assert_eq!(transcription_timeout(minimum, Duration::ZERO), minimum);
+        assert_eq!(
+            transcription_timeout(minimum, Duration::from_secs(60)),
+            minimum
+        );
+        assert_eq!(
+            transcription_timeout(minimum, Duration::from_secs(75)),
+            minimum
+        );
+        assert_eq!(
+            transcription_timeout(minimum, Duration::from_secs(15 * 60)),
+            Duration::from_secs(60 * 60)
+        );
+        assert_eq!(transcription_timeout(minimum, Duration::MAX), Duration::MAX);
+    }
+
+    fn wav_header(byte_rate: u32) -> Vec<u8> {
+        let mut header = Vec::new();
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header.extend_from_slice(b"WAVEfmt ");
+        header.extend_from_slice(&16u32.to_le_bytes());
+        header.extend_from_slice(&1u16.to_le_bytes());
+        header.extend_from_slice(&1u16.to_le_bytes());
+        header.extend_from_slice(&(byte_rate / 2).to_le_bytes());
+        header.extend_from_slice(&byte_rate.to_le_bytes());
+        header.extend_from_slice(&2u16.to_le_bytes());
+        header.extend_from_slice(&16u16.to_le_bytes());
+        header.extend_from_slice(b"data");
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header
+    }
+
+    #[test]
+    fn wav_duration_reads_the_recording_length() {
+        // 24 kHz mono PCM16: 48,000 bytes per second.
+        let header = wav_header(48_000);
+        assert_eq!(
+            wav_duration(&header, 44 + 48_000 * 600),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(wav_duration(&header, 10), Some(Duration::ZERO));
+        assert_eq!(wav_duration(&wav_header(0), 44 + 48_000), None);
+        assert_eq!(wav_duration(b"not a wav file", 1_000), None);
+        let mut not_wave = header.clone();
+        not_wave[8..12].copy_from_slice(b"AVI ");
+        assert_eq!(wav_duration(&not_wave, 44 + 48_000), None);
+    }
+
+    #[test]
+    fn wav_file_duration_is_unknown_for_missing_files() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            wav_file_duration(&directory.path().join("missing.wav")),
+            None
+        );
+        let path = directory.path().join("take.wav");
+        let mut bytes = wav_header(48_000);
+        bytes.resize(44 + 48_000 * 2, 0);
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(wav_file_duration(&path), Some(Duration::from_secs(2)));
+    }
 
     #[test]
     fn parses_successful_transcript() {
@@ -515,6 +1390,37 @@ mod tests {
         let transcript: Transcript = serde_json::from_value(value).unwrap();
         assert_eq!(transcript.text, "hello");
         assert_eq!(transcript.segments.len(), 1);
+    }
+
+    #[test]
+    fn transcribe_request_carries_the_speech_locale() {
+        let path = Path::new("recording.wav");
+        let request = transcribe_request(7, path, Some("terms"), Some("en-GB"));
+        assert_eq!(request["command"], "transcribe");
+        assert_eq!(request["language"], "en-GB");
+        assert_eq!(request["prompt"], "terms");
+        let automatic = transcribe_request(8, path, None, None);
+        assert!(automatic
+            .as_object()
+            .unwrap()
+            .get("language")
+            .unwrap()
+            .is_null());
+    }
+
+    #[test]
+    fn worker_handshake_requires_matching_protocol_and_application_versions() {
+        let good = json!({"protocol_version": 1, "worker_version": env!("CARGO_PKG_VERSION")});
+        assert!(JsonlTranscriber::validate_hello(&good).is_ok());
+        for bad in [
+            json!({}),
+            json!({"protocol_version": 2, "worker_version": env!("CARGO_PKG_VERSION")}),
+            json!({"protocol_version": 1, "worker_version": "old"}),
+        ] {
+            assert!(
+                matches!(JsonlTranscriber::validate_hello(&bad), Err(AsrError::Worker(error)) if error.code == "worker_version_mismatch")
+            );
+        }
     }
 
     #[test]
@@ -537,6 +1443,24 @@ mod tests {
                 ("ASR_WORKER_PROGRESS".to_string(), "1".to_string()),
             ]
         );
+        assert_eq!(command.current_dir, None);
+        assert_eq!(
+            command.with_current_dir("checkout").current_dir,
+            Some(PathBuf::from("checkout"))
+        );
+    }
+
+    #[test]
+    fn worker_process_keeps_its_directory_with_or_without_the_log_pipe() {
+        let spec = WorkerCommand::python("python").with_current_dir("checkout");
+        for log_stderr in [false, true] {
+            let command = worker_process_command(&spec, log_stderr);
+            let command = command.as_std();
+            assert_eq!(command.get_program(), "python");
+            assert_eq!(command.get_current_dir(), Some(Path::new("checkout")));
+        }
+        let without_directory = worker_process_command(&WorkerCommand::python("python"), true);
+        assert_eq!(without_directory.as_std().get_current_dir(), None);
     }
 
     #[test]
@@ -647,5 +1571,835 @@ mod tests {
         assert_eq!(response["text"], "bad:\u{FFFD}");
         assert_eq!(response["paired"], "\u{1F600}");
         assert_eq!(response["literal"], r"\udfff");
+    }
+
+    #[tokio::test]
+    async fn reconfigure_interrupts_only_for_a_new_command() {
+        let command = WorkerCommand::python("python").with_backend("mock");
+        let transcriber = JsonlTranscriber::new(
+            command.clone(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        let mut interrupt = transcriber.interrupt.subscribe();
+        // Like a model load in progress: the state lock is taken.
+        let load = transcriber.state.clone().lock_owned().await;
+        timeout(
+            Duration::from_secs(1),
+            transcriber.reconfigure(command.clone()),
+        )
+        .await
+        .expect("an unchanged command waited for the running load");
+        assert!(!interrupt.has_changed().unwrap());
+        drop(load);
+
+        let changed = command.with_backend("faster-whisper");
+        transcriber.reconfigure(changed.clone()).await;
+        assert!(interrupt.has_changed().unwrap());
+        interrupt.mark_unchanged();
+        assert_eq!(transcriber.state.lock().await.command, changed);
+
+        transcriber.reconfigure(changed.clone()).await;
+        assert!(!interrupt.has_changed().unwrap());
+    }
+
+    /// `JsonlTranscriber` against the real `python -m asr_worker --backend
+    /// mock` process. The mock never downloads a model; files in the test's
+    /// directory hold or crash it on cue and it logs what it ran.
+    mod worker_process {
+        use super::*;
+        use std::ffi::OsString;
+        use std::time::Instant;
+
+        const BOUNDED: Duration = Duration::from_secs(3);
+
+        #[tokio::test]
+        async fn real_faster_whisper_pipe_answers_before_stdin_closes() {
+            let Some(python) = python() else {
+                return;
+            };
+            let root = repository_root();
+            let mut spec = WorkerCommand::python(python)
+                .with_backend("faster-whisper")
+                .with_current_dir(&root);
+            spec.env
+                .push(("PYTHONPATH".into(), root.to_string_lossy().into_owned()));
+            let mut child = worker_process_command(&spec, true).spawn().unwrap();
+            let mut worker = RunningWorker {
+                stdin: child.stdin.take().unwrap(),
+                stdout: BufReader::new(child.stdout.take().unwrap()),
+                child,
+                partial_line: Vec::new(),
+                in_flight: false,
+            };
+            let hello = async {
+                worker
+                    .send(&json!({"id": 1, "command": "hello"}))
+                    .await
+                    .unwrap();
+                let line = worker.read_line(Duration::from_secs(5)).await.unwrap();
+                JsonlTranscriber::validate_hello(
+                    &JsonlTranscriber::validate_response(&line, &json!(1)).unwrap(),
+                )
+                .unwrap();
+                worker
+                    .send(&load_request(2, "invalid-test-format"))
+                    .await
+                    .unwrap();
+                let line = worker.read_line(Duration::from_secs(5)).await.unwrap();
+                assert!(
+                    matches!(JsonlTranscriber::validate_response(&line, &json!(2)), Err(AsrError::Worker(error)) if error.code == "unsupported_quantization")
+                );
+            };
+            let outcome = timeout(Duration::from_secs(15), hello).await;
+            worker.kill().await;
+            outcome.expect("interactive worker stalled without loading a model");
+        }
+
+        #[tokio::test]
+        #[ignore = "requires an existing large-v3-turbo cache and optionally CUDA; never downloads"]
+        async fn cached_faster_whisper_load_through_native_client() {
+            let Some(python) = python() else {
+                return;
+            };
+            let root = repository_root();
+            let mut spec = WorkerCommand::python(python)
+                .with_backend("faster-whisper")
+                .with_current_dir(&root);
+            spec.env.extend([
+                ("PYTHONPATH".into(), root.to_string_lossy().into_owned()),
+                ("ASR_MODEL_ID".into(), "large-v3-turbo".into()),
+                ("ASR_DEVICE".into(), "auto".into()),
+                ("HF_HUB_OFFLINE".into(), "1".into()),
+                ("ASR_WORKER_PROGRESS".into(), "1".into()),
+            ]);
+            let client =
+                JsonlTranscriber::new(spec, Duration::from_secs(10), Duration::from_secs(60));
+            let mut progress = client.load_progress().unwrap();
+            let load = client.load("bf16");
+            tokio::pin!(load);
+            let outcome = loop {
+                tokio::select! {
+                    result = &mut load => break result,
+                    event = progress.recv() => eprintln!("native load stage: {}", event.unwrap().stage),
+                }
+            };
+            if outcome.is_ok() {
+                let health = client.health().await.unwrap();
+                eprintln!(
+                    "native load ready: {:?} {:?}",
+                    health.device, health.compute_type
+                );
+            }
+            client.shutdown().await.unwrap();
+            outcome.unwrap();
+        }
+
+        fn repository_root() -> PathBuf {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("src-tauri has a parent")
+                .to_path_buf()
+        }
+
+        /// The interpreter the app would use (`ASR_PYTHON`, else the project
+        /// virtual environment), else `python` on PATH. `None` skips the test.
+        fn python() -> Option<OsString> {
+            let root = repository_root();
+            let venv = if cfg!(windows) {
+                root.join(".venv").join("Scripts").join("python.exe")
+            } else {
+                root.join(".venv").join("bin").join("python")
+            };
+            let candidates = std::env::var_os("ASR_PYTHON")
+                .into_iter()
+                .chain(venv.is_file().then(|| venv.into_os_string()))
+                .chain([OsString::from("python")]);
+            for candidate in candidates {
+                let supported = std::process::Command::new(&candidate)
+                    .args(["-c", "import sys; sys.exit(sys.version_info < (3, 10))"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if supported {
+                    return Some(candidate);
+                }
+            }
+            eprintln!("skipping worker process test: no Python 3.10+ found");
+            None
+        }
+
+        struct MockWorker {
+            directory: tempfile::TempDir,
+            command: WorkerCommand,
+            audio: PathBuf,
+        }
+
+        impl MockWorker {
+            fn new(extra_env: &[(&str, &str)]) -> Option<Self> {
+                let python = python()?;
+                let directory = tempfile::tempdir().unwrap();
+                let mut command = WorkerCommand::python(python).with_backend("mock");
+                command.env.push((
+                    "PYTHONPATH".into(),
+                    repository_root().to_string_lossy().into_owned(),
+                ));
+                for (name, file) in [
+                    ("ASR_WORKER_MOCK_EVENT_LOG", "events.log"),
+                    ("ASR_WORKER_MOCK_HOLD_FILE", "hold"),
+                    ("ASR_WORKER_MOCK_CRASH_FILE", "crash"),
+                ] {
+                    let path = directory.path().join(file);
+                    command
+                        .env
+                        .push((name.into(), path.to_string_lossy().into_owned()));
+                }
+                for (name, value) in extra_env {
+                    command.env.push(((*name).into(), (*value).into()));
+                }
+                let audio = directory.path().join("take.wav");
+                let mut bytes = wav_header(48_000);
+                bytes.resize(44 + 4_800, 0);
+                std::fs::write(&audio, bytes).unwrap();
+                Some(Self {
+                    directory,
+                    command,
+                    audio,
+                })
+            }
+
+            fn transcriber(&self) -> JsonlTranscriber {
+                JsonlTranscriber::new(
+                    self.command.clone(),
+                    Duration::from_secs(20),
+                    Duration::from_secs(20),
+                )
+                .with_grace_periods(Duration::from_secs(5), Duration::from_secs(2))
+            }
+
+            fn flag(&self, name: &str) -> PathBuf {
+                self.directory.path().join(name)
+            }
+
+            fn hold(&self) {
+                std::fs::write(self.flag("hold"), b"").unwrap();
+            }
+
+            fn release(&self) {
+                std::fs::remove_file(self.flag("hold")).unwrap();
+            }
+
+            /// `(pid, event)` pairs in the order the mock logged them.
+            fn events(&self) -> Vec<(String, String)> {
+                std::fs::read_to_string(self.flag("events.log"))
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|line| line.split_once(' '))
+                    .map(|(pid, event)| (pid.to_owned(), event.to_owned()))
+                    .collect()
+            }
+
+            fn event_names(&self) -> Vec<String> {
+                self.events().into_iter().map(|(_, event)| event).collect()
+            }
+
+            fn processes(&self) -> usize {
+                let mut pids: Vec<_> = self.events().into_iter().map(|(pid, _)| pid).collect();
+                pids.dedup();
+                pids.len()
+            }
+
+            async fn wait_for_event(&self, event: &str, count: usize) {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while self
+                    .event_names()
+                    .iter()
+                    .filter(|name| *name == event)
+                    .count()
+                    < count
+                {
+                    assert!(Instant::now() < deadline, "worker never logged {event}");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+
+            async fn transcribe(
+                &self,
+                transcriber: &JsonlTranscriber,
+            ) -> Result<Transcript, AsrError> {
+                let (_cancel, cancel) = watch::channel(false);
+                transcriber.transcribe(&self.audio, None, cancel).await
+            }
+        }
+
+        fn resident(transcriber: &JsonlTranscriber) -> Option<u64> {
+            match *transcriber.model_residency().unwrap().borrow() {
+                ModelResidency::Resident(generation) => Some(generation),
+                ModelResidency::Absent | ModelResidency::Restoring => None,
+            }
+        }
+
+        async fn wait_until_not_resident(transcriber: &JsonlTranscriber) {
+            let mut residency = transcriber.model_residency().unwrap();
+            timeout(
+                Duration::from_secs(10),
+                residency.wait_for(|residency| *residency == ModelResidency::Absent),
+            )
+            .await
+            .expect("worker was never reset")
+            .unwrap();
+        }
+
+        #[tokio::test]
+        async fn health_after_worker_reset_never_starts_a_slow_restore() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = mock.transcriber();
+            transcriber.load("4bit").await.unwrap();
+            transcriber.reset().await;
+            mock.hold();
+            // A restore would block in MockBackend.load until release().
+            let health = timeout(BOUNDED, transcriber.health())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!health.loaded);
+            assert_eq!(
+                *transcriber.model_residency().unwrap().borrow(),
+                ModelResidency::Absent
+            );
+            assert_eq!(mock.event_names(), ["load 4bit"]);
+            mock.release();
+            mock.transcribe(&transcriber).await.unwrap();
+            assert_eq!(mock.event_names(), ["load 4bit", "load 4bit", "transcribe"]);
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn health_starts_worker_without_loading_and_reports_residency_after_load() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = mock.transcriber();
+            let initial = transcriber.health().await.unwrap();
+            assert_eq!(initial.backend, "mock");
+            assert!(!initial.loaded);
+            assert_eq!(initial.device, None);
+            assert!(!initial.python_path.is_empty());
+            assert!(mock.event_names().is_empty());
+            assert_eq!(resident(&transcriber), None);
+            transcriber.load("4bit").await.unwrap();
+            assert!(transcriber.health().await.unwrap().loaded);
+            assert_eq!(mock.event_names(), ["load 4bit"]);
+            assert_eq!(resident(&transcriber), Some(1));
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn loads_transcribes_and_shuts_down() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = mock.transcriber();
+            transcriber.load("4bit").await.unwrap();
+            assert_eq!(resident(&transcriber), Some(1));
+            // Loading the resident quantization again needs no worker round trip.
+            transcriber.load("4bit").await.unwrap();
+
+            let transcript = mock.transcribe(&transcriber).await.unwrap();
+            assert_eq!(transcript.text, "mock transcription");
+            transcriber.shutdown().await.unwrap();
+
+            assert_eq!(resident(&transcriber), None);
+            assert_eq!(mock.event_names(), ["load 4bit", "transcribe"]);
+        }
+
+        #[tokio::test]
+        async fn a_crash_respawns_the_worker_and_restores_the_model() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = mock.transcriber();
+            transcriber.load("8bit").await.unwrap();
+            std::fs::write(mock.flag("crash"), b"").unwrap();
+
+            let crashed = mock.transcribe(&transcriber).await;
+            assert!(matches!(crashed, Err(AsrError::Crashed)), "{crashed:?}");
+            assert_eq!(
+                *transcriber.model_residency().unwrap().borrow(),
+                ModelResidency::Absent
+            );
+
+            let mut residency = transcriber.model_residency().unwrap();
+            // Clones retain unseen changes from before subscription.
+            assert_eq!(*residency.borrow_and_update(), ModelResidency::Absent);
+            let observed = tokio::spawn(async move {
+                let mut seen = Vec::new();
+                while residency.changed().await.is_ok() {
+                    let current = *residency.borrow_and_update();
+                    seen.push(current);
+                    if matches!(current, ModelResidency::Resident(_)) {
+                        break;
+                    }
+                }
+                seen
+            });
+            let transcript = mock.transcribe(&transcriber).await.unwrap();
+            assert_eq!(transcript.text, "mock transcription");
+            assert!(resident(&transcriber).is_some());
+            assert_eq!(
+                observed.await.unwrap(),
+                [ModelResidency::Restoring, ModelResidency::Resident(2)]
+            );
+            assert_eq!(
+                mock.event_names(),
+                ["load 8bit", "transcribe", "load 8bit", "transcribe"]
+            );
+            assert_eq!(mock.processes(), 2);
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_timeout_resets_the_worker_within_the_timeout() {
+            let Some(mock) = MockWorker::new(&[("ASR_WORKER_MOCK_IGNORE_CANCEL", "1")]) else {
+                return;
+            };
+            let transcriber = JsonlTranscriber::new(
+                mock.command.clone(),
+                Duration::from_millis(500),
+                Duration::from_secs(20),
+            );
+            transcriber.load("4bit").await.unwrap();
+            mock.hold();
+
+            let started = Instant::now();
+            let result = mock.transcribe(&transcriber).await;
+            assert!(matches!(result, Err(AsrError::Timeout)), "{result:?}");
+            assert!(started.elapsed() < BOUNDED);
+            assert_eq!(resident(&transcriber), None);
+            mock.release();
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn cancelling_a_transcription_keeps_the_worker_and_its_model() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = mock.transcriber();
+            transcriber.load("4bit").await.unwrap();
+            let generation = resident(&transcriber);
+            mock.hold();
+
+            let (cancel_tx, cancel) = watch::channel(false);
+            let request = transcriber.transcribe(&mock.audio, None, cancel);
+            let cancel_once_running = async {
+                mock.wait_for_event("transcribe", 1).await;
+                cancel_tx.send_replace(true);
+                Instant::now()
+            };
+            let (result, cancelled_at) = tokio::join!(request, cancel_once_running);
+            assert!(matches!(result, Err(AsrError::Cancelled)), "{result:?}");
+            assert!(cancelled_at.elapsed() < BOUNDED);
+
+            // The held backend stops only because the worker relayed the cancel.
+            mock.wait_for_event("cancelled", 1).await;
+            mock.release();
+            let transcript = mock.transcribe(&transcriber).await.unwrap();
+            assert_eq!(transcript.text, "mock transcription");
+            assert_eq!(resident(&transcriber), generation);
+            assert_eq!(
+                mock.event_names(),
+                ["load 4bit", "transcribe", "cancelled", "transcribe"]
+            );
+            assert_eq!(mock.processes(), 1);
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_cancelled_backend_that_finishes_within_the_grace_period_is_kept() {
+            // Like a backend that cannot stop early, or a worker that predates
+            // `cancel`: the abandoned response is drained when it arrives.
+            let Some(mock) = MockWorker::new(&[("ASR_WORKER_MOCK_IGNORE_CANCEL", "1")]) else {
+                return;
+            };
+            let transcriber = mock.transcriber();
+            transcriber.load("4bit").await.unwrap();
+            mock.hold();
+
+            let (cancel_tx, cancel) = watch::channel(false);
+            let request = transcriber.transcribe(&mock.audio, None, cancel);
+            let cancel_once_running = async {
+                mock.wait_for_event("transcribe", 1).await;
+                cancel_tx.send_replace(true);
+            };
+            let (result, ()) = tokio::join!(request, cancel_once_running);
+            assert!(matches!(result, Err(AsrError::Cancelled)), "{result:?}");
+            mock.release();
+
+            mock.transcribe(&transcriber).await.unwrap();
+            assert!(resident(&transcriber).is_some());
+            assert_eq!(
+                mock.event_names(),
+                ["load 4bit", "transcribe", "transcribe"]
+            );
+            assert_eq!(mock.processes(), 1);
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn an_unconfirmed_cancel_falls_back_to_killing_the_worker() {
+            let Some(mock) = MockWorker::new(&[("ASR_WORKER_MOCK_IGNORE_CANCEL", "1")]) else {
+                return;
+            };
+            let transcriber = mock
+                .transcriber()
+                .with_grace_periods(Duration::from_millis(300), Duration::from_secs(2));
+            transcriber.load("4bit").await.unwrap();
+            mock.hold();
+
+            let (cancel_tx, cancel) = watch::channel(false);
+            let request = transcriber.transcribe(&mock.audio, None, cancel);
+            let cancel_once_running = async {
+                mock.wait_for_event("transcribe", 1).await;
+                cancel_tx.send_replace(true);
+            };
+            let (result, ()) = tokio::join!(request, cancel_once_running);
+            assert!(matches!(result, Err(AsrError::Cancelled)), "{result:?}");
+            wait_until_not_resident(&transcriber).await;
+            mock.release();
+
+            mock.transcribe(&transcriber).await.unwrap();
+            assert_eq!(
+                mock.event_names(),
+                ["load 4bit", "transcribe", "load 4bit", "transcribe"]
+            );
+            assert_eq!(mock.processes(), 2);
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_dropped_cancel_sender_neither_cancels_nor_resends_the_request() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = mock.transcriber();
+            transcriber.load("4bit").await.unwrap();
+            mock.hold();
+
+            let (cancel_tx, cancel) = watch::channel(false);
+            let request = transcriber.transcribe(&mock.audio, None, cancel);
+            let drop_sender_once_running = async {
+                mock.wait_for_event("transcribe", 1).await;
+                drop(cancel_tx);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                mock.release();
+            };
+            let (result, ()) = tokio::join!(request, drop_sender_once_running);
+            assert_eq!(result.unwrap().text, "mock transcription");
+
+            // A resent request would leave a stale response that fails this one.
+            mock.transcribe(&transcriber).await.unwrap();
+            assert_eq!(
+                mock.event_names(),
+                ["load 4bit", "transcribe", "transcribe"]
+            );
+            assert_eq!(mock.processes(), 1);
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn cancelling_a_load_stops_it_in_bounded_time() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = mock.transcriber();
+            mock.hold();
+
+            let (cancel_tx, cancel) = watch::channel(false);
+            let load = transcriber.load_cancellable("4bit", cancel);
+            let cancel_once_loading = async {
+                mock.wait_for_event("load 4bit", 1).await;
+                cancel_tx.send_replace(true);
+                Instant::now()
+            };
+            let (result, cancelled_at) = tokio::join!(load, cancel_once_loading);
+            assert!(matches!(result, Err(AsrError::Cancelled)), "{result:?}");
+            assert!(cancelled_at.elapsed() < BOUNDED);
+            assert_eq!(resident(&transcriber), None);
+
+            mock.release();
+            transcriber.load("4bit").await.unwrap();
+            assert_eq!(mock.processes(), 2);
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn shutdown_does_not_wait_for_a_load() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = Arc::new(mock.transcriber());
+            mock.hold();
+            let load = tokio::spawn({
+                let transcriber = transcriber.clone();
+                async move { transcriber.load("4bit").await }
+            });
+            mock.wait_for_event("load 4bit", 1).await;
+
+            let started = Instant::now();
+            transcriber.shutdown().await.unwrap();
+            assert!(started.elapsed() < BOUNDED);
+            let result = load.await.unwrap();
+            assert!(matches!(result, Err(AsrError::Cancelled)), "{result:?}");
+            mock.release();
+        }
+
+        #[tokio::test]
+        async fn reconfigure_does_not_wait_for_a_load_and_switches_the_command() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = Arc::new(mock.transcriber());
+            mock.hold();
+            let load = tokio::spawn({
+                let transcriber = transcriber.clone();
+                async move { transcriber.load("4bit").await }
+            });
+            mock.wait_for_event("load 4bit", 1).await;
+
+            let mut command = mock.command.clone();
+            command
+                .env
+                .push(("ASR_WORKER_MOCK_TEXT".into(), "reconfigured".into()));
+            let started = Instant::now();
+            transcriber.reconfigure(command).await;
+            assert!(started.elapsed() < BOUNDED);
+            let result = load.await.unwrap();
+            assert!(matches!(result, Err(AsrError::Cancelled)), "{result:?}");
+
+            mock.release();
+            transcriber.load("4bit").await.unwrap();
+            assert_eq!(
+                mock.transcribe(&transcriber).await.unwrap().text,
+                "reconfigured"
+            );
+            assert_eq!(mock.processes(), 2);
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn quantization_change_interrupts_a_load_and_rejects_stale_requests() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let mut initial = mock.command.clone();
+            initial.quantization = Some("4bit".into());
+            let transcriber = Arc::new(mock.transcriber());
+            transcriber.reconfigure(initial).await;
+            mock.hold();
+            let load = tokio::spawn({
+                let transcriber = transcriber.clone();
+                async move { transcriber.load("4bit").await }
+            });
+            mock.wait_for_event("load 4bit", 1).await;
+            let mut changed = mock.command.clone();
+            changed.quantization = Some("8bit".into());
+            transcriber.reconfigure(changed).await;
+            assert!(matches!(load.await.unwrap(), Err(AsrError::Cancelled)));
+            mock.release();
+            transcriber.load("8bit").await.unwrap();
+            mock.wait_for_event("load 8bit", 1).await;
+            let started = std::sync::atomic::AtomicBool::new(false);
+            let stale = transcriber
+                .load_when_started("4bit", None, &|| {
+                    started.store(true, Ordering::SeqCst);
+                })
+                .await;
+            assert!(matches!(stale, Err(AsrError::Cancelled)));
+            assert!(!started.load(Ordering::SeqCst));
+            assert_eq!(
+                transcriber
+                    .state
+                    .lock()
+                    .await
+                    .loaded_quantization
+                    .as_deref(),
+                Some("8bit")
+            );
+            mock.transcribe(&transcriber).await.unwrap();
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn reconfigure_with_the_current_command_keeps_a_running_load() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = Arc::new(mock.transcriber());
+            mock.hold();
+            let load = tokio::spawn({
+                let transcriber = transcriber.clone();
+                async move { transcriber.load("4bit").await }
+            });
+            mock.wait_for_event("load 4bit", 1).await;
+
+            let started = Instant::now();
+            transcriber.reconfigure(mock.command.clone()).await;
+            assert!(started.elapsed() < BOUNDED);
+            assert!(!load.is_finished());
+
+            mock.release();
+            load.await.unwrap().unwrap();
+            assert_eq!(resident(&transcriber), Some(1));
+            mock.transcribe(&transcriber).await.unwrap();
+            assert_eq!(mock.event_names(), ["load 4bit", "transcribe"]);
+            assert_eq!(mock.processes(), 1);
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn shutdown_kills_a_worker_whose_load_was_abandoned() {
+            // Quit aborts the startup load task, dropping its future while
+            // the worker is still loading; shutdown must not wait for it.
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = Arc::new(
+                mock.transcriber()
+                    .with_grace_periods(Duration::from_secs(5), Duration::from_secs(30)),
+            );
+            mock.hold();
+            let load = tokio::spawn({
+                let transcriber = transcriber.clone();
+                async move { transcriber.load("4bit").await }
+            });
+            mock.wait_for_event("load 4bit", 1).await;
+            load.abort();
+            assert!(load.await.unwrap_err().is_cancelled());
+
+            let started = Instant::now();
+            transcriber.shutdown().await.unwrap();
+            assert!(started.elapsed() < BOUNDED);
+            assert!(transcriber.state.lock().await.running.is_none());
+            mock.release();
+        }
+
+        #[tokio::test]
+        async fn a_request_after_an_abandoned_load_uses_a_new_worker() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = Arc::new(mock.transcriber());
+            mock.hold();
+            let load = tokio::spawn({
+                let transcriber = transcriber.clone();
+                async move { transcriber.load("4bit").await }
+            });
+            mock.wait_for_event("load 4bit", 1).await;
+            load.abort();
+            let _ = load.await;
+            mock.release();
+
+            // The stale load response is never read as this load's reply.
+            transcriber.load("8bit").await.unwrap();
+            mock.transcribe(&transcriber).await.unwrap();
+            assert_eq!(mock.processes(), 2);
+            transcriber.shutdown().await.unwrap();
+        }
+
+        /// A worker from before `cancel` existed: it handles one request at a
+        /// time and rejects `cancel` as unknown after the transcription.
+        const LEGACY_WORKER: &str = r#"
+import json, sys
+from asr_worker.backends import MockBackend
+from asr_worker.worker import Worker, error_response
+worker = Worker(MockBackend())
+for line in sys.stdin:
+    request = json.loads(line)
+    if request.get("command") == "cancel":
+        response = error_response(request["id"], "unsupported_operation", "v1")
+    else:
+        response, _ = worker.handle(request)
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#;
+
+        #[tokio::test]
+        async fn incompatible_worker_is_rejected_before_model_load_and_not_retained() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let mut command = mock.command.clone();
+            command.args = vec!["-c".into(), r#"
+import json, sys
+request = json.loads(sys.stdin.readline())
+assert request['command'] == 'hello'
+print(json.dumps({'id': request['id'], 'ok': True, 'protocol_version': 999, 'worker_version': 'old'}), flush=True)
+sys.stdin.read()
+"#.into()];
+            let transcriber =
+                JsonlTranscriber::new(command, Duration::from_secs(20), Duration::from_secs(20));
+            assert!(
+                matches!(transcriber.load("4bit").await, Err(AsrError::Worker(error)) if error.code == "worker_version_mismatch")
+            );
+            assert!(transcriber.state.lock().await.running.is_none());
+            assert!(resident(&transcriber).is_none());
+        }
+
+        #[tokio::test]
+        async fn a_legacy_worker_answering_cancel_last_is_drained_and_kept() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let mut command = mock.command.clone();
+            command.args = vec!["-c".into(), LEGACY_WORKER.into()];
+            let transcriber =
+                JsonlTranscriber::new(command, Duration::from_secs(20), Duration::from_secs(20))
+                    .with_grace_periods(Duration::from_secs(5), Duration::from_secs(2));
+            transcriber.load("4bit").await.unwrap();
+            mock.hold();
+
+            let (cancel_tx, cancel) = watch::channel(false);
+            let request = transcriber.transcribe(&mock.audio, None, cancel);
+            let cancel_once_running = async {
+                mock.wait_for_event("transcribe", 1).await;
+                cancel_tx.send_replace(true);
+            };
+            let (result, ()) = tokio::join!(request, cancel_once_running);
+            assert!(matches!(result, Err(AsrError::Cancelled)), "{result:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            mock.release();
+
+            mock.transcribe(&transcriber).await.unwrap();
+            assert!(resident(&transcriber).is_some());
+            assert_eq!(
+                mock.event_names(),
+                ["load 4bit", "transcribe", "transcribe"]
+            );
+            assert_eq!(mock.processes(), 1);
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn shutdown_kills_a_worker_that_does_not_answer() {
+            let Some(mock) = MockWorker::new(&[]) else {
+                return;
+            };
+            let transcriber = mock
+                .transcriber()
+                .with_grace_periods(Duration::from_secs(5), Duration::from_millis(500));
+            transcriber.load("4bit").await.unwrap();
+            // The mock's unload, which `shutdown` runs, now never returns.
+            mock.hold();
+
+            let started = Instant::now();
+            let result = transcriber.shutdown().await;
+            assert!(matches!(result, Err(AsrError::Timeout)), "{result:?}");
+            assert!(started.elapsed() < BOUNDED);
+            assert!(transcriber.state.lock().await.running.is_none());
+        }
     }
 }

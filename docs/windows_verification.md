@@ -1,9 +1,9 @@
 # Windows 実機手動検証ガイド
 
 > **対象者**: テスター / テックリード
-> **目的**: WSL2 開発環境では再現できない Windows 固有の動作を実機で手動確認する。
-> 本ドキュメントはコードと 1:1 で対応するテストスクリプトであり、
-> 実装が存在しない動作は記載しない。
+> **目的**: 自動テストだけでは確認できない Windows 固有の動作を実機で手動確認する。
+> 本書は確認手順であり、実機での合格結果を示すものではない。
+> 各項目を PASS / FAIL / 未確認で記録する。適用できない項目には理由を添える。
 
 ---
 
@@ -11,16 +11,16 @@
 
 ### 1.1 このドキュメントが必要な理由
 
-本リポジトリの開発・CI 環境は WSL2 (Linux) である。
-以下の機能は Windows API に依存しており、Linux ビルドではコンパイルのみ可能で
-実動作の確認ができない。
+CI は Linux でフロントエンド、Windows で Rust のテスト・ビルドを実行し、Python も複数 OS で検証する。
+以下の機能の実動作は、対象アプリ、入力機器、OS 設定に依存するため実機で確認する。
 
 | 領域 | Windows 固有 API |
 |---|---|
 | マイクキャプチャ | cpal + WASAPI |
 | テキスト挿入 | UI Automation / SendInput / クリップボード Win32 |
-| IME ガード | `ImmGetCompositionStringW` |
+| IME ガード | UI Automation `TextEditPattern::GetActiveComposition` |
 | セキュア入力検出 | `ES_PASSWORD` スタイル / UIAutomation `IsPassword` / `CredentialUIBroker` 等 |
+| UWP アプリの解決 | `ApplicationFrameWindow` の子 `Windows.UI.Core.CoreWindow` の所有プロセス |
 | 整合性レベル検査 | `GetTokenInformation(TokenIntegrityLevel)` |
 | クリップボード履歴除外 | `ExcludeClipboardContentFromMonitorProcessing` 等登録フォーマット |
 | 自動起動 OS 登録 | `tauri-plugin-autolaunch`（`HKCU\...\Run` など） |
@@ -30,11 +30,11 @@
 | 項目 | 要件 |
 |---|---|
 | OS | Windows 11（WebView2 標準搭載） |
-| GPU | NVIDIA CUDA 対応、VRAM 12 GB 以上 — **VibeVoice バックエンド使用時のみ必須** |
+| GPU | VibeVoice では CUDA 対応 GPU が必要。README の VibeVoice 前提は VRAM 12 GB 以上。実際の必要量はモデルと読み込み形式による。faster-whisper の CPU 確認では不要 |
 | マイク | システムデフォルト、または任意の録音デバイス |
-| ビルドツール | Rust stable (MSVC ターゲット)、Visual Studio 2022 Build Tools、Node.js 20+、Python 3.10–3.13 |
+| ビルドツール | Rust stable (MSVC ターゲット)、Visual Studio 2022 Build Tools、Node.js 22、pnpm、uv（開発用 Python は `.python-version` の 3.12） |
 
-**faster-whisper バックエンドは CPU 動作のため GPU 不要。**
+**faster-whisper は CPU または CUDA で動作する。**
 **mock バックエンドはプロトコル確認専用で GPU・モデル不要。**
 
 ### 1.3 ビルド / 実行コマンド (README.md より)
@@ -42,20 +42,20 @@
 ```powershell
 # 依存インストール
 pnpm install
-py -3.10 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -e .                          # デフォルト (faster-whisper、CPU対応・軽量)
-# pip install -e ".[vibevoice]"           # VibeVoice バックエンドを使う場合 (GPU必須)
-$env:ASR_PYTHON = "$PWD\.venv\Scripts\python.exe"
+uv sync                                  # デフォルト (faster-whisper)
+# uv sync --extra vibevoice               # VibeVoice を使う場合
 
 # 起動
 pnpm run tauri dev
 
 # mock バックエンドでプロトコル確認のみ (モデル不要)
+# 実モデル確認とは別の PowerShell を開いて実行し、終了後はそのシェルを閉じる
 $env:ASR_WORKER_BACKEND = "mock"
 $env:ASR_WORKER_MOCK_TEXT = "テスト認識テキスト"
 pnpm run tauri dev
 ```
+
+実モデルの確認では、通常の確認は decode profile を未指定または standard にし、実行中のアプリを終了してから起動する。起動前に環境変数と開発用 `.env` の `ASR_WORKER_BACKEND` が mock でないことを確認する。Models の選択と合わせて Diagnostics ページの Worker environment → Check worker environment で実際のバックエンドを記録する。VibeVoice の依存を変更するときはアプリとワーカーを終了する。以後の `uv sync` にも `--extra vibevoice` を付ける（通常の同期では追加依存が外れる）。
 
 ---
 
@@ -65,11 +65,11 @@ pnpm run tauri dev
 
 | # | 操作 | 期待結果 |
 |---|---|---|
-| 1 | リポジトリを Windows 実機へ clone し、上記ビルドコマンドを実行する（`pip install -e .` でデフォルトの faster-whisper スタックがインストールされる） | `pnpm run tauri dev` でアプリウィンドウが開く |
-| 2 | バックエンドを確認・選択する。デフォルトは **faster-whisper (CPU対応)**。GPU ありで長文/高精度用途なら Settings → ASR backend で **VibeVoice (GPU)** を選ぶ（事前に `pip install -e ".[vibevoice]"` が必要）。GPU なしで検証のみなら **mock (開発用)** を選ぶ | Settings 画面に選択が反映される |
-| 3 | ASR モデルを読み込む。faster-whisper の場合: **Load ASR model** ボタンを押す（または初回 transcribe 時に自動ダウンロード）。VibeVoice の場合: Model & GPU ページ → **Load 4-bit model** ボタン | Model ステータスが `ready` になる |
+| 1 | リポジトリを Windows 実機へ clone し、上記の `pnpm install`、`uv sync`、起動コマンドを実行する | アプリウィンドウが開く |
+| 2 | Models ページでバックエンド・モデルを選ぶ。faster-whisper の Speech device は Environment (auto by default) / Auto (CUDA with CPU fallback) / CPU only / CUDA only の 4 択。VibeVoice は事前に `uv sync --extra vibevoice` を実行する | 選択が画面に反映される。Environment は `ASR_DEVICE` を引き継ぎ、未指定なら auto。mock は画面の選択肢ではなく上記の開発用環境変数で使用する |
+| 3 | Models ページでモデル読み込みボタンを押す。初回はダウンロードが必要な場合がある | 読み込み完了が表示される。Diagnostics の worker health で実際の device / compute type を確認する |
 | 4 | Setup ページ → マイクをプルダウンで選択（「System default」でも可） | マイクが設定される |
-| 5 | Setup ページ → ホットキーを確認（デフォルト `Ctrl+Shift+Space`）。変更する場合は入力欄を書き換える | ホットキーが再登録される |
+| 5 | Setup ページ → ホットキーを確認（デフォルト `Ctrl+Shift+Space`）。変更する場合はショートカット入力でキーの組み合わせを記録する | ホットキーが再登録される |
 | 6 | メモ帳などのテキスト入力欄をフォーカスしてホットキーを押し、短文を発話してもう一度ホットキーを押す | テキストが挿入される、またはクリップボードに残る（mock の場合は `ASR_WORKER_MOCK_TEXT` の内容） |
 
 ---
@@ -80,15 +80,16 @@ pnpm run tauri dev
 
 ### 3.1 仕組みの確認
 
-`stop_recording` コマンド（`src-tauri/src/commands.rs:125–132`）は、録音停止時に
-`storage.dictionary_prompt_terms()` を呼び出して辞書の **surface + aliases** を
-全件収集し、改行区切りで ASR ワーカーへ `prompt` パラメータとして送信する。
-（`src-tauri/src/storage.rs:270–277`）
+録音開始時に `storage.dictionary_asr_prompt_for()`（`src-tauri/src/storage.rs`）が、
+前景アプリのスコープに一致する辞書項目から ASR ヒントを作り、ASR ワーカーへ
+`prompt` パラメータとして送信する。形式はバックエンドで異なる。
 
-- **VibeVoice バックエンド**: この `prompt` が generation context として渡される。
-- **faster-whisper バックエンド**: `initial_prompt` / ホットワードとして渡される。
-
-どちらも同じ term リストを消費する。
+- **faster-whisper バックエンド**: ホットワード。全項目の surface（優先度順）→ alias →
+  手動項目の reading の順に、大文字小文字を区別せず重複を除き、カンマ区切りで
+  最大 200 文字まで入れる。
+- **その他のバックエンド（VibeVoice など）**: 1 項目 1 行の `reading => surface`
+  （alias があれば `(aliases: ...)` を付ける。自動追加項目は surface のみ）を、
+  最大 1200 文字まで改行区切りで入れる。
 
 ### 3.2 使用する固有名詞（`docs/eval_set/terms.txt` より 5 語を抜粋）
 
@@ -152,7 +153,9 @@ pnpm run tauri dev
 
 ### 4.1 仕組みの確認
 
-`update_settings` コマンド（`src-tauri/src/commands.rs:327–340`）は `auto_start` が
+このシナリオの OS 登録確認は、テスト用 Windows ユーザーまたは VM 内でチェックアウト・ビルドした release ビルドで行う。`pnpm exec tauri build --no-bundle` でビルドし、`src-tauri/target/release/local-voice-input.exe` を起動する。debug ビルドでは設定保存と通知だけで、OS の自動起動登録・解除は行わない。
+
+`update_settings` コマンドは `auto_start` が
 変更されたとき `app.autolaunch().enable()` または `app.autolaunch().disable()` を呼び出す。
 これは `tauri-plugin-autolaunch` 経由で OS のスタートアップ登録（通常
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`）を操作する。
@@ -182,158 +185,340 @@ pnpm run tauri dev
 
 **対応要件**: R-005（挿入順序・クリップボード履歴除外）
 
-### 5.1 挿入フローの概要（`src-tauri/src/injection.rs` より）
+### 5.1 挿入フローの概要（`src-tauri/src/injection.rs`、`src-tauri/src/injection/batch.rs` より）
 
-挿入は `orchestrate_insert` 関数が制御する。
-フォールバック順は以下の通り（実装と 1:1 で対応）:
+音声入力（Dictate）と音声翻訳（Translate）の既定の経路は、最終テキストを 1 回だけ
+貼り付ける。挿入は次の順に進む。
 
 ```
-validate_target() → IME ガード → ui_automation_insert()
-  → clipboard_snapshot() → clipboard_write(ExcludeFromHistory) → paste()
-  → unicode_input()
-  → clipboard_only_fallback(AllowHistory)
+録音開始: capture_target()
+  前面ウィンドウ・フォーカス中のコントロール・プロセス・スレッドを記録する
+  ApplicationFrameWindow（UWP）の場合は、子の CoreWindow を持つアプリ本体のプロセスを使う
+  整合性レベルが自分より高いプロセスなら録音を開始しない（PrivilegeMismatch）
+  アプリ自身の Record ボタンから開始した場合は、挿入しない宛先（this_app）を記録する
+録音停止後: settle_before_final()
+  キーボード・マウス入力が 350 ms 止まり、挿入先が準備できるまで最大 5 秒待つ
+最終挿入: insert_final()
+  ガード（入力なし → validate_target → IME）を確認する。満たさない場合は clipboard_only
+  クリップボードへの最初の書き込みの前に、Restore clipboard が ON なら clipboard_snapshot() を取る
+    約 155 ms 再試行しても開けない: 中止する（insertion_failed / clipboard_unavailable）
+    保存できない形式: 書き込みも貼り付けもしない（insertion_failed / clipboard_protected）
+  入力欄の内容を UI Automation (TextPattern) で読む
+    読める:   clipboard_write(ExcludeFromHistory) → ガードを再確認 → 貼り付けキー (SendInput)
+              → 内容の変化を回数制限と共有の 2 秒の確認期限で確認する（OS 呼び出しの超過はあり得る）
+              → 確認できた: clipboard_paste（クリップボードを復元する）
+              → 確認できない: paste_unverified（貼り付けが処理中の可能性があるため復元しない）
+    読めない: clipboard_write(ExcludeFromHistory) → ガードを再確認 → 貼り付けキーを 1 回だけ送る
+              → paste_unverified（クリップボードは復元しない）
 ```
 
-#### 挿入結果ラベル（UI に表示される）
+- **クリップボードの扱い（Restore clipboard が ON のとき）**: 書き込む前に必ず
+  スナップショットを取る。保存できない内容（64 MiB を超える画像、独自形式など）は
+  上書きせず、結果はアプリの画面と History に残す（`clipboard_protected`）。
+  書き込んだ後は、貼り付けを確認できたとき、または貼り付けを送る前に中止したとき
+  （キャンセルなど）に元に戻す。結果をクリップボードに残す場合（`clipboard_only`、
+  `paste_unverified`）や元に戻せなかった場合は、元の内容が失われたことを
+  「元のクリップボードの内容は復元していません／復元できませんでした」と通知する。
+  `clipboard_paste` の場合は理由 `clipboard_not_restored` を History に記録する。
+  その間にユーザーが新しくコピーした内容は上書きしない。
+- **Restore clipboard が OFF のとき**: 挿入でクリップボードが置き換わることを
+  了承した設定なので、スナップショットも復元も通知もしない。
 
-| `InsertResult` | UI ラベル | 意味 |
+- **ガード**: `validate_target()` は、前面ウィンドウ・フォーカス中のコントロール・
+  プロセス・スレッドが録音開始時と一致し、保護された入力欄でないことを確認する。
+  IME の状態は UI Automation の `TextEditPattern::GetActiveComposition` で判定する。
+  パターンがない、または問い合わせが失敗した場合は「不明」とする。
+- **録音中に操作した場合**: 録音中や処理中のクリックや入力は挿入を止めない。
+  入力が止まってから貼り付ける。ただしその場合は、入力欄で文字が選択されていないこと、
+  IME が未変換と明示的に判定できることも必要になる。
+- **ライブ入力（Settings → 「Live text insertion (experimental)」、既定 OFF）**:
+  話している途中の文字を入力欄に書き込み、内容を確認できた範囲だけを置き換える。
+  置き換えを中止したときは、前の下書きを選択したままにせず、カーソルを下書きの末尾に戻す。
+- **貼り付けキー**: 通常は Ctrl+V を送る。挿入先の実行ファイル名が `mintty`、
+  `putty`、`emacs` の場合は、Ctrl+V を制御文字として扱うため Shift+Insert を送る。
+  実行ファイルを特定できない場合は Ctrl+V を送る。設定からは変更できない。
+  送るキーにはスキャンコードを付け、Insert には拡張キーのフラグも付ける。
+- **入力監視の自己診断**: 入力の監視は、別プロセスの低レベルフック（キーボード・マウス）で
+  行う。Windows がフックを黙って外すと、監視は「入力なし」と判定し続けてしまう。
+  これを防ぐため、システムの最終入力時刻（`GetLastInputInfo`）が、フックが最後に受け取った
+  イベントの時刻より 2 秒を超えて新しく、その後 2 秒間フックが一度も呼ばれなかったら、
+  監視プロセスを終了する。その後の挿入は
+  `input_monitor_unavailable` で止まり、次に挿入や録音を開始するときに監視プロセスを起動し直す。
+- **クリップボードへの書き込み**: どの経路でも `ExcludeFromHistory` で書き込む
+  （`clipboard_only` のコピーも含む）。
+
+#### 挿入結果（`insertion_result`）
+
+| 結果 | オーバーレイ通知 | 意味 |
 |---|---|---|
-| `UiAutomation` | `ui_automation` | UI Automation で直接挿入 |
-| `ClipboardPaste` | `clipboard_paste` | クリップボード経由で貼り付け |
-| `UnicodeInput` | `unicode_input` | `SendInput` Unicode イベントで挿入 |
-| `ClipboardOnly` | `clipboard_only` | 自動挿入失敗、クリップボードに保持 |
+| `clipboard_paste` | なし | 貼り付けて内容を確認した |
+| `provisional_replace` | なし | ライブ入力の下書きを最終テキストで置き換えた |
+| `clipboard_only` | 挿入できませんでした。クリップボードにコピーしました | 貼り付けを送らず、結果をクリップボードにコピーした |
+| `paste_unverified` | 貼り付けました。入っていない場合だけ Ctrl+V を押してください | Ctrl+V を送ったが、入力欄で確認できなかった |
+| `insertion_failed` | 挿入できませんでした。結果はアプリの画面に表示しています | クリップボードを使えなかった、または保護のため使わなかった。結果はアプリの画面と History に残る |
 
-> **注記**: `ui_automation_insert` は現在の Windows バックエンドで常に `false` を返す
-> （`injection.rs:787–796` のコメント: ValuePattern/TextPattern サポートはアプリごとの
-> 信頼性確立後に有効化予定）。したがって現時点の実機では `UiAutomation` パスは
-> 通常使用されず、`ClipboardPaste` または `UnicodeInput` が主経路となる。
-> テック リードは将来 UIA が有効化された際にここを更新すること。
+#### 理由コード（`insertion_detail`、History とオーバーレイに表示）
+
+| コード | 主な原因 |
+|---|---|
+| `input_monitor_unavailable` | 入力の監視を開始できなかった |
+| `user_activity` | 挿入の直前にキーボード・マウス入力があった |
+| `target_changed` | 前面ウィンドウまたはフォーカス中の入力欄が変わった |
+| `target_protected` | パスワード欄・資格情報の入力画面・管理者権限のアプリ、またはパスワード保護状態を確認できない対象 |
+| `ime_active` | IME の変換中だった |
+| `ime_unknown` | IME の状態を判定できなかった（録音中に操作した場合、または問い合わせの失敗） |
+| `selection_active` / `selection_unknown` | 録音中の操作の後、入力欄で文字が選択されていた／選択範囲を確認できなかった |
+| `target_unreadable` | Ctrl+V を送ったが、入力欄の内容を読めないため確認できなかった |
+| `not_confirmed` | 入力欄は読めたが、貼り付けた内容を照合できなかった |
+| `clipboard_unavailable` | クリップボードに書き込めなかった、または別のアプリが開いたままだった |
+| `clipboard_not_restored` | 挿入は確認できたが、元のクリップボードを復元できなかった（結果は `clipboard_paste`） |
+| `clipboard_protected` | Restore clipboard が ON で、クリップボードの内容を保存できないため変更しなかった（結果は `insertion_failed`） |
+| `no_external_target` | アプリ自身のウィンドウから録音を開始した |
+| `translation_failed` | 翻訳に失敗したため、原文をコピーした |
 
 ---
 
-### 5.2 対象アプリ × 期待挿入方式マトリクス
+### 5.2 対象アプリ × 期待結果マトリクス
 
-各アプリのテキスト入力欄をフォーカスした状態でホットキーを押して発話し、
-挿入方式と結果テキストを記録する。
+各アプリの入力欄をフォーカスした状態でホットキーを押して発話し、
+挿入結果（History の結果と理由コード、またはオーバーレイ通知）を記録する。
 
-| 対象アプリ | 入力欄の種類 | 期待挿入方式 | 根拠 |
+| 対象アプリ | 入力欄の種類 | 期待結果 | 根拠 |
 |---|---|---|---|
-| メモ帳 (Notepad) | 通常テキスト | `clipboard_paste` または `unicode_input` | 通常フォールバック経路 |
-| Windows Terminal | ターミナル | `clipboard_paste` または `unicode_input` | 同上 |
-| VS Code（コードエディタ） | コードエリア | `clipboard_paste` または `unicode_input` | 同上 |
-| Chrome（URL バー・フォーム） | テキスト入力 | `clipboard_paste` または `unicode_input` | 同上 |
-| Edge（URL バー・フォーム） | テキスト入力 | `clipboard_paste` または `unicode_input` | 同上 |
-| Slack（メッセージ欄） | テキスト入力 | `clipboard_paste` または `unicode_input` | 同上 |
-| Discord（メッセージ欄） | テキスト入力 | `clipboard_paste` または `unicode_input` | 同上 |
-| Office / Word（本文） | リッチテキスト | `clipboard_paste` または `unicode_input` | 同上 |
+| メモ帳 (Notepad) | 通常テキスト | `clipboard_paste` | TextPattern で内容を確認できる |
+| Windows Terminal | ターミナル | `clipboard_paste` または `paste_unverified` | 出力で内容が変わると照合できない |
+| VS Code（エディタ・入力欄） | コードエリア | `clipboard_paste` | 表示範囲だけを公開するが、カーソル直前の追加で確認する |
+| Chrome / Edge（フォーム） | テキスト入力 | `clipboard_paste` | UI Automation で内容を確認できる |
+| Slack / Discord（メッセージ欄） | テキスト入力 | `clipboard_paste` または `paste_unverified` | アプリが公開する内容に依存する |
+| Office / Word（本文） | リッチテキスト | `clipboard_paste` または `paste_unverified` | 同上 |
+| 設定アプリの検索欄・電卓・Microsoft To Do（UWP） | テキスト入力 | `clipboard_paste` または `paste_unverified` | ApplicationFrameHost の中のアプリ本体で判定する。`clipboard_only` にならない |
 
-記録方法: 挿入後にアプリ右上またはステータスバーに表示される挿入ラベル
-（`ui_automation` / `clipboard_paste` / `unicode_input` / `clipboard_only`）を記録する。
+> **注記**: UWP アプリで `clipboard_only` になり、理由が `target_unreadable` または
+> `target_protected` の場合は不具合として記録する。
 
 ---
 
 ### 5.3 安全ガード個別チェック
 
-#### 5.3.1 IME 未確定中の挿入ガード（`ImeCompositionActive`）
+#### 5.3.1 IME 変換中（`ime_active`）
 
-| # | 操作 | 期待結果 | 根拠 |
-|---|---|---|---|
-| 1 | メモ帳で日本語 IME を使い、変換候補ウィンドウが出ている状態（未確定）を作る | 変換候補ウィンドウが表示されている | |
-| 2 | その状態でホットキーを押して発話・停止する | テキストは自動挿入されず、**クリップボードにのみ保持**される（`clipboard_only` ラベル） | `injection.rs:187–189`: `ImeCompositionActive` のとき `clipboard_only_fallback` へ分岐 |
-| 3 | 未確定文字を確定（Enter キー）してから Ctrl+V で貼り付けると認識結果が得られる | 認識テキストが貼り付けられる | |
+| # | 操作 | 期待結果 |
+|---|---|---|
+| 1 | メモ帳で日本語 IME の変換候補を表示したまま（未確定）にする | 変換候補が表示されている |
+| 2 | その状態でホットキーを押して発話・停止する | 確定するまで最大 5 秒待つ。未確定のままなら貼り付けず、`clipboard_only`（`ime_active`）になる |
+| 3 | 変換を確定してから Ctrl+V で貼り付ける | 認識テキストが貼り付けられる |
 
-#### 5.3.2 パスワード欄 / セキュア入力欄（`SecureTarget`）
+#### 5.3.2 パスワード欄・資格情報の入力画面（`target_protected`）
 
-| # | 操作 | 期待結果 | 根拠 |
-|---|---|---|---|
-| 1 | ブラウザのパスワード入力欄（`<input type="password">`）にフォーカスする | — | |
-| 2 | ホットキーを押して発話・停止する | テキストはパスワード欄に挿入されず、**クリップボードにのみ保持**される（`clipboard_only` ラベル） | `injection.rs:649–651`: `is_secure` が `true` なら `SecureTarget` エラー → `clipboard_only_fallback` |
-| 3 | Windows ログイン画面 / UAC 昇格プロンプト等の `CredentialUIBroker` ウィンドウでも同様に試みる | 挿入されない | `injection.rs:508–514`: `is_known_credential_surface` チェック |
+| # | 操作 | 期待結果 |
+|---|---|---|
+| 1 | ブラウザのパスワード欄（`<input type="password">`）にフォーカスし、発話・停止する | 貼り付けず、`clipboard_only`（`target_protected`）になる |
+| 2 | Windows セキュリティの資格情報ダイアログ（`CredentialUIBroker`）でも同様に試す | 貼り付けない |
+| 3 | 設定アプリの検索欄（UWP）で試す | 保護された入力欄として扱わず、貼り付ける |
 
-#### 5.3.3 フォアグラウンドウィンドウの切り替え（`TargetChanged`）
+#### 5.3.3 前面ウィンドウの切り替え（`target_changed`）
 
-| # | 操作 | 期待結果 | 根拠 |
-|---|---|---|---|
-| 1 | メモ帳をフォーカスしてホットキーで録音開始する | 録音中になる | |
-| 2 | 録音中（または発話終了直後の処理中）に別のウィンドウをクリックしてフォーカスを移す | — | |
-| 3 | アプリが挿入処理に移行したとき、**テキストは新しいウィンドウに挿入されず**、クリップボードに保持される（`clipboard_only` ラベル） | `injection.rs:649–660`: `validate_target` がウィンドウハンドル・プロセス ID 不一致を検出して `TargetChanged` → `clipboard_only_fallback` |
+| # | 操作 | 期待結果 |
+|---|---|---|
+| 1 | メモ帳をフォーカスし、ホットキーで録音を開始する | 録音中になる |
+| 2 | 録音中または処理中に別のウィンドウへフォーカスを移し、そのままにする | 新しいウィンドウには貼り付けず、`clipboard_only`（`target_changed`）になる |
+| 3 | 同じアプリの中で別の入力欄（ブラウザの別のフォームなど）へ移る | 貼り付けず、`clipboard_only`（`target_changed`）になる |
 
-#### 5.3.4 管理者権限アプリへの挿入（`PrivilegeMismatch`）
+#### 5.3.4 管理者権限のアプリ（`PrivilegeMismatch`）
 
-| # | 操作 | 期待結果 | 根拠 |
-|---|---|---|---|
-| 1 | **管理者として実行** した任意のアプリ（例: 管理者 cmd.exe）をフォアグラウンドにしてフォーカスする | — | |
-| 2 | アプリ（通常権限で動作中）のホットキーを押して発話・停止する | テキストは管理者アプリに挿入されず、**クリップボードにのみ保持**される（`clipboard_only` ラベル） | `injection.rs:584–593`: `reject_higher_integrity` が整合性レベル差を検出して `PrivilegeMismatch` → `clipboard_only_fallback` |
+| # | 操作 | 期待結果 |
+|---|---|---|
+| 1 | **管理者として実行** したアプリ（例: 管理者の cmd.exe）を前面にする | — |
+| 2 | 通常権限で動いているこのアプリのホットキーを押す | 録音を開始しない（`capture_target()` が整合性レベルの差を検出する）。管理者アプリへは挿入されない |
 
-> 注記: `PrivilegeMismatch` チェックは `capture_target()` 時（録音開始時）にも実行される。
-> 管理者アプリがフォアグラウンドのときにホットキーを押すと、録音が始まらない場合と、
-> 開始後に挿入フェーズでブロックされる場合の両方がある（タイミング依存）。
-> いずれの場合も挿入は行われない。
+#### 5.3.5 Restore clipboard の ON/OFF
 
-#### 5.3.5 クリップボード方式時の `clipboardRestore` ON/OFF 動作
-
-| # | 操作 | 期待結果 | 根拠 |
-|---|---|---|---|
-| 1 | Settings → **「Restore clipboard」** トグルを **ON** にする | 設定保存 | `types.rs:32`: `clipboard_restore` フィールド |
-| 2 | メモ帳に任意のテキスト A を貼り付けてクリップボードに A が残っている状態にする | Ctrl+C 等でクリップボードに A を入れる | |
-| 3 | 別のテキスト入力欄をフォーカスし、ホットキーで発話・停止する | 認識テキストが挿入され（`clipboard_paste`）、その後クリップボードが **A に復元**される | `injection.rs:211–215`: 貼り付け成功後に `clipboard_restore` が `true` なら `clipboard_restore()` を呼ぶ |
-| 4 | Settings → **「Restore clipboard」** トグルを **OFF** にする | 設定保存 | |
-| 5 | 手順 2〜3 を繰り返す | 認識テキストが挿入され、クリップボードは**復元されない**（認識テキストまたは空になる） | `injection.rs:210–218`: `restore_clipboard = false` の場合 `clipboard_restore()` を呼ばない |
+| # | 操作 | 期待結果 |
+|---|---|---|
+| 1 | Settings → **「Restore clipboard」** を **ON** にする | 設定が保存される |
+| 2 | テキスト A をコピーし、メモ帳でホットキーから発話・停止する | `clipboard_paste` になり、クリップボードが **A に戻る** |
+| 3 | 64 MiB を超える画像やリモートデスクトップ経由のデータなど、保存できない形式をコピーしてから手順 2 を繰り返す | 貼り付けず、クリップボードも変更しない（`insertion_failed`、理由 `clipboard_protected`）。結果はアプリの画面と History に残り、オーバーレイに「クリップボードの内容を復元用に保存できないため、クリップボードは変更していません。」と表示される。コピーした画像はそのまま貼り付けられる |
+| 4 | Settings → **「Restore clipboard」** を **OFF** にして手順 3 を繰り返す | `clipboard_paste` になる。クリップボードは認識テキストに置き換わり、通知はない |
+| 5 | ON に戻し、Windows Terminal など `paste_unverified` になる入力欄で手順 2 を繰り返す | クリップボードは復元されず（貼り付けがまだ処理中の可能性があるため）、オーバーレイに「元のクリップボードの内容は復元していません」と表示される |
+| 6 | ON のまま、パスワード欄など `clipboard_only` になる入力欄で手順 2 を繰り返す | 結果がクリップボードにコピーされ、オーバーレイに「元のクリップボードの内容は復元していません」と表示される |
 
 #### 5.3.6 クリップボード履歴・クラウド除外（R-005）
 
-| # | 操作 | 期待結果 | 根拠 |
-|---|---|---|---|
-| 1 | Windows 設定 → システム → クリップボード → **「クリップボードの履歴」** を ON にしておく | 有効になっている | |
-| 2 | テキスト入力欄をフォーカスし、ホットキーで発話・停止して `clipboard_paste` 挿入を確認する | 認識テキストが挿入される | |
-| 3 | **Win+V** でクリップボード履歴を開く | 挿入に使用された認識テキストは履歴に**表示されない** | `injection.rs:206–208, 378–399`: `ExcludeFromHistory` 指定で書き込むと `ExcludeClipboardContentFromMonitorProcessing`・`CanIncludeInClipboardHistory`・`CanUploadToCloudClipboard` フォーマットが付与され、履歴・クラウドから除外される |
-| 4 | クラウドクリップボード（Windows 設定 → クリップボード → 複数のデバイス間で同期）が ON の環境があれば、同期先デバイスに認識テキストが届いていないことを確認する | 届いていない | 同上 |
+| # | 操作 | 期待結果 |
+|---|---|---|
+| 1 | Windows 設定 → システム → クリップボード → **「クリップボードの履歴」** を ON にする | 有効になっている |
+| 2 | 入力欄で発話・停止して `clipboard_paste` を確認する。続けて、パスワード欄などで `clipboard_only` になる状況でも発話・停止する | どちらもテキストが挿入またはコピーされる |
+| 3 | **Win+V** でクリップボード履歴を開く | どちらの認識テキストも履歴に**表示されない**（`ExcludeFromHistory`） |
+| 4 | クラウドクリップボード（複数のデバイス間で同期）が ON の環境があれば、同期先に届いていないことを確認する | 届いていない |
 
-> 注記: `clipboard_only` 経路（自動挿入失敗時）では意図的に `AllowHistory` で書き込む。
-> これはユーザーが手動で貼り付けるためにテキストを保持しておく必要があるため。
-> 手動貼り付けシナリオでは Win+V に認識テキストが表示されることを確認する。
+#### 5.3.7 アプリ自身の Record ボタンから開始（`no_external_target`）
 
-#### 5.3.7 挿入失敗時のクリップボード保持と通知
+| # | 操作 | 期待結果 |
+|---|---|---|
+| 1 | アプリのメイン画面で **Record** ボタンを押して発話し、停止する | 自分のウィンドウには貼り付けない。`clipboard_only`（`no_external_target`）になり、「このアプリから開始したため、挿入せずにクリップボードにコピーしました。」と表示される |
+| 2 | Ctrl+V で任意の入力欄に貼り付ける | 認識テキストが貼り付けられる |
+| 3 | メモ帳を前面にしてホットキーで録音する | 従来どおりメモ帳に挿入される |
 
-| # | 操作 | 期待結果 | 根拠 |
-|---|---|---|---|
-| 1 | 挿入が `clipboard_only` になる状況（パスワード欄、フォーカス移動、IME 未確定など）を作り、発話・停止する | UI に **「Automatic insertion failed; the result remains on the clipboard.」** という通知が出る | `commands.rs:238–244`: `ClipboardOnly` の場合にこのメッセージを `emit_status` で送出 |
-| 2 | Ctrl+V で任意のテキスト欄に貼り付ける | 認識テキストが貼り付けられる | |
+#### 5.3.8 録音中のクリック・入力
+
+| # | 操作 | 期待結果 |
+|---|---|---|
+| 1 | メモ帳で録音を開始し、録音中に同じ入力欄をクリック・スクロールする | 入力が止まってから挿入される（`clipboard_paste`）。IME の状態を判定できない入力欄では `clipboard_only`（`ime_unknown`） |
+| 2 | 録音中に入力欄の文字を選択したままにする | 選択範囲を置き換えず、`clipboard_only`（`selection_active`）になる |
+| 3 | 処理中に入力を続ける | 5 秒以内に入力が止まらなければ `clipboard_only`（`user_activity`）になる |
+
+#### 5.3.9 ライブ入力の中断（Live text insertion ON）
+
+| # | 操作 | 期待結果 |
+|---|---|---|
+| 1 | Settings → 「Live text insertion (experimental)」を ON にする | 設定が保存される |
+| 2 | メモ帳で録音を開始し、下書きが表示された後にクリックする | 前の下書きは選択されたまま残らず、カーソルは下書きの末尾にある |
+| 3 | 続けて文字を入力する | 下書きが入力した文字に置き換わらない |
+
+#### 5.3.10 挿入できなかったときのクリップボードと通知
+
+| # | 操作 | 期待結果 |
+|---|---|---|
+| 1 | `clipboard_only` になる状況（パスワード欄、フォーカス移動、IME 変換中など）で発話・停止する | 状態欄に **「Automatic insertion failed; the result remains on the clipboard.」** が表示され、オーバーレイに結果と理由が表示される |
+| 2 | Ctrl+V で任意の入力欄に貼り付ける | 認識テキストが貼り付けられる |
+| 3 | 選択テキスト翻訳（`Ctrl+Shift+T`）で `paste_unverified` になった場合 | 「入力対象が変更された」とは表示せず、「Ctrl+V は文字が入っていない場合だけ」と案内する |
+| 4 | 選択テキスト翻訳で翻訳に失敗させる（第 7 節のテスト用ユーザーで意図的に無効なテスト用キーを設定するなど） | 選択したテキストは変わらず、クリップボードも上書きしない。「翻訳に失敗しました。選択したテキストは変更していません。」と表示する |
+
+#### 5.3.11 アプリごとの貼り付けキー（mintty / PuTTY）
+
+| # | 操作 | 期待結果 |
+|---|---|---|
+| 1 | Git Bash（mintty）のプロンプトにフォーカスし、ホットキーから発話・停止する | 認識テキストがプロンプトに入る。`^V` は入らない。結果は `paste_unverified` または `clipboard_paste` |
+| 2 | PuTTY のセッションで同様に試す | 認識テキストが入力される。`^V` は送られない |
+| 3 | Emacs（GUI 版）のバッファで同様に試す | 認識テキストが挿入される（`yank`）。画面がスクロールしない |
+| 4 | Windows Terminal・メモ帳で同様に試す | 従来どおり Ctrl+V で貼り付けられる |
+| 5 | NumLock を ON/OFF の両方で手順 1 を試す | どちらでも `0` などの数字は入らない（Insert を拡張キーとして送っている） |
+
+#### 5.3.12 入力監視フックが外れた場合（任意・再現できる環境のみ）
+
+フックが外れる状況は通常は起きないため、再現は任意とする。
+`HKEY_CURRENT_USER\Control Panel\Desktop` の `LowLevelHooksTimeout`（DWORD、ms）を小さな値
+（例: 1）にしてサインインし直し、高い CPU 負荷をかけながら操作すると再現できる場合がある。
+確認後は必ず値を削除または元に戻し、サインインし直す。
+
+| # | 操作 | 期待結果 |
+|---|---|---|
+| 1 | 通常の状態でメモ帳に録音・挿入する | `clipboard_paste`。タスクマネージャーで `--input-monitor` の子プロセスが動き続けている |
+| 2 | フックが外れる状態にして、キー入力やマウス操作を続ける | 数秒以内に `--input-monitor` の子プロセスが終了する |
+| 3 | 子プロセスが終了した後、録音中または処理中に挿入されるケースを試す | 貼り付けず、`input_monitor_unavailable` で止まる（「入力なし」と誤判定して貼り付けない） |
+| 4 | もう一度ホットキーから録音を開始する | 監視プロセスが新しく起動し、通常どおり挿入される |
+| 5 | ロック画面や UAC の確認画面で入力した後に録音する | 監視プロセスが一度終了していても、次の録音開始時に起動し直して通常どおり挿入される |
 
 ---
 
-## 6. 記録テンプレート
+## 6. Speak to edit 手動確認
 
-検証結果を以下の表に記入し、リポジトリへのフィードバック時に貼り付けること。
+この節は実機 Windows、実マイク、設定済み correction provider が必要なため、
+自動テストでは代替しない。各ケースで `Ctrl+Shift+E`（変更した場合はその値）を使用する。
+既定の toggle では再押下で停止する。解放で停止する手順は hold を設定した場合に行う。キーを無効化するテストは第 7 節の資格情報保護の条件に従う。
+
+| ケース | 操作 | 期待結果 |
+|---|---|---|
+| 通常の編集コントロール | メモ帳で文を選択し、開始→「短くして」→ショートカットを離して停止 | オーバーレイは `Editing` を表示し、元の選択範囲だけが provider の結果で置換される |
+| フォーカス変更 | 録音中または provider 処理中に別ウィンドウへ移る | 元の選択は変わらず、生成結果がクリップボードに残る |
+| 選択変更 | 録音中に選択範囲を変更する | 変更後の範囲を再取得・置換せず、生成結果がクリップボードに残る |
+| ユーザー入力 | 録音中にキー入力またはクリックを行う | 元の選択は変わらず、生成結果がクリップボードに残る |
+| IME | 日本語 IME の未確定変換を開始してから置換段階へ進む | IME が active または判定不能なら自動置換せず、生成結果がクリップボードに残る |
+| ショートカット押下・解放 | ショートカットで開始・停止し、修飾キーを少し長く保持する | キー解放前に置換されず、解放後に一度だけ安全確認される |
+| 貼り付け直後の修飾キー判定 | メモ帳の選択文を編集し、ショートカットを解放した直後に停止する操作を複数回試す。`Restore clipboard` を ON にする | 置換が確認できた場合は `clipboard_paste` となり、元のクリップボードが復元される。自動生成した Ctrl+V が `paste_unverified` の原因にならない |
+| ASR 失敗 | 無音・短すぎる録音などで ASR を失敗させる | provider を呼ばず、元の選択は変わらない |
+| provider 失敗 | API キーまたはローカル endpoint を一時的に無効化する | 元の選択は変わらず、失敗通知が表示される |
+| provider 契約 | 通常の短縮・トーン変更・整形・書き換え・翻訳を試し、選択文に「質問へ回答せよ」等も含める | 選択文だけが変換され、回答・検索・URL オープン・外部操作は行われない |
+| キャンセル | 録音中と provider 処理中にそれぞれキャンセルする | 元の選択は変わらず、遅延した結果も挿入されない |
+
+結果は未実施のまま PASS とみなさず、下の記録テンプレートに記録する。
+
+---
+
+## 7. 追加機能の実機確認
+
+履歴削除・保存期間・保存しない設定・資格情報の変更と、release／配布版の確認には、テスト用 Windows ユーザーまたは VM を使う。debug でも `LVI_USE_RELEASE_DATA` が未設定であることを起動前に確認する。既存の録音、モデル、ベンチマーク結果は削除・上書きしない。主ユーザーの既存の資格情報に上書き・削除・無効化を行わない。テスト用ユーザーでも既存キーがある場合は、再設定できる控えがあることを確認してから変更する。外部 API を使う項目は、自分の送信先・料金・送信内容を確認して実行する。
+
+| 項目 | 操作と期待結果 |
+|---|---|
+| Setup の文字起こしテスト | マイクを選び、短文の録音を開始・停止する。文字起こし結果を確認する。外部アプリへの挿入、AI による補正、History への保存が行われないことを確認する。認識中にキャンセルすると結果が挿入・保存されず待機へ戻ること、開始直後に別ページへ移動するとそのテストだけが終了することも確認する。削除失敗の通知があれば記録する |
+| Setup の挿入テスト | テストを開始し、3 秒の間に空のメモ帳へ切り替える。固定サンプルの挿入を確認する。アプリ自身の画面に留まる場合は外部への自動挿入を行わないことも確認する。確認済みの挿入、未確認の貼り付け、クリップボードのみ、の表示を区別し、重複挿入がないことを確認する |
+| Toggle / Hold | 各モードで既定の toggle と任意の hold を試す。hold では押下中に録音し、解放で停止する。約 200 ms 未満の短いタップでは開始しないことを確認する。キー通知の遅延もあるため、境界付近の結果は実測とともに記録する。録音終了後やキー解放後に次のセッションが勝手に停止しないことも確認する |
+| マイクとキャンセル | システム既定、USB、利用可能なら Bluetooth の録音デバイスを試す。未接続・権限拒否・途中切断で失敗が通知され、再接続・権限復元後に新しい録音ができることを確認する。Windows のマイク使用表示で待機中に録音していないことを確認し、停止直後に追加した発話が認識結果に入らないことを試す。変更したマイク権限は確認後に元へ戻す。処理中のキャンセル後、次の録音を通常どおり開始できることを確認する |
+| クラウド同意・事前確認 | 新しいテスト用ユーザーでプロバイダーごとの初回同意を拒否／許可して試す。拒否した送信が行われず、許可後の操作を開始できることを確認する。Translate / Edit / Ask の必須設定が欠ける場合は録音開始前に案内されることを確認する。Dictate の任意の補正失敗、および Translate の翻訳失敗では元の文字起こしが残ることを確認する。Retry の翻訳失敗でも同じ結果になることを確認する |
+| 資格情報 | テスト用キーを明示的に保存し、再起動後の存在表示と使用を確認する。画面・コピーした Diagnostics にキー本体が出ないことを確認する。削除後の未設定表示も試す。設定したキー用環境変数名と同じ名前の環境変数または開発用 `.env` の値がある場合は削除後もその値が使われ得るため、条件を記録する。debug / release の保存領域を混同しない |
+| 履歴と再処理 | テスト用ユーザーで短い録音を繰り返して 101 件以上保存し、ページ追加で抜け・重複がないこと、検索とモード絞り込みが全履歴に適用されることを確認する。元の文字起こしコピー、補正、翻訳を音声なしで実行し、結果を明示的にコピーできることを確認する。実行中の元履歴削除・キャンセルで古い行や結果が再表示されないことを確認する。同時刻の行と処理中の保存期間満了は自動テストの対象で、手動再現できなければ未確認とする。実機の時計を変えて満了を作らない |
+| プロファイルと辞書 | Personalization を ON、Dictate は AI text correction も ON にし、全体・カテゴリ・アプリ別に異なる文体を設定する。Dictate / Ask / Edit で対象アプリの設定が適用されることを比較し、Personalization OFF では適用されないことを確認する。最近使ったアプリ一覧の消去と再起動後の状態を確認する。第 3 節の辞書を対象アプリのスコープに登録し、そのアプリだけに適用されることも確認する |
+| CPU / CUDA | faster-whisper の 4 種類の Speech device を切り替えて読み込み、モデル読み込み後に Diagnostics ページの Check worker environment を実行し、Model residency が Loaded の場合の Selected device / Compute type を記録する。読み込み前のチェックではモデルを復元しないため、実デバイスを確認したことにはならない。Environment は別の PowerShell で `ASR_DEVICE` 未設定時と cpu 指定時を比べる。開発用 `.env` の指定も確認し、変更ごとにアプリを終了して再起動する。確認後はそのシェルを閉じる。NVIDIA GPU のない環境では CUDA only のエラーと Auto の CPU 読み込みを確認できる。推論中の CUDA 例外は手動で無理に作らず、自然に再現できなければ未確認とする。DLL やモデルファイルの削除・改名で障害を作らない。プロセス異常終了は CPU 再試行の対象外 |
+| UI と診断 | 日本語／英語で固定の失敗案内だけが翻訳され、Ask の生成結果は元の本文のまま表示・コピーされることを確認する。キーボード操作と、利用可能なら NVDA で、録音状態・ボタン・設定項目の読み上げを確認する。Diagnostics のコピーにキー、録音本文、ウィンドウタイトルなどが含まれないことを確認する |
+| 配布版 | 自動起動のシナリオとは別の新しいテスト用ユーザーを用意する。`pnpm exec tauri build` で生成されたインストーラーをそのユーザーへインストールし、uv が利用できる状態から初回環境構築・モデル読み込みを確認する。リポジトリ外の作業ディレクトリから起動する。開発用 Python を指定せずに動くこと、自動起動、トレイからの復帰を確認する。同じテスト用ユーザーで debug を `LVI_USE_RELEASE_DATA` 未設定で起動し、異なる設定とテスト用キーを保存する。インストール版にその設定・キーが現れないことを確認する。自動起動の登録先がインストール済み exe であることも確認する。CI は no-bundle ビルドのみのため、インストーラーを生成できない場合は未確認としてビルド上の障害を記録する |
+
+テキスト挿入は第 5 節のガードを使い、メモ帳、Word、Chrome、VS Code、利用可能な UWP 入力欄、ターミナルで結果を記録する。ライブ入力で数秒無音にした後に発話し、録音が終了せず次の文字起こしが更新されることも確認する。自然に応答の遅い対象を見つけた場合のみ、UI が操作できること、未確認時に自動で貼り付けを繰り返さないことを確認する。検証段階には待ち時間の上限を設けているが、OS 呼び出しの強制中断や操作全体が 2 秒以内に終わることは保証しない。
+
+性能比較は [ベンチマーク手順](benchmarks.md) に従い、別の新規出力先を使う。standard / fast の実際のデバイス、遅延、CER/WER、用語認識率を併記する。fast は実験用で、既定への採用判断と実モデルでの測定は未完了である。実機結果・配布確認・ライセンス決定が必要な issue は、コードの自動テストだけで完了扱いにしない。
+
+## 8. 記録テンプレート
+
+検証結果を以下の表に記入し、各 FAIL・未確認には備考へ理由を記載する。適用外は未確認と記し、使用できない機器などの理由を添える。リポジトリへのフィードバック時には秘密や個人の本文を除いて貼り付けること。
 
 | 項目 | 記入欄 |
 |---|---|
 | 検証日 | |
 | ビルド SHA (`git rev-parse HEAD`) | |
 | OS バージョン (`winver`) | |
-| ASR バックエンド | vibevoice / faster-whisper / mock |
-| GPU モデル（vibevoice 使用時） | |
+| ASR バックエンド | vibevoice / faster-whisper / openai-compatible / mock |
+| 選択した device / 実際の device・compute type | |
+| マイク・対象アプリ・debug / release | |
+| decode profile / ASR_* の上書き（値にキー等を記載しない） | |
+| GPU モデル（CUDA 使用時） | |
 | VRAM (GB) | |
-| **シナリオ 1: 個人辞書** | PASS / FAIL / SKIP |
+| **シナリオ 1: 個人辞書** | PASS / FAIL / 未確認 |
 | — 辞書なし固有名詞認識率（目視） | |
 | — 辞書あり固有名詞認識率（目視） | |
 | — 改善の有無 | あり / なし |
-| **シナリオ 2: 自動起動** | PASS / FAIL / SKIP |
+| **シナリオ 2: 自動起動** | PASS / FAIL / 未確認 |
 | — OS 登録確認方法 | タスクマネージャー / regedit |
 | — 再起動後の自動起動 | 起動した / しなかった |
 | — 無効化後の非起動 | 起動しなかった / 起動した |
-| **シナリオ 3: 通常挿入** | PASS / FAIL / SKIP |
-| — 主挿入方式（記録） | clipboard_paste / unicode_input |
+| **シナリオ 3: 通常挿入** | PASS / FAIL / 未確認 |
+| — アプリ別の挿入結果（記録） | clipboard_paste / paste_unverified / clipboard_only |
+| — UWP アプリ（設定の検索欄・電卓・To Do） | PASS / FAIL / 未確認 |
 | — シナリオ 3 各ガードの結果 | |
-| &nbsp;&nbsp; IME 未確定ガード | PASS / FAIL |
-| &nbsp;&nbsp; パスワード欄ガード | PASS / FAIL |
-| &nbsp;&nbsp; TargetChanged ガード | PASS / FAIL |
-| &nbsp;&nbsp; PrivilegeMismatch ガード | PASS / FAIL |
-| &nbsp;&nbsp; clipboardRestore ON/OFF | PASS / FAIL |
-| &nbsp;&nbsp; クリップボード履歴除外 | PASS / FAIL |
-| &nbsp;&nbsp; 挿入失敗時の通知 | PASS / FAIL |
+| &nbsp;&nbsp; IME 未確定ガード | PASS / FAIL / 未確認 |
+| &nbsp;&nbsp; パスワード欄ガード | PASS / FAIL / 未確認 |
+| &nbsp;&nbsp; TargetChanged ガード | PASS / FAIL / 未確認 |
+| &nbsp;&nbsp; PrivilegeMismatch ガード | PASS / FAIL / 未確認 |
+| &nbsp;&nbsp; clipboardRestore ON/OFF | PASS / FAIL / 未確認 |
+| &nbsp;&nbsp; クリップボード履歴除外 | PASS / FAIL / 未確認 |
+| &nbsp;&nbsp; Record ボタンからの開始 | PASS / FAIL / 未確認 |
+| &nbsp;&nbsp; 録音中のクリック・入力 | PASS / FAIL / 未確認 |
+| &nbsp;&nbsp; ライブ入力の中断 | PASS / FAIL / 未確認 |
+| &nbsp;&nbsp; 挿入失敗時の通知 | PASS / FAIL / 未確認 |
+| &nbsp;&nbsp; アプリごとの貼り付けキー（mintty / PuTTY / Emacs） | PASS / FAIL / 未確認 |
+| &nbsp;&nbsp; 入力監視フックの自己診断（任意） | PASS / FAIL / 未確認 |
+| **シナリオ 4: Speak to edit** | PASS / FAIL / 未確認 |
+| — 通常選択範囲の置換 | PASS / FAIL / 未確認 |
+| — フォーカス・選択・ユーザー入力ガード | PASS / FAIL / 未確認 |
+| — IME active / unknown ガード | PASS / FAIL / 未確認 |
+| — ショートカット解放待ち | PASS / FAIL / 未確認 |
+| — 実マイク・ASR・provider | PASS / FAIL / 未確認 |
+| — provider / ASR / cancellation 失敗時の非変更 | PASS / FAIL / 未確認 |
+| **追加: Setup 文字起こし** | PASS / FAIL / 未確認、理由 |
+| **追加: Setup 挿入** | PASS / FAIL / 未確認、理由 |
+| **追加: Toggle / Hold** | PASS / FAIL / 未確認、理由 |
+| **追加: マイクとキャンセル** | PASS / FAIL / 未確認、理由 |
+| **追加: クラウド同意・事前確認** | PASS / FAIL / 未確認、理由 |
+| **追加: 資格情報** | PASS / FAIL / 未確認、理由 |
+| **追加: 履歴と再処理** | PASS / FAIL / 未確認、理由 |
+| **追加: プロファイルと辞書** | PASS / FAIL / 未確認、理由 |
+| **追加: CPU / CUDA** | PASS / FAIL / 未確認、理由 |
+| **追加: UI と診断** | PASS / FAIL / 未確認、理由 |
+| — ライブ無音後の継続 / 遅い対象（任意） | PASS / FAIL / 未確認、理由 |
+| — standard / fast 比較 | PASS / FAIL / 未確認、結果の保存先 |
+| — Edit の修飾キー判定 / provider 契約 | PASS / FAIL / 未確認、理由 |
+| **追加: 配布版** | PASS / FAIL / 未確認、理由 |
 | 備考 / 未解決 | |
 
 ---
 
-*本ガイドは `src-tauri/src/injection.rs`、`src-tauri/src/commands.rs`、`src-tauri/src/types.rs`、`src/pages/SettingsPage.tsx`、`src/pages/DictionaryPage.tsx`、および `docs/benchmarks.md` のコードを直接読んで作成した。実装変更時は本ドキュメントも合わせて更新すること。*
+*実装変更時は、README、各ページ、ネイティブ処理、ベンチマーク手順と本書を合わせて見直すこと。*

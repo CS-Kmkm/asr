@@ -1,4 +1,5 @@
-import { SettingRow, Toggle } from "./ui";
+import { HelpHint, SettingRow, Toggle } from "./ui";
+import { CommitField, StepSlider, validateModel, validateEnvironmentName, validateLocalEndpoint } from "./CommitField";
 import type { Settings } from "../types";
 import { useI18n } from "../i18n";
 
@@ -10,20 +11,20 @@ interface AiCorrectionSettingsProps {
 export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsProps) {
   const { t } = useI18n();
   const status = settings.textCorrectionEnabled ? t("On") : t("Off");
-
   return (
     <section className="panel ai-correction-panel">
       <div className="ai-correction-header">
         <div>
       <h2>{t("AI text correction")}</h2>
-          <p className="muted">
-            {t("When enabled, the transcript is sent to the selected external provider after local transcription. Audio is never sent by this feature.")}
-          </p>
         </div>
         <div className="ai-correction-master">
           <span className={`ai-correction-status ${settings.textCorrectionEnabled ? "on" : ""}`}>
             {status}
           </span>
+          <HelpHint label={t("AI text correction")}>{[settings.textCorrectionEnabled
+            ? t("AI correction is applied before text is inserted. If the API fails, the original transcript is used.")
+            : t("AI correction requests are disabled for Dictation. Translate, Speak to edit, and Ask still use the selected provider when invoked."),
+            t("Dictation sends its transcript to the selected provider only when AI correction is on. Voice and selected-text Translate send text whenever used. Speak to edit sends selected source text and the transcribed spoken instruction whenever used. Ask sends only the transcribed spoken instruction to the selected provider for planning; answer generation using a selection also sends that selected source text with the instruction. Translate, Speak to edit, and Ask work even when Dictation AI correction is off. These text-processing requests do not send audio, but the selected ASR backend may.")].join("\n\n")}</HelpHint>
           <Toggle
             checked={settings.textCorrectionEnabled}
             onChange={(value) => onSave({ textCorrectionEnabled: value })}
@@ -31,15 +32,9 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
           />
         </div>
       </div>
-      <p className="ai-correction-master-detail">
-        {settings.textCorrectionEnabled
-          ? t("AI correction is applied before text is inserted. If the API fails, the original transcript is used.")
-          : t("AI correction and external API requests are disabled. You can configure the options below before enabling it.")}
-      </p>
 
       <SettingRow
         title={t("Provider")}
-        detail={t("Choose the API used for correction. This can be configured while correction is off.")}
         control={
           <select
             value={settings.correctionProvider}
@@ -51,18 +46,37 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
           >
             <option value="openai">OpenAI</option>
             <option value="gemini">Google Gemini</option>
+            <option value="local">{t("Local (OpenAI-compatible)")}</option>
+          </select>
+        }
+      />
+      <SettingRow
+        title={t("Correction mode")}
+        detail={settings.correctionMode === "intent_aware"
+          ? t("Intent-aware: limited checks; names are unchecked. Failed checks keep the original.")
+          : t("Keep utterance order; intent-aware may reorganize phrasing.")}
+        detailMode={settings.correctionMode === "intent_aware" ? "inline" : "hint"}
+        help={t("Conservative keeps utterance order. Intent-aware may reorganize phrasing within this transcript; it is instructed not to add details, does not learn automatically, and uses no context beyond the current transcript and profile. Only intent-aware results are checked for changed numbers, URLs, backtick code, and uncertainty markers; a failed check inserts the original transcript. Names and other details are not checked.")}
+        control={
+          <select
+            value={settings.correctionMode}
+            onChange={(event) =>
+              onSave({ correctionMode: event.target.value as Settings["correctionMode"] })
+            }
+          >
+            <option value="conservative">{t("Conservative")}</option>
+            <option value="intent_aware">{t("Intent-aware")}</option>
           </select>
         }
       />
       <div className="correction-options-heading">
         <strong>{t("Automatic editing")}</strong>
-        <p>{t("Each operation is independently applied when AI text correction is enabled.")}</p>
       </div>
       <SettingRow
         title={t("Remove filler words")}
         detail={t("Remove empty hesitations such as ‘えーと’, ‘あのー’, ‘um’, and ‘uh’, while preserving meaningful hesitation or emphasis.")}
         control={
-          <Toggle
+          <Toggle label={t("Remove filler words")}
             checked={settings.correctionRemoveFillers}
             onChange={(value) => onSave({ correctionRemoveFillers: value })}
           />
@@ -72,7 +86,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         title={t("Remove accidental repetition")}
         detail={t("Collapse unintended repeated words and false starts, while retaining deliberate rhetorical repetition.")}
         control={
-          <Toggle
+          <Toggle label={t("Remove accidental repetition")}
             checked={settings.correctionRemoveRepetitions}
             onChange={(value) => onSave({ correctionRemoveRepetitions: value })}
           />
@@ -82,7 +96,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         title={t("Apply spoken self-corrections")}
         detail={t("For phrases such as ‘Tuesday—actually, Wednesday’, keep the speaker’s final intended revision.")}
         control={
-          <Toggle
+          <Toggle label={t("Apply spoken self-corrections")}
             checked={settings.correctionResolveSelfCorrections}
             onChange={(value) => onSave({ correctionResolveSelfCorrections: value })}
           />
@@ -92,7 +106,7 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         title={t("Automatic formatting")}
         detail={t("Turn spoken lists, steps, action items, and key points into paragraphs, bullets, or numbered lists when appropriate.")}
         control={
-          <Toggle
+          <Toggle label={t("Automatic formatting")}
             checked={settings.correctionAutoFormat}
             onChange={(value) => onSave({ correctionAutoFormat: value })}
           />
@@ -102,77 +116,78 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         title={t("Improve clarity")}
         detail={t("Lightly repair spontaneous-speech grammar and unclear phrasing without changing meaning, tone, or formality.")}
         control={
-          <Toggle
+          <Toggle label={t("Improve clarity")}
             checked={settings.correctionImproveClarity}
             onChange={(value) => onSave({ correctionImproveClarity: value })}
           />
         }
       />
-      {settings.correctionProvider === "openai" ? (
+      {settings.correctionProvider === "openai" && (
         <>
           <SettingRow
             title={t("OpenAI model")}
             detail={t("Model ID used through the OpenAI Responses API.")}
             control={
-              <input
-                value={settings.openaiCorrectionModel}
-                onChange={(event) => onSave({ openaiCorrectionModel: event.target.value })}
-              />
+              <CommitField label={t("OpenAI model")} value={settings.openaiCorrectionModel} onCommit={(value) => onSave({ openaiCorrectionModel: value })} validate={validateModel} />
             }
           />
           <SettingRow
             title={t("Reasoning effort")}
             detail={t("Choose the quality, latency, and cost tradeoff. None is fastest; high and above spend more time reasoning. Availability depends on the selected model.")}
             control={
-              <select
-                value={settings.openaiReasoningEffort}
-                onChange={(event) =>
-                  onSave({
-                    openaiReasoningEffort: event.target
-                      .value as Settings["openaiReasoningEffort"],
-                  })
-                }
-              >
-                <option value="none">{t("None — fastest")}</option>
-                <option value="low">{t("Low")}</option>
-                <option value="medium">{t("Medium — balanced")}</option>
-                <option value="high">{t("High")}</option>
-                <option value="xhigh">{t("XHigh")}</option>
-                <option value="max">{t("Max — quality first")}</option>
-              </select>
+              <StepSlider label={t("Reasoning effort")} value={settings.openaiReasoningEffort}
+                options={[{ value: "none", label: t("None — fastest") }, { value: "low", label: t("Low") }, { value: "medium", label: t("Medium — balanced") }, { value: "high", label: t("High") }, { value: "xhigh", label: t("XHigh") }, { value: "max", label: t("Max — quality first") }] as const}
+                onCommit={openaiReasoningEffort => onSave({ openaiReasoningEffort })} />
             }
           />
           <SettingRow
             title={t("OpenAI API key environment variable")}
             detail={t("The key itself is not saved. Restart the app after setting this variable.")}
             control={
-              <input
-                value={settings.openaiApiKeyEnvVar}
-                onChange={(event) => onSave({ openaiApiKeyEnvVar: event.target.value })}
-              />
+              <CommitField label={t("OpenAI API key environment variable")} value={settings.openaiApiKeyEnvVar} onCommit={(value) => onSave({ openaiApiKeyEnvVar: value })} validate={validateEnvironmentName} />
             }
           />
         </>
-      ) : (
+      )}
+      {settings.correctionProvider === "gemini" && (
         <>
           <SettingRow
             title={t("Gemini model")}
             detail={t("Model ID used through the Gemini Interactions API.")}
             control={
-              <input
-                value={settings.geminiCorrectionModel}
-                onChange={(event) => onSave({ geminiCorrectionModel: event.target.value })}
-              />
+              <CommitField label={t("Gemini model")} value={settings.geminiCorrectionModel} onCommit={(value) => onSave({ geminiCorrectionModel: value })} validate={validateModel} />
             }
           />
           <SettingRow
             title={t("Gemini API key environment variable")}
             detail={t("The key itself is not saved. Restart the app after setting this variable.")}
             control={
-              <input
-                value={settings.geminiApiKeyEnvVar}
-                onChange={(event) => onSave({ geminiApiKeyEnvVar: event.target.value })}
-              />
+              <CommitField label={t("Gemini API key environment variable")} value={settings.geminiApiKeyEnvVar} onCommit={(value) => onSave({ geminiApiKeyEnvVar: value })} validate={validateEnvironmentName} />
+            }
+          />
+        </>
+      )}
+      {settings.correctionProvider === "local" && (
+        <>
+          <SettingRow
+            title={t("Local endpoint base URL")}
+            detail={t("Use a numeric loopback URL ending in /v1. Requests bypass proxies and redirects are rejected.")}
+            control={
+              <CommitField label={t("Local endpoint base URL")} value={settings.localCorrectionBaseUrl} onCommit={(value) => onSave({ localCorrectionBaseUrl: value })} validate={validateLocalEndpoint} />
+            }
+          />
+          <SettingRow
+            title={t("Local correction model")}
+            detail={t("Model ID exposed by the local OpenAI-compatible Chat Completions server. No API key is sent.")}
+            control={
+              <CommitField label={t("Local correction model")} value={settings.localCorrectionModel} onCommit={(value) => onSave({ localCorrectionModel: value })} validate={validateModel} />
+            }
+          />
+          <SettingRow
+            title={t("Local output token limit")}
+            detail={t("Includes thinking tokens. Increase for reasoning models; supported range is 128 to 32768.")}
+            control={
+              <CommitField label={t("Local output token limit")} value={String(settings.localCorrectionMaxTokens)} onCommit={(value) => onSave({ localCorrectionMaxTokens: Number(value) })} validate={(value) => Number.isInteger(Number(value)) && Number(value) >= 128 && Number(value) <= 32768 ? null : "Enter a token limit between 128 and 32768."} />
             }
           />
         </>
@@ -181,12 +196,13 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
         title={t("Additional style and tone guidance")}
         detail={t("Customize the editing style. Safety constraints, enabled operations, and dictionary spellings are applied automatically.")}
         control={
-          <textarea
-            rows={7}
+          <CommitField
+            label={t("Additional style and tone guidance")}
+            multiline
             maxLength={500}
             value={settings.correctionInstruction}
             placeholder={t("For example: Keep my tone concise and friendly.")}
-            onChange={(event) => onSave({ correctionInstruction: event.target.value })}
+            onCommit={(value) => onSave({ correctionInstruction: value })}
           />
         }
       />

@@ -4,7 +4,13 @@ import io
 import json
 import os
 import tempfile
+import subprocess
+import sys
 import unittest
+import queue
+import threading
+
+from asr_worker.tests.support import IsolatedWorkerTestCase
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,7 +18,148 @@ from asr_worker.backends import MockBackend, map_backend_exception, vibevoice_de
 from asr_worker.worker import Worker, _configure_protocol_stdio, serve
 
 
-class WorkerTests(unittest.TestCase):
+class WorkerTests(IsolatedWorkerTestCase):
+    def test_invalid_load_formats_do_not_initialize_native_dependencies(self) -> None:
+        calls = []
+        output = io.StringIO()
+        requests = [
+            {"id": 1, "command": "load", "quantization": ["4bit"]},
+            {"id": 2, "command": "load", "quantization": "invalid-test-format"},
+            {"id": 3, "command": "health"},
+            {"id": 4, "command": "shutdown"},
+        ]
+        serve(Worker(MockBackend()), [json.dumps(request) + "\n" for request in requests], output, initialize_load_runtime=lambda: calls.append(True))
+        responses = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(calls, [])
+        self.assertEqual(responses[0]["error"]["code"], "invalid_request")
+        self.assertEqual(responses[1]["error"]["code"], "unsupported_quantization")
+        self.assertTrue(responses[2]["ok"])
+
+    def test_native_initialization_is_load_only_and_failure_keeps_health_available(self) -> None:
+        for error, code in [(ImportError("private dependency detail"), "backend_unavailable"), (RuntimeError("private runtime detail"), "model_load_failed")]:
+            with self.subTest(code=code):
+                calls = []
+                def initialize():
+                    calls.append(True)
+                    raise error
+                requests = [json.dumps({"id": index, "command": command}) + "\n" for index, command in enumerate(["hello", "health", "load", "health", "shutdown"], 1)]
+                output = io.StringIO()
+                serve(Worker(MockBackend()), requests, output, initialize_load_runtime=initialize)
+                responses = [json.loads(line) for line in output.getvalue().splitlines()]
+                self.assertEqual([response["id"] for response in responses], [1, 2, 3, 4, 5])
+                self.assertEqual(calls, [True])
+                self.assertEqual(responses[2]["error"]["code"], code)
+                self.assertNotIn("private", output.getvalue())
+                self.assertTrue(all(response["ok"] for response in [*responses[:2], *responses[3:]]))
+
+    def test_native_runtime_initializes_before_model_load_with_open_stdin(self) -> None:
+        script = '''
+import asr_worker.worker as worker
+from asr_worker.backends import MockBackend
+class NumericalBackend(MockBackend):
+    def load(self, quantization):
+        import numpy
+        super().load(quantization)
+worker.create_backend = lambda name: NumericalBackend()
+raise SystemExit(worker.main(["--backend", "faster-whisper"]))
+'''
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[2],
+            env={**os.environ, "ASR_WORKER_PROGRESS": "0"},
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8",
+        )
+        responses = queue.Queue()
+        def read_responses():
+            for line in process.stdout:
+                responses.put(line)
+        reader = threading.Thread(target=read_responses, daemon=True)
+        reader.start()
+        try:
+            # Keep stdin open between requests: communicate() would hide the
+            # native import hang by allowing the input thread to reach EOF.
+            for request_id, command in enumerate(["hello", "load", "shutdown"], 1):
+                process.stdin.write(json.dumps({"id": request_id, "command": command}) + "\n")
+                process.stdin.flush()
+                response = json.loads(responses.get(timeout=15))
+                self.assertEqual(response["id"], request_id)
+                self.assertTrue(response["ok"], response)
+            self.assertEqual(process.wait(timeout=10), 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            reader.join(timeout=5)
+            process.stdin.close()
+            process.stdout.close()
+            process.stderr.close()
+
+    def test_health_reports_runtime_without_loading_or_importing_model_packages(self) -> None:
+        worker = Worker(MockBackend())
+        def installed_version(name: str) -> str:
+            return {"faster-whisper": "test-whisper", "ctranslate2": "test-ct2"}[name]
+        with patch("asr_worker.worker.importlib.metadata.version", side_effect=installed_version):
+            response, stop = worker.handle({"id": 1, "command": "health"})
+        self.assertTrue(response["ok"])
+        self.assertFalse(stop)
+        health = response["health"]
+        self.assertEqual(health["pythonPath"], sys.executable)
+        self.assertEqual(health["backend"], "mock")
+        self.assertEqual(health["fasterWhisperVersion"], "test-whisper")
+        self.assertEqual(health["ctranslate2Version"], "test-ct2")
+        self.assertFalse(health["loaded"])
+        self.assertIsNone(health["device"])
+        self.assertFalse(worker.loaded)
+
+    def test_health_reports_loaded_device_and_missing_optional_packages(self) -> None:
+        import importlib.metadata
+        worker = Worker(MockBackend())
+        worker.handle({"id": 1, "command": "load"})
+        worker.backend.device = "cpu"
+        worker.backend.compute_type = "int8"
+        with patch("asr_worker.worker.importlib.metadata.version", side_effect=importlib.metadata.PackageNotFoundError):
+            response, _ = worker.handle({"id": 2, "command": "health"})
+        health = response["health"]
+        self.assertTrue(health["loaded"])
+        self.assertEqual(health["device"], "cpu")
+        self.assertEqual(health["computeType"], "int8")
+        self.assertIsNone(health["fasterWhisperVersion"])
+        self.assertIsNone(health["ctranslate2Version"])
+    def test_library_stdout_cannot_corrupt_the_protocol_pipe(self) -> None:
+        script = '''
+import os, sys
+from asr_worker.worker import Worker, serve, _isolate_protocol_stdout
+from asr_worker.backends import MockBackend
+class Noisy(MockBackend):
+    def load(self, quantization):
+        print("library Python output", flush=True)
+        os.write(1, b"library native output\\n")
+        super().load(quantization)
+with _isolate_protocol_stdout() as output:
+    serve(Worker(Noisy()), sys.stdin, output_stream=output)
+'''
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            input='{"id":1,"command":"load"}\n{"id":2,"command":"shutdown"}\n',
+            capture_output=True, text=True, encoding="utf-8", timeout=10, check=True,
+        )
+        responses = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([response["id"] for response in responses], [1, 2])
+        self.assertTrue(all(response["ok"] for response in responses))
+        self.assertIn("library Python output", result.stderr)
+        self.assertIn("library native output", result.stderr)
+
+    def test_hello_reports_version_without_loading_the_model(self) -> None:
+        worker = Worker(MockBackend())
+        response, stop = worker.handle({"id": "handshake", "command": "hello"})
+        self.assertEqual(response, {
+            "id": "handshake", "ok": True,
+            "protocol_version": 1, "worker_version": "0.1.0",
+        })
+        self.assertFalse(worker.loaded)
+        self.assertFalse(stop)
+
     def test_protocol_stdio_is_forced_to_utf8(self) -> None:
         input_bytes = io.BytesIO()
         output_bytes = io.BytesIO()
@@ -44,6 +191,46 @@ class WorkerTests(unittest.TestCase):
         response = json.loads(output.getvalue())
         self.assertEqual(response["id"], None)
         self.assertEqual(response["error"]["code"], "invalid_json")
+
+    def test_unexpected_failure_logs_a_redacted_stack_to_stderr(self) -> None:
+        # stderr is persisted to the desktop app's worker log, so an exception
+        # quoting the request or its result must not reach it or the response.
+        private = ("PROMPT-SECRET", "DICT-TERM", "AUDIO-NAME", "TRANSCRIPT-TEXT", "sk-SECRET")
+
+        class LeakyBackend(MockBackend):
+            def transcribe(self, audio_path, prompt, language=None):  # type: ignore[no-untyped-def]
+                raise RuntimeError(f"{audio_path} {prompt} TRANSCRIPT-TEXT sk-SECRET") from ValueError(
+                    "PROMPT-SECRET"
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            audio = Path(directory) / "AUDIO-NAME.wav"
+            audio.write_bytes(b"")
+            requests = [
+                {"id": 1, "command": "load"},
+                {
+                    "id": 2,
+                    "command": "transcribe",
+                    "audio_path": str(audio),
+                    "prompt": ["PROMPT-SECRET", "DICT-TERM"],
+                },
+            ]
+            output = io.StringIO()
+            stderr = io.StringIO()
+            with patch("asr_worker.worker.sys.stderr", stderr):
+                serve(
+                    Worker(LeakyBackend()),
+                    io.StringIO("".join(json.dumps(request) + "\n" for request in requests)),
+                    output,
+                )
+
+        diagnostic = json.loads(stderr.getvalue().removeprefix("ASR_DIAGNOSTIC "))
+        self.assertEqual(diagnostic["chain"][0]["type"], "RuntimeError")
+        self.assertTrue(diagnostic["chain"][0]["frames"])
+        response = json.loads(output.getvalue().splitlines()[-1])
+        self.assertEqual(response["error"]["code"], "internal_error")
+        for value in private:
+            self.assertNotIn(value, output.getvalue())
 
     def test_response_replaces_lone_surrogates_with_replacement_character(self) -> None:
         class SurrogateBackend(MockBackend):
@@ -213,6 +400,25 @@ class WorkerTests(unittest.TestCase):
             )
         self.assertEqual(response["error"]["code"], "invalid_request")
 
+    def test_regional_locale_reaches_backend_unchanged(self) -> None:
+        class CapturingBackend(MockBackend):
+            locale = None
+
+            def transcribe(self, audio_path, prompt, language=None):  # type: ignore[no-untyped-def]
+                self.locale = language
+                return super().transcribe(audio_path, prompt, language)
+
+        backend = CapturingBackend()
+        worker = Worker(backend)
+        worker.handle({"id": 1, "command": "load"})
+        with tempfile.NamedTemporaryFile(suffix=".wav") as audio:
+            response, _ = worker.handle({
+                "id": 2, "command": "transcribe", "audio_path": audio.name,
+                "language": "en-GB",
+            })
+        self.assertTrue(response["ok"])
+        self.assertEqual(backend.locale, "en-GB")
+
 
 class _ProgressBackend(MockBackend):
     def load(self, quantization: str) -> None:
@@ -221,7 +427,7 @@ class _ProgressBackend(MockBackend):
         super().load(quantization)
 
 
-class LoadProgressTests(unittest.TestCase):
+class LoadProgressTests(IsolatedWorkerTestCase):
     def test_load_reports_progress_before_its_response(self) -> None:
         output = io.StringIO()
         serve(

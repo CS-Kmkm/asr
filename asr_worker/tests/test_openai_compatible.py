@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import tempfile
+import time
 import unittest
+
+from asr_worker.tests.support import IsolatedWorkerTestCase
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,7 +18,7 @@ from asr_worker.backends import BackendError, OpenAICompatibleBackend, create_ba
 from asr_worker.backends import MockBackend
 
 
-class OpenAICompatibleBackendTests(unittest.TestCase):
+class OpenAICompatibleBackendTests(IsolatedWorkerTestCase):
     def create_local_backend(self) -> OpenAICompatibleBackend:
         with patch.dict(
             os.environ,
@@ -58,7 +62,7 @@ class OpenAICompatibleBackendTests(unittest.TestCase):
             audio.write(b"RIFF-test")
             audio_path = Path(audio.name)
         try:
-            text, segments = backend.transcribe(audio_path, "product names", "en")
+            text, segments = backend.transcribe(audio_path, "product names", "en-GB")
         finally:
             audio_path.unlink(missing_ok=True)
 
@@ -70,6 +74,8 @@ class OpenAICompatibleBackendTests(unittest.TestCase):
         self.assertIn(b'name="file"', captured_body)
         self.assertIn(b'name="prompt"', captured_body)
         self.assertIn(b'name="language"', captured_body)
+        self.assertIn(b"\r\n\r\nen\r\n", captured_body)
+        self.assertNotIn(b"en-GB", captured_body)
         self.assertIn(b'name="response_format"', captured_body)
         self.assertIn(b"json", captured_body)
 
@@ -91,7 +97,7 @@ class OpenAICompatibleBackendTests(unittest.TestCase):
         self.assertNotIn("secret response body", context.exception.message)
 
 
-class ApiFormattingTests(unittest.TestCase):
+class ApiFormattingTests(IsolatedWorkerTestCase):
     def test_verbose_response_is_openai_shaped(self) -> None:
         payload = _verbose_response(
             "hello",
@@ -109,14 +115,15 @@ class ApiFormattingTests(unittest.TestCase):
         self.assertIn("00:00:01.250 --> 00:00:02.500", _subtitle(segments, "", vtt=True))
 
 
-class ApiServerTests(unittest.TestCase):
+@unittest.skipUnless(importlib.util.find_spec("fastapi"), "requires the serve extra")
+class ApiServerTests(IsolatedWorkerTestCase):
     def test_transcriptions_endpoint_and_auth(self) -> None:
         from fastapi.testclient import TestClient
 
         from asr_worker.api import create_app
 
         with patch.dict(os.environ, {"ASR_WORKER_MOCK_TEXT": "served locally"}):
-            client = TestClient(create_app(MockBackend(), api_key="test-key", served_model="local-asr"))
+            client = TestClient(create_app(MockBackend(), api_key="test-key", served_model="local-asr"), base_url="http://localhost")
             unauthorized = client.post(
                 "/v1/audio/transcriptions",
                 data={"model": "local-asr"},
@@ -137,7 +144,7 @@ class ApiServerTests(unittest.TestCase):
 
         from asr_worker.api import create_app
 
-        client = TestClient(create_app(MockBackend(), served_model="local-asr"))
+        client = TestClient(create_app(MockBackend(), served_model="local-asr"), base_url="http://localhost")
         models = client.get("/v1/models")
         response = client.post(
             "/v1/audio/transcriptions",
@@ -148,12 +155,118 @@ class ApiServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["task"], "transcribe")
 
+    @staticmethod
+    def stream_events(response: httpx.Response) -> list[dict]:
+        return [
+            json.loads(line[len("data: "):])
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+
+    def test_streaming_sends_one_delta_per_segment_then_done(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from asr_worker.api import create_app
+
+        seen: list[Path] = []
+
+        class SegmentedBackend(MockBackend):
+            def transcribe_segments(self, audio_path, prompt, language=None):
+                seen.append(Path(audio_path))
+                yield {"start": 0.0, "end": 1.0, "speaker": None, "text": " Hello"}
+                yield {"start": 1.0, "end": 2.0, "speaker": None, "text": " world."}
+
+        client = TestClient(create_app(SegmentedBackend(), served_model="local-asr"), base_url="http://localhost")
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={"model": "local-asr", "stream": "true"},
+            files={"file": ("sample.wav", b"RIFF-test", "audio/wav")},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.headers["content-type"].startswith("text/event-stream"))
+        events = self.stream_events(response)
+        self.assertEqual(
+            [event["type"] for event in events],
+            ["transcript.text.delta", "transcript.text.delta", "transcript.text.done"],
+        )
+        self.assertEqual([event["delta"] for event in events[:2]], ["Hello", " world."])
+        self.assertEqual(events[-1]["text"], "Hello world.")
+        # The producer deletes the upload once decoding finishes.
+        for _ in range(100):
+            if not seen[0].exists():
+                break
+            time.sleep(0.01)
+        self.assertFalse(seen[0].exists())
+
+    def test_streaming_failure_after_text_ends_with_an_error_event(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from asr_worker.api import create_app
+
+        class FailsMidway(MockBackend):
+            def transcribe_segments(self, audio_path, prompt, language=None):
+                yield {"start": 0.0, "end": 1.0, "speaker": None, "text": " Hello"}
+                raise BackendError("gpu_oom", "GPU out of memory while operating the ASR model")
+
+        client = TestClient(create_app(FailsMidway(), served_model="local-asr"), base_url="http://localhost")
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={"model": "local-asr", "stream": "true"},
+            files={"file": ("sample.wav", b"RIFF-test", "audio/wav")},
+        )
+        # The status was already sent with the first delta.
+        self.assertEqual(response.status_code, 200)
+        events = self.stream_events(response)
+        self.assertEqual([event["type"] for event in events], ["transcript.text.delta", "error"])
+        self.assertEqual(events[1]["error"]["code"], "gpu_oom")
+
+    def test_streaming_whole_transcript_backends_send_a_single_delta(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from asr_worker.api import create_app
+
+        with patch.dict(os.environ, {"ASR_WORKER_MOCK_TEXT": "served locally"}):
+            client = TestClient(create_app(MockBackend(), served_model="local-asr"), base_url="http://localhost")
+            response = client.post(
+                "/v1/audio/transcriptions",
+                data={"model": "local-asr", "stream": "true", "response_format": "text"},
+                files={"file": ("sample.wav", b"RIFF-test", "audio/wav")},
+            )
+        events = self.stream_events(response)
+        self.assertEqual(events[0], {"type": "transcript.text.delta", "delta": "served locally", "logprobs": []})
+        self.assertEqual(events[1]["text"], "served locally")
+
+    def test_streaming_rejects_segment_formats_and_reports_early_failures(self) -> None:
+        from fastapi.testclient import TestClient
+
+        from asr_worker.api import create_app
+
+        class FailingBackend(MockBackend):
+            def transcribe_segments(self, audio_path, prompt, language=None):
+                raise BackendError("gpu_oom", "GPU out of memory while operating the ASR model")
+                yield  # pragma: no cover - makes this a generator
+
+        client = TestClient(create_app(FailingBackend(), served_model="local-asr"), base_url="http://localhost")
+        unsupported = client.post(
+            "/v1/audio/transcriptions",
+            data={"model": "local-asr", "stream": "true", "response_format": "srt"},
+            files={"file": ("sample.wav", b"RIFF-test", "audio/wav")},
+        )
+        failed = client.post(
+            "/v1/audio/transcriptions",
+            data={"model": "local-asr", "stream": "true"},
+            files={"file": ("sample.wav", b"RIFF-test", "audio/wav")},
+        )
+        self.assertEqual(unsupported.status_code, 400)
+        self.assertEqual(failed.status_code, 500)
+        self.assertEqual(failed.json()["error"]["code"], "gpu_oom")
+
     def test_invalid_and_oversized_requests_use_openai_error_shape(self) -> None:
         from fastapi.testclient import TestClient
 
         from asr_worker.api import create_app
 
-        client = TestClient(create_app(MockBackend(), max_upload_bytes=4))
+        client = TestClient(create_app(MockBackend(), max_upload_bytes=4), base_url="http://localhost")
         missing_file = client.post("/v1/audio/transcriptions", data={"model": "local-asr"})
         too_large = client.post(
             "/v1/audio/transcriptions",
