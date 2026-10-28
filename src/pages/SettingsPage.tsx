@@ -323,6 +323,20 @@ export function SettingsPage({
 
         <SettingRow title={t("Restore clipboard")} detail={t("Restore previous clipboard contents after successful paste.")}
           control={<Toggle label={t("Restore clipboard")} checked={settings.clipboardRestore} onChange={(value) => onSave({ clipboardRestore: value })} />} />
+        <SettingRow title={t("Automatic voice mode")}
+          detail={t("Voice mode detection runs locally. Model files download on first load and stay cached. Editing, translation and answers still use the configured AI provider.")}
+          detailMode="inline"
+          help={t("The Dictation shortcut chooses Dictate, Translate, Edit or Ask from your speech. Select text before asking to edit or translate it. Insertion waits until the decision is complete. Other mode shortcuts stay fixed.")}
+          control={<Toggle label={t("Automatic voice mode")} checked={settings.automaticVoiceMode} disabled={recording} onChange={(value) => onSave({ automaticVoiceMode: value })} />} />
+        {settings.automaticVoiceMode && <>
+          <p className="settings-note">{t("Enable automatic voice mode, then use Load model on the Models page to prepare the local decision model. Recording never downloads or loads decision weights. Install the decision extra for a source checkout. Unavailable or uncertain decisions keep selected text unchanged.")}</p>
+          <SettingRow title={t("Decision model")} control={<select aria-label={t("Decision model")} disabled={recording} value={settings.decisionModel} onChange={(event) => onSave({ decisionModel: event.target.value })}>
+            <option value="Cloudflare/clef-flash">Clef-Flash 9B</option><option value="Cloudflare/clef">Clef</option>
+          </select>} />
+          <SettingRow title={t("Decision model quantization")} help={t("All options require CUDA. 4-bit uses less GPU memory; 8-bit and BF16 need more. Load the decision model again after changing it or restarting the app.")} control={<select aria-label={t("Decision model quantization")} disabled={recording} value={settings.decisionQuantization} onChange={(event) => onSave({ decisionQuantization: event.target.value })}>
+            <option value="4bit">4-bit</option><option value="8bit">8-bit</option><option value="bf16">BF16</option>
+          </select>} />
+        </>}
         <SettingRow title={t("Live text insertion (experimental)")} detail={t("Partial insertion may leave incomplete text in some apps.")}
           detailMode="inline"
           help={t("Off by default: Dictate inserts only the final text once. When on, partial text is typed into the target while you speak; some editors and browser fields may keep only the first part.")}

@@ -188,12 +188,14 @@ export function HelpHint({ label, children }: { label: string; children: string 
 
 export function Toggle({
   checked,
+  disabled = false,
   onChange,
   label,
   id,
   "aria-describedby": describedBy,
 }: {
   checked: boolean;
+  disabled?: boolean;
   onChange: (value: boolean) => void;
   label: string;
   id?: string;
@@ -202,6 +204,7 @@ export function Toggle({
   return (
     <button
       type="button"
+      disabled={disabled}
       id={id}
       className={`toggle ${checked ? "on" : ""}`}
       role="switch"

@@ -319,6 +319,7 @@ impl RecordingDriver for Desktop<'_> {
             .take();
 
         let take = RecordedTake {
+            automatic: false,
             settings,
             transcript,
             artifact,
@@ -335,7 +336,7 @@ impl RecordingDriver for Desktop<'_> {
     async fn deliver(
         &self,
         operation_id: u64,
-        mode: PipelineMode,
+        _mode: PipelineMode,
         recognized: Self::Recognized,
     ) -> Result<RecordingResult, String> {
         let Self {
@@ -344,7 +345,7 @@ impl RecordingDriver for Desktop<'_> {
             state,
             storage,
         } = *self;
-        let (take, edit_session, ask_session) = recognized;
+        let (mut take, mut edit_session, mut ask_session) = recognized;
         let context = PipelineContext {
             app,
             services,
@@ -355,7 +356,19 @@ impl RecordingDriver for Desktop<'_> {
         if services.lifecycle.is_dictation_test(operation_id) {
             return super::setup_tests::finish_dictation_test(context, take).await;
         }
-        match mode {
+        if let Err(error) =
+            super::routing::route(&context, &mut take, &mut edit_session, &mut ask_session).await
+        {
+            if services.lifecycle.is_cancelled(operation_id) {
+                let (message, _) = cancellation_copy(take.mode);
+                emit_state(app, state, AppPhase::Idle, message);
+            } else if state.phase() != Some(AppPhase::Error) {
+                emit_state(app, state, AppPhase::Error, "Voice mode could not be completed. The transcript remains available in this app. Check Models and Privacy, or use a dedicated mode shortcut.");
+            }
+            report_temp_cleanup(app, &mut take.artifact_cleanup);
+            return Err(error);
+        }
+        match take.mode {
             PipelineMode::Edit => super::edit::finish(context, take, edit_session).await,
             PipelineMode::Ask => super::ask::finish(context, take, ask_session).await,
             PipelineMode::Dictate | PipelineMode::Translate => {

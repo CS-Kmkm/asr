@@ -60,6 +60,7 @@ async fn finish_owned(
         operation_id,
     } = context;
     let RecordedTake {
+        automatic,
         settings,
         transcript,
         artifact,
@@ -141,10 +142,11 @@ async fn finish_owned(
         let translation_started = Instant::now();
         llm_provider = Some(settings.correction_provider.clone());
         match classify_ai_stage(
-            correction::translate_transcript(
+            correction::translate_voice_request(
                 &settings,
                 &transcript.text,
                 target_language,
+                automatic,
                 correction_cancel,
                 |delta| emit_correction_preview(app, delta, "streaming"),
             )

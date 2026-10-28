@@ -7,6 +7,7 @@ mod commands;
 mod correction;
 mod correction_prompt;
 mod credentials;
+mod decision;
 mod dictionary;
 mod environment;
 mod injection;

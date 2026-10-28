@@ -931,16 +931,26 @@ async fn start_owned_recording(
     let active_hotkey = trigger_chord
         .as_deref()
         .unwrap_or_else(|| mode_shortcuts[0].as_str());
+    let automatic =
+        !dictation_test && mode == PipelineMode::Dictate && settings.automatic_voice_mode;
     let (mut edit_session, mut ask_session) =
-        if matches!(mode, PipelineMode::Edit | PipelineMode::Ask) {
+        if automatic || matches!(mode, PipelineMode::Edit | PipelineMode::Ask) {
             let settings = settings.clone();
             let active_hotkey = active_hotkey.to_owned();
             tokio::task::spawn_blocking(move || {
                 let edit = (mode == PipelineMode::Edit)
                     .then(|| EditSession::new(&settings, &active_hotkey, from_shortcut))
                     .transpose()?;
-                let ask = (mode == PipelineMode::Ask)
-                    .then(|| AskSession::new(&settings, &active_hotkey, from_shortcut));
+                let ask = if automatic {
+                    Some(AskSession::automatic(
+                        &settings,
+                        &active_hotkey,
+                        from_shortcut,
+                    ))
+                } else {
+                    (mode == PipelineMode::Ask)
+                        .then(|| AskSession::new(&settings, &active_hotkey, from_shortcut))
+                };
                 Ok::<_, String>((edit, ask))
             })
             .await
@@ -2616,6 +2626,12 @@ pub(crate) async fn update_settings(
                 .await
                 .map_err(|_| "settings task failed".to_owned())?;
         services.transcriber.reconfigure(command).await;
+    } else if decision_configuration_changed(&previous, &settings) {
+        // Release optional VRAM under the same maintenance gate, preserving
+        // the speech model and its ready status.
+        if services.transcriber.unload_decision().await.is_err() {
+            emit_status(&app, "decision_model_unload_failed", "The decision model could not be released. Restart the app if GPU memory remains in use.");
+        }
     }
     if model_configuration_changed {
         let (model_id, detail) = model_identity(&settings);
@@ -2675,6 +2691,7 @@ const MODEL_CHANGE_IN_PROGRESS: &str = "The speech model is being changed. Try a
 /// behind a model load that holds the transcriber.
 struct ModelChangeGate {
     changing: Mutex<bool>,
+    preparation_cancel: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
 }
 
 pub(crate) fn begin_history_retry(
@@ -2697,6 +2714,25 @@ pub(crate) fn begin_setup_insertion(
 static MODEL_CHANGE_GATE: ModelChangeGate = ModelChangeGate::new();
 
 impl ModelChangeGate {
+    fn begin_preparation(
+        &self,
+        phase: impl FnOnce() -> PipelinePhase,
+    ) -> Result<(ModelChangeGuard<'_>, tokio::sync::watch::Receiver<bool>), String> {
+        let mut changing = self.changing();
+        if *changing {
+            return Err(MODEL_CHANGE_IN_PROGRESS.into());
+        }
+        if phase() != PipelinePhase::Idle {
+            return Err(MODEL_CHANGE_WHILE_BUSY.into());
+        }
+        *changing = true;
+        let (sender, cancel) = tokio::sync::watch::channel(false);
+        *self
+            .preparation_cancel
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(sender);
+        Ok((ModelChangeGuard { gate: self }, cancel))
+    }
     fn begin_secret_change(
         &self,
         phase: impl FnOnce() -> PipelinePhase,
@@ -2714,6 +2750,7 @@ impl ModelChangeGate {
     const fn new() -> Self {
         Self {
             changing: Mutex::new(false),
+            preparation_cancel: Mutex::new(None),
         }
     }
 
@@ -2739,6 +2776,14 @@ impl ModelChangeGate {
         // carrying the old model) would let the first guard clear the mark
         // while its own reconfiguration is still pending.
         if *changing {
+            if let Some(cancel) = self
+                .preparation_cancel
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+            {
+                cancel.send_replace(true);
+            }
             return Err(MODEL_CHANGE_IN_PROGRESS.into());
         }
         reject_model_change_while_busy(previous, next, phase())?;
@@ -2753,6 +2798,14 @@ impl ModelChangeGate {
     ) -> Result<T, &'static str> {
         let changing = self.changing();
         if *changing {
+            if let Some(cancel) = self
+                .preparation_cancel
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+            {
+                cancel.send_replace(true);
+            }
             return Err(MODEL_CHANGE_IN_PROGRESS);
         }
         begin()
@@ -2766,12 +2819,24 @@ struct ModelChangeGuard<'a> {
 
 impl Drop for ModelChangeGuard<'_> {
     fn drop(&mut self) {
-        *self.gate.changing() = false;
+        let mut changing = self.gate.changing();
+        self.gate
+            .preparation_cancel
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        *changing = false;
     }
 }
 
 fn speech_model_changed(previous: &Settings, next: &Settings) -> bool {
-    worker_configuration_changed(previous, next)
+    worker_configuration_changed(previous, next) || decision_configuration_changed(previous, next)
+}
+
+fn decision_configuration_changed(previous: &Settings, next: &Settings) -> bool {
+    previous.automatic_voice_mode != next.automatic_voice_mode
+        || previous.decision_model != next.decision_model
+        || previous.decision_quantization != next.decision_quantization
 }
 
 /// A recording or its processing owns the loaded speech model until it
@@ -3178,7 +3243,44 @@ pub(crate) async fn load_model(
             return Err("model settings changed; save them before loading".into());
         }
     }
-    ensure_model_loaded(&app, &services, &settings).await
+    let status = ensure_model_loaded(&app, &services, &settings).await?;
+    if settings.automatic_voice_mode {
+        // Only optional preparation holds this gate. A recording press signals
+        // cancellation and returns immediately; the user can retry once speech
+        // recovery finishes. Ordinary speech loading keeps its existing behavior.
+        let (_preparation, cancel) =
+            MODEL_CHANGE_GATE.begin_preparation(|| services.lifecycle.phase())?;
+        if speech_model_changed(&settings, &storage.get_settings().map_err(command_error)?) {
+            return Err("model settings changed; save them before loading".into());
+        }
+        emit_status(
+            &app,
+            "decision_model_loading",
+            "Loading the local voice decision model.",
+        );
+        if services
+            .transcriber
+            .load_decision(
+                &settings.decision_model,
+                &settings.decision_quantization,
+                Some(cancel),
+            )
+            .await
+            .is_err()
+        {
+            emit_status(&app, "decision_model_unavailable", "The local voice decision model is unavailable. Automatic mode detection will be skipped.");
+            if services
+                .shutdown_started
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(MODEL_LOAD_CANCELLED.into());
+            }
+            // A timeout/crash may have restarted the shared worker. Restore
+            // speech before releasing the gate, without retrying Clef.
+            return ensure_model_loaded(&app, &services, &settings).await;
+        }
+    }
+    Ok(status)
 }
 
 pub(crate) async fn ensure_model_loaded(

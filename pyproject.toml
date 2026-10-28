@@ -10,6 +10,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+decision = [
+    "truststore>=0.10",
+    "accelerate>=1.13.0",
+    "bitsandbytes>=0.46.0",
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "pillow>=10",
+    "transformers==5.10.2",
+]
 vibevoice = [
     "accelerate>=1.13.0",
     "bitsandbytes>=0.46.0",

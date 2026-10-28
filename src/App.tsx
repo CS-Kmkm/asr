@@ -125,6 +125,9 @@ const isAskAnswer = windowLabel === "ask-answer";
 const MODEL_PREPARATION_KINDS = ["model_loading", "model_downloading", "worker_setup"];
 
 const WARNING_STATUS_KINDS = new Set([
+  "decision_model_unavailable",
+  "decision_model_unload_failed",
+  "voice_mode_fallback",
   "artifact_cleanup_failed",
   "history_audio_unavailable",
   "history_audio_and_metric_save_failed",

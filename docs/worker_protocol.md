@@ -389,6 +389,28 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
 検査全体は60秒、要求送信後の応答は10秒を
 上限とする。Pythonのパスはローカル画面だけに表示し、コピーする診断結果からは除外する。
 
+### ローカル音声モード判定
+
+`load_decision` は `model` と `quantization` (`4bit` / `8bit` / `bf16`) を受け取り、
+固定リビジョンの Clef を既存の常駐ワーカーに読み込む。`quantization` 省略時は `4bit`。
+成功応答は `{"id": ..., "ok": true, "model": ...}`。明示的なモデル読み込み操作で実行し、
+録音開始時には実行しない。判断モデルの準備中に新たな録音・再処理を要求すると、
+準備をキャンセルし、その要求には待機させず案内を返す。復旧後にもう一度操作できる。
+通常の音声認識モデルの読み込みにはこの制限を加えない。
+通常の判断モデルエラーでは音声認識モデルを維持し、タイムアウト・クラッシュで
+ワーカーを再起動した場合は音声認識モデルの復元を試みてから準備状態を解除する。
+復元も失敗した場合は音声認識の読み込みエラーを返す。すべての量子化で CUDA が必要。
+
+`classify_decision` の `input` は `model`、`quantization`、`state`、`questions` を含む。
+`state` は非空で8192文字以下の `spoken` と真偽値 `has_selection` のみ。
+選択した文章自体は判断モデルに送らない。応答の `answers.mode` には `choice`、
+`confidence`、4モードの `probabilities` が入り、Rust側で確信度と整合性を検査する。
+未読み込みの場合はエラーを返し、自動で重みの取得や読み込みを始めない。
+キャンセル時は結果を使わず、既存の中断・ワーカー再起動の規則に従う。
+
+`unload_decision` は判断モデルだけを解放して `{"id": ..., "ok": true}` を返す。
+自動判定の無効化や判断モデル・量子化の変更時に実行し、音声認識モデルは維持する。
+
 ## 3. エラーコード一覧
 
 `error.code` は実装上の文字列定数であり、以下が全コードである。`message` は人間可読の
@@ -396,13 +418,19 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
 
 | コード | 発生箇所 | 発生条件 |
 |---|---|---|
-| `invalid_request` | worker.py | リクエストがJSONオブジェクトでない / `id` が欠落 / `quantization` が文字列でない / `prompt` の型が不正(非文字列要素を含むリスト、文字列・リスト・null以外) / `language` が文字列・null 以外、または32文字超。 |
+| `invalid_decision_model` | decision.py | 許可された固定モデルまたは量子化ではない。 |
+| `decision_dependencies_missing` | decision.py | 判断モデルの追加依存がない。`uv sync --extra decision` で準備する。 |
+| `decision_cuda_required` | decision.py | 判断モデルに必要な CUDA がない。CPU の自動判定は対象外。 |
+| `decision_release_invalid` | decision.py | 固定リビジョンの実装を読み込めない。 |
+| `decision_not_loaded` | decision.py | 判断モデルの読み込み前に判定を要求した。 |
+| `invalid_decision_input` | decision.py | モデル・量子化の不一致、発話の長さ・型、選択状態の型、許可されない state のフィールド。 |
+| `invalid_request` | worker.py | リクエストがJSONオブジェクトでない / `id` が欠落 / `quantization` が文字列でない / 判断モデルの `model` が文字列でない / `prompt` の型が不正(非文字列要素を含むリスト、文字列・リスト・null以外) / `language` が文字列・null 以外、または32文字超。 |
 | `invalid_json` | worker.py (`serve`) | 受信行がJSONとして解釈できない(`JSONDecodeError`)。`id` は `null`。 |
 | `model_not_loaded` | worker.py | `load` 成功前に `transcribe` を要求した。 |
 | `invalid_audio_path` | worker.py | `audio_path` が非空文字列でない。 |
 | `audio_not_found` | worker.py | `audio_path` が示すパスが存在しない、またはファイルでない。 |
-| `unsupported_operation` | worker.py | `command`/`op` が `hello`/`health`/`load`/`transcribe`/`cancel`/`shutdown` のいずれでもない。 |
-| `cancelled` | worker.py / backends.py | `cancel`(§2.5)で中断された `transcribe`。中断できずに完了した場合も結果を破棄してこのコードを返す。 |
+| `unsupported_operation` | worker.py | `command`/`op` が `hello`/`health`/`load`/`transcribe`/`load_decision`/`unload_decision`/`classify_decision`/`cancel`/`shutdown` のいずれでもない。 |
+| `cancelled` | worker.py / backends.py | `cancel`(§2.5)で中断された `transcribe` / `load_decision` / `classify_decision`。中断できずに完了した場合も結果を破棄してこのコードを返す。判断モデルの読み込み直後にキャンセルされた場合も、その判断モデルを解放する。 |
 | `unsupported_quantization` | backends.py(各バックエンドの `load` / `faster_whisper_compute_type`) | `quantization` が許容集合 `{4bit, 8bit, bf16}` 外。 |
 | `unsupported_backend` | backends.py (`create_backend`) | 未知のバックエンド名。プロセス起動時 (`main`) に発生し、終了コード2でワーカーが起動失敗する(この場合プロトコル応答ではなくstderr出力)。 |
 | `backend_unavailable` | backends.py | faster-whisper、VibeVoice、HTTP バックエンドの必要パッケージがない。 |

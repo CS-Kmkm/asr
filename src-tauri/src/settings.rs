@@ -61,6 +61,18 @@ pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
         return Err("speech locale is unsupported".into());
     }
     validate_translation_targets(settings)?;
+    if !matches!(
+        settings.decision_model.as_str(),
+        "Cloudflare/clef-flash" | "Cloudflare/clef"
+    ) {
+        return Err("unsupported local decision model".into());
+    }
+    if !matches!(
+        settings.decision_quantization.as_str(),
+        "4bit" | "8bit" | "bf16"
+    ) {
+        return Err("unsupported decision quantization".into());
+    }
     if !["off", "low", "medium", "high"].contains(&settings.noise_suppression.as_str()) {
         return Err("noise suppression must be off, low, medium, or high".into());
     }

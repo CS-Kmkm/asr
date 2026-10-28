@@ -2211,6 +2211,57 @@ fn a_recording_cannot_start_between_the_model_check_and_reconfigure() {
 }
 
 #[test]
+fn manual_model_preparation_refuses_active_takes_and_prevents_queued_recordings() {
+    let gate = ModelChangeGate::new();
+    assert!(gate.begin_preparation(|| PipelinePhase::Recording).is_err());
+    assert!(gate
+        .begin_preparation(|| PipelinePhase::Processing)
+        .is_err());
+    let (preparation, cancel) = gate.begin_preparation(|| PipelinePhase::Idle).unwrap();
+    assert!(!*cancel.borrow());
+    assert_eq!(
+        gate.begin_pipeline(|| Ok(())),
+        Err(MODEL_CHANGE_IN_PROGRESS)
+    );
+    assert!(*cancel.borrow());
+    assert!(gate.begin_preparation(|| PipelinePhase::Idle).is_err());
+    drop(preparation);
+    assert_eq!(gate.begin_pipeline(|| Ok(())), Ok(()));
+}
+
+#[test]
+fn disabling_routing_cancels_preparation_and_can_be_retried_after_recovery() {
+    let gate = ModelChangeGate::new();
+    let (preparation, cancel) = gate.begin_preparation(|| PipelinePhase::Idle).unwrap();
+    let previous = Settings {
+        automatic_voice_mode: true,
+        ..Settings::default()
+    };
+    let next = Settings::default();
+    assert!(gate
+        .begin_change(&previous, &next, || PipelinePhase::Idle)
+        .is_err());
+    assert!(*cancel.borrow());
+    drop(preparation);
+    assert!(gate
+        .begin_change(&previous, &next, || PipelinePhase::Idle)
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn decision_settings_never_restart_the_speech_worker() {
+    let previous = Settings::default();
+    let mut next = previous.clone();
+    next.automatic_voice_mode = true;
+    next.decision_model = "Cloudflare/clef".into();
+    next.decision_quantization = "8bit".into();
+    assert!(!worker_configuration_changed(&previous, &next));
+    assert!(speech_model_changed(&previous, &next));
+    assert!(reject_model_change_while_busy(&previous, &next, PipelinePhase::Recording).is_err());
+}
+
+#[test]
 fn overlapping_model_changes_are_refused() {
     let gate = ModelChangeGate::new();
     let (previous, next) = model_change();

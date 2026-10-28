@@ -13,6 +13,20 @@ vi.mock("../api", async (original) => ({ ...await original<typeof import("../api
 beforeEach(() => { vi.clearAllMocks(); vi.mocked(setShortcutCapture).mockResolvedValue(undefined); });
 afterEach(() => vi.useRealTimers());
 
+test("automatic routing requires opt-in and its controls cannot change during recording", () => {
+  const save = vi.fn();
+  const view = render(<I18nProvider language="en"><SettingsPage section="input" settings={defaultSettings} onSave={save} devices={[]} recording={false} /></I18nProvider>);
+  const toggle = screen.getByRole("switch", { name: "Automatic voice mode" });
+  expect(toggle.getAttribute("aria-checked")).toBe("false");
+  expect(screen.queryByRole("combobox", { name: "Decision model" })).toBeNull();
+  fireEvent.click(toggle);
+  expect(save).toHaveBeenCalledWith({ automaticVoiceMode: true });
+  view.rerender(<I18nProvider language="en"><SettingsPage section="input" settings={{ ...defaultSettings, automaticVoiceMode: true }} onSave={save} devices={[]} recording={true} /></I18nProvider>);
+  expect((screen.getByRole("switch", { name: "Automatic voice mode" }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole("combobox", { name: "Decision model" }) as HTMLSelectElement).disabled).toBe(true);
+  expect((screen.getByRole("combobox", { name: "Decision model quantization" }) as HTMLSelectElement).disabled).toBe(true);
+});
+
 test("hold to talk is off by default and each mode saves its own choice", () => {
   const save = vi.fn();
   render(<I18nProvider language="en"><SettingsPage settings={defaultSettings} onSave={save} devices={[]} recording={false} /></I18nProvider>);

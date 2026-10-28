@@ -134,6 +134,12 @@ pub struct Settings {
     pub keep_failed_takes: bool,
     pub auto_start: bool,
     pub clipboard_restore: bool,
+    #[serde(default)]
+    pub automatic_voice_mode: bool,
+    #[serde(default = "default_decision_model")]
+    pub decision_model: String,
+    #[serde(default = "default_decision_quantization")]
+    pub decision_quantization: String,
     /// Off by default: Dictate pastes only the final text once. On restores
     /// live provisional insertion and replacement in the captured target.
     #[serde(default)]
@@ -317,6 +323,13 @@ fn default_api_key_env_var() -> String {
     "OPENAI_API_KEY".into()
 }
 
+fn default_decision_model() -> String {
+    "Cloudflare/clef-flash".into()
+}
+fn default_decision_quantization() -> String {
+    "4bit".into()
+}
+
 fn default_noise_suppression() -> String {
     "medium".into()
 }
@@ -420,6 +433,9 @@ impl Default for Settings {
             keep_failed_takes: default_keep_failed_takes(),
             auto_start: false,
             clipboard_restore: true,
+            automatic_voice_mode: false,
+            decision_model: default_decision_model(),
+            decision_quantization: default_decision_quantization(),
             live_target_insertion: false,
             noise_suppression: default_noise_suppression(),
             input_gain_percent: default_input_gain_percent(),
@@ -735,6 +751,10 @@ mod tests {
         assert!(settings.correction_improve_clarity);
         assert!(settings.custom_models.is_empty());
         assert!(!settings.live_target_insertion);
+        assert!(!settings.automatic_voice_mode);
+        assert!(!Settings::default().automatic_voice_mode);
+        assert_eq!(settings.decision_model, "Cloudflare/clef-flash");
+        assert_eq!(settings.decision_quantization, "4bit");
     }
 
     #[test]

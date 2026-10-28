@@ -22,6 +22,7 @@ pub(crate) fn classify_ai_stage(result: Result<String, CorrectionError>) -> AiSt
 mod ask;
 mod dictate_translate;
 mod edit;
+mod routing;
 pub(crate) mod setup_tests;
 pub(crate) mod stop;
 
@@ -35,6 +36,7 @@ pub(crate) struct PipelineContext<'a> {
 }
 
 struct RecordedTake {
+    automatic: bool,
     settings: crate::types::Settings,
     transcript: crate::asr::Transcript,
     artifact: crate::audio::AudioArtifact,

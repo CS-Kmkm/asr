@@ -5,6 +5,7 @@
 
 | 分類 | 契約 | 扱い |
 |---|---|---|
+| completed | [残存ブランチの main 統合](remaining-branch-integration.md) | 自動判定を初期無効で移植。自動テスト・Windowsビルド・独立レビュー完了。GPU実推論と実マイク挿入は未確認 |
 | active | [UI polish pass](ui-polish-pass.md) | Remaining inconsistencies fixed; 160 tests/build/review passed; native visual verification pending |
 | active | [UI review fixes](ui-review-fixes.md) | Four findings fixed; 155 tests/build/review passed; native keyboard/layout verification pending |
 | active | [Remaining explanation cleanup](ui-explanation-cleanup.md) | Redundant copy removed/help consolidated; tests/build/review passed; native visual verification pending |

@@ -30,6 +30,8 @@ pub(crate) async fn finish(
         operation_id,
     } = context;
     let RecordedTake {
+        automatic,
+        translation_target,
         transcript,
         artifact,
         mut artifact_cleanup,
@@ -54,6 +56,7 @@ pub(crate) async fn finish(
         duration_ms,
         started,
         Some(&artifact.path),
+        if automatic { translation_target } else { None },
     )
     .await;
     if !services.lifecycle.is_cancelled(operation_id) {
@@ -104,6 +107,10 @@ pub(crate) async fn finish(
     result
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keeps the captured translation target with the existing recording metadata."
+)]
 async fn finish_ask(
     context: &PipelineContext<'_>,
     session: Arc<AskSession>,
@@ -112,6 +119,7 @@ async fn finish_ask(
     duration_ms: u64,
     started: Instant,
     audio_path: Option<&std::path::Path>,
+    selected_translation: Option<String>,
 ) -> Result<RecordingResult, String> {
     let PipelineContext {
         app,
@@ -142,45 +150,48 @@ async fn finish_ask(
         "Choosing a safe Ask action.",
     );
     // Planning receives spoken text and context only. It never receives source.
-    let planning_personalization = super::personalization::resolve(
-        storage,
-        &settings,
-        app_context.as_ref(),
-        spoken,
-        None,
-        services
-            .lifecycle
-            .cancellation(operation_id)
-            .map_err(command_error)?,
-    )
-    .await
-    .ok_or("ask was cancelled")?;
-    let plan_started = Instant::now();
-    let plan = correction::generate_ask_plan(
-        &settings,
-        spoken,
-        &planning_personalization.instruction(&ask::planning_prompt(session.kind())),
-        services
-            .lifecycle
-            .cancellation(operation_id)
-            .map_err(command_error)?,
-    )
-    .await;
-    if !matches!(plan, Err(correction::CorrectionError::Cancelled)) {
-        let _ = metrics.add_metric(
-            "ask_plan",
-            Some(&settings.correction_provider),
-            Some(plan_started.elapsed().as_millis() as i64),
-            plan.is_ok(),
-            plan.as_ref().err().map(|error| error.failure_code()),
-        );
-    }
-    let plan = plan.map_err(|error| ai_command_error(app, &error, FailureOutcome::NoAction))?;
-    if services.lifecycle.is_cancelled(operation_id) {
-        return Err("ask was cancelled".into());
-    }
-    let parsed =
-        ask::parse_plan(&plan).map_err(|_| "Ask planner returned an invalid action".to_string())?;
+    let parsed = if let Some(target_language) = selected_translation {
+        ask::AskAction::Translate { target_language }
+    } else {
+        let planning_personalization = super::personalization::resolve(
+            storage,
+            &settings,
+            app_context.as_ref(),
+            spoken,
+            None,
+            services
+                .lifecycle
+                .cancellation(operation_id)
+                .map_err(command_error)?,
+        )
+        .await
+        .ok_or("ask was cancelled")?;
+        let plan_started = Instant::now();
+        let plan = correction::generate_ask_plan(
+            &settings,
+            spoken,
+            &planning_personalization.instruction(&ask::planning_prompt(session.kind())),
+            services
+                .lifecycle
+                .cancellation(operation_id)
+                .map_err(command_error)?,
+        )
+        .await;
+        if !matches!(plan, Err(correction::CorrectionError::Cancelled)) {
+            let _ = metrics.add_metric(
+                "ask_plan",
+                Some(&settings.correction_provider),
+                Some(plan_started.elapsed().as_millis() as i64),
+                plan.is_ok(),
+                plan.as_ref().err().map(|error| error.failure_code()),
+            );
+        }
+        let plan = plan.map_err(|error| ai_command_error(app, &error, FailureOutcome::NoAction))?;
+        if services.lifecycle.is_cancelled(operation_id) {
+            return Err("ask was cancelled".into());
+        }
+        ask::parse_plan(&plan).map_err(|_| "Ask planner returned an invalid action".to_string())?
+    };
     let action = match ask::validate_action(
         parsed,
         session.kind(),

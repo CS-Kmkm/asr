@@ -23,6 +23,14 @@ const backendTemplates = Object.entries(backendCatalogue).filter(([, entry]) => 
 });
 
 const en = {
+  "Enable automatic voice mode, then use Load model on the Models page to prepare the local decision model. Recording never downloads or loads decision weights. Install the decision extra for a source checkout. Unavailable or uncertain decisions keep selected text unchanged.": "Enable automatic voice mode, then use Load model on the Models page to prepare the local decision model. Recording never downloads or loads decision weights. Install the decision extra for a source checkout. Unavailable or uncertain decisions keep selected text unchanged.",
+  "Automatic voice mode": "Automatic voice mode",
+  "Decision model": "Decision model",
+  "Decision model quantization": "Decision model quantization",
+  "Voice mode detection runs locally. Model files download on first load and stay cached. Editing, translation and answers still use the configured AI provider.": "Voice mode detection runs locally. Model files download on first load and stay cached. Editing, translation and answers still use the configured AI provider.",
+  "All options require CUDA. 4-bit uses less GPU memory; 8-bit and BF16 need more. Load the decision model again after changing it or restarting the app.": "All options require CUDA. 4-bit uses less GPU memory; 8-bit and BF16 need more. Load the decision model again after changing it or restarting the app.",
+  "The Dictation shortcut chooses Dictate, Translate, Edit or Ask from your speech. Select text before asking to edit or translate it. Insertion waits until the decision is complete. Other mode shortcuts stay fixed.": "The Dictation shortcut chooses Dictate, Translate, Edit or Ask from your speech. Select text before asking to edit or translate it. Insertion waits until the decision is complete. Other mode shortcuts stay fixed.",
+
   "This may prepare dependencies; no model is loaded.": "This may prepare dependencies; no model is loaded.",
   "Help": "Help",
   "Uses provider even with correction off: selected text and instruction. ASR may send audio.": "Uses provider even with correction off: selected text and instruction. ASR may send audio.",
@@ -414,6 +422,14 @@ const en = {
 } as const;
 export type MessageKey = keyof typeof en | keyof typeof backendMessages;
 const ja: Record<keyof typeof en, string> = {
+  "Enable automatic voice mode, then use Load model on the Models page to prepare the local decision model. Recording never downloads or loads decision weights. Install the decision extra for a source checkout. Unavailable or uncertain decisions keep selected text unchanged.": "音声モードの自動判定を有効にし、モデル画面の「モデルを読み込む」で判断モデルを準備してください。録音開始時には判断モデルの取得・読み込みを行いません。ソースから使う場合は decision 追加依存が必要です。判定できない場合や確信度が低い場合、選択した文章は変更しません。",
+  "Automatic voice mode": "音声モードの自動判定",
+  "Decision model": "判断モデル",
+  "Decision model quantization": "判断モデルの量子化",
+  "Voice mode detection runs locally. Model files download on first load and stay cached. Editing, translation and answers still use the configured AI provider.": "音声モードはローカルモデルで判定します。初回読み込み時にモデルを取得し、以後はキャッシュを使います。編集・翻訳・回答の生成は、設定したAIプロバイダーを使います。",
+  "All options require CUDA. 4-bit uses less GPU memory; 8-bit and BF16 need more. Load the decision model again after changing it or restarting the app.": "すべての選択肢にCUDAが必要です。4-bitはGPUメモリを抑え、8-bitとBF16はより多く必要です。モデル変更やアプリ再起動の後は判断モデルを読み込んでください。",
+  "The Dictation shortcut chooses Dictate, Translate, Edit or Ask from your speech. Select text before asking to edit or translate it. Insertion waits until the decision is complete. Other mode shortcuts stay fixed.": "Dictationのショートカットで、発話から文字入力・翻訳・編集・質問を選びます。文章の編集や翻訳は、先に対象を選択してください。判定が終わってから挿入します。各モード専用のショートカットでは、自動判定せず指定したモードを使います。",
+
   "This may prepare dependencies; no model is loaded.": "依存環境を準備する場合があります。モデルは読み込みません。",
   "Help": "ヘルプ",
   "Uses provider even with correction off: selected text and instruction. ASR may send audio.": "補正オフでも選択文と指示を送信。音声もクラウド処理の場合があります。",

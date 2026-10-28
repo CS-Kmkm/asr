@@ -78,6 +78,7 @@ pub(crate) fn is_external_ask_target(target: &TargetWindow) -> bool {
 }
 
 pub(crate) struct AskSession {
+    pub(crate) automatic: Option<crate::decision::DecisionConfig>,
     pub(crate) capture: AskCapture,
     pub(crate) injector: SystemTextInjector,
     pub(crate) monitor: Option<Arc<InputMonitor>>,
@@ -96,6 +97,35 @@ impl AskSession {
             injector,
             Arc::new(InputMonitor::default()),
         )
+    }
+
+    pub(crate) fn automatic(settings: &Settings, active_hotkey: &str, from_shortcut: bool) -> Self {
+        let mut capture_settings = settings.clone();
+        capture_settings.shortcuts.ask = settings.shortcuts.dictate.clone();
+        let mut session = Self::new(&capture_settings, active_hotkey, from_shortcut);
+        session.automatic = Some(crate::decision::DecisionConfig::from_settings(settings));
+        session
+    }
+
+    pub(crate) fn take_edit(&mut self) -> Result<EditSession, String> {
+        if self.monitor.is_none()
+            || self.checkpoint.is_none()
+            || !matches!(self.capture, AskCapture::Selected(_))
+        {
+            return Err("The original selection could not be monitored safely.".into());
+        }
+        let AskCapture::Selected(selection) =
+            std::mem::replace(&mut self.capture, AskCapture::Unavailable)
+        else {
+            unreachable!()
+        };
+        // Move the same injector so captured clipboard ownership and loss reporting survive.
+        Ok(EditSession {
+            selection,
+            injector: std::mem::take(&mut self.injector),
+            monitor: self.monitor.take().expect("checked"),
+            checkpoint: self.checkpoint.take().expect("checked"),
+        })
     }
 
     fn with_injector(
@@ -141,6 +171,7 @@ impl AskSession {
             capture
         };
         Self {
+            automatic: None,
             capture,
             injector,
             monitor,
@@ -282,6 +313,43 @@ mod tests {
         assert!(session.monitor.is_none());
         assert!(session.checkpoint.is_none());
         assert_eq!(calls(&mock.lock().unwrap(), "paste"), 0);
+    }
+
+    #[test]
+    fn routing_an_edit_preserves_original_selection_and_monitor_ownership() {
+        let settings = Settings::default();
+        let (injector, mock, monitor) = dependencies("original", true);
+        let mut session = AskSession::with_injector(
+            &settings,
+            &settings.shortcuts.dictate[0],
+            false,
+            injector,
+            Arc::clone(&monitor),
+        );
+        let edit = session.take_edit().unwrap();
+        drop(session);
+        assert_eq!(edit.selection.text(), "original");
+        assert!(edit.monitor.unchanged_since(edit.checkpoint));
+        assert_eq!(calls(&mock.lock().unwrap(), "paste"), 0);
+        drop(edit);
+        assert!(monitor.checkpoint().is_none());
+    }
+
+    #[test]
+    fn routing_an_edit_refuses_unmonitored_or_caret_context() {
+        let settings = Settings::default();
+        for (selected, available) in [("original", false), ("", true)] {
+            let (injector, mock, monitor) = dependencies(selected, available);
+            let mut session = AskSession::with_injector(
+                &settings,
+                &settings.shortcuts.dictate[0],
+                false,
+                injector,
+                monitor,
+            );
+            assert!(session.take_edit().is_err());
+            assert_eq!(calls(&mock.lock().unwrap(), "paste"), 0);
+        }
     }
 
     #[test]

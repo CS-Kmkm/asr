@@ -29,7 +29,9 @@ const LIVE_INTERVAL: Duration = Duration::from_millis(150);
 /// insertion is an explicit opt-in because editors whose content cannot be
 /// read back keep the first unverified fragment. Other modes always defer.
 pub(crate) fn defers_target_insertion(mode: PipelineMode, settings: &Settings) -> bool {
-    mode != PipelineMode::Dictate || !settings.live_target_insertion
+    mode != PipelineMode::Dictate
+        || settings.automatic_voice_mode
+        || !settings.live_target_insertion
 }
 
 #[derive(Clone, Copy)]
@@ -669,6 +671,8 @@ mod tests {
         assert!(defers_target_insertion(PipelineMode::Translate, &settings));
         settings.live_target_insertion = true;
         assert!(!defers_target_insertion(PipelineMode::Dictate, &settings));
+        settings.automatic_voice_mode = true;
+        assert!(defers_target_insertion(PipelineMode::Dictate, &settings));
         for mode in [
             PipelineMode::Translate,
             PipelineMode::Edit,

@@ -59,6 +59,9 @@ export interface Settings {
   keepFailedTakes: boolean;
   autoStart: boolean;
   clipboardRestore: boolean;
+  automaticVoiceMode: boolean;
+  decisionModel: string;
+  decisionQuantization: string;
   liveTargetInsertion: boolean;
   noiseSuppression: NoiseSuppression;
   inputGainPercent: number;

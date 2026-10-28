@@ -39,6 +39,7 @@ impl Provision {
                 "sync",
                 "--frozen",
                 "--no-dev",
+                "--inexact",
                 "--python",
                 "3.12",
                 "--project",
@@ -58,8 +59,8 @@ impl Provision {
     }
 
     pub(crate) async fn prepare(&self) -> Result<(), AsrError> {
-        // uv checks the frozen lock and reuses installed wheels. Run on each
-        // spawn so upgrades and backend changes cannot reuse stale packages.
+        // Align base requirements on each spawn while retaining optional
+        // packages the user explicitly prepared for another feature.
         let status = self
             .command()
             .status()
@@ -67,6 +68,27 @@ impl Provision {
             .map_err(|_| setup_error("worker_setup_unavailable"))?;
         if !status.success() || !self.python().is_file() {
             return Err(setup_error("worker_setup_failed"));
+        }
+        Ok(())
+    }
+
+    /// Optional packages are installed only by an explicit preparation action.
+    /// Inexact sync preserves extras that a different backend still needs.
+    pub(crate) async fn prepare_decision(
+        &self,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<(), AsrError> {
+        if *cancel.borrow() {
+            return Err(AsrError::Cancelled);
+        }
+        let mut command = self.command();
+        command.args(["--extra", "decision"]);
+        let status = tokio::select! {
+            result = command.status() => result.map_err(|_| setup_error("decision_dependencies_missing"))?,
+            _ = cancel.wait_for(|cancelled| *cancelled) => return Err(AsrError::Cancelled),
+        };
+        if !status.success() {
+            return Err(setup_error("decision_dependencies_missing"));
         }
         Ok(())
     }
@@ -118,6 +140,8 @@ mod tests {
         assert_eq!(command.get_current_dir(), Some(provision.source.as_path()));
         let args: Vec<_> = command.get_args().collect();
         assert!(args.windows(2).any(|pair| pair == ["--extra", "vibevoice"]));
+        assert!(args.iter().any(|arg| *arg == "--inexact"));
+        assert!(!args.iter().any(|arg| *arg == "decision"));
         assert!(args.iter().any(|arg| *arg == "--frozen"));
         assert_eq!(
             command

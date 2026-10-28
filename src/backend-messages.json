@@ -1,4 +1,13 @@
 {
+  "Allow the required providers in Privacy before using this voice mode. The transcript remains available in this app.": {"code":"voice_mode_consent_required","ja":"この音声モードを使う前に、プライバシー設定で必要なプロバイダーへの送信を許可してください。文字起こし結果はアプリ内に残っています。"},
+  "The decision model could not be released. Restart the app if GPU memory remains in use.": {"code":"decision_model_unload_failed","ja":"判断モデルを解放できませんでした。GPUメモリが使用されたままの場合はアプリを再起動してください。"},
+  "The decision model is not ready. Load it in Models before automatic routing; the transcript remains available in this app.": {"code":"decision_model_not_ready","ja":"判断モデルの準備ができていません。自動判定を使う前にモデル画面で読み込んでください。文字起こし結果はアプリ内に残っています。"},
+  "Voice mode could not be completed. The transcript remains available in this app. Check Models and Privacy, or use a dedicated mode shortcut.": {"code":"voice_mode_failed_transcript_retained","ja":"音声モードの処理を完了できませんでした。文字起こし結果はアプリ内に残っています。モデル・プライバシー設定を確認するか、専用ショートカットを使ってください。"},
+  "Choosing a voice mode from your instruction.": {"code":"voice_mode_planning","ja":"発話から音声モードを判定しています。"},
+  "Loading the local voice decision model.": {"code":"decision_model_loading","ja":"ローカルの音声判断モデルを読み込んでいます。"},
+  "The local voice decision model is unavailable. Automatic mode detection will be skipped.": {"code":"decision_model_unavailable","ja":"ローカルの音声判断モデルを読み込めませんでした。音声モードの自動判定を見送ります。"},
+  "Voice mode detection was unavailable or uncertain; using Dictate.": {"code":"voice_mode_fallback","ja":"音声モードを判定できなかったため、文字入力として処理します。"},
+  "Voice mode was uncertain; the selected text was not changed. Use a mode shortcut or a clearer instruction.": {"code":"voice_mode_uncertain","ja":"音声モードが不明確なため、選択した文章は変更しませんでした。専用ショートカットを使うか、指示を明確にして録音してください。"},
   "Insertion test stopped because your clipboard could not be saved for restoring. Copy a short plain-text sample and try again. Your clipboard was left unchanged.": {"code":"setup_clipboard_restore_protected","ja":"復元用にクリップボードを保存できなかったため、文字挿入テストを中止しました。短い文字列をコピーして、もう一度お試しください。クリップボードは変更していません。"},
   "Insertion test could not access the clipboard. Close any clipboard menu and try again.": {"code":"setup_clipboard_busy","ja":"クリップボードにアクセスできませんでした。クリップボードのメニューなどを閉じて、文字挿入テストをやり直してください。"},
   "local operation failed: the clipboard was left unchanged because it could not be saved for restoring": {"code":"clipboard_restore_protected_legacy","ja":"復元用にクリップボードを保存できなかったため、処理を中止しました。クリップボードは変更していません。"},

@@ -264,6 +264,29 @@ pub trait Transcriber: Send + Sync {
         Err(AsrError::Protocol("worker health is unavailable".into()))
     }
     async fn load(&self, quantization: &str) -> Result<(), AsrError>;
+    async fn load_decision(
+        &self,
+        _model: &str,
+        _quantization: &str,
+        _cancel: Option<watch::Receiver<bool>>,
+    ) -> Result<(), AsrError> {
+        Err(AsrError::Protocol(
+            "local decision model is unavailable".into(),
+        ))
+    }
+    async fn unload_decision(&self) -> Result<(), AsrError> {
+        Ok(())
+    }
+    async fn classify_decision(
+        &self,
+        _input: Value,
+        _cancel: watch::Receiver<bool>,
+    ) -> Result<Value, AsrError> {
+        Err(AsrError::Protocol(
+            "local decision model is unavailable".into(),
+        ))
+    }
+
     /// `load` that gives up with `AsrError::Cancelled` once `cancel` turns
     /// true, for example when the recording that needs the model is cancelled.
     async fn load_cancellable(
@@ -1122,6 +1145,76 @@ fn transcribe_request(
 
 #[async_trait]
 impl Transcriber for JsonlTranscriber {
+    async fn load_decision(
+        &self,
+        model: &str,
+        quantization: &str,
+        cancel: Option<watch::Receiver<bool>>,
+    ) -> Result<(), AsrError> {
+        let generation = *self.interrupt.borrow();
+        let (_sender, idle) = watch::channel(false);
+        let cancel = cancel.unwrap_or(idle);
+        let provision = self.configured_command.lock().await.provision.clone();
+        if let Some(provision) = provision {
+            provision.prepare_decision(cancel.clone()).await?;
+        }
+        if *self.interrupt.borrow() != generation {
+            return Err(AsrError::Cancelled);
+        }
+        let speech_quantization = self.state.lock().await.loaded_quantization.clone();
+        let result = self.protocol_request(json!({"id":self.next_id(), "command":"load_decision", "model":model, "quantization":quantization}), cancel.clone(), self.load_timeout, true).await;
+        if result
+            .as_ref()
+            .is_err_and(|error| Self::requires_reset(error) || matches!(error, AsrError::Cancelled))
+            && *self.interrupt.borrow() == generation
+        {
+            if let Some(speech_quantization) = speech_quantization {
+                self.load(&speech_quantization).await?;
+            }
+        }
+        result.map(|_| ())
+    }
+    async fn unload_decision(&self) -> Result<(), AsrError> {
+        let generation = *self.interrupt.borrow();
+        let speech_quantization = {
+            let state = self.state.lock().await;
+            if state.running.is_none() {
+                return Ok(());
+            }
+            state.loaded_quantization.clone()
+        };
+        let (_sender, cancel) = watch::channel(false);
+        let result = self
+            .protocol_request(
+                json!({"id":self.next_id(), "command":"unload_decision"}),
+                cancel,
+                Duration::from_secs(10),
+                true,
+            )
+            .await;
+        if result.as_ref().is_err_and(Self::requires_reset)
+            && *self.interrupt.borrow() == generation
+        {
+            if let Some(speech_quantization) = speech_quantization {
+                self.load(&speech_quantization).await?;
+            }
+        }
+        result.map(|_| ())
+    }
+    async fn classify_decision(
+        &self,
+        input: Value,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Value, AsrError> {
+        self.protocol_request(
+            json!({"id":self.next_id(), "command":"classify_decision", "input":input}),
+            cancel,
+            Duration::from_secs(30),
+            true,
+        )
+        .await
+    }
+
     async fn health(&self) -> Result<WorkerHealth, AsrError> {
         let (_sender, cancel) = watch::channel(false);
         let response = self
@@ -1700,6 +1793,104 @@ mod tests {
                 .parent()
                 .expect("src-tauri has a parent")
                 .to_path_buf()
+        }
+
+        #[tokio::test]
+        async fn failed_optional_decision_load_preserves_ready_speech_model() {
+            let Some(python) = python() else {
+                return;
+            };
+            let spec = WorkerCommand::python(python)
+                .with_backend("mock")
+                .with_current_dir(repository_root());
+            let client =
+                JsonlTranscriber::new(spec, Duration::from_secs(10), Duration::from_secs(10));
+            client.load("bf16").await.unwrap();
+            let error = client
+                .load_decision("unsupported/model", "4bit", None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, AsrError::Worker(error) if error.code == "invalid_decision_model")
+            );
+            assert!(client.health().await.unwrap().loaded);
+            let (_sender, cancel) = watch::channel(false);
+            let error = client
+                .classify_decision(json!({}), cancel)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, AsrError::Worker(error) if error.code == "decision_not_loaded")
+            );
+            assert!(client.health().await.unwrap().loaded);
+            client.unload_decision().await.unwrap();
+            assert!(client.health().await.unwrap().loaded);
+            client.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn decision_timeout_crash_or_cancel_restores_speech_before_returning() {
+            let Some(python) = python() else {
+                return;
+            };
+            for failure in ["timeout", "crash", "cancel"] {
+                let mut command =
+                    WorkerCommand::python(python.clone()).with_current_dir(repository_root());
+                command
+                    .env
+                    .push(("TEST_DECISION_FAILURE".into(), failure.into()));
+                command.args = vec![
+                    "-u".into(),
+                    "-c".into(),
+                    r#"
+import os, time
+from asr_worker.worker import Worker, main
+original = Worker.handle
+def handle(self, request, *args, **kwargs):
+    if isinstance(request, dict) and request.get('command') == 'load_decision':
+        if os.environ['TEST_DECISION_FAILURE'] != 'crash':
+            time.sleep(10)
+        else:
+            os._exit(7)
+    return original(self, request, *args, **kwargs)
+Worker.handle = handle
+main(['--backend', 'mock'])
+"#
+                    .into(),
+                ];
+                let client =
+                    JsonlTranscriber::new(command, Duration::from_secs(10), Duration::from_secs(2))
+                        .with_grace_periods(Duration::from_millis(200), Duration::from_secs(2));
+                client.load("bf16").await.unwrap();
+                let (sender, cancel) = watch::channel(false);
+                let load = client.load_decision("Cloudflare/clef-flash", "4bit", Some(cancel));
+                let result = if failure == "cancel" {
+                    tokio::join!(
+                        async {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            sender.send_replace(true);
+                        },
+                        load
+                    )
+                    .1
+                } else {
+                    load.await
+                };
+                let error = result.unwrap_err();
+                assert!(
+                    matches!(
+                        error,
+                        AsrError::Timeout | AsrError::Crashed | AsrError::Cancelled
+                    ),
+                    "{error:?}"
+                );
+                assert!(matches!(
+                    *client.model_residency().unwrap().borrow(),
+                    ModelResidency::Resident(_)
+                ));
+                assert!(client.health().await.unwrap().loaded, "{failure}");
+                client.shutdown().await.unwrap();
+            }
         }
 
         /// The interpreter the app would use (`ASR_PYTHON`, else the project

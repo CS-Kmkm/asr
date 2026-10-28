@@ -14,10 +14,11 @@ from typing import Any, Callable, Iterable, Iterator, TextIO
 
 from .backends import Backend, BackendError, CancelCheck, QUANTIZATIONS, cancelled_error, create_backend
 from .diagnostics import log_exception
+from .decision import DecisionModel
 
 PROTOCOL_VERSION = 1
 WORKER_VERSION = "0.1.0"
-SUPPORTED_OPERATIONS = "hello, health, load, transcribe, cancel, shutdown"
+SUPPORTED_OPERATIONS = "hello, health, load, transcribe, load_decision, unload_decision, classify_decision, cancel, shutdown"
 
 
 def _configure_protocol_stdio() -> None:
@@ -93,6 +94,7 @@ class Worker:
     ) -> None:
         self.backend = backend
         self.loaded = False
+        self.decision = DecisionModel()
         # Assigned by serve() so a load can report progress before its response.
         self.notify = notify
 
@@ -143,6 +145,28 @@ class Worker:
                         "computeType": getattr(self.backend, "compute_type", None) if self.loaded else None,
                     },
                 }, False
+            if operation in {"load_decision", "classify_decision"}:
+                if cancel_requested is not None and cancel_requested():
+                    raise cancelled_error()
+                if operation == "load_decision":
+                    model = request.get("model")
+                    quantization = request.get("quantization", "4bit")
+                    if not isinstance(model, str) or not isinstance(quantization, str):
+                        return error_response(request_id, "invalid_request", "Decision model and quantization must be strings"), False
+                    self.decision.load(model, quantization, lambda update: self._emit_progress(request_id, update))
+                    result = {"model": model}
+                else:
+                    result = self.decision.classify(request.get("input"))
+                if cancel_requested is not None and cancel_requested():
+                    if operation == "load_decision":
+                        self.decision.unload()
+                    raise cancelled_error()
+                return {**result, "id": request_id, "ok": True}, False
+
+            if operation == "unload_decision":
+                self.decision.unload()
+                return {"id": request_id, "ok": True}, False
+
             if operation == "load":
                 quantization = request.get("quantization", "4bit")
                 if not isinstance(quantization, str):
@@ -223,6 +247,7 @@ class Worker:
                 return {"id": request_id, "ok": True, "cancelled": False}, False
 
             if operation == "shutdown":
+                self.decision.unload()
                 self.backend.unload()
                 self.loaded = False
                 return {"id": request_id, "ok": True}, True
