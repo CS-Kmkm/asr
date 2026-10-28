@@ -276,10 +276,31 @@ test("each history entry keeps its own reprocessing choices", async () => {
   await screen.findByText("Transcript-1");
   const rows = document.querySelectorAll<HTMLElement>(".history-list > article");
   for (const row of rows) fireEvent.click(within(row).getByText("Reprocess text"));
+  expect(within(rows[0]).getByRole("option", { name: "Japanese" })).toHaveProperty("value", "ja");
   fireEvent.change(within(rows[0]).getByRole("combobox", { name: "Translation target" }), { target: { value: "ja" } });
   expect(within(rows[1]).getByRole("combobox", { name: "Translation target" })).toHaveProperty("value", "en");
   fireEvent.click(within(rows[0]).getByRole("button", { name: "Translate to…" }));
   await waitFor(() => expect(reprocessHistoryText).toHaveBeenCalledWith(1, { kind: "translate", target: "ja" }));
+});
+
+test("Home shows the recording status once while other pages keep the header status", async () => {
+  render(<App />);
+  await screen.findByRole("heading", { name: "Latest result" });
+  expect(document.querySelector(".status-pill")).toBeNull();
+  await navigate("History");
+  expect(document.querySelector(".status-pill")).not.toBeNull();
+});
+
+test("Setup offers a return from Models until the user navigates elsewhere", async () => {
+  render(<App />);
+  await navigate("Setup");
+  fireEvent.click(screen.getByRole("button", { name: "Configure model" }));
+  fireEvent.click(screen.getByRole("button", { name: /Back to setup/ }));
+  expect(screen.getByRole("button", { name: "Finish setup" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Configure model" }));
+  fireEvent.click(screen.getByRole("button", { name: "General" }));
+  fireEvent.click(screen.getByRole("button", { name: "Models" }));
+  expect(screen.queryByRole("button", { name: /Back to setup/ })).toBeNull();
 });
 
 test("model configuration and unsaved API key drafts survive settings category changes", async () => {
@@ -569,7 +590,7 @@ test("model configuration waits for preceding settings saves before loading", as
   vi.mocked(updateSettings).mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
   await openSettings();
   fireEvent.click(screen.getByRole("button", { name: "Input settings" }));
-  fireEvent.click(screen.getByRole("button", { name: "Interaction sounds" }));
+  fireEvent.click(screen.getByRole("switch", { name: "Interaction sounds" }));
   await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
   await navigate("Models");
   fireEvent.change(screen.getByRole("combobox", { name: "ASR backend" }), { target: { value: "builtin:vibevoice" } });
@@ -590,7 +611,7 @@ test("custom model creation waits for queued settings and preserves their values
   vi.mocked(updateSettings).mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
   await openSettings();
   fireEvent.click(screen.getByRole("button", { name: "Input settings" }));
-  fireEvent.click(screen.getByRole("button", { name: "Interaction sounds" }));
+  fireEvent.click(screen.getByRole("switch", { name: "Interaction sounds" }));
   await waitFor(() => expect(updateSettings).toHaveBeenCalledTimes(1));
   await navigate("Models");
   fireEvent.change(screen.getByRole("combobox", { name: "ASR backend" }), { target: { value: "__additional_model__" } });

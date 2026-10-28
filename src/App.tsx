@@ -52,7 +52,7 @@ import type {
   Settings,
   SettingsSnapshot,
 } from "./types";
-import { ModelProgressBar } from "./components/ui";
+import { IconButton, ModelProgressBar } from "./components/ui";
 import { DashboardPage } from "./pages/DashboardPage";
 import { SetupPage } from "./pages/SetupPage";
 import { ApiKeySettings } from "./components/ApiKeySettings";
@@ -222,9 +222,12 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const settingsArea = !primaryPages.some(item => item.id === page);
   const pageLabel = settingsPages.find(item => item.id === page && (!item.section || item.section === settingsSection))?.label
     ?? pages.find(item => item.id === page)?.label ?? "Home";
+  // Set when Setup sends the user to Models, so they can come back to it.
+  const [returnToSetup, setReturnToSetup] = useState(false);
   useEffect(() => {
     document.documentElement.scrollTop = 0;
     document.body.scrollTop = 0;
+    if (page !== "models") setReturnToSetup(false);
   }, [page, settingsSection]);
   const [state, setState] = useState<AppState>({
     phase: "idle",
@@ -763,10 +766,10 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
           <div>
             <h1>{t(pageLabel)}</h1>
           </div>
-          <div className={`status-pill ${state.phase}`}>
+          {page !== "dashboard" && <div className={`status-pill ${state.phase}`}>
             <span />
             {statusLabel}
-          </div>
+          </div>}
         </header>
 
         {page === "dashboard" && (
@@ -798,7 +801,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             gpu={gpu}
             gpuChecking={gpuChecking}
             onSettingsChange={editSettingsLocally}
-            onConfigureModel={() => setPage("models")}
+            onConfigureModel={() => { setPage("models"); setReturnToSetup(true); }}
             onLoadModel={() => void prepareModel()}
             modelLoading={preparingModel}
             modelReady={model?.state === "ready" && model.quantization === settings.modelQuantization}
@@ -822,7 +825,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
         )}
 
         {settingsArea && (
-          <div className="settings-stack" hidden={page !== "models"}><ModelsPage
+          <div className="settings-stack" hidden={page !== "models"}>{returnToSetup && <button className="text-button back-link" onClick={() => setPage("setup")}><span aria-hidden="true">←</span> {t("Back to setup")}</button>}<ModelsPage
             onOpenLogs={() => void openLogs()}
             gpu={gpu}
             settings={settings}
@@ -925,20 +928,19 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             </button>
             {shownProgress && !progressNoticeHidden && <ModelProgressBar progress={shownProgress} />}
           </div>
-          <button type="button" className="secondary" onClick={() => void copyNotice()} aria-label={t("Copy notification")}>{t("Copy")}</button>
+          <IconButton icon="copy" label={t("Copy notification")} className="notice-action" onClick={() => void copyNotice()} />
           {noticeCopied && <span className="notice-copied">{t("Copied")}</span>}
-          <button
-            className="notice-dismiss"
+          <IconButton
+            icon="close"
+            label={t("Dismiss notification")}
+            className="notice-action"
             onClick={() => {
               if (preparingModel) setProgressNoticeHidden(true);
               if (notice) {
                 dismissNotice();
               } else setStartupHotkeyWarnings([]);
             }}
-            aria-label={t("Dismiss notification")}
-          >
-            ×
-          </button>
+          />
         </div>
       )}
     </div>

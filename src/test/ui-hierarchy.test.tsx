@@ -45,7 +45,7 @@ test("component controls receive help descriptions and retain validation descrip
     <SettingRow title="Sound" detail="Plays a local cue" control={<Toggle label="Sound" checked={false} onChange={vi.fn()} />} />
     <SettingRow title="Model" detail="Model identifier" control={<CommitField label="Model" value="old-model" validate={value => value ? null : "Enter a non-empty model ID without control characters (up to 512 bytes)."} onCommit={vi.fn()} />} />
   </I18nProvider>);
-  const sound = screen.getByRole("button", { name: "Sound" });
+  const sound = screen.getByRole("switch", { name: "Sound" });
   const model = screen.getByRole("textbox", { name: "Model" });
   expect(document.getElementById(sound.getAttribute("aria-describedby")!)?.textContent).toBe("Plays a local cue");
   expect(document.getElementById(model.getAttribute("aria-describedby")!)?.textContent).toBe("Model identifier");
@@ -119,4 +119,10 @@ test.each([false, true])("leaving input settings stops a microphone test, includ
   if (pending) await act(async () => started());
   await waitFor(() => expect(stopMicrophoneTest).toHaveBeenCalled());
   expect(screen.queryByRole("button", { name: "Stop test" })).toBeNull();
+});
+
+test("toggles are switches and cloud consent names use provider display names", () => {
+  render(<I18nProvider language="en"><PrivacyPage settings={{ ...defaultSettings, cloudConsents: ["openai"] }} settingsLoaded onSave={vi.fn()} /></I18nProvider>);
+  expect(screen.getByRole("switch", { name: "OpenAI: Cloud provider consent" }).getAttribute("aria-checked")).toBe("true");
+  expect(screen.getByRole("switch", { name: "Gemini: Cloud provider consent" }).getAttribute("aria-checked")).toBe("false");
 });

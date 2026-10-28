@@ -81,3 +81,16 @@ test("editing preserves an imported priority but rejects a newly out-of-range va
   expect(onUpdate).toHaveBeenCalledTimes(1);
   expect(screen.getByRole("alert")).toBeTruthy();
 });
+
+test("entry rows show only non-default metadata and candidates name each spelling once", () => {
+  render(<I18nProvider language="en"><DictionaryPage entries={[
+    { id: 1, reading: "manual", surface: "Manual", aliases: [], category: null, appScope: null, priority: 0, source: "manual", createdAt: "" },
+    { id: 2, reading: "learned", surface: "Learned", aliases: [], category: null, appScope: "app:code", priority: 5, source: "auto", createdAt: "" },
+  ]} candidates={[{ id: 3, originalSpan: "open ai", preferredSpan: "OpenAI", confidence: 1, historyId: null, createdAt: "" }]}
+    onAdd={async () => true} onUpdate={async () => true} onDelete={vi.fn()} onImport={async () => true} onConfirmCandidate={vi.fn()} onRejectCandidate={vi.fn()} /></I18nProvider>);
+  const [manual, learned] = ["Manual", "Learned"].map(name => screen.getByText(name).closest(".setting-row")!);
+  expect(manual.querySelectorAll(".entry-badge")).toHaveLength(0);
+  expect([...learned.querySelectorAll(".entry-badge")].map(badge => badge.textContent)).toEqual(["Auto-added", "priority 5", "scope: app:code"]);
+  expect(screen.getAllByText("OpenAI")).toHaveLength(1);
+  expect(screen.getByText("open ai").closest(".candidate-spans")?.textContent).toBe("open ai → OpenAI");
+});

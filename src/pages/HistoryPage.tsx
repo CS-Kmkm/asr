@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Empty, HelpHint, IconButton } from "../components/ui";
 import { HistoryRetentionSelect } from "../components/HistoryRetentionSelect";
-import type { HistoryAudioPayload, HistoryFilter, HistoryItem, HistoryTextAction, Settings } from "../types";
+import { translationLanguageRegistry, type HistoryAudioPayload, type HistoryFilter, type HistoryItem, type HistoryTextAction, type Settings } from "../types";
 import { insertionDetailLabels, insertionOutcomeLabels, useI18n } from "../i18n";
 
 const filters = [
@@ -100,7 +100,7 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, query =
       </div>
       <details className="history-management"><summary>{t("Manage history")}</summary><div className="management-content"><HistoryRetentionSelect value={settings.historyRetention} disabled={!settingsLoaded} onChange={(historyRetention) => onSave({ historyRetention })} />
       <IconButton icon="trash" label={t("Delete all")} className="danger-button" onClick={() => { if (window.confirm(t("Delete all history and suggested spellings?"))) onDeleteAll(); }} /></div></details>
-      {retryActive && <button onClick={onCancelRetry}>{t("Cancel")}</button>}
+      {retryActive && <button className="secondary" onClick={onCancelRetry}>{t("Cancel")}</button>}
     </div>
 
     {reprocessedText !== undefined && <section className="history-item" aria-label={t("Reprocessed result")}>
@@ -115,11 +115,11 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, query =
     {loading && <p role="status">{t("Loading...")}</p>}
     {failed && <p role="alert">{t("History could not be loaded.")} {onSearch && <IconButton icon="refresh" label={t("Reload history")} onClick={() => onSearch(query)} />}</p>}
     {history.length === 0 && (loading || failed) ? null
-      : history.length === 0 && query ? <Empty title={t("No matching history")} />
-      : settings.historyRetention === "never" && history.length === 0 ? <Empty title={t("History is disabled")} detail={settings.keepFailedTakes
+      : history.length === 0 && query ? <Empty icon="search" title={t("No matching history")} />
+      : settings.historyRetention === "never" && history.length === 0 ? <Empty icon="history" title={t("History is disabled")} detail={settings.keepFailedTakes
       ? t("New transcripts are not saved. A failed recording (and, for Edit, the selected text) is kept for 24 hours so you can retry it.")
       : t("New transcripts will not be written to SQLite.")} />
-      : history.length === 0 ? <Empty title={t("No dictations yet")} />
+      : history.length === 0 ? <Empty icon="microphone" title={t("No dictations yet")} />
       : <>{settings.historyRetention === "never" && <p className="muted">{t("History is off. Failed recordings (and, for Edit, the selected text) are kept here for 24 hours so you can retry them.")}</p>}
       <div className="history-list">{history.map(item => {
           const context = `${new Date(item.createdAt).toLocaleString()} · ${(item.processedText || item.transcriptText || item.sourceText || item.instructionText || "").slice(0, 80)}`;
@@ -146,7 +146,7 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, query =
           </div>
           {onReprocess && <HistoryReprocessing settings={settings} settingsLoaded={settingsLoaded} item={item} busy={reprocessing} onReprocess={onReprocess} />}
         </article>; })}</div></>}
-    {hasMore && onLoadMore && <button disabled={loading} onClick={onLoadMore}>{t("Load more")}</button>}
+    {hasMore && onLoadMore && <button className="secondary load-more" disabled={loading} onClick={onLoadMore}>{t("Load more")}</button>}
   </section>;
 }
 
@@ -174,7 +174,10 @@ function HistoryReprocessing({ settings, settingsLoaded, item, busy, onReprocess
       </select></label>
       <button disabled={disabled} onClick={() => onReprocess(item.id, { kind: "correct", profile: effectiveProfile || null })}>{t("Re-correct")}</button></div>
       <div className="reprocess-action"><label>{t("Translation target")} <select value={effectiveTarget} disabled={busy} onChange={event => setTarget(event.target.value)}>
-        {settings.translationTargetLanguages.map(language => <option key={language} value={language}>{language}</option>)}
+        {settings.translationTargetLanguages.map(language => {
+          const known = translationLanguageRegistry.find(({ code }) => code === language);
+          return <option key={language} value={language}>{known ? t(known.label) : language}</option>;
+        })}
       </select></label>
       <button disabled={disabled} onClick={() => onReprocess(item.id, { kind: "translate", target: effectiveTarget })}>{t("Translate to…")}</button></div>
       <HelpHint label={t("Reprocess text")}>{t("Reprocessing uses the raw transcript and does not insert text.")}</HelpHint>

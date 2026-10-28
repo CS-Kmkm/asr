@@ -58,9 +58,9 @@ export function PrivacyPage({
       />
       <h2>{t("Cloud provider consent")}</h2>
       <p className="compact-note">{t("Cloud modes send transcripts or selections, even with correction off.")}</p>
-      {(["openai", "gemini"] as const).map((provider) => (
-        <SettingRow key={provider} title={provider === "openai" ? "OpenAI" : "Gemini"}
-          control={<Toggle label={`${provider} ${t("Cloud provider consent")}`} checked={consents.includes(provider)} onChange={(allowed) => changeConsent(provider, allowed)} />} />
+      {([["openai", "OpenAI"], ["gemini", "Gemini"]] as const).map(([provider, name]) => (
+        <SettingRow key={provider} title={name}
+          control={<Toggle label={`${name}: ${t("Cloud provider consent")}`} checked={consents.includes(provider)} onChange={(allowed) => changeConsent(provider, allowed)} />} />
       ))}
       {settings.asrBackend === "openai-compatible" && <SettingRow
         title={t("Cloud speech provider")}

@@ -303,9 +303,8 @@ p { color: var(--text-muted); line-height: 1.55; }
 .model-progress-value.indeterminate { width: 35%; animation: model-progress-slide 1.2s ease-in-out infinite; }
 .model-progress-label { flex: 0 0 auto; color: var(--accent-strong); font-variant-numeric: tabular-nums; }
 .notice-copied { flex: 0 0 auto; color: var(--accent-strong); font-size: 12px; font-weight: 700; }
-.notice-dismiss { cursor: pointer; }
-.notice-dismiss { flex: 0 0 auto; width: 26px; height: 26px; padding: 0; border-color: transparent; background: transparent; border-radius: 6px; font-size: 20px; line-height: 1; }
-.notice-dismiss:hover { background: rgba(23, 32, 51, .08); }
+.notice .notice-action { width: 30px; height: 30px; border-color: transparent; background: transparent; color: inherit; border-radius: 6px; }
+.notice .notice-action.icon-button:not(:disabled):hover { background: rgba(23, 32, 51, .08); }
 .progress-ring { flex: 0 0 auto; width: 18px; height: 18px; border: 2px solid #cbd5e6; border-top-color: var(--accent); border-radius: 50%; animation: progress-spin .8s linear infinite; }
 button:focus-visible, .history-text:focus-visible { outline: 3px solid rgba(49, 95, 206, .45); outline-offset: 2px; }
 button:disabled { cursor: wait; color: var(--text-subtle); background: var(--surface-muted); border-color: var(--border); opacity: .75; }
@@ -357,7 +356,7 @@ textarea { width: min(420px, 42vw); resize: vertical; line-height: 1.45; }
 .dictionary-form .setting-row { padding: 12px 0; }
 .empty { text-align: center; padding: 58px 20px; border: 0; margin-top: 18px; }
 .compact-page-panel .empty { padding: 36px 20px; }
-.empty-icon { color: var(--accent); font-size: 24px; letter-spacing: 6px; margin-bottom: 12px; }
+.empty-icon { display: inline-grid; place-items: center; width: 44px; height: 44px; margin-bottom: 12px; border-radius: 50%; color: var(--accent); background: var(--accent-soft); }
 .history-list { display: grid; margin-top: 10px; }
 .history-item { position: relative; min-width: 0; padding: 27px 4px 15px; border-bottom: 1px solid var(--border); }
 .history-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; color: var(--text-muted); font-size: 12px; line-height: 1.5; }
@@ -565,9 +564,22 @@ details[open] > summary { color: var(--text); }
 .model-load-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
 .model-load-actions > div { flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; }
 .model-load-actions p { margin: 4px 0 0; }
-.profile-list > .setting-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin: 16px 0; padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-raised); }
+.profile-list > .setting-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; align-items: end; gap: 10px; margin: 16px 0; padding: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-raised); }
 .profile-list > .setting-row > :last-child:not(:first-child) { max-width: 100%; }
 .profile-list input, .profile-list select { min-width: 0; width: 100%; }
+.profile-field { display: grid; gap: 4px; min-width: 0; }
+.profile-field > span { color: var(--text-muted); font-size: 12px; }
+.profile-field.wide { grid-column: 1 / 3; }
+/* Placed beside the first row but kept last in DOM order, after the fields it removes. */
+.profile-list .profile-remove { grid-column: 3; grid-row: 1; }
+.dictionary-entry { min-width: 0; }
+.dictionary-entry-title { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.dictionary-entry p { margin: 4px 0 0; overflow-wrap: anywhere; }
+.entry-badge { padding: 1px 7px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-muted); font-size: 11px; font-weight: 600; }
+.setting-row .candidate-spans { margin: 0; overflow-wrap: anywhere; color: var(--text-muted); }
+.candidate-spans strong { color: var(--text); }
+.back-link { justify-self: start; }
+.panel > .load-more { display: block; margin: 16px auto 0; }
 .shortcut-field { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
 .shortcut-field input { flex: 1; min-width: 100px; }
 @media (max-width: 1050px) {

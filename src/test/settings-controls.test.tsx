@@ -16,8 +16,8 @@ afterEach(() => vi.useRealTimers());
 test("hold to talk is off by default and each mode saves its own choice", () => {
   const save = vi.fn();
   render(<I18nProvider language="en"><SettingsPage settings={defaultSettings} onSave={save} devices={[]} recording={false} /></I18nProvider>);
-  const dictate = screen.getByRole("button", { name: "Dictation shortcuts: Hold to talk" });
-  expect(dictate.getAttribute("aria-pressed")).toBe("false");
+  const dictate = screen.getByRole("switch", { name: "Dictation shortcuts: Hold to talk" });
+  expect(dictate.getAttribute("aria-checked")).toBe("false");
   fireEvent.click(dictate);
   expect(save).toHaveBeenCalledWith({ holdToTalk: { dictate: true, translate: false, ask: false, edit: false } });
 });
@@ -145,7 +145,7 @@ test("missing microphone remains selectable and settings controls have accessibl
   expect(screen.getByRole("option", { name: "Unavailable device" })).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Refresh microphones" }));
   expect(refresh).toHaveBeenCalledOnce();
-  expect(screen.getByRole("button", { name: "Automatic gain" })).toBeTruthy();
+  expect(screen.getByRole("switch", { name: "Automatic gain" })).toBeTruthy();
   expect(screen.getByRole("combobox", { name: "Language" })).toBeTruthy();
   expect(document.documentElement.lang).toBe("en");
 });
@@ -194,13 +194,27 @@ test("grouped selects and profile guidance have distinct accessible names", () =
   expect(screen.getByRole("textbox", { name: "Global profile guidance" })).toBeTruthy();
 });
 
+test("scoped profile fields show captions matching their names with Remove last in keyboard order", () => {
+  const save = vi.fn();
+  const settings = { ...defaultSettings, personalizationEnabled: true, scopedStyleProfiles: [{ scope: "app:code", profile: { formality: "casual" as const, detail: "concise" as const, guidance: "" } }] };
+  render(<I18nProvider language="en"><SettingsPage section="writing" settings={settings} onSave={save} devices={[]} recording={false} /></I18nProvider>);
+  const scope = screen.getByRole("textbox", { name: "Applies to 1" });
+  const row = scope.closest(".setting-row")!;
+  expect([...row.querySelectorAll(".profile-field > span")].map(caption => caption.textContent)).toEqual(["Applies to", "Preset", "Formality", "Level of detail", "Guidance"]);
+  expect(screen.getByRole("combobox", { name: "Level of detail 1" })).toBeTruthy();
+  const focusable = [...row.querySelectorAll("input, select, button")];
+  expect(focusable.at(-1)).toBe(screen.getByRole("button", { name: "Remove: app:code" }));
+  fireEvent.click(focusable.at(-1)!);
+  expect(save).toHaveBeenCalledExactlyOnceWith({ scopedStyleProfiles: [] });
+});
+
 test("disabled personalization collapses its editor while preserving the guidance draft", () => {
   const save = vi.fn();
   const settings = { ...defaultSettings, globalStyleProfile: { formality: "formal" as const, detail: "concise" as const, guidance: "Saved" } };
   const view = (enabled: boolean) => <I18nProvider language="en"><SettingsPage section="writing" settings={{ ...settings, personalizationEnabled: enabled }} onSave={save} devices={[]} recording={false} /></I18nProvider>;
   const app = render(view(false));
   expect(screen.queryByRole("combobox", { name: "Global style preset" })).toBeNull();
-  fireEvent.click(screen.getByRole("button", { name: "Personalization" }));
+  fireEvent.click(screen.getByRole("switch", { name: "Personalization" }));
   expect(save).toHaveBeenCalledExactlyOnceWith({ personalizationEnabled: true });
   app.rerender(view(true));
   fireEvent.change(screen.getByRole("textbox", { name: "Global profile guidance" }), { target: { value: "Draft" } });

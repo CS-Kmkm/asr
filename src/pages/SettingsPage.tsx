@@ -8,14 +8,11 @@ import { RecentAppPicker } from "../components/RecentAppPicker";
 import { stylePresets, profileCategories } from "../stylePresets";
 import { SettingsRepairBanner } from "../components/SettingsRepairBanner";
 import type { AudioDevice, AudioLevel, ScopedStyleProfile, Settings, ShortcutMode, StyleProfile } from "../types";
-import { speechLocaleRegistry, uiLocaleRegistry } from "../types";
+import { speechLocaleRegistry, translationLanguageRegistry, uiLocaleRegistry } from "../types";
 import { getShortcutWarning, startMicrophoneTest, stopMicrophoneTest } from "../api";
 import { translateAppMessage, useI18n } from "../i18n";
 
-const translationLanguages = [
-  ["en", "English"], ["ja", "Japanese"], ["zh", "Chinese"], ["es", "Spanish"],
-  ["fr", "French"], ["pt", "Portuguese"], ["de", "German"], ["ko", "Korean"],
-] as const;
+const translationLanguages = translationLanguageRegistry.map(({ code, label }) => [code, label] as const);
 
 const shortcutModes: Array<{ mode: ShortcutMode; label: "Dictation shortcuts" | "Voice Translate shortcuts" | "Ask Anything shortcuts" | "Speak to edit shortcuts" }> = [
   { mode: "dictate", label: "Dictation shortcuts" },
@@ -513,18 +510,28 @@ function PersonalizationProfiles({
         {profileDraftIsInvalid && <p role="alert">{t("Profile scopes must be valid and unique before changes are saved.")}</p>}
         {profiles.map((item, index) => (
           <div className="setting-row" key={index}>
-            <select aria-label={`${t("Scoped style preset")} ${index + 1}`} value="" onChange={(event) => {
-              const preset = stylePresets.find((preset) => preset.id === event.target.value);
-              if (preset) onSaveProfiles(profiles.map((entry, current) => current === index ? { ...entry, profile: { ...preset.profile } } : entry));
-            }}>
-              <option value="">{t("Apply a preset")}</option>
-              {stylePresets.map((preset) => <option key={preset.id} value={preset.id}>{t(preset.label)}</option>)}
-            </select>
-            <input aria-label={`${t("Profile scope")} ${index + 1}`} value={item.scope} maxLength={80} placeholder={t("app:code or category:development")} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, scope: e.target.value }; onEditProfiles(next); }} onBlur={onCommitProfiles} onKeyDown={commitOnEnter} />
-            <select aria-label={`${t("Profile formality")} ${index + 1}`} value={item.profile.formality} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, formality: e.target.value as StyleProfile["formality"] } }; onSaveProfiles(next); }}><option value="formal">{t("Formal")}</option><option value="casual">{t("Casual")}</option></select>
-            <select aria-label={`${t("Profile detail")} ${index + 1}`} value={item.profile.detail} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, detail: e.target.value as StyleProfile["detail"] } }; onSaveProfiles(next); }}><option value="concise">{t("Concise")}</option><option value="detailed">{t("Detailed")}</option></select>
-            <input aria-label={`${t("Optional guidance")} ${index + 1}`} maxLength={300} placeholder={t("Optional guidance")} value={item.profile.guidance ?? ""} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, guidance: e.target.value } }; onEditProfiles(next); }} onBlur={onCommitProfiles} onKeyDown={commitOnEnter} />
-            <IconButton icon="trash" label={t("Remove")} onClick={() => onSaveProfiles(profiles.filter((_, i) => i !== index))} />
+            <label className="profile-field"><span>{t("Applies to")}</span>
+              <input aria-label={`${t("Applies to")} ${index + 1}`} value={item.scope} maxLength={80} placeholder={t("app:code or category:development")} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, scope: e.target.value }; onEditProfiles(next); }} onBlur={onCommitProfiles} onKeyDown={commitOnEnter} />
+            </label>
+            <label className="profile-field"><span>{t("Preset")}</span>
+              <select aria-label={`${t("Scoped style preset")} ${index + 1}`} value="" onChange={(event) => {
+                const preset = stylePresets.find((preset) => preset.id === event.target.value);
+                if (preset) onSaveProfiles(profiles.map((entry, current) => current === index ? { ...entry, profile: { ...preset.profile } } : entry));
+              }}>
+                <option value="">{t("Apply a preset")}</option>
+                {stylePresets.map((preset) => <option key={preset.id} value={preset.id}>{t(preset.label)}</option>)}
+              </select>
+            </label>
+            <label className="profile-field"><span>{t("Formality")}</span>
+              <select aria-label={`${t("Profile formality")} ${index + 1}`} value={item.profile.formality} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, formality: e.target.value as StyleProfile["formality"] } }; onSaveProfiles(next); }}><option value="formal">{t("Formal")}</option><option value="casual">{t("Casual")}</option></select>
+            </label>
+            <label className="profile-field"><span>{t("Level of detail")}</span>
+              <select aria-label={`${t("Level of detail")} ${index + 1}`} value={item.profile.detail} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, detail: e.target.value as StyleProfile["detail"] } }; onSaveProfiles(next); }}><option value="concise">{t("Concise")}</option><option value="detailed">{t("Detailed")}</option></select>
+            </label>
+            <label className="profile-field wide"><span>{t("Guidance")}</span>
+              <input aria-label={`${t("Optional guidance")} ${index + 1}`} maxLength={300} placeholder={t("Optional guidance")} value={item.profile.guidance ?? ""} onChange={(e) => { const next = [...profiles]; next[index] = { ...item, profile: { ...item.profile, guidance: e.target.value } }; onEditProfiles(next); }} onBlur={onCommitProfiles} onKeyDown={commitOnEnter} />
+            </label>
+            <IconButton icon="trash" className="profile-remove" label={t("Remove")} context={item.scope || String(index + 1)} onClick={() => onSaveProfiles(profiles.filter((_, i) => i !== index))} />
           </div>
         ))}
         <IconButton icon="add" label={t("Add scoped profile")} className="primary" onClick={() => onSaveProfiles([...profiles, { scope: "", profile: { formality: "formal", detail: "concise", guidance: "" } }])} />

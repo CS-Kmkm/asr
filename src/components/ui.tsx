@@ -204,8 +204,9 @@ export function Toggle({
       type="button"
       id={id}
       className={`toggle ${checked ? "on" : ""}`}
+      role="switch"
       onClick={() => onChange(!checked)}
-      aria-pressed={checked}
+      aria-checked={checked}
       aria-label={label}
       aria-describedby={describedBy}
     >
@@ -214,10 +215,10 @@ export function Toggle({
   );
 }
 
-export function Empty({ title, detail }: { title: string; detail?: string }) {
+export function Empty({ title, detail, icon = "all" }: { title: string; detail?: string; icon?: IconName }) {
   return (
     <div className="empty">
-      <div className="empty-icon">•••</div>
+      <div className="empty-icon" aria-hidden="true"><Icon name={icon} /></div>
       <h3>{title}</h3>
       {detail && <p>{detail}</p>}
     </div>
