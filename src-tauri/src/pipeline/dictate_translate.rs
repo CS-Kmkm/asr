@@ -88,8 +88,12 @@ async fn finish_owned(
     // stage; it does not isolate connection setup or server queueing.
     let mut first_output_ms = None;
     let _ = app.emit("app-state", state.publish_result(transcript.text.clone()));
-    // Full-recording recognition reconciles the last live hypothesis before AI correction.
-    draft.monitor.wait_for_shortcut_release().await;
+    // Full-recording recognition reconciles the last live hypothesis before AI
+    // correction. Only a live draft edits the target here; a deferred final
+    // paste waits for released keys while settling, so AI need not wait.
+    if draft.edits_target_live() {
+        draft.monitor.wait_for_shortcut_release().await;
+    }
     if services.lifecycle.is_cancelled(operation_id) {
         emit_state(app, state, AppPhase::Idle, cancel_message);
         return Err(cancel_error.into());

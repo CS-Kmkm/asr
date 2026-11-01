@@ -177,6 +177,13 @@ impl LiveDraft {
         }
     }
 
+    /// Whether `update` can still edit the target. Only then must a caller
+    /// let a held recording shortcut go first; a deferred final paste waits
+    /// for released keys while settling and is guarded against them.
+    pub(crate) fn edits_target_live(&self) -> bool {
+        !self.defer_insertion || self.session.is_some()
+    }
+
     /// Shows a new live hypothesis. An empty one is ignored; withdrawing text
     /// already shown is `retract`'s job.
     pub(crate) fn update(&mut self, text: &str) -> Result<(), injection::InjectionError> {
