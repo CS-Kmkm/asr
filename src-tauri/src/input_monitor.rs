@@ -295,27 +295,38 @@ impl InputMonitor {
             && self.sequence.load(Ordering::Acquire) == checkpoint
     }
 
+    /// Stops observing at once; the helper process exits in the background.
+    ///
+    /// Invariant: everything a later `start()` relies on changes here,
+    /// synchronously: the generation advances (so the old reader neither
+    /// records events nor reports its EOF), the child leaves the slot, and the
+    /// monitor is unavailable. The background thread owns only the detached
+    /// child and touches no shared state, so it can never mark a newer helper
+    /// unavailable.
     pub(crate) fn shutdown(&self) {
         #[cfg(all(target_os = "windows", not(test)))]
         {
             // Invalidate the reader before stopping its child so a delayed EOF
             // cannot mark a later helper process unavailable.
             self.generation.fetch_add(1, Ordering::AcqRel);
-            if let Ok(mut slot) = self.child.lock() {
-                if let Some(mut running) = slot.take() {
+            let running = self.child.lock().ok().and_then(|mut slot| slot.take());
+            self.available.store(false, Ordering::Release);
+            if let Some(mut running) = running {
+                // Waiting for the helper to exit would delay completion of
+                // the dictation that dropped this monitor.
+                std::thread::spawn(move || {
                     let _ = running.stdin.write_all(b"shutdown\n");
                     let _ = running.stdin.flush();
                     let deadline = Instant::now() + Duration::from_millis(500);
                     while Instant::now() < deadline {
                         if running.child.try_wait().ok().flatten().is_some() {
-                            self.available.store(false, Ordering::Release);
                             return;
                         }
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     let _ = running.child.kill();
                     let _ = running.child.wait();
-                }
+                });
             }
         }
         self.available.store(false, Ordering::Release);
