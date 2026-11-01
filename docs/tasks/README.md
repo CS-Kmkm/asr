@@ -5,6 +5,7 @@
 
 | 分類 | 契約 | 扱い |
 |---|---|---|
+| completed | [ASR高速化の実装調査](asr-performance-audit.md) | Claude `6043cb09…` の途中成果を回収し現行コードを再確認。[調査報告](../asr-performance-audit.md)の独立レビュー・指摘修正完了。高速化実装・実機計測は別工程 |
 | completed | [残存ブランチの main 統合](remaining-branch-integration.md) | 自動判定を初期無効で移植。自動テスト・Windowsビルド・独立レビュー完了。GPU実推論と実マイク挿入は未確認 |
 | active | [UI polish pass](ui-polish-pass.md) | Remaining inconsistencies fixed; 160 tests/build/review passed; native visual verification pending |
 | active | [UI review fixes](ui-review-fixes.md) | Four findings fixed; 155 tests/build/review passed; native keyboard/layout verification pending |
