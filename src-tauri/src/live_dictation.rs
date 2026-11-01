@@ -101,8 +101,17 @@ pub(crate) struct LiveTask {
 }
 
 impl LiveTask {
-    pub(crate) async fn finish(self) -> Result<LiveDraft, String> {
+    /// Asks the live loop to stop without waiting for it. The loop checks this
+    /// before each snapshot and decode, so a stop signalled before audio
+    /// finalization starts no new live decode; one already running drains.
+    pub(crate) fn signal_stop(&self) {
         self.stop.send_replace(true);
+    }
+
+    /// Stops the live loop if it is still running and joins its owner, which
+    /// returns the draft for finalization.
+    pub(crate) async fn finish(self) -> Result<LiveDraft, String> {
+        self.signal_stop();
         self.task
             .await
             .map_err(|_| "live dictation task failed".to_string())
@@ -1492,6 +1501,69 @@ mod tests {
                 .unwrap();
             assert_eq!(result, Ok(()));
             assert_eq!((updates, calls), (1, 1));
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_signalled_before_audio_finalization_starts_no_new_decode() {
+        for signalled in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let audio = Arc::new(voiced_capture(directory.path()));
+            let recognizer = Arc::new(ScriptedRecognizer {
+                calls: AtomicUsize::new(0),
+                script: vec![Some("途中")],
+            });
+            let (_cancel, cancel) = watch::channel(false);
+            let (stop, stopped) = watch::channel(false);
+            // Stop holds the capture while it finalizes the recording.
+            let finalizing = audio.lock().await;
+            let task = tokio::spawn({
+                let audio = Arc::clone(&audio);
+                let recognizer = Arc::clone(&recognizer);
+                async move {
+                    let result = run(
+                        &audio,
+                        recognizer.as_ref(),
+                        None,
+                        None,
+                        cancel,
+                        stopped,
+                        Duration::from_millis(1),
+                        |_| {},
+                    )
+                    .await;
+                    assert_eq!(result, Ok(()));
+                    deferred_test_draft()
+                }
+            });
+            let task = LiveTask { stop, task };
+            // Let the loop wait for the capture held by the stop path.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            if signalled {
+                task.signal_stop();
+            }
+            drop(finalizing);
+            if !signalled {
+                // Without the early signal the waiting loop decodes again.
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while recognizer.calls.load(Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            // Joining still returns the draft for finalization.
+            tokio::time::timeout(Duration::from_secs(2), task.finish())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                recognizer.calls.load(Ordering::SeqCst) == 0,
+                signalled,
+                "signalled: {signalled}"
+            );
             assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
         }
     }

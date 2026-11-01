@@ -518,7 +518,9 @@ Full usage and Phase 0 gate criteria are documented in
   finalization, live-task drain and model readiness/load. AI stage totals are
   sampled after the provider result and validation, before metric persistence.
   Additional timings are `audio_stop` (audio-lock wait, stream closure and WAV
-  creation), `live_drain` (live-task finish/join, even without in-flight inference),
+  creation), `live_drain` (live-task finish/join after audio finalization, even
+  without in-flight inference; the live task is told to stop before audio
+  finalization, so values are not comparable with records made before that change),
   `text_correction_first_output`/`voice_translation_first_output` (first nonempty
   provider callback of a completed request, within the AI total; a nonstreaming
   response calls back only with the completed text), `insertion_settle`

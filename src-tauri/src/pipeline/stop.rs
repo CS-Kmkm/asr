@@ -88,6 +88,11 @@ impl RecordingDriver for Desktop<'_> {
             &services.voice_translation_target,
         )
         .await?;
+        // Stop live recognition first so it starts no window decode while the
+        // capture is finalized. It is joined below, after the stop cue.
+        if let Some(task) = &live_task {
+            task.signal_stop();
+        }
         let audio_stop_started = Instant::now();
         let mut audio = services.audio.lock().await;
         let artifact_result = audio.stop().await;
