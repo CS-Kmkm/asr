@@ -511,6 +511,26 @@ Full usage and Phase 0 gate criteria are documented in
   deleted with the History retention window, and are removed by Delete all.
   Diagnostics groups new performance and outcome records by mode, category,
   event and provider; older records without context keep an unknown group.
+  The `dictation`/`voice_translate` and legacy `insertion` durations share a
+  stop-path span through output, diagnosis and input-monitor cleanup; they
+  exclude subsequent History/metric persistence and final cleanup. `insertion`
+  is an outcome record, not paste-only time. `asr` excludes preceding audio
+  finalization, live-task drain and model readiness/load. AI stage totals are
+  sampled after the provider result and validation, before metric persistence.
+  Additional timings are `audio_stop` (audio-lock wait, stream closure and WAV
+  creation), `live_drain` (live-task finish/join, even without in-flight inference),
+  `text_correction_first_output`/`voice_translation_first_output` (first nonempty
+  provider callback of a completed request, within the AI total; a nonstreaming
+  response calls back only with the completed text), `insertion_settle`
+  (quiet-input/target wait; absent when a failed translation is only copied),
+  and `insertion_paste` (the full commit operation, including safety checks,
+  clipboard, paste confirmation and restoration). First-output time does not
+  isolate connection setup or prove connection reuse.
+  These events do not cover every early failure or cancellation. `dictation`
+  success can include uncorrected fallback or failed insertion, whereas
+  `insertion` success requires confirmed paste. Timing-event success means an
+  observation was made, not that final delivery succeeded. Compare confirmed
+  pastes separately from unverified, clipboard-only, failed or cancelled takes.
 - New SQLite deletions overwrite freed record content using secure-delete.
   History deletions request a WAL checkpoint/truncation; an active external reader or
   database error can defer this until the next policy pass. Previously freed

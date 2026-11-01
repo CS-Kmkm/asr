@@ -42,6 +42,9 @@ struct Captured {
     artifact_cleanup: TempArtifact,
     started: Instant,
     disconnected: bool,
+    /// Stop-path stage timings, recorded once the take has a metric context.
+    audio_stop_ms: i64,
+    live_drain_ms: Option<i64>,
     translation_target: Option<String>,
     draft: Option<LiveDraft>,
     edit_session: Option<EditSession>,
@@ -85,8 +88,10 @@ impl RecordingDriver for Desktop<'_> {
             &services.voice_translation_target,
         )
         .await?;
+        let audio_stop_started = Instant::now();
         let mut audio = services.audio.lock().await;
         let artifact_result = audio.stop().await;
+        let audio_stop_ms = audio_stop_started.elapsed().as_millis() as i64;
         // `stop` closes the input stream. Do not re-arm it while transcription is
         // running: on Bluetooth headsets an open microphone selects the low-quality
         // HFP playback profile until the stream is released.
@@ -102,6 +107,9 @@ impl RecordingDriver for Desktop<'_> {
             .as_ref()
             .ok()
             .map(|artifact| TempArtifact::new(artifact.path.clone(), false));
+        // Stop waits for an in-flight live window before the final recognition.
+        let live_drain_started = Instant::now();
+        let live_drained = live_task.is_some();
         let draft = match live_task {
             Some(task) => Some(task.finish().await?),
             None if mode == PipelineMode::Edit
@@ -112,6 +120,7 @@ impl RecordingDriver for Desktop<'_> {
             }
             None => return Err("live dictation session is unavailable".into()),
         };
+        let live_drain_ms = live_drained.then(|| live_drain_started.elapsed().as_millis() as i64);
         let settings = storage.get_settings().map_err(command_error)?;
         let disconnected = microphone_disconnected(reason, &artifact_result);
         let artifact = artifact_result.map_err(|error| {
@@ -145,6 +154,8 @@ impl RecordingDriver for Desktop<'_> {
             artifact_cleanup,
             started,
             disconnected,
+            audio_stop_ms,
+            live_drain_ms,
             translation_target,
             draft,
             edit_session,
@@ -180,6 +191,8 @@ impl RecordingDriver for Desktop<'_> {
             artifact,
             mut artifact_cleanup,
             started,
+            audio_stop_ms,
+            live_drain_ms,
             translation_target,
             draft,
             edit_session,
@@ -203,6 +216,18 @@ impl RecordingDriver for Desktop<'_> {
             mode,
             crate::app_context::history_category(app_context.as_ref()),
         );
+        if !services.lifecycle.is_dictation_test(operation_id) {
+            let _ = metrics.add_metric("audio_stop", None, Some(audio_stop_ms), true, None);
+            if let Some(live_drain_ms) = live_drain_ms {
+                let _ = metrics.add_metric(
+                    "live_drain",
+                    Some(&settings.asr_backend),
+                    Some(live_drain_ms),
+                    true,
+                    None,
+                );
+            }
+        }
         let correction_cancel = cancel.clone();
         // Defense in depth: model changes are refused while a recording is
         // active, but if the model is not marked ready (for example its load
