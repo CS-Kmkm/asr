@@ -7,6 +7,7 @@ use crate::{
         SystemTextInjector, TargetWindow,
     },
     input_monitor::InputMonitor,
+    recording_overlay,
     services::Services,
     state::{AppState, PipelineMode, PipelinePhase},
     types::Settings,
@@ -429,6 +430,11 @@ pub(crate) fn start(
     preview_enabled: bool,
 ) -> LiveTask {
     draft.monitor.observe_cancellation(Some(cancel.clone()));
+    if preview_enabled {
+        // Called while recording starts, after its phase was published, so a
+        // later stop or cancel always ends the subtitle room again.
+        recording_overlay::enable_live_subtitles(&app);
+    }
     let (stop, stopped) = watch::channel(false);
     let task = spawn_recording_owner(async move {
         if !preview_enabled {
@@ -451,6 +457,8 @@ pub(crate) fn start(
                 }
                 let state = app.state::<AppState>();
                 let _ = app.emit("app-state", state.publish_result(live.text().to_owned()));
+                // A retraction updates the subtitle like a revision does.
+                recording_overlay::show_live_subtitle(&app, live.text());
                 let result = match live {
                     LiveText::Revise(text) => draft.update(text),
                     LiveText::Retract(committed) => draft.retract(committed),

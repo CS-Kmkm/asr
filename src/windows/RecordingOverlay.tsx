@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { cancelRecording, cycleVoiceTranslationTarget } from "../api";
 import { insertionDetailLabels, insertionOutcomeNotices, isAppMessage, translateAppMessage, useI18n, type MessageKey } from "../i18n";
-import type { AppState, AudioLevel } from "../types";
+import type { AppState, AudioLevel, LiveSubtitle } from "../types";
 
 const OVERLAY_WAVE_BAR_COUNT = 9;
 const OVERLAY_PREVIEW_CHARS = 140;
@@ -56,6 +56,9 @@ const translationLanguageKeys: Record<string, MessageKey> = {
   ko: "Korean",
 };
 
+// Live text stays up after stop only until the final recognition replaces it.
+const LIVE_TEXT_STAGES: readonly AppState["stage"][] = ["finishing_audio", "transcribing"];
+
 function compactOverlayPreview(text: string): string {
   const characters = Array.from(text.trim());
   return characters.length > OVERLAY_PREVIEW_CHARS
@@ -74,6 +77,9 @@ export function RecordingOverlay() {
   const [message, setMessage] = useState<string | null>(null);
   const [messageCode, setMessageCode] = useState<string | null>(null);
   const [preview, setPreview] = useState<CorrectionPreview | null>(null);
+  // `null` when this take has no live recognition; "" reserves the subtitle
+  // row until the first text arrives.
+  const [liveText, setLiveText] = useState<string | null>(null);
   const [voiceMode, setVoiceMode] = useState<VoiceModeEvent>({
     mode: "dictate",
     targetLanguage: null,
@@ -111,7 +117,17 @@ export function RecordingOverlay() {
       }),
       listen<AppState>("app-state", ({ payload }) => {
         const recordingStarted = payload.phase === "recording" && previousPhase.current !== "recording";
+        if (payload.phase !== previousPhase.current) {
+          // A hint belongs to the view that showed it, as the backend's
+          // widening does: a recording's hint never covers its processing.
+          window.clearTimeout(hintTimer.current);
+          setHint(null);
+        }
         previousPhase.current = payload.phase;
+        // A cancelled or finished take never shows its live text again.
+        const keepsLiveText = payload.phase === "recording"
+          || (payload.phase === "processing" && LIVE_TEXT_STAGES.includes(payload.stage));
+        if (recordingStarted || !keepsLiveText) setLiveText(null);
         setPhase(payload.phase);
         setStage(payload.stage);
         setMessage(payload.message);
@@ -129,7 +145,12 @@ export function RecordingOverlay() {
           setPreview(null);
         }
       }),
+      listen<LiveSubtitle>("live-subtitle", ({ payload }) => {
+        // Only the running recording publishes live text.
+        if (previousPhase.current === "recording") setLiveText(payload.text);
+      }),
       listen<CorrectionPreview>("correction-preview", ({ payload }) => {
+        setLiveText(null);
         setPreview((current) => {
           if (payload.stage !== "streaming") return payload;
           return {
@@ -197,9 +218,20 @@ export function RecordingOverlay() {
     </button>
   );
 
+  // Not announced: a screen reader would read every revision while speaking.
+  const subtitle = (text: string) => (
+    <span className="live-subtitle" aria-live="off">
+      <span>{compactOverlayPreview(text)}</span>
+    </span>
+  );
+
   if (phase === "recording") {
     return (
-      <div className="recording-overlay recording" role="status" aria-label={t("Recording in progress")}>
+      <div
+        className={`recording-overlay recording${liveText !== null ? " with-subtitle" : ""}`}
+        role="status"
+        aria-label={t("Recording in progress")}
+      >
         <span className="recording-live-dot" aria-hidden="true" />
         <span
           className={`recording-overlay-label${hint ? " overlay-hint" : ""}`}
@@ -237,6 +269,7 @@ export function RecordingOverlay() {
           </button>
         )}
         {cancelButton}
+        {liveText !== null && subtitle(liveText)}
       </div>
     );
   }
@@ -246,6 +279,8 @@ export function RecordingOverlay() {
   const compactPreview = compactOverlayPreview(preview?.text ?? "");
   // A start waiting for the model has not published its voice mode yet.
   const preparing = stage === "preparing_model";
+  // The last live text until the draft or correction preview replaces it.
+  const lastLiveText = !preview && !preparing && liveText ? liveText : null;
   const label = preparing
     ? t("Preparing speech model")
     : voiceMode.mode === "selected_translate"
@@ -275,11 +310,19 @@ export function RecordingOverlay() {
       <span className="processing-spinner" aria-hidden="true" />
       <div className="processing-copy">
         <span className="recording-overlay-label">{label}</span>
-        <span className={`correction-preview${compactPreview && !preparing ? "" : " pending"}`}>
-          {preparing
-            ? t("Starts when ready")
-            : compactPreview || translateAppMessage(language, message, messageCode) || t("Preparing text…")}
-        </span>
+        {hint ? (
+          // The final paste waits for the user (for example an open IME
+          // conversion), so say what to do instead of the text preview.
+          <span className="correction-preview overlay-hint" role="alert">
+            {translateAppMessage(language, hint)}
+          </span>
+        ) : lastLiveText ? subtitle(lastLiveText) : (
+          <span className={`correction-preview${compactPreview && !preparing ? "" : " pending"}`}>
+            {preparing
+              ? t("Starts when ready")
+              : compactPreview || translateAppMessage(language, message, messageCode) || t("Preparing text…")}
+          </span>
+        )}
       </div>
       {phase === "processing" && cancelButton}
     </div>
