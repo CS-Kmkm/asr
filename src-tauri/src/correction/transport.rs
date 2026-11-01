@@ -77,18 +77,19 @@ impl ProviderAccess {
     }
 }
 
-/// Best-effort connection warmup while the user speaks. The later request may
-/// reuse the connection if the endpoint keeps it open. The probe carries no
-/// credentials or text, and its response is ignored.
+/// Best-effort connection warmup while the recording is recognized. Starting
+/// at stop keeps the connection fresh for the request that follows. The later
+/// request may reuse the connection if the endpoint keeps it open. The probe
+/// carries no credentials or text, and its response is ignored.
 pub(crate) fn prewarm_connection(settings: &Settings, mode: PipelineMode) {
     let Some(endpoint) = prewarm_endpoint(settings, mode) else {
         return;
     };
-    let Ok(client) = ProviderAccess::Configured.client(false) else {
-        return;
-    };
     tauri::async_runtime::spawn(async move {
-        let _ = prewarm_with_client(&client, endpoint).await;
+        // The first use builds the shared client and its TLS configuration.
+        if let Ok(client) = ProviderAccess::Configured.client(false) {
+            let _ = prewarm_with_client(&client, endpoint).await;
+        }
     });
 }
 
@@ -101,12 +102,12 @@ async fn prewarm_with_client(
     client.head(endpoint).timeout(PREWARM_TIMEOUT).send().await
 }
 
-/// The provider endpoint to connect to ahead of a recording that will send
-/// text to a consented cloud provider. Local providers connect cheaply.
+/// The provider endpoint to connect to for a recording that will send text to
+/// a consented cloud provider. Automatic voice mode decides after recognition
+/// whether a Dictate take needs the provider, so it does not warm on its own.
+/// Local providers connect cheaply.
 fn prewarm_endpoint(settings: &Settings, mode: PipelineMode) -> Option<&'static str> {
-    let uses_provider = mode != PipelineMode::Dictate
-        || settings.text_correction_enabled
-        || settings.automatic_voice_mode;
+    let uses_provider = mode != PipelineMode::Dictate || settings.text_correction_enabled;
     if !uses_provider || crate::privacy::check_text(settings).is_err() {
         return None;
     }

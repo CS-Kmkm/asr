@@ -925,7 +925,6 @@ async fn start_owned_recording(
         .await
         .map_err(|_| "recording session task failed".to_owned())?
         .map_err(|error| error.user_message().to_owned())?;
-        correction::prewarm_connection(&settings, mode);
     }
     let mode_shortcuts =
         voice_mode_shortcuts(&settings, mode).ok_or("selected-text translation does not record")?;

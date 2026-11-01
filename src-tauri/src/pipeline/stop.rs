@@ -101,12 +101,20 @@ impl RecordingDriver for Desktop<'_> {
         // running: on Bluetooth headsets an open microphone selects the low-quality
         // HFP playback profile until the stream is released.
         drop(audio);
+        let stop_settings = storage.get_settings();
         play_stop_cue(
-            storage
-                .get_settings()
+            stop_settings
+                .as_ref()
                 .map(|settings| settings.interaction_sounds)
                 .unwrap_or(false),
         );
+        // Warm the AI provider connection while the live task drains and the
+        // recording is recognized.
+        if let Ok(settings) = &stop_settings {
+            if artifact_result.is_ok() && services.lifecycle.dictation_test_id().is_none() {
+                crate::correction::prewarm_connection(settings, mode);
+            }
+        }
         // Keep the full artifact owned even if joining live work or loading settings fails.
         let mut artifact_cleanup = artifact_result
             .as_ref()

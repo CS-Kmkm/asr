@@ -489,12 +489,15 @@ Full usage and Phase 0 gate criteria are documented in
   Privacy requires explicit consent per text provider and speech endpoint before
   a request can be sent. Changing the speech backend or endpoint removes old
   speech consents, so returning to a previous endpoint requires consent again.
-  When a recording may use a consented OpenAI or Gemini provider, the app
-  attempts to warm a connection during recording preparation (a HEAD request
-  without credentials, text, or audio). The request after recognition may reuse
-  that connection if the provider keeps it open; warming failures are ignored.
-  The probe can run even if recording preparation later fails or the recording
-  is cancelled. It does not warm a model or perform an AI inference.
+  When a stopped recording will use a consented OpenAI or Gemini provider
+  (Translate, Edit, Ask, or Dictate with AI correction on), the app attempts to
+  warm a connection while the audio is recognized (a HEAD request without
+  credentials, text, or audio). Automatic voice mode does not warm on its own,
+  because it decides after recognition whether the provider is needed. The
+  request after recognition may reuse that connection if the provider keeps it
+  open; warming failures are ignored. The probe can run even if recognition
+  later fails or the take is cancelled. It does not warm a model or perform an
+  AI inference.
 - Live transcription preview may decode the same audio repeatedly. It is on by
   default for local backends (including VibeVoice) and off for OpenAI-compatible speech; enabling it
   with cloud speech causes multiple audio uploads. Privacy controls local and

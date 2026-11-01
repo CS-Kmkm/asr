@@ -493,12 +493,10 @@ fn prewarm_targets_only_a_consented_cloud_provider_that_the_mode_will_use() {
         None
     );
 
+    // Routing decides after recognition whether the provider is needed.
     dictate.text_correction_enabled = false;
     dictate.automatic_voice_mode = true;
-    assert_eq!(
-        prewarm_endpoint(&dictate, PipelineMode::Dictate),
-        Some(OPENAI_RESPONSES_URL)
-    );
+    assert_eq!(prewarm_endpoint(&dictate, PipelineMode::Dictate), None);
     for provider in ["openai", "gemini"] {
         for mode in [
             PipelineMode::Dictate,
