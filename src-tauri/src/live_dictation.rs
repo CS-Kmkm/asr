@@ -54,32 +54,45 @@ const SETTLE_TIMING: SettleTiming = SettleTiming {
     hint: Duration::from_secs(1),
 };
 
+/// The result of [`settled_checkpoint`].
+#[derive(Debug, PartialEq, Eq)]
+struct Settled {
+    checkpoint: Option<u64>,
+    /// Whether it slept at least once, as opposed to settling on the first check.
+    waited: bool,
+}
+
 /// Returns a checkpoint taken once input has been quiet for `timing.quiet`,
 /// preferring a moment when `ready` also holds. Quiet time counts from the
 /// last input the monitor observed, so input that ended before the wait adds
 /// no delay; a held shortcut or modifier is never quiet. At the limit, a
 /// quiet but unready target still yields a checkpoint so the outcome names
-/// the target as the reason. `None` means input never settled, the monitor
-/// stopped, or the operation was cancelled; the caller keeps its earlier
-/// checkpoint. Once a quiet target has stayed unready for `timing.hint`,
-/// `on_unready` runs once so the user can act instead of waiting silently.
+/// the target as the reason. No checkpoint means input never settled, the
+/// monitor stopped, or the operation was cancelled; the caller keeps its
+/// earlier checkpoint. Once a quiet target has stayed unready for
+/// `timing.hint`, `on_unready` runs once so the user can act instead of
+/// waiting silently.
 async fn settled_checkpoint(
     monitor: &InputMonitor,
     cancel: &watch::Receiver<bool>,
     timing: SettleTiming,
     ready: impl Fn() -> bool,
     on_unready: impl FnOnce(),
-) -> Option<u64> {
+) -> Settled {
     let started = Instant::now();
     let mut quiet_since = monitor.last_input();
     let quiet = |since: Option<Instant>| since.is_none_or(|at| at.elapsed() >= timing.quiet);
     let mut unready_since = None;
     let mut on_unready = Some(on_unready);
+    let mut waited = false;
+    let settled = |checkpoint, waited| Settled { checkpoint, waited };
     loop {
         if *cancel.borrow() {
-            return None;
+            return settled(None, waited);
         }
-        let mut current = monitor.checkpoint()?;
+        let Some(mut current) = monitor.checkpoint() else {
+            return settled(None, waited);
+        };
         // The monitor stamps input before publishing its sequence, so this
         // is at least as recent as any input `current` includes.
         quiet_since = quiet_since.max(monitor.last_input());
@@ -89,9 +102,11 @@ async fn settled_checkpoint(
         if quiet(quiet_since) {
             if ready() {
                 // Input during the readiness check would make this checkpoint stale.
-                let after = monitor.checkpoint()?;
+                let Some(after) = monitor.checkpoint() else {
+                    return settled(None, waited);
+                };
                 if after == current {
-                    return Some(current);
+                    return settled(Some(current), waited);
                 }
                 current = after;
                 quiet_since = quiet_since.max(monitor.last_input());
@@ -103,9 +118,10 @@ async fn settled_checkpoint(
             }
         }
         if started.elapsed() >= timing.limit {
-            return quiet(quiet_since).then_some(current);
+            return settled(quiet(quiet_since).then_some(current), waited);
         }
         tokio::time::sleep(timing.poll).await;
+        waited = true;
     }
 }
 
@@ -318,10 +334,11 @@ impl LiveDraft {
             on_unready,
         )
         .await;
-        if let Some(checkpoint) = settled {
+        if let Some(checkpoint) = settled.checkpoint {
             self.renew_checkpoint(checkpoint);
         }
-        true
+        // Input that was already quiet with a ready target needed no wait.
+        settled.waited
     }
 
     fn renew_checkpoint(&mut self, checkpoint: u64) {
@@ -852,8 +869,15 @@ mod tests {
         monitor.test_record_input_at(ago(Duration::from_secs(1)));
         let (_cancel, cancelled) = watch::channel(false);
         let started = Instant::now();
-        let checkpoint = settled_checkpoint(&monitor, &cancelled, FAST, || true, || {}).await;
-        assert_eq!(checkpoint, Some(1));
+        let settled = settled_checkpoint(&monitor, &cancelled, FAST, || true, || {}).await;
+        // Settling on the first check is not reported as a wait.
+        assert_eq!(
+            settled,
+            Settled {
+                checkpoint: Some(1),
+                waited: false
+            }
+        );
         assert!(started.elapsed() < FAST.quiet, "{:?}", started.elapsed());
     }
 
@@ -869,8 +893,14 @@ mod tests {
         monitor.test_record_input_at(input);
         let (_cancel, cancelled) = watch::channel(false);
         let started = Instant::now();
-        let checkpoint = settled_checkpoint(&monitor, &cancelled, timing, || true, || {}).await;
-        assert_eq!(checkpoint, Some(1));
+        let settled = settled_checkpoint(&monitor, &cancelled, timing, || true, || {}).await;
+        assert_eq!(
+            settled,
+            Settled {
+                checkpoint: Some(1),
+                waited: true
+            }
+        );
         // A full quiet window after the input, but not one after the start.
         assert!(input.elapsed() >= timing.quiet);
         assert!(started.elapsed() < timing.quiet, "{:?}", started.elapsed());
@@ -883,7 +913,9 @@ mod tests {
         monitor.test_set_async_modifier_pending(true);
         let (_cancel, cancelled) = watch::channel(false);
         assert_eq!(
-            settled_checkpoint(&monitor, &cancelled, FAST, || true, || {}).await,
+            settled_checkpoint(&monitor, &cancelled, FAST, || true, || {})
+                .await
+                .checkpoint,
             None
         );
     }
@@ -905,7 +937,8 @@ mod tests {
             || false,
             || reported.set(Some(started.elapsed())),
         )
-        .await;
+        .await
+        .checkpoint;
         // The safety outcome is unchanged: a quiet checkpoint at the limit.
         assert_eq!(checkpoint, Some(0));
         let reported = reported.get().expect("the wait was reported");
@@ -926,7 +959,8 @@ mod tests {
             || started.elapsed() >= Duration::from_millis(40),
             || reported.set(true),
         )
-        .await;
+        .await
+        .checkpoint;
         assert_eq!(checkpoint, Some(0));
         assert!(!reported.get());
     }
@@ -947,6 +981,7 @@ mod tests {
         let (_cancel, cancelled) = watch::channel(false);
         let checkpoint = settled_checkpoint(&draft.monitor, &cancelled, FAST, || true, || {})
             .await
+            .checkpoint
             .unwrap();
         draft.checkpoint = Some(checkpoint);
         assert!(draft.can_insert_final("final"));
@@ -972,7 +1007,9 @@ mod tests {
             }
         });
         let (_cancel, cancelled) = watch::channel(false);
-        let result = settled_checkpoint(&monitor, &cancelled, FAST, || true, || {}).await;
+        let result = settled_checkpoint(&monitor, &cancelled, FAST, || true, || {})
+            .await
+            .checkpoint;
         done.store(true, Ordering::Release);
         typing.await.unwrap();
         assert_eq!(result, None);
@@ -1051,7 +1088,9 @@ mod tests {
         monitor.test_record_input();
         let (_cancel, cancelled) = watch::channel(false);
         let started = Instant::now();
-        let checkpoint = settled_checkpoint(&monitor, &cancelled, FAST, || false, || {}).await;
+        let checkpoint = settled_checkpoint(&monitor, &cancelled, FAST, || false, || {})
+            .await
+            .checkpoint;
         assert_eq!(checkpoint, monitor.checkpoint());
         assert!(started.elapsed() >= FAST.limit);
     }
@@ -1062,13 +1101,17 @@ mod tests {
         let (cancel, cancelled) = watch::channel(false);
         cancel.send_replace(true);
         assert_eq!(
-            settled_checkpoint(&monitor, &cancelled, FAST, || true, || {}).await,
+            settled_checkpoint(&monitor, &cancelled, FAST, || true, || {})
+                .await
+                .checkpoint,
             None
         );
         let (_cancel, cancelled) = watch::channel(false);
         monitor.test_set_available(false);
         assert_eq!(
-            settled_checkpoint(&monitor, &cancelled, FAST, || true, || {}).await,
+            settled_checkpoint(&monitor, &cancelled, FAST, || true, || {})
+                .await
+                .checkpoint,
             None
         );
     }
