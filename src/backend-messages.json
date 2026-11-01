@@ -822,6 +822,10 @@
     "code": "selected_microphone_not_found_using_the_default",
     "ja": "選択したマイクがないため、既定のマイクを使用中"
   },
+  "To insert, return to the original field or confirm the IME conversion.": {
+    "code": "insertion_waiting_for_target",
+    "ja": "挿入するには、元の入力欄に戻るか、IMEの変換を確定してください。"
+  },
   "The selected microphone was not found, so this recording uses the default microphone. The saved microphone setting was not changed.": {
     "code": "the_selected_microphone_was_not_found_so_this_recording_uses_the_default_microphone_the_saved_microp",
     "ja": "選択したマイクが見つからないため、この録音では既定のマイクを使用しています。保存したマイクの設定は変更していません。"

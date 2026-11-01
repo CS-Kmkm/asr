@@ -1026,6 +1026,7 @@ const appMessageKeys: ReadonlySet<MessageKey> = new Set(
       "The selected microphone was not found. Check the microphone in Settings.",
       "The microphone could not be opened. Check the microphone in Settings.",
       "Selected microphone not found. Using the default.",
+      "To insert, return to the original field or confirm the IME conversion.",
       "The selected microphone was not found, so this recording uses the default microphone. The saved microphone setting was not changed.",
       "Recording from the default microphone.",
       "Translating the selected text.",

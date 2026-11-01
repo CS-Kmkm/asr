@@ -19,6 +19,11 @@ use crate::{
 use std::time::Instant;
 use tauri::{Emitter, Manager};
 
+/// Shown when the final paste is held back because the original field lost
+/// focus or its IME is still composing. Fixed copy: no transcript or title.
+const TARGET_WAIT_HINT: &str =
+    "To insert, return to the original field or confirm the IME conversion.";
+
 pub(crate) async fn finish(
     context: PipelineContext<'_>,
     take: RecordedTake,
@@ -321,7 +326,9 @@ async fn finish_owned(
             // blocking owner before taking the irreversible commit fence.
             let settle_started = Instant::now();
             if !translation_failed {
-                runtime.block_on(draft.settle_before_final(&cancel));
+                runtime.block_on(draft.settle_before_final_with_hint(&cancel, || {
+                    recording_overlay::show_live_notice(&app_for_insertion, TARGET_WAIT_HINT);
+                }));
             }
             let settle_ms = settle_started.elapsed().as_millis() as i64;
             let paste_started = Instant::now();
