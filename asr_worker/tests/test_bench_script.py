@@ -99,6 +99,52 @@ class WorkerStderrTests(IsolatedWorkerTestCase):
 
 
 class WorkerEnvTests(IsolatedWorkerTestCase):
+    def test_language_is_optional_and_explicit_locale_reaches_each_request(self):
+        class Session:
+            def __init__(self): self.requests = []
+            def request(self, request):
+                self.requests.append(request)
+                return {"text": "sample", "duration_ms": 10.0}, 20.0
+
+        for language in (None, "ja-JP"):
+            session = Session()
+            bench_asr.run_transcribe_loop(session, [Path("audio.wav")], 2, ["term"], language=language)
+            self.assertEqual(len(session.requests), 2)
+            for request in session.requests:
+                self.assertEqual(request["prompt"], ["term"])
+                if language is None:
+                    self.assertNotIn("language", request)
+                else:
+                    self.assertEqual(request["language"], language)
+
+    def test_language_is_preserved_in_cold_warm_requests_and_report(self):
+        sessions = []
+        class Session:
+            def __init__(self, *args, **kwargs):
+                self.requests = []
+                sessions.append(self)
+            def __enter__(self): return self
+            def __exit__(self, *args): return None
+            def request(self, request):
+                self.requests.append(request)
+                return {"text": "sample", "model": "mock", "duration_ms": 10.0}, 20.0
+
+        args = bench_asr.parse_args(["--language", "ja-JP", "--cold-runs", "2", "--repeat", "3"])
+        with patch.object(bench_asr, "WorkerSession", Session):
+            report = bench_asr.run_benchmark(args, [Path("audio.wav")])
+        self.assertEqual(report["config"]["language"], "ja-JP")
+        self.assertEqual([len([r for r in s.requests if r["command"] == "transcribe"]) for s in sessions], [1, 1, 3])
+        self.assertTrue(all(r["language"] == "ja-JP" for s in sessions for r in s.requests if r["command"] == "transcribe"))
+
+    def test_language_cli_rejects_invalid_length_before_starting_worker(self):
+        self.assertIsNone(bench_asr.parse_args([]).language)
+        self.assertEqual(bench_asr.parse_args(["--language", "x" * 32]).language, "x" * 32)
+        for value in ("", "   ", "x" * 33):
+            with patch.object(bench_asr, "WorkerSession") as session:
+                with self.assertRaises(SystemExit):
+                    bench_asr.main(["--language", value])
+                session.assert_not_called()
+
     def test_bad_output_is_rejected_before_any_benchmark_work(self):
         with tempfile.TemporaryDirectory() as tmp:
             invalid = Path(tmp) / "missing" / "result.json"
