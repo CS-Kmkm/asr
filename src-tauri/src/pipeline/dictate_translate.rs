@@ -76,6 +76,8 @@ async fn finish_owned(
         app_context,
         translation_target,
         mut draft,
+        // Recorded by the shared stop pipeline after delivery.
+        stop_timings: _,
     } = take;
     let metrics = storage.metrics_for(mode, app_context::history_category(app_context.as_ref()));
     let duration_ms = artifact.duration.as_millis() as u64;
@@ -166,13 +168,8 @@ async fn finish_owned(
         )
         .await;
         let translation_ms = translation_started.elapsed().as_millis() as i64;
-        record_first_output(
-            metrics,
-            "voice_translation_first_output",
-            &settings.correction_provider,
-            // A failed or cancelled request has no comparable first output.
-            first_output_ms.filter(|_| result.is_ok()),
-        );
+        // A failed or cancelled request has no comparable first output.
+        first_output_ms = first_output_ms.filter(|_| result.is_ok());
         match classify_ai_stage(result) {
             AiStageResult::Corrected(translated) => {
                 final_text = translated;
@@ -247,12 +244,7 @@ async fn finish_owned(
         )
         .await;
         let correction_ms = correction_started.elapsed().as_millis() as i64;
-        record_first_output(
-            metrics,
-            "text_correction_first_output",
-            &settings.correction_provider,
-            first_output_ms.filter(|_| result.is_ok()),
-        );
+        first_output_ms = first_output_ms.filter(|_| result.is_ok());
         match result {
             Ok(corrected) => {
                 final_text = corrected;
@@ -325,12 +317,12 @@ async fn finish_owned(
             // Readiness may synchronously query UIA; await quiet input on this
             // blocking owner before taking the irreversible commit fence.
             let settle_started = Instant::now();
-            if !translation_failed {
-                runtime.block_on(draft.settle_before_final_with_hint(&cancel, || {
+            // Only a real wait for quiet input is timed; most takes need none.
+            let settle_ms = (!translation_failed
+                && runtime.block_on(draft.settle_before_final_with_hint(&cancel, || {
                     recording_overlay::show_live_notice(&app_for_insertion, TARGET_WAIT_HINT);
-                }));
-            }
-            let settle_ms = settle_started.elapsed().as_millis() as i64;
+                })))
+            .then(|| settle_started.elapsed().as_millis() as i64);
             let paste_started = Instant::now();
             let committed = commit_dictation_output(&services.lifecycle, operation_id, || {
                 if translation_failed {
@@ -456,8 +448,19 @@ async fn finish_owned(
         inserted,
         (!inserted).then_some(insertion_code.as_str()),
     );
-    // A failed translation is copied without settling, so there is no wait to record.
-    if !translation_failed {
+    // Stage timings are written after delivery so their commits stay off the
+    // measured path.
+    record_first_output(
+        metrics,
+        if mode == PipelineMode::Translate {
+            "voice_translation_first_output"
+        } else {
+            "text_correction_first_output"
+        },
+        &settings.correction_provider,
+        first_output_ms,
+    );
+    if let Some(settle_ms) = settle_ms {
         let _ = metrics.add_metric(
             "insertion_settle",
             Some(mode_metric),

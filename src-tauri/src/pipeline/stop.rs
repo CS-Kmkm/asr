@@ -1,5 +1,5 @@
 //! Shared stop/capture/recognition lifecycle and mode dispatch.
-use super::{PipelineContext, RecordedTake};
+use super::{PipelineContext, RecordedTake, StopTimings};
 use crate::commands::{
     cancellation_copy, ensure_model_loaded_cancellable, failed_take_history_item,
     failed_take_message, microphone_disconnected, play_stop_cue, preserve_failed_take,
@@ -42,9 +42,7 @@ struct Captured {
     artifact_cleanup: TempArtifact,
     started: Instant,
     disconnected: bool,
-    /// Stop-path stage timings, recorded once the take has a metric context.
-    audio_stop_ms: i64,
-    live_drain_ms: Option<i64>,
+    stop_timings: StopTimings,
     translation_target: Option<String>,
     draft: Option<LiveDraft>,
     edit_session: Option<EditSession>,
@@ -167,8 +165,10 @@ impl RecordingDriver for Desktop<'_> {
             artifact_cleanup,
             started,
             disconnected,
-            audio_stop_ms,
-            live_drain_ms,
+            stop_timings: StopTimings {
+                audio_stop_ms,
+                live_drain_ms,
+            },
             translation_target,
             draft,
             edit_session,
@@ -204,8 +204,7 @@ impl RecordingDriver for Desktop<'_> {
             artifact,
             mut artifact_cleanup,
             started,
-            audio_stop_ms,
-            live_drain_ms,
+            stop_timings,
             translation_target,
             draft,
             edit_session,
@@ -229,18 +228,13 @@ impl RecordingDriver for Desktop<'_> {
             mode,
             crate::app_context::history_category(app_context.as_ref()),
         );
-        if !services.lifecycle.is_dictation_test(operation_id) {
-            let _ = metrics.add_metric("audio_stop", None, Some(audio_stop_ms), true, None);
-            if let Some(live_drain_ms) = live_drain_ms {
-                let _ = metrics.add_metric(
-                    "live_drain",
-                    Some(&settings.asr_backend),
-                    Some(live_drain_ms),
-                    true,
-                    None,
-                );
+        // Stop-path timings are written once the take ends here or, after
+        // delivery, by `deliver`. Dictation tests record none.
+        let record_stop_timings = || {
+            if !services.lifecycle.is_dictation_test(operation_id) {
+                stop_timings.record(metrics, &settings.asr_backend);
             }
-        }
+        };
         let correction_cancel = cancel.clone();
         // Defense in depth: model changes are refused while a recording is
         // active, but if the model is not marked ready (for example its load
@@ -248,6 +242,7 @@ impl RecordingDriver for Desktop<'_> {
         let model_ready =
             ensure_model_loaded_cancellable(app, services, &settings, Some(cancel.clone())).await;
         if services.lifecycle.is_cancelled(operation_id) {
+            record_stop_timings();
             report_temp_cleanup(app, &mut artifact_cleanup);
             emit_state(app, state, AppPhase::Idle, cancel_message);
             return Err(cancel_error.into());
@@ -268,6 +263,7 @@ impl RecordingDriver for Desktop<'_> {
             {
                 Ok(value) => Ok(value),
                 Err(asr::AsrError::Cancelled) => {
+                    record_stop_timings();
                     report_temp_cleanup(app, &mut artifact_cleanup);
                     emit_state(app, state, AppPhase::Idle, cancel_message);
                     return Err(cancel_error.into());
@@ -298,6 +294,7 @@ impl RecordingDriver for Desktop<'_> {
                         Some("asr_failed"),
                     )
                 };
+                record_stop_timings();
                 let asr_provider = model_identity(&settings)
                     .0
                     .unwrap_or_else(|| settings.asr_backend.clone());
@@ -336,6 +333,7 @@ impl RecordingDriver for Desktop<'_> {
             }
         };
         if services.lifecycle.is_cancelled(operation_id) {
+            record_stop_timings();
             emit_state(app, state, AppPhase::Idle, cancel_message);
             return Err(cancel_error.into());
         }
@@ -368,13 +366,14 @@ impl RecordingDriver for Desktop<'_> {
             app_context,
             translation_target,
             draft,
+            stop_timings,
         };
         Ok((take, edit_session, ask_session))
     }
     async fn deliver(
         &self,
         operation_id: u64,
-        _mode: PipelineMode,
+        mode: PipelineMode,
         recognized: Self::Recognized,
     ) -> Result<RecordingResult, String> {
         let Self {
@@ -394,9 +393,26 @@ impl RecordingDriver for Desktop<'_> {
         if services.lifecycle.is_dictation_test(operation_id) {
             return super::setup_tests::finish_dictation_test(context, take).await;
         }
-        if let Err(error) =
-            super::routing::route(&context, &mut take, &mut edit_session, &mut ask_session).await
-        {
+        let routed =
+            super::routing::route(&context, &mut take, &mut edit_session, &mut ask_session).await;
+        // Captured before the mode finish consumes the take; written after it.
+        let stop_timings = take.stop_timings;
+        // Attributed to the stop mode, like the `asr` metric of the same take,
+        // even when automatic routing changes the delivered mode.
+        let metric_mode = mode;
+        let metric_context = take.app_context.clone();
+        let asr_backend = take.settings.asr_backend.clone();
+        let record_stop_timings = || {
+            stop_timings.record(
+                storage.metrics_for(
+                    metric_mode,
+                    app_context::history_category(metric_context.as_ref()),
+                ),
+                &asr_backend,
+            );
+        };
+        if let Err(error) = routed {
+            record_stop_timings();
             if services.lifecycle.is_cancelled(operation_id) {
                 let (message, _) = cancellation_copy(take.mode);
                 emit_state(app, state, AppPhase::Idle, message);
@@ -406,14 +422,16 @@ impl RecordingDriver for Desktop<'_> {
             report_temp_cleanup(app, &mut take.artifact_cleanup);
             return Err(error);
         }
-        match take.mode {
+        let result = match take.mode {
             PipelineMode::Edit => super::edit::finish(context, take, edit_session).await,
             PipelineMode::Ask => super::ask::finish(context, take, ask_session).await,
             PipelineMode::Dictate | PipelineMode::Translate => {
                 super::dictate_translate::finish(context, take).await
             }
             PipelineMode::SelectedText => unreachable!("selected text does not record audio"),
-        }
+        };
+        record_stop_timings();
+        result
     }
 }
 

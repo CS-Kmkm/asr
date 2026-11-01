@@ -520,17 +520,26 @@ Full usage and Phase 0 gate criteria are documented in
   is an outcome record, not paste-only time. `asr` excludes preceding audio
   finalization, live-task drain and model readiness/load. AI stage totals are
   sampled after the provider result and validation, before metric persistence.
-  Additional timings are `audio_stop` (audio-lock wait, stream closure and WAV
-  creation), `live_drain` (live-task finish/join after audio finalization, even
-  without in-flight inference; the live task is told to stop before audio
-  finalization, so values are not comparable with records made before that change),
+  Additional timings are `audio_stop` (audio-lock wait, stream closure,
+  resampling, enhancement, voice detection and WAV creation), `live_drain`
+  (live-task finish/join after audio finalization, even without in-flight
+  inference; the live task is told to stop before audio finalization, so values
+  are not comparable with records made before that change),
   `text_correction_first_output`/`voice_translation_first_output` (first nonempty
   provider callback of a completed request, within the AI total; a nonstreaming
   response calls back only with the completed text), `insertion_settle`
-  (quiet-input/target wait; absent when a failed translation is only copied),
-  and `insertion_paste` (the full commit operation, including safety checks,
-  clipboard, paste confirmation and restoration). First-output time does not
-  isolate connection setup or prove connection reuse.
+  (recorded only when the take had to wait for quiet input or the original
+  field), and `insertion_paste` (the full commit operation, including safety
+  checks, clipboard, paste confirmation and restoration). First-output time
+  does not isolate connection setup or prove connection reuse.
+  The stages do not add up to `dictation`: settings and session handoff,
+  shortcut release, the live draft update, dictionary lookup, the automatic
+  voice mode decision and a target readiness check that needs no wait are not
+  timed separately. `audio_stop` and `live_drain` are recorded under the mode
+  the recording stopped in, like `asr`, even when automatic routing delivers
+  another mode. They are written once the take ends (after delivery, a
+  recognition failure or cancellation during recognition); stage timings are
+  written after the measured work.
   These events do not cover every early failure or cancellation. `dictation`
   success can include uncorrected fallback or failed insertion, whereas
   `insertion` success requires confirmed paste. Timing-event success means an

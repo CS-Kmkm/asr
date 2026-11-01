@@ -279,8 +279,9 @@ impl LiveDraft {
     /// paste: once input is quiet and the target is ready, the checkpoint is
     /// renewed, so only input during the paste itself stops it. Live sessions
     /// keep the recording-start checkpoint their replacement ranges rely on.
-    pub(crate) async fn settle_before_final(&mut self, cancel: &watch::Receiver<bool>) {
-        self.settle_before_final_with_hint(cancel, || {}).await;
+    /// Returns whether it had to wait for input to settle.
+    pub(crate) async fn settle_before_final(&mut self, cancel: &watch::Receiver<bool>) -> bool {
+        self.settle_before_final_with_hint(cancel, || {}).await
     }
 
     /// `settle_before_final`, calling `on_unready` once if the original
@@ -290,9 +291,14 @@ impl LiveDraft {
         &mut self,
         cancel: &watch::Receiver<bool>,
         on_unready: impl FnOnce(),
-    ) {
-        if !self.defer_insertion || self.pasted || self.session.is_some() {
-            return;
+    ) -> bool {
+        // Without an available input monitor there is nothing to wait for.
+        if !self.defer_insertion
+            || self.pasted
+            || self.session.is_some()
+            || self.monitor.checkpoint().is_none()
+        {
+            return false;
         }
         let ready =
             |draft: &Self| draft.injector.target_ready(&draft.target) && draft.focus_unchanged();
@@ -301,7 +307,7 @@ impl LiveDraft {
             .is_some_and(|checkpoint| self.monitor.unchanged_since(checkpoint))
             && ready(self)
         {
-            return;
+            return false;
         }
         let draft = &*self;
         let settled = settled_checkpoint(
@@ -315,6 +321,7 @@ impl LiveDraft {
         if let Some(checkpoint) = settled {
             self.renew_checkpoint(checkpoint);
         }
+        true
     }
 
     fn renew_checkpoint(&mut self, checkpoint: u64) {
@@ -972,6 +979,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settling_without_an_input_monitor_reports_no_wait() {
+        let (_cancel, cancelled) = watch::channel(false);
+        let mut draft = deferred_test_draft();
+        draft.monitor.test_set_available(false);
+        let waited = tokio::time::timeout(
+            Duration::from_millis(50),
+            draft.settle_before_final(&cancelled),
+        )
+        .await
+        .unwrap();
+        assert!(!waited);
+        assert_eq!(draft.checkpoint, Some(0));
+    }
+
+    #[tokio::test]
     async fn settling_leaves_live_sessions_and_queued_pastes_alone() {
         let (_cancel, cancelled) = watch::channel(false);
         for case in ["live", "pasted"] {
@@ -982,12 +1004,14 @@ mod tests {
                 "pasted" => draft.pasted = true,
                 _ => unreachable!(),
             }
-            tokio::time::timeout(
+            let waited = tokio::time::timeout(
                 Duration::from_millis(50),
                 draft.settle_before_final(&cancelled),
             )
             .await
             .unwrap();
+            // Skipping the settle is not reported as a wait.
+            assert!(!waited, "{case}");
             // The recording-start checkpoint is kept, so input still blocks.
             assert_eq!(draft.checkpoint, Some(0), "{case}");
             assert!(!draft.can_insert_final("final"), "{case}");
