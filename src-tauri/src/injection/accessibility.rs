@@ -19,6 +19,9 @@ use windows::Win32::UI::Accessibility::{
 
 const MAX_TEXT_UNITS: i32 = 1_048_576;
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(2);
+/// One unit tells an empty composition range from a real composition without
+/// transferring the text being composed.
+const COMPOSITION_TEXT_UNITS: i32 = 1;
 
 thread_local! {
     static QUERY_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -206,8 +209,18 @@ pub(super) fn is_password(process_id: u32) -> Result<bool, InjectionError> {
     })
 }
 
+/// Whether a non-null active composition range is an open composition, given
+/// how many UTF-16 units its text read back (`None`: the read failed or the
+/// budget ran out). Some providers return an empty range while nothing is
+/// being composed, which would hold a final paste for the whole settle limit.
+/// An unreadable range stays active: an unknown state lets an additive paste
+/// through, possibly into a real composition.
+fn composition_range_active(units_read: Option<usize>) -> Option<bool> {
+    Some(units_read != Some(0))
+}
+
 pub(super) fn ime_active(process_id: u32) -> Result<Option<bool>, InjectionError> {
-    dispatch(move |automation, _deadline| {
+    dispatch(move |automation, deadline| {
         let element = focused_in_process(automation, process_id)?;
         let pattern = match unsafe {
             element.GetCurrentPatternAs::<IUIAutomationTextEditPattern>(UIA_TextEditPatternId)
@@ -216,7 +229,12 @@ pub(super) fn ime_active(process_id: u32) -> Result<Option<bool>, InjectionError
             Err(_) => return Ok(None),
         };
         match unsafe { pattern.GetActiveComposition() } {
-            Ok(_) => Ok(Some(true)),
+            Ok(range) => Ok(composition_range_active(
+                (Instant::now() < deadline)
+                    .then(|| unsafe { range.GetText(COMPOSITION_TEXT_UNITS) }.ok())
+                    .flatten()
+                    .map(|text| text.len()),
+            )),
             // The binding represents the documented null range as an empty
             // interface error; unsupported/partial providers stay unknown.
             Err(error) if error.code() == windows::core::Error::empty().code() => Ok(Some(false)),
@@ -651,6 +669,33 @@ mod tests {
                 .unwrap();
         });
         assert_eq!(bounded_deadline(ordinary), ordinary);
+    }
+
+    #[test]
+    fn only_a_composition_range_read_back_empty_counts_as_inactive() {
+        use super::super::SafetyPolicy;
+        let policies = [
+            SafetyPolicy::Additive,
+            SafetyPolicy::FinalAdditive,
+            SafetyPolicy::Destructive,
+        ];
+        // A degenerate range is no composition, so no guard waits for it.
+        assert_eq!(composition_range_active(Some(0)), Some(false));
+        assert!(policies
+            .iter()
+            .all(|policy| policy.permits_ime(composition_range_active(Some(0)))));
+        // Composed text, or a range that could not be read, blocks every
+        // paste; unknown would let an additive paste into a real composition.
+        for units_read in [Some(1), Some(2), None] {
+            assert_eq!(
+                composition_range_active(units_read),
+                Some(true),
+                "{units_read:?}"
+            );
+            assert!(policies
+                .iter()
+                .all(|policy| !policy.permits_ime(composition_range_active(units_read))));
+        }
     }
 
     #[test]
