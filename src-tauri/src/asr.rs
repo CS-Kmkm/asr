@@ -679,22 +679,66 @@ impl JsonlTranscriber {
                 message: "Speech worker resources are missing".into(),
             }));
         }
-        if let Some(provision) = &command_spec.provision {
-            let _ = self.progress.send(LoadProgress {
-                stage: "setup".into(),
-                model: None,
-                completed_bytes: None,
-                total_bytes: None,
-            });
-            until_cancelled(
-                timeout(self.load_timeout, provision.prepare()),
-                cancel,
-                interrupt,
-            )
-            .await
-            .map_err(|_| AsrError::Cancelled)?
-            .map_err(|_| AsrError::Timeout)??;
+        let Some(provision) = &command_spec.provision else {
+            return self.start_process(command_spec, cancel, interrupt).await;
+        };
+        if !provision.is_synced_async().await {
+            self.provision(provision, cancel, interrupt).await?;
+            return self.start_process(command_spec, cancel, interrupt).await;
         }
+        // The environment still matches its last successful sync, so this
+        // spawn skipped it. A worker that then cannot start or import gets one
+        // full sync as a repair before the error is reported.
+        match self.start_process(command_spec, cancel, interrupt).await {
+            Err(error) if Self::repairable_start(&error) => {
+                self.provision(provision, cancel, interrupt).await?;
+                self.start_process(command_spec, cancel, interrupt).await
+            }
+            result => result,
+        }
+    }
+
+    /// Start failures a dependency sync could fix: the interpreter would not
+    /// run, or the worker exited, hung or answered garbage before its
+    /// handshake. A cancellation or a worker that answered (for example with
+    /// a version mismatch) is not one.
+    fn repairable_start(error: &AsrError) -> bool {
+        matches!(
+            error,
+            AsrError::Io(_) | AsrError::Protocol(_) | AsrError::Crashed | AsrError::Timeout
+        )
+    }
+
+    /// Sync the bundled worker environment, reporting it as the setup stage.
+    async fn provision(
+        &self,
+        provision: &crate::worker_setup::Provision,
+        cancel: &mut Option<watch::Receiver<bool>>,
+        interrupt: &mut watch::Receiver<u64>,
+    ) -> Result<(), AsrError> {
+        let _ = self.progress.send(LoadProgress {
+            stage: "setup".into(),
+            model: None,
+            completed_bytes: None,
+            total_bytes: None,
+        });
+        until_cancelled(
+            timeout(self.load_timeout, provision.prepare()),
+            cancel,
+            interrupt,
+        )
+        .await
+        .map_err(|_| AsrError::Cancelled)?
+        .map_err(|_| AsrError::Timeout)?
+    }
+
+    /// Start the worker process and complete its handshake.
+    async fn start_process(
+        &self,
+        command_spec: &WorkerCommand,
+        cancel: &mut Option<watch::Receiver<bool>>,
+        interrupt: &mut watch::Receiver<u64>,
+    ) -> Result<RunningWorker, AsrError> {
         // stderr carries the worker's internal_error details; persist it to the
         // rotating worker log when the app installed one.
         let mut command = worker_process_command(command_spec, crate::worker_log::is_installed());
@@ -2572,6 +2616,148 @@ sys.stdin.read()
             );
             assert_eq!(mock.processes(), 1);
             transcriber.shutdown().await.unwrap();
+        }
+
+        /// A bundled-worker layout whose `uv` is the test interpreter: run
+        /// as `uv sync ...` from the project directory, it executes the
+        /// `sync` script there, which logs the run and, when `installs`,
+        /// makes the worker importable by copying it to where the worker
+        /// command imports it from. Nothing is downloaded.
+        struct FakeProvision {
+            directory: tempfile::TempDir,
+            provision: crate::worker_setup::Provision,
+            command: WorkerCommand,
+        }
+
+        impl FakeProvision {
+            fn new(installs: bool) -> Option<Self> {
+                let python = python()?;
+                let directory = tempfile::tempdir().unwrap();
+                let source = directory.path().join("worker");
+                let site = directory.path().join("site");
+                std::fs::create_dir_all(&source).unwrap();
+                std::fs::create_dir_all(&site).unwrap();
+                std::fs::write(source.join("uv.lock"), "lock").unwrap();
+                std::fs::write(source.join("pyproject.toml"), "[project]").unwrap();
+                let quoted = |path: &Path| format!("{:?}", path.to_string_lossy());
+                let script = format!(
+                    "import shutil\n\
+                     with open({log}, 'a') as log:\n    log.write('sync\\n')\n\
+                     if {installs}:\n    shutil.copytree({worker}, {target}, dirs_exist_ok=True, \
+                     ignore=shutil.ignore_patterns('tests', '__pycache__'))\n",
+                    log = quoted(&directory.path().join("sync.log")),
+                    installs = if installs { "True" } else { "False" },
+                    worker = quoted(&repository_root().join("asr_worker")),
+                    target = quoted(&site.join("asr_worker")),
+                );
+                std::fs::write(source.join("sync"), script).unwrap();
+                let provision = crate::worker_setup::Provision {
+                    source,
+                    environment: directory.path().join("runtime"),
+                    vibevoice: false,
+                    uv: python.clone().into(),
+                };
+                // What uv would have created: the environment's interpreter
+                // (never run here) and its configuration.
+                std::fs::create_dir_all(provision.python().parent().unwrap()).unwrap();
+                std::fs::write(provision.python(), b"").unwrap();
+                std::fs::write(provision.environment.join("pyvenv.cfg"), "home = test").unwrap();
+                let mut command = WorkerCommand::python(python)
+                    .with_backend("mock")
+                    .with_current_dir(directory.path());
+                command
+                    .env
+                    .push(("PYTHONPATH".into(), site.to_string_lossy().into_owned()));
+                command.provision = Some(provision.clone());
+                Some(Self {
+                    directory,
+                    provision,
+                    command,
+                })
+            }
+
+            fn transcriber(&self) -> JsonlTranscriber {
+                JsonlTranscriber::new(
+                    self.command.clone(),
+                    Duration::from_secs(20),
+                    Duration::from_secs(20),
+                )
+            }
+
+            fn syncs(&self) -> usize {
+                std::fs::read_to_string(self.directory.path().join("sync.log"))
+                    .unwrap_or_default()
+                    .lines()
+                    .count()
+            }
+        }
+
+        fn setup_reported(progress: &mut broadcast::Receiver<LoadProgress>) -> bool {
+            std::iter::from_fn(|| progress.try_recv().ok()).any(|update| update.stage == "setup")
+        }
+
+        #[tokio::test]
+        async fn a_matching_environment_starts_the_worker_without_a_sync() {
+            let Some(fake) = FakeProvision::new(true) else {
+                return;
+            };
+            fake.provision.prepare().await.unwrap();
+            assert_eq!(fake.syncs(), 1);
+            let transcriber = fake.transcriber();
+            let mut progress = transcriber.load_progress().unwrap();
+            assert_eq!(transcriber.health().await.unwrap().backend, "mock");
+            assert_eq!(fake.syncs(), 1, "the recorded sync was reused");
+            assert!(!setup_reported(&mut progress));
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn an_unrecorded_environment_is_synced_before_the_worker_starts() {
+            let Some(fake) = FakeProvision::new(true) else {
+                return;
+            };
+            let transcriber = fake.transcriber();
+            let mut progress = transcriber.load_progress().unwrap();
+            assert_eq!(transcriber.health().await.unwrap().backend, "mock");
+            assert_eq!(fake.syncs(), 1);
+            assert!(setup_reported(&mut progress));
+            assert!(fake.provision.is_synced());
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_worker_that_fails_after_a_skipped_sync_is_repaired_once() {
+            let Some(fake) = FakeProvision::new(true) else {
+                return;
+            };
+            // The marker matches, but the environment lost the worker's
+            // imports, so the first start fails.
+            fake.provision.record_sync();
+            let transcriber = fake.transcriber();
+            let mut progress = transcriber.load_progress().unwrap();
+            assert_eq!(transcriber.health().await.unwrap().backend, "mock");
+            assert_eq!(fake.syncs(), 1);
+            assert!(setup_reported(&mut progress));
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_repair_that_does_not_help_reports_the_start_failure() {
+            let Some(fake) = FakeProvision::new(false) else {
+                return;
+            };
+            fake.provision.record_sync();
+            let transcriber = fake.transcriber();
+            let result = transcriber.health().await;
+            assert!(
+                matches!(
+                    result,
+                    Err(AsrError::Crashed | AsrError::Io(_) | AsrError::Protocol(_))
+                ),
+                "{result:?}"
+            );
+            assert_eq!(fake.syncs(), 1, "one repair per start, not a loop");
+            assert!(transcriber.state.lock().await.running.is_none());
         }
 
         #[tokio::test]

@@ -12,6 +12,13 @@ use tokio::process::Command;
 
 static BUNDLED: OnceLock<Provision> = OnceLock::new();
 
+/// Written into the environment after a successful base sync. It names the
+/// inputs that sync aligned the environment with, so a later spawn can skip
+/// the sync while they are unchanged.
+const SYNC_MARKER: &str = ".asr-sync-fingerprint";
+/// Part of every fingerprint; changing the sync command must change it too.
+const SYNC_COMMAND_IDENTITY: &str = "uv sync --frozen --no-dev --inexact --python 3.12";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Provision {
     pub(crate) source: PathBuf,
@@ -58,9 +65,74 @@ impl Provision {
         command
     }
 
+    fn marker(&self) -> PathBuf {
+        self.environment.join(SYNC_MARKER)
+    }
+
+    /// A digest of everything a base sync aligns the environment with: the
+    /// sync command, the app version, the requested extras, the interpreter
+    /// path, the dependency lock and project files, and the environment's own
+    /// `pyvenv.cfg` (rewritten whenever uv recreates the environment). The
+    /// worker source is not part of it: it runs from the bundled resources,
+    /// is not installed into the environment, and changes only with the app
+    /// version. `None` when a required input cannot be read.
+    fn fingerprint(&self) -> Option<String> {
+        let mut digest = Fnv1a::default();
+        digest.field(SYNC_COMMAND_IDENTITY.as_bytes());
+        digest.field(env!("CARGO_PKG_VERSION").as_bytes());
+        digest.field(if self.vibevoice { b"vibevoice" } else { b"" });
+        digest.field(self.python().as_os_str().as_encoded_bytes());
+        for name in ["uv.lock", "pyproject.toml"] {
+            digest.field(&std::fs::read(self.source.join(name)).ok()?);
+        }
+        digest.field(&std::fs::read(self.source.join(".python-version")).unwrap_or_default());
+        digest.field(&std::fs::read(self.environment.join("pyvenv.cfg")).ok()?);
+        Some(format!("{:016x}", digest.finish()))
+    }
+
+    /// Whether the environment's interpreter exists and the environment still
+    /// matches the inputs of its last successful base sync.
+    pub(crate) fn is_synced(&self) -> bool {
+        self.python().is_file()
+            && self.fingerprint().is_some_and(|fingerprint| {
+                std::fs::read_to_string(self.marker())
+                    .is_ok_and(|recorded| recorded.trim() == fingerprint)
+            })
+    }
+
+    /// `is_synced` without blocking the async runtime on file reads.
+    pub(crate) async fn is_synced_async(&self) -> bool {
+        let provision = self.clone();
+        tokio::task::spawn_blocking(move || provision.is_synced())
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Forget the last successful sync, so the next spawn syncs again.
+    fn forget_sync(&self) {
+        let _ = std::fs::remove_file(self.marker());
+    }
+
+    /// Record a successful sync. A marker that cannot be written only costs
+    /// the next spawn a sync.
+    pub(crate) fn record_sync(&self) {
+        let Some(fingerprint) = self.fingerprint() else {
+            return;
+        };
+        let partial = self.environment.join(format!("{SYNC_MARKER}.partial"));
+        if std::fs::write(&partial, fingerprint).is_err()
+            || std::fs::rename(&partial, self.marker()).is_err()
+        {
+            let _ = std::fs::remove_file(&partial);
+        }
+    }
+
     pub(crate) async fn prepare(&self) -> Result<(), AsrError> {
-        // Align base requirements on each spawn while retaining optional
-        // packages the user explicitly prepared for another feature.
+        // An interrupted or failed sync may leave the environment between
+        // states, so it never keeps an earlier sync's marker.
+        self.forget_sync();
+        // Align base requirements while retaining optional packages the user
+        // explicitly prepared for another feature.
         let status = self
             .command()
             .status()
@@ -69,6 +141,8 @@ impl Provision {
         if !status.success() || !self.python().is_file() {
             return Err(setup_error("worker_setup_failed"));
         }
+        let provision = self.clone();
+        let _ = tokio::task::spawn_blocking(move || provision.record_sync()).await;
         Ok(())
     }
 
@@ -91,6 +165,35 @@ impl Provision {
             return Err(setup_error("decision_dependencies_missing"));
         }
         Ok(())
+    }
+}
+
+/// 64-bit FNV-1a over length-prefixed fields. It detects accidental changes
+/// to the sync inputs; it is not meant to resist deliberate tampering with
+/// the user's own data directory.
+struct Fnv1a(u64);
+
+impl Default for Fnv1a {
+    fn default() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Fnv1a {
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+
+    fn field(&mut self, bytes: &[u8]) {
+        self.write(&(bytes.len() as u64).to_le_bytes());
+        self.write(bytes);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
     }
 }
 
@@ -153,6 +256,86 @@ mod tests {
         );
         assert!(provision.python().starts_with(&provision.environment));
         assert!(!provision.python().starts_with(&provision.source));
+    }
+
+    /// A provision whose project files and environment exist on disk, as
+    /// after a sync, without running uv.
+    fn synced_layout(directory: &Path) -> Provision {
+        let source = directory.join("worker");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("uv.lock"), "lock v1").unwrap();
+        std::fs::write(source.join("pyproject.toml"), "[project]").unwrap();
+        std::fs::write(source.join(".python-version"), "3.12").unwrap();
+        let provision = Provision {
+            source,
+            environment: directory.join("runtime"),
+            vibevoice: false,
+            uv: directory.join("missing-uv"),
+        };
+        std::fs::create_dir_all(provision.python().parent().unwrap()).unwrap();
+        std::fs::write(provision.python(), b"interpreter").unwrap();
+        std::fs::write(provision.environment.join("pyvenv.cfg"), "home = a").unwrap();
+        provision
+    }
+
+    #[test]
+    fn a_recorded_sync_matches_until_an_input_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let provision = synced_layout(directory.path());
+        assert!(!provision.is_synced(), "no sync was recorded yet");
+        provision.record_sync();
+        assert!(provision.is_synced());
+        assert!(!provision
+            .environment
+            .join(format!("{SYNC_MARKER}.partial"))
+            .exists());
+
+        let vibevoice = Provision {
+            vibevoice: true,
+            ..provision.clone()
+        };
+        assert!(!vibevoice.is_synced(), "other extras need their own sync");
+
+        let changes: [(&Path, &str); 4] = [
+            (&provision.source.join("uv.lock"), "lock v2"),
+            (&provision.source.join("pyproject.toml"), "[project]\n"),
+            (&provision.source.join(".python-version"), "3.13"),
+            (&provision.environment.join("pyvenv.cfg"), "home = b"),
+        ];
+        for (path, changed) in changes {
+            let original = std::fs::read(path).unwrap();
+            std::fs::write(path, changed).unwrap();
+            assert!(!provision.is_synced(), "{}", path.display());
+            std::fs::write(path, original).unwrap();
+            assert!(provision.is_synced(), "{}", path.display());
+        }
+
+        std::fs::remove_file(provision.python()).unwrap();
+        assert!(!provision.is_synced(), "the interpreter must exist");
+        std::fs::write(provision.python(), b"interpreter").unwrap();
+        assert!(provision.is_synced());
+        provision.forget_sync();
+        assert!(!provision.is_synced());
+    }
+
+    #[test]
+    fn a_sync_with_unreadable_inputs_is_never_recorded() {
+        let directory = tempfile::tempdir().unwrap();
+        let provision = synced_layout(directory.path());
+        std::fs::remove_file(provision.source.join("uv.lock")).unwrap();
+        provision.record_sync();
+        assert!(!provision.environment.join(SYNC_MARKER).exists());
+        assert!(!provision.is_synced());
+    }
+
+    #[tokio::test]
+    async fn a_failed_sync_forgets_the_previous_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let provision = synced_layout(directory.path());
+        provision.record_sync();
+        assert!(provision.is_synced_async().await);
+        assert!(provision.prepare().await.is_err());
+        assert!(!provision.is_synced_async().await);
     }
 
     #[tokio::test]
