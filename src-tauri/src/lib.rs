@@ -1794,9 +1794,10 @@ pub fn run() {
                     let app = app.clone();
                     tauri::async_runtime::spawn(async move {
                         app.state::<Services>().shutdown().await;
-                        // Give metrics and temporary-audio cleanup deferred by
-                        // the last takes a bounded wait; a leftover capture is
-                        // removed by the next start's stale-artifact cleanup.
+                        // Give the History saves, metrics and temporary-audio
+                        // cleanup deferred by the last takes a bounded wait; a
+                        // leftover capture is removed by the next start's
+                        // stale-artifact cleanup.
                         let storage = app.state::<Storage>().inner().clone();
                         let _ = tauri::async_runtime::spawn_blocking(move || {
                             storage.drain_deferred_completions(Duration::from_secs(3))
