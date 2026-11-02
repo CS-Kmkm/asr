@@ -64,6 +64,7 @@ export const defaultSettings: Settings = {
   cloudConsents: [],
   livePreviewEnabled: null,
   livePreviewFastDecode: false,
+  incrementalFinalAsr: false,
   cloudLivePreviewEnabled: false,
   shortcuts: {
     dictate: ["Ctrl+Shift+Space"],
