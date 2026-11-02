@@ -3629,12 +3629,40 @@ fn spawn_load_progress_forwarder(
     }))
 }
 
+/// Upper bound on one `nvidia-smi` query. A hung driver query then reports
+/// diagnostics as unavailable instead of keeping them pending indefinitely.
+pub(crate) const GPU_DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The output of `child` once it exits within `limit`; otherwise the child is
+/// killed and `None` returned. Its stdout must be small enough for the pipe,
+/// which holds for the single CSV line `nvidia-smi` prints per adapter.
+fn output_within(mut child: std::process::Child, limit: Duration) -> Option<std::process::Output> {
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 pub(crate) fn probe_gpu_diagnostics() -> GpuDiagnostics {
     let mut command = crate::environment::helper_command("nvidia-smi");
-    command.args([
-        "--query-gpu=name,driver_version,memory.total",
-        "--format=csv,noheader,nounits",
-    ]);
+    command
+        .args([
+            "--query-gpu=name,driver_version,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
     // The release app has no console for this console tool to share, so it
     // would otherwise open a window of its own.
     #[cfg(windows)]
@@ -3643,8 +3671,11 @@ pub(crate) fn probe_gpu_diagnostics() -> GpuDiagnostics {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let output = command.output();
-    if let Ok(output) = output {
+    let output = command
+        .spawn()
+        .ok()
+        .and_then(|child| output_within(child, GPU_DIAGNOSTICS_TIMEOUT));
+    if let Some(output) = output {
         if output.status.success() {
             let line = String::from_utf8_lossy(&output.stdout);
             let values: Vec<&str> = line

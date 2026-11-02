@@ -1437,34 +1437,42 @@ fn release_shortcut(app: AppHandle, shortcut: Shortcut) {
 }
 
 async fn initialize_model_runtime(app: AppHandle, settings: Settings) {
-    let diagnostics = tauri::async_runtime::spawn_blocking(commands::probe_gpu_diagnostics)
-        .await
-        .unwrap_or_else(|_| GpuDiagnostics {
-            status: "unavailable".into(),
-            adapter_name: None,
-            driver_version: None,
-            memory_total_mb: None,
-            recommendation: "GPU diagnostics could not be completed.".into(),
-        });
-    if let Ok(mut current) = app.state::<Services>().gpu_diagnostics.lock() {
-        *current = Some(diagnostics.clone());
-    }
-    let diagnostic_kind = if diagnostics.status == "available" {
-        "gpu_available"
-    } else {
-        "gpu_unavailable"
+    // The preload reads only the saved settings (backend, device policy,
+    // quantization), never the diagnosis, so the two run side by side. Both
+    // stay inside this task, which shutdown aborts.
+    let diagnosis = async {
+        // The probe bounds its own `nvidia-smi` query, so this always settles.
+        let diagnostics = tauri::async_runtime::spawn_blocking(commands::probe_gpu_diagnostics)
+            .await
+            .unwrap_or_else(|_| GpuDiagnostics {
+                status: "unavailable".into(),
+                adapter_name: None,
+                driver_version: None,
+                memory_total_mb: None,
+                recommendation: "GPU diagnostics could not be completed.".into(),
+            });
+        if let Ok(mut current) = app.state::<Services>().gpu_diagnostics.lock() {
+            *current = Some(diagnostics.clone());
+        }
+        let diagnostic_kind = if diagnostics.status == "available" {
+            "gpu_available"
+        } else {
+            "gpu_unavailable"
+        };
+        emit_status(&app, diagnostic_kind, &diagnostics.recommendation);
+        let _ = app.emit("gpu-diagnostics", diagnostics);
     };
-    emit_status(&app, diagnostic_kind, &diagnostics.recommendation);
-    let _ = app.emit("gpu-diagnostics", diagnostics);
-
-    let services = app.state::<Services>();
-    // Setup requires an explicit Load action; never start an unseen download.
-    if !settings.setup_complete || privacy::check_asr(&settings).is_err() {
-        return;
-    }
-    if let Err(error) = commands::ensure_model_loaded(&app, &services, &settings).await {
-        emit_status(&app, "model_load_failed", &error);
-    }
+    let preload = async {
+        // Setup requires an explicit Load action; never start an unseen download.
+        if !settings.setup_complete || privacy::check_asr(&settings).is_err() {
+            return;
+        }
+        let services = app.state::<Services>();
+        if let Err(error) = commands::ensure_model_loaded(&app, &services, &settings).await {
+            emit_status(&app, "model_load_failed", &error);
+        }
+    };
+    tokio::join!(diagnosis, preload);
 }
 
 /// Argument the sign-in Run entry passes so the app starts in the tray only.

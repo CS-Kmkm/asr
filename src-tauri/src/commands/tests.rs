@@ -2889,3 +2889,44 @@ fn failed_takes_keep_what_retry_needs_for_each_mode() {
             .is_none()
     );
 }
+
+/// A command that prints one line and exits, and one that runs far longer
+/// than any test bound, using only tools every test machine has.
+fn quick_and_hung_commands() -> (std::process::Command, std::process::Command) {
+    let piped = |mut command: std::process::Command| {
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        command
+    };
+    if cfg!(windows) {
+        let mut quick = std::process::Command::new("cmd");
+        quick.args(["/C", "echo ready"]);
+        let mut hung = std::process::Command::new("ping");
+        hung.args(["-n", "60", "127.0.0.1"]);
+        (piped(quick), piped(hung))
+    } else {
+        let mut quick = std::process::Command::new("sh");
+        quick.args(["-c", "echo ready"]);
+        let mut hung = std::process::Command::new("sleep");
+        hung.arg("60");
+        (piped(quick), piped(hung))
+    }
+}
+
+#[test]
+fn a_prompt_gpu_query_answer_is_read() {
+    let (mut quick, _) = quick_and_hung_commands();
+    let output = output_within(quick.spawn().unwrap(), Duration::from_secs(10)).unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ready"));
+}
+
+#[test]
+fn a_hung_gpu_query_is_killed_at_the_deadline() {
+    let (_, mut hung) = quick_and_hung_commands();
+    let started = Instant::now();
+    assert!(output_within(hung.spawn().unwrap(), Duration::from_millis(300)).is_none());
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
