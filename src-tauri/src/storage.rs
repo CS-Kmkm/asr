@@ -4404,7 +4404,11 @@ mod tests {
         assert!(!old.settings.incremental_final_asr);
         assert!(old.repairs.is_empty());
         saved["incrementalFinalAsr"] = serde_json::json!(true);
-        assert!(load_settings(&saved.to_string()).settings.incremental_final_asr);
+        assert!(
+            load_settings(&saved.to_string())
+                .settings
+                .incremental_final_asr
+        );
         saved["incrementalFinalAsr"] = serde_json::json!("yes");
         let repaired = load_settings(&saved.to_string());
         assert!(!repaired.settings.incremental_final_asr);
