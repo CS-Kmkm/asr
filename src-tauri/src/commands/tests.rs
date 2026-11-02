@@ -2890,6 +2890,57 @@ fn failed_takes_keep_what_retry_needs_for_each_mode() {
     );
 }
 
+#[tokio::test]
+async fn the_target_is_captured_while_the_preflight_runs() {
+    // The preflight finishes only after the capture started, which a serial
+    // order (preflight first) would never allow.
+    let (capture_started, started) = tokio::sync::oneshot::channel::<()>();
+    let preflight = async {
+        started.await.unwrap();
+        Ok(())
+    };
+    let capture = async {
+        capture_started.send(()).unwrap();
+        Ok("target")
+    };
+    let both = preflight_beside_capture(preflight, capture);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), both)
+            .await
+            .unwrap(),
+        Ok("target")
+    );
+}
+
+#[tokio::test]
+async fn a_failed_preflight_wins_over_any_capture_outcome() {
+    let refused = || async { Err::<(), _>("missing API key".to_owned()) };
+    assert_eq!(
+        preflight_beside_capture(refused(), async { Ok("target") }).await,
+        Err("missing API key".to_owned())
+    );
+    assert_eq!(
+        preflight_beside_capture(refused(), async {
+            Err::<&str, _>("no foreground target is available".to_owned())
+        })
+        .await,
+        Err("missing API key".to_owned())
+    );
+    assert_eq!(
+        preflight_beside_capture(async { Ok(()) }, async {
+            Err::<&str, _>("no foreground target is available".to_owned())
+        })
+        .await,
+        Err("no foreground target is available".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn already_spawned_blocking_work_is_joined_with_its_result() {
+    let work = tokio::task::spawn_blocking(|| Some("prompt".to_owned()));
+    assert_eq!(join_blocking(work).await.flatten(), Some("prompt".into()));
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn selected_text_blocking_work_leaves_the_async_owner_free() {
     // On a single-threaded runtime, inline blocking work would stall every
