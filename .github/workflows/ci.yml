@@ -1,8 +1,20 @@
 name: CI
 
+# Runs only when main changes (a merged PR or a direct push), never for
+# branch pushes or pull requests, to save runner minutes. Changes that touch
+# only documentation are skipped; run it by hand with workflow_dispatch.
 on:
   push:
-  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:
+
+# A newer run on the same ref supersedes an older one still running.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
