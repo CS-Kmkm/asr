@@ -135,8 +135,69 @@ uv run scripts/bench_asr.py --backend faster-whisper --language ja-JP --quantiza
 ```
 
 出力先の親ディレクトリは先に用意し、比較ごとに新しい出力名を使う。既存結果は
-上書きされない。このハーネスは録音中のlive処理や停止後の補正・挿入、idle間隔を
-再現しないため、ASR単体の結果だけでアプリ全体の高速化を判断しない。
+上書きされない。停止後の補正・挿入は再現しないため、ASR単体の結果だけでアプリ全体の
+高速化を判断しない。
+
+#### 3.2.1 アプリと同じ要求条件(M2)
+
+既定(`--request-shape production`)では、各`transcribe`要求をアプリの最終認識と同じ形で
+送る(`src-tauri/src/asr.rs`の`transcribe_request`)。
+
+- `prompt`と`language`は常に含め、未指定なら`null`とする。`decoding`は送らない。
+- キーはserde_jsonと同じ辞書順で直列化し、各行をLFで終える。同じ音声パス・辞書・
+  localeなら、アプリが送る行とバイト単位で一致する。
+- `prompt`はアプリの`Storage::dictionary_asr_prompt_for`(`storage.rs`)と同じ規則で
+  組み立てる。`priority`降順・`surface`昇順に並べ、scopeで絞り込む。faster-whisperは
+  surface→alias→手動登録のreadingの順に重複を除き、`, `区切り・200文字以内のhotwordsに
+  する。その他のbackendは`reading => surface (aliases: …)`を1行ずつ、1200文字以内で連結する
+  (`auto`の項目はsurfaceのみ)。整形には`--backend`の値を使う。
+- 辞書は`--dictionary-csv`で渡す。形式はアプリの辞書CSV取込と同じ
+  `reading,surface,category,aliases,priority,app_scope`(aliasは`|`区切り、priorityの空欄は0)。
+  確定済み候補(`auto`)を再現する場合に限り、末尾に`source`列(`manual`/`auto`)を足せる。
+  `--prompt TERM`は、readingとsurfaceがどちらもTERMの手動・global項目として同じ規則で
+  整形される(以前のように語のリストをそのまま送るのではない)。
+- `app:`・`category:` scopeの項目は、`--app-key`・`--app-category`を指定したときだけ対象に
+  なる。指定しない場合は、アプリのEdit/Askや対象アプリ不明の状態と同じく、global項目だけを使う。
+- 結果JSONの`config.prompt`には、辞書本文ではなく文字数・項目数・SHA-256を記録する。
+  `config.audio_format`には各WAVのサンプルレート・チャンネル数・サンプル幅を記録する。
+  アプリが認識に渡すWAVは、faster-whisperなら16 kHz、ほかのbackendなら24 kHzのmono PCM16で、
+  ノイズ抑制などの前処理も済んでいる。比較には同じ条件で用意した音声を使う。
+- load直後にhealthで問い合わせた実device/compute typeを`config.worker_health`に記録する
+  (どの計時にも含めない)。`--record-device`では各要求後の値と、観測した組合せの一覧
+  (`config.observed_devices`)も記録する。
+
+`--request-shape legacy`は、この変更より前の要求(未指定の`prompt`/`language`を省略し、
+`--prompt`の語をリストのまま送る)を再現する。以前の結果と比べるときだけ使う。
+legacyでは`--dictionary-csv`・`--app-key`・`--app-category`・`--live-preview`は使えない。
+
+#### 3.2.2 idle後とライブプレビュー競合
+
+`--idle-gap-s N`は、warmの各要求の前にN秒待つ(計時に含めない)。cold計測には適用しない。
+しばらく操作しなかった後の認識を測るときに使う。
+
+`--live-preview`は、warmの各最終要求の前に録音1回分のライブプレビュー要求を流す。
+`live_dictation.rs`の直列ループと同じく、`--live-interval-ms`(既定150 ms、`LIVE_INTERVAL`)
+待つ→`--live-prep-ms`の音声準備→プレビュー要求を1件送り応答を待つ、を繰り返す。
+`--live-recording-s`秒(既定は最終音声の長さ)で停止したとみなす。待機中の停止はすぐ反映される。
+準備中やプレビュー要求の処理中に停止した場合は、それが終わるまで最終要求を送らない
+(`pipeline/stop.rs`はlive taskをjoinしてから最終認識を始める)。ワーカーは`cancel`以外の
+要求を受信順に1件ずつ処理するため、同時送信による競合は起きない。競合は「処理中のプレビュー
+の後ろに最終要求が並ぶ」待ちとしてモデル化している。プレビュー要求は最終要求と同じ
+`prompt`/`language`を持ち、`--live-preview-greedy`(設定「ライブプレビューを軽量化」に相当)を
+指定したときだけ`"decoding":"greedy"`を加える。`--live-preview-audio`で別の音声を使える。
+
+各warm sampleには、停止から最終要求を送れるまでの待ち`live_drain_ms`、それに最終要求の
+往復を足した`stop_to_final_ms`、プレビュー回数を記録する。`warm`にはこれらとプレビュー往復
+(`preview_wall_ms`)の要約が加わる。プレビューの認識結果はsampleに含めないため、
+`score_asr.py`の採点対象にならない。`wall_ms`と`duration_ms`は従来どおり最終要求だけを表す。
+
+制約: アプリは区間判定で不要な反復の認識を省き、発話中の伸びていく区間だけを認識する。
+このハーネスは毎回の反復で同じ音声全体を認識するため、プレビュー負荷の上限側を測る。
+cold計測にはidle間隔もプレビュー負荷も加えない。
+
+```powershell
+uv run scripts/bench_asr.py --backend faster-whisper --language ja-JP --dictionary-csv bench_audio/dictionary.csv --idle-gap-s 30 --live-preview --live-preview-greedy --record-device --audio bench_audio/quiet/ja_short_01.wav --repeat 10 --cold-runs 3 --json --output results/ja_production_live.json
+```
 
 ### 3.3 VRAM の測り方(nvidia-smi)
 
@@ -300,7 +361,18 @@ uv run python scripts\bench_asr.py --repeat 10 --audio bench_audio\ja_3s.wav `
 | `--audio WAV` | (なし) | 計測対象 WAV。複数指定可(繰り返し) |
 | `--repeat` | `5` | warm の 1 音声あたり反復回数 |
 | `--cold-runs` | `1` | プロセス再起動込み cold 計測の回数 |
-| `--prompt TERM` | (なし) | ホットワード/辞書語を prompt として渡す。複数可 |
+| `--language` | (なし) | 音声locale(例 `ja-JP`)。アプリの設定と同じ値を渡す |
+| `--prompt TERM` | (なし) | 辞書語。readingとsurfaceがTERMの手動項目としてアプリと同じ形式に整形する。複数可(§3.2.1) |
+| `--dictionary-csv CSV` | (なし) | アプリの辞書CSV取込形式の辞書。アプリと同じ形式でpromptに整形する(§3.2.1) |
+| `--app-key` / `--app-category` | (なし) | `app:`・`category:` scopeの辞書項目を対象にする対象アプリ情報 |
+| `--request-shape` | `production` | `production`はアプリの要求形式。`legacy`は以前のベンチの要求形式 |
+| `--idle-gap-s` | `0` | warmの各要求の前の待ち秒数(計時外) |
+| `--live-preview` | off | warmの各要求の前にライブプレビュー要求を直列に流す(§3.2.2) |
+| `--live-preview-greedy` | off | プレビュー要求に`"decoding":"greedy"`を付ける |
+| `--live-preview-audio WAV` | 最終音声 | プレビュー要求に使う音声 |
+| `--live-recording-s` | 音声長 | 停止までの録音時間とみなす秒数 |
+| `--live-interval-ms` | `150` | ライブ反復間の待ち(`LIVE_INTERVAL`) |
+| `--live-prep-ms` | `0` | 反復ごとの音声準備時間の模擬値 |
 | `--worker-cmd ...` | (なし) | 既定起動コマンドを上書き(以降の全トークン) |
 | `--timeout` | `300` | リクエストごとのタイムアウト秒(ハング防止) |
 | `--json` | off | markdown 要約の代わりに JSON を出力 |
@@ -313,6 +385,9 @@ uv run python scripts\bench_asr.py --repeat 10 --audio bench_audio\ja_3s.wav `
 - markdown 要約の **「warm duration (ASR pure)」** = ASR 成分(予算 p50 < 800ms)。
 - **「warm wall (round trip)」** = ASR 成分 + IPC/直列化。
 - **「cold load」** = 初回ロード時間(§9.3)。
+- `--live-preview`時の **「warm stop -> final」** = 停止時に処理中だったプレビューの待ち +
+  最終要求の往復。アプリの停止→ASR完了に近い値で、「warm wall」とは別に比較する。
+- 要約冒頭のdevice・locale・要求形式・prompt指紋・idle/live条件が一致する結果同士だけを比較する。
 - 要約末尾に ASR 成分予算(p50 < 800ms)に対する簡易 PASS/REVIEW ヒントを表示する
   (あくまで ASR スライス単体。最終ゲートは §1.2 の全体予算と §4 で判断)。
 - `--json` の数値を §4.3 のテンプレート表へ転記し、§4.2 の判定サマリを確定させる。
