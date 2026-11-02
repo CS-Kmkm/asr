@@ -4432,12 +4432,19 @@ mod tests {
     fn speculative_correction_defaults_off_and_an_unreadable_value_repairs_only_itself() {
         let mut saved = serde_json::to_value(Settings::default()).unwrap();
         saved["textCorrectionEnabled"] = serde_json::json!(true);
-        saved.as_object_mut().unwrap().remove("speculativeCorrection");
+        saved
+            .as_object_mut()
+            .unwrap()
+            .remove("speculativeCorrection");
         let old = load_settings(&saved.to_string());
         assert!(!old.settings.speculative_correction);
         assert!(old.repairs.is_empty());
         saved["speculativeCorrection"] = serde_json::json!(true);
-        assert!(load_settings(&saved.to_string()).settings.speculative_correction);
+        assert!(
+            load_settings(&saved.to_string())
+                .settings
+                .speculative_correction
+        );
         saved["speculativeCorrection"] = serde_json::json!(1);
         let repaired = load_settings(&saved.to_string());
         assert!(!repaired.settings.speculative_correction);
