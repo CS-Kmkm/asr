@@ -122,6 +122,17 @@ pub struct Storage {
     completions: Arc<completion_queue::CompletionQueue>,
 }
 
+/// A reserved place in the deferred completion queue; see
+/// [`Storage::reserve_completion`]. Dropping it unused releases the place.
+pub struct CompletionReservation(completion_queue::Reservation);
+
+impl CompletionReservation {
+    /// Queues the reserved job.
+    pub fn defer(self, job: impl FnOnce() + Send + 'static) {
+        self.0.push(Box::new(job));
+    }
+}
+
 /// Builds without the V2 `shortcuts` field read one scalar chord per mode.
 /// Mirroring each mode's primary chord keeps those chords after a downgrade;
 /// an older build that rewrites settings drops `shortcuts`, and the next
@@ -913,13 +924,21 @@ impl Storage {
         self.connection.lock().map_err(|_| StorageError::Lock)
     }
 
-    /// Runs `job` on a background thread after every job deferred before it.
-    /// A delivered take defers its remaining persistence and cleanup here so
-    /// the next take need not wait; the job owns what it writes or removes.
-    /// Delete all and settings saves (retention changes) first wait for every
-    /// queued job, so none of its writes lands after such a deletion.
+    #[cfg(test)]
     pub fn defer_completion(&self, job: impl FnOnce() + Send + 'static) {
-        self.completions.push(Box::new(job));
+        self.reserve_completion().defer(job);
+    }
+
+    /// Reserves a place for a job that runs on a background thread after
+    /// every job reserved before it. A delivered take defers its remaining
+    /// persistence and cleanup there so the next take need not wait; the job
+    /// owns what it writes or removes. Delete all and settings saves
+    /// (retention changes) first wait for every reserved job, so none of its
+    /// writes lands after such a deletion. A take reserves before it writes
+    /// its History item, so a deletion that starts before the job is queued
+    /// still waits for it.
+    pub fn reserve_completion(&self) -> CompletionReservation {
+        CompletionReservation(self.completions.reserve())
     }
 
     /// Waits up to `timeout` for every deferred job queued so far, as at app
@@ -928,7 +947,8 @@ impl Storage {
         self.completions.drain(Some(timeout))
     }
 
-    /// Waits for every deferred job queued so far before a privacy deletion.
+    /// Waits for every deferred job queued or reserved so far before a
+    /// privacy deletion.
     /// Jobs only write storage, emit events and remove temporary files, so
     /// they finish without anything this caller holds.
     fn wait_for_deferred_completions(&self) {

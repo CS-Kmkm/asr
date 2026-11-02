@@ -2,8 +2,8 @@
 //!
 //! Each job owns what it writes or removes (metrics, temporary audio) and runs
 //! on one background thread in submission order. Storage privacy deletions
-//! wait for every job queued before them, so deferred writes never land after
-//! a deletion the user asked for. A worker thread exists only while jobs are
+//! wait for every job queued or reserved before them, so deferred writes never
+//! land after a deletion the user asked for. A worker thread exists only while jobs are
 //! queued.
 use std::{
     collections::VecDeque,
@@ -39,11 +39,20 @@ impl CompletionQueue {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Queues `job` after every job queued before it.
-    pub(crate) fn push(self: &Arc<Self>, job: Job) {
+    /// Counts a job that its owner queues later, so a drain that starts in
+    /// between already waits for it. The reservation is released when its
+    /// job is queued, or when it is dropped unused.
+    pub(crate) fn reserve(self: &Arc<Self>) -> Reservation {
+        self.lock().queued += 1;
+        Reservation {
+            queue: Some(Arc::clone(self)),
+        }
+    }
+
+    /// Adds an already counted job and starts a worker if none runs.
+    fn enqueue(self: &Arc<Self>, job: Job) {
         let mut state = self.lock();
         state.jobs.push_back(job);
-        state.queued += 1;
         if state.running {
             return;
         }
@@ -108,6 +117,31 @@ impl CompletionQueue {
     }
 }
 
+/// A counted place in the queue for a job its owner has yet to build.
+pub(crate) struct Reservation {
+    queue: Option<Arc<CompletionQueue>>,
+}
+
+impl Reservation {
+    /// Queues the reserved job after every job queued before it.
+    pub(crate) fn push(mut self, job: Job) {
+        if let Some(queue) = self.queue.take() {
+            queue.enqueue(job);
+        }
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        // An unused reservation counts as finished, so no drain waits for it.
+        if let Some(queue) = self.queue.take() {
+            let mut state = queue.lock();
+            state.finished += 1;
+            queue.progress.notify_all();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,7 +154,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         for index in 0..50 {
             let sender = sender.clone();
-            queue.push(Box::new(move || {
+            queue.reserve().push(Box::new(move || {
                 sender.send((index, thread::current().id())).unwrap();
             }));
         }
@@ -137,12 +171,14 @@ mod tests {
     fn a_bounded_drain_reports_unfinished_work_and_a_panic_does_not_stall_the_queue() {
         let queue = Arc::new(CompletionQueue::default());
         let (release, gate) = mpsc::channel::<()>();
-        queue.push(Box::new(move || {
+        queue.reserve().push(Box::new(move || {
             let _ = gate.recv();
         }));
-        queue.push(Box::new(|| panic!("job failure")));
+        queue.reserve().push(Box::new(|| panic!("job failure")));
         let (sender, receiver) = mpsc::channel();
-        queue.push(Box::new(move || sender.send(()).unwrap()));
+        queue
+            .reserve()
+            .push(Box::new(move || sender.send(()).unwrap()));
         assert!(!queue.drain(Some(Duration::from_millis(20))));
         release.send(()).unwrap();
         assert!(queue.drain(Some(Duration::from_secs(10))));
@@ -150,11 +186,26 @@ mod tests {
     }
 
     #[test]
+    fn a_drain_waits_for_a_reservation_until_its_job_ran_or_it_was_dropped() {
+        let queue = Arc::new(CompletionQueue::default());
+        let reservation = queue.reserve();
+        // Work counted before a deletion but not yet queued still blocks it.
+        assert!(!queue.drain(Some(Duration::from_millis(20))));
+        let (sender, receiver) = mpsc::channel();
+        reservation.push(Box::new(move || sender.send(()).unwrap()));
+        assert!(queue.drain(Some(Duration::from_secs(10))));
+        assert!(receiver.try_recv().is_ok());
+
+        drop(queue.reserve());
+        assert!(queue.drain(Some(Duration::from_millis(20))));
+    }
+
+    #[test]
     fn a_job_that_drains_does_not_wait_for_itself() {
         let queue = Arc::new(CompletionQueue::default());
         let inner = Arc::clone(&queue);
         let (sender, receiver) = mpsc::channel();
-        queue.push(Box::new(move || {
+        queue.reserve().push(Box::new(move || {
             sender.send(inner.drain(None)).unwrap();
         }));
         assert_eq!(receiver.recv_timeout(Duration::from_secs(10)), Ok(true));

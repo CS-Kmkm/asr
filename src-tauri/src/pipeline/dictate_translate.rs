@@ -387,6 +387,9 @@ async fn finish_owned(
         Ok(InsertResult::PasteUnverified) => "paste_unverified",
     };
     let inserted = insertion_result == Ok(InsertResult::ClipboardPaste);
+    // Reserved before the History save so a Delete all that starts from here
+    // on also waits for this take's deferred metrics.
+    let completion_slot = storage.reserve_completion();
     let history_save_status = save_history(
         storage,
         &NewHistoryItem {
@@ -446,6 +449,7 @@ async fn finish_owned(
         },
         history_save_status,
         artifact_cleanup,
+        reservation: completion_slot,
     };
     let insertion = match insertion_result {
         Ok(insertion) => insertion,
@@ -613,14 +617,50 @@ struct DeferredCompletion {
     metrics: TakeMetrics,
     history_save_status: crate::pipeline::finish::HistorySaveStatus,
     artifact_cleanup: crate::TempArtifact,
+    reservation: crate::storage::CompletionReservation,
 }
 
 impl DeferredCompletion {
     fn queue(self) {
-        let storage = self.storage.clone();
-        storage.defer_completion(move || self.run());
+        let (reservation, job) = self.into_job();
+        reservation.defer(move || job.run());
     }
 
+    fn into_job(self) -> (crate::storage::CompletionReservation, CompletionJob) {
+        let Self {
+            app,
+            storage,
+            app_context,
+            metrics,
+            history_save_status,
+            artifact_cleanup,
+            reservation,
+        } = self;
+        (
+            reservation,
+            CompletionJob {
+                app,
+                storage,
+                app_context,
+                metrics,
+                history_save_status,
+                artifact_cleanup,
+            },
+        )
+    }
+}
+
+/// The part of a [`DeferredCompletion`] that runs on the completion queue.
+struct CompletionJob {
+    app: tauri::AppHandle,
+    storage: crate::storage::Storage,
+    app_context: Option<types::AppContext>,
+    metrics: TakeMetrics,
+    history_save_status: crate::pipeline::finish::HistorySaveStatus,
+    artifact_cleanup: crate::TempArtifact,
+}
+
+impl CompletionJob {
     /// Writes the metrics, reports a persistence failure with the same
     /// status as before, then removes the temporary capture.
     fn run(mut self) {
