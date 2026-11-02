@@ -236,9 +236,9 @@ async fn finish_owned(
         let correction_started = Instant::now();
         let style_guidance = super::speculative::style_guidance(&settings, app_context.as_ref());
         // An opt-in speculative correction of this exact text with these
-        // exact inputs replaces the request; on a hit the AI span and first
-        // output measure only the wait from here. Any other speculation is
-        // cancelled here, never awaited.
+        // exact inputs replaces the request; on a hit the per-take AI span
+        // and first-output span measure only the wait from here. Any other
+        // speculation is cancelled here, never awaited.
         let adopted = match speculation.take() {
             Some(speculation) => {
                 speculation
@@ -254,9 +254,14 @@ async fn finish_owned(
             }
             None => None,
         };
+        let speculative_hit = adopted.is_some();
         let result = match adopted {
             Some(adopted) => {
-                first_output_ms = adopted.first_output_ms;
+                // Span only: a clamped wait is not comparable with the
+                // `text_correction_first_output` metric of full requests.
+                if let Some(first_output_ms) = adopted.first_output_ms {
+                    trace.span(TakeSpan::AiFirstOutput, first_output_ms);
+                }
                 Ok(adopted.text)
             }
             None => {
@@ -283,12 +288,11 @@ async fn finish_owned(
                 emit_correction_preview(app, &final_text, "final");
                 processed_text = Some(final_text.clone());
                 llm_provider = Some(settings.correction_provider.clone());
-                let _ = metrics.add_metric(
-                    "text_correction",
-                    Some(settings.correction_provider.as_str()),
-                    Some(correction_ms),
-                    true,
-                    None,
+                record_text_correction_success(
+                    metrics,
+                    &settings.correction_provider,
+                    correction_ms,
+                    speculative_hit,
                 );
             }
             Err(correction::CorrectionError::Cancelled) => {
@@ -580,6 +584,24 @@ async fn finish_owned(
     })
 }
 
+/// Records a successful Dictate correction. An adopted speculative result
+/// counts but is untimed, so `text_correction` percentiles stay those of
+/// full provider requests (its full duration is in `speculative_correction`).
+fn record_text_correction_success(
+    metrics: crate::storage::MetricRecorder<'_>,
+    provider: &str,
+    correction_ms: i64,
+    speculative_hit: bool,
+) {
+    let _ = metrics.add_metric(
+        "text_correction",
+        Some(provider),
+        (!speculative_hit).then_some(correction_ms),
+        true,
+        None,
+    );
+}
+
 /// Remembers when the provider's first non-empty streamed text arrived.
 fn note_first_output(first_output_ms: &mut Option<i64>, started: Instant, delta: &str) {
     if first_output_ms.is_none() && !delta.is_empty() {
@@ -761,6 +783,22 @@ fn record_first_output(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_speculative_hit_counts_as_text_correction_but_stays_out_of_its_timings() {
+        let storage = crate::storage::Storage::in_memory().unwrap();
+        let metrics = storage.metrics_for(PipelineMode::Dictate, None);
+        record_text_correction_success(metrics, "openai", 900, false);
+        record_text_correction_success(metrics, "openai", 40, true);
+        let report = storage.diagnostics().unwrap();
+        let row = report
+            .summaries
+            .iter()
+            .find(|row| row.event_type == "text_correction")
+            .unwrap();
+        assert_eq!((row.count, row.successes, row.timed_count), (2, 2, 1));
+        assert_eq!(row.p50_ms, Some(900));
+    }
 
     #[test]
     fn first_output_ignores_empty_updates_and_preserves_the_first_observation() {

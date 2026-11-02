@@ -537,9 +537,11 @@ Full usage and Phase 0 gate criteria are documented in
   the final transcript is corrected as usual, so a miss (also when automatic
   voice mode chooses another mode) costs an extra AI request. A take cancelled
   after stop may already have sent the live text. Speculative streaming text is
-  never shown. On a hit, the `ai` span, `text_correction` and
-  `text_correction_first_output` measure only the wait from where the normal
-  correction would have started (first output is 0 if it arrived earlier).
+  never shown. On a hit, the per-take `ai` and `first_output` spans measure
+  only the wait from where the normal correction would have started (first
+  output is 0 if it arrived earlier); `text_correction` is still counted as a
+  success but untimed, so its percentiles stay those of full requests, and no
+  `text_correction_first_output` is recorded.
   The content-free `speculative_correction` metric records `hit` (success,
   timed as the whole speculative request) or `miss_text`, `miss_inputs`,
   `miss_mode`, `failed`, `not_started:no_hypothesis`, `not_started:consent`;

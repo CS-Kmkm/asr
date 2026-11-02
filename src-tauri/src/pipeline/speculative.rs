@@ -169,7 +169,10 @@ impl Outcome {
 pub(crate) struct Adopted {
     pub(crate) text: String,
     /// Time from the adoption point to the first streamed text, zero when
-    /// it arrived earlier; `None` when no text was streamed.
+    /// it arrived earlier; `None` when no text was streamed. Only the
+    /// per-take first-output span uses it: the `text_correction_first_output`
+    /// metric is not recorded for a hit, and its `text_correction` record is
+    /// untimed.
     pub(crate) first_output_ms: Option<i64>,
 }
 
