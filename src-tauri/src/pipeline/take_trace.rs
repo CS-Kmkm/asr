@@ -27,6 +27,9 @@ struct TraceState {
     outcome: Option<TakeOutcome>,
     spans: [Option<i64>; TakeSpan::ALL.len()],
     storage: Storage,
+    /// The completion-queue place of this take's row, taken when the take
+    /// is concluded, before its lifecycle guard is released.
+    reservation: Option<crate::storage::CompletionReservation>,
     released: bool,
 }
 
@@ -80,6 +83,7 @@ impl TakeTrace {
             outcome: None,
             spans: [None; TakeSpan::ALL.len()],
             storage: storage.clone(),
+            reservation: None,
             released: false,
         }))))
     }
@@ -133,8 +137,16 @@ impl TakeTrace {
     /// Fixes the terminal outcome from the stop pipeline's result: a
     /// delivered take by its insertion label, otherwise an explicit outcome
     /// or a failure/cancel at the stage it reached.
+    ///
+    /// Also reserves the row's place on the completion queue. Every caller
+    /// concludes while it still owns the lifecycle, so a Delete all or
+    /// retention purge that starts once a new take is accepted waits for
+    /// this row and removes it, instead of the row landing after it.
     pub(crate) fn conclude(&self, delivered: Result<&str, ()>, cancelled: bool) {
         self.with(|state| {
+            if !state.released && state.reservation.is_none() {
+                state.reservation = Some(state.storage.reserve_completion());
+            }
             state.outcome = Some(match delivered {
                 Ok(label) => outcome_for_label(label),
                 Err(()) => state.outcome.unwrap_or(if cancelled {
@@ -153,7 +165,7 @@ impl TakeTrace {
         let Some(shared) = &self.0 else {
             return;
         };
-        let storage = {
+        let (reservation, job_storage) = {
             let mut state = Self::lock(shared);
             if state.released {
                 return;
@@ -162,13 +174,16 @@ impl TakeTrace {
             if let Some(stop) = state.stop {
                 state.spans[TakeSpan::StopToNextTake.index()].get_or_insert(duration_ms(stop));
             }
-            state.storage.clone()
+            let reservation = state
+                .reservation
+                .take()
+                .unwrap_or_else(|| state.storage.reserve_completion());
+            (reservation, state.storage.clone())
         };
         let shared = Arc::clone(shared);
-        let job_storage = storage.clone();
         // Read at run time, so a completion job queued earlier by this take
         // has already added its own span.
-        storage.reserve_completion().defer(move || {
+        reservation.defer(move || {
             let record = Self::lock(&shared).record();
             let _ = job_storage.add_take_spans(&record);
         });
@@ -390,6 +405,26 @@ mod tests {
             assert_eq!(row.outcome, outcome);
             assert_eq!(row.stage.as_deref(), stage);
         }
+    }
+
+    #[test]
+    fn a_delete_all_after_the_lifecycle_release_removes_the_take_row() {
+        let storage = Storage::in_memory().unwrap();
+        let trace = TakeTrace::new(&storage, PipelineMode::Dictate);
+        trace.stopped(Instant::now());
+        // Concluded while the stop pipeline still owns the lifecycle.
+        trace.conclude(Ok("clipboard_paste"), false);
+        // The lifecycle is released; a Delete all starts before the row's
+        // job is queued, and must wait for it.
+        let deleting = {
+            let storage = storage.clone();
+            std::thread::spawn(move || storage.delete_all_history().unwrap())
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!deleting.is_finished(), "Delete all overtook the take row");
+        trace.release();
+        deleting.join().unwrap();
+        assert!(drained(&storage).is_empty());
     }
 
     #[test]
