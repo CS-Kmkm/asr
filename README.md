@@ -515,8 +515,49 @@ Full usage and Phase 0 gate criteria are documented in
   beam search) to lower load while recording; VAD and other options stay the
   same, preview text may be less accurate, and the final transcription after
   stopping always uses the normal decode.
+- Settings > Input "Incremental final transcription (experimental)" (off by
+  default, local speech backends only) lets Dictate and Translate transcribe
+  parts of the recording that end in a pause of at least about a second while
+  recording, with the normal final-recognition request, and transcribe only
+  the rest after stopping; the parts are joined in audio order. Each part is
+  prepared and recognized on its own, so the text may differ slightly from
+  whole-recording recognition (accuracy on real speech is not yet measured).
+  Any change of settings, dictionary prompt or loaded model during the take,
+  a failed part or incomplete coverage falls back to transcribing the whole
+  recording. It sends no audio to a cloud provider and records only a
+  content-free `asr_incremental` metric (used, or a fixed fallback reason).
+- Settings > AI text correction "Speculative correction (experimental)" (off by
+  default) applies only to Dictate with AI correction on and a live preview
+  that showed text. After stop (never while recording), it sends the last
+  live preview text to the AI provider, behind the same consent check, with
+  exactly the normal correction request, while the recording is still
+  transcribed. That result is used only if the final transcript equals it
+  exactly and the settings, dictionary hints and style guidance recomputed for
+  the final transcript are identical; otherwise the request is cancelled and
+  the final transcript is corrected as usual, so a miss (also when automatic
+  voice mode chooses another mode) costs an extra AI request. A take cancelled
+  after stop may already have sent the live text. Speculative streaming text is
+  never shown. On a hit, the per-take `ai` and `first_output` spans measure
+  only the wait from where the normal correction would have started (first
+  output is 0 if it arrived earlier); `text_correction` is still counted as a
+  success but untimed, so its percentiles stay those of full requests, and no
+  `text_correction_first_output` is recorded.
+  The content-free `speculative_correction` metric records `hit` (success,
+  timed as the whole speculative request) or `miss_text`, `miss_inputs`,
+  `miss_mode`, `failed`, `not_started:no_hypothesis`, `not_started:consent`;
+  a take that ends before the decision records nothing. Whatever this setting,
+  `live_final_match` records whether a Dictate take's last live preview text
+  equals its final transcript (success when equal, `differs` otherwise; no
+  text), written with the other stop-path timings.
 - History can be disabled; when disabled, transcript rows are not written
   (failed recordings kept for Retry are the exception described below).
+- Dictate and Translate save their History row (and kept recording) and any
+  dictionary candidate right after the take completes, in take order, so the
+  next take need not wait; the History and Dictionary pages update when they
+  land. Delete all and History/retention changes wait for these saves and then
+  apply to them. Quitting waits up to 3 s for them; a save still pending then
+  may be lost, and leftover temporary or partial recording files are removed
+  at the next start.
 - 履歴は本文検索と追加読み込みに対応しています。録音を削除した後も「原文をコピー」「再補正」「指定言語へ翻訳」を使えます。
   再補正では現在のスタイル設定、または保存済みのスタイルを選択できます。再処理は原文を使い、
   入力先への挿入は行いません。結果は履歴の保持設定に従って別の行に保存され、元の行は変更しません。
@@ -558,6 +599,37 @@ Full usage and Phase 0 gate criteria are documented in
   `insertion` success requires confirmed paste. Timing-event success means an
   observation was made, not that final delivery succeeded. Compare confirmed
   pastes separately from unverified, clipboard-only, failed or cancelled takes.
+- Per-take spans (`take_spans`, record version 1) are kept apart from those
+  events and cover every recording take, including failed starts and cancels.
+  Each take gets a random, ephemeral id at its start request (not derived
+  from the operation, time or History row, and never exported), exactly one
+  outcome (`pasted`, `paste_unverified`, `clipboard_only`, `insertion_failed`,
+  `panel`, `search`, or `failed`/`cancelled` with the stage `start`,
+  `recording`, `capture`, `model`, `asr`, `route`, `ai` or `delivery`) and the
+  spans that happened on it, in milliseconds; a span that did not happen is
+  missing, not zero. Spans: `record_ready` (start request to the microphone
+  capturing), `model_ensure` (readiness check at stop), `audio_stop`,
+  `live_drain`, `asr` (the final recognition request), `shortcut_release`
+  (only when awaited), `route` (automatic routing only), `plan` (Ask
+  planning), `ai` (the mode's AI request) and `first_output` (within `ai`),
+  `settle` (only a real wait), `paste` (the output commit: paste, copy or
+  answer-panel publish), `helper_exit` (Dictate/Translate draft drop),
+  `history_save` (Edit's includes its metric write; Dictate/Translate's runs
+  inside `completion_job`), `completion_job` (the Dictate/Translate work
+  deferred until after the take completes, in this order: History save with
+  its recording copy, dictionary candidate, metrics, persistence warning and
+  temporary-audio cleanup), `stop_to_delivery` (stop
+  request to the output commit returning, delivered takes only) and
+  `stop_to_next_take` (stop request to the lifecycle accepting a new take).
+  The `ai` stage covers all mode processing before output. Records are
+  written on the deferred completion queue, follow the History retention and
+  Delete all, and are not written for dictation tests or while History is off.
+  An older build can still open the database but does not purge these
+  records, so each open removes every take record when no metric remains and
+  otherwise those older than the oldest remaining metric.
+  Storage diagnostics (`takes`, included in copied diagnostics) aggregate them
+  per mode, outcome and stage with timed and missing counts and nearest-rank
+  p50/p95 per span.
 - New SQLite deletions overwrite freed record content using secure-delete.
   History deletions request a WAL checkpoint/truncation; an active external reader or
   database error can defer this until the next policy pass. Previously freed

@@ -54,6 +54,233 @@ impl MetricRecorder<'_> {
     }
 }
 
+/// Shape of a `take_spans` row. Diagnostics aggregate only this version, so a
+/// later change of span boundaries never mixes with these records.
+pub(crate) const TAKE_SPAN_VERSION: i64 = 1;
+
+/// Metric written with every `take_spans` row: no duration, success unless
+/// the take failed or was cancelled. It anchors the row for
+/// [`reconcile_take_spans`].
+pub(crate) const TAKE_METRIC_EVENT: &str = "take";
+
+/// One timed section of a recording take, in milliseconds. A span that did
+/// not happen on a take stays NULL, never zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TakeSpan {
+    /// Start request to the microphone capturing.
+    RecordReady,
+    /// Speech-model readiness check at stop.
+    ModelEnsure,
+    AudioStop,
+    LiveDrain,
+    /// Final recognition request.
+    Asr,
+    /// Waiting for the shortcut keys to be released, when it was awaited.
+    ShortcutRelease,
+    /// Automatic voice-mode routing.
+    Route,
+    /// Ask action planning.
+    AiPlan,
+    /// The AI request of the mode (correction, translation, edit, answer).
+    Ai,
+    /// AI start to the first nonempty streamed output; inside `Ai`.
+    AiFirstOutput,
+    /// Waiting for quiet input before the final paste, when it waited.
+    Settle,
+    /// The output commit: paste, copy or answer-panel publish with checks.
+    Paste,
+    /// Dropping the live draft, which stops the input-monitor helper.
+    HelperExit,
+    /// The History save: before Edit/Ask complete; inside the deferred
+    /// completion job for Dictate/Translate.
+    HistorySave,
+    /// The Dictate/Translate deferred completion job (History, dictionary
+    /// candidate, metrics and temporary-audio cleanup).
+    CompletionJob,
+    /// Stop request to the output commit returning.
+    StopToDelivery,
+    /// Stop request to the lifecycle accepting a new take.
+    StopToNextTake,
+}
+
+impl TakeSpan {
+    pub(crate) const ALL: [Self; 17] = [
+        Self::RecordReady,
+        Self::ModelEnsure,
+        Self::AudioStop,
+        Self::LiveDrain,
+        Self::Asr,
+        Self::ShortcutRelease,
+        Self::Route,
+        Self::AiPlan,
+        Self::Ai,
+        Self::AiFirstOutput,
+        Self::Settle,
+        Self::Paste,
+        Self::HelperExit,
+        Self::HistorySave,
+        Self::CompletionJob,
+        Self::StopToDelivery,
+        Self::StopToNextTake,
+    ];
+
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::RecordReady => "record_ready",
+            Self::ModelEnsure => "model_ensure",
+            Self::AudioStop => "audio_stop",
+            Self::LiveDrain => "live_drain",
+            Self::Asr => "asr",
+            Self::ShortcutRelease => "shortcut_release",
+            Self::Route => "route",
+            Self::AiPlan => "plan",
+            Self::Ai => "ai",
+            Self::AiFirstOutput => "first_output",
+            Self::Settle => "settle",
+            Self::Paste => "paste",
+            Self::HelperExit => "helper_exit",
+            Self::HistorySave => "history_save",
+            Self::CompletionJob => "completion_job",
+            Self::StopToDelivery => "stop_to_delivery",
+            Self::StopToNextTake => "stop_to_next_take",
+        }
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Where a take that produced no output ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TakeStage {
+    /// Before the microphone was capturing.
+    Start,
+    /// While recording, before a stop.
+    Recording,
+    /// Audio stop, live drain and settings after a stop.
+    Capture,
+    /// Speech-model readiness at stop.
+    Model,
+    Asr,
+    /// Automatic voice-mode routing.
+    Route,
+    /// Mode processing before output, including its AI request.
+    Ai,
+    /// The output commit.
+    Delivery,
+}
+
+impl TakeStage {
+    pub(crate) const ALL: [Self; 8] = [
+        Self::Start,
+        Self::Recording,
+        Self::Capture,
+        Self::Model,
+        Self::Asr,
+        Self::Route,
+        Self::Ai,
+        Self::Delivery,
+    ];
+
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Recording => "recording",
+            Self::Capture => "capture",
+            Self::Model => "model",
+            Self::Asr => "asr",
+            Self::Route => "route",
+            Self::Ai => "ai",
+            Self::Delivery => "delivery",
+        }
+    }
+}
+
+/// The single terminal outcome of a take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TakeOutcome {
+    /// A confirmed paste or replacement.
+    Pasted,
+    PasteUnverified,
+    ClipboardOnly,
+    /// Neither the target nor the clipboard received the output.
+    InsertionFailed,
+    /// An Ask answer or notice shown in the answer panel.
+    Panel,
+    /// An Ask fixed search opened in the browser.
+    Search,
+    Failed(TakeStage),
+    Cancelled(TakeStage),
+}
+
+impl TakeOutcome {
+    pub(crate) const CODES: [&'static str; 8] = [
+        "pasted",
+        "paste_unverified",
+        "clipboard_only",
+        "insertion_failed",
+        "panel",
+        "search",
+        "failed",
+        "cancelled",
+    ];
+
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::Pasted => "pasted",
+            Self::PasteUnverified => "paste_unverified",
+            Self::ClipboardOnly => "clipboard_only",
+            Self::InsertionFailed => "insertion_failed",
+            Self::Panel => "panel",
+            Self::Search => "search",
+            Self::Failed(_) => "failed",
+            Self::Cancelled(_) => "cancelled",
+        }
+    }
+
+    pub(crate) const fn stage(self) -> Option<TakeStage> {
+        match self {
+            Self::Failed(stage) | Self::Cancelled(stage) => Some(stage),
+            _ => None,
+        }
+    }
+}
+
+/// One finished take: a random take id, its recording mode, outcome and
+/// spans indexed by [`TakeSpan::index`]. Content-free by construction.
+#[derive(Clone, Debug)]
+pub(crate) struct TakeSpanRecord {
+    pub take_id: String,
+    pub mode: crate::state::PipelineMode,
+    pub outcome: TakeOutcome,
+    pub spans: [Option<i64>; TakeSpan::ALL.len()],
+}
+
+/// Spans of one take cohort. `missing_count` counts takes of the cohort
+/// without this span (or with an invalid one), so it is never read as zero.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TakeSpanSummary {
+    pub span: String,
+    pub timed_count: i64,
+    pub missing_count: i64,
+    pub p50_ms: Option<i64>,
+    pub p95_ms: Option<i64>,
+}
+
+/// Takes of one recording mode with the same terminal outcome (and, for a
+/// failure or cancel, the same stage). Only fixed codes; no take ids.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TakeCohortSummary {
+    pub mode: Option<String>,
+    pub outcome: String,
+    pub stage: Option<String>,
+    pub count: i64,
+    pub spans: Vec<TakeSpanSummary>,
+}
+
 // A worker model identifier can contain a local path or arbitrary server
 // text. Only fixed application codes may cross the diagnostics IPC boundary.
 const RETAINED_METRICS: &str = "WITH retained AS (
@@ -104,6 +331,9 @@ pub struct StorageDiagnostics {
     pub schema_version: i64,
     pub summaries: Vec<MetricSummary>,
     pub outcomes: Vec<MetricOutcome>,
+    /// Per-take spans grouped by outcome cohort (`take_spans`, version
+    /// [`TAKE_SPAN_VERSION`]); kept apart from the metric summaries above.
+    pub takes: Vec<TakeCohortSummary>,
 }
 
 impl Storage {
@@ -198,13 +428,246 @@ impl Storage {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+        let takes = take_cohorts(&connection)?;
         Ok(StorageDiagnostics {
             database_ok,
             schema_version,
             summaries,
             outcomes,
+            takes,
         })
     }
+
+    /// Writes one finished take. Like metrics, nothing is written while
+    /// History is off, and retention and Delete all remove these rows
+    /// together with the metrics.
+    ///
+    /// Each row is paired with a [`TAKE_METRIC_EVENT`] metric of the same
+    /// time, so a row is never older than every metric unless a purge that
+    /// skipped `take_spans` removed its pair (see [`reconcile_take_spans`]);
+    /// takes that end without other metrics, such as a cancelled recording,
+    /// survive the reconciliation.
+    pub(crate) fn add_take_spans(&self, record: &TakeSpanRecord) -> Result<(), StorageError> {
+        let mut connection = self.connection()?;
+        if super::stored_settings(&connection)?.history_retention
+            == crate::types::HistoryRetention::Never
+        {
+            return Ok(());
+        }
+        let columns: String = TakeSpan::ALL
+            .iter()
+            .map(|span| format!(", {}_ms", span.code()))
+            .collect();
+        let placeholders: String = (0..TakeSpan::ALL.len())
+            .map(|index| format!(", ?{}", index + 7))
+            .collect();
+        let mode = MetricContext {
+            mode: record.mode,
+            app_category: None,
+        }
+        .mode_code();
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let mut values: Vec<rusqlite::types::Value> = vec![
+            record.take_id.clone().into(),
+            TAKE_SPAN_VERSION.into(),
+            created_at.clone().into(),
+            mode.to_owned().into(),
+            record.outcome.code().to_owned().into(),
+            record
+                .outcome
+                .stage()
+                .map(|stage| stage.code().to_owned())
+                .into(),
+        ];
+        values.extend(record.spans.iter().map(|value| (*value).into()));
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            &format!(
+                "INSERT INTO take_spans(take_id, version, created_at, mode, outcome, stage{columns})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6{placeholders})"
+            ),
+            rusqlite::params_from_iter(values),
+        )?;
+        transaction.execute(
+            "INSERT INTO metrics(event_type, provider, duration_ms, success, error_code, created_at, mode, app_category)
+             VALUES (?1, NULL, NULL, ?2, NULL, ?3, ?4, NULL)",
+            rusqlite::params![
+                TAKE_METRIC_EVENT,
+                i64::from(record.outcome.stage().is_none()),
+                created_at,
+                mode,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Stored takes with their present spans, in write order.
+    #[cfg(test)]
+    pub(crate) fn take_records_for_test(&self) -> Vec<TakeRowForTest> {
+        let connection = self.connection().unwrap();
+        let columns: String = TakeSpan::ALL
+            .iter()
+            .map(|span| format!(", {}_ms", span.code()))
+            .collect();
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT take_id, outcome, stage{columns} FROM take_spans ORDER BY id"
+            ))
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                let mut spans = Vec::new();
+                for (index, span) in TakeSpan::ALL.iter().enumerate() {
+                    if let Some(value) = row.get::<_, Option<i64>>(index + 3)? {
+                        spans.push((span.code(), value));
+                    }
+                }
+                Ok(TakeRowForTest {
+                    take_id: row.get(0)?,
+                    outcome: row.get(1)?,
+                    stage: row.get(2)?,
+                    spans,
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct TakeRowForTest {
+    pub take_id: String,
+    pub outcome: String,
+    pub stage: Option<String>,
+    pub spans: Vec<(&'static str, i64)>,
+}
+
+#[cfg(test)]
+impl TakeRowForTest {
+    pub(crate) fn span(&self, span: TakeSpan) -> Option<i64> {
+        self.spans
+            .iter()
+            .find(|(code, _)| *code == span.code())
+            .map(|(_, value)| *value)
+    }
+}
+
+/// Removes take records an older build's purge should have removed. Such a
+/// build opens this database (the `take_spans` step keeps reader version 1)
+/// and its Delete all, History off and retention purges clear `metrics` but
+/// not `take_spans`. Run on every open: with no metrics left every take
+/// record goes, otherwise every one older than the oldest remaining metric.
+/// A record this build keeps is never removed, because its paired
+/// [`TAKE_METRIC_EVENT`] metric has the same time and goes only with it.
+/// Returns how many rows were deleted.
+pub(super) fn reconcile_take_spans(
+    connection: &rusqlite::Connection,
+) -> Result<usize, StorageError> {
+    Ok(connection.execute(
+        "DELETE FROM take_spans
+         WHERE NOT EXISTS (SELECT 1 FROM metrics)
+           OR created_at < (SELECT MIN(created_at) FROM metrics)",
+        [],
+    )?)
+}
+
+/// Aggregates current-version take records per (mode, outcome, stage) with
+/// nearest-rank percentiles per span, ranked in SQLite. Stored text outside
+/// the fixed codes maps to `other` (or no mode); take ids never leave SQLite.
+fn take_cohorts(connection: &rusqlite::Connection) -> Result<Vec<TakeCohortSummary>, StorageError> {
+    let quoted = |codes: Vec<&'static str>| {
+        codes
+            .into_iter()
+            .map(|code| format!("'{code}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let outcomes = quoted(TakeOutcome::CODES.to_vec());
+    let stages = quoted(TakeStage::ALL.iter().map(|stage| stage.code()).collect());
+    let span_columns: String = TakeSpan::ALL
+        .iter()
+        .map(|span| format!(", {}_ms", span.code()))
+        .collect();
+    let unpivot = TakeSpan::ALL
+        .iter()
+        .map(|span| {
+            let code = span.code();
+            format!("SELECT mode, outcome, stage, '{code}' AS span, {code}_ms AS ms FROM takes")
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let span_list = TakeSpan::ALL
+        .iter()
+        .enumerate()
+        .map(|(order, span)| format!("SELECT '{}' AS span, {order} AS ord", span.code()))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let mut query = connection.prepare(&format!(
+        "WITH takes AS (
+           SELECT
+             CASE WHEN mode IN ('dictate', 'translate', 'edit', 'ask', 'selected_text') THEN mode ELSE NULL END AS mode,
+             CASE WHEN outcome IN ({outcomes}) THEN outcome ELSE 'other' END AS outcome,
+             CASE WHEN stage IS NULL THEN NULL WHEN stage IN ({stages}) THEN stage ELSE 'other' END AS stage
+             {span_columns}
+           FROM take_spans WHERE version = {TAKE_SPAN_VERSION}
+         ), cohorts AS (
+           SELECT mode, outcome, stage, COUNT(*) AS n FROM takes GROUP BY mode, outcome, stage
+         ), spans AS ({unpivot}
+         ), ranked AS (
+           SELECT mode, outcome, stage, span, ms,
+             ROW_NUMBER() OVER (PARTITION BY mode, outcome, stage, span ORDER BY ms) AS rank,
+             COUNT(*) OVER (PARTITION BY mode, outcome, stage, span) AS n
+           FROM spans WHERE ms >= 0
+         ), timings AS (
+           SELECT mode, outcome, stage, span, COUNT(*) AS timed,
+             MAX(CASE WHEN rank = (n + 1) / 2 THEN ms END) AS p50,
+             MAX(CASE WHEN rank = (n * 95 + 99) / 100 THEN ms END) AS p95
+           FROM ranked GROUP BY mode, outcome, stage, span
+         ), span_list AS ({span_list})
+         SELECT c.mode, c.outcome, c.stage, c.n, s.span, COALESCE(t.timed, 0), t.p50, t.p95
+         FROM cohorts c CROSS JOIN span_list s
+         LEFT JOIN timings t ON t.mode IS c.mode AND t.outcome = c.outcome
+           AND t.stage IS c.stage AND t.span = s.span
+         ORDER BY c.mode, c.outcome, c.stage, s.ord",
+    ))?;
+    let rows = query.query_map([], |row| {
+        let count: i64 = row.get(3)?;
+        let timed_count: i64 = row.get(5)?;
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            count,
+            TakeSpanSummary {
+                span: row.get(4)?,
+                timed_count,
+                missing_count: count - timed_count,
+                p50_ms: row.get(6)?,
+                p95_ms: row.get(7)?,
+            },
+        ))
+    })?;
+    let mut cohorts: Vec<TakeCohortSummary> = Vec::new();
+    for row in rows {
+        let (mode, outcome, stage, count, span) = row?;
+        match cohorts.last_mut() {
+            Some(last) if last.mode == mode && last.outcome == outcome && last.stage == stage => {
+                last.spans.push(span);
+            }
+            _ => cohorts.push(TakeCohortSummary {
+                mode,
+                outcome,
+                stage,
+                count,
+                spans: vec![span],
+            }),
+        }
+    }
+    Ok(cohorts)
 }
 
 #[cfg(test)]
@@ -407,6 +870,356 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("sentinel"));
         assert!(!json.contains("small"));
+    }
+
+    fn take(outcome: TakeOutcome, spans: &[(TakeSpan, i64)]) -> TakeSpanRecord {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut record = TakeSpanRecord {
+            take_id: format!("take-id-sentinel-{id}"),
+            mode: crate::state::PipelineMode::Dictate,
+            outcome,
+            spans: [None; TakeSpan::ALL.len()],
+        };
+        for (span, ms) in spans {
+            record.spans[span.index()] = Some(*ms);
+        }
+        record
+    }
+
+    #[test]
+    fn every_take_span_has_a_column_in_the_schema() {
+        let storage = Storage::in_memory().unwrap();
+        let connection = storage.connection().unwrap();
+        for span in TakeSpan::ALL {
+            let exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('take_spans') WHERE name = ?1)",
+                    [format!("{}_ms", span.code())],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "{}", span.code());
+        }
+        for (index, span) in TakeSpan::ALL.into_iter().enumerate() {
+            assert_eq!(span.index(), index);
+        }
+    }
+
+    #[test]
+    fn take_cohorts_split_by_outcome_and_count_missing_spans_apart_from_zero() {
+        let storage = Storage::in_memory().unwrap();
+        for asr in [30, 10, 20] {
+            storage
+                .add_take_spans(&take(
+                    TakeOutcome::Pasted,
+                    &[(TakeSpan::Asr, asr), (TakeSpan::Settle, 0)],
+                ))
+                .unwrap();
+        }
+        storage
+            .add_take_spans(&take(TakeOutcome::Pasted, &[(TakeSpan::Asr, 40)]))
+            .unwrap();
+        storage
+            .add_take_spans(&take(
+                TakeOutcome::Cancelled(TakeStage::Asr),
+                &[(TakeSpan::AudioStop, 5)],
+            ))
+            .unwrap();
+        // Historical metrics stay in their own summaries; take records add
+        // only their untimed anchor metric.
+        storage
+            .add_metric("asr", None, Some(9999), true, None)
+            .unwrap();
+        let report = storage.diagnostics().unwrap();
+        let events: Vec<_> = report
+            .summaries
+            .iter()
+            .map(|summary| (summary.event_type.as_str(), summary.count, summary.p50_ms))
+            .collect();
+        assert_eq!(
+            events,
+            vec![("asr", 1, Some(9999)), (TAKE_METRIC_EVENT, 5, None)]
+        );
+        assert_eq!(report.takes.len(), 2);
+        let cancelled = &report.takes[0];
+        assert_eq!(
+            (cancelled.outcome.as_str(), cancelled.stage.as_deref()),
+            ("cancelled", Some("asr"))
+        );
+        assert_eq!(cancelled.mode.as_deref(), Some("dictate"));
+        let pasted = &report.takes[1];
+        assert_eq!((pasted.outcome.as_str(), pasted.count), ("pasted", 4));
+        assert_eq!(pasted.spans.len(), TakeSpan::ALL.len());
+        let span = |code: &str| pasted.spans.iter().find(|row| row.span == code).unwrap();
+        let asr = span("asr");
+        assert_eq!(
+            (asr.timed_count, asr.missing_count, asr.p50_ms, asr.p95_ms),
+            (4, 0, Some(20), Some(40))
+        );
+        let settle = span("settle");
+        assert_eq!(
+            (settle.timed_count, settle.missing_count, settle.p50_ms),
+            (3, 1, Some(0))
+        );
+        let paste = span("paste");
+        assert_eq!(
+            (paste.timed_count, paste.missing_count, paste.p50_ms),
+            (0, 4, None)
+        );
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("sentinel"), "take ids never leave storage");
+    }
+
+    #[test]
+    fn take_cohorts_export_only_fixed_codes_and_the_current_version() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Search, &[]))
+            .unwrap();
+        storage
+            .add_take_spans(&take(
+                TakeOutcome::Failed(TakeStage::Route),
+                &[(TakeSpan::Route, 1)],
+            ))
+            .unwrap();
+        {
+            let connection = storage.connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE take_spans SET mode = 'private-mode-sentinel', outcome = 'private-outcome-sentinel', stage = 'private-stage-sentinel' WHERE outcome = 'failed'",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO take_spans(take_id, version, created_at, outcome) VALUES ('future', 2, '2026-01-01T00:00:00+00:00', 'pasted')",
+                    [],
+                )
+                .unwrap();
+        }
+        let report = storage.diagnostics().unwrap();
+        let cohorts: Vec<_> = report
+            .takes
+            .iter()
+            .map(|row| {
+                (
+                    row.mode.as_deref(),
+                    row.outcome.as_str(),
+                    row.stage.as_deref(),
+                    row.count,
+                )
+            })
+            .collect();
+        assert_eq!(
+            cohorts,
+            [
+                (None, "other", Some("other"), 1),
+                (Some("dictate"), "search", None, 1)
+            ]
+        );
+        assert!(!serde_json::to_string(&report).unwrap().contains("sentinel"));
+    }
+
+    fn set_created_at(storage: &Storage, table: &str, created_at: &str) {
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                &format!("UPDATE {table} SET created_at = ?1 WHERE created_at > ?1"),
+                [created_at],
+            )
+            .unwrap();
+    }
+
+    /// What an older build's purge does: it removes metrics only.
+    fn delete_metrics_before(storage: &Storage, cutoff: Option<&str>) {
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "DELETE FROM metrics WHERE ?1 IS NULL OR created_at < ?1",
+                [cutoff],
+            )
+            .unwrap();
+    }
+
+    fn reconcile(storage: &Storage) -> usize {
+        reconcile_take_spans(&storage.connection().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn reconciling_after_an_older_build_emptied_metrics_removes_every_take() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Pasted, &[]))
+            .unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Failed(TakeStage::Start), &[]))
+            .unwrap();
+        delete_metrics_before(&storage, None);
+        assert_eq!(reconcile(&storage), 2);
+        assert!(storage.take_records_for_test().is_empty());
+    }
+
+    #[test]
+    fn reconciling_after_an_older_retention_purge_removes_older_takes_only() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Pasted, &[(TakeSpan::Asr, 1)]))
+            .unwrap();
+        set_created_at(&storage, "take_spans", "2026-01-01T00:00:00+00:00");
+        set_created_at(&storage, "metrics", "2026-01-01T00:00:00+00:00");
+        storage
+            .add_metric("asr", None, Some(1), true, None)
+            .unwrap();
+        set_created_at(&storage, "metrics", "2026-02-01T00:00:00+00:00");
+        // The older build's purge kept metrics from 2026-02-01 on.
+        delete_metrics_before(&storage, Some("2026-02-01T00:00:00+00:00"));
+        storage
+            .add_take_spans(&take(TakeOutcome::Pasted, &[(TakeSpan::Asr, 2)]))
+            .unwrap();
+        assert_eq!(reconcile(&storage), 1);
+        let rows = storage.take_records_for_test();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].span(TakeSpan::Asr), Some(2));
+    }
+
+    #[test]
+    fn reconciling_a_consistent_database_keeps_every_take() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .add_metric("asr", None, Some(1), true, None)
+            .unwrap();
+        set_created_at(&storage, "metrics", "2026-01-01T00:00:00+00:00");
+        storage
+            .add_take_spans(&take(TakeOutcome::Pasted, &[]))
+            .unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Cancelled(TakeStage::Recording), &[]))
+            .unwrap();
+        assert_eq!(reconcile(&storage), 0);
+        assert_eq!(storage.take_records_for_test().len(), 2);
+    }
+
+    #[test]
+    fn reconciling_keeps_takes_that_wrote_no_other_metric() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Cancelled(TakeStage::Recording), &[]))
+            .unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Failed(TakeStage::Start), &[]))
+            .unwrap();
+        assert_eq!(reconcile(&storage), 0);
+        assert_eq!(storage.take_records_for_test().len(), 2);
+
+        // This build's retention removes both tables before the cutoff, so a
+        // take after it outlives every other metric and is still kept.
+        set_created_at(&storage, "take_spans", "2026-01-01T00:00:00+00:00");
+        set_created_at(&storage, "metrics", "2026-01-01T00:00:00+00:00");
+        storage
+            .add_take_spans(&take(TakeOutcome::Cancelled(TakeStage::Recording), &[]))
+            .unwrap();
+        crate::storage::purge_metrics_before(
+            &storage.connection().unwrap(),
+            Some("2026-02-01T00:00:00+00:00"),
+        )
+        .unwrap();
+        assert_eq!(reconcile(&storage), 0);
+        assert_eq!(storage.take_records_for_test().len(), 1);
+    }
+
+    #[test]
+    fn every_take_record_writes_a_take_metric() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Pasted, &[]))
+            .unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Cancelled(TakeStage::Recording), &[]))
+            .unwrap();
+        let summary = storage
+            .diagnostics()
+            .unwrap()
+            .summaries
+            .into_iter()
+            .find(|summary| summary.event_type == TAKE_METRIC_EVENT)
+            .unwrap();
+        assert_eq!(
+            (summary.count, summary.successes, summary.timed_count),
+            (2, 1, 0)
+        );
+    }
+
+    #[test]
+    fn opening_a_database_reconciles_its_take_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("takes.sqlite3");
+        {
+            let storage = Storage::open(&path).unwrap();
+            storage
+                .add_metric("asr", None, Some(1), true, None)
+                .unwrap();
+            storage
+                .add_take_spans(&take(TakeOutcome::Pasted, &[]))
+                .unwrap();
+            // An older build's Delete all clears metrics but not takes.
+            storage
+                .connection()
+                .unwrap()
+                .execute("DELETE FROM metrics", [])
+                .unwrap();
+        }
+        let storage = Storage::open(&path).unwrap();
+        assert!(storage.take_records_for_test().is_empty());
+    }
+
+    #[test]
+    fn take_records_follow_delete_all_retention_and_disabled_history() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Pasted, &[(TakeSpan::Asr, 1)]))
+            .unwrap();
+        storage.delete_all_history().unwrap();
+        assert!(storage.take_records_for_test().is_empty());
+        assert!(storage.diagnostics().unwrap().takes.is_empty());
+
+        storage
+            .add_take_spans(&take(TakeOutcome::Pasted, &[(TakeSpan::Asr, 1)]))
+            .unwrap();
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE take_spans SET created_at = '2000-01-01T00:00:00+00:00'",
+                [],
+            )
+            .unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Pasted, &[(TakeSpan::Asr, 2)]))
+            .unwrap();
+        storage
+            .update_settings_and_apply_history_policy(&Settings {
+                history_retention: HistoryRetention::OneWeek,
+                ..Settings::default()
+            })
+            .unwrap();
+        let rows = storage.take_records_for_test();
+        assert_eq!(rows.len(), 1, "an expired take is purged by retention");
+        assert_eq!(rows[0].span(TakeSpan::Asr), Some(2));
+
+        storage
+            .update_settings_and_apply_history_policy(&Settings {
+                history_retention: HistoryRetention::Never,
+                ..Settings::default()
+            })
+            .unwrap();
+        assert!(storage.take_records_for_test().is_empty());
+        storage
+            .add_take_spans(&take(TakeOutcome::Pasted, &[]))
+            .unwrap();
+        assert!(storage.take_records_for_test().is_empty());
     }
 
     #[test]

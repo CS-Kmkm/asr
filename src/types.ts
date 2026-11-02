@@ -78,6 +78,8 @@ export interface Settings {
   apiBaseUrl: string;
   apiKeyEnvVar: string;
   textCorrectionEnabled: boolean;
+  /** Dictate with AI correction: correct the last live hypothesis after stop; used only on an exact match. */
+  speculativeCorrection: boolean;
   correctionProvider: CorrectionProvider;
   openaiCorrectionModel: string;
   openaiReasoningEffort: OpenAIReasoningEffort;
@@ -100,6 +102,8 @@ export interface Settings {
   scopedStyleProfiles: ScopedStyleProfile[];
   /** Live preview only: greedy (single-candidate) decoding on faster-whisper. */
   livePreviewFastDecode: boolean;
+  /** Dictate/Translate: recognize finished ranges while recording (local speech backends only). */
+  incrementalFinalAsr: boolean;
 }
 /**
  * Stored settings with the backend revision of the write that stored them.
@@ -233,6 +237,20 @@ export interface StorageDiagnostics {
     success: boolean;
     code: string | null;
     count: number;
+  }[];
+  /** Per-take spans by outcome cohort; separate from `summaries`. Fixed codes only, no take ids. */
+  takes: {
+    mode: string | null;
+    outcome: string;
+    stage: string | null;
+    count: number;
+    spans: {
+      span: string;
+      timedCount: number;
+      missingCount: number;
+      p50Ms: number | null;
+      p95Ms: number | null;
+    }[];
   }[];
 }
 

@@ -94,6 +94,31 @@ test("banner fetches the repair status on mount and lists the fields", async () 
   assert.match(text, /saves only the fallback values the app is currently using/);
 });
 
+test("recognition opt-ins are named by their settings labels", async () => {
+  const { render } = fixture({
+    status: async () => ["incrementalFinalAsr", "livePreviewFastDecode"],
+    persist: async () => [],
+  });
+  render();
+  await flush();
+  const { text } = render();
+  assert.match(text, /Incremental final transcription \(experimental\)/);
+  assert.match(text, /Faster live preview/);
+  assert.doesNotMatch(text, /incrementalFinalAsr|livePreviewFastDecode/);
+});
+
+test("the speculative correction opt-in is named by its settings label", async () => {
+  const { render } = fixture({
+    status: async () => ["speculativeCorrection"],
+    persist: async () => [],
+  });
+  render();
+  await flush();
+  const { text } = render();
+  assert.match(text, /Speculative correction \(experimental\)/);
+  assert.doesNotMatch(text, /speculativeCorrection/);
+});
+
 test("fields with side effects name what saving the value in use does", async () => {
   const { render } = fixture({
     status: async () => ["deleteAudioAfterProcessing", "autoStart", "futureSetting"],

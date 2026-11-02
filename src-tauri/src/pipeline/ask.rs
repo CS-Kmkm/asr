@@ -10,6 +10,7 @@ use crate::{
     answer_panel, ask, command_error, correction,
     correction::FailureOutcome,
     emit_stage, emit_state, recording_overlay,
+    storage::{TakeSpan, TakeStage},
     types::{self, AppPhase, NewHistoryItem, RecordingResult},
     AskCapture, AskSession,
 };
@@ -39,6 +40,7 @@ pub(crate) async fn finish(
         mode,
         settings,
         app_context,
+        trace,
         ..
     } = take;
     let duration_ms = artifact.duration.as_millis() as u64;
@@ -57,6 +59,7 @@ pub(crate) async fn finish(
         started,
         Some(&artifact.path),
         if automatic { translation_target } else { None },
+        &trace,
     )
     .await;
     if !services.lifecycle.is_cancelled(operation_id) {
@@ -120,6 +123,7 @@ async fn finish_ask(
     started: Instant,
     audio_path: Option<&std::path::Path>,
     selected_translation: Option<String>,
+    trace: &super::take_trace::TakeTrace,
 ) -> Result<RecordingResult, String> {
     let PipelineContext {
         app,
@@ -177,6 +181,7 @@ async fn finish_ask(
                 .map_err(command_error)?,
         )
         .await;
+        trace.span_since(TakeSpan::AiPlan, plan_started);
         if !matches!(plan, Err(correction::CorrectionError::Cancelled)) {
             let _ = metrics.add_metric(
                 "ask_plan",
@@ -205,6 +210,7 @@ async fn finish_ask(
             if services.lifecycle.is_cancelled(operation_id) {
                 return Err("ask was cancelled".into());
             }
+            trace.stage(TakeStage::Delivery);
             let published = services
                 .answer_panel
                 .publish_notice(operation_id, clarification.into());
@@ -212,6 +218,7 @@ async fn finish_ask(
                 commit_ask_copy(&services.lifecycle, operation_id, || {
                     session.injector.copy_to_clipboard(clarification)
                 })?;
+                trace.delivered();
                 let snapshot = state.complete(
                     clarification.into(),
                     "Ask needs clarification; the prompt is on the clipboard.".into(),
@@ -224,6 +231,7 @@ async fn finish_ask(
                     latency_ms: started.elapsed().as_millis() as u64,
                 });
             }
+            trace.delivered();
             let snapshot = state.complete(clarification.into(), "Ask needs clarification.".into());
             let _ = app.emit("app-state", snapshot);
             return Ok(RecordingResult {
@@ -247,11 +255,16 @@ async fn finish_ask(
         // Browser launch is irreversible. Cancellation either wins before
         // launch or observes a committed search; History and completion remain
         // owned by this operation until the outer PipelineGuard finishes it.
+        trace.stage(TakeStage::Delivery);
+        let launch_started = std::time::Instant::now();
         services
             .lifecycle
             .commit_side_effect(operation_id, || open_fixed_search(&url))
             .map_err(|_| "ask was cancelled".to_string())??;
+        trace.span_since(TakeSpan::Paste, launch_started);
+        trace.delivered();
         let latency_ms = started.elapsed().as_millis() as u64;
+        let history_save_started = Instant::now();
         let history_save_status = save_history(
             storage,
             &NewHistoryItem {
@@ -274,6 +287,7 @@ async fn finish_ask(
             },
             audio_path,
         );
+        trace.span_since(TakeSpan::HistorySave, history_save_started);
         let snapshot = state.complete(query.clone(), "Opening the requested fixed search.".into());
         let _ = app.emit("app-state", snapshot);
         report_history_save_warning(app, history_save_status);
@@ -327,6 +341,7 @@ async fn finish_ask(
         },
     )
     .await;
+    trace.span_since(TakeSpan::Ai, generation_started);
     if !matches!(output, Err(correction::CorrectionError::Cancelled)) {
         let _ = metrics.add_metric(
             "ask_generation",
@@ -345,6 +360,8 @@ async fn finish_ask(
     let session_for_insertion = Arc::clone(&session);
     let output_for_insertion = output.clone();
     let action_for_insertion = action.clone();
+    trace.stage(TakeStage::Delivery);
+    let output_started = Instant::now();
     let insertion = tokio::task::spawn_blocking(move || {
         let app = &app_for_insertion;
         let services = app.state::<crate::Services>();
@@ -419,12 +436,17 @@ async fn finish_ask(
     })
     .await
     .map_err(|_| "Ask insertion task failed".to_owned())??;
+    trace.span_since(TakeSpan::Paste, output_started);
+    if !matches!(insertion, "insertion_failed" | "clipboard_protected") {
+        trace.delivered();
+    }
     // A committed paste or copy ignores later cancels, so only an answer
     // shown in the panel can still be cancelled here.
     if services.lifecycle.is_cancelled(operation_id) {
         return Err("ask was cancelled".into());
     }
     let latency_ms = started.elapsed().as_millis() as u64;
+    let history_save_started = Instant::now();
     let history_save_status = save_history(
         storage,
         &NewHistoryItem {
@@ -450,6 +472,7 @@ async fn finish_ask(
         },
         audio_path,
     );
+    trace.span_since(TakeSpan::HistorySave, history_save_started);
     let message = ask_completion_message(insertion);
     let snapshot = state.complete(output.clone(), message.into());
     let _ = app.emit("app-state", snapshot);

@@ -198,6 +198,8 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 | `language` | 文字列(32文字以下) / `null` / 省略 | 任意 | 音声の言語(例 `ja`、`en-GB`)。それ以外の型や長すぎる値は `invalid_request`。faster-whisper と openai-compatible は地域部分を除いたベース言語として渡す。VibeVoice は transformers の `apply_transcription_request` が言語引数を持たないため無視する。 |
 | `decoding` | `"greedy"` / `null` / 省略 | 任意 | ライブプレビューの認識だけが、設定「ライブプレビューを軽量化」がオンのときに `"greedy"` を送る。faster-whisper は `beam_size=1`・`best_of=1` で認識し、VAD などほかの設定は変えない。ほかのバックエンドは無視する。それ以外の値は `invalid_request`。停止後の最終認識のリクエストには含まれない。 |
 
+設定「増分の最終文字起こし」がオンのとき、録音中に確定した区間と停止後の残り(末尾)の認識も、停止後の最終認識と同じ `transcribe` リクエスト(同じ `prompt`・`language`、`decoding` なし)を区間ごとの WAV に対して送る。プロトコルに追加のフィールドはなく、ワーカー側の扱いも通常の最終認識と同じ。前の区間の認識結果を `prompt` に含めることはない。
+
 **`prompt` の扱い:**
 
 - **文字列**: そのままバックエンドに渡される。

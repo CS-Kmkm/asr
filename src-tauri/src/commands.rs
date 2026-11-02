@@ -766,6 +766,8 @@ async fn start_recording_mode(
     origin: StartOrigin,
     mode: PipelineMode,
 ) -> Result<(), String> {
+    // The take's start-to-ready span begins at the start request.
+    let requested = Instant::now();
     let StartOrigin {
         from_shortcut,
         trigger_chord,
@@ -810,6 +812,9 @@ async fn start_recording_mode(
             return Err(error.into());
         }
     };
+    if !services.lifecycle.is_dictation_test(operation_id) {
+        crate::pipeline::take_trace::PENDING.begin(operation_id, &storage, mode, requested);
+    }
     start_claimed_recording(
         app,
         services,
@@ -853,6 +858,8 @@ async fn start_claimed_recording(
         // The recording keeps the lifecycle until it is stopped or cancelled.
         Ok(()) => std::mem::forget(guard),
         Err(ref error) => {
+            crate::pipeline::take_trace::PENDING
+                .end(operation_id, services.lifecycle.is_cancelled(operation_id));
             let (cancel_message, _) = cancellation_copy(mode);
             match start_failure(
                 services.lifecycle.is_cancelled(operation_id),
@@ -1117,6 +1124,7 @@ async fn start_owned_recording(
         audio.cancel().await.map_err(command_error)?;
         return Err(error.into());
     }
+    crate::pipeline::take_trace::PENDING.ready(operation_id);
     let microphone_fell_back = audio.uses_fallback_device();
     drop(audio);
     *services
@@ -2345,6 +2353,8 @@ async fn cancel_pipeline_operation_for(
     if phase != PipelinePhase::Recording {
         return Ok(Some(phase));
     }
+    // A recording cancelled before any stop ends its take here.
+    crate::pipeline::take_trace::PENDING.end(operation_id, true);
     let _guard = PipelineGuard {
         lifecycle,
         id: operation_id,
@@ -2920,6 +2930,23 @@ fn reject_model_change_while_busy(
     Ok(())
 }
 
+/// How long a History or dictionary-candidate read waits for what delivered
+/// Dictate/Translate takes still save on the completion queue.
+const PENDING_SAVE_WAIT: Duration = Duration::from_secs(2);
+
+/// Runs `read` once every completion job reserved before it has finished, or
+/// after `wait`, so a read right after a take completed includes its History
+/// row and dictionary candidate. A read that times out returns what is
+/// stored; the job's change event refreshes the page when the row lands.
+pub(crate) fn after_pending_saves<T>(
+    storage: &Storage,
+    wait: Duration,
+    read: impl FnOnce(&Storage) -> T,
+) -> T {
+    let _ = storage.drain_deferred_completions(wait);
+    read(storage)
+}
+
 #[tauri::command]
 pub(crate) async fn list_history(
     filter: Option<types::HistoryFilter>,
@@ -2931,15 +2958,16 @@ pub(crate) async fn list_history(
 ) -> Result<types::HistoryPage, String> {
     let storage = storage.inner().clone();
     storage_task(move || {
-        storage
-            .query_history_page(
+        after_pending_saves(&storage, PENDING_SAVE_WAIT, |storage| {
+            storage.query_history_page(
                 filter.unwrap_or(types::HistoryFilter::All),
                 limit.unwrap_or(100),
                 before.as_ref(),
                 query.as_deref().unwrap_or(""),
                 known_ids.as_deref().unwrap_or(&[]),
             )
-            .map_err(command_error)
+        })
+        .map_err(command_error)
     })
     .await
 }
@@ -2968,9 +2996,11 @@ pub(crate) async fn preview_history_retention_purge(
 ) -> Result<storage::HistoryPurgePreview, String> {
     let storage = storage.inner().clone();
     storage_task(move || {
-        storage
-            .history_purge_preview(retention)
-            .map_err(command_error)
+        // Count the rows a pending take is about to save, as the save will.
+        after_pending_saves(&storage, PENDING_SAVE_WAIT, |storage| {
+            storage.history_purge_preview(retention)
+        })
+        .map_err(command_error)
     })
     .await
 }
@@ -3189,7 +3219,15 @@ pub(crate) async fn list_dictionary_candidates(
     storage: State<'_, Storage>,
 ) -> Result<Vec<DictionaryCandidate>, String> {
     let storage = storage.inner().clone();
-    storage_task(move || storage.list_dictionary_candidates().map_err(command_error)).await
+    storage_task(move || {
+        after_pending_saves(
+            &storage,
+            PENDING_SAVE_WAIT,
+            Storage::list_dictionary_candidates,
+        )
+        .map_err(command_error)
+    })
+    .await
 }
 
 #[tauri::command]

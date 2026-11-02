@@ -19,7 +19,10 @@ use std::time::Instant;
 use tauri::AppHandle;
 
 use super::orchestration::{RecordingDriver, RecordingEvents};
+use super::speculative::{CorrectionInputs, Speculation};
+use super::take_trace::{TakeTrace, PENDING};
 use crate::live_dictation::LiveDraft;
+use crate::storage::{TakeSpan, TakeStage};
 use crate::{
     audio::AudioArtifact,
     state::PipelineLifecycle,
@@ -67,11 +70,21 @@ impl RecordingDriver for Desktop<'_> {
     fn lifecycle(&self) -> &PipelineLifecycle {
         &self.services.lifecycle
     }
+    fn begin_trace(&self, id: u64, mode: PipelineMode) -> TakeTrace {
+        // Dictation tests record nothing, like their metrics.
+        if self.services.lifecycle.is_dictation_test(id) {
+            return TakeTrace::disabled();
+        }
+        PENDING
+            .claim(id)
+            .unwrap_or_else(|| TakeTrace::new(self.storage, mode))
+    }
     async fn capture(
         &self,
         mode: PipelineMode,
         reason: StopReason,
         started: Instant,
+        trace: &TakeTrace,
     ) -> Result<Captured, String> {
         let Self {
             app,
@@ -95,6 +108,7 @@ impl RecordingDriver for Desktop<'_> {
         let mut audio = services.audio.lock().await;
         let artifact_result = audio.stop().await;
         let audio_stop_ms = audio_stop_started.elapsed().as_millis() as i64;
+        trace.span(TakeSpan::AudioStop, audio_stop_ms);
         // `stop` closes the input stream. Do not re-arm it while transcription is
         // running: on Bluetooth headsets an open microphone selects the low-quality
         // HFP playback profile until the stream is released.
@@ -132,6 +146,9 @@ impl RecordingDriver for Desktop<'_> {
             None => return Err("live dictation session is unavailable".into()),
         };
         let live_drain_ms = live_drained.then(|| live_drain_started.elapsed().as_millis() as i64);
+        if let Some(live_drain_ms) = live_drain_ms {
+            trace.span(TakeSpan::LiveDrain, live_drain_ms);
+        }
         let settings = storage.get_settings().map_err(command_error)?;
         let disconnected = microphone_disconnected(reason, &artifact_result);
         let artifact = artifact_result.map_err(|error| {
@@ -168,6 +185,7 @@ impl RecordingDriver for Desktop<'_> {
             stop_timings: StopTimings {
                 audio_stop_ms,
                 live_drain_ms,
+                live_final_match: None,
             },
             translation_target,
             draft,
@@ -192,6 +210,7 @@ impl RecordingDriver for Desktop<'_> {
         mode: PipelineMode,
         capture: Captured,
         cancel: watch::Receiver<bool>,
+        trace: &TakeTrace,
     ) -> Result<Self::Recognized, String> {
         let Self {
             app,
@@ -206,13 +225,14 @@ impl RecordingDriver for Desktop<'_> {
             started,
             stop_timings,
             translation_target,
-            draft,
+            mut draft,
             edit_session,
             ask_session,
             ..
         } = capture;
         let duration_ms = artifact.duration.as_millis() as u64;
         let (cancel_message, cancel_error) = cancellation_copy(mode);
+        trace.stage(TakeStage::Model);
         let app_context = services
             .app_context
             .lock()
@@ -236,11 +256,35 @@ impl RecordingDriver for Desktop<'_> {
             }
         };
         let correction_cancel = cancel.clone();
+        // Opt-in: start correcting the last live hypothesis now, after stop,
+        // in parallel with final recognition. Dropping it cancels it.
+        let speculation = if !settings.speculative_correction
+            || services.lifecycle.is_dictation_test(operation_id)
+            || services.lifecycle.is_cancelled(operation_id)
+        {
+            None
+        } else {
+            Speculation::begin(
+                &settings,
+                mode,
+                draft.as_ref().and_then(LiveDraft::last_hypothesis),
+                |hypothesis| {
+                    CorrectionInputs::resolve(storage, &settings, hypothesis, app_context.as_ref())
+                },
+                cancel.clone(),
+                super::speculative::provider_correction,
+            )
+        };
         // Defense in depth: model changes are refused while a recording is
         // active, but if the model is not marked ready (for example its load
         // failed, or a worker crash lost it), load it as a new recording would.
+        let model_ensure_started = Instant::now();
         let model_ready =
             ensure_model_loaded_cancellable(app, services, &settings, Some(cancel.clone())).await;
+        trace.span_since(TakeSpan::ModelEnsure, model_ensure_started);
+        if model_ready.is_ok() {
+            trace.stage(TakeStage::Asr);
+        }
         if services.lifecycle.is_cancelled(operation_id) {
             record_stop_timings();
             report_temp_cleanup(app, &mut artifact_cleanup);
@@ -251,24 +295,34 @@ impl RecordingDriver for Desktop<'_> {
         let model_was_ready = model_ready.is_ok();
         let transcript_result = match model_ready {
             Err(error) => Err((error, TranscriptionFailure::Retryable)),
-            Ok(_) => match services
-                .transcriber
-                .transcribe_with_locale(
-                    &artifact.path,
-                    prompt.as_deref(),
-                    settings.speech_locale.as_deref(),
-                    cancel,
-                )
-                .await
+            Ok(_) => match crate::live_dictation::incremental::transcribe_final(
+                services.transcriber.as_ref(),
+                draft.as_mut().and_then(|draft| draft.incremental.take()),
+                &settings,
+                &artifact.path,
+                prompt.as_deref(),
+                cancel,
+                |outcome| {
+                    if !services.lifecycle.is_dictation_test(operation_id) {
+                        outcome.record(metrics, &settings.asr_backend);
+                    }
+                },
+            )
+            .await
             {
-                Ok(value) => Ok(value),
+                Ok(value) => {
+                    trace.span_since(TakeSpan::Asr, asr_started);
+                    Ok(value)
+                }
                 Err(asr::AsrError::Cancelled) => {
+                    trace.span_since(TakeSpan::Asr, asr_started);
                     record_stop_timings();
                     report_temp_cleanup(app, &mut artifact_cleanup);
                     emit_state(app, state, AppPhase::Idle, cancel_message);
                     return Err(cancel_error.into());
                 }
                 Err(error) => {
+                    trace.span_since(TakeSpan::Asr, asr_started);
                     let failure = TranscriptionFailure::of(&error);
                     let message = if failure == TranscriptionFailure::CpuMemory {
                         crate::commands::CPU_MEMORY_FAILURE.to_owned()
@@ -354,6 +408,14 @@ impl RecordingDriver for Desktop<'_> {
             .map_err(|_| "target service is unavailable".to_string())?
             .take();
 
+        let stop_timings = StopTimings {
+            live_final_match: super::live_final_match(
+                mode,
+                draft.as_ref().and_then(LiveDraft::last_hypothesis),
+                &transcript.text,
+            ),
+            ..stop_timings
+        };
         let take = RecordedTake {
             automatic: false,
             settings,
@@ -366,7 +428,9 @@ impl RecordingDriver for Desktop<'_> {
             app_context,
             translation_target,
             draft,
+            speculation,
             stop_timings,
+            trace: trace.clone(),
         };
         Ok((take, edit_session, ask_session))
     }
@@ -375,6 +439,7 @@ impl RecordingDriver for Desktop<'_> {
         operation_id: u64,
         mode: PipelineMode,
         recognized: Self::Recognized,
+        trace: &TakeTrace,
     ) -> Result<RecordingResult, String> {
         let Self {
             app,
@@ -422,6 +487,19 @@ impl RecordingDriver for Desktop<'_> {
             report_temp_cleanup(app, &mut take.artifact_cleanup);
             return Err(error);
         }
+        // A speculative Dictate correction cannot serve another mode.
+        if take.mode != PipelineMode::Dictate {
+            if let Some(speculation) = take.speculation.take() {
+                speculation.discard(
+                    storage.metrics_for(
+                        metric_mode,
+                        app_context::history_category(metric_context.as_ref()),
+                    ),
+                    &take.settings.correction_provider,
+                );
+            }
+        }
+        trace.stage(TakeStage::Ai);
         let result = match take.mode {
             PipelineMode::Edit => super::edit::finish(context, take, edit_session).await,
             PipelineMode::Ask => super::ask::finish(context, take, ask_session).await,

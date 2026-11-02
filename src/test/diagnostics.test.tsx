@@ -10,6 +10,7 @@ const report: StorageDiagnostics = {
   databaseOk: true, schemaVersion: 3,
   summaries: [{ eventType: "asr", provider: "faster-whisper", mode: "dictate", appCategory: "email", count: 22, successes: 20, timedCount: 20, p50Ms: 10, p95Ms: 19 }],
   outcomes: [{ eventType: "asr", provider: "faster-whisper", mode: "dictate", appCategory: "email", success: false, code: "asr_failed", count: 2 }],
+  takes: [{ mode: "dictate", outcome: "cancelled", stage: "asr", count: 3, spans: [{ span: "asr", timedCount: 2, missingCount: 1, p50Ms: 40, p95Ms: 90 }] }],
 };
 const state: AppState = { phase: "idle", stage: "idle", operation: null, operationId: null, message: null, messageCode: null, lastResult: "private transcript sentinel", updatedAt: new Date().toISOString() };
 function show() {
@@ -81,4 +82,14 @@ test("wide metric tables have independently focusable scroll regions with intact
   }
   expect(within(tables[1]).getByText(code)).toBeTruthy();
   expect(getWorkerHealth).not.toHaveBeenCalled();
+});
+
+test("copied diagnostics carry the per-take cohorts without adding a table", async () => {
+  vi.mocked(getStorageDiagnostics).mockResolvedValue(report);
+  show();
+  expect(await screen.findAllByRole("table")).toHaveLength(2);
+  fireEvent.click(screen.getByRole("button", { name: "診断結果をコピー" }));
+  await screen.findByText("診断結果をコピーしました");
+  const copied = JSON.parse(vi.mocked(copyToClipboard).mock.calls[0][0]);
+  expect(copied.storage.takes).toEqual(report.takes);
 });

@@ -4,11 +4,34 @@ use crate::{
     decision,
     sessions::{AskSession, EditSession},
     state::PipelineMode,
+    storage::{TakeSpan, TakeStage},
     types::AppStage,
 };
+use std::time::Instant;
 use tauri::Emitter;
 
 pub(super) async fn route(
+    context: &PipelineContext<'_>,
+    take: &mut RecordedTake,
+    edit: &mut Option<EditSession>,
+    ask: &mut Option<AskSession>,
+) -> Result<(), String> {
+    if !ask
+        .as_ref()
+        .is_some_and(|session| session.automatic.is_some())
+    {
+        return Ok(());
+    }
+    // Only an automatic session routes, so only it has a route span.
+    let trace = take.trace.clone();
+    trace.stage(TakeStage::Route);
+    let started = Instant::now();
+    let routed = route_automatic(context, take, edit, ask).await;
+    trace.span_since(TakeSpan::Route, started);
+    routed
+}
+
+async fn route_automatic(
     context: &PipelineContext<'_>,
     take: &mut RecordedTake,
     edit: &mut Option<EditSession>,

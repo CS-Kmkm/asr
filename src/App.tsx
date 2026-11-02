@@ -485,6 +485,29 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     };
   }, [page, state.phase, settings.historyRetention]);
 
+  useEffect(() => {
+    // Dictate and Translate save their History row and dictionary candidate
+    // after the take completes; the backend says when one landed (no
+    // content), and the visible page re-reads it. The page re-reads once more
+    // when the listener is registered: an event sent before that is not
+    // delivered, and the opening read may have run before its row landed.
+    const event = page === "history" ? "history-changed" : page === "dictionary" ? "dictionary-changed" : null;
+    if (!event) return;
+    let active = true;
+    const refresh = () => {
+      if (!active) return;
+      const reading = event === "history-changed" ? refreshHistory() : refreshDictionary();
+      void reading.catch((error) => { if (active) showNotice(String(error), "error"); });
+    };
+    const listening = listen(event, refresh)
+      .then((stop) => { refresh(); return stop; })
+      .catch(() => { refresh(); return undefined; });
+    return () => {
+      active = false;
+      void listening.then((stop) => stop?.());
+    };
+  }, [page]);
+
   async function saveSettings(patch: Partial<Settings>): Promise<boolean> {
     if (!settingsReady()) return false;
     const outcome = await queueSettingsSave(patch);

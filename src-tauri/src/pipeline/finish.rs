@@ -2,15 +2,31 @@
 use crate::{emit_status, storage::Storage, types::NewHistoryItem, TempArtifact};
 use tauri::AppHandle;
 
+/// Main-window events, without payload, after a deferred completion job
+/// wrote a History row or a dictionary candidate; the History and
+/// Dictionary pages re-read their data on them.
+pub(crate) const HISTORY_CHANGED_EVENT: &str = "history-changed";
+pub(crate) const DICTIONARY_CHANGED_EVENT: &str = "dictionary-changed";
+
 pub(crate) fn save_history(
     storage: &Storage,
     item: &NewHistoryItem<'_>,
     audio_path: Option<&std::path::Path>,
 ) -> HistorySaveStatus {
+    save_history_reporting_row(storage, item, audio_path).0
+}
+
+/// Like [`save_history`], and also tells whether a row was written (History
+/// off writes none).
+pub(crate) fn save_history_reporting_row(
+    storage: &Storage,
+    item: &NewHistoryItem<'_>,
+    audio_path: Option<&std::path::Path>,
+) -> (HistorySaveStatus, bool) {
     match storage.add_history_with_audio_report(item, audio_path) {
-        Ok((_, true)) => HistorySaveStatus::AudioUnavailable,
-        Ok((_, false)) => HistorySaveStatus::Complete,
-        Err(_) => HistorySaveStatus::Failed,
+        Ok((saved, true)) => (HistorySaveStatus::AudioUnavailable, saved),
+        Ok((saved, false)) => (HistorySaveStatus::Complete, saved),
+        Err(_) => (HistorySaveStatus::Failed, false),
     }
 }
 
@@ -37,13 +53,14 @@ pub(crate) fn report_history_save_warning(app: &AppHandle, status: HistorySaveSt
     }
 }
 
+/// The status kind and message of a failed temporary-audio cleanup.
+pub(crate) const TEMP_CLEANUP_FAILED: (&str, &str) =
+    ("artifact_cleanup_failed", "Temporary audio cleanup failed.");
+
 pub(crate) fn report_temp_cleanup(app: &AppHandle, artifact: &mut TempArtifact) {
     if artifact.cleanup().is_err() {
-        emit_status(
-            app,
-            "artifact_cleanup_failed",
-            "Temporary audio cleanup failed.",
-        );
+        let (kind, message) = TEMP_CLEANUP_FAILED;
+        emit_status(app, kind, message);
     }
 }
 

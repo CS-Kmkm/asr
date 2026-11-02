@@ -4,7 +4,10 @@ mod history_audio;
 mod metrics;
 mod schema;
 use history_audio::queue_audio_deletion;
+#[cfg(test)]
+pub(crate) use metrics::TakeRowForTest;
 pub use metrics::{MetricContext, MetricRecorder, StorageDiagnostics};
+pub(crate) use metrics::{TakeOutcome, TakeSpan, TakeSpanRecord, TakeStage};
 use schema::{run_migrations, MIGRATIONS};
 #[cfg(test)]
 use schema::{stored_min_reader_version, Migration, MIN_READER_VERSION_KEY};
@@ -934,17 +937,25 @@ impl Storage {
     /// persistence and cleanup there so the next take need not wait; the job
     /// owns what it writes or removes. Delete all and settings saves
     /// (retention changes) first wait for every reserved job, so none of its
-    /// writes lands after such a deletion. A take reserves before it writes
-    /// its History item, so a deletion that starts before the job is queued
-    /// still waits for it.
+    /// writes lands after such a deletion. A Dictate/Translate take reserves
+    /// before it is shown as complete, and its job writes the History item,
+    /// so a deletion that starts before the job is queued still waits for it.
     pub fn reserve_completion(&self) -> CompletionReservation {
         CompletionReservation(self.completions.reserve())
     }
 
-    /// Waits up to `timeout` for every deferred job queued so far, as at app
-    /// exit. Returns whether they all finished.
+    /// Waits up to `timeout` for every deferred job queued or reserved so
+    /// far, as at app exit or before a History or dictionary-candidate read
+    /// that must include a delivered take's deferred row. Returns whether
+    /// they all finished.
     pub fn drain_deferred_completions(&self, timeout: std::time::Duration) -> bool {
         self.completions.drain(Some(timeout))
+    }
+
+    /// The History audio files this storage still keeps.
+    #[cfg(test)]
+    pub(crate) fn history_audio_files_for_test(&self) -> Vec<PathBuf> {
+        tests::history_audio_files(self)
     }
 
     /// Waits for every deferred job queued or reserved so far before a
@@ -979,7 +990,9 @@ impl Storage {
              PRAGMA foreign_keys = ON;
              PRAGMA secure_delete = ON;",
         )?;
-        run_migrations(&mut connection, MIGRATIONS)
+        run_migrations(&mut connection, MIGRATIONS)?;
+        metrics::reconcile_take_spans(&connection)?;
+        Ok(())
     }
 
     /// Reads the stored settings without ever failing on their content.
@@ -2265,17 +2278,22 @@ fn purge_dictionary_candidates_before(
     Ok(candidates + decisions)
 }
 
-/// Usage metrics record when the app was used, so they follow the History
-/// retention too; `None` removes every metric. Returns how many rows were
-/// deleted.
+/// Usage metrics and per-take span records say when the app was used, so
+/// they follow the History retention too; `None` removes every one. Returns
+/// how many rows were deleted.
 fn purge_metrics_before(
     connection: &Connection,
     cutoff: Option<&str>,
 ) -> Result<usize, StorageError> {
-    Ok(connection.execute(
+    let metrics = connection.execute(
         "DELETE FROM metrics WHERE ?1 IS NULL OR created_at < ?1",
         params![cutoff],
-    )?)
+    )?;
+    let takes = connection.execute(
+        "DELETE FROM take_spans WHERE ?1 IS NULL OR created_at < ?1",
+        params![cutoff],
+    )?;
+    Ok(metrics + takes)
 }
 
 fn read_dictionary_entries<C: std::ops::Deref<Target = Connection>>(
@@ -2912,6 +2930,7 @@ mod tests {
             "pending_audio_deletions",
             "metrics",
             "settings_backups",
+            "take_spans",
         ] {
             assert!(object_exists(connection, "table", table), "{table}");
         }
@@ -4396,6 +4415,57 @@ mod tests {
     }
 
     #[test]
+    fn incremental_final_asr_defaults_off_and_an_unreadable_value_repairs_only_itself() {
+        let mut saved = serde_json::to_value(Settings::default()).unwrap();
+        saved["inputGainPercent"] = serde_json::json!(125);
+        saved.as_object_mut().unwrap().remove("incrementalFinalAsr");
+        let old = load_settings(&saved.to_string());
+        assert!(!old.settings.incremental_final_asr);
+        assert!(old.repairs.is_empty());
+        saved["incrementalFinalAsr"] = serde_json::json!(true);
+        assert!(
+            load_settings(&saved.to_string())
+                .settings
+                .incremental_final_asr
+        );
+        saved["incrementalFinalAsr"] = serde_json::json!("yes");
+        let repaired = load_settings(&saved.to_string());
+        assert!(!repaired.settings.incremental_final_asr);
+        assert_eq!(repaired.settings.input_gain_percent, 125);
+        assert_eq!(
+            repaired.repairs.fields(),
+            vec!["incrementalFinalAsr".to_owned()]
+        );
+    }
+
+    #[test]
+    fn speculative_correction_defaults_off_and_an_unreadable_value_repairs_only_itself() {
+        let mut saved = serde_json::to_value(Settings::default()).unwrap();
+        saved["textCorrectionEnabled"] = serde_json::json!(true);
+        saved
+            .as_object_mut()
+            .unwrap()
+            .remove("speculativeCorrection");
+        let old = load_settings(&saved.to_string());
+        assert!(!old.settings.speculative_correction);
+        assert!(old.repairs.is_empty());
+        saved["speculativeCorrection"] = serde_json::json!(true);
+        assert!(
+            load_settings(&saved.to_string())
+                .settings
+                .speculative_correction
+        );
+        saved["speculativeCorrection"] = serde_json::json!(1);
+        let repaired = load_settings(&saved.to_string());
+        assert!(!repaired.settings.speculative_correction);
+        assert!(repaired.settings.text_correction_enabled);
+        assert_eq!(
+            repaired.repairs.fields(),
+            vec!["speculativeCorrection".to_owned()]
+        );
+    }
+
+    #[test]
     fn legacy_settings_receive_automatic_editing_defaults() {
         let mut value = serde_json::to_value(Settings::default()).unwrap();
         let object = value.as_object_mut().unwrap();
@@ -4945,7 +5015,7 @@ mod tests {
     /// still holds the file open leaves it "delete pending": the name stays in
     /// the directory until that handle closes, but the file can no longer be
     /// opened. Such files are waited for, then counted as deleted as well.
-    fn history_audio_files(storage: &Storage) -> Vec<PathBuf> {
+    pub(super) fn history_audio_files(storage: &Storage) -> Vec<PathBuf> {
         let mut files = kept_history_audio_files(storage);
         for _ in 0..80 {
             if files.iter().all(|path| fs::File::open(path).is_ok()) {

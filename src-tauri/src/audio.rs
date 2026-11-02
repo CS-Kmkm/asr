@@ -16,6 +16,7 @@ pub use dsp::{interleaved_to_mono, resample_linear};
 #[cfg(test)]
 pub use vad::VoiceActivityDetector;
 pub use vad::{EnergyVad, EnergyVadConfig, VadAnalysis};
+pub(crate) use wav::read_pcm16_wav;
 use wav::{temporary_wav_path, write_pcm16_wav};
 
 use serde::Serialize;
@@ -67,6 +68,13 @@ pub trait AudioCapture: Send {
     fn probe(&self, since: Duration, new_from: Duration) -> Result<Option<AudioProbe>, AudioError> {
         let _ = (since, new_from);
         Ok(None)
+    }
+    /// Asks the recording in progress to hand the raw audio after `tail`'s
+    /// mark to `tail` when it stops (see [`FinalTail`]). Returns whether the
+    /// capture supports it; one that does not leaves `tail` unsealed.
+    fn retain_final_tail(&mut self, tail: FinalTail) -> bool {
+        let _ = tail;
+        false
     }
     fn stop(&mut self) -> AudioFuture<'_, AudioArtifact>;
     fn cancel(&mut self) -> AudioFuture<'_, ()>;
@@ -125,6 +133,17 @@ impl Default for CaptureConfig {
     }
 }
 
+impl CaptureConfig {
+    /// Whether audio prepared with `other` is resampled and enhanced exactly
+    /// as with this configuration (the device and file location aside).
+    pub(crate) fn prepares_like(&self, other: &Self) -> bool {
+        self.target_sample_rate == other.target_sample_rate
+            && self.minimum_duration == other.minimum_duration
+            && self.vad == other.vad
+            && self.enhancement == other.enhancement
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoiseSuppressionLevel {
     Off,
@@ -166,16 +185,41 @@ pub struct AudioArtifact {
     pub warning: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct AudioSnapshot {
     samples: Vec<f32>,
     input_sample_rate: u32,
     config: CaptureConfig,
 }
 
+/// The `since` that makes `AudioCapture::snapshot` start exactly at raw
+/// sample `index` of a recording captured at `sample_rate`.
+pub(crate) fn raw_position(index: usize, sample_rate: u32) -> Duration {
+    samples_to_duration(index, sample_rate)
+}
+
 impl AudioSnapshot {
     /// Length of the raw audio, before resampling and enhancement.
     pub(crate) fn duration(&self) -> Duration {
         samples_to_duration(self.samples.len(), self.input_sample_rate)
+    }
+
+    /// Number of raw (captured, mono) samples.
+    pub(crate) fn raw_len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub(crate) fn input_sample_rate(&self) -> u32 {
+        self.input_sample_rate
+    }
+
+    pub(crate) fn config(&self) -> &CaptureConfig {
+        &self.config
+    }
+
+    /// Keeps only the first `raw_len` raw samples.
+    pub(crate) fn truncate(&mut self, raw_len: usize) {
+        self.samples.truncate(raw_len);
     }
 
     /// Processing and disk I/O run outside the capture lock and callback.
@@ -239,6 +283,89 @@ impl AudioProbe {
             enhancement: config.enhancement,
             vad: config.vad,
         }
+    }
+}
+
+/// Hands the raw audio after a moving mark to whoever holds a clone, at the
+/// moment the recording stops. Incremental final recognition advances the
+/// mark past each range it has recognized; the stop path then prepares only
+/// the rest. Nothing is copied while the mark is at the start, and once the
+/// recording has ended (stopped, cancelled or failed) the mark is frozen.
+#[derive(Clone, Default)]
+pub(crate) struct FinalTail(Arc<Mutex<FinalTailState>>);
+
+#[derive(Default)]
+struct FinalTailState {
+    from: usize,
+    ended: bool,
+    sealed: Option<SealedTail>,
+}
+
+/// What a stopped recording handed to a [`FinalTail`].
+pub(crate) struct SealedTail {
+    /// The mark: raw samples before it were not copied.
+    pub(crate) from: usize,
+    /// Raw samples the whole recording held.
+    pub(crate) total: usize,
+    /// The raw samples from the mark on; `None` for a mark at the start or
+    /// a recording that ended without audio.
+    pub(crate) audio: Option<AudioSnapshot>,
+}
+
+impl FinalTail {
+    /// Moves the mark to raw sample `to`. False once the recording ended.
+    pub(crate) fn advance(&self, to: usize) -> bool {
+        let Ok(mut state) = self.0.lock() else {
+            return false;
+        };
+        if state.ended {
+            return false;
+        }
+        state.from = to;
+        true
+    }
+
+    /// Ends the recording with its complete raw `samples`.
+    pub(crate) fn seal(&self, samples: &[f32], input_sample_rate: u32, config: &CaptureConfig) {
+        let Ok(mut state) = self.0.lock() else {
+            return;
+        };
+        if state.ended {
+            return;
+        }
+        state.ended = true;
+        let from = state.from;
+        let audio = (from > 0 && from <= samples.len()).then(|| AudioSnapshot {
+            samples: samples[from..].to_vec(),
+            input_sample_rate,
+            config: config.clone(),
+        });
+        state.sealed = Some(SealedTail {
+            from,
+            total: samples.len(),
+            audio,
+        });
+    }
+
+    /// Ends a recording that produced no usable audio (cancelled or failed).
+    fn seal_without_audio(&self) {
+        if let Ok(mut state) = self.0.lock() {
+            if !state.ended {
+                state.ended = true;
+                let from = state.from;
+                state.sealed = Some(SealedTail {
+                    from,
+                    total: 0,
+                    audio: None,
+                });
+            }
+        }
+    }
+
+    /// The sealed tail, at most once. `None` while the recording runs.
+    pub(crate) fn take(&self) -> Option<SealedTail> {
+        let mut state = self.0.lock().ok()?;
+        state.sealed.take()
     }
 }
 
@@ -589,6 +716,8 @@ pub struct CpalAudioCapture {
     active: Option<ActiveCapture>,
     /// True once `start()` has promoted the active stream to recording mode.
     recording: bool,
+    /// Receives the raw audio after its mark when this recording ends.
+    final_tail: Option<FinalTail>,
 }
 
 /// A blocking task can outlive its awaiting future. Remove an unclaimed WAV
@@ -620,17 +749,34 @@ impl CpalAudioCapture {
         let mut active = self.active.take().ok_or(AudioError::NotCapturing)?;
         self.recording = false;
         drop_active_stream(&mut active);
+        // Whatever happens below, the mark is frozen when the take ends.
+        let final_tail = self.final_tail.take();
+        let unsealed = |final_tail: &Option<FinalTail>| {
+            if let Some(tail) = final_tail {
+                tail.seal_without_audio();
+            }
+        };
 
         if cancelled {
+            unsealed(&final_tail);
             return Err(AudioError::Cancelled);
         }
 
-        let mut shared = active
+        let finished = active
             .shared
             .lock()
-            .map_err(|_| AudioError::StreamFailure("capture buffer lock poisoned".into()))?;
-        let (mono, stream_error) = shared.finish_recording()?;
-        drop(shared);
+            .map_err(|_| AudioError::StreamFailure("capture buffer lock poisoned".into()))
+            .and_then(|mut shared| shared.finish_recording());
+        let (mono, stream_error) = match finished {
+            Ok(finished) => finished,
+            Err(error) => {
+                unsealed(&final_tail);
+                return Err(error);
+            }
+        };
+        if let Some(tail) = &final_tail {
+            tail.seal(&mono, active.input_sample_rate, &active.config);
+        }
         let mut artifact = finalize_samples(mono, active.input_sample_rate, &active.config)?;
         artifact.warning = stream_error;
         Ok(artifact)
@@ -658,6 +804,14 @@ impl AudioCapture for CpalAudioCapture {
             input_sample_rate: active.input_sample_rate,
             config: active.config.clone(),
         })
+    }
+
+    fn retain_final_tail(&mut self, tail: FinalTail) -> bool {
+        if !self.is_recording() {
+            return false;
+        }
+        self.final_tail = Some(tail);
+        true
     }
 
     fn probe(&self, since: Duration, new_from: Duration) -> Result<Option<AudioProbe>, AudioError> {
@@ -746,6 +900,7 @@ impl AudioCapture for CpalAudioCapture {
             }
             self.active = Some(active);
             self.recording = true;
+            self.final_tail = None;
             Ok(())
         })
     }
@@ -1301,6 +1456,7 @@ mod tests {
         }));
         let mut capture = CpalAudioCapture {
             recording: true,
+            final_tail: None,
             active: Some(ActiveCapture {
                 config,
                 input_sample_rate: TARGET_SAMPLE_RATE,
@@ -1338,6 +1494,7 @@ mod tests {
     fn recording_capture(shared: &Arc<Mutex<SharedCapture>>, directory: &Path) -> CpalAudioCapture {
         CpalAudioCapture {
             recording: true,
+            final_tail: None,
             active: Some(ActiveCapture {
                 config: CaptureConfig {
                     artifact_directory: Some(directory.to_owned()),
@@ -1398,6 +1555,61 @@ mod tests {
             capture.probe(Duration::ZERO, Duration::ZERO),
             Err(AudioError::StreamFailure(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_stopped_recording_hands_only_the_audio_after_the_mark_to_its_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let samples: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.1).sin() * 0.2).collect();
+        let shared = Arc::new(Mutex::new(SharedCapture {
+            samples: samples.clone(),
+            recording: true,
+            ..SharedCapture::default()
+        }));
+        let mut capture = recording_capture(&shared, directory.path());
+        let tail = FinalTail::default();
+        assert!(capture.retain_final_tail(tail.clone()));
+        // The snapshot that starts at a mark starts at exactly that sample.
+        let mark = 9_001;
+        let from_mark = capture
+            .snapshot(raw_position(mark, TARGET_SAMPLE_RATE))
+            .unwrap();
+        assert_eq!(from_mark.samples, samples[mark..]);
+        assert!(tail.advance(mark));
+        assert!(
+            tail.take().is_none(),
+            "nothing is handed over while recording"
+        );
+        let artifact = capture.stop().await.unwrap();
+        assert_eq!(artifact.sample_count, samples.len());
+        assert!(!tail.advance(mark + 1), "the mark is frozen once stopped");
+        let sealed = tail.take().unwrap();
+        assert_eq!((sealed.from, sealed.total), (mark, samples.len()));
+        let audio = sealed.audio.unwrap();
+        assert_eq!(audio.samples, samples[mark..]);
+        assert_eq!(audio.input_sample_rate(), TARGET_SAMPLE_RATE);
+        assert!(audio.config().prepares_like(&CaptureConfig::default()));
+        let _ = fs::remove_file(artifact.path);
+
+        // A cancelled take, and a mark at the start, copy nothing.
+        let shared = Arc::new(Mutex::new(SharedCapture {
+            samples: samples.clone(),
+            recording: true,
+            ..SharedCapture::default()
+        }));
+        let mut capture = recording_capture(&shared, directory.path());
+        let cancelled = FinalTail::default();
+        assert!(capture.retain_final_tail(cancelled.clone()));
+        assert!(cancelled.advance(mark));
+        capture.cancel().await.unwrap();
+        let sealed = cancelled.take().unwrap();
+        assert!(sealed.audio.is_none());
+        assert!(!cancelled.advance(1));
+        let start = FinalTail::default();
+        start.seal(&samples, TARGET_SAMPLE_RATE, &CaptureConfig::default());
+        assert!(start.take().unwrap().audio.is_none());
+        // An idle capture cannot hand anything over.
+        assert!(!CpalAudioCapture::new().retain_final_tail(FinalTail::default()));
     }
 
     #[tokio::test]
@@ -1710,6 +1922,7 @@ mod tests {
     fn duplicate_start_state_is_represented_without_hardware() {
         let shared = Arc::new(Mutex::new(SharedCapture::default()));
         let mut capture = CpalAudioCapture {
+            final_tail: None,
             active: Some(ActiveCapture {
                 config: CaptureConfig::default(),
                 input_sample_rate: TARGET_SAMPLE_RATE,
@@ -1730,6 +1943,7 @@ mod tests {
     fn armed_stream_is_idle_until_recording_starts() {
         let shared = Arc::new(Mutex::new(SharedCapture::default()));
         let capture = CpalAudioCapture {
+            final_tail: None,
             active: Some(ActiveCapture {
                 config: CaptureConfig::default(),
                 input_sample_rate: TARGET_SAMPLE_RATE,

@@ -171,7 +171,8 @@ test("a newer visible-page refresh wins over a delayed earlier dictionary respon
   const old = deferred<DictionaryCandidate[]>();
   vi.mocked(listDictionaryCandidates).mockReturnValueOnce(old.promise);
   await navigate("Dictionary");
-  await waitFor(() => expect(listDictionaryCandidates).toHaveBeenCalledTimes(1));
+  // The opening read, then the read once the change listener registered.
+  await waitFor(() => expect(listDictionaryCandidates).toHaveBeenCalledTimes(2));
   vi.mocked(listDictionaryCandidates).mockResolvedValue([candidate(2)]);
   await phase("completed");
   expect(await screen.findByText("Suggested-2")).toBeTruthy();
@@ -330,6 +331,88 @@ test("History entry and shortcut completion refresh retained rows", async () => 
   await phase("completed");
   expect(await screen.findByText("Transcript-2")).toBeTruthy();
   expect(screen.queryByText("Transcript-1")).toBeNull();
+});
+
+test("History re-reads once its change listener registers, so an earlier event is not lost", async () => {
+  vi.mocked(listHistory).mockResolvedValue([history(1)]);
+  const registered = deferred<void>();
+  const subscribe = vi.mocked(listen).getMockImplementation()!;
+  vi.mocked(listen).mockImplementation(async (name, handler) => {
+    if (name === "history-changed") await registered.promise;
+    return subscribe(name, handler);
+  });
+  try {
+    render(<App />);
+    await navigate("History");
+    expect(await screen.findByText("Transcript-1")).toBeTruthy();
+    // The deferred save outlasts the opening read and emits before the
+    // listener is registered, so nothing receives that event.
+    vi.mocked(listHistory).mockResolvedValue([history(2), history(1)]);
+    await emit("history-changed", null);
+    expect(screen.queryByText("Transcript-2")).toBeNull();
+    await act(async () => { registered.resolve(); });
+    expect(await screen.findByText("Transcript-2")).toBeTruthy();
+    expect(events.get("history-changed")?.size).toBe(1);
+  } finally {
+    vi.mocked(listen).mockImplementation(subscribe);
+  }
+});
+
+test("a page closed before its change listener registers unsubscribes it", async () => {
+  const registered = deferred<void>();
+  const subscribe = vi.mocked(listen).getMockImplementation()!;
+  vi.mocked(listen).mockImplementation(async (name, handler) => {
+    if (name === "dictionary-changed") await registered.promise;
+    return subscribe(name, handler);
+  });
+  try {
+    render(<App />);
+    await navigate("Dictionary");
+    await navigate("History");
+    const reads = vi.mocked(listDictionaryCandidates).mock.calls.length;
+    await act(async () => { registered.resolve(); });
+    await waitFor(() => expect(events.get("dictionary-changed")?.size ?? 0).toBe(0));
+    expect(listDictionaryCandidates).toHaveBeenCalledTimes(reads);
+  } finally {
+    vi.mocked(listen).mockImplementation(subscribe);
+  }
+});
+
+test("History re-reads when a deferred History save lands after completion", async () => {
+  vi.mocked(listHistory).mockResolvedValue([history(1)]);
+  render(<App />);
+  await navigate("History");
+  expect(await screen.findByText("Transcript-1")).toBeTruthy();
+  await phase("recording");
+  await phase("completed");
+  // The completion job saves the row after the completed phase.
+  vi.mocked(listHistory).mockResolvedValue([history(2), history(1)]);
+  await emit("history-changed", null);
+  expect(await screen.findByText("Transcript-2")).toBeTruthy();
+  expect(screen.getByText("Transcript-1")).toBeTruthy();
+  // Another page neither listens nor reads.
+  await navigate("Dictionary");
+  await waitFor(() => expect(events.get("history-changed")?.size ?? 0).toBe(0));
+  const reads = vi.mocked(listHistoryPage).mock.calls.length;
+  await emit("history-changed", null);
+  expect(listHistoryPage).toHaveBeenCalledTimes(reads);
+});
+
+test("Dictionary re-reads candidates when a deferred candidate save lands", async () => {
+  vi.mocked(listDictionaryCandidates).mockResolvedValue([candidate(1)]);
+  render(<App />);
+  await navigate("Dictionary");
+  expect(await screen.findByText("Suggested-1")).toBeTruthy();
+  await phase("completed");
+  vi.mocked(listDictionaryCandidates).mockResolvedValue([candidate(1), candidate(2)]);
+  await emit("dictionary-changed", null);
+  expect(await screen.findByText("Suggested-2")).toBeTruthy();
+  expect(screen.getByText("Suggested-1")).toBeTruthy();
+  await navigate("History");
+  await waitFor(() => expect(events.get("dictionary-changed")?.size ?? 0).toBe(0));
+  const reads = vi.mocked(listDictionaryCandidates).mock.calls.length;
+  await emit("dictionary-changed", null);
+  expect(listDictionaryCandidates).toHaveBeenCalledTimes(reads);
 });
 
 test("History loads beyond the first hundred and ignores a stale page after a search", async () => {

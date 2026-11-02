@@ -73,6 +73,7 @@ Claude Code セッション `6043cb09-3484-41ae-a331-5050f85cedf3` の網羅的�
 | `*_first_output`〔追加済み〕 | AI開始から最初の空でないcallbackまで。AI全体時間に包含され、接続・server待ち・生成を単独では分離できない。非stream応答なら全文取得時になる |
 | `insertion_settle`〔追加済み〕 | 最終挿入前のsettle呼出し。`success=true`は入力先準備完了の保証ではない |
 | `insertion_paste`〔追加済み〕 | commit closure全体。入力先確認、clipboard操作、確認・復元を含み、SendInputだけではない |
+| `take_spans`〔M1で追加〕 | `metrics`とは別tableで1take 1行。録音開始時のランダムな一時take id、終了outcome 1つ（`pasted`/`paste_unverified`/`clipboard_only`/`insertion_failed`/`panel`/`search`/stage付き`failed`・`cancelled`）と、実際に起きたspanだけを記録（無いspanはNULLで0と区別）。`stop_to_delivery`・`stop_to_next_take`はstop要求起点。診断の`takes`がmode・outcome・stage別に件数・計測数・欠落数・p50/p95を返し、take idは出さない。各spanの定義はREADME参照 |
 
 根拠: `pipeline/stop.rs:91,111,242,335`; `pipeline/dictate_translate.rs:223,238,253,315,320,375,425,438,542`。各stageの中央値は足し算できない。診断画面の分位点には失敗操作の有効な時間も入る（`storage/metrics.rs:126`）ため、成功例限定の過去集計とも区別する。Edit等はさらに時間起点が異なる（後述）。
 
@@ -94,7 +95,7 @@ Claude Code セッション `6043cb09-3484-41ae-a331-5050f85cedf3` の網羅的�
 | A4 | P2・長文ライブ処理 | live loopは各反復で150 ms待った後、現在発話全体をコピー・DSPし、認識可否判断より先にコストを払う。軽い増分VADと完全な音声準備を分ける | `audio.rs:580`; `live_dictation.rs:26,499,515`; `audio/dsp.rs:25,56`。実際の周期には準備・認識時間も加わる。whole-window統計依存のDSPを単純cacheすると結果が変わる。長い連続発話でCPU・allocation・callback欠落を確認 |
 | A5 | P2・増分最終ASR | 録音中の確定境界・テキストを返し、停止時は未確定末尾だけ認識する選択式モード | `live_dictation.rs:492,561`; `pipeline/stop.rs:248`。境界・設定・音声処理の同一性と全録音fallbackが必要。重複文字列の削除で接続しない。短文のencoder計算量が音声長に比例して減るとは限らない |
 | C1 | P1・既存差分の評価 | 録音開始時のLLM HEAD prewarmは別セッションですでに実装済み。追加実装ではなく、接続再利用の成否とfirst-outputのA/B評価が残る | `correction/transport.rs:79`; `commands.rs:928`。first-outputだけでは接続再利用を判定できず、本文・認証headerを含めない接続ID/新規TCP・TLS確立数のtransport計測が別途必要。同じpoolでも再利用の保証はなく、cancelした録音でも通信する |
-| C2 | P2・補正方針 | 短文補正省略、補正期限で生テキストfallback、モデル/プロバイダー比較は、呼出し回数や待ちを減らせる候補 | `dictate_translate.rs:204`; `transport.rs:170,185`; `correction.rs:166`。短文でも辞書・自己訂正の価値はある。品質・コスト・生テキスト出力が変わるため、無断で既定変更しない |
+| C2 | P2・補正方針 | 短文補正省略、補正期限で生テキストfallback、モデル/プロバイダー比較は、呼出し回数や待ちを減らせる候補 | `dictate_translate.rs:204`; `transport.rs:170,185`; `correction.rs:166`。短文でも辞書・自己訂正の価値はある。品質・コスト・生テキスト出力が変わるため、無断で既定変更しない。2026-11-02 にユーザー判断で見送り（補正方針として採用しない） |
 | C3 | P2・投機的補正 | 最終ASRと並行して最後のlive仮説を補正し、最終入力条件が完全一致した場合だけ採用する | `dictate_translate.rs:224`; `live_dictation.rs:561`。一致率を先に測る。本文だけでなく設定・辞書・styleも一致させ、最終検証を通す。miss時の追加料金・未確定内容の送信・cancelの扱いが必要 |
 | S1 | P2・保存/次回受付 | 履歴保存ごとのretention処理で、削除なしでもWAL truncateを要求する。削除・再試行状態に応じて実行を絞る候補 | `storage.rs:44,1115,1266`; `storage/history.rs:112`。privacy削除や未完了checkpoint再試行は保持。通常の貼り付け後なので、改善対象は完了表示・次回受付・DB競合 |
 | S2 | P2・helper/保存終了 | helper終了は既存latency内、履歴・metrics・一時音声cleanupはその後も受付を塞ぐ。所有権を明示した非同期終了/保存を検討 | `dictate_translate.rs:347,375,384,534`; `input_monitor.rs:298`。タイマー移動だけでは高速化にならない。stale callback、終了drain、Delete all/Never変更、artifact所有権を設計する |

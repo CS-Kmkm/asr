@@ -110,6 +110,12 @@ pub struct Settings {
     /// is unchanged. Off by default.
     #[serde(default)]
     pub live_preview_fast_decode: bool,
+    /// Dictate and Translate recognize ranges of the recording that end in a
+    /// long pause while recording, and only the rest after stopping, with a
+    /// local speech backend. Any doubt falls back to whole-recording
+    /// recognition. Off by default.
+    #[serde(default)]
+    pub incremental_final_asr: bool,
     #[serde(default)]
     pub shortcuts: VoiceShortcuts,
     #[serde(default)]
@@ -169,6 +175,12 @@ pub struct Settings {
     pub api_key_env_var: String,
     #[serde(default)]
     pub text_correction_enabled: bool,
+    /// Dictate with AI correction on starts correcting the last live
+    /// hypothesis after stop, in parallel with final recognition, and uses
+    /// that result only when the final transcript and every correction input
+    /// are identical. A miss costs an extra AI request. Off by default.
+    #[serde(default)]
+    pub speculative_correction: bool,
     #[serde(default = "default_correction_provider")]
     pub correction_provider: String,
     #[serde(default = "default_openai_correction_model")]
@@ -424,6 +436,7 @@ impl Default for Settings {
             live_preview_enabled: None,
             cloud_live_preview_enabled: false,
             live_preview_fast_decode: false,
+            incremental_final_asr: false,
             shortcuts: VoiceShortcuts::default(),
             hold_to_talk: HoldToTalk::default(),
             translation_hotkey: default_translation_hotkey(),
@@ -453,6 +466,7 @@ impl Default for Settings {
             api_base_url: default_api_base_url(),
             api_key_env_var: default_api_key_env_var(),
             text_correction_enabled: false,
+            speculative_correction: false,
             correction_provider: default_correction_provider(),
             openai_correction_model: default_openai_correction_model(),
             openai_reasoning_effort: default_openai_reasoning_effort(),
@@ -736,6 +750,12 @@ mod tests {
         assert_eq!(settings.translation_target_languages, ["en", "ja"]);
         assert_eq!(settings.translation_target_language, "en");
         assert!(!settings.text_correction_enabled);
+        assert!(!settings.speculative_correction);
+        assert!(!Settings::default().speculative_correction);
+        assert_eq!(
+            serde_json::to_value(Settings::default()).unwrap()["speculativeCorrection"],
+            false
+        );
         assert_eq!(settings.correction_provider, "openai");
         assert_eq!(settings.openai_correction_model, "gpt-5.6-luna");
         assert_eq!(settings.openai_reasoning_effort, "none");
@@ -759,6 +779,12 @@ mod tests {
         assert!(!settings.live_target_insertion);
         assert!(!settings.live_preview_fast_decode);
         assert!(!Settings::default().live_preview_fast_decode);
+        assert!(!settings.incremental_final_asr);
+        assert!(!Settings::default().incremental_final_asr);
+        assert_eq!(
+            serde_json::to_value(Settings::default()).unwrap()["incrementalFinalAsr"],
+            false
+        );
         assert!(!settings.automatic_voice_mode);
         assert!(!Settings::default().automatic_voice_mode);
         assert_eq!(settings.decision_model, "Cloudflare/clef-flash");

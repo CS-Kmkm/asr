@@ -2965,3 +2965,74 @@ fn a_hung_gpu_query_is_killed_at_the_deadline() {
     assert!(output_within(hung.spawn().unwrap(), Duration::from_millis(300)).is_none());
     assert!(started.elapsed() < Duration::from_secs(5));
 }
+
+/// Saves what a delivered take defers: a History row and a candidate.
+fn defer_take_saves(reservation: crate::storage::CompletionReservation, storage: &Storage) {
+    let storage = storage.clone();
+    reservation.defer(move || {
+        storage
+            .add_history_with_audio_report(&settings_history_item(), None)
+            .unwrap();
+        storage
+            .add_dictionary_candidate_from_correction("open ai", "OpenAI", None)
+            .unwrap();
+    });
+}
+
+#[test]
+fn history_candidate_and_purge_preview_reads_include_a_take_still_being_saved() {
+    let storage = Storage::in_memory().unwrap();
+    // Reserved as a take does before it is shown as complete.
+    let reservation = storage.reserve_completion();
+    let spawn_read = |read: fn(&Storage) -> usize| {
+        let storage = storage.clone();
+        std::thread::spawn(move || after_pending_saves(&storage, PENDING_SAVE_WAIT, read))
+    };
+    let readers = [
+        spawn_read(|storage| {
+            storage
+                .query_history_page(types::HistoryFilter::All, 100, None, "", &[])
+                .unwrap()
+                .items
+                .len()
+        }),
+        spawn_read(|storage| storage.list_dictionary_candidates().unwrap().len()),
+        spawn_read(|storage| {
+            storage
+                .history_purge_preview(types::HistoryRetention::Never)
+                .unwrap()
+                .history_items as usize
+        }),
+    ];
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(readers.iter().all(|reader| !reader.is_finished()));
+    defer_take_saves(reservation, &storage);
+    for reader in readers {
+        assert_eq!(reader.join().unwrap(), 1);
+    }
+}
+
+#[test]
+fn a_read_waiting_for_pending_saves_is_bounded() {
+    let storage = Storage::in_memory().unwrap();
+    let reservation = storage.reserve_completion();
+    let started = Instant::now();
+    let rows = after_pending_saves(&storage, Duration::from_millis(50), |storage| {
+        storage
+            .list_history(types::HistoryFilter::All, 10)
+            .unwrap()
+            .len()
+    });
+    // The read returns what is stored; the job's change event refreshes later.
+    assert_eq!(rows, 0);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    defer_take_saves(reservation, &storage);
+    assert!(storage.drain_deferred_completions(Duration::from_secs(10)));
+    assert_eq!(
+        storage
+            .list_history(types::HistoryFilter::All, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+}
