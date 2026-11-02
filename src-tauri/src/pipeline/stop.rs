@@ -19,7 +19,9 @@ use std::time::Instant;
 use tauri::AppHandle;
 
 use super::orchestration::{RecordingDriver, RecordingEvents};
+use super::take_trace::{TakeTrace, PENDING};
 use crate::live_dictation::LiveDraft;
+use crate::storage::{TakeSpan, TakeStage};
 use crate::{
     audio::AudioArtifact,
     state::PipelineLifecycle,
@@ -67,11 +69,21 @@ impl RecordingDriver for Desktop<'_> {
     fn lifecycle(&self) -> &PipelineLifecycle {
         &self.services.lifecycle
     }
+    fn begin_trace(&self, id: u64, mode: PipelineMode) -> TakeTrace {
+        // Dictation tests record nothing, like their metrics.
+        if self.services.lifecycle.is_dictation_test(id) {
+            return TakeTrace::disabled();
+        }
+        PENDING
+            .claim(id)
+            .unwrap_or_else(|| TakeTrace::new(self.storage, mode))
+    }
     async fn capture(
         &self,
         mode: PipelineMode,
         reason: StopReason,
         started: Instant,
+        trace: &TakeTrace,
     ) -> Result<Captured, String> {
         let Self {
             app,
@@ -95,6 +107,7 @@ impl RecordingDriver for Desktop<'_> {
         let mut audio = services.audio.lock().await;
         let artifact_result = audio.stop().await;
         let audio_stop_ms = audio_stop_started.elapsed().as_millis() as i64;
+        trace.span(TakeSpan::AudioStop, audio_stop_ms);
         // `stop` closes the input stream. Do not re-arm it while transcription is
         // running: on Bluetooth headsets an open microphone selects the low-quality
         // HFP playback profile until the stream is released.
@@ -132,6 +145,9 @@ impl RecordingDriver for Desktop<'_> {
             None => return Err("live dictation session is unavailable".into()),
         };
         let live_drain_ms = live_drained.then(|| live_drain_started.elapsed().as_millis() as i64);
+        if let Some(live_drain_ms) = live_drain_ms {
+            trace.span(TakeSpan::LiveDrain, live_drain_ms);
+        }
         let settings = storage.get_settings().map_err(command_error)?;
         let disconnected = microphone_disconnected(reason, &artifact_result);
         let artifact = artifact_result.map_err(|error| {
@@ -192,6 +208,7 @@ impl RecordingDriver for Desktop<'_> {
         mode: PipelineMode,
         capture: Captured,
         cancel: watch::Receiver<bool>,
+        trace: &TakeTrace,
     ) -> Result<Self::Recognized, String> {
         let Self {
             app,
@@ -213,6 +230,7 @@ impl RecordingDriver for Desktop<'_> {
         } = capture;
         let duration_ms = artifact.duration.as_millis() as u64;
         let (cancel_message, cancel_error) = cancellation_copy(mode);
+        trace.stage(TakeStage::Model);
         let app_context = services
             .app_context
             .lock()
@@ -239,8 +257,13 @@ impl RecordingDriver for Desktop<'_> {
         // Defense in depth: model changes are refused while a recording is
         // active, but if the model is not marked ready (for example its load
         // failed, or a worker crash lost it), load it as a new recording would.
+        let model_ensure_started = Instant::now();
         let model_ready =
             ensure_model_loaded_cancellable(app, services, &settings, Some(cancel.clone())).await;
+        trace.span_since(TakeSpan::ModelEnsure, model_ensure_started);
+        if model_ready.is_ok() {
+            trace.stage(TakeStage::Asr);
+        }
         if services.lifecycle.is_cancelled(operation_id) {
             record_stop_timings();
             report_temp_cleanup(app, &mut artifact_cleanup);
@@ -261,14 +284,19 @@ impl RecordingDriver for Desktop<'_> {
                 )
                 .await
             {
-                Ok(value) => Ok(value),
+                Ok(value) => {
+                    trace.span_since(TakeSpan::Asr, asr_started);
+                    Ok(value)
+                }
                 Err(asr::AsrError::Cancelled) => {
+                    trace.span_since(TakeSpan::Asr, asr_started);
                     record_stop_timings();
                     report_temp_cleanup(app, &mut artifact_cleanup);
                     emit_state(app, state, AppPhase::Idle, cancel_message);
                     return Err(cancel_error.into());
                 }
                 Err(error) => {
+                    trace.span_since(TakeSpan::Asr, asr_started);
                     let failure = TranscriptionFailure::of(&error);
                     let message = if failure == TranscriptionFailure::CpuMemory {
                         crate::commands::CPU_MEMORY_FAILURE.to_owned()
@@ -367,6 +395,7 @@ impl RecordingDriver for Desktop<'_> {
             translation_target,
             draft,
             stop_timings,
+            trace: trace.clone(),
         };
         Ok((take, edit_session, ask_session))
     }
@@ -375,6 +404,7 @@ impl RecordingDriver for Desktop<'_> {
         operation_id: u64,
         mode: PipelineMode,
         recognized: Self::Recognized,
+        trace: &TakeTrace,
     ) -> Result<RecordingResult, String> {
         let Self {
             app,
@@ -422,6 +452,7 @@ impl RecordingDriver for Desktop<'_> {
             report_temp_cleanup(app, &mut take.artifact_cleanup);
             return Err(error);
         }
+        trace.stage(TakeStage::Ai);
         let result = match take.mode {
             PipelineMode::Edit => super::edit::finish(context, take, edit_session).await,
             PipelineMode::Ask => super::ask::finish(context, take, ask_session).await,

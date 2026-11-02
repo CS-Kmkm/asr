@@ -4,7 +4,10 @@ mod history_audio;
 mod metrics;
 mod schema;
 use history_audio::queue_audio_deletion;
+#[cfg(test)]
+pub(crate) use metrics::TakeRowForTest;
 pub use metrics::{MetricContext, MetricRecorder, StorageDiagnostics};
+pub(crate) use metrics::{TakeOutcome, TakeSpan, TakeSpanRecord, TakeStage};
 use schema::{run_migrations, MIGRATIONS};
 #[cfg(test)]
 use schema::{stored_min_reader_version, Migration, MIN_READER_VERSION_KEY};
@@ -2265,17 +2268,22 @@ fn purge_dictionary_candidates_before(
     Ok(candidates + decisions)
 }
 
-/// Usage metrics record when the app was used, so they follow the History
-/// retention too; `None` removes every metric. Returns how many rows were
-/// deleted.
+/// Usage metrics and per-take span records say when the app was used, so
+/// they follow the History retention too; `None` removes every one. Returns
+/// how many rows were deleted.
 fn purge_metrics_before(
     connection: &Connection,
     cutoff: Option<&str>,
 ) -> Result<usize, StorageError> {
-    Ok(connection.execute(
+    let metrics = connection.execute(
         "DELETE FROM metrics WHERE ?1 IS NULL OR created_at < ?1",
         params![cutoff],
-    )?)
+    )?;
+    let takes = connection.execute(
+        "DELETE FROM take_spans WHERE ?1 IS NULL OR created_at < ?1",
+        params![cutoff],
+    )?;
+    Ok(metrics + takes)
 }
 
 fn read_dictionary_entries<C: std::ops::Deref<Target = Connection>>(
@@ -2912,6 +2920,7 @@ mod tests {
             "pending_audio_deletions",
             "metrics",
             "settings_backups",
+            "take_spans",
         ] {
             assert!(object_exists(connection, "table", table), "{table}");
         }

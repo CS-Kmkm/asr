@@ -766,6 +766,8 @@ async fn start_recording_mode(
     origin: StartOrigin,
     mode: PipelineMode,
 ) -> Result<(), String> {
+    // The take's start-to-ready span begins at the start request.
+    let requested = Instant::now();
     let StartOrigin {
         from_shortcut,
         trigger_chord,
@@ -810,6 +812,9 @@ async fn start_recording_mode(
             return Err(error.into());
         }
     };
+    if !services.lifecycle.is_dictation_test(operation_id) {
+        crate::pipeline::take_trace::PENDING.begin(operation_id, &storage, mode, requested);
+    }
     start_claimed_recording(
         app,
         services,
@@ -853,6 +858,8 @@ async fn start_claimed_recording(
         // The recording keeps the lifecycle until it is stopped or cancelled.
         Ok(()) => std::mem::forget(guard),
         Err(ref error) => {
+            crate::pipeline::take_trace::PENDING
+                .end(operation_id, services.lifecycle.is_cancelled(operation_id));
             let (cancel_message, _) = cancellation_copy(mode);
             match start_failure(
                 services.lifecycle.is_cancelled(operation_id),
@@ -1117,6 +1124,7 @@ async fn start_owned_recording(
         audio.cancel().await.map_err(command_error)?;
         return Err(error.into());
     }
+    crate::pipeline::take_trace::PENDING.ready(operation_id);
     let microphone_fell_back = audio.uses_fallback_device();
     drop(audio);
     *services
@@ -2345,6 +2353,8 @@ async fn cancel_pipeline_operation_for(
     if phase != PipelinePhase::Recording {
         return Ok(Some(phase));
     }
+    // A recording cancelled before any stop ends its take here.
+    crate::pipeline::take_trace::PENDING.end(operation_id, true);
     let _guard = PipelineGuard {
         lifecycle,
         id: operation_id,

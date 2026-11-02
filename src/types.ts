@@ -234,6 +234,20 @@ export interface StorageDiagnostics {
     code: string | null;
     count: number;
   }[];
+  /** Per-take spans by outcome cohort; separate from `summaries`. Fixed codes only, no take ids. */
+  takes: {
+    mode: string | null;
+    outcome: string;
+    stage: string | null;
+    count: number;
+    spans: {
+      span: string;
+      timedCount: number;
+      missingCount: number;
+      p50Ms: number | null;
+      p95Ms: number | null;
+    }[];
+  }[];
 }
 
 export interface WorkerHealth {
