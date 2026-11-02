@@ -1575,7 +1575,10 @@ mod tests {
             .unwrap();
         assert_eq!(from_mark.samples, samples[mark..]);
         assert!(tail.advance(mark));
-        assert!(tail.take().is_none(), "nothing is handed over while recording");
+        assert!(
+            tail.take().is_none(),
+            "nothing is handed over while recording"
+        );
         let artifact = capture.stop().await.unwrap();
         assert_eq!(artifact.sample_count, samples.len());
         assert!(!tail.advance(mark + 1), "the mark is frozen once stopped");

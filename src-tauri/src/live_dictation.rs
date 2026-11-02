@@ -21,6 +21,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::watch;
 #[cfg(test)]
 mod benchmark;
+pub(crate) mod incremental;
 mod segmentation;
 use segmentation::{append_utterance, trailing_quiet, Decision, Segmentation};
 
@@ -241,6 +242,9 @@ pub(crate) struct LiveDraft {
     /// How this recording's live-preview requests decode, fixed from the
     /// settings the recording started with.
     preview_decoding: asr::PreviewDecoding,
+    /// Incremental final recognition when its setting was on at start; the
+    /// stop path takes it for the final recognition.
+    pub(crate) incremental: Option<incremental::Take>,
 }
 
 impl LiveDraft {
@@ -289,6 +293,7 @@ impl LiveDraft {
             defer_insertion,
             pasted: false,
             preview_decoding: preview_decoding(settings),
+            incremental: incremental::Take::plan(settings),
         }
     }
 
@@ -531,11 +536,21 @@ pub(crate) fn start(
     let (stop, stopped) = watch::channel(false);
     let decoding = draft.preview_decoding;
     let task = spawn_recording_owner(async move {
-        if !preview_enabled {
+        let mut incremental = draft
+            .incremental
+            .take()
+            .map(|take| take.begin(prompt.as_deref(), speech_locale.as_deref()));
+        if !preview_enabled
+            && incremental
+                .as_mut()
+                .and_then(incremental::Take::session_mut)
+                .is_none()
+        {
+            draft.incremental = incremental;
             return draft;
         }
         let services = app.state::<Services>();
-        let result = run(
+        let result = run_loop(
             &services.audio,
             services.transcriber.as_ref(),
             prompt.as_deref(),
@@ -544,6 +559,10 @@ pub(crate) fn start(
             cancel,
             stopped,
             LIVE_INTERVAL,
+            Work {
+                preview: preview_enabled,
+                incremental: incremental.as_mut().and_then(incremental::Take::session_mut),
+            },
             |live| {
                 if services.lifecycle.phase() != PipelinePhase::Recording
                     || services.lifecycle.is_cancelled(operation_id)
@@ -564,6 +583,7 @@ pub(crate) fn start(
             },
         )
         .await;
+        draft.incremental = incremental;
         if let Err(failure) = result {
             if !services.lifecycle.is_cancelled(operation_id) {
                 let (kind, message) = failure.status();
@@ -630,6 +650,9 @@ impl From<&str> for LiveFailure {
 /// while the transcriber cancels the request in the worker, which keeps
 /// the loaded model for the next recording. A late result is never
 /// published.
+///
+/// The live preview alone, as the replay tests drive it.
+#[cfg(test)]
 #[allow(
     clippy::too_many_arguments,
     reason = "The replay seam keeps independent stop/cancel channels and borrowed recognition inputs explicit."
@@ -640,9 +663,52 @@ async fn run(
     prompt: Option<&str>,
     speech_locale: Option<&str>,
     decoding: asr::PreviewDecoding,
+    cancel: watch::Receiver<bool>,
+    stopped: watch::Receiver<bool>,
+    interval: Duration,
+    on_update: impl FnMut(&LiveText),
+) -> Result<(), LiveFailure> {
+    run_loop(
+        audio,
+        transcriber,
+        prompt,
+        speech_locale,
+        decoding,
+        cancel,
+        stopped,
+        interval,
+        Work {
+            preview: true,
+            incremental: None,
+        },
+        on_update,
+    )
+    .await
+}
+
+/// What the serial live loop does each turn.
+struct Work<'a> {
+    /// Recognize and show live preview windows.
+    preview: bool,
+    /// Recognize incremental final ranges (see [`incremental`]). A turn that
+    /// decodes a range skips the preview; the next turn goes to the preview.
+    incremental: Option<&'a mut incremental::Session>,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The replay seam keeps independent stop/cancel channels and borrowed recognition inputs explicit."
+)]
+async fn run_loop(
+    audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
+    transcriber: &dyn Transcriber,
+    prompt: Option<&str>,
+    speech_locale: Option<&str>,
+    decoding: asr::PreviewDecoding,
     mut cancel: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
     interval: Duration,
+    mut work: Work<'_>,
     mut on_update: impl FnMut(&LiveText),
 ) -> Result<(), LiveFailure> {
     let mut segmentation = Segmentation::default();
@@ -658,6 +724,22 @@ async fn run(
             _ = cancel.changed() => return Ok(()),
             _ = stopped.changed() => return Ok(()),
             _ = tokio::time::sleep(interval) => {},
+        }
+        if let Some(session) = work.incremental.as_mut() {
+            match session
+                .step(audio, transcriber, &cancel, &stopped, work.preview)
+                .await
+            {
+                // Without a preview, a session that gave up leaves nothing to do.
+                incremental::Turn::Idle if !work.preview && !session.active() => return Ok(()),
+                incremental::Turn::Idle => {}
+                incremental::Turn::Used => continue,
+                incremental::Turn::Stop => return Ok(()),
+                incremental::Turn::CaptureFailed => return Err(LiveFailure::Capture),
+            }
+        }
+        if !work.preview {
+            continue;
         }
         let snapshot = {
             let audio = audio.lock().await;
@@ -846,6 +928,7 @@ mod tests {
             defer_insertion: true,
             pasted: false,
             preview_decoding: asr::PreviewDecoding::Standard,
+            incremental: None,
         }
     }
 
@@ -1293,6 +1376,7 @@ mod tests {
             defer_insertion: false,
             pasted: false,
             preview_decoding: asr::PreviewDecoding::Standard,
+            incremental: None,
         };
         (draft, mock)
     }
