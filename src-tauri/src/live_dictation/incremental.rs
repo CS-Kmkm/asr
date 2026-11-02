@@ -43,8 +43,9 @@
 //! Results are reused only if the recognition identity (backend, model,
 //! quantization, device, locale, the setting itself), the prompt, the
 //! resident model generation and the preparation configuration are the ones
-//! of the stop path, every range succeeded and the ranges and tail cover
-//! the recording exactly. Otherwise the whole recording is recognized as
+//! of the stop path, every range succeeded, every range or tail judged
+//! silent is below the VAD threshold in the prepared whole recording too,
+//! and the ranges and tail cover the recording exactly. Otherwise the whole recording is recognized as
 //! before, and a content-free metric records the reason.
 use super::segmentation::{append_utterance, FRAME, VOICE_HYSTERESIS};
 use crate::{
@@ -96,6 +97,10 @@ pub(crate) enum Fallback {
     PreparationChanged,
     /// Preparing a range or the tail failed.
     PreparationFailed,
+    /// A range or the tail prepared on its own showed no voice, but the
+    /// prepared whole recording reaches the VAD threshold there, so the
+    /// whole-recording request would decode that sound.
+    VoiceMismatch,
     /// Recognizing the tail failed.
     TailFailed,
     /// The join is empty although the recording has voice.
@@ -116,6 +121,7 @@ impl Fallback {
             Self::MissingCoverage => "missing_coverage",
             Self::PreparationChanged => "preparation_changed",
             Self::PreparationFailed => "preparation_failed",
+            Self::VoiceMismatch => "voice_mismatch",
             Self::TailFailed => "tail_failed",
             Self::EmptyResult => "empty_result",
         }
@@ -425,6 +431,17 @@ fn plan_range(
     Ok(Some((raw_cut, artifact)))
 }
 
+/// Whether any VAD frame of `prepared` reaches the VAD threshold.
+fn reaches_vad_threshold(prepared: &[f32], config: &CaptureConfig) -> bool {
+    let frame = samples(config.vad.frame_duration, config.target_sample_rate).max(1);
+    let threshold = f64::from(config.vad.rms_threshold);
+    prepared.chunks(frame).any(|values| {
+        let mean_square =
+            values.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / values.len() as f64;
+        mean_square.sqrt() >= threshold
+    })
+}
+
 fn samples(duration: Duration, rate: u32) -> usize {
     (duration.as_secs_f64() * f64::from(rate)).round() as usize
 }
@@ -533,7 +550,15 @@ pub(crate) async fn transcribe_final(
         Take::Unavailable(reason) => Attempt::Fallback(reason),
         Take::Planned(_) => Attempt::Fallback(Fallback::NoRanges),
         Take::Recorded(session) => {
-            join_recorded(transcriber, *session, settings, prompt, cancel.clone()).await
+            join_recorded(
+                transcriber,
+                *session,
+                settings,
+                audio_path,
+                prompt,
+                cancel.clone(),
+            )
+            .await
         }
     };
     let fallback = match attempt {
@@ -563,6 +588,7 @@ async fn join_recorded(
     transcriber: &dyn Transcriber,
     session: Session,
     settings: &Settings,
+    audio_path: &Path,
     prompt: Option<&str>,
     cancel: watch::Receiver<bool>,
 ) -> Attempt {
@@ -632,6 +658,28 @@ async fn join_recorded(
     let mut cleanup = artifact
         .as_ref()
         .map(|artifact| TempArtifact::new(artifact.path.clone(), false));
+    // Parts judged silent were prepared on their own; the prepared whole
+    // recording, which a fallback decodes, must be silent there too.
+    let silent: Vec<(usize, usize)> = session
+        .ranges
+        .iter()
+        .filter(|range| range.transcript.is_none())
+        .map(|range| (range.start, range.end))
+        .chain(artifact.is_none().then_some((sealed.from, sealed.total)))
+        .collect();
+    if !silent.is_empty() {
+        let whole = audio_path.to_owned();
+        let config = config.clone();
+        let checked = tokio::task::spawn_blocking(move || {
+            sound_in_whole_recording(&whole, &silent, rate, &config)
+        })
+        .await;
+        match checked {
+            Ok(Ok(false)) => {}
+            Ok(Ok(true)) => return Fall(Fallback::VoiceMismatch),
+            Ok(Err(_)) | Err(_) => return Fall(Fallback::PreparationFailed),
+        }
+    }
     if *cancel.borrow() {
         return Attempt::Cancelled;
     }
@@ -670,6 +718,24 @@ async fn join_recorded(
         Ok(_) => Fall(Fallback::EmptyResult),
         Err(reason) => Fall(reason),
     }
+}
+
+/// Whether the prepared whole recording at `path` reaches the VAD threshold
+/// in any of the raw sample spans `parts` (at `input_rate`).
+fn sound_in_whole_recording(
+    path: &Path,
+    parts: &[(usize, usize)],
+    input_rate: u32,
+    config: &CaptureConfig,
+) -> Result<bool, AudioError> {
+    let (samples, rate) = audio::read_pcm16_wav(path)?;
+    let at = |raw: usize| {
+        ((raw as f64 * f64::from(rate) / f64::from(input_rate)).round() as usize).min(samples.len())
+    };
+    Ok(parts.iter().any(|&(start, end)| {
+        let (start, end) = (at(start), at(end));
+        start < end && reaches_vad_threshold(&samples[start..end], config)
+    }))
 }
 
 /// Joins recognized parts, each with its start in seconds, in audio order.

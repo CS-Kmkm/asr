@@ -16,6 +16,7 @@ pub use dsp::{interleaved_to_mono, resample_linear};
 #[cfg(test)]
 pub use vad::VoiceActivityDetector;
 pub use vad::{EnergyVad, EnergyVadConfig, VadAnalysis};
+pub(crate) use wav::read_pcm16_wav;
 use wav::{temporary_wav_path, write_pcm16_wav};
 
 use serde::Serialize;

@@ -50,6 +50,22 @@ fn fixture() -> Vec<f32> {
     samples
 }
 
+/// Two long sentences, then a long pause, optionally a sound of `blip`
+/// milliseconds (too short for the VAD) and another pause: the tail at stop
+/// holds no voice.
+fn ends_quiet(blip: Option<usize>) -> Vec<f32> {
+    let mut samples = silence(400);
+    samples.extend(sentence(&LONG));
+    samples.extend(silence(1_500));
+    samples.extend(sentence(&LONG));
+    samples.extend(silence(2_500));
+    if let Some(blip) = blip {
+        samples.extend(tone(blip));
+        samples.extend(silence(1_500));
+    }
+    samples
+}
+
 fn fixture_seconds() -> f64 {
     fixture().len() as f64 / f64::from(RATE)
 }
@@ -711,7 +727,8 @@ async fn expect_fallback(
     let finals = transcriber.finals();
     assert!(finals.len() > before);
     let last = finals.last().unwrap();
-    assert!((last.seconds - fixture_seconds()).abs() < 0.01);
+    let total = full.sample_count as f64 / f64::from(full.sample_rate);
+    assert!((last.seconds - total).abs() < 0.01);
     assert_eq!(last.prompt.as_deref(), prompt);
 }
 
@@ -877,26 +894,18 @@ async fn short_recordings_empty_joins_and_cloud_takes_fall_back() {
     let (_, outcome) = stop(&transcriber, take, &settings, &full, PROMPT).await;
     assert_eq!(fallback(outcome), Some(Fallback::NoRanges));
 
+    // A tail without voice needs no decode and adds no text.
     expect_fallback(
         Fallback::EmptyResult,
         Bursts::new(),
-        tape,
+        |directory| Tape::new(ends_quiet(None), directory),
         |_, _, _, take| {
-            let session = recorded(take);
-            for range in &mut session.ranges {
+            for range in &mut recorded(take).ranges {
                 if let Some(transcript) = range.transcript.as_mut() {
                     transcript.text.clear();
                     transcript.segments.clear();
                 }
             }
-            // A tail without voice needs no decode and adds no text.
-            let sealed = session.tail.take().unwrap();
-            let tail = FinalTail::default();
-            assert!(tail.advance(sealed.from));
-            let mut samples = fixture();
-            samples[sealed.from..].fill(0.0);
-            tail.seal(&samples, RATE, sealed.audio.unwrap().config());
-            session.tail = tail;
         },
     )
     .await;
@@ -919,6 +928,42 @@ async fn short_recordings_empty_joins_and_cloud_takes_fall_back() {
     .await;
     assert_eq!(fallback(outcome), Some(Fallback::CloudBackend));
     assert_eq!(transcriber.finals().len(), 1);
+}
+
+/// A tail without sound in the whole recording joins as silence: stop
+/// sends no request at all.
+#[tokio::test]
+async fn a_quiet_tail_is_silence_in_the_whole_recording_too() {
+    let directory = tempfile::tempdir().unwrap();
+    let transcriber = Bursts::new();
+    let settings = settings();
+    let (take, full) = record(
+        Tape::new(ends_quiet(None), directory.path()),
+        &transcriber,
+        &settings,
+        false,
+    )
+    .await;
+    assert_eq!(ranges(&take).len(), 2);
+    let before = transcriber.finals().len();
+    let (joined, outcome) = stop(&transcriber, take, &settings, &full, PROMPT).await;
+    assert_eq!(fallback(outcome), None);
+    assert_eq!(transcriber.finals().len(), before);
+    assert_eq!(joined.text, recognize_bursts(&full.path).text);
+}
+
+/// A tail whose only sound is too short for the VAD on its own is not
+/// dropped: the whole recording reaches the threshold there, so it is
+/// recognized instead.
+#[tokio::test]
+async fn a_tail_with_sound_the_whole_recording_keeps_falls_back() {
+    expect_fallback(
+        Fallback::VoiceMismatch,
+        Bursts::new(),
+        |directory| Tape::new(ends_quiet(Some(40)), directory),
+        no_change,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -958,6 +1003,7 @@ fn fallback_codes_are_fixed_and_distinct() {
         Fallback::MissingCoverage,
         Fallback::PreparationChanged,
         Fallback::PreparationFailed,
+        Fallback::VoiceMismatch,
         Fallback::TailFailed,
         Fallback::EmptyResult,
     ];
