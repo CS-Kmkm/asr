@@ -46,6 +46,11 @@ pub(super) const MIGRATIONS: &[Migration] = &[
 /// outcome under a random take id). Kept apart from `metrics` so historical
 /// summaries keep their meaning; `version` separates later record shapes.
 /// Span columns are NULL when the span did not happen on that take.
+///
+/// The step stays readable by older builds (`min_reader_version` 1) so a
+/// downgrade still starts, but their Delete all, History off and retention
+/// purges do not know this table. Every open therefore reconciles it with
+/// `metrics`, which those purges do clear (`metrics::reconcile_take_spans`).
 fn migrate_v4_take_spans(connection: &Connection) -> Result<(), StorageError> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS take_spans (

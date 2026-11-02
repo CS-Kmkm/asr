@@ -624,6 +624,9 @@ Full usage and Phase 0 gate criteria are documented in
   The `ai` stage covers all mode processing before output. Records are
   written on the deferred completion queue, follow the History retention and
   Delete all, and are not written for dictation tests or while History is off.
+  An older build can still open the database but does not purge these
+  records, so each open removes every take record when no metric remains and
+  otherwise those older than the oldest remaining metric.
   Storage diagnostics (`takes`, included in copied diagnostics) aggregate them
   per mode, outcome and stage with timed and missing counts and nearest-rank
   p50/p95 per span.

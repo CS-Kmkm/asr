@@ -990,7 +990,9 @@ impl Storage {
              PRAGMA foreign_keys = ON;
              PRAGMA secure_delete = ON;",
         )?;
-        run_migrations(&mut connection, MIGRATIONS)
+        run_migrations(&mut connection, MIGRATIONS)?;
+        metrics::reconcile_take_spans(&connection)?;
+        Ok(())
     }
 
     /// Reads the stored settings without ever failing on their content.
