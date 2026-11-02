@@ -937,17 +937,25 @@ impl Storage {
     /// persistence and cleanup there so the next take need not wait; the job
     /// owns what it writes or removes. Delete all and settings saves
     /// (retention changes) first wait for every reserved job, so none of its
-    /// writes lands after such a deletion. A take reserves before it writes
-    /// its History item, so a deletion that starts before the job is queued
-    /// still waits for it.
+    /// writes lands after such a deletion. A Dictate/Translate take reserves
+    /// before it is shown as complete, and its job writes the History item,
+    /// so a deletion that starts before the job is queued still waits for it.
     pub fn reserve_completion(&self) -> CompletionReservation {
         CompletionReservation(self.completions.reserve())
     }
 
-    /// Waits up to `timeout` for every deferred job queued so far, as at app
-    /// exit. Returns whether they all finished.
+    /// Waits up to `timeout` for every deferred job queued or reserved so
+    /// far, as at app exit or before a History or dictionary-candidate read
+    /// that must include a delivered take's deferred row. Returns whether
+    /// they all finished.
     pub fn drain_deferred_completions(&self, timeout: std::time::Duration) -> bool {
         self.completions.drain(Some(timeout))
+    }
+
+    /// The History audio files this storage still keeps.
+    #[cfg(test)]
+    pub(crate) fn history_audio_files_for_test(&self) -> Vec<PathBuf> {
+        tests::history_audio_files(self)
     }
 
     /// Waits for every deferred job queued or reserved so far before a
@@ -4978,7 +4986,7 @@ mod tests {
     /// still holds the file open leaves it "delete pending": the name stays in
     /// the directory until that handle closes, but the file can no longer be
     /// opened. Such files are waited for, then counted as deleted as well.
-    fn history_audio_files(storage: &Storage) -> Vec<PathBuf> {
+    pub(super) fn history_audio_files(storage: &Storage) -> Vec<PathBuf> {
         let mut files = kept_history_audio_files(storage);
         for _ in 0..80 {
             if files.iter().all(|path| fs::File::open(path).is_ok()) {

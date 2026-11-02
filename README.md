@@ -528,6 +528,13 @@ Full usage and Phase 0 gate criteria are documented in
   content-free `asr_incremental` metric (used, or a fixed fallback reason).
 - History can be disabled; when disabled, transcript rows are not written
   (failed recordings kept for Retry are the exception described below).
+- Dictate and Translate save their History row (and kept recording) and any
+  dictionary candidate right after the take completes, in take order, so the
+  next take need not wait; the History and Dictionary pages update when they
+  land. Delete all and History/retention changes wait for these saves and then
+  apply to them. Quitting waits up to 3 s for them; a save still pending then
+  may be lost, and leftover temporary or partial recording files are removed
+  at the next start.
 - 履歴は本文検索と追加読み込みに対応しています。録音を削除した後も「原文をコピー」「再補正」「指定言語へ翻訳」を使えます。
   再補正では現在のスタイル設定、または保存済みのスタイルを選択できます。再処理は原文を使い、
   入力先への挿入は行いません。結果は履歴の保持設定に従って別の行に保存され、元の行は変更しません。
@@ -584,8 +591,11 @@ Full usage and Phase 0 gate criteria are documented in
   planning), `ai` (the mode's AI request) and `first_output` (within `ai`),
   `settle` (only a real wait), `paste` (the output commit: paste, copy or
   answer-panel publish), `helper_exit` (Dictate/Translate draft drop),
-  `history_save` (Edit's includes its metric write), `completion_job`
-  (Dictate/Translate deferred metrics and cleanup), `stop_to_delivery` (stop
+  `history_save` (Edit's includes its metric write; Dictate/Translate's runs
+  inside `completion_job`), `completion_job` (the Dictate/Translate work
+  deferred until after the take completes, in this order: History save with
+  its recording copy, dictionary candidate, metrics, persistence warning and
+  temporary-audio cleanup), `stop_to_delivery` (stop
   request to the output commit returning, delivered takes only) and
   `stop_to_next_take` (stop request to the lifecycle accepting a new take).
   The `ai` stage covers all mode processing before output. Records are

@@ -1,6 +1,7 @@
 //! FIFO queue for work a delivered take defers past its lifecycle guard.
 //!
-//! Each job owns what it writes or removes (metrics, temporary audio) and runs
+//! Each job owns what it writes or removes (History, dictionary candidates,
+//! metrics, temporary audio) and runs
 //! on one background thread in submission order. Storage privacy deletions
 //! wait for every job queued or reserved before them, so deferred writes never
 //! land after a deletion the user asked for. A worker thread exists only while jobs are

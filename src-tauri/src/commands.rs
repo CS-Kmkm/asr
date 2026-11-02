@@ -2930,6 +2930,23 @@ fn reject_model_change_while_busy(
     Ok(())
 }
 
+/// How long a History or dictionary-candidate read waits for what delivered
+/// Dictate/Translate takes still save on the completion queue.
+const PENDING_SAVE_WAIT: Duration = Duration::from_secs(2);
+
+/// Runs `read` once every completion job reserved before it has finished, or
+/// after `wait`, so a read right after a take completed includes its History
+/// row and dictionary candidate. A read that times out returns what is
+/// stored; the job's change event refreshes the page when the row lands.
+pub(crate) fn after_pending_saves<T>(
+    storage: &Storage,
+    wait: Duration,
+    read: impl FnOnce(&Storage) -> T,
+) -> T {
+    let _ = storage.drain_deferred_completions(wait);
+    read(storage)
+}
+
 #[tauri::command]
 pub(crate) async fn list_history(
     filter: Option<types::HistoryFilter>,
@@ -2941,15 +2958,16 @@ pub(crate) async fn list_history(
 ) -> Result<types::HistoryPage, String> {
     let storage = storage.inner().clone();
     storage_task(move || {
-        storage
-            .query_history_page(
+        after_pending_saves(&storage, PENDING_SAVE_WAIT, |storage| {
+            storage.query_history_page(
                 filter.unwrap_or(types::HistoryFilter::All),
                 limit.unwrap_or(100),
                 before.as_ref(),
                 query.as_deref().unwrap_or(""),
                 known_ids.as_deref().unwrap_or(&[]),
             )
-            .map_err(command_error)
+        })
+        .map_err(command_error)
     })
     .await
 }
@@ -2978,9 +2996,11 @@ pub(crate) async fn preview_history_retention_purge(
 ) -> Result<storage::HistoryPurgePreview, String> {
     let storage = storage.inner().clone();
     storage_task(move || {
-        storage
-            .history_purge_preview(retention)
-            .map_err(command_error)
+        // Count the rows a pending take is about to save, as the save will.
+        after_pending_saves(&storage, PENDING_SAVE_WAIT, |storage| {
+            storage.history_purge_preview(retention)
+        })
+        .map_err(command_error)
     })
     .await
 }
@@ -3199,7 +3219,15 @@ pub(crate) async fn list_dictionary_candidates(
     storage: State<'_, Storage>,
 ) -> Result<Vec<DictionaryCandidate>, String> {
     let storage = storage.inner().clone();
-    storage_task(move || storage.list_dictionary_candidates().map_err(command_error)).await
+    storage_task(move || {
+        after_pending_saves(
+            &storage,
+            PENDING_SAVE_WAIT,
+            Storage::list_dictionary_candidates,
+        )
+        .map_err(command_error)
+    })
+    .await
 }
 
 #[tauri::command]
