@@ -73,6 +73,7 @@ Claude Code セッション `6043cb09-3484-41ae-a331-5050f85cedf3` の網羅的�
 | `*_first_output`〔追加済み〕 | AI開始から最初の空でないcallbackまで。AI全体時間に包含され、接続・server待ち・生成を単独では分離できない。非stream応答なら全文取得時になる |
 | `insertion_settle`〔追加済み〕 | 最終挿入前のsettle呼出し。`success=true`は入力先準備完了の保証ではない |
 | `insertion_paste`〔追加済み〕 | commit closure全体。入力先確認、clipboard操作、確認・復元を含み、SendInputだけではない |
+| `take_spans`〔M1で追加〕 | `metrics`とは別tableで1take 1行。録音開始時のランダムな一時take id、終了outcome 1つ（`pasted`/`paste_unverified`/`clipboard_only`/`insertion_failed`/`panel`/`search`/stage付き`failed`・`cancelled`）と、実際に起きたspanだけを記録（無いspanはNULLで0と区別）。`stop_to_delivery`・`stop_to_next_take`はstop要求起点。診断の`takes`がmode・outcome・stage別に件数・計測数・欠落数・p50/p95を返し、take idは出さない。各spanの定義はREADME参照 |
 
 根拠: `pipeline/stop.rs:91,111,242,335`; `pipeline/dictate_translate.rs:223,238,253,315,320,375,425,438,542`。各stageの中央値は足し算できない。診断画面の分位点には失敗操作の有効な時間も入る（`storage/metrics.rs:126`）ため、成功例限定の過去集計とも区別する。Edit等はさらに時間起点が異なる（後述）。
 

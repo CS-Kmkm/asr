@@ -558,6 +558,31 @@ Full usage and Phase 0 gate criteria are documented in
   `insertion` success requires confirmed paste. Timing-event success means an
   observation was made, not that final delivery succeeded. Compare confirmed
   pastes separately from unverified, clipboard-only, failed or cancelled takes.
+- Per-take spans (`take_spans`, record version 1) are kept apart from those
+  events and cover every recording take, including failed starts and cancels.
+  Each take gets a random, ephemeral id at its start request (not derived
+  from the operation, time or History row, and never exported), exactly one
+  outcome (`pasted`, `paste_unverified`, `clipboard_only`, `insertion_failed`,
+  `panel`, `search`, or `failed`/`cancelled` with the stage `start`,
+  `recording`, `capture`, `model`, `asr`, `route`, `ai` or `delivery`) and the
+  spans that happened on it, in milliseconds; a span that did not happen is
+  missing, not zero. Spans: `record_ready` (start request to the microphone
+  capturing), `model_ensure` (readiness check at stop), `audio_stop`,
+  `live_drain`, `asr` (the final recognition request), `shortcut_release`
+  (only when awaited), `route` (automatic routing only), `plan` (Ask
+  planning), `ai` (the mode's AI request) and `first_output` (within `ai`),
+  `settle` (only a real wait), `paste` (the output commit: paste, copy or
+  answer-panel publish), `helper_exit` (Dictate/Translate draft drop),
+  `history_save` (Edit's includes its metric write), `completion_job`
+  (Dictate/Translate deferred metrics and cleanup), `stop_to_delivery` (stop
+  request to the output commit returning, delivered takes only) and
+  `stop_to_next_take` (stop request to the lifecycle accepting a new take).
+  The `ai` stage covers all mode processing before output. Records are
+  written on the deferred completion queue, follow the History retention and
+  Delete all, and are not written for dictation tests or while History is off.
+  Storage diagnostics (`takes`, included in copied diagnostics) aggregate them
+  per mode, outcome and stage with timed and missing counts and nearest-rank
+  p50/p95 per span.
 - New SQLite deletions overwrite freed record content using secure-delete.
   History deletions request a WAL checkpoint/truncation; an active external reader or
   database error can defer this until the next policy pass. Previously freed
