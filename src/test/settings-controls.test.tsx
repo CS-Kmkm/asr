@@ -106,6 +106,22 @@ test("AI model, key variable and guidance fields never save per keystroke", () =
   }
 });
 
+test("speculative correction is an opt-in whose copy states the extra request and post-stop sending", () => {
+  const save = vi.fn();
+  const name = "Speculative correction (experimental)";
+  const view = (settings: typeof defaultSettings) => <I18nProvider language="en"><AiCorrectionSettings settings={settings} onSave={save} /></I18nProvider>;
+  const app = render(view(defaultSettings));
+  const toggle = screen.getByRole("switch", { name });
+  expect(toggle.getAttribute("aria-checked")).toBe("false");
+  fireEvent.click(toggle);
+  expect(save).toHaveBeenCalledWith({ speculativeCorrection: true });
+  app.rerender(view({ ...defaultSettings, speculativeCorrection: true }));
+  expect(screen.getByRole("switch", { name }).getAttribute("aria-checked")).toBe("true");
+  fireEvent.click(screen.getByRole("button", { name: `Help: ${name}` }));
+  expect(document.body.innerHTML).toContain("costs an extra AI request");
+  expect(document.body.innerHTML).toContain("may already have been sent");
+});
+
 test("gain commits only once after dragging and once after a keyboard adjustment", () => {
   const save = vi.fn();
   render(<GainSlider label="Gain" value={100} onCommit={save} />);

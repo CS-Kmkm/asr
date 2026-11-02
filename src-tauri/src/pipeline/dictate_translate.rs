@@ -15,7 +15,7 @@ use crate::{
     correction::FailureOutcome,
     emit_ai_failure, emit_stage, emit_state, emit_status, injection,
     injection::{InsertResult, InsertionDetail},
-    personalization, recording_overlay,
+    recording_overlay,
     state::PipelineMode,
     storage::{TakeOutcome, TakeSpan, TakeStage},
     types::{self, AppPhase, NewHistoryItem, RecordingResult},
@@ -80,6 +80,7 @@ async fn finish_owned(
         app_context,
         translation_target,
         mut draft,
+        mut speculation,
         // Recorded by the shared stop pipeline after delivery.
         stop_timings: _,
         trace,
@@ -218,9 +219,8 @@ async fn finish_owned(
             }
         }
     } else if settings.text_correction_enabled {
-        let correction_hints = storage
-            .dictionary_correction_terms(&transcript.text, app_context.as_ref())
-            .unwrap_or_default();
+        let correction_hints =
+            super::speculative::correction_hints(storage, &transcript.text, app_context.as_ref());
         emit_correction_preview(app, &transcript.text, "draft");
         if streamed_into_target {
             emit_state(
@@ -237,20 +237,51 @@ async fn finish_owned(
             "Correcting the transcript with the configured AI provider.",
         );
         let correction_started = Instant::now();
-        let result = correction::correct_transcript(
-            &settings,
-            &transcript.text,
-            &correction_hints,
-            personalization::resolve_profile(&settings, app_context.as_ref())
-                .map(|profile| personalization::guidance(&profile))
-                .as_deref(),
-            correction_cancel,
-            |delta| {
-                note_first_output(&mut first_output_ms, correction_started, delta);
-                emit_correction_preview(app, delta, "streaming");
-            },
-        )
-        .await;
+        let style_guidance = super::speculative::style_guidance(&settings, app_context.as_ref());
+        // An opt-in speculative correction of this exact text with these
+        // exact inputs replaces the request; on a hit the per-take AI span
+        // and first-output span measure only the wait from here. Any other
+        // speculation is cancelled here, never awaited.
+        let adopted = match speculation.take() {
+            Some(speculation) => {
+                speculation
+                    .adopt(
+                        &transcript.text,
+                        &settings,
+                        &correction_hints,
+                        style_guidance.as_deref(),
+                        correction_started,
+                        metrics,
+                    )
+                    .await
+            }
+            None => None,
+        };
+        let speculative_hit = adopted.is_some();
+        let result = match adopted {
+            Some(adopted) => {
+                // Span only: a clamped wait is not comparable with the
+                // `text_correction_first_output` metric of full requests.
+                if let Some(first_output_ms) = adopted.first_output_ms {
+                    trace.span(TakeSpan::AiFirstOutput, first_output_ms);
+                }
+                Ok(adopted.text)
+            }
+            None => {
+                correction::correct_transcript(
+                    &settings,
+                    &transcript.text,
+                    &correction_hints,
+                    style_guidance.as_deref(),
+                    correction_cancel,
+                    |delta| {
+                        note_first_output(&mut first_output_ms, correction_started, delta);
+                        emit_correction_preview(app, delta, "streaming");
+                    },
+                )
+                .await
+            }
+        };
         let correction_ms = correction_started.elapsed().as_millis() as i64;
         trace.span(TakeSpan::Ai, correction_ms);
         first_output_ms = first_output_ms.filter(|_| result.is_ok());
@@ -260,12 +291,11 @@ async fn finish_owned(
                 emit_correction_preview(app, &final_text, "final");
                 processed_text = Some(final_text.clone());
                 llm_provider = Some(settings.correction_provider.clone());
-                let _ = metrics.add_metric(
-                    "text_correction",
-                    Some(settings.correction_provider.as_str()),
-                    Some(correction_ms),
-                    true,
-                    None,
+                record_text_correction_success(
+                    metrics,
+                    &settings.correction_provider,
+                    correction_ms,
+                    speculative_hit,
                 );
             }
             Err(correction::CorrectionError::Cancelled) => {
@@ -295,6 +325,8 @@ async fn finish_owned(
     } else {
         emit_correction_preview(app, &transcript.text, "final");
     }
+    // Any speculation not decided above (none should remain) is cancelled.
+    drop(speculation);
     if let Some(first_output_ms) = first_output_ms {
         trace.span(TakeSpan::AiFirstOutput, first_output_ms);
     }
@@ -542,6 +574,24 @@ async fn finish_owned(
         duration_ms,
         latency_ms,
     })
+}
+
+/// Records a successful Dictate correction. An adopted speculative result
+/// counts but is untimed, so `text_correction` percentiles stay those of
+/// full provider requests (its full duration is in `speculative_correction`).
+fn record_text_correction_success(
+    metrics: crate::storage::MetricRecorder<'_>,
+    provider: &str,
+    correction_ms: i64,
+    speculative_hit: bool,
+) {
+    let _ = metrics.add_metric(
+        "text_correction",
+        Some(provider),
+        (!speculative_hit).then_some(correction_ms),
+        true,
+        None,
+    );
 }
 
 /// Remembers when the provider's first non-empty streamed text arrived.
@@ -806,6 +856,22 @@ fn record_first_output(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_speculative_hit_counts_as_text_correction_but_stays_out_of_its_timings() {
+        let storage = crate::storage::Storage::in_memory().unwrap();
+        let metrics = storage.metrics_for(PipelineMode::Dictate, None);
+        record_text_correction_success(metrics, "openai", 900, false);
+        record_text_correction_success(metrics, "openai", 40, true);
+        let report = storage.diagnostics().unwrap();
+        let row = report
+            .summaries
+            .iter()
+            .find(|row| row.event_type == "text_correction")
+            .unwrap();
+        assert_eq!((row.count, row.successes, row.timed_count), (2, 2, 1));
+        assert_eq!(row.p50_ms, Some(900));
+    }
 
     #[test]
     fn first_output_ignores_empty_updates_and_preserves_the_first_observation() {

@@ -96,6 +96,7 @@ export const defaultSettings: Settings = {
   apiBaseUrl: "https://api.openai.com/v1",
   apiKeyEnvVar: "OPENAI_API_KEY",
   textCorrectionEnabled: false,
+  speculativeCorrection: false,
   correctionProvider: "openai",
   openaiCorrectionModel: "gpt-5.6-luna",
   openaiReasoningEffort: "none",

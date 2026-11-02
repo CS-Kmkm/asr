@@ -526,6 +526,29 @@ Full usage and Phase 0 gate criteria are documented in
   a failed part or incomplete coverage falls back to transcribing the whole
   recording. It sends no audio to a cloud provider and records only a
   content-free `asr_incremental` metric (used, or a fixed fallback reason).
+- Settings > AI text correction "Speculative correction (experimental)" (off by
+  default) applies only to Dictate with AI correction on and a live preview
+  that showed text. After stop (never while recording), it sends the last
+  live preview text to the AI provider, behind the same consent check, with
+  exactly the normal correction request, while the recording is still
+  transcribed. That result is used only if the final transcript equals it
+  exactly and the settings, dictionary hints and style guidance recomputed for
+  the final transcript are identical; otherwise the request is cancelled and
+  the final transcript is corrected as usual, so a miss (also when automatic
+  voice mode chooses another mode) costs an extra AI request. A take cancelled
+  after stop may already have sent the live text. Speculative streaming text is
+  never shown. On a hit, the per-take `ai` and `first_output` spans measure
+  only the wait from where the normal correction would have started (first
+  output is 0 if it arrived earlier); `text_correction` is still counted as a
+  success but untimed, so its percentiles stay those of full requests, and no
+  `text_correction_first_output` is recorded.
+  The content-free `speculative_correction` metric records `hit` (success,
+  timed as the whole speculative request) or `miss_text`, `miss_inputs`,
+  `miss_mode`, `failed`, `not_started:no_hypothesis`, `not_started:consent`;
+  a take that ends before the decision records nothing. Whatever this setting,
+  `live_final_match` records whether a Dictate take's last live preview text
+  equals its final transcript (success when equal, `differs` otherwise; no
+  text), written with the other stop-path timings.
 - History can be disabled; when disabled, transcript rows are not written
   (failed recordings kept for Retry are the exception described below).
 - Dictate and Translate save their History row (and kept recording) and any

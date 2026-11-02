@@ -245,6 +245,10 @@ pub(crate) struct LiveDraft {
     /// Incremental final recognition when its setting was on at start; the
     /// stop path takes it for the final recognition.
     pub(crate) incremental: Option<incremental::Take>,
+    /// The live text shown last while recording (a revision, or the committed
+    /// text a retraction returned to). Held in memory only; the stop path
+    /// compares it with the final transcript.
+    last_hypothesis: String,
 }
 
 impl LiveDraft {
@@ -294,7 +298,19 @@ impl LiveDraft {
             pasted: false,
             preview_decoding: preview_decoding(settings),
             incremental: incremental::Take::plan(settings),
+            last_hypothesis: String::new(),
         }
+    }
+
+    /// Remembers `text` as the live text shown last.
+    fn note_hypothesis(&mut self, text: &str) {
+        text.clone_into(&mut self.last_hypothesis);
+    }
+
+    /// The live text shown last while recording, or `None` if live
+    /// recognition showed nothing or withdrew everything it showed.
+    pub(crate) fn last_hypothesis(&self) -> Option<&str> {
+        (!self.last_hypothesis.is_empty()).then_some(self.last_hypothesis.as_str())
     }
 
     /// Whether `update` can still edit the target. Only then must a caller
@@ -573,6 +589,7 @@ pub(crate) fn start(
                 let _ = app.emit("app-state", state.publish_result(live.text().to_owned()));
                 // A retraction updates the subtitle like a revision does.
                 recording_overlay::show_live_subtitle(&app, live.text());
+                draft.note_hypothesis(live.text());
                 let result = match live {
                     LiveText::Revise(text) => draft.update(text),
                     LiveText::Retract(committed) => draft.retract(committed),
@@ -929,7 +946,20 @@ mod tests {
             pasted: false,
             preview_decoding: asr::PreviewDecoding::Standard,
             incremental: None,
+            last_hypothesis: String::new(),
         }
+    }
+
+    #[test]
+    fn last_hypothesis_is_the_latest_live_text_and_absent_once_withdrawn() {
+        let mut draft = deferred_test_draft();
+        assert_eq!(draft.last_hypothesis(), None);
+        draft.note_hypothesis("hello");
+        draft.note_hypothesis("hello world");
+        assert_eq!(draft.last_hypothesis(), Some("hello world"));
+        // A retraction to empty committed text leaves no hypothesis.
+        draft.note_hypothesis("");
+        assert_eq!(draft.last_hypothesis(), None);
     }
 
     #[test]
@@ -1377,6 +1407,7 @@ mod tests {
             pasted: false,
             preview_decoding: asr::PreviewDecoding::Standard,
             incremental: None,
+            last_hypothesis: String::new(),
         };
         (draft, mock)
     }

@@ -78,6 +78,8 @@ export interface Settings {
   apiBaseUrl: string;
   apiKeyEnvVar: string;
   textCorrectionEnabled: boolean;
+  /** Dictate with AI correction: correct the last live hypothesis after stop; used only on an exact match. */
+  speculativeCorrection: boolean;
   correctionProvider: CorrectionProvider;
   openaiCorrectionModel: string;
   openaiReasoningEffort: OpenAIReasoningEffort;
