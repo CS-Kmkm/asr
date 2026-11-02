@@ -17,6 +17,7 @@ from asr_worker.backends import (
     compute_max_new_tokens,
     create_backend,
     faster_whisper_compute_type,
+    load_pcm16_wav,
     map_backend_exception,
     wav_duration_seconds,
 )
@@ -135,6 +136,84 @@ class WavDurationTests(IsolatedWorkerTestCase):
 
     def test_missing_file_returns_none(self) -> None:
         self.assertIsNone(wav_duration_seconds(Path("/nonexistent/missing.wav")))
+
+
+def _write_wav(path: Path, frames: bytes, *, channels: int = 1, width: int = 2, rate: int = 16000) -> Path:
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(channels)
+        handle.setsampwidth(width)
+        handle.setframerate(rate)
+        handle.writeframes(frames)
+    return path
+
+
+def _pcm16_frames() -> bytes:
+    import numpy as np
+
+    samples = np.concatenate([
+        np.array([-32768, -1, 0, 1, 32767], dtype="<i2"),
+        (np.sin(np.arange(16000) * 0.05) * 20000).astype("<i2"),
+    ])
+    return samples.tobytes()
+
+
+class DirectWavLoadTests(IsolatedWorkerTestCase):
+    def test_app_wav_matches_faster_whisper_decode_audio(self) -> None:
+        import numpy as np
+
+        try:
+            from faster_whisper.audio import decode_audio
+        except ImportError:
+            self.skipTest("requires faster-whisper")
+        with TemporaryDirectory() as tmp:
+            path = _write_wav(Path(tmp) / "take.wav", _pcm16_frames())
+            direct = load_pcm16_wav(path)
+            expected = decode_audio(str(path), sampling_rate=16000)
+        self.assertIsNotNone(direct)
+        self.assertEqual(direct.dtype, np.float32)
+        self.assertEqual(direct.shape, expected.shape)
+        np.testing.assert_allclose(direct, expected, rtol=0, atol=1e-7)
+        self.assertEqual(float(direct[0]), -1.0)
+
+    def test_other_formats_and_malformed_files_fall_back(self) -> None:
+        frames = _pcm16_frames()
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cases = {
+                "stereo": _write_wav(root / "stereo.wav", frames, channels=2),
+                "rate": _write_wav(root / "rate.wav", frames, rate=48000),
+                "width": _write_wav(root / "width.wav", frames, width=1),
+                "not_wav": root / "not.wav",
+                "missing": root / "missing.wav",
+            }
+            cases["not_wav"].write_bytes(b"not a wav file")
+            truncated = root / "truncated.wav"
+            truncated.write_bytes(_write_wav(root / "full.wav", frames).read_bytes()[:-10])
+            cases["truncated"] = truncated
+            for name, path in cases.items():
+                with self.subTest(case=name):
+                    self.assertIsNone(load_pcm16_wav(path))
+
+    def test_transcribe_passes_samples_for_app_wav_and_path_otherwise(self) -> None:
+        import numpy as np
+
+        backend = FasterWhisperBackend()
+        with TemporaryDirectory() as tmp, patch.dict(sys.modules, _install_fake_faster_whisper()):
+            backend.load("4bit")
+            app_wav = _write_wav(Path(tmp) / "take.wav", _pcm16_frames())
+            backend.transcribe(app_wav, None)
+            audio = _FakeWhisperModel.last_transcribe_kwargs["audio_path"]
+            self.assertIsInstance(audio, np.ndarray)
+            np.testing.assert_array_equal(audio, load_pcm16_wav(app_wav))
+
+            other = _write_wav(Path(tmp) / "other.wav", _pcm16_frames(), rate=44100)
+            backend.transcribe(other, None)
+            self.assertEqual(_FakeWhisperModel.last_transcribe_kwargs["audio_path"], str(other))
+
+            # A model with another feature rate never receives 16 kHz samples.
+            backend.model.feature_extractor = types.SimpleNamespace(sampling_rate=8000)
+            backend.transcribe(app_wav, None)
+            self.assertEqual(_FakeWhisperModel.last_transcribe_kwargs["audio_path"], str(app_wav))
 
 
 class _FakeSegment:

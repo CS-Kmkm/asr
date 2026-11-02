@@ -242,6 +242,38 @@ def wav_duration_seconds(audio_path: Path) -> float | None:
         return None
 
 
+WHISPER_SAMPLE_RATE = 16_000
+
+
+def load_pcm16_wav(audio_path: Path, sample_rate: int = WHISPER_SAMPLE_RATE) -> Any | None:
+    """Load a mono 16-bit PCM WAV at ``sample_rate`` as float32 samples.
+
+    Returns the array faster-whisper's own ``decode_audio`` would produce for
+    such a file (``int16 / 32768``) without its generic PyAV decode, which
+    resamples frame groups and runs ``gc.collect()`` on every call. Any other
+    format, an unreadable file or a header that disagrees with the data
+    returns None so the caller keeps the generic decoder.
+    """
+    try:
+        import numpy as np
+
+        with contextlib.closing(wave.open(str(audio_path), "rb")) as handle:
+            if (
+                handle.getnchannels() != 1
+                or handle.getsampwidth() != 2
+                or handle.getframerate() != sample_rate
+                or handle.getcomptype() != "NONE"
+            ):
+                return None
+            frames = handle.getnframes()
+            data = handle.readframes(frames)
+        if len(data) != frames * 2:
+            return None
+        return np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
+    except (wave.Error, OSError, EOFError, ValueError, ImportError):
+        return None
+
+
 def map_backend_exception(exc: BaseException, operation: str, backend_label: str = "VibeVoice", *, device: str | None = None) -> BackendError:
     log_exception(exc, operation)
     details: list[str] = []
@@ -709,11 +741,13 @@ class FasterWhisperBackend(ProgressReporting):
         """Yield segments as faster-whisper decodes them, for streaming."""
         try:
             emitted = False
+            self.raise_if_cancelled()
+            audio = self._audio_input(audio_path)
             for attempt in range(2):
                 self.raise_if_cancelled()
                 try:
                     raw_segments, _info = self.model.transcribe(
-                        str(audio_path),
+                        audio,
                         # Whisper accepts an ISO 639 language, not a regional BCP 47 tag.
                         language=language.split("-", 1)[0] if language else None,
                         hotwords=prompt if prompt else None,
@@ -750,6 +784,19 @@ class FasterWhisperBackend(ProgressReporting):
             raise
         except BaseException as exc:
             raise map_backend_exception(exc, "transcribe", "faster-whisper", device=self.device) from exc
+
+    def _audio_input(self, audio_path: Path) -> Any:
+        """The decoded samples of the app's own WAV, else the path.
+
+        The app writes 16 kHz mono PCM16, which needs no resampling, so it is
+        read directly. Anything else is left to faster-whisper's decoder.
+        """
+        extractor = getattr(self.model, "feature_extractor", None)
+        sample_rate = getattr(extractor, "sampling_rate", WHISPER_SAMPLE_RATE)
+        if sample_rate != WHISPER_SAMPLE_RATE:
+            return str(audio_path)
+        samples = load_pcm16_wav(audio_path, WHISPER_SAMPLE_RATE)
+        return str(audio_path) if samples is None else samples
 
     @staticmethod
     def _is_cuda_failure(exc: Exception) -> bool:
