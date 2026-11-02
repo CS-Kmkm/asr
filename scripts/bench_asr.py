@@ -11,6 +11,14 @@ It distinguishes two kinds of timing:
 * ``wall_ms`` -- the full request/response round trip measured by this script
   (includes IPC, JSON encode/decode and the worker compute time).
 
+By default each ``transcribe`` request has the shape the app sends for final
+recognition (``src-tauri/src/asr.rs`` ``transcribe_request``): ``prompt`` is
+the dictionary rendered exactly as ``Storage::dictionary_asr_prompt_for``
+renders it and ``language`` is the speech locale, both null when unset.
+``--idle-gap-s`` and ``--live-preview`` reproduce idle time and serial
+live-preview load before warm requests; ``--request-shape legacy`` keeps the
+request earlier runs sent.
+
 Only the Python standard library is used so the harness runs anywhere the
 worker runs, including the offline WSL2 dev box using the ``mock`` backend.
 
@@ -35,6 +43,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
+import hashlib
+import io
 import json
 import math
 import os
@@ -46,6 +57,7 @@ import threading
 import time
 import wave
 from collections import deque
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -153,6 +165,16 @@ class WorkerSession:
             )
         except (OSError, ValueError) as exc:
             raise BenchError(f"failed to start worker {self.cmd!r}: {exc}") from exc
+        # A text-mode pipe writes os.linesep (CRLF on Windows); the app ends
+        # each request with a bare LF, so requests are written the same way.
+        if self.proc.stdin is not None:
+            self.proc.stdin = io.TextIOWrapper(
+                self.proc.stdin.detach(),
+                encoding="utf-8",
+                newline="\n",
+                line_buffering=True,
+                write_through=True,
+            )
         # Model libraries write warnings and progress bars to stderr. Unread,
         # they fill the pipe buffer and block the worker, which then looks like
         # a model hang ("worker timed out").
@@ -215,7 +237,9 @@ class WorkerSession:
             raise BenchError("worker process is not running")
 
         payload = {"id": self._alloc_id(), **payload}
-        line = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        # The app serializes requests with serde_json, whose default map sorts
+        # keys; sorting here makes a production-shape line byte-comparable.
+        line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
 
         # perf_counter uses QueryPerformanceCounter on Windows. monotonic uses
         # GetTickCount64 there and would quantize fast requests to 0/16 ms.
@@ -312,40 +336,333 @@ class WorkerSession:
 
 
 # --------------------------------------------------------------------------- #
-# Benchmark driver
+# Production request parity
 # --------------------------------------------------------------------------- #
-def build_worker_cmd(args: argparse.Namespace) -> list[str]:
-    if args.worker_cmd:
-        return args.worker_cmd
-    return [sys.executable, "-m", "asr_worker", "--backend", args.backend]
+# Characters Rust's `str::trim` removes (Unicode White_Space). Python's
+# argument-less `str.strip()` also removes U+001C..U+001F, so the set is explicit.
+_RUST_WHITESPACE = (
+    "\t\n\x0b\x0c\r \x85\xa0        "
+    "        　"
+)
+
+# Column order of the app's dictionary CSV import (`storage.rs`
+# `import_dictionary_csv`). The bench also accepts a trailing `source` column.
+DICTIONARY_CSV_HEADER = ["reading", "surface", "category", "aliases", "priority", "app_scope"]
+
+
+def rust_trim(value: str) -> str:
+    return value.strip(_RUST_WHITESPACE)
+
+
+@dataclass(frozen=True)
+class DictionaryEntry:
+    """The fields of a stored dictionary entry that the ASR prompt reads."""
+
+    reading: str
+    surface: str
+    aliases: tuple[str, ...] = ()
+    priority: int = 0
+    app_scope: str | None = None
+    source: str = "manual"
+
+
+def _normalized_scope(scope: str | None) -> str | None:
+    """`storage.rs` `normalized_scope`: blank and `global` mean unscoped."""
+    if scope is None:
+        return None
+    scope = rust_trim(scope)
+    return scope if scope and scope != "global" else None
+
+
+def _scope_matches(scope: str | None, app_key: str | None, app_category: str | None) -> bool:
+    """`storage.rs` `scope_matches` with an optional app context."""
+    if scope is None or scope == "" or scope == "global":
+        return True
+    if app_key is None and app_category is None:
+        return False  # no app context (Edit/Ask, or no target app)
+    app_scope = f"app:{app_key}" if app_key is not None else None
+    return app_scope == scope or scope == f"category:{app_category or ''}"
+
+
+def render_asr_prompt(
+    entries: list[DictionaryEntry],
+    backend: str,
+    *,
+    app_key: str | None = None,
+    app_category: str | None = None,
+) -> str | None:
+    """Render the dictionary the way the app builds a transcription prompt.
+
+    A line-for-line port of `Storage::dictionary_asr_prompt_for`
+    (`src-tauri/src/storage.rs`): entries are read in `priority DESC, surface
+    ASC` order and filtered by scope; faster-whisper gets comma-separated
+    hotwords within 200 characters, every other backend gets one
+    `reading => surface (aliases: ...)` line per entry within 1200 characters.
+    """
+    ordered = sorted(entries, key=lambda entry: (-entry.priority, entry.surface))
+    selected = [entry for entry in ordered if _scope_matches(entry.app_scope, app_key, app_category)]
+    terms: list[str] = []
+    length = 0
+
+    def push_within(term: str, separator: int, budget: int) -> None:
+        nonlocal length
+        size = len(term) + (separator if terms else 0)
+        if length + size <= budget:
+            length += size
+            terms.append(term)
+
+    if backend == "faster-whisper":
+        seen: set[str] = set()
+        candidates = (
+            [entry.surface for entry in selected]
+            + [alias for entry in selected for alias in entry.aliases]
+            + [entry.reading for entry in selected if entry.source == "manual"]
+        )
+        for candidate in candidates:
+            term = rust_trim(candidate)
+            if term and term.lower() not in seen:
+                seen.add(term.lower())
+                push_within(term, 2, 200)
+        return ", ".join(terms) if terms else None
+    for entry in selected:
+        aliases = f" (aliases: {', '.join(entry.aliases)})" if entry.aliases else ""
+        if entry.source == "auto":
+            term = f"{entry.surface}{aliases}"
+        else:
+            term = f"{entry.reading} => {entry.surface}{aliases}"
+        push_within(term, 1, 1200)
+    return "\n".join(terms) if terms else None
+
+
+def _validated_text(value: str, name: str, row: int) -> str:
+    trimmed = rust_trim(value)
+    if not trimmed or any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in trimmed):
+        raise BenchError(f"dictionary CSV row {row}: {name} is empty or contains control characters")
+    return trimmed
+
+
+def load_dictionary_csv(path: Path) -> list[DictionaryEntry]:
+    """Read dictionary entries in the app's CSV import format.
+
+    The header must be `reading,surface,category,aliases,priority,app_scope`
+    (aliases separated by `|`, a blank priority meaning 0), optionally followed
+    by a `source` column (`manual`, the default, or `auto`) so confirmed
+    candidates, which the app stores as `auto`, can be reproduced too.
+    """
+    try:
+        with path.open(encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.reader(stream))
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
+        raise BenchError(f"could not read dictionary CSV {path}: {exc}") from exc
+    if not rows:
+        raise BenchError("dictionary CSV is empty; it needs the app's import header")
+    header = rows[0]
+    with_source = header == [*DICTIONARY_CSV_HEADER, "source"]
+    if header != DICTIONARY_CSV_HEADER and not with_source:
+        raise BenchError(
+            "dictionary CSV header must be " + ",".join(DICTIONARY_CSV_HEADER) + "[,source]"
+        )
+    entries: list[DictionaryEntry] = []
+    for index, row in enumerate(rows[1:], start=2):
+        if not row:
+            continue
+        if len(row) != len(header):
+            raise BenchError(f"dictionary CSV row {index} has an invalid field count")
+        priority_cell = rust_trim(row[4])
+        try:
+            priority = int(priority_cell) if priority_cell else 0
+        except ValueError as exc:
+            raise BenchError(f"dictionary CSV row {index} has an invalid priority") from exc
+        aliases = tuple(rust_trim(alias) for alias in row[3].split("|")) if rust_trim(row[3]) else ()
+        if any(not alias for alias in aliases):
+            raise BenchError(f"dictionary CSV row {index}: aliases must be non-empty")
+        source = rust_trim(row[6]) if with_source else "manual"
+        if source not in ("manual", "auto"):
+            raise BenchError(f"dictionary CSV row {index}: source must be manual or auto")
+        entries.append(
+            DictionaryEntry(
+                reading=_validated_text(row[0], "reading", index),
+                surface=_validated_text(row[1], "surface", index),
+                aliases=aliases,
+                priority=priority,
+                app_scope=_normalized_scope(row[5]),
+                source=source,
+            )
+        )
+    return entries
+
+
+def prompt_terms_as_entries(terms: list[str] | None) -> list[DictionaryEntry]:
+    """`--prompt` terms as manual global entries whose reading is the surface."""
+    entries = []
+    for term in terms or []:
+        term = rust_trim(term)
+        if term:
+            entries.append(DictionaryEntry(reading=term, surface=term))
+    return entries
+
+
+@dataclass(frozen=True)
+class LivePreviewLoad:
+    """Live-preview requests issued while a take records (`live_dictation.rs`).
+
+    The production loop is serial: sleep `interval_s`, prepare the window
+    (`prep_s`), send one preview request and wait for it, repeat. Stop ends
+    the sleep at once, but a preparation or a preview request already running
+    finishes first, and only then is the final request sent (`stop.rs` joins
+    the live task before final recognition). The bench decodes on every
+    iteration, the upper bound of the app's segmentation gate.
+    """
+
+    interval_s: float = 0.150
+    prep_s: float = 0.0
+    recording_s: float | None = None  # None: the final audio's duration
+    greedy: bool = False
+    audio: Path | None = None  # None: the final audio
+
+
+@dataclass(frozen=True)
+class RequestConditions:
+    """Everything that shapes a transcription request and its timing."""
+
+    shape: str = "production"  # or "legacy": the pre-parity request shape
+    prompt: str | list[str] | None = None
+    language: str | None = None
+    idle_gap_s: float = 0.0
+    live: LivePreviewLoad | None = None
+
+
+def transcribe_payload(audio: Path, conditions: RequestConditions, *, preview: bool = False) -> dict[str, Any]:
+    """A `transcribe` request without its id.
+
+    The production shape matches `transcribe_request` in
+    `src-tauri/src/asr.rs`: `prompt` and `language` are always present
+    (null when unset) and only a greedy live-preview request carries
+    `decoding`. The legacy shape is what earlier bench runs sent.
+    """
+    if conditions.shape == "legacy":
+        payload: dict[str, Any] = {"command": "transcribe", "audio_path": str(audio)}
+        if conditions.prompt:
+            payload["prompt"] = conditions.prompt
+        if conditions.language is not None:
+            payload["language"] = conditions.language
+        return payload
+    payload = {
+        "command": "transcribe",
+        "audio_path": str(audio),
+        "prompt": conditions.prompt,
+        "language": conditions.language,
+    }
+    if preview and conditions.live is not None and conditions.live.greedy:
+        payload["decoding"] = "greedy"
+    return payload
+
+
+def wav_duration_s(path: Path) -> float:
+    try:
+        with wave.open(str(path), "rb") as wav:
+            return wav.getnframes() / float(wav.getframerate())
+    except (OSError, EOFError, wave.Error, ZeroDivisionError) as exc:
+        raise BenchError(f"could not read the duration of {path}: {exc}") from exc
+
+
+def wav_format(path: Path) -> dict[str, int] | None:
+    """Sample rate, channels and sample width, to compare with the app's WAVs."""
+    try:
+        with wave.open(str(path), "rb") as wav:
+            return {
+                "sample_rate": wav.getframerate(),
+                "channels": wav.getnchannels(),
+                "sample_width_bytes": wav.getsampwidth(),
+            }
+    except (OSError, EOFError, wave.Error):
+        return None
+
+
+# Clock and sleep seams, replaced by tests with a simulated clock.
+_now = time.perf_counter
+_sleep = time.sleep
+
+
+def _wait_until(deadline: float) -> None:
+    remaining = deadline - _now()
+    if remaining > 0:
+        _sleep(remaining)
+
+
+def simulate_live_preview(
+    session: WorkerSession, audio: Path, conditions: RequestConditions
+) -> dict[str, Any]:
+    """Run the live-preview loop for one take and return how stop was delayed.
+
+    `live_drain_ms` is the time from the simulated stop until the final
+    request may be sent: the remainder of a preparation or preview request
+    that was running when stop arrived (0 when stop interrupted the sleep).
+    """
+    live = conditions.live
+    assert live is not None
+    recording_s = live.recording_s if live.recording_s is not None else wav_duration_s(audio)
+    preview_audio = live.audio or audio
+    payload = transcribe_payload(preview_audio, conditions, preview=True)
+    preview_wall_ms: list[float] = []
+    stop_at = _now() + recording_s
+    while True:
+        now = _now()
+        if now + live.interval_s >= stop_at:
+            # Stop interrupts the sleep; nothing is in flight.
+            _wait_until(stop_at)
+            drain_end = stop_at
+            break
+        _sleep(live.interval_s)
+        if live.prep_s > 0:
+            _sleep(live.prep_s)
+            if _now() >= stop_at:
+                # The preparation finishes, then the loop sees stop.
+                drain_end = _now()
+                break
+        _, wall_ms = session.request(payload)
+        preview_wall_ms.append(wall_ms)
+        if _now() >= stop_at:
+            drain_end = _now()
+            break
+    return {
+        "live_drain_ms": max(0.0, drain_end - stop_at) * 1000.0,
+        "preview_wall_ms": preview_wall_ms,
+    }
 
 
 def run_transcribe_loop(
     session: WorkerSession,
     audio_paths: list[Path],
     repeat: int,
-    prompt: list[str] | None,
+    conditions: RequestConditions,
     record_device: bool = False,
-    language: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Run `repeat` transcriptions per audio file, return per-call records."""
+    """Run `repeat` transcriptions per audio file, return per-call records.
+
+    Before each request the worker idles for `conditions.idle_gap_s` and, with
+    live-preview load, serves preview requests for the simulated recording.
+    Neither is included in `wall_ms`.
+    """
     records: list[dict[str, Any]] = []
     for audio in audio_paths:
         for _ in range(repeat):
-            payload: dict[str, Any] = {"command": "transcribe", "audio_path": str(audio)}
-            if prompt:
-                payload["prompt"] = prompt
-            if language is not None:
-                payload["language"] = language
-            response, wall_ms = session.request(payload)
-            records.append(
-                {
-                    "audio": str(audio),
-                    "wall_ms": wall_ms,
-                    "duration_ms": float(response.get("duration_ms", float("nan"))),
-                    "text": response.get("text", ""),
-                }
-            )
+            if conditions.idle_gap_s > 0:
+                _sleep(conditions.idle_gap_s)
+            live = simulate_live_preview(session, audio, conditions) if conditions.live else None
+            response, wall_ms = session.request(transcribe_payload(audio, conditions))
+            record: dict[str, Any] = {
+                "audio": str(audio),
+                "wall_ms": wall_ms,
+                "duration_ms": float(response.get("duration_ms", float("nan"))),
+                "text": response.get("text", ""),
+            }
+            if live is not None:
+                record["live_drain_ms"] = live["live_drain_ms"]
+                record["stop_to_final_ms"] = live["live_drain_ms"] + wall_ms
+                record["preview_requests"] = len(live["preview_wall_ms"])
+                record["preview_wall_ms"] = live["preview_wall_ms"]
+            records.append(record)
             if record_device:
                 # Query after every inference: auto can switch device during a
                 # request. Health overhead is excluded from that request's timer.
@@ -354,6 +671,28 @@ def run_transcribe_loop(
                 records[-1]["device"] = health.get("device")
                 records[-1]["compute_type"] = health.get("computeType")
     return records
+
+
+def query_health(session: WorkerSession) -> dict[str, Any] | None:
+    """Device and compute type the loaded worker actually uses, if it reports them."""
+    try:
+        response, _ = session.request({"command": "health"})
+    except BenchError:
+        return None  # e.g. a --worker-cmd worker without health support
+    health = response.get("health")
+    if not isinstance(health, dict):
+        return None
+    return {
+        "backend": health.get("backend"),
+        "device": health.get("device"),
+        "compute_type": health.get("computeType"),
+    }
+
+
+def build_worker_cmd(args: argparse.Namespace) -> list[str]:
+    if args.worker_cmd:
+        return args.worker_cmd
+    return [sys.executable, "-m", "asr_worker", "--backend", args.backend]
 
 
 def worker_env(args: argparse.Namespace) -> dict[str, str]:
@@ -372,9 +711,79 @@ def worker_env(args: argparse.Namespace) -> dict[str, str]:
     return env
 
 
+def request_conditions(args: argparse.Namespace) -> tuple[RequestConditions, dict[str, Any]]:
+    """Build the request conditions and their content-free description."""
+    shape = getattr(args, "request_shape", "production")
+    terms = getattr(args, "prompt", None) or None
+    dictionary_csv = getattr(args, "dictionary_csv", None)
+    app_key = getattr(args, "app_key", None)
+    app_category = getattr(args, "app_category", None)
+    language = getattr(args, "language", None)
+    idle_gap_s = getattr(args, "idle_gap_s", 0.0) or 0.0
+    live: LivePreviewLoad | None = None
+    if getattr(args, "live_preview", False):
+        audio = getattr(args, "live_preview_audio", None)
+        live = LivePreviewLoad(
+            interval_s=getattr(args, "live_interval_ms", 150.0) / 1000.0,
+            prep_s=(getattr(args, "live_prep_ms", 0.0) or 0.0) / 1000.0,
+            recording_s=getattr(args, "live_recording_s", None),
+            greedy=getattr(args, "live_preview_greedy", False),
+            audio=Path(audio) if audio else None,
+        )
+    elif getattr(args, "live_preview_greedy", False) or getattr(args, "live_preview_audio", None):
+        raise BenchError("--live-preview-greedy and --live-preview-audio require --live-preview")
+
+    prompt: str | list[str] | None
+    entries: list[DictionaryEntry] = []
+    if shape == "legacy":
+        if dictionary_csv or app_key is not None or app_category is not None or live is not None:
+            raise BenchError(
+                "--dictionary-csv, --app-key, --app-category and --live-preview require --request-shape production"
+            )
+        prompt = terms
+    else:
+        if dictionary_csv:
+            entries.extend(load_dictionary_csv(Path(dictionary_csv)))
+        entries.extend(prompt_terms_as_entries(terms))
+        prompt = render_asr_prompt(entries, args.backend, app_key=app_key, app_category=app_category)
+
+    rendered = prompt if isinstance(prompt, str) else ("\n".join(prompt) if prompt else None)
+    description = {
+        "request_shape": shape,
+        "prompt": {
+            "dictionary_csv": str(dictionary_csv) if dictionary_csv else None,
+            "terms": len(terms or []),
+            "entries": len(entries),
+            "app_key": app_key,
+            "app_category": app_category,
+            "format_backend": args.backend if shape == "production" else None,
+            # The prompt holds dictionary text: record a fingerprint, not the text.
+            "chars": len(rendered) if rendered else 0,
+            "sha256": hashlib.sha256(rendered.encode("utf-8")).hexdigest() if rendered else None,
+        },
+        "idle_gap_s": idle_gap_s,
+        "live_preview": None
+        if live is None
+        else {
+            "interval_ms": live.interval_s * 1000.0,
+            "prep_ms": live.prep_s * 1000.0,
+            "recording_s": live.recording_s,
+            "greedy": live.greedy,
+            "audio": str(live.audio) if live.audio else None,
+            "model": "serial: sleep, prepare, preview request; stop waits for an in-flight preview before the final request",
+        },
+    }
+    return RequestConditions(shape=shape, prompt=prompt, language=language, idle_gap_s=idle_gap_s, live=live), description
+
+
 def run_benchmark(args: argparse.Namespace, audio_paths: list[Path]) -> dict[str, Any]:
     cmd = build_worker_cmd(args)
     env = worker_env(args)
+    conditions, condition_config = request_conditions(args)
+    # Cold runs measure process start + load + the first request only; the
+    # idle gap and live-preview load apply to warm requests.
+    cold_conditions = replace(conditions, idle_gap_s=0.0, live=None)
+    record_device = getattr(args, "record_device", False)
 
     cold_load_ms: list[float] = []
     warm_records: list[dict[str, Any]] = []
@@ -389,7 +798,7 @@ def run_benchmark(args: argparse.Namespace, audio_paths: list[Path]) -> dict[str
             cold_load_ms.append(load_wall_ms)
             # One transcription per audio file counts as the "cold path"
             # (process start + load + first transcription).
-            cold_records.extend(run_transcribe_loop(session, audio_paths, 1, args.prompt, getattr(args, "record_device", False), getattr(args, "language", None)))
+            cold_records.extend(run_transcribe_loop(session, audio_paths, 1, cold_conditions, record_device))
             if cold_i == 0:
                 model_name = load_resp.get("model", "?")
 
@@ -399,29 +808,49 @@ def run_benchmark(args: argparse.Namespace, audio_paths: list[Path]) -> dict[str
             {"command": "load", "quantization": args.quantization}
         )
         model_name = warm_load_resp.get("model", "?")
-        warm_records = run_transcribe_loop(session, audio_paths, args.repeat, args.prompt, getattr(args, "record_device", False), getattr(args, "language", None))
+        # Health after load is outside every timer.
+        worker_health = query_health(session)
+        warm_records = run_transcribe_loop(session, audio_paths, args.repeat, conditions, record_device)
+
+    observed = sorted(
+        {
+            (record.get("device"), record.get("compute_type"))
+            for record in warm_records + cold_records
+            if "device" in record
+        },
+        key=lambda pair: (str(pair[0]), str(pair[1])),
+    )
+    warm: dict[str, Any] = {
+        "wall_ms": summarize([r["wall_ms"] for r in warm_records]),
+        "duration_ms": summarize([r["duration_ms"] for r in warm_records]),
+    }
+    if conditions.live is not None:
+        warm["live_drain_ms"] = summarize([r["live_drain_ms"] for r in warm_records])
+        warm["stop_to_final_ms"] = summarize([r["stop_to_final_ms"] for r in warm_records])
+        warm["preview_wall_ms"] = summarize([ms for r in warm_records for ms in r["preview_wall_ms"]])
+    warm["samples"] = warm_records
 
     return {
         "config": {
             "backend": args.backend,
             "whisper_decode_profile": env.get("ASR_WHISPER_DECODE_PROFILE") if args.backend == "faster-whisper" else None,
             "device_policy": env.get("ASR_DEVICE", "auto"),
-            "record_device": getattr(args, "record_device", False),
+            "record_device": record_device,
+            "worker_health": worker_health,
+            "observed_devices": [{"device": d, "compute_type": c} for d, c in observed] if record_device else None,
             "quantization": args.quantization,
             "language": getattr(args, "language", None),
+            **condition_config,
             "worker_cmd": cmd,
             "audio": [str(p) for p in audio_paths],
+            "audio_format": [wav_format(p) for p in audio_paths],
             "repeat": args.repeat,
             "cold_runs": args.cold_runs,
             "timeout_s": args.timeout,
             "model": model_name,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         },
-        "warm": {
-            "wall_ms": summarize([r["wall_ms"] for r in warm_records]),
-            "duration_ms": summarize([r["duration_ms"] for r in warm_records]),
-            "samples": warm_records,
-        },
+        "warm": warm,
         "cold": {
             "load_ms": summarize(cold_load_ms),
             "wall_ms": summarize([r["wall_ms"] for r in cold_records]),
@@ -449,7 +878,35 @@ def render_markdown(result: dict[str, Any]) -> str:
     lines.append("")
     lines.append(f"- backend: `{cfg['backend']}`  quantization: `{cfg['quantization']}`")
     lines.append(f"- model: `{cfg['model']}`")
+    health = cfg.get("worker_health")
+    if health:
+        lines.append(
+            f"- device after load: `{health.get('device') or '-'}`  compute type: `{health.get('compute_type') or '-'}`"
+            f"  (policy `{cfg.get('device_policy', 'auto')}`)"
+        )
+    observed = cfg.get("observed_devices")
+    if observed:
+        lines.append(
+            "- devices observed after requests: "
+            + ", ".join(f"`{item['device'] or '-'}/{item['compute_type'] or '-'}`" for item in observed)
+        )
     lines.append(f"- language: `{cfg.get('language') or 'auto'}`")
+    prompt = cfg.get("prompt")
+    if prompt is not None:
+        lines.append(
+            f"- request shape: `{cfg.get('request_shape')}`  prompt: {prompt['chars']} chars"
+            f" from {prompt['entries']} entries"
+            + (f" (sha256 `{prompt['sha256'][:12]}`)" if prompt.get("sha256") else "")
+        )
+    if cfg.get("idle_gap_s"):
+        lines.append(f"- idle gap before each warm request: {cfg['idle_gap_s']:g} s")
+    live = cfg.get("live_preview")
+    if live:
+        lines.append(
+            f"- live preview load: every {live['interval_ms']:g} ms + {live['prep_ms']:g} ms prep, "
+            f"{'greedy' if live['greedy'] else 'standard'} decoding, recording "
+            + (f"{live['recording_s']:g} s" if live.get("recording_s") is not None else "= audio duration")
+        )
     lines.append(f"- worker cmd: `{' '.join(cfg['worker_cmd'])}`")
     lines.append(f"- audio files: {len(cfg['audio'])}  repeat (warm): {cfg['repeat']}  cold runs: {cfg['cold_runs']}")
     lines.append(f"- timestamp: {cfg['timestamp']}")
@@ -467,6 +924,10 @@ def render_markdown(result: dict[str, Any]) -> str:
 
     lines.append(row("warm wall (round trip)", warm["wall_ms"]))
     lines.append(row("warm duration (ASR pure)", warm["duration_ms"]))
+    if "stop_to_final_ms" in warm:
+        lines.append(row("warm live drain (stop wait)", warm["live_drain_ms"]))
+        lines.append(row("warm stop -> final (drain + wall)", warm["stop_to_final_ms"]))
+        lines.append(row("warm preview wall", warm["preview_wall_ms"]))
     lines.append(row("cold wall (round trip)", cold["wall_ms"]))
     lines.append(row("cold duration (ASR pure)", cold["duration_ms"]))
     lines.append(row("cold load (model load)", cold["load_ms"]))
@@ -494,6 +955,23 @@ def language_argument(value: str) -> str:
     if not value.strip() or len(value) > 32:
         raise argparse.ArgumentTypeError("language must be a nonempty string of at most 32 characters")
     return value
+
+
+def non_negative_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("must be a finite number >= 0")
+    return number
+
+
+def positive_float(value: str) -> float:
+    number = non_negative_float(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be > 0")
+    return number
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -524,8 +1002,19 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="append",
         default=[],
         metavar="TERM",
-        help="hotword/dictionary term passed as prompt; repeatable",
+        help="dictionary term (a manual entry whose reading is the term); repeatable",
     )
+    parser.add_argument("--dictionary-csv", metavar="CSV", help="dictionary in the app's CSV import format (optional trailing source column); rendered into the prompt as the app does")
+    parser.add_argument("--app-key", help="app context key for app:KEY dictionary scopes (default: no app context)")
+    parser.add_argument("--app-category", help="app context category for category:NAME dictionary scopes")
+    parser.add_argument("--request-shape", choices=["production", "legacy"], default="production", help="production: the app's transcribe request (prompt/language always present, prompt rendered as the app does); legacy: the request earlier bench runs sent (default: production)")
+    parser.add_argument("--idle-gap-s", type=non_negative_float, default=0.0, metavar="SECONDS", help="idle time before each warm request, excluded from timings (default: 0)")
+    parser.add_argument("--live-preview", action="store_true", help="before each warm request, simulate a recording with serial live-preview requests; stop waits for an in-flight preview")
+    parser.add_argument("--live-preview-greedy", action="store_true", help="send decoding=greedy on preview requests (the app's lighter live preview setting)")
+    parser.add_argument("--live-preview-audio", metavar="WAV", help="audio for preview requests (default: the final request's audio)")
+    parser.add_argument("--live-recording-s", type=positive_float, metavar="SECONDS", help="simulated recording length before stop (default: the audio's duration)")
+    parser.add_argument("--live-interval-ms", type=positive_float, default=150.0, metavar="MS", help="sleep between live iterations (default: 150, live_dictation.rs LIVE_INTERVAL)")
+    parser.add_argument("--live-prep-ms", type=non_negative_float, default=0.0, metavar="MS", help="simulated audio preparation per live iteration (default: 0)")
     parser.add_argument(
         "--worker-cmd",
         nargs=argparse.REMAINDER,
@@ -561,6 +1050,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.output_stream = Path(args.output).open("x", encoding="utf-8", newline="\n")
             except OSError as exc:
                 raise BenchError("could not create a new result file; check its path and permissions") from exc
+        if args.live_preview_audio and not Path(args.live_preview_audio).is_file():
+            raise BenchError(f"live preview audio not found: {args.live_preview_audio}")
         if args.smoke:
             with tempfile.TemporaryDirectory(prefix="bench_asr_smoke_") as tmp:
                 wav_path = Path(tmp) / "smoke_sine.wav"
