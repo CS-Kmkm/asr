@@ -86,9 +86,11 @@ pub(crate) enum TakeSpan {
     Paste,
     /// Dropping the live draft, which stops the input-monitor helper.
     HelperExit,
-    /// The History save done before the take completes.
+    /// The History save: before Edit/Ask complete; inside the deferred
+    /// completion job for Dictate/Translate.
     HistorySave,
-    /// The deferred completion job (metrics and temporary-audio cleanup).
+    /// The Dictate/Translate deferred completion job (History, dictionary
+    /// candidate, metrics and temporary-audio cleanup).
     CompletionJob,
     /// Stop request to the output commit returning.
     StopToDelivery,

@@ -3,9 +3,12 @@ use super::{classify_ai_stage, AiStageResult, PipelineContext, RecordedTake};
 use crate::commands::{
     cancellation_copy, commit_dictation_output, completion_persistence_warning,
     correction_failure_metric_code, correction_failure_status, emit_correction_preview,
-    output_limit_inserted_message, report_clipboard_not_restored, report_temp_cleanup,
-    save_history, CommittedOutput, INSERTION_FAILED, TRANSLATION_PASTE_UNVERIFIED,
-    TRANSLATION_TARGET_CHANGED,
+    output_limit_inserted_message, report_clipboard_not_restored, CommittedOutput,
+    INSERTION_FAILED, TRANSLATION_PASTE_UNVERIFIED, TRANSLATION_TARGET_CHANGED,
+};
+use crate::pipeline::finish::{
+    save_history_reporting_row, DICTIONARY_CHANGED_EVENT, HISTORY_CHANGED_EVENT,
+    TEMP_CLEANUP_FAILED,
 };
 use crate::{
     app_context, command_error, correction,
@@ -411,72 +414,61 @@ async fn finish_owned(
         Ok(InsertResult::PasteUnverified) => "paste_unverified",
     };
     let inserted = insertion_result == Ok(InsertResult::ClipboardPaste);
-    // Reserved before the History save so a Delete all that starts from here
-    // on also waits for this take's deferred metrics.
+    // Reserved before the take is shown as complete, so a Delete all or a
+    // retention change that starts from here on waits for this take's
+    // deferred History row, dictionary candidate and metrics.
     let completion_slot = storage.reserve_completion();
-    let history_save_started = Instant::now();
-    let history_save_status = save_history(
-        storage,
-        &NewHistoryItem {
-            transcript_text: &transcript.text,
-            processed_text: processed_text.as_deref(),
-            source_text: None,
-            instruction_text: None,
-            action_kind: None,
-            search_site: None,
-            mode: if mode == PipelineMode::Translate {
-                "translate"
-            } else if processed_text.is_some() {
-                "ai_corrected"
-            } else if correction_failed {
-                "faithful_fallback"
-            } else {
-                "faithful"
-            },
-            asr_provider: &transcript.model,
-            llm_provider: llm_provider.as_deref(),
-            target_language: translation_target.as_deref(),
-            app_category: app_context::history_category(app_context.as_ref()),
-            duration_ms: Some(duration_ms as i64),
-            latency_ms: Some(latency_ms as i64),
-            retry_of_id: None,
-            insertion_result: Some(insertion_label),
-            insertion_detail,
-        },
-        Some(&artifact.path),
-    );
-    trace.span_since(TakeSpan::HistorySave, history_save_started);
     // Only an AI correction of a Dictate transcript proposes a spelling; a
     // translation is a different text, not a correction of the transcript.
-    if mode == PipelineMode::Dictate && processed_text.is_some() {
-        let _ =
-            storage.add_dictionary_candidate_from_correction(&transcript.text, &final_text, None);
-    }
-    // History and dictionary candidates stay above: the History and
-    // Dictionary pages re-read them when the completed phase is published.
-    // Metrics and temporary-audio cleanup are deferred past the lifecycle
-    // guard, in take order, and reported as before once they ran.
+    let dictionary_candidate = (mode == PipelineMode::Dictate && processed_text.is_some())
+        .then(|| (transcript.text.clone(), final_text.clone()));
+    // History, the dictionary candidate, metrics and temporary-audio cleanup
+    // are deferred past the lifecycle guard, in take order; the History and
+    // Dictionary pages re-read on the job's change events.
     let deferred = DeferredCompletion {
         app: app.clone(),
-        storage: storage.clone(),
-        app_context: app_context.clone(),
-        metrics: TakeMetrics {
-            mode,
-            asr_backend: settings.asr_backend.clone(),
-            correction_provider: settings.correction_provider.clone(),
-            latency_ms: latency_ms as i64,
-            translation_failed,
-            insertion_label,
-            insertion_detail,
-            inserted,
-            first_output_ms,
-            settle_ms,
-            paste_ms,
+        job: CompletionJob {
+            storage: storage.clone(),
+            app_context: app_context.clone(),
+            history: DeferredHistory {
+                mode: if mode == PipelineMode::Translate {
+                    "translate"
+                } else if processed_text.is_some() {
+                    "ai_corrected"
+                } else if correction_failed {
+                    "faithful_fallback"
+                } else {
+                    "faithful"
+                },
+                transcript_text: transcript.text,
+                processed_text,
+                asr_provider: transcript.model,
+                llm_provider,
+                target_language: translation_target,
+                duration_ms: duration_ms as i64,
+                latency_ms: latency_ms as i64,
+                insertion_label,
+                insertion_detail,
+                audio_path: artifact.path.clone(),
+            },
+            dictionary_candidate,
+            metrics: TakeMetrics {
+                mode,
+                asr_backend: settings.asr_backend.clone(),
+                correction_provider: settings.correction_provider.clone(),
+                latency_ms: latency_ms as i64,
+                translation_failed,
+                insertion_label,
+                insertion_detail,
+                inserted,
+                first_output_ms,
+                settle_ms,
+                paste_ms,
+            },
+            artifact_cleanup,
+            trace: trace.clone(),
         },
-        history_save_status,
-        artifact_cleanup,
         reservation: completion_slot,
-        trace: trace.clone(),
     };
     let insertion = match insertion_result {
         Ok(insertion) => insertion,
@@ -635,78 +627,159 @@ impl TakeMetrics {
     }
 }
 
+/// The History row of a delivered take, owned so the completion job can
+/// write it after the take is shown as complete.
+struct DeferredHistory {
+    transcript_text: String,
+    processed_text: Option<String>,
+    mode: &'static str,
+    asr_provider: String,
+    llm_provider: Option<String>,
+    target_language: Option<String>,
+    duration_ms: i64,
+    latency_ms: i64,
+    insertion_label: &'static str,
+    insertion_detail: Option<&'static str>,
+    /// The temporary capture the retained recording is copied from. The
+    /// job's `artifact_cleanup` owns it and removes it only after the copy.
+    audio_path: std::path::PathBuf,
+}
+
+impl DeferredHistory {
+    fn item<'a>(&'a self, app_category: Option<&'a str>) -> NewHistoryItem<'a> {
+        NewHistoryItem {
+            transcript_text: &self.transcript_text,
+            processed_text: self.processed_text.as_deref(),
+            source_text: None,
+            instruction_text: None,
+            action_kind: None,
+            search_site: None,
+            mode: self.mode,
+            asr_provider: &self.asr_provider,
+            llm_provider: self.llm_provider.as_deref(),
+            target_language: self.target_language.as_deref(),
+            app_category,
+            duration_ms: Some(self.duration_ms),
+            latency_ms: Some(self.latency_ms),
+            retry_of_id: None,
+            insertion_result: Some(self.insertion_label),
+            insertion_detail: self.insertion_detail,
+        }
+    }
+}
+
 /// What a delivered take still writes and removes after it is shown as
-/// complete. The completion job owns it, including the temporary capture,
-/// and runs after the lifecycle guard is released, in take order.
+/// complete, and the app its job reports to.
 struct DeferredCompletion {
     app: tauri::AppHandle,
-    storage: crate::storage::Storage,
-    app_context: Option<types::AppContext>,
-    metrics: TakeMetrics,
-    history_save_status: crate::pipeline::finish::HistorySaveStatus,
-    artifact_cleanup: crate::TempArtifact,
+    job: CompletionJob,
     reservation: crate::storage::CompletionReservation,
-    trace: super::take_trace::TakeTrace,
 }
 
 impl DeferredCompletion {
     fn queue(self) {
-        let (reservation, job) = self.into_job();
-        reservation.defer(move || job.run());
-    }
-
-    fn into_job(self) -> (crate::storage::CompletionReservation, CompletionJob) {
         let Self {
             app,
-            storage,
-            app_context,
-            metrics,
-            history_save_status,
-            artifact_cleanup,
+            job,
             reservation,
-            trace,
         } = self;
-        (
-            reservation,
-            CompletionJob {
-                app,
-                storage,
-                app_context,
-                metrics,
-                history_save_status,
-                artifact_cleanup,
-                trace,
-            },
-        )
+        reservation.defer(move || job.run(&mut |notice| notice.deliver(&app)));
     }
 }
 
-/// The part of a [`DeferredCompletion`] that runs on the completion queue.
+/// What the completion job tells the main window, in the order it happens.
+/// The change events carry no content; the statuses keep their copy.
+#[derive(Debug, PartialEq, Eq)]
+enum CompletionNotice {
+    HistoryChanged,
+    DictionaryChanged,
+    /// History or metrics could not be (fully) saved.
+    PersistenceFailed {
+        history: crate::pipeline::finish::HistorySaveStatus,
+        metric_failed: bool,
+    },
+    TempCleanupFailed,
+}
+
+impl CompletionNotice {
+    fn deliver(self, app: &tauri::AppHandle) {
+        match self {
+            Self::HistoryChanged => {
+                let _ = app.emit_to("main", HISTORY_CHANGED_EVENT, ());
+            }
+            Self::DictionaryChanged => {
+                let _ = app.emit_to("main", DICTIONARY_CHANGED_EVENT, ());
+            }
+            Self::PersistenceFailed {
+                history,
+                metric_failed,
+            } => {
+                if let Some((kind, message)) =
+                    completion_persistence_warning(history, metric_failed)
+                {
+                    emit_status(app, kind, message);
+                }
+            }
+            Self::TempCleanupFailed => {
+                let (kind, message) = TEMP_CLEANUP_FAILED;
+                emit_status(app, kind, message);
+            }
+        }
+    }
+}
+
+/// The deferred part of a delivered take. It owns the temporary capture and
+/// runs after the lifecycle guard is released, after every job reserved
+/// before it; Delete all and retention changes wait for it.
 struct CompletionJob {
-    app: tauri::AppHandle,
     storage: crate::storage::Storage,
     app_context: Option<types::AppContext>,
+    history: DeferredHistory,
+    /// The transcript and its AI correction, when they may propose one.
+    dictionary_candidate: Option<(String, String)>,
     metrics: TakeMetrics,
-    history_save_status: crate::pipeline::finish::HistorySaveStatus,
     artifact_cleanup: crate::TempArtifact,
     trace: super::take_trace::TakeTrace,
 }
 
 impl CompletionJob {
-    /// Writes the metrics, reports a persistence failure with the same
-    /// status as before, then removes the temporary capture.
-    fn run(mut self) {
+    /// Saves History (copying the recording it retains), then a dictionary
+    /// candidate, then the metrics; reports a persistence failure with the
+    /// same status as before; and only then removes the temporary capture.
+    fn run(mut self, notify: &mut impl FnMut(CompletionNotice)) {
         let job_started = Instant::now();
-        let metric_failed = self.metrics.record(self.storage.metrics_for(
-            self.metrics.mode,
-            app_context::history_category(self.app_context.as_ref()),
-        ));
-        if let Some((kind, message)) =
-            completion_persistence_warning(self.history_save_status, metric_failed)
-        {
-            emit_status(&self.app, kind, message);
+        let app_category = app_context::history_category(self.app_context.as_ref());
+        let history_save_started = Instant::now();
+        let (history_save_status, history_saved) = save_history_reporting_row(
+            &self.storage,
+            &self.history.item(app_category),
+            Some(&self.history.audio_path),
+        );
+        self.trace
+            .span_since(TakeSpan::HistorySave, history_save_started);
+        if history_saved {
+            notify(CompletionNotice::HistoryChanged);
         }
-        report_temp_cleanup(&self.app, &mut self.artifact_cleanup);
+        if let Some((original, corrected)) = &self.dictionary_candidate {
+            if let Ok(Some(_)) = self
+                .storage
+                .add_dictionary_candidate_from_correction(original, corrected, None)
+            {
+                notify(CompletionNotice::DictionaryChanged);
+            }
+        }
+        let metric_failed = self
+            .metrics
+            .record(self.storage.metrics_for(self.metrics.mode, app_category));
+        if completion_persistence_warning(history_save_status, metric_failed).is_some() {
+            notify(CompletionNotice::PersistenceFailed {
+                history: history_save_status,
+                metric_failed,
+            });
+        }
+        if self.artifact_cleanup.cleanup().is_err() {
+            notify(CompletionNotice::TempCleanupFailed);
+        }
         // The take's record is queued after this job, so it includes this.
         self.trace.span_since(TakeSpan::CompletionJob, job_started);
     }
@@ -805,6 +878,211 @@ mod tests {
             storage.metric_durations_for_test("dictation"),
             vec![100, 200, 300]
         );
+    }
+
+    const CAPTURE: &[u8] = b"RIFF deferred capture";
+
+    /// A temporary capture owned for cleanup, as a recorded take has.
+    fn temp_capture() -> (std::path::PathBuf, crate::TempArtifact) {
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "local-ai-voice-completion-test-{}-{}.wav",
+            std::process::id(),
+            NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&path, CAPTURE).unwrap();
+        (path.clone(), crate::TempArtifact::new(path, false))
+    }
+
+    /// History on, keeping recordings.
+    fn keeping_audio(storage: &crate::storage::Storage) {
+        storage
+            .update_settings(&types::Settings {
+                delete_audio_after_processing: false,
+                ..types::Settings::default()
+            })
+            .unwrap();
+    }
+
+    /// The job of an AI-corrected Dictate take that proposes a spelling.
+    fn corrected_take_job(
+        storage: &crate::storage::Storage,
+        audio_path: std::path::PathBuf,
+        artifact_cleanup: crate::TempArtifact,
+    ) -> CompletionJob {
+        CompletionJob {
+            storage: storage.clone(),
+            app_context: None,
+            history: DeferredHistory {
+                transcript_text: "open ai".into(),
+                processed_text: Some("OpenAI".into()),
+                mode: "ai_corrected",
+                asr_provider: "mock".into(),
+                llm_provider: Some("openai".into()),
+                target_language: None,
+                duration_ms: 1_000,
+                latency_ms: 100,
+                insertion_label: "clipboard_paste",
+                insertion_detail: None,
+                audio_path,
+            },
+            dictionary_candidate: Some(("open ai".into(), "OpenAI".into())),
+            metrics: take_metrics(100),
+            artifact_cleanup,
+            trace: super::super::take_trace::TakeTrace::disabled(),
+        }
+    }
+
+    type Notices = std::sync::Arc<std::sync::Mutex<Vec<CompletionNotice>>>;
+
+    /// Queues `job` on `reservation` as a take does, recording its notices.
+    fn queue(reservation: crate::storage::CompletionReservation, job: CompletionJob) -> Notices {
+        let notices = Notices::default();
+        let sink = notices.clone();
+        reservation.defer(move || job.run(&mut |notice| sink.lock().unwrap().push(notice)));
+        notices
+    }
+
+    fn history_rows(storage: &crate::storage::Storage) -> Vec<types::HistoryItem> {
+        storage.list_history(types::HistoryFilter::All, 10).unwrap()
+    }
+
+    #[test]
+    fn the_job_saves_history_before_the_candidate_metrics_and_cleanup() {
+        let storage = crate::storage::Storage::in_memory().unwrap();
+        keeping_audio(&storage);
+        let (path, cleanup) = temp_capture();
+        let notices = queue(
+            storage.reserve_completion(),
+            corrected_take_job(&storage, path.clone(), cleanup),
+        );
+        assert!(storage.drain_deferred_completions(Duration::from_secs(10)));
+        assert_eq!(
+            *notices.lock().unwrap(),
+            [
+                CompletionNotice::HistoryChanged,
+                CompletionNotice::DictionaryChanged
+            ]
+        );
+        // The retained recording was copied before the capture was removed.
+        let rows = history_rows(&storage);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mode, "ai_corrected");
+        assert!(rows[0].has_audio);
+        assert_eq!(
+            storage.history_audio(rows[0].id).unwrap().as_deref(),
+            Some(CAPTURE)
+        );
+        assert!(!path.exists());
+        assert_eq!(storage.list_dictionary_candidates().unwrap().len(), 1);
+        assert_eq!(storage.metric_durations_for_test("dictation"), vec![100]);
+    }
+
+    #[test]
+    fn a_persistence_warning_follows_the_change_events_and_cleanup_still_runs() {
+        let storage = crate::storage::Storage::in_memory().unwrap();
+        keeping_audio(&storage);
+        let (path, cleanup) = temp_capture();
+        // A capture that cannot be copied leaves History text without audio.
+        let missing = path.with_extension("missing.wav");
+        let notices = queue(
+            storage.reserve_completion(),
+            corrected_take_job(&storage, missing, cleanup),
+        );
+        assert!(storage.drain_deferred_completions(Duration::from_secs(10)));
+        assert_eq!(
+            *notices.lock().unwrap(),
+            [
+                CompletionNotice::HistoryChanged,
+                CompletionNotice::DictionaryChanged,
+                CompletionNotice::PersistenceFailed {
+                    history: crate::pipeline::finish::HistorySaveStatus::AudioUnavailable,
+                    metric_failed: false,
+                },
+            ]
+        );
+        assert!(!history_rows(&storage)[0].has_audio);
+        assert!(!path.exists());
+    }
+
+    /// Starts `deletion` after a take reserved its completion and checks it
+    /// waits for the job, then removes what the job wrote.
+    fn deletion_after_delivery(deletion: fn(&crate::storage::Storage)) {
+        let storage = crate::storage::Storage::in_memory().unwrap();
+        keeping_audio(&storage);
+        let (path, cleanup) = temp_capture();
+        let reservation = storage.reserve_completion();
+        let deleting = {
+            let storage = storage.clone();
+            std::thread::spawn(move || deletion(&storage))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !deleting.is_finished(),
+            "the deletion overtook a delivered take's deferred History save"
+        );
+        let notices = queue(
+            reservation,
+            corrected_take_job(&storage, path.clone(), cleanup),
+        );
+        deleting.join().unwrap();
+        // The job ran first and wrote; the deletion then removed it all.
+        assert_eq!(
+            notices.lock().unwrap().first(),
+            Some(&CompletionNotice::HistoryChanged)
+        );
+        assert!(history_rows(&storage).is_empty());
+        assert!(storage.history_audio_files_for_test().is_empty());
+        assert!(storage.diagnostics().unwrap().summaries.is_empty());
+        assert!(!path.exists());
+        keeping_audio(&storage);
+        assert!(storage.list_dictionary_candidates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_all_after_delivery_removes_the_deferred_history_row_and_its_audio() {
+        deletion_after_delivery(|storage| {
+            assert_eq!(storage.delete_all_history().unwrap(), 1);
+        });
+    }
+
+    #[test]
+    fn turning_history_off_after_delivery_removes_the_deferred_history_row_and_its_audio() {
+        deletion_after_delivery(|storage| {
+            storage
+                .update_settings_and_apply_history_policy(&types::Settings {
+                    history_retention: types::HistoryRetention::Never,
+                    delete_audio_after_processing: false,
+                    ..types::Settings::default()
+                })
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn a_save_queued_after_history_was_turned_off_writes_nothing() {
+        let storage = crate::storage::Storage::in_memory().unwrap();
+        storage
+            .update_settings_and_apply_history_policy(&types::Settings {
+                history_retention: types::HistoryRetention::Never,
+                delete_audio_after_processing: false,
+                ..types::Settings::default()
+            })
+            .unwrap();
+        let (path, cleanup) = temp_capture();
+        let notices = queue(
+            storage.reserve_completion(),
+            corrected_take_job(&storage, path.clone(), cleanup),
+        );
+        assert!(storage.drain_deferred_completions(Duration::from_secs(10)));
+        // Nothing changed, so the pages are not told to re-read.
+        assert!(notices.lock().unwrap().is_empty());
+        assert!(!path.exists());
+        assert!(storage.history_audio_files_for_test().is_empty());
+        assert!(storage.diagnostics().unwrap().summaries.is_empty());
+        keeping_audio(&storage);
+        assert!(history_rows(&storage).is_empty());
+        assert!(storage.list_dictionary_candidates().unwrap().is_empty());
     }
 
     #[test]
