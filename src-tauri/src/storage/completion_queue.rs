@@ -6,7 +6,7 @@
 //! land after a deletion the user asked for. A worker thread exists only while jobs are
 //! queued.
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread::{self, ThreadId},
@@ -17,13 +17,26 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 
 #[derive(Default)]
 struct QueueState {
-    jobs: VecDeque<Job>,
-    /// Jobs ever queued and finished; a drain waits for the count it saw.
-    queued: u64,
-    finished: u64,
+    jobs: VecDeque<(u64, Job)>,
+    /// Every reservation takes the next ticket. A drain waits until every
+    /// ticket below the one it saw is finished, whatever order they finish
+    /// in: `finished_below` is that watermark, and `finished_above` holds
+    /// tickets that finished ahead of an earlier one.
+    next_ticket: u64,
+    finished_below: u64,
+    finished_above: BTreeSet<u64>,
     /// Set while a worker owns the queue; `worker` names its thread.
     running: bool,
     worker: Option<ThreadId>,
+}
+
+impl QueueState {
+    fn finish(&mut self, ticket: u64) {
+        self.finished_above.insert(ticket);
+        while self.finished_above.remove(&self.finished_below) {
+            self.finished_below += 1;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -35,7 +48,7 @@ pub(crate) struct CompletionQueue {
 impl CompletionQueue {
     fn lock(&self) -> MutexGuard<'_, QueueState> {
         // Jobs run outside the lock and panics are caught, so a poisoned
-        // lock still holds consistent counters.
+        // lock still holds consistent tickets.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -43,16 +56,19 @@ impl CompletionQueue {
     /// between already waits for it. The reservation is released when its
     /// job is queued, or when it is dropped unused.
     pub(crate) fn reserve(self: &Arc<Self>) -> Reservation {
-        self.lock().queued += 1;
+        let mut state = self.lock();
+        let ticket = state.next_ticket;
+        state.next_ticket += 1;
         Reservation {
             queue: Some(Arc::clone(self)),
+            ticket,
         }
     }
 
-    /// Adds an already counted job and starts a worker if none runs.
-    fn enqueue(self: &Arc<Self>, job: Job) {
+    /// Adds a reserved job and starts a worker if none runs.
+    fn enqueue(self: &Arc<Self>, ticket: u64, job: Job) {
         let mut state = self.lock();
-        state.jobs.push_back(job);
+        state.jobs.push_back((ticket, job));
         if state.running {
             return;
         }
@@ -72,7 +88,7 @@ impl CompletionQueue {
         let mut state = self.lock();
         state.worker = Some(thread::current().id());
         loop {
-            let Some(job) = state.jobs.pop_front() else {
+            let Some((ticket, job)) = state.jobs.pop_front() else {
                 state.running = false;
                 state.worker = None;
                 return;
@@ -81,12 +97,12 @@ impl CompletionQueue {
             // A failing job must not stall later jobs or a waiting deletion.
             let _ = catch_unwind(AssertUnwindSafe(job));
             state = self.lock();
-            state.finished += 1;
+            state.finish(ticket);
             self.progress.notify_all();
         }
     }
 
-    /// Waits until every job queued before this call has finished, or until
+    /// Waits until every job reserved before this call has finished, or until
     /// `timeout` passes. Returns whether they all finished. Called from a job,
     /// it returns at once: the jobs queued before that job already ran.
     pub(crate) fn drain(&self, timeout: Option<Duration>) -> bool {
@@ -95,8 +111,8 @@ impl CompletionQueue {
         if state.worker == Some(thread::current().id()) {
             return true;
         }
-        let target = state.queued;
-        while state.finished < target {
+        let target = state.next_ticket;
+        while state.finished_below < target {
             state = match deadline {
                 None => self
                     .progress
@@ -120,13 +136,14 @@ impl CompletionQueue {
 /// A counted place in the queue for a job its owner has yet to build.
 pub(crate) struct Reservation {
     queue: Option<Arc<CompletionQueue>>,
+    ticket: u64,
 }
 
 impl Reservation {
     /// Queues the reserved job after every job queued before it.
     pub(crate) fn push(mut self, job: Job) {
         if let Some(queue) = self.queue.take() {
-            queue.enqueue(job);
+            queue.enqueue(self.ticket, job);
         }
     }
 }
@@ -136,7 +153,7 @@ impl Drop for Reservation {
         // An unused reservation counts as finished, so no drain waits for it.
         if let Some(queue) = self.queue.take() {
             let mut state = queue.lock();
-            state.finished += 1;
+            state.finish(self.ticket);
             queue.progress.notify_all();
         }
     }
@@ -198,6 +215,19 @@ mod tests {
 
         drop(queue.reserve());
         assert!(queue.drain(Some(Duration::from_millis(20))));
+    }
+
+    #[test]
+    fn a_later_reservation_finishing_first_does_not_release_a_drain() {
+        let queue = Arc::new(CompletionQueue::default());
+        let earlier = queue.reserve();
+        let later = queue.reserve();
+        drop(later);
+        queue.reserve().push(Box::new(|| {}));
+        // Two later tickets finished, but the earlier one is still pending.
+        assert!(!queue.drain(Some(Duration::from_millis(50))));
+        drop(earlier);
+        assert!(queue.drain(Some(Duration::from_secs(10))));
     }
 
     #[test]
