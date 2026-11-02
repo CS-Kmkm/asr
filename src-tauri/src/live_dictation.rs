@@ -29,6 +29,15 @@ const LIVE_INTERVAL: Duration = Duration::from_millis(150);
 /// Default Dictate pastes only the final text once. Live provisional target
 /// insertion is an explicit opt-in because editors whose content cannot be
 /// read back keep the first unverified fragment. Other modes always defer.
+/// The cheaper greedy decode is an explicit opt-in for live preview only.
+fn preview_decoding(settings: &Settings) -> asr::PreviewDecoding {
+    if settings.live_preview_fast_decode {
+        asr::PreviewDecoding::Greedy
+    } else {
+        asr::PreviewDecoding::Standard
+    }
+}
+
 pub(crate) fn defers_target_insertion(mode: PipelineMode, settings: &Settings) -> bool {
     mode != PipelineMode::Dictate
         || settings.automatic_voice_mode
@@ -173,6 +182,9 @@ pub(crate) struct LiveDraft {
     attempted: bool,
     defer_insertion: bool,
     pub(crate) pasted: bool,
+    /// How this recording's live-preview requests decode, fixed from the
+    /// settings the recording started with.
+    preview_decoding: asr::PreviewDecoding,
 }
 
 impl LiveDraft {
@@ -220,6 +232,7 @@ impl LiveDraft {
             attempted: false,
             defer_insertion,
             pasted: false,
+            preview_decoding: preview_decoding(settings),
         }
     }
 
@@ -460,6 +473,7 @@ pub(crate) fn start(
         recording_overlay::enable_live_subtitles(&app);
     }
     let (stop, stopped) = watch::channel(false);
+    let decoding = draft.preview_decoding;
     let task = spawn_recording_owner(async move {
         if !preview_enabled {
             return draft;
@@ -470,6 +484,7 @@ pub(crate) fn start(
             services.transcriber.as_ref(),
             prompt.as_deref(),
             speech_locale.as_deref(),
+            decoding,
             cancel,
             stopped,
             LIVE_INTERVAL,
@@ -568,6 +583,7 @@ async fn run(
     transcriber: &dyn Transcriber,
     prompt: Option<&str>,
     speech_locale: Option<&str>,
+    decoding: asr::PreviewDecoding,
     mut cancel: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
     interval: Duration,
@@ -633,7 +649,13 @@ async fn run(
                 }
                 let inference_started = Instant::now();
                 let result = transcriber
-                    .transcribe_with_locale(&artifact.path, prompt, speech_locale, cancel.clone())
+                    .transcribe_preview(
+                        &artifact.path,
+                        prompt,
+                        speech_locale,
+                        decoding,
+                        cancel.clone(),
+                    )
                     .await;
                 let inference_cost = inference_started.elapsed();
                 cleanup.cleanup().map_err(command_error)?;
@@ -746,6 +768,7 @@ mod tests {
             attempted: false,
             defer_insertion: true,
             pasted: false,
+            preview_decoding: asr::PreviewDecoding::Standard,
         }
     }
 
@@ -817,6 +840,7 @@ mod tests {
                 &recognizer,
                 None,
                 None,
+                asr::PreviewDecoding::Standard,
                 cancel,
                 stopped,
                 Duration::from_millis(1),
@@ -1191,6 +1215,7 @@ mod tests {
             attempted: false,
             defer_insertion: false,
             pasted: false,
+            preview_decoding: asr::PreviewDecoding::Standard,
         };
         (draft, mock)
     }
@@ -1441,6 +1466,7 @@ mod tests {
                 &recognizer,
                 None,
                 None,
+                asr::PreviewDecoding::Standard,
                 cancel,
                 stopped,
                 Duration::from_millis(1),
@@ -1460,6 +1486,88 @@ mod tests {
         assert_eq!(recognizer.calls.load(Ordering::SeqCst), 2);
         assert_eq!(audio.lock().await.state(), CaptureState::Capturing);
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    /// Records how each live request asked to decode. Live recognition must
+    /// never use the final-recognition request.
+    struct DecodingRecognizer {
+        seen: std::sync::Mutex<Vec<asr::PreviewDecoding>>,
+    }
+    #[async_trait::async_trait]
+    impl Transcriber for DecodingRecognizer {
+        async fn load(&self, _: &str) -> Result<(), asr::AsrError> {
+            Ok(())
+        }
+        async fn transcribe(
+            &self,
+            _: &Path,
+            _: Option<&str>,
+            _: watch::Receiver<bool>,
+        ) -> Result<asr::Transcript, asr::AsrError> {
+            panic!("live recognition must send preview requests")
+        }
+        async fn transcribe_preview(
+            &self,
+            _: &Path,
+            _: Option<&str>,
+            _: Option<&str>,
+            decoding: asr::PreviewDecoding,
+            _: watch::Receiver<bool>,
+        ) -> Result<asr::Transcript, asr::AsrError> {
+            self.seen.lock().unwrap().push(decoding);
+            Ok(asr::Transcript {
+                text: "途中".into(),
+                segments: vec![],
+                model: "test".into(),
+                duration_ms: 1,
+            })
+        }
+        async fn shutdown(&self) -> Result<(), asr::AsrError> {
+            Ok(())
+        }
+        async fn reconfigure(&self, _: WorkerCommand) {}
+    }
+
+    #[tokio::test]
+    async fn live_requests_carry_the_recordings_preview_decoding() {
+        let mut settings = Settings::default();
+        assert_eq!(preview_decoding(&settings), asr::PreviewDecoding::Standard);
+        settings.live_preview_fast_decode = true;
+        assert_eq!(preview_decoding(&settings), asr::PreviewDecoding::Greedy);
+        for decoding in [asr::PreviewDecoding::Standard, asr::PreviewDecoding::Greedy] {
+            let directory = tempfile::tempdir().unwrap();
+            let audio: tokio::sync::Mutex<Box<dyn AudioCapture>> =
+                tokio::sync::Mutex::new(Box::new(Capture {
+                    directory: directory.path().to_owned(),
+                    snapshots: AtomicUsize::new(0),
+                    stages: vec![],
+                }));
+            let recognizer = DecodingRecognizer {
+                seen: std::sync::Mutex::new(vec![]),
+            };
+            let (_cancel, cancel) = watch::channel(false);
+            let (stop, stopped) = watch::channel(false);
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                run(
+                    &audio,
+                    &recognizer,
+                    None,
+                    None,
+                    decoding,
+                    cancel,
+                    stopped,
+                    Duration::from_millis(1),
+                    |_| {
+                        stop.send_replace(true);
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(*recognizer.seen.lock().unwrap(), [decoding]);
+        }
     }
 
     #[tokio::test]
@@ -1485,6 +1593,7 @@ mod tests {
                 &recognizer,
                 None,
                 None,
+                asr::PreviewDecoding::Standard,
                 cancel,
                 stopped,
                 Duration::from_millis(1),
@@ -1539,6 +1648,7 @@ mod tests {
                 &recognizer,
                 None,
                 None,
+                asr::PreviewDecoding::Standard,
                 cancel,
                 stopped,
                 Duration::from_millis(1),
@@ -1672,6 +1782,7 @@ mod tests {
                     &recognizer,
                     None,
                     None,
+                    asr::PreviewDecoding::Standard,
                     cancel,
                     stopped,
                     Duration::from_millis(1),
@@ -1741,6 +1852,7 @@ mod tests {
                         recognizer.as_ref(),
                         None,
                         None,
+                        asr::PreviewDecoding::Standard,
                         cancel,
                         stopped,
                         Duration::from_millis(1),
@@ -1800,6 +1912,7 @@ mod tests {
                 &recognizer,
                 None,
                 None,
+                asr::PreviewDecoding::Standard,
                 cancel,
                 stopped,
                 Duration::from_millis(1),
@@ -1851,6 +1964,7 @@ mod tests {
                 &recognizer,
                 None,
                 None,
+                asr::PreviewDecoding::Standard,
                 cancel,
                 stopped,
                 Duration::from_millis(1),
@@ -1908,6 +2022,7 @@ mod tests {
                 &recognizer,
                 None,
                 None,
+                asr::PreviewDecoding::Standard,
                 cancel,
                 stopped,
                 Duration::from_millis(1),

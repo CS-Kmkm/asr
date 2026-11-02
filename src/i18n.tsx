@@ -420,6 +420,9 @@ const en = {
   "Open the app window for details.": "Open the app window for details.",
   "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.": "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.",
   "Generating answer…": "Generating answer…",
+  "Faster live preview": "Faster live preview",
+  "Greedy decoding for the preview only; the final text is unchanged.": "Greedy decoding for the preview only; the final text is unchanged.",
+  "Off by default. Live preview asks faster-whisper for a single-candidate (greedy) decode instead of beam search, lowering GPU or CPU load while recording. Preview text can be less accurate; the final transcription after stopping always uses the normal decode.": "Off by default. Live preview asks faster-whisper for a single-candidate (greedy) decode instead of beam search, lowering GPU or CPU load while recording. Preview text can be less accurate; the final transcription after stopping always uses the normal decode.",
 } as const;
 export type MessageKey = keyof typeof en | keyof typeof backendMessages;
 const ja: Record<keyof typeof en, string> = {
@@ -820,6 +823,9 @@ const ja: Record<keyof typeof en, string> = {
   "Open the app window for details.": "詳細はアプリのウィンドウで確認してください。",
   "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.": "Esc は録音中のキャンセルキーでもあります。この割り当てでは、× ボタンでキャンセルしてください。",
   "Generating answer…": "回答を生成中…",
+  "Faster live preview": "ライブプレビューを軽量化",
+  "Greedy decoding for the preview only; the final text is unchanged.": "プレビューだけ貪欲デコードにします。最終結果は変わりません。",
+  "Off by default. Live preview asks faster-whisper for a single-candidate (greedy) decode instead of beam search, lowering GPU or CPU load while recording. Preview text can be less accurate; the final transcription after stopping always uses the normal decode.": "既定ではオフです。ライブプレビューの認識だけを、ビームサーチではなく候補1つの貪欲デコードで faster-whisper に依頼し、録音中の GPU/CPU 負荷を下げます。プレビューの文字は不正確になることがありますが、停止後の最終的な文字起こしは常に通常のデコードで行います。",
 } satisfies Record<keyof typeof en, string>;
 
 const catalogs = { en, ja } satisfies Record<UiLanguage, Record<keyof typeof en, string>>;

@@ -254,6 +254,17 @@ pub enum AsrError {
     Worker(WorkerError),
 }
 
+/// How a live-preview request asks the worker to decode. Final recognition
+/// never sends a preview request, so it always uses the worker defaults.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PreviewDecoding {
+    /// The same decoding as final recognition.
+    #[default]
+    Standard,
+    /// A single-candidate (greedy) decode, where the backend supports one.
+    Greedy,
+}
+
 #[async_trait]
 #[allow(
     clippy::double_must_use,
@@ -327,6 +338,20 @@ pub trait Transcriber: Send + Sync {
     ) -> Result<Transcript, AsrError> {
         let _ = locale;
         self.transcribe(audio_path, prompt, cancel).await
+    }
+    /// A live-preview request. `decoding` may ask for a cheaper decode than
+    /// final recognition, which uses `transcribe_with_locale` instead.
+    async fn transcribe_preview(
+        &self,
+        audio_path: &Path,
+        prompt: Option<&str>,
+        locale: Option<&str>,
+        decoding: PreviewDecoding,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Transcript, AsrError> {
+        let _ = decoding;
+        self.transcribe_with_locale(audio_path, prompt, locale, cancel)
+            .await
     }
     async fn shutdown(&self) -> Result<(), AsrError>;
     /// Reconfigure the worker command (for example when the ASR backend
@@ -1171,20 +1196,53 @@ fn load_request(id: u64, quantization: &str) -> Value {
 
 /// JSONL `transcribe` request. `language` carries the full speech locale tag
 /// (or null for automatic detection); the worker backend decides how much of
-/// it to honor.
+/// it to honor. Only a greedy preview request carries `decoding`, so every
+/// other request is exactly the request sent before that field existed.
 fn transcribe_request(
     id: u64,
     audio_path: &Path,
     prompt: Option<&str>,
     locale: Option<&str>,
+    decoding: PreviewDecoding,
 ) -> Value {
-    json!({
+    let mut request = json!({
         "id": id,
         "command": "transcribe",
         "audio_path": audio_path,
         "prompt": prompt,
         "language": locale,
-    })
+    });
+    if decoding == PreviewDecoding::Greedy {
+        request["decoding"] = json!("greedy");
+    }
+    request
+}
+
+impl JsonlTranscriber {
+    async fn transcribe_with_decoding(
+        &self,
+        audio_path: &Path,
+        prompt: Option<&str>,
+        locale: Option<&str>,
+        decoding: PreviewDecoding,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Transcript, AsrError> {
+        let request = transcribe_request(self.next_id(), audio_path, prompt, locale, decoding);
+        let response_timeout = transcription_timeout(
+            self.request_timeout,
+            wav_file_duration(audio_path).unwrap_or_default(),
+        );
+        let response = self
+            .protocol_request(request, cancel, response_timeout, true)
+            .await?;
+        match serde_json::from_value(response) {
+            Ok(transcript) => Ok(transcript),
+            Err(error) => {
+                self.reset().await;
+                Err(AsrError::Protocol(error.to_string()))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1309,21 +1367,26 @@ impl Transcriber for JsonlTranscriber {
         locale: Option<&str>,
         cancel: watch::Receiver<bool>,
     ) -> Result<Transcript, AsrError> {
-        let request = transcribe_request(self.next_id(), audio_path, prompt, locale);
-        let response_timeout = transcription_timeout(
-            self.request_timeout,
-            wav_file_duration(audio_path).unwrap_or_default(),
-        );
-        let response = self
-            .protocol_request(request, cancel, response_timeout, true)
-            .await?;
-        match serde_json::from_value(response) {
-            Ok(transcript) => Ok(transcript),
-            Err(error) => {
-                self.reset().await;
-                Err(AsrError::Protocol(error.to_string()))
-            }
-        }
+        self.transcribe_with_decoding(
+            audio_path,
+            prompt,
+            locale,
+            PreviewDecoding::Standard,
+            cancel,
+        )
+        .await
+    }
+
+    async fn transcribe_preview(
+        &self,
+        audio_path: &Path,
+        prompt: Option<&str>,
+        locale: Option<&str>,
+        decoding: PreviewDecoding,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Transcript, AsrError> {
+        self.transcribe_with_decoding(audio_path, prompt, locale, decoding, cancel)
+            .await
     }
 
     async fn shutdown(&self) -> Result<(), AsrError> {
@@ -1532,17 +1595,43 @@ mod tests {
     #[test]
     fn transcribe_request_carries_the_speech_locale() {
         let path = Path::new("recording.wav");
-        let request = transcribe_request(7, path, Some("terms"), Some("en-GB"));
+        let request = transcribe_request(
+            7,
+            path,
+            Some("terms"),
+            Some("en-GB"),
+            PreviewDecoding::Standard,
+        );
         assert_eq!(request["command"], "transcribe");
         assert_eq!(request["language"], "en-GB");
         assert_eq!(request["prompt"], "terms");
-        let automatic = transcribe_request(8, path, None, None);
+        let automatic = transcribe_request(8, path, None, None, PreviewDecoding::Standard);
         assert!(automatic
             .as_object()
             .unwrap()
             .get("language")
             .unwrap()
             .is_null());
+    }
+
+    #[test]
+    fn only_a_greedy_preview_request_carries_a_decoding_field() {
+        let path = Path::new("recording.wav");
+        let standard = transcribe_request(1, path, None, None, PreviewDecoding::Standard);
+        assert!(standard.as_object().unwrap().get("decoding").is_none());
+        assert_eq!(
+            standard,
+            json!({
+                "id": 1,
+                "command": "transcribe",
+                "audio_path": path,
+                "prompt": null,
+                "language": null,
+            })
+        );
+        let greedy = transcribe_request(2, path, None, None, PreviewDecoding::Greedy);
+        assert_eq!(greedy["decoding"], "greedy");
+        assert_eq!(PreviewDecoding::default(), PreviewDecoding::Standard);
     }
 
     #[test]

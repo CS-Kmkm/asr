@@ -566,6 +566,28 @@ class TranscribeWithFakeModuleTests(IsolatedWorkerTestCase):
                     self.assertNotIn("beam_size", options)
                     self.assertNotIn("vad_filter", options)
 
+    def test_greedy_request_changes_only_beam_and_best_of(self):
+        for profile in ["standard", "fast"]:
+            with self.subTest(profile=profile), patch.dict(os.environ, {"ASR_WHISPER_DECODE_PROFILE": profile}), patch.dict(sys.modules, _install_fake_faster_whisper()):
+                backend = FasterWhisperBackend()
+                backend.load("4bit")
+                backend.transcribe(Path("audio.wav"), "dictionary", "ja-JP")
+                final = dict(_FakeWhisperModel.last_transcribe_kwargs)
+                backend.transcribe(Path("audio.wav"), "dictionary", "ja-JP", "greedy")
+                preview = dict(_FakeWhisperModel.last_transcribe_kwargs)
+                self.assertEqual(preview["beam_size"], 1)
+                self.assertEqual(preview["best_of"], 1)
+                self.assertNotIn("best_of", final)
+                # VAD and every other option stay exactly as for final recognition.
+                for options in (final, preview):
+                    options.pop("beam_size", None)
+                    options.pop("best_of", None)
+                self.assertEqual(preview, final)
+                self.assertEqual("vad_filter" in final, profile == "fast")
+                # The next unflagged request is back on the library defaults.
+                backend.transcribe(Path("audio.wav"), "dictionary", "ja-JP")
+                self.assertNotIn("best_of", _FakeWhisperModel.last_transcribe_kwargs)
+
     def test_unknown_decode_profile_is_rejected_before_loading(self):
         with patch.dict(os.environ, {"ASR_WHISPER_DECODE_PROFILE": "unknown"}):
             with self.assertRaises(BackendError) as caught:
@@ -653,6 +675,12 @@ class InferenceFallbackTests(IsolatedWorkerTestCase):
         self.assertEqual([call[0] for call in calls], ["cuda", "cpu"])
         self.assertTrue(all(call[2]["beam_size"] == 1 and call[2]["vad_filter"] for call in calls))
         self.assertEqual(calls[0][1:], calls[1][1:])
+
+    def test_greedy_decoding_survives_the_cpu_inference_retry(self):
+        backend, calls, _, _ = self.loaded(self.cuda_failure)
+        backend.transcribe(Path("audio.wav"), None, None, "greedy")
+        self.assertEqual([call[0] for call in calls], ["cuda", "cpu"])
+        self.assertTrue(all(call[2]["beam_size"] == 1 and call[2]["best_of"] == 1 for call in calls))
 
     def test_failure_after_publishing_a_segment_never_mixes_in_cpu_output(self):
         def partial_failure():

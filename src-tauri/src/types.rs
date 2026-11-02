@@ -105,6 +105,11 @@ pub struct Settings {
     pub live_preview_enabled: Option<bool>,
     #[serde(default)]
     pub cloud_live_preview_enabled: bool,
+    /// Live preview asks the local faster-whisper worker for a greedy
+    /// (single-candidate) decode instead of beam search. Final recognition
+    /// is unchanged. Off by default.
+    #[serde(default)]
+    pub live_preview_fast_decode: bool,
     #[serde(default)]
     pub shortcuts: VoiceShortcuts,
     #[serde(default)]
@@ -418,6 +423,7 @@ impl Default for Settings {
             cloud_consents: Vec::new(),
             live_preview_enabled: None,
             cloud_live_preview_enabled: false,
+            live_preview_fast_decode: false,
             shortcuts: VoiceShortcuts::default(),
             hold_to_talk: HoldToTalk::default(),
             translation_hotkey: default_translation_hotkey(),
@@ -751,6 +757,8 @@ mod tests {
         assert!(settings.correction_improve_clarity);
         assert!(settings.custom_models.is_empty());
         assert!(!settings.live_target_insertion);
+        assert!(!settings.live_preview_fast_decode);
+        assert!(!Settings::default().live_preview_fast_decode);
         assert!(!settings.automatic_voice_mode);
         assert!(!Settings::default().automatic_voice_mode);
         assert_eq!(settings.decision_model, "Cloudflare/clef-flash");

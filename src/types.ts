@@ -98,6 +98,8 @@ export interface Settings {
   personalizationEnabled: boolean;
   globalStyleProfile: StyleProfile | null;
   scopedStyleProfiles: ScopedStyleProfile[];
+  /** Live preview only: greedy (single-candidate) decoding on faster-whisper. Off unless set. */
+  livePreviewFastDecode?: boolean;
 }
 /**
  * Stored settings with the backend revision of the write that stored them.

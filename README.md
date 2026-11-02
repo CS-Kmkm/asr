@@ -509,6 +509,11 @@ Full usage and Phase 0 gate criteria are documented in
   default for local backends (including VibeVoice) and off for OpenAI-compatible speech; enabling it
   with cloud speech causes multiple audio uploads. Privacy controls local and
   cloud preview separately; a local opt-in never enables cloud uploads.
+  With faster-whisper, Privacy's "Faster live preview" (off by default) asks
+  the worker to decode preview requests greedily (one candidate instead of
+  beam search) to lower load while recording; VAD and other options stay the
+  same, preview text may be less accurate, and the final transcription after
+  stopping always uses the normal decode.
 - History can be disabled; when disabled, transcript rows are not written
   (failed recordings kept for Retry are the exception described below).
 - 履歴は本文検索と追加読み込みに対応しています。録音を削除した後も「原文をコピー」「再補正」「指定言語へ翻訳」を使えます。

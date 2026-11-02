@@ -52,7 +52,11 @@ class Backend(Protocol):
         audio_path: Path,
         prompt: str | None,
         language: str | None = None,
-    ) -> tuple[str, list[dict[str, Any]]]: ...
+        decoding: str | None = None,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """`decoding` is an optional per-request hint (see `DECODINGS`); a
+        backend without a cheaper decode ignores it."""
+        ...
 
 
 class ProgressReporting:
@@ -243,6 +247,10 @@ def wav_duration_seconds(audio_path: Path) -> float | None:
 
 
 WHISPER_SAMPLE_RATE = 16_000
+# Per-request `decoding` value the app sends for live-preview requests when
+# the user opts into cheaper preview decoding. Final recognition never sends it.
+GREEDY_DECODING = "greedy"
+DECODINGS = {GREEDY_DECODING}
 
 
 def load_pcm16_wav(audio_path: Path, sample_rate: int = WHISPER_SAMPLE_RATE) -> Any | None:
@@ -419,6 +427,7 @@ class MockBackend(ProgressReporting):
         audio_path: Path,
         prompt: str | None,
         language: str | None = None,
+        decoding: str | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         self._log_event("transcribe")
         crash_file = os.environ.get("ASR_WORKER_MOCK_CRASH_FILE")
@@ -521,6 +530,7 @@ class VibeVoiceBackend(ProgressReporting):
         audio_path: Path,
         prompt: str | None,
         language: str | None = None,
+        decoding: str | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         try:
             import torch
@@ -721,11 +731,12 @@ class FasterWhisperBackend(ProgressReporting):
         audio_path: Path,
         prompt: str | None,
         language: str | None = None,
+        decoding: str | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         segments: list[dict[str, Any]] = []
         # faster-whisper decodes lazily, so cancellation takes effect at the
         # next segment boundary.
-        for segment in self.transcribe_segments(audio_path, prompt, language):
+        for segment in self.transcribe_segments(audio_path, prompt, language, decoding):
             self.raise_if_cancelled()
             segments.append(segment)
         self.raise_if_cancelled()
@@ -737,8 +748,10 @@ class FasterWhisperBackend(ProgressReporting):
         audio_path: Path,
         prompt: str | None,
         language: str | None = None,
+        decoding: str | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Yield segments as faster-whisper decodes them, for streaming."""
+        options = self.decode_options(decoding)
         try:
             emitted = False
             self.raise_if_cancelled()
@@ -751,7 +764,7 @@ class FasterWhisperBackend(ProgressReporting):
                         # Whisper accepts an ISO 639 language, not a regional BCP 47 tag.
                         language=language.split("-", 1)[0] if language else None,
                         hotwords=prompt if prompt else None,
-                        **({"beam_size": 1, "vad_filter": True} if self.decode_profile == "fast" else {}),
+                        **options,
                     )
                     for segment in raw_segments:
                         self.raise_if_cancelled()
@@ -784,6 +797,21 @@ class FasterWhisperBackend(ProgressReporting):
             raise
         except BaseException as exc:
             raise map_backend_exception(exc, "transcribe", "faster-whisper", device=self.device) from exc
+
+    def decode_options(self, decoding: str | None) -> dict[str, Any]:
+        """faster-whisper options beyond its library defaults for one request.
+
+        The process-wide ``fast`` profile trades beam search and adds VAD. A
+        ``greedy`` request (live preview only) switches beam search and
+        best-of sampling to a single candidate and changes nothing else, so
+        VAD and every other option stay as the profile sets them.
+        """
+        options: dict[str, Any] = (
+            {"beam_size": 1, "vad_filter": True} if self.decode_profile == "fast" else {}
+        )
+        if decoding == GREEDY_DECODING:
+            options.update(beam_size=1, best_of=1)
+        return options
 
     def _audio_input(self, audio_path: Path) -> Any:
         """The decoded samples of the app's own WAV, else the path.
@@ -909,6 +937,7 @@ class OpenAICompatibleBackend(ProgressReporting):
         audio_path: Path,
         prompt: str | None,
         language: str | None = None,
+        decoding: str | None = None,
     ) -> tuple[str, list[dict[str, Any]]]:
         if self.client is None:
             raise BackendError("model_not_loaded", "Load the API backend before transcription")
