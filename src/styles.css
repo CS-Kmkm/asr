@@ -78,6 +78,8 @@ button { color: inherit; border: 1px solid var(--border); border-radius: 8px; pa
 .ask-answer-panel { min-width: 0; min-height: 0; padding: 22px; background: var(--surface-raised); }
 .ask-answer-text { min-height: 120px; overflow-wrap: anywhere; white-space: pre-wrap; line-height: 1.55; }
 .ask-answer-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.ask-answer-status { color: var(--text-muted); font-size: 12px; font-style: italic; margin: 0 0 6px; }
+.ask-answer-preview { color: var(--text-muted); border-left: 3px dashed var(--border); padding-left: 10px; }
 .recording-overlay {
   width: 100vw;
   height: 100vh;

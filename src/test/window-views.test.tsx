@@ -51,6 +51,55 @@ test("Ask ignores an older snapshot after a newer event and unsubscribes on unmo
   expect(screen.queryByText("old snapshot")).toBeNull();
   view.unmount();
   await waitFor(() => expect(transport.stopped).toHaveBeenCalledWith("ask-answer"));
+  expect(transport.stopped).toHaveBeenCalledWith("ask-answer-preview");
+});
+
+test("Ask streams a marked, silent preview that the validated answer replaces", async () => {
+  const view = render(<I18nProvider language="en"><AskAnswerPanel /></I18nProvider>);
+  await emit("ask-answer", { operationId: 1, payload: "earlier answer", kind: "generated" });
+  await emit("ask-answer-preview", { operationId: 2, text: "The answ", active: true });
+  const preview = screen.getByText("The answ");
+  expect(preview.getAttribute("aria-live")).toBe("off");
+  expect(preview.classList.contains("ask-answer-preview")).toBe(true);
+  expect(screen.getByText("Generating answer…")).toBeTruthy();
+  expect(view.container.querySelector("main")!.getAttribute("aria-busy")).toBe("true");
+  // Partial text cannot be copied or dismissed as if it were final.
+  expect((screen.getByRole("button", { name: "Copy" }) as HTMLButtonElement).disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "Dismiss" }) as HTMLButtonElement).disabled).toBe(true);
+  // An older operation's late partial is stale.
+  await emit("ask-answer-preview", { operationId: 1, text: "stale partial", active: true });
+  expect(screen.queryByText("stale partial")).toBeNull();
+  await emit("ask-answer-preview", { operationId: 2, text: "The answer is", active: true });
+  expect(screen.getByText("The answer is")).toBeTruthy();
+  await emit("ask-answer", { operationId: 2, payload: "The answer is 42.", kind: "generated" });
+  const final = screen.getByText("The answer is 42.");
+  expect(final.getAttribute("aria-live")).toBe("polite");
+  expect(screen.queryByText("The answer is")).toBeNull();
+  expect(screen.queryByText("Generating answer…")).toBeNull();
+  expect(view.container.querySelector("main")!.getAttribute("aria-busy")).toBe("false");
+  // A partial arriving after its final answer never covers it.
+  await emit("ask-answer-preview", { operationId: 2, text: "The answer is 4", active: true });
+  expect(screen.queryByText("The answer is 4")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+  await waitFor(() => expect(copyToClipboard).toHaveBeenLastCalledWith("The answer is 42."));
+});
+
+test("a failed or cancelled Ask withdraws its preview and keeps the earlier answer", async () => {
+  render(<I18nProvider language="en"><AskAnswerPanel /></I18nProvider>);
+  await emit("ask-answer", { operationId: 4, payload: "earlier answer", kind: "generated" });
+  await emit("ask-answer-preview", { operationId: 5, text: "half an ans", active: true });
+  expect(screen.getByText("half an ans")).toBeTruthy();
+  // Withdrawing an older operation leaves the newer preview alone.
+  await emit("ask-answer-preview", { operationId: 3, text: "", active: false });
+  expect(screen.getByText("half an ans")).toBeTruthy();
+  await emit("ask-answer-preview", { operationId: 5, text: "", active: false });
+  expect(screen.queryByText("half an ans")).toBeNull();
+  expect(screen.queryByText("Generating answer…")).toBeNull();
+  expect(screen.getByText("earlier answer")).toBeTruthy();
+  // A late partial of the withdrawn operation stays hidden.
+  await emit("ask-answer-preview", { operationId: 5, text: "half an answer", active: true });
+  expect(screen.queryByText("half an answer")).toBeNull();
+  expect((screen.getByRole("button", { name: "Copy" }) as HTMLButtonElement).disabled).toBe(false);
 });
 
 test("overlay labels follow typed stages independently of English message wording", async () => {

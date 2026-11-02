@@ -419,6 +419,7 @@ const en = {
   "Cancel (Esc)": "Cancel (Esc)",
   "Open the app window for details.": "Open the app window for details.",
   "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.": "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.",
+  "Generating answer…": "Generating answer…",
 } as const;
 export type MessageKey = keyof typeof en | keyof typeof backendMessages;
 const ja: Record<keyof typeof en, string> = {
@@ -818,6 +819,7 @@ const ja: Record<keyof typeof en, string> = {
   "Cancel (Esc)": "キャンセル (Esc)",
   "Open the app window for details.": "詳細はアプリのウィンドウで確認してください。",
   "Esc is also the cancel key while recording; with this assignment, cancel with the × button instead.": "Esc は録音中のキャンセルキーでもあります。この割り当てでは、× ボタンでキャンセルしてください。",
+  "Generating answer…": "回答を生成中…",
 } satisfies Record<keyof typeof en, string>;
 
 const catalogs = { en, ja } satisfies Record<UiLanguage, Record<keyof typeof en, string>>;

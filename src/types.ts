@@ -283,3 +283,10 @@ export interface DictionaryCandidate {
   historyId: number | null;
   createdAt: string;
 }
+
+/** Unvalidated, in-progress Ask generation shown only in the answer panel; `active: false` withdraws it. */
+export interface AskAnswerPreview {
+  operationId: number;
+  text: string;
+  active: boolean;
+}

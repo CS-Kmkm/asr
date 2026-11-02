@@ -351,6 +351,10 @@ Askの計画は、[OpenAIのStructured Outputs](https://developers.openai.com/ap
 [Gemini Interactionsの構造化出力](https://ai.google.dev/gemini-api/docs/structured-output)・対応するローカルAPIの
 JSON Schemaを要求します。OpenAIの古いモデルや対応を確認できないIDでは、従来どおりプロンプトでJSONを要求します。
 受信後はどちらも厳密に解析・権限判定し、形式の修復や別の操作への置換はしません。
+回答パネルに表示する回答（質問への回答・要約・説明など）は、生成中の文章を「回答を生成中…」の印付きプレビューとして
+同じパネルにだけ表示し（約100msごとに更新、読み上げ対象外）、完了後に確定した回答で置き換えます。
+プレビュー中はコピー・閉じるを無効にし、失敗やキャンセルではプレビューを取り消します。
+選択文の置換やカーソル位置への下書きは、従来どおり完成後にだけ挿入します。
 
 To keep API cost and latency low, the editor uses a compact instruction, sends
 only dictionary aliases actually found in the transcript, caps optional style
