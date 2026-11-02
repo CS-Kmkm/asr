@@ -834,6 +834,10 @@ class FasterWhisperBackend(ProgressReporting):
         self.compute_type = "int8"
 
 
+# Idle time an HTTP connection to the transcription endpoint stays pooled.
+API_KEEPALIVE_SECONDS = 60.0
+
+
 class OpenAICompatibleBackend(ProgressReporting):
     """Client for OpenAI's ``POST /v1/audio/transcriptions`` contract.
 
@@ -851,6 +855,7 @@ class OpenAICompatibleBackend(ProgressReporting):
         self.model_name = f"openai-compatible:{self.model_id}"
         self.timeout = self._timeout_from_env()
         self.client: Any = None
+        self._client_key: tuple[str, str | None, float] | None = None
 
     @staticmethod
     def _timeout_from_env() -> float:
@@ -875,10 +880,24 @@ class OpenAICompatibleBackend(ProgressReporting):
         try:
             import httpx
 
-            if self.client is not None:
-                self.client.close()
+            config = self._client_config()
+            if self.client is not None and self._client_key == config:
+                # Same endpoint and credentials: keep the pooled connection.
+                return
+            self._close_client()
             headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-            self.client = httpx.Client(base_url=f"{self.base_url}/", headers=headers, timeout=self.timeout)
+            # Opening the client sends nothing; the first transcription
+            # connects. A longer idle expiry than httpx's 5-second default
+            # lets the next take reuse that connection (and its TLS session)
+            # instead of reconnecting. A connection the server closed in the
+            # meantime is discarded by the pool before it is reused.
+            self.client = httpx.Client(
+                base_url=f"{self.base_url}/",
+                headers=headers,
+                timeout=self.timeout,
+                limits=httpx.Limits(keepalive_expiry=API_KEEPALIVE_SECONDS),
+            )
+            self._client_key = config
         except ModuleNotFoundError as exc:
             raise BackendError(
                 "backend_unavailable",
@@ -960,10 +979,17 @@ class OpenAICompatibleBackend(ProgressReporting):
                 f"Transcription API request failed: {type(exc).__name__}",
             ) from exc
 
-    def unload(self) -> None:
+    def _client_config(self) -> tuple[str, str | None, float]:
+        return (self.base_url, self.api_key, self.timeout)
+
+    def _close_client(self) -> None:
         if self.client is not None:
             self.client.close()
-            self.client = None
+        self.client = None
+        self._client_key = None
+
+    def unload(self) -> None:
+        self._close_client()
         gc.collect()
 
 

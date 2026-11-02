@@ -97,6 +97,66 @@ class OpenAICompatibleBackendTests(IsolatedWorkerTestCase):
         self.assertNotIn("secret response body", context.exception.message)
 
 
+class ConnectionReuseTests(IsolatedWorkerTestCase):
+    def test_one_pooled_client_serves_every_request_until_config_change_or_unload(self) -> None:
+        requests: list[httpx.Request] = []
+        created: list[tuple[httpx.Client, dict]] = []
+        real_client = httpx.Client
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json={"text": "pooled"})
+
+        def client_factory(**kwargs):  # noqa: ANN003
+            client = real_client(transport=httpx.MockTransport(handler), **kwargs)
+            created.append((client, kwargs))
+            return client
+
+        with patch.dict(
+            os.environ,
+            {"ASR_API_BASE_URL": "http://127.0.0.1:8000/v1", "ASR_API_KEY": "first-key"},
+            clear=True,
+        ):
+            backend = OpenAICompatibleBackend()
+        with patch.object(httpx, "Client", side_effect=client_factory), tempfile.TemporaryDirectory() as tmp:
+            audio_path = Path(tmp) / "take.wav"
+            audio_path.write_bytes(b"RIFF-test")
+            backend.load("4bit")
+            # Opening the client is not a warm-up: nothing is sent before a take.
+            self.assertEqual(requests, [])
+            self.assertEqual(len(created), 1)
+            client, options = created[0]
+            self.assertEqual(options["timeout"], backend.timeout)
+            self.assertEqual(options["limits"].keepalive_expiry, 60.0)
+
+            self.assertEqual(backend.transcribe(audio_path, None)[0], "pooled")
+            self.assertEqual(backend.transcribe(audio_path, None)[0], "pooled")
+            self.assertEqual(len(requests), 2)
+            self.assertIs(backend.client, client)
+
+            # Reloading with the same endpoint and credentials keeps the pool.
+            backend.load("4bit")
+            self.assertIs(backend.client, client)
+            self.assertEqual(len(created), 1)
+
+            # Another credential gets a new client; the old one is closed.
+            backend.api_key = "second-key"
+            backend.load("4bit")
+            self.assertEqual(len(created), 2)
+            self.assertTrue(client.is_closed)
+            replacement = created[1][0]
+            backend.transcribe(audio_path, None)
+            self.assertEqual(requests[-1].headers["Authorization"], "Bearer second-key")
+
+            backend.unload()
+            self.assertTrue(replacement.is_closed)
+            self.assertIsNone(backend.client)
+            with self.assertRaises(BackendError) as context:
+                backend.transcribe(audio_path, None)
+            self.assertEqual(context.exception.code, "model_not_loaded")
+            self.assertEqual(len(requests), 3)
+
+
 class ApiFormattingTests(IsolatedWorkerTestCase):
     def test_verbose_response_is_openai_shaped(self) -> None:
         payload = _verbose_response(
