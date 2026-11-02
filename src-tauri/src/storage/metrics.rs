@@ -532,6 +532,23 @@ impl TakeRowForTest {
     }
 }
 
+/// Removes take records an older build's purge should have removed. Such a
+/// build opens this database (the `take_spans` step keeps reader version 1)
+/// and its Delete all, History off and retention purges clear `metrics` but
+/// not `take_spans`. Run on every open: with no metrics left every take
+/// record goes, otherwise every one older than the oldest remaining metric.
+/// Returns how many rows were deleted.
+pub(super) fn reconcile_take_spans(
+    connection: &rusqlite::Connection,
+) -> Result<usize, StorageError> {
+    Ok(connection.execute(
+        "DELETE FROM take_spans
+         WHERE NOT EXISTS (SELECT 1 FROM metrics)
+           OR created_at < (SELECT MIN(created_at) FROM metrics)",
+        [],
+    )?)
+}
+
 /// Aggregates current-version take records per (mode, outcome, stage) with
 /// nearest-rank percentiles per span, ranked in SQLite. Stored text outside
 /// the fixed codes maps to `other` (or no mode); take ids never leave SQLite.
@@ -968,6 +985,95 @@ mod tests {
             ]
         );
         assert!(!serde_json::to_string(&report).unwrap().contains("sentinel"));
+    }
+
+    fn set_created_at(storage: &Storage, table: &str, created_at: &str) {
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                &format!("UPDATE {table} SET created_at = ?1 WHERE created_at > ?1"),
+                [created_at],
+            )
+            .unwrap();
+    }
+
+    fn reconcile(storage: &Storage) -> usize {
+        reconcile_take_spans(&storage.connection().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn reconciling_after_an_older_build_emptied_metrics_removes_every_take() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Pasted, &[]))
+            .unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Failed(TakeStage::Start), &[]))
+            .unwrap();
+        assert_eq!(reconcile(&storage), 2);
+        assert!(storage.take_records_for_test().is_empty());
+    }
+
+    #[test]
+    fn reconciling_after_an_older_retention_purge_removes_older_takes_only() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Pasted, &[(TakeSpan::Asr, 1)]))
+            .unwrap();
+        set_created_at(&storage, "take_spans", "2026-01-01T00:00:00+00:00");
+        // The older build's purge kept metrics from 2026-02-01 on.
+        storage
+            .add_metric("asr", None, Some(1), true, None)
+            .unwrap();
+        set_created_at(&storage, "metrics", "2026-02-01T00:00:00+00:00");
+        storage
+            .add_take_spans(&take(TakeOutcome::Pasted, &[(TakeSpan::Asr, 2)]))
+            .unwrap();
+        assert_eq!(reconcile(&storage), 1);
+        let rows = storage.take_records_for_test();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].span(TakeSpan::Asr), Some(2));
+    }
+
+    #[test]
+    fn reconciling_a_consistent_database_keeps_every_take() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .add_metric("asr", None, Some(1), true, None)
+            .unwrap();
+        set_created_at(&storage, "metrics", "2026-01-01T00:00:00+00:00");
+        storage
+            .add_take_spans(&take(TakeOutcome::Pasted, &[]))
+            .unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Cancelled(TakeStage::Recording), &[]))
+            .unwrap();
+        assert_eq!(reconcile(&storage), 0);
+        assert_eq!(storage.take_records_for_test().len(), 2);
+    }
+
+    #[test]
+    fn opening_a_database_reconciles_its_take_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("takes.sqlite3");
+        {
+            let storage = Storage::open(&path).unwrap();
+            storage
+                .add_metric("asr", None, Some(1), true, None)
+                .unwrap();
+            storage
+                .add_take_spans(&take(TakeOutcome::Pasted, &[]))
+                .unwrap();
+            // An older build's Delete all clears metrics but not takes.
+            storage
+                .connection()
+                .unwrap()
+                .execute("DELETE FROM metrics", [])
+                .unwrap();
+        }
+        let storage = Storage::open(&path).unwrap();
+        assert!(storage.take_records_for_test().is_empty());
     }
 
     #[test]
