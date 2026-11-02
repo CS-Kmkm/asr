@@ -69,6 +69,18 @@ export function AiCorrectionSettings({ settings, onSave }: AiCorrectionSettingsP
           </select>
         }
       />
+      <SettingRow
+        title={t("Speculative correction (experimental)")}
+        detail={t("Dictate starts correcting the last live preview right after you stop. Used only if the final transcript is identical.")}
+        detailMode="inline"
+        help={t("Off by default. Works only for Dictate with AI correction on and a live preview that showed text; never while you are still recording. After you stop, the last live preview text is sent to the AI provider for correction while the recording is still being transcribed. If the final transcript, the correction settings, the dictionary hints and the style guidance are exactly the same, that result is used and the wait after transcription is shorter. Otherwise it is discarded and the final transcript is corrected as usual, which costs an extra AI request (also when automatic voice mode chooses another mode). If you cancel after stopping, the last live preview text may already have been sent.")}
+        control={
+          <Toggle label={t("Speculative correction (experimental)")}
+            checked={settings.speculativeCorrection}
+            onChange={(value) => onSave({ speculativeCorrection: value })}
+          />
+        }
+      />
       <div className="correction-options-heading">
         <strong>{t("Automatic editing")}</strong>
       </div>

@@ -175,6 +175,12 @@ pub struct Settings {
     pub api_key_env_var: String,
     #[serde(default)]
     pub text_correction_enabled: bool,
+    /// Dictate with AI correction on starts correcting the last live
+    /// hypothesis after stop, in parallel with final recognition, and uses
+    /// that result only when the final transcript and every correction input
+    /// are identical. A miss costs an extra AI request. Off by default.
+    #[serde(default)]
+    pub speculative_correction: bool,
     #[serde(default = "default_correction_provider")]
     pub correction_provider: String,
     #[serde(default = "default_openai_correction_model")]
@@ -460,6 +466,7 @@ impl Default for Settings {
             api_base_url: default_api_base_url(),
             api_key_env_var: default_api_key_env_var(),
             text_correction_enabled: false,
+            speculative_correction: false,
             correction_provider: default_correction_provider(),
             openai_correction_model: default_openai_correction_model(),
             openai_reasoning_effort: default_openai_reasoning_effort(),
@@ -743,6 +750,12 @@ mod tests {
         assert_eq!(settings.translation_target_languages, ["en", "ja"]);
         assert_eq!(settings.translation_target_language, "en");
         assert!(!settings.text_correction_enabled);
+        assert!(!settings.speculative_correction);
+        assert!(!Settings::default().speculative_correction);
+        assert_eq!(
+            serde_json::to_value(Settings::default()).unwrap()["speculativeCorrection"],
+            false
+        );
         assert_eq!(settings.correction_provider, "openai");
         assert_eq!(settings.openai_correction_model, "gpt-5.6-luna");
         assert_eq!(settings.openai_reasoning_effort, "none");

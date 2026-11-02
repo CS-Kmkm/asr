@@ -107,6 +107,18 @@ test("recognition opt-ins are named by their settings labels", async () => {
   assert.doesNotMatch(text, /incrementalFinalAsr|livePreviewFastDecode/);
 });
 
+test("the speculative correction opt-in is named by its settings label", async () => {
+  const { render } = fixture({
+    status: async () => ["speculativeCorrection"],
+    persist: async () => [],
+  });
+  render();
+  await flush();
+  const { text } = render();
+  assert.match(text, /Speculative correction \(experimental\)/);
+  assert.doesNotMatch(text, /speculativeCorrection/);
+});
+
 test("fields with side effects name what saving the value in use does", async () => {
   const { render } = fixture({
     status: async () => ["deleteAudioAfterProcessing", "autoStart", "futureSetting"],
