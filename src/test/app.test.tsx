@@ -171,7 +171,8 @@ test("a newer visible-page refresh wins over a delayed earlier dictionary respon
   const old = deferred<DictionaryCandidate[]>();
   vi.mocked(listDictionaryCandidates).mockReturnValueOnce(old.promise);
   await navigate("Dictionary");
-  await waitFor(() => expect(listDictionaryCandidates).toHaveBeenCalledTimes(1));
+  // The opening read, then the read once the change listener registered.
+  await waitFor(() => expect(listDictionaryCandidates).toHaveBeenCalledTimes(2));
   vi.mocked(listDictionaryCandidates).mockResolvedValue([candidate(2)]);
   await phase("completed");
   expect(await screen.findByText("Suggested-2")).toBeTruthy();
@@ -330,6 +331,51 @@ test("History entry and shortcut completion refresh retained rows", async () => 
   await phase("completed");
   expect(await screen.findByText("Transcript-2")).toBeTruthy();
   expect(screen.queryByText("Transcript-1")).toBeNull();
+});
+
+test("History re-reads once its change listener registers, so an earlier event is not lost", async () => {
+  vi.mocked(listHistory).mockResolvedValue([history(1)]);
+  const registered = deferred<void>();
+  const subscribe = vi.mocked(listen).getMockImplementation()!;
+  vi.mocked(listen).mockImplementation(async (name, handler) => {
+    if (name === "history-changed") await registered.promise;
+    return subscribe(name, handler);
+  });
+  try {
+    render(<App />);
+    await navigate("History");
+    expect(await screen.findByText("Transcript-1")).toBeTruthy();
+    // The deferred save outlasts the opening read and emits before the
+    // listener is registered, so nothing receives that event.
+    vi.mocked(listHistory).mockResolvedValue([history(2), history(1)]);
+    await emit("history-changed", null);
+    expect(screen.queryByText("Transcript-2")).toBeNull();
+    await act(async () => { registered.resolve(); });
+    expect(await screen.findByText("Transcript-2")).toBeTruthy();
+    expect(events.get("history-changed")?.size).toBe(1);
+  } finally {
+    vi.mocked(listen).mockImplementation(subscribe);
+  }
+});
+
+test("a page closed before its change listener registers unsubscribes it", async () => {
+  const registered = deferred<void>();
+  const subscribe = vi.mocked(listen).getMockImplementation()!;
+  vi.mocked(listen).mockImplementation(async (name, handler) => {
+    if (name === "dictionary-changed") await registered.promise;
+    return subscribe(name, handler);
+  });
+  try {
+    render(<App />);
+    await navigate("Dictionary");
+    await navigate("History");
+    const reads = vi.mocked(listDictionaryCandidates).mock.calls.length;
+    await act(async () => { registered.resolve(); });
+    await waitFor(() => expect(events.get("dictionary-changed")?.size ?? 0).toBe(0));
+    expect(listDictionaryCandidates).toHaveBeenCalledTimes(reads);
+  } finally {
+    vi.mocked(listen).mockImplementation(subscribe);
+  }
 });
 
 test("History re-reads when a deferred History save lands after completion", async () => {
