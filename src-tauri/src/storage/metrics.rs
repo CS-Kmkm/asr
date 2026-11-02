@@ -58,6 +58,11 @@ impl MetricRecorder<'_> {
 /// later change of span boundaries never mixes with these records.
 pub(crate) const TAKE_SPAN_VERSION: i64 = 1;
 
+/// Metric written with every `take_spans` row: no duration, success unless
+/// the take failed or was cancelled. It anchors the row for
+/// [`reconcile_take_spans`].
+pub(crate) const TAKE_METRIC_EVENT: &str = "take";
+
 /// One timed section of a recording take, in milliseconds. A span that did
 /// not happen on a take stays NULL, never zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -436,8 +441,14 @@ impl Storage {
     /// Writes one finished take. Like metrics, nothing is written while
     /// History is off, and retention and Delete all remove these rows
     /// together with the metrics.
+    ///
+    /// Each row is paired with a [`TAKE_METRIC_EVENT`] metric of the same
+    /// time, so a row is never older than every metric unless a purge that
+    /// skipped `take_spans` removed its pair (see [`reconcile_take_spans`]);
+    /// takes that end without other metrics, such as a cancelled recording,
+    /// survive the reconciliation.
     pub(crate) fn add_take_spans(&self, record: &TakeSpanRecord) -> Result<(), StorageError> {
-        let connection = self.connection()?;
+        let mut connection = self.connection()?;
         if super::stored_settings(&connection)?.history_retention
             == crate::types::HistoryRetention::Never
         {
@@ -455,10 +466,11 @@ impl Storage {
             app_category: None,
         }
         .mode_code();
+        let created_at = chrono::Utc::now().to_rfc3339();
         let mut values: Vec<rusqlite::types::Value> = vec![
             record.take_id.clone().into(),
             TAKE_SPAN_VERSION.into(),
-            chrono::Utc::now().to_rfc3339().into(),
+            created_at.clone().into(),
             mode.to_owned().into(),
             record.outcome.code().to_owned().into(),
             record
@@ -468,13 +480,25 @@ impl Storage {
                 .into(),
         ];
         values.extend(record.spans.iter().map(|value| (*value).into()));
-        connection.execute(
+        let transaction = connection.transaction()?;
+        transaction.execute(
             &format!(
                 "INSERT INTO take_spans(take_id, version, created_at, mode, outcome, stage{columns})
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6{placeholders})"
             ),
             rusqlite::params_from_iter(values),
         )?;
+        transaction.execute(
+            "INSERT INTO metrics(event_type, provider, duration_ms, success, error_code, created_at, mode, app_category)
+             VALUES (?1, NULL, NULL, ?2, NULL, ?3, ?4, NULL)",
+            rusqlite::params![
+                TAKE_METRIC_EVENT,
+                i64::from(record.outcome.stage().is_none()),
+                created_at,
+                mode,
+            ],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -537,6 +561,8 @@ impl TakeRowForTest {
 /// and its Delete all, History off and retention purges clear `metrics` but
 /// not `take_spans`. Run on every open: with no metrics left every take
 /// record goes, otherwise every one older than the oldest remaining metric.
+/// A record this build keeps is never removed, because its paired
+/// [`TAKE_METRIC_EVENT`] metric has the same time and goes only with it.
 /// Returns how many rows were deleted.
 pub(super) fn reconcile_take_spans(
     connection: &rusqlite::Connection,
@@ -900,13 +926,21 @@ mod tests {
                 &[(TakeSpan::AudioStop, 5)],
             ))
             .unwrap();
-        // Historical metrics stay in their own summaries.
+        // Historical metrics stay in their own summaries; take records add
+        // only their untimed anchor metric.
         storage
             .add_metric("asr", None, Some(9999), true, None)
             .unwrap();
         let report = storage.diagnostics().unwrap();
-        assert_eq!(report.summaries.len(), 1);
-        assert_eq!(report.summaries[0].p50_ms, Some(9999));
+        let events: Vec<_> = report
+            .summaries
+            .iter()
+            .map(|summary| (summary.event_type.as_str(), summary.count, summary.p50_ms))
+            .collect();
+        assert_eq!(
+            events,
+            vec![("asr", 1, Some(9999)), (TAKE_METRIC_EVENT, 5, None)]
+        );
         assert_eq!(report.takes.len(), 2);
         let cancelled = &report.takes[0];
         assert_eq!(
@@ -998,6 +1032,18 @@ mod tests {
             .unwrap();
     }
 
+    /// What an older build's purge does: it removes metrics only.
+    fn delete_metrics_before(storage: &Storage, cutoff: Option<&str>) {
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "DELETE FROM metrics WHERE ?1 IS NULL OR created_at < ?1",
+                [cutoff],
+            )
+            .unwrap();
+    }
+
     fn reconcile(storage: &Storage) -> usize {
         reconcile_take_spans(&storage.connection().unwrap()).unwrap()
     }
@@ -1011,6 +1057,7 @@ mod tests {
         storage
             .add_take_spans(&take(TakeOutcome::Failed(TakeStage::Start), &[]))
             .unwrap();
+        delete_metrics_before(&storage, None);
         assert_eq!(reconcile(&storage), 2);
         assert!(storage.take_records_for_test().is_empty());
     }
@@ -1022,11 +1069,13 @@ mod tests {
             .add_take_spans(&take(TakeOutcome::Pasted, &[(TakeSpan::Asr, 1)]))
             .unwrap();
         set_created_at(&storage, "take_spans", "2026-01-01T00:00:00+00:00");
-        // The older build's purge kept metrics from 2026-02-01 on.
+        set_created_at(&storage, "metrics", "2026-01-01T00:00:00+00:00");
         storage
             .add_metric("asr", None, Some(1), true, None)
             .unwrap();
         set_created_at(&storage, "metrics", "2026-02-01T00:00:00+00:00");
+        // The older build's purge kept metrics from 2026-02-01 on.
+        delete_metrics_before(&storage, Some("2026-02-01T00:00:00+00:00"));
         storage
             .add_take_spans(&take(TakeOutcome::Pasted, &[(TakeSpan::Asr, 2)]))
             .unwrap();
@@ -1051,6 +1100,56 @@ mod tests {
             .unwrap();
         assert_eq!(reconcile(&storage), 0);
         assert_eq!(storage.take_records_for_test().len(), 2);
+    }
+
+    #[test]
+    fn reconciling_keeps_takes_that_wrote_no_other_metric() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Cancelled(TakeStage::Recording), &[]))
+            .unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Failed(TakeStage::Start), &[]))
+            .unwrap();
+        assert_eq!(reconcile(&storage), 0);
+        assert_eq!(storage.take_records_for_test().len(), 2);
+
+        // This build's retention removes both tables before the cutoff, so a
+        // take after it outlives every other metric and is still kept.
+        set_created_at(&storage, "take_spans", "2026-01-01T00:00:00+00:00");
+        set_created_at(&storage, "metrics", "2026-01-01T00:00:00+00:00");
+        storage
+            .add_take_spans(&take(TakeOutcome::Cancelled(TakeStage::Recording), &[]))
+            .unwrap();
+        crate::storage::purge_metrics_before(
+            &storage.connection().unwrap(),
+            Some("2026-02-01T00:00:00+00:00"),
+        )
+        .unwrap();
+        assert_eq!(reconcile(&storage), 0);
+        assert_eq!(storage.take_records_for_test().len(), 1);
+    }
+
+    #[test]
+    fn every_take_record_writes_a_take_metric() {
+        let storage = Storage::in_memory().unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Pasted, &[]))
+            .unwrap();
+        storage
+            .add_take_spans(&take(TakeOutcome::Cancelled(TakeStage::Recording), &[]))
+            .unwrap();
+        let summary = storage
+            .diagnostics()
+            .unwrap()
+            .summaries
+            .into_iter()
+            .find(|summary| summary.event_type == TAKE_METRIC_EVENT)
+            .unwrap();
+        assert_eq!(
+            (summary.count, summary.successes, summary.timed_count),
+            (2, 1, 0)
+        );
     }
 
     #[test]
