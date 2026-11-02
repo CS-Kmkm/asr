@@ -12,7 +12,7 @@ Scope (one worker per slice; disjoint write sets per wave; integration branch `p
   - C3 speculative correction (opt-in, default off): after stop, correct the last live hypothesis in parallel with final ASR; adopt it only if the final transcript and every correction input (settings, dictionary hints, personalization guidance, provider/model) are identical; otherwise cancel it and run the normal correction. Record a content-free hit/miss metric (and the live-vs-final match rate even when C3 is off).
 - Main session: native verification checklist (`docs/tasks/native-verification-checklist.md`) covering #74, #75 and this task.
 
-Non-scope: C2 (short-text skip, correction deadline fallback, model/provider change: needs user decision), default changes to recognition/correction, Edit/Ask completion reordering, cue/target-capture order, running real-device or provider measurements.
+Non-scope: C2 (short-text skip, correction deadline fallback, model/provider change; rejected by the user on 2026-11-02 because the correction-policy trade-offs are not acceptable), default changes to recognition/correction, Edit/Ask completion reordering, cue/target-capture order, running real-device or provider measurements.
 
 Constraints: Preserve insertion safety, cancellation and ownership semantics, consent gating and privacy: no transcript, audio, window title or prompt text in logs or metrics; take ids are random, ephemeral and never linked to History ids in exported diagnostics; metrics follow the existing retention/Delete all policy. New settings default off and keep current behavior byte-for-byte when off. A5 issues no new provider requests (cloud ASR keeps full-recording recognition unless live preview already sends the same audio to that provider under existing consent; otherwise A5 is local-backend only). C3 settings copy states that a miss costs an extra AI request and that a cancelled take may already have sent the hypothesis. Existing tests pass; each change has focused tests where testable off-device. Workers commit on their own worktree branch with Conventional Commits; the main session integrates.
 
@@ -27,7 +27,7 @@ Acceptance criteria:
 Open questions:
 - Span storage shape (new table vs metrics columns), outcome codes: may decide myself (worker records decision).
 - A5 segment confirmation rule, worker scheduling against preview decodes, prompt conditioning across segments: may decide myself within constraints (worker records decision and an offline replay comparison).
-- C3 enablement and C2 policy defaults: needs user confirmation (C3 ships default off).
+- C3 enablement: needs user confirmation (C3 ships default off). C2: rejected by the user (2026-11-02); do not implement.
 
 Context: `docs/asr-performance-audit.md` (IDs, locators, constraints), `docs/tasks/remaining-latency-improvements.md` and `docs/tasks/stop-to-insert-latency-fixes.md` (prior slices), `docs/benchmarks.md`, `docs/worker_protocol.md`.
 
@@ -42,4 +42,4 @@ Status: implementation integrated on `perf/measurement-structural`; automated ch
 - Criterion 1: done for M1, M2, S2 remainder, A5, C3 (limits recorded above).
 - Criterion 4: checklist sections A–C written; native/real-device verification, speed and accuracy measurement pending.
 - Native checklist drafted for #74/#75 (`docs/tasks/native-verification-checklist.md`); section C pending integration.
-Next: (1) user decides push/PR for `perf/measurement-structural`; (2) run `docs/tasks/native-verification-checklist.md` on the real machine; (3) C2 policy and enabling A5/C3 by default need user decisions after measurements.
+Next: (1) review/merge the PR for `perf/measurement-structural`; (2) run `docs/tasks/native-verification-checklist.md` on the real machine; (3) decide whether to enable A5/C3 by default after measurements.
