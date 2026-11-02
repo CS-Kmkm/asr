@@ -184,6 +184,7 @@ impl RecordingDriver for Desktop<'_> {
             stop_timings: StopTimings {
                 audio_stop_ms,
                 live_drain_ms,
+                live_final_match: None,
             },
             translation_target,
             draft,
@@ -387,6 +388,14 @@ impl RecordingDriver for Desktop<'_> {
             .map_err(|_| "target service is unavailable".to_string())?
             .take();
 
+        let stop_timings = StopTimings {
+            live_final_match: super::live_final_match(
+                mode,
+                draft.as_ref().and_then(LiveDraft::last_hypothesis),
+                &transcript.text,
+            ),
+            ..stop_timings
+        };
         let take = RecordedTake {
             automatic: false,
             settings,
