@@ -1,8 +1,7 @@
 //! History queries and transactional deletion. Column order has one owner.
 use super::{
-    checkpoint_deleted_history, insert_history_row, purge_dictionary_candidates_before,
-    purge_history, purge_metrics_before, queue_audio_deletion, stored_settings, Storage,
-    StorageError,
+    insert_history_row, purge_dictionary_candidates_before, purge_history, purge_metrics_before,
+    queue_audio_deletion, stored_settings, Storage, StorageError,
 };
 use crate::types::{HistoryCursor, HistoryFilter, HistoryItem, HistoryPage, HistoryRetention};
 use chrono::Utc;
@@ -62,7 +61,7 @@ impl Storage {
         let settings = stored_settings(&connection)?;
         let transaction = connection.transaction()?;
         let now = Utc::now();
-        purge_history(&transaction, &settings, now)?;
+        let deleted = purge_history(&transaction, &settings, now)?;
         let exists: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM dictation_history WHERE id = ?1)",
             [source_id],
@@ -73,7 +72,7 @@ impl Storage {
             insert_history_row(&transaction, item, &now.to_rfc3339(), None, None)?;
         }
         transaction.commit()?;
-        checkpoint_deleted_history(&connection);
+        self.checkpoint_if_needed(&connection, deleted);
         drop(connection);
         let _ = self.retry_pending_audio_deletions();
         Ok(exists.then_some(saved))
@@ -192,7 +191,7 @@ impl Storage {
         let changed =
             transaction.execute("DELETE FROM dictation_history WHERE id = ?1", [id])? != 0;
         transaction.commit()?;
-        checkpoint_deleted_history(&connection);
+        self.checkpoint_after_deletion(&connection);
         drop(connection);
         let _ = self.retry_pending_audio_deletions();
         Ok(changed)
@@ -219,7 +218,7 @@ impl Storage {
         purge_dictionary_candidates_before(&transaction, None)?;
         purge_metrics_before(&transaction, None)?;
         transaction.commit()?;
-        checkpoint_deleted_history(&connection);
+        self.checkpoint_after_deletion(&connection);
         drop(connection);
         let _ = self.retry_pending_audio_deletions();
         Ok(changed)

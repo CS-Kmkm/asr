@@ -13,7 +13,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
     },
 };
@@ -43,16 +43,23 @@ const MAX_CSV_ROWS: usize = 1000;
 
 /// Remove old WAL frames after privacy deletions; secure_delete scrubs the
 /// database pages, but an earlier WAL frame can still contain the old text.
-fn checkpoint_deleted_history(connection: &Connection) {
+/// Returns whether the WAL was truncated.
+fn checkpoint_deleted_history(connection: &Connection) -> bool {
     // This runs after commit: a busy reader or I/O failure must not report a
     // failed settings save, or skip cleanup of retained audio. A later policy
     // pass retries the checkpoint. No user content belongs in this diagnostic.
     match connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
         row.get::<_, i64>(0)
     }) {
-        Ok(0) => {}
-        Ok(_) => eprintln!("History WAL checkpoint deferred: database reader is active."),
-        Err(_) => eprintln!("History WAL checkpoint deferred: database operation failed."),
+        Ok(0) => true,
+        Ok(_) => {
+            eprintln!("History WAL checkpoint deferred: database reader is active.");
+            false
+        }
+        Err(_) => {
+            eprintln!("History WAL checkpoint deferred: database operation failed.");
+            false
+        }
     }
 }
 
@@ -105,6 +112,11 @@ pub struct Storage {
     /// that holds the connection pairs the row with the revision that wrote
     /// it.
     settings_revision: Arc<AtomicU64>,
+    /// Set while a WAL truncate after a privacy deletion has not succeeded
+    /// (a reader was active or the checkpoint failed), so the next History
+    /// policy pass retries it even when it deletes nothing. Starts set, so
+    /// the first pass of a run also truncates whatever an earlier run left.
+    wal_checkpoint_pending: Arc<AtomicBool>,
 }
 
 /// Builds without the V2 `shortcuts` field read one scalar chord per mode.
@@ -257,12 +269,14 @@ fn expired_history_rows(
 }
 
 /// Removes the History rows that `settings` no longer keep at `now` (see
-/// `expired_history_rows`) and queues their audio for deletion.
+/// `expired_history_rows`) and queues their audio for deletion. Returns
+/// whether any History row, dictionary candidate or metric was deleted, so
+/// the caller knows whether old WAL frames may still hold removed content.
 fn purge_history(
     connection: &Connection,
     settings: &Settings,
     now: DateTime<Utc>,
-) -> Result<(), StorageError> {
+) -> Result<bool, StorageError> {
     let removed = expired_history_rows(connection, settings, now)?;
     for (_, filename) in &removed {
         if let Some(filename) = filename {
@@ -280,13 +294,13 @@ fn purge_history(
         )?;
     }
     let cutoff = match HistoryCutoff::at(settings.history_retention, now) {
-        HistoryCutoff::KeepAll => return Ok(()),
+        HistoryCutoff::KeepAll => return Ok(!removed.is_empty()),
         HistoryCutoff::RemoveAll => None,
         HistoryCutoff::Before(cutoff) => Some(cutoff),
     };
-    purge_dictionary_candidates_before(connection, cutoff.as_deref())?;
-    purge_metrics_before(connection, cutoff.as_deref())?;
-    Ok(())
+    let candidates = purge_dictionary_candidates_before(connection, cutoff.as_deref())?;
+    let metrics = purge_metrics_before(connection, cutoff.as_deref())?;
+    Ok(!removed.is_empty() || candidates > 0 || metrics > 0)
 }
 
 /// Reads the stored settings while the caller holds the connection, so a
@@ -887,6 +901,7 @@ impl Storage {
             history_audio_dir,
             settings_writes: Arc::new(Mutex::new(())),
             settings_revision: Arc::new(AtomicU64::new(0)),
+            wal_checkpoint_pending: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -1099,7 +1114,9 @@ impl Storage {
         purge_history(&transaction, settings, now)?;
         transaction.commit()?;
         let revision = self.advance_settings_revision(&connection);
-        checkpoint_deleted_history(&connection);
+        // A settings save can turn History off or shorten its window, so it
+        // always truncates, as before.
+        self.checkpoint_after_deletion(&connection);
         drop(connection);
         let _ = self.retry_pending_audio_deletions();
         Ok(revision)
@@ -1119,12 +1136,31 @@ impl Storage {
     ) -> Result<(), StorageError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        purge_history(&transaction, settings, now)?;
+        let deleted = purge_history(&transaction, settings, now)?;
         transaction.commit()?;
-        checkpoint_deleted_history(&connection);
+        // Runs before every History save and page read: truncate only when
+        // this pass removed content or an earlier truncate is still owed.
+        self.checkpoint_if_needed(&connection, deleted);
         drop(connection);
         let _ = self.retry_pending_audio_deletions();
         Ok(())
+    }
+
+    /// Truncates the WAL after a privacy deletion, remembering a truncate
+    /// that did not succeed so a later History policy pass retries it.
+    /// `connection` is the held connection, which serializes the flag.
+    fn checkpoint_after_deletion(&self, connection: &Connection) {
+        let truncated = checkpoint_deleted_history(connection);
+        self.wal_checkpoint_pending
+            .store(!truncated, Ordering::SeqCst);
+    }
+
+    /// Truncates the WAL when `deleted` content may remain in old frames or
+    /// an earlier truncate is pending a retry; otherwise does nothing.
+    fn checkpoint_if_needed(&self, connection: &Connection, deleted: bool) {
+        if deleted || self.wal_checkpoint_pending.load(Ordering::SeqCst) {
+            self.checkpoint_after_deletion(connection);
+        }
     }
 
     /// Counts what saving `retention` would delete right now, without
@@ -2164,30 +2200,34 @@ pub struct HistoryPurgePreview {
 
 /// Candidate spans come from transcripts, so they follow the History
 /// retention; `None` removes every pending candidate and decision.
+/// Returns how many rows were deleted.
 fn purge_dictionary_candidates_before(
     connection: &Connection,
     cutoff: Option<&str>,
-) -> Result<(), StorageError> {
-    connection.execute(
+) -> Result<usize, StorageError> {
+    let candidates = connection.execute(
         "DELETE FROM dictionary_candidates WHERE ?1 IS NULL OR created_at < ?1",
         params![cutoff],
     )?;
-    connection.execute(
+    let decisions = connection.execute(
         "DELETE FROM dictionary_candidate_decisions
          WHERE ?1 IS NULL OR created_at IS NULL OR created_at < ?1",
         params![cutoff],
     )?;
-    Ok(())
+    Ok(candidates + decisions)
 }
 
 /// Usage metrics record when the app was used, so they follow the History
-/// retention too; `None` removes every metric.
-fn purge_metrics_before(connection: &Connection, cutoff: Option<&str>) -> Result<(), StorageError> {
-    connection.execute(
+/// retention too; `None` removes every metric. Returns how many rows were
+/// deleted.
+fn purge_metrics_before(
+    connection: &Connection,
+    cutoff: Option<&str>,
+) -> Result<usize, StorageError> {
+    Ok(connection.execute(
         "DELETE FROM metrics WHERE ?1 IS NULL OR created_at < ?1",
         params![cutoff],
-    )?;
-    Ok(())
+    )?)
 }
 
 fn read_dictionary_entries<C: std::ops::Deref<Target = Connection>>(
@@ -2525,6 +2565,89 @@ mod tests {
                 assert!(!fs::read(file).is_ok_and(|bytes| contains(&bytes)));
             }
         }
+    }
+
+    fn wal_len(database: &Path) -> u64 {
+        let mut wal = database.as_os_str().to_owned();
+        wal.push("-wal");
+        fs::metadata(PathBuf::from(wal)).map_or(0, |metadata| metadata.len())
+    }
+
+    #[test]
+    fn history_policy_truncates_the_wal_only_after_it_deleted_something() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("retention.sqlite3");
+        let storage = Storage::open(&path).unwrap();
+        let settings = Settings {
+            history_retention: HistoryRetention::OneWeek,
+            ..Settings::default()
+        };
+        // A settings save always truncates, as a privacy change.
+        storage
+            .update_settings_and_apply_history_policy(&settings)
+            .unwrap();
+        assert_eq!(wal_len(&path), 0);
+
+        storage.add_history(&item()).unwrap();
+        storage
+            .add_metric("dictation", None, Some(1), true, None)
+            .unwrap();
+        let written = wal_len(&path);
+        assert!(written > 0);
+        // Nothing expired: neither a later save nor a page read truncates.
+        storage.enforce_current_history_policy().unwrap();
+        storage
+            .query_history_page(HistoryFilter::All, 10, None, "", &[])
+            .unwrap();
+        assert_eq!(wal_len(&path), written);
+        storage.add_history(&item()).unwrap();
+        assert!(wal_len(&path) >= written);
+        assert_eq!(
+            storage.list_history(HistoryFilter::All, 10).unwrap().len(),
+            2
+        );
+
+        // Once the rows age out, the pass that removes them truncates.
+        storage
+            .apply_history_policy_at(&settings, Utc::now() + chrono::Duration::days(8))
+            .unwrap();
+        assert_eq!(wal_len(&path), 0);
+        assert!(storage
+            .list_history(HistoryFilter::All, 10)
+            .unwrap()
+            .is_empty());
+        assert!(storage.diagnostics().unwrap().summaries.is_empty());
+    }
+
+    #[test]
+    fn a_deferred_wal_truncate_is_retried_by_the_next_policy_pass() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("retry.sqlite3");
+        let storage = Storage::open(&path).unwrap();
+        storage
+            .connection()
+            .unwrap()
+            .busy_timeout(std::time::Duration::from_millis(10))
+            .unwrap();
+        storage.add_history(&item()).unwrap();
+        // An open read transaction keeps the deleted frames in the WAL.
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM dictation_history", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        storage.delete_all_history().unwrap();
+        assert!(wal_len(&path) > 0);
+        assert!(storage.wal_checkpoint_pending.load(Ordering::SeqCst));
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+
+        // This pass deletes nothing, but owes the earlier truncate.
+        storage.enforce_current_history_policy().unwrap();
+        assert_eq!(wal_len(&path), 0);
+        assert!(!storage.wal_checkpoint_pending.load(Ordering::SeqCst));
     }
 
     #[test]
