@@ -893,20 +893,6 @@ fn voice_mode_event_name(mode: PipelineMode) -> &'static str {
     }
 }
 
-/// Runs the recording preflight and the original target capture side by
-/// side. The capture only reads which window and control has focus and sends
-/// nothing anywhere, so it need not wait for the preflight; it also lands
-/// closer to the press. A preflight failure still wins over the capture's
-/// outcome, and a target captured for a refused start is discarded.
-async fn preflight_beside_capture<T>(
-    preflight: impl std::future::Future<Output = Result<(), String>>,
-    capture: impl std::future::Future<Output = Result<T, String>>,
-) -> Result<T, String> {
-    let (preflight, capture) = tokio::join!(preflight, capture);
-    preflight?;
-    capture
-}
-
 /// The part of a start that runs while it owns the lifecycle as Starting.
 #[allow(clippy::too_many_arguments)]
 async fn start_owned_recording(
@@ -932,38 +918,14 @@ async fn start_owned_recording(
     let settings = storage.get_settings().map_err(command_error)?;
     crate::privacy::check_recording(&settings, mode).map_err(str::to_owned)?;
     let preflight_settings = settings.clone();
-    let preflight = async move {
-        if dictation_test {
-            return Ok(());
-        }
+    if !dictation_test {
         tokio::task::spawn_blocking(move || {
             correction::preflight_recording(&preflight_settings, mode)
         })
         .await
         .map_err(|_| "recording session task failed".to_owned())?
-        .map_err(|error| error.user_message().to_owned())
-    };
-    // Capture the target at the press: a model load may take minutes, and
-    // the foreground window by then is not necessarily the one meant. Edit
-    // and Ask capture their selection or caret in their sessions instead.
-    let captures_target = !dictation_test
-        && !matches!(mode, PipelineMode::Edit | PipelineMode::Ask)
-        && voice_mode_shortcuts(&settings, mode).is_some();
-    let capture = async move {
-        if !captures_target {
-            return Ok(None);
-        }
-        tokio::task::spawn_blocking(move || {
-            SystemTextInjector::default()
-                .capture_target()
-                .map(|target| injection::recording_target(target, from_shortcut))
-                .map_err(command_error)
-        })
-        .await
-        .map_err(|_| "recording session task failed".to_owned())?
-        .map(Some)
-    };
-    let target = preflight_beside_capture(preflight, capture).await?;
+        .map_err(|error| error.user_message().to_owned())?;
+    }
     let mode_shortcuts =
         voice_mode_shortcuts(&settings, mode).ok_or("selected-text translation does not record")?;
     let active_hotkey = trigger_chord
@@ -996,6 +958,22 @@ async fn start_owned_recording(
         } else {
             (None, None)
         };
+    // Capture the target at the press: a model load may take minutes, and
+    // the foreground window by then is not necessarily the one meant.
+    let target = if !dictation_test && mode != PipelineMode::Edit && mode != PipelineMode::Ask {
+        Some(
+            tokio::task::spawn_blocking(move || {
+                SystemTextInjector::default()
+                    .capture_target()
+                    .map(|target| injection::recording_target(target, from_shortcut))
+                    .map_err(command_error)
+            })
+            .await
+            .map_err(|_| "recording session task failed".to_owned())??,
+        )
+    } else {
+        None
+    };
     // The overlay appears on the monitor of the window this take targets.
     let ask_target = ask_session
         .as_ref()
