@@ -418,6 +418,8 @@ class MockBackend(ProgressReporting):
             raise BackendError("unsupported_quantization", f"Unsupported quantization: {quantization}")
         if os.environ.get("ASR_WORKER_MOCK_LOAD_ERROR") == "oom":
             raise BackendError("gpu_oom", "GPU out of memory while operating the ASR model")
+        if os.environ.get("ASR_WORKER_MOCK_LOAD_ERROR") == "missing":
+            raise BackendError("backend_unavailable", "mock backend dependency is not installed")
         self._log_event(f"load {quantization}")
         self._hold(cancellable=False)
         self.loaded = True

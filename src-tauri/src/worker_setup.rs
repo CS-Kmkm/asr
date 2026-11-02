@@ -109,7 +109,7 @@ impl Provision {
     }
 
     /// Forget the last successful sync, so the next spawn syncs again.
-    fn forget_sync(&self) {
+    pub(crate) fn forget_sync(&self) {
         let _ = std::fs::remove_file(self.marker());
     }
 

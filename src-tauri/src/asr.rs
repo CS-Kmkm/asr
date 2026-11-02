@@ -723,6 +723,11 @@ impl JsonlTranscriber {
         }
     }
 
+    /// A load failure that reports a backend package as not installed.
+    fn missing_dependency(error: &AsrError) -> bool {
+        matches!(error, AsrError::Worker(worker) if worker.code == "backend_unavailable")
+    }
+
     /// Start failures a dependency sync could fix: the interpreter would not
     /// run, or the worker exited, hung or answered garbage before its
     /// handshake. A cancellation or a worker that answered (for example with
@@ -1073,7 +1078,18 @@ impl JsonlTranscriber {
             Ok(Err(error)) => {
                 // The worker unloads its previous model before loading.
                 state.loaded_quantization = None;
-                if Self::requires_reset(&error) {
+                if let Some(provision) = state
+                    .command
+                    .provision
+                    .as_ref()
+                    .filter(|_| Self::missing_dependency(&error))
+                {
+                    // A skipped sync cannot catch a package that only the model
+                    // load imports. Forget the sync and restart the worker, so
+                    // the next load repairs the environment with a full sync.
+                    provision.forget_sync();
+                    state.reset().await;
+                } else if Self::requires_reset(&error) {
                     state.reset().await;
                 } else {
                     state.mark_not_resident();
@@ -2847,6 +2863,32 @@ sys.stdin.read()
             );
             assert_eq!(fake.syncs(), 1, "one repair per start, not a loop");
             assert!(transcriber.state.lock().await.running.is_none());
+        }
+
+        #[tokio::test]
+        async fn a_model_load_missing_a_package_makes_the_next_load_sync_again() {
+            let Some(mut fake) = FakeProvision::new(true) else {
+                return;
+            };
+            fake.provision.prepare().await.unwrap();
+            assert_eq!(fake.syncs(), 1);
+            // The worker starts, but the model load finds a package missing.
+            fake.command
+                .env
+                .push(("ASR_WORKER_MOCK_LOAD_ERROR".into(), "missing".into()));
+            let transcriber = fake.transcriber();
+            let result = transcriber.load("4bit").await;
+            assert!(
+                matches!(&result, Err(AsrError::Worker(error)) if error.code == "backend_unavailable"),
+                "{result:?}"
+            );
+            assert_eq!(fake.syncs(), 1, "the matching environment was reused");
+            assert!(!fake.provision.is_synced());
+            assert!(transcriber.state.lock().await.running.is_none());
+            // The next load restarts the worker after a full sync.
+            let _ = transcriber.load("4bit").await;
+            assert_eq!(fake.syncs(), 2);
+            transcriber.shutdown().await.unwrap();
         }
 
         #[tokio::test]
