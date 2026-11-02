@@ -4405,6 +4405,30 @@ mod tests {
     }
 
     #[test]
+    fn incremental_final_asr_defaults_off_and_an_unreadable_value_repairs_only_itself() {
+        let mut saved = serde_json::to_value(Settings::default()).unwrap();
+        saved["inputGainPercent"] = serde_json::json!(125);
+        saved.as_object_mut().unwrap().remove("incrementalFinalAsr");
+        let old = load_settings(&saved.to_string());
+        assert!(!old.settings.incremental_final_asr);
+        assert!(old.repairs.is_empty());
+        saved["incrementalFinalAsr"] = serde_json::json!(true);
+        assert!(
+            load_settings(&saved.to_string())
+                .settings
+                .incremental_final_asr
+        );
+        saved["incrementalFinalAsr"] = serde_json::json!("yes");
+        let repaired = load_settings(&saved.to_string());
+        assert!(!repaired.settings.incremental_final_asr);
+        assert_eq!(repaired.settings.input_gain_percent, 125);
+        assert_eq!(
+            repaired.repairs.fields(),
+            vec!["incrementalFinalAsr".to_owned()]
+        );
+    }
+
+    #[test]
     fn legacy_settings_receive_automatic_editing_defaults() {
         let mut value = serde_json::to_value(Settings::default()).unwrap();
         let object = value.as_object_mut().unwrap();

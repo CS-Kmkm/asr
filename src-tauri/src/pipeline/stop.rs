@@ -223,7 +223,7 @@ impl RecordingDriver for Desktop<'_> {
             started,
             stop_timings,
             translation_target,
-            draft,
+            mut draft,
             edit_session,
             ask_session,
             ..
@@ -274,15 +274,20 @@ impl RecordingDriver for Desktop<'_> {
         let model_was_ready = model_ready.is_ok();
         let transcript_result = match model_ready {
             Err(error) => Err((error, TranscriptionFailure::Retryable)),
-            Ok(_) => match services
-                .transcriber
-                .transcribe_with_locale(
-                    &artifact.path,
-                    prompt.as_deref(),
-                    settings.speech_locale.as_deref(),
-                    cancel,
-                )
-                .await
+            Ok(_) => match crate::live_dictation::incremental::transcribe_final(
+                services.transcriber.as_ref(),
+                draft.as_mut().and_then(|draft| draft.incremental.take()),
+                &settings,
+                &artifact.path,
+                prompt.as_deref(),
+                cancel,
+                |outcome| {
+                    if !services.lifecycle.is_dictation_test(operation_id) {
+                        outcome.record(metrics, &settings.asr_backend);
+                    }
+                },
+            )
+            .await
             {
                 Ok(value) => {
                     trace.span_since(TakeSpan::Asr, asr_started);

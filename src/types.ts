@@ -100,6 +100,8 @@ export interface Settings {
   scopedStyleProfiles: ScopedStyleProfile[];
   /** Live preview only: greedy (single-candidate) decoding on faster-whisper. */
   livePreviewFastDecode: boolean;
+  /** Dictate/Translate: recognize finished ranges while recording (local speech backends only). */
+  incrementalFinalAsr: boolean;
 }
 /**
  * Stored settings with the backend revision of the write that stored them.

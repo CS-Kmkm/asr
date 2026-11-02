@@ -110,6 +110,12 @@ pub struct Settings {
     /// is unchanged. Off by default.
     #[serde(default)]
     pub live_preview_fast_decode: bool,
+    /// Dictate and Translate recognize ranges of the recording that end in a
+    /// long pause while recording, and only the rest after stopping, with a
+    /// local speech backend. Any doubt falls back to whole-recording
+    /// recognition. Off by default.
+    #[serde(default)]
+    pub incremental_final_asr: bool,
     #[serde(default)]
     pub shortcuts: VoiceShortcuts,
     #[serde(default)]
@@ -424,6 +430,7 @@ impl Default for Settings {
             live_preview_enabled: None,
             cloud_live_preview_enabled: false,
             live_preview_fast_decode: false,
+            incremental_final_asr: false,
             shortcuts: VoiceShortcuts::default(),
             hold_to_talk: HoldToTalk::default(),
             translation_hotkey: default_translation_hotkey(),
@@ -759,6 +766,12 @@ mod tests {
         assert!(!settings.live_target_insertion);
         assert!(!settings.live_preview_fast_decode);
         assert!(!Settings::default().live_preview_fast_decode);
+        assert!(!settings.incremental_final_asr);
+        assert!(!Settings::default().incremental_final_asr);
+        assert_eq!(
+            serde_json::to_value(Settings::default()).unwrap()["incrementalFinalAsr"],
+            false
+        );
         assert!(!settings.automatic_voice_mode);
         assert!(!Settings::default().automatic_voice_mode);
         assert_eq!(settings.decision_model, "Cloudflare/clef-flash");
