@@ -515,6 +515,17 @@ Full usage and Phase 0 gate criteria are documented in
   beam search) to lower load while recording; VAD and other options stay the
   same, preview text may be less accurate, and the final transcription after
   stopping always uses the normal decode.
+- Settings > Input "Incremental final transcription (experimental)" (off by
+  default, local speech backends only) lets Dictate and Translate transcribe
+  parts of the recording that end in a pause of at least about a second while
+  recording, with the normal final-recognition request, and transcribe only
+  the rest after stopping; the parts are joined in audio order. Each part is
+  prepared and recognized on its own, so the text may differ slightly from
+  whole-recording recognition (accuracy on real speech is not yet measured).
+  Any change of settings, dictionary prompt or loaded model during the take,
+  a failed part or incomplete coverage falls back to transcribing the whole
+  recording. It sends no audio to a cloud provider and records only a
+  content-free `asr_incremental` metric (used, or a fixed fallback reason).
 - History can be disabled; when disabled, transcript rows are not written
   (failed recordings kept for Retry are the exception described below).
 - 履歴は本文検索と追加読み込みに対応しています。録音を削除した後も「原文をコピー」「再補正」「指定言語へ翻訳」を使えます。

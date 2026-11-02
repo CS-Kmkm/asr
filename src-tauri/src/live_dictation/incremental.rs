@@ -7,7 +7,7 @@
 //! stitched by looking for repeated words: a range is a disjoint span of raw
 //! samples, so the join is a concatenation.
 //!
-//! Decisions (see `docs/tasks/measurement-and-structural-latency.md`, A5):
+//! Decisions (audit item A5):
 //! - Boundaries: a range ends in the middle of a run of at least
 //!   [`BOUNDARY_SILENCE`] in which every 20 ms frame of the prepared audio
 //!   stays below the live-segmentation continuation level (0.2 x the VAD
