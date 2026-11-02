@@ -102,7 +102,7 @@ test("recognition opt-ins are named by their settings labels", async () => {
   render();
   await flush();
   const { text } = render();
-  assert.match(text, /Incremental final transcription \(experimental\)/);
+  assert.match(text, /Incremental final transcription/);
   assert.match(text, /Faster live preview/);
   assert.doesNotMatch(text, /incrementalFinalAsr|livePreviewFastDecode/);
 });
