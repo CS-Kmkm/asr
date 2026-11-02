@@ -19,6 +19,11 @@ use crate::{
 use std::time::Instant;
 use tauri::{Emitter, Manager};
 
+/// Shown when the final paste is held back because the original field lost
+/// focus or its IME is still composing. Fixed copy: no transcript or title.
+const TARGET_WAIT_HINT: &str =
+    "To insert, return to the original field or confirm the IME conversion.";
+
 pub(crate) async fn finish(
     context: PipelineContext<'_>,
     take: RecordedTake,
@@ -71,6 +76,8 @@ async fn finish_owned(
         app_context,
         translation_target,
         mut draft,
+        // Recorded by the shared stop pipeline after delivery.
+        stop_timings: _,
     } = take;
     let metrics = storage.metrics_for(mode, app_context::history_category(app_context.as_ref()));
     let duration_ms = artifact.duration.as_millis() as u64;
@@ -84,9 +91,16 @@ async fn finish_owned(
     let mut correction_failed = false;
     let mut translation_failed = false;
     let mut correction_output_limit = None;
+    // Time to the first nonempty provider callback. This overlaps the total AI
+    // stage; it does not isolate connection setup or server queueing.
+    let mut first_output_ms = None;
     let _ = app.emit("app-state", state.publish_result(transcript.text.clone()));
-    // Full-recording recognition reconciles the last live hypothesis before AI correction.
-    draft.monitor.wait_for_shortcut_release().await;
+    // Full-recording recognition reconciles the last live hypothesis before AI
+    // correction. Only a live draft edits the target here; a deferred final
+    // paste waits for released keys while settling, so AI need not wait.
+    if draft.edits_target_live() {
+        draft.monitor.wait_for_shortcut_release().await;
+    }
     if services.lifecycle.is_cancelled(operation_id) {
         emit_state(app, state, AppPhase::Idle, cancel_message);
         return Err(cancel_error.into());
@@ -141,17 +155,22 @@ async fn finish_owned(
         );
         let translation_started = Instant::now();
         llm_provider = Some(settings.correction_provider.clone());
-        match classify_ai_stage(
-            correction::translate_voice_request(
-                &settings,
-                &transcript.text,
-                target_language,
-                automatic,
-                correction_cancel,
-                |delta| emit_correction_preview(app, delta, "streaming"),
-            )
-            .await,
-        ) {
+        let result = correction::translate_voice_request(
+            &settings,
+            &transcript.text,
+            target_language,
+            automatic,
+            correction_cancel,
+            |delta| {
+                note_first_output(&mut first_output_ms, translation_started, delta);
+                emit_correction_preview(app, delta, "streaming");
+            },
+        )
+        .await;
+        let translation_ms = translation_started.elapsed().as_millis() as i64;
+        // A failed or cancelled request has no comparable first output.
+        first_output_ms = first_output_ms.filter(|_| result.is_ok());
+        match classify_ai_stage(result) {
             AiStageResult::Corrected(translated) => {
                 final_text = translated;
                 processed_text = Some(final_text.clone());
@@ -162,7 +181,7 @@ async fn finish_owned(
                 let _ = metrics.add_metric(
                     "voice_translation",
                     Some(settings.correction_provider.as_str()),
-                    Some(translation_started.elapsed().as_millis() as i64),
+                    Some(translation_ms),
                     true,
                     None,
                 );
@@ -177,7 +196,7 @@ async fn finish_owned(
                 let _ = metrics.add_metric(
                     "voice_translation",
                     Some(settings.correction_provider.as_str()),
-                    Some(translation_started.elapsed().as_millis() as i64),
+                    Some(translation_ms),
                     false,
                     Some(error.failure_code()),
                 );
@@ -210,7 +229,7 @@ async fn finish_owned(
             "Correcting the transcript with the configured AI provider.",
         );
         let correction_started = Instant::now();
-        match correction::correct_transcript(
+        let result = correction::correct_transcript(
             &settings,
             &transcript.text,
             &correction_hints,
@@ -219,11 +238,14 @@ async fn finish_owned(
                 .as_deref(),
             correction_cancel,
             |delta| {
+                note_first_output(&mut first_output_ms, correction_started, delta);
                 emit_correction_preview(app, delta, "streaming");
             },
         )
-        .await
-        {
+        .await;
+        let correction_ms = correction_started.elapsed().as_millis() as i64;
+        first_output_ms = first_output_ms.filter(|_| result.is_ok());
+        match result {
             Ok(corrected) => {
                 final_text = corrected;
                 emit_correction_preview(app, &final_text, "final");
@@ -232,7 +254,7 @@ async fn finish_owned(
                 let _ = metrics.add_metric(
                     "text_correction",
                     Some(settings.correction_provider.as_str()),
-                    Some(correction_started.elapsed().as_millis() as i64),
+                    Some(correction_ms),
                     true,
                     None,
                 );
@@ -248,7 +270,7 @@ async fn finish_owned(
                 let _ = metrics.add_metric(
                     "text_correction",
                     Some(settings.correction_provider.as_str()),
-                    Some(correction_started.elapsed().as_millis() as i64),
+                    Some(correction_ms),
                     false,
                     Some(correction_failure_metric_code(&error)),
                 );
@@ -289,44 +311,57 @@ async fn finish_owned(
     let app_for_insertion = app.clone();
     let text_for_insertion = final_text.clone();
     let runtime = tokio::runtime::Handle::current();
-    let (committed, clipboard_lost, insertion_detail) = tokio::task::spawn_blocking(move || {
-        let services = app_for_insertion.state::<crate::Services>();
-        // Readiness may synchronously query UIA; await quiet input on this
-        // blocking owner before taking the irreversible commit fence.
-        if !translation_failed {
-            runtime.block_on(draft.settle_before_final(&cancel));
-        }
-        let committed = commit_dictation_output(&services.lifecycle, operation_id, || {
-            if translation_failed {
-                draft
-                    .injector
-                    .copy_to_clipboard(&text_for_insertion)
-                    .map(|()| InsertResult::ClipboardOnly)
-            } else {
-                draft.finish(&text_for_insertion, &cancel)
-            }
-        });
-        let clipboard_lost = draft.injector.take_clipboard_not_restored();
-        let insertion_detail = match &committed {
-            CommittedOutput::Ran(Ok(_)) if translation_failed => Some("translation_failed"),
-            CommittedOutput::Ran(Ok(result)) => draft
-                .diagnose(*result)
-                .or(InsertionDetail::for_confirmed_paste(
-                    *result,
-                    clipboard_lost,
-                ))
-                .map(InsertionDetail::code),
-            CommittedOutput::Ran(Err(error)) => {
-                InsertionDetail::from_error(error).map(InsertionDetail::code)
-            }
-            _ => None,
-        };
-        recording_overlay::set_phase(&app_for_insertion, &AppPhase::Completed);
-        drop(draft);
-        (committed, clipboard_lost, insertion_detail)
-    })
-    .await
-    .map_err(|_| "dictation insertion task failed".to_owned())?;
+    let (committed, clipboard_lost, insertion_detail, settle_ms, paste_ms) =
+        tokio::task::spawn_blocking(move || {
+            let services = app_for_insertion.state::<crate::Services>();
+            // Readiness may synchronously query UIA; await quiet input on this
+            // blocking owner before taking the irreversible commit fence.
+            let settle_started = Instant::now();
+            // Only a real wait for quiet input is timed; most takes need none.
+            let settle_ms = (!translation_failed
+                && runtime.block_on(draft.settle_before_final_with_hint(&cancel, || {
+                    recording_overlay::show_live_notice(&app_for_insertion, TARGET_WAIT_HINT);
+                })))
+            .then(|| settle_started.elapsed().as_millis() as i64);
+            let paste_started = Instant::now();
+            let committed = commit_dictation_output(&services.lifecycle, operation_id, || {
+                if translation_failed {
+                    draft
+                        .injector
+                        .copy_to_clipboard(&text_for_insertion)
+                        .map(|()| InsertResult::ClipboardOnly)
+                } else {
+                    draft.finish(&text_for_insertion, &cancel)
+                }
+            });
+            let paste_ms = paste_started.elapsed().as_millis() as i64;
+            let clipboard_lost = draft.injector.take_clipboard_not_restored();
+            let insertion_detail = match &committed {
+                CommittedOutput::Ran(Ok(_)) if translation_failed => Some("translation_failed"),
+                CommittedOutput::Ran(Ok(result)) => draft
+                    .diagnose(*result)
+                    .or(InsertionDetail::for_confirmed_paste(
+                        *result,
+                        clipboard_lost,
+                    ))
+                    .map(InsertionDetail::code),
+                CommittedOutput::Ran(Err(error)) => {
+                    InsertionDetail::from_error(error).map(InsertionDetail::code)
+                }
+                _ => None,
+            };
+            recording_overlay::set_phase(&app_for_insertion, &AppPhase::Completed);
+            drop(draft);
+            (
+                committed,
+                clipboard_lost,
+                insertion_detail,
+                settle_ms,
+                paste_ms,
+            )
+        })
+        .await
+        .map_err(|_| "dictation insertion task failed".to_owned())?;
     let insertion_result = match committed {
         CommittedOutput::Ran(inserted) => inserted,
         // Nothing was pasted or copied; ends below as a cancelled insertion,
@@ -413,6 +448,34 @@ async fn finish_owned(
         inserted,
         (!inserted).then_some(insertion_code.as_str()),
     );
+    // Stage timings are written after delivery so their commits stay off the
+    // measured path.
+    record_first_output(
+        metrics,
+        if mode == PipelineMode::Translate {
+            "voice_translation_first_output"
+        } else {
+            "text_correction_first_output"
+        },
+        &settings.correction_provider,
+        first_output_ms,
+    );
+    if let Some(settle_ms) = settle_ms {
+        let _ = metrics.add_metric(
+            "insertion_settle",
+            Some(mode_metric),
+            Some(settle_ms),
+            true,
+            None,
+        );
+    }
+    let _ = metrics.add_metric(
+        "insertion_paste",
+        Some(mode_metric),
+        Some(paste_ms),
+        inserted,
+        None,
+    );
     let metric_failed = metric_result.is_err() || insertion_metric.is_err();
     let insertion = match insertion_result {
         Ok(insertion) => insertion,
@@ -495,4 +558,66 @@ async fn finish_owned(
         duration_ms,
         latency_ms,
     })
+}
+
+/// Remembers when the provider's first non-empty streamed text arrived.
+fn note_first_output(first_output_ms: &mut Option<i64>, started: Instant, delta: &str) {
+    if first_output_ms.is_none() && !delta.is_empty() {
+        *first_output_ms = Some(started.elapsed().as_millis() as i64);
+    }
+}
+
+fn record_first_output(
+    metrics: crate::storage::MetricRecorder<'_>,
+    event_type: &str,
+    provider: &str,
+    first_output_ms: Option<i64>,
+) {
+    if let Some(first_output_ms) = first_output_ms {
+        let _ = metrics.add_metric(
+            event_type,
+            Some(provider),
+            Some(first_output_ms),
+            true,
+            None,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn first_output_ignores_empty_updates_and_preserves_the_first_observation() {
+        let started = Instant::now();
+        let mut first = None;
+        note_first_output(&mut first, started, "");
+        assert_eq!(first, None);
+
+        note_first_output(&mut first, started, "first");
+        let observed = first.expect("nonempty callback has a timing");
+        // An artificially old start would produce a different time if a later
+        // callback overwrote the first one; no wall-clock sleeps are needed.
+        note_first_output(&mut first, started - Duration::from_secs(60), "later");
+        note_first_output(&mut first, started, "");
+        assert_eq!(first, Some(observed));
+    }
+
+    #[test]
+    fn first_output_records_zero_but_does_not_invent_a_sample_without_output() {
+        let storage = crate::storage::Storage::in_memory().unwrap();
+        let metrics = storage.metrics_for(PipelineMode::Dictate, None);
+        record_first_output(metrics, "text_correction_first_output", "openai", None);
+        assert!(storage.diagnostics().unwrap().summaries.is_empty());
+
+        let mut first = Some(0);
+        note_first_output(&mut first, Instant::now(), "later");
+        record_first_output(metrics, "text_correction_first_output", "openai", first);
+        let report = storage.diagnostics().unwrap();
+        assert_eq!(report.summaries.len(), 1);
+        assert_eq!(report.summaries[0].timed_count, 1);
+        assert_eq!(report.summaries[0].p50_ms, Some(0));
+    }
 }

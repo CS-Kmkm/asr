@@ -1,6 +1,7 @@
 mod budget;
 mod transport;
 use budget::OutputBudget;
+pub(crate) use transport::prewarm_connection;
 mod fact_check;
 #[cfg(not(test))]
 use fact_check::accept_provider_correction;

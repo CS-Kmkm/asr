@@ -4,7 +4,7 @@ use super::{
     local_chat_completions_url, local_client, local_request, openai_request, CorrectionError,
     OutputBudget, GEMINI_INTERACTIONS_URL, OPENAI_RESPONSES_URL, REQUEST_TIMEOUT,
 };
-use crate::types::Settings;
+use crate::{state::PipelineMode, types::Settings};
 use reqwest::{redirect::Policy, Client};
 use std::{sync::OnceLock, time::Duration};
 use tokio::sync::watch;
@@ -71,8 +71,50 @@ impl ProviderAccess {
         } else {
             cloud_client_with(REQUEST_TIMEOUT, false)?
         };
-        let _ = slot.set(client.clone());
-        Ok(client)
+        // A concurrent first caller may have initialized the pool while this
+        // client was built. Always return the canonical pooled client.
+        Ok(slot.get_or_init(|| client).clone())
+    }
+}
+
+/// Best-effort connection warmup while the recording is recognized. Starting
+/// at stop keeps the connection fresh for the request that follows. The later
+/// request may reuse the connection if the endpoint keeps it open. The probe
+/// carries no credentials or text, and its response is ignored.
+pub(crate) fn prewarm_connection(settings: &Settings, mode: PipelineMode) {
+    let Some(endpoint) = prewarm_endpoint(settings, mode) else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        // The first use builds the shared client and its TLS configuration.
+        if let Ok(client) = ProviderAccess::Configured.client(false) {
+            let _ = prewarm_with_client(&client, endpoint).await;
+        }
+    });
+}
+
+const PREWARM_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn prewarm_with_client(
+    client: &Client,
+    endpoint: &str,
+) -> reqwest::Result<reqwest::Response> {
+    client.head(endpoint).timeout(PREWARM_TIMEOUT).send().await
+}
+
+/// The provider endpoint to connect to for a recording that will send text to
+/// a consented cloud provider. Automatic voice mode decides after recognition
+/// whether a Dictate take needs the provider, so it does not warm on its own.
+/// Local providers connect cheaply.
+fn prewarm_endpoint(settings: &Settings, mode: PipelineMode) -> Option<&'static str> {
+    let uses_provider = mode != PipelineMode::Dictate || settings.text_correction_enabled;
+    if !uses_provider || crate::privacy::check_text(settings).is_err() {
+        return None;
+    }
+    match settings.correction_provider.as_str() {
+        "openai" => Some(OPENAI_RESPONSES_URL),
+        "gemini" => Some(GEMINI_INTERACTIONS_URL),
+        _ => None,
     }
 }
 

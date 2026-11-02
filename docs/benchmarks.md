@@ -124,6 +124,20 @@
 cold は `--cold-runs` でプロセスを毎回再起動して測定(load 時間込み)。
 warm は単一プロセスで `--repeat` 回反復して定常状態を測定。
 
+実運用で言語を指定している場合は、同じ値を `--language ja-JP` などで渡す。
+省略時はbackendの言語自動判定を使う。指定値はcold/warm両方の要求と結果の
+`config.language`に保持される。既存の`--whisper-profile standard|fast`比較でも
+言語・音声・辞書・量子化をそろえること。`fast`はbeam=1とVADを同時に変更する
+実験用profileであり、アプリの既定設定は変わらない。
+
+```powershell
+uv run scripts/bench_asr.py --backend faster-whisper --language ja-JP --quantization bf16 --whisper-profile standard --record-device --audio bench_audio/quiet/ja_short_01.wav --repeat 10 --cold-runs 3 --json --output results/ja_standard_new.json
+```
+
+出力先の親ディレクトリは先に用意し、比較ごとに新しい出力名を使う。既存結果は
+上書きされない。このハーネスは録音中のlive処理や停止後の補正・挿入、idle間隔を
+再現しないため、ASR単体の結果だけでアプリ全体の高速化を判断しない。
+
 ### 3.3 VRAM の測り方(nvidia-smi)
 
 ハーネスは VRAM を測らない(GPU 非依存・stdlib 限定のため)。実機で別途記録する。

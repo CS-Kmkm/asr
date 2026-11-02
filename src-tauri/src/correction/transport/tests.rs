@@ -2,7 +2,7 @@ use super::*;
 use serde_json::{json, Value};
 use std::{
     io::{Read, Write},
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -14,6 +14,49 @@ const STUB_KEY: &str = "synthetic-stub-key";
 struct CapturedRequest {
     headers: String,
     body: Value,
+    body_len: usize,
+}
+
+fn read_request(socket: &mut TcpStream) -> CapturedRequest {
+    socket.set_nonblocking(false).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut request = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        let count = socket.read(&mut buffer).unwrap();
+        assert!(count > 0, "request ended before its body");
+        request.extend_from_slice(&buffer[..count]);
+        assert!(
+            request.len() <= 64 * 1024,
+            "test request exceeded its bound"
+        );
+        if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            let headers = String::from_utf8(request[..end].to_vec())
+                .unwrap()
+                .to_lowercase();
+            let length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .unwrap_or("0")
+                .trim()
+                .parse::<usize>()
+                .unwrap();
+            if request.len() >= end + 4 + length {
+                let body = &request[end + 4..end + 4 + length];
+                return CapturedRequest {
+                    headers,
+                    body_len: body.len(),
+                    body: if body.is_empty() {
+                        Value::Null
+                    } else {
+                        serde_json::from_slice(body).unwrap()
+                    },
+                };
+            }
+        }
+    }
 }
 struct Stub {
     endpoint: String,
@@ -62,42 +105,7 @@ impl Stub {
                         Err(error) => panic!("stub accept failed: {error}"),
                     }
                 };
-                // Winsock may propagate the listener's nonblocking mode to the
-                // accepted socket. The bounded reads below require blocking I/O.
-                socket.set_nonblocking(false).unwrap();
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut request = Vec::new();
-                let mut buffer = [0; 4096];
-                let captured = loop {
-                    let count = socket.read(&mut buffer).unwrap();
-                    assert!(count > 0, "request ended before its body");
-                    request.extend_from_slice(&buffer[..count]);
-                    assert!(
-                        request.len() <= 64 * 1024,
-                        "test request exceeded its bound"
-                    );
-                    if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
-                        let headers = String::from_utf8(request[..end].to_vec())
-                            .unwrap()
-                            .to_lowercase();
-                        let length = headers
-                            .lines()
-                            .find_map(|line| line.strip_prefix("content-length:"))
-                            .unwrap()
-                            .trim()
-                            .parse::<usize>()
-                            .unwrap();
-                        if request.len() >= end + 4 + length {
-                            break CapturedRequest {
-                                headers,
-                                body: serde_json::from_slice(&request[end + 4..end + 4 + length])
-                                    .unwrap(),
-                            };
-                        }
-                    }
-                };
+                let captured = read_request(&mut socket);
                 if let Some(send) = send.take() {
                     let _ = send.send(captured);
                 }
@@ -454,5 +462,130 @@ async fn both_cloud_transports_cancel_a_request_waiting_for_a_response() {
         ));
         let _ = stub.release.send(());
         stub.handler.join().unwrap();
+    }
+}
+
+#[test]
+fn prewarm_targets_only_a_consented_cloud_provider_that_the_mode_will_use() {
+    let mut dictate = settings("openai");
+    dictate.text_correction_enabled = false;
+    dictate.automatic_voice_mode = false;
+    assert_eq!(prewarm_endpoint(&dictate, PipelineMode::Dictate), None);
+    assert_eq!(
+        prewarm_endpoint(&dictate, PipelineMode::Translate),
+        Some(OPENAI_RESPONSES_URL)
+    );
+    dictate.text_correction_enabled = true;
+    assert_eq!(
+        prewarm_endpoint(&dictate, PipelineMode::Dictate),
+        Some(OPENAI_RESPONSES_URL)
+    );
+
+    let mut unconsented = settings("gemini");
+    unconsented.cloud_consents.clear();
+    assert_eq!(prewarm_endpoint(&unconsented, PipelineMode::Edit), None);
+    assert_eq!(
+        prewarm_endpoint(&settings("gemini"), PipelineMode::Edit),
+        Some(GEMINI_INTERACTIONS_URL)
+    );
+    assert_eq!(
+        prewarm_endpoint(&settings("local"), PipelineMode::Ask),
+        None
+    );
+
+    // Routing decides after recognition whether the provider is needed.
+    dictate.text_correction_enabled = false;
+    dictate.automatic_voice_mode = true;
+    assert_eq!(prewarm_endpoint(&dictate, PipelineMode::Dictate), None);
+    for provider in ["openai", "gemini"] {
+        for mode in [
+            PipelineMode::Dictate,
+            PipelineMode::Translate,
+            PipelineMode::Edit,
+            PipelineMode::Ask,
+        ] {
+            let mut configured = settings(provider);
+            configured.cloud_consents.clear();
+            assert_eq!(prewarm_endpoint(&configured, mode), None);
+        }
+    }
+}
+
+#[tokio::test]
+async fn prewarm_is_anonymous_and_normal_requests_reuse_its_connection() {
+    for provider in ["openai", "gemini"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/provider", listener.local_addr().unwrap());
+        let reply = success(provider).to_string();
+        let handler = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < deadline =>
+                    {
+                        thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(error) => panic!("stub accept failed: {error}"),
+                }
+            };
+            let probe = read_request(&mut socket);
+            assert!(probe.headers.starts_with("head /provider http/1.1\r\n"));
+            assert_eq!(probe.body, Value::Null);
+            assert_eq!(probe.body_len, 0);
+            for forbidden in [
+                "authorization:",
+                "proxy-authorization:",
+                "x-goog-api-key:",
+                "cookie:",
+                "transfer-encoding:",
+                STUB_KEY,
+            ] {
+                assert!(!probe.headers.contains(forbidden));
+            }
+            // An unauthenticated provider may reject HEAD while retaining TCP.
+            socket
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            // Only one socket is accepted: POST must reuse that connection.
+            let post = read_request(&mut socket);
+            assert!(post.headers.starts_with("post /provider http/1.1\r\n"));
+            assert_eq!(post.body["input"], "synthetic transcript");
+            let auth = if provider == "openai" {
+                "authorization: bearer "
+            } else {
+                "x-goog-api-key: "
+            };
+            assert!(post.headers.contains(&format!("{auth}{STUB_KEY}")));
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes()).unwrap();
+        });
+        let client = cloud_client_with(REQUEST_TIMEOUT, true).unwrap();
+        let response = prewarm_with_client(&client, &endpoint).await.unwrap();
+        assert_eq!(response.status(), 401);
+        drop(response);
+        let (_sender, cancel) = watch::channel(false);
+        let result = request_text_with_access(
+            &settings(provider),
+            TextRequest {
+                input: "synthetic transcript",
+                instruction: "instruction",
+                trim_output: true,
+                budget: OutputBudget::Transcript,
+            },
+            cancel,
+            |_| {},
+            ProviderAccess::Stub {
+                endpoint,
+                api_key: STUB_KEY.into(),
+                client: Some(client),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "fixed text");
+        handler.join().unwrap();
     }
 }

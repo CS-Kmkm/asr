@@ -29,6 +29,11 @@ const HINT_DURATION: Duration = Duration::from_secs(3);
 /// so its sentence is readable next to the waveform, for this long.
 const LIVE_NOTICE_WIDTH: f64 = MESSAGE_NOTICE_WIDTH;
 const LIVE_NOTICE_DURATION: Duration = Duration::from_secs(6);
+/// A take with live recognition shows its partial text as a two-line
+/// subtitle under the recording controls. The size holds from recording
+/// start through processing, so the window never grows when text arrives.
+const SUBTITLE_WIDTH: f64 = 360.0;
+const SUBTITLE_HEIGHT: f64 = 78.0;
 
 /// Advanced by every phase change and notice. A notice timer hides the window
 /// only if nothing replaced its notice, so it never hides a later recording.
@@ -40,6 +45,9 @@ static LIVE: AtomicBool = AtomicBool::new(false);
 /// Whether the live view is widened for a live notice. Every phase change
 /// ends it.
 static LIVE_NOTICE: AtomicBool = AtomicBool::new(false);
+/// Whether this take's live view reserves room for live subtitles. A new
+/// recording or the end of a take clears it.
+static SUBTITLES: AtomicBool = AtomicBool::new(false);
 /// The window handle of the session's captured target (0 for none). The
 /// overlay is placed on that window's monitor.
 static ANCHOR: AtomicI64 = AtomicI64::new(0);
@@ -147,6 +155,9 @@ pub(crate) fn set_phase(app: &AppHandle, phase: &AppPhase) {
     let live = phase_view(phase) == PhaseView::Live;
     LIVE.store(live, Ordering::Release);
     LIVE_NOTICE.store(false, Ordering::Release);
+    if !keeps_subtitles(phase) {
+        SUBTITLES.store(false, Ordering::Release);
+    }
     if live {
         let _ = window.set_ignore_cursor_events(click_through(phase));
         // Recalculate whenever shown in case display layout, DPI, or the
@@ -156,6 +167,47 @@ pub(crate) fn set_phase(app: &AppHandle, phase: &AppPhase) {
     } else {
         let _ = window.hide();
     }
+}
+
+/// Only the phases of the take whose recording reserved subtitles keep their
+/// room; a finished take never passes them on.
+fn keeps_subtitles(phase: &AppPhase) -> bool {
+    matches!(
+        phase,
+        AppPhase::Recording | AppPhase::Processing | AppPhase::Injecting
+    )
+}
+
+/// Decides, before a recording is shown, whether its live view has room for
+/// subtitles, so the window appears at its final size instead of growing
+/// right after it is shown. Every recording start sets it explicitly.
+pub(crate) fn reserve_live_subtitles(reserved: bool) {
+    SUBTITLES.store(reserved, Ordering::Release);
+}
+
+/// Gives the showing recording view room for live subtitles for the rest of
+/// the take and clears any subtitle left in the overlay.
+pub(crate) fn enable_live_subtitles(app: &AppHandle) {
+    SUBTITLES.store(true, Ordering::Release);
+    show_live_subtitle(app, "");
+    if !LIVE.load(Ordering::Acquire) {
+        return;
+    }
+    if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
+        let _ = place(&window, current_live_size());
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveSubtitle<'a> {
+    text: &'a str,
+}
+
+/// Sends the current live text, possibly empty after a retraction, to the
+/// overlay window only. It is recognized speech: never log or broadcast it.
+pub(crate) fn show_live_subtitle(app: &AppHandle, text: &str) {
+    let _ = app.emit_to(WINDOW_LABEL, "live-subtitle", LiveSubtitle { text });
 }
 
 /// Whether the overlay lets clicks through to the window below. Only views
@@ -249,24 +301,35 @@ pub(crate) fn show_live_notice(app: &AppHandle, message: &str) {
 }
 
 /// The live view's logical size.
-fn live_size(translation_control: bool, live_notice: bool) -> (f64, f64) {
+fn live_size(translation_control: bool, live_notice: bool, subtitles: bool) -> (f64, f64) {
     let width = if translation_control {
         TRANSLATION_WIDTH
     } else {
         RECORDING_WIDTH
+    };
+    let width = if subtitles {
+        width.max(SUBTITLE_WIDTH)
+    } else {
+        width
     };
     let width = if live_notice {
         width.max(LIVE_NOTICE_WIDTH)
     } else {
         width
     };
-    (width, RECORDING_HEIGHT)
+    let height = if subtitles {
+        SUBTITLE_HEIGHT
+    } else {
+        RECORDING_HEIGHT
+    };
+    (width, height)
 }
 
 fn current_live_size() -> (f64, f64) {
     live_size(
         TRANSLATION_CONTROL.load(Ordering::Acquire),
         LIVE_NOTICE.load(Ordering::Acquire),
+        SUBTITLES.load(Ordering::Acquire),
     )
 }
 
@@ -332,6 +395,8 @@ fn show_notice(
     };
     let generation = GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     LIVE.store(false, Ordering::Release);
+    // A notice ends the take's live view; a later retry starts compact.
+    SUBTITLES.store(false, Ordering::Release);
     emit(app);
     let _ = window.set_ignore_cursor_events(true);
     let _ = place(&window, (width, height));
@@ -548,8 +613,8 @@ mod tests {
 
     #[test]
     fn the_live_view_makes_room_for_the_cancel_button_and_language_control() {
-        let (recording, height) = live_size(false, false);
-        let (translating, _) = live_size(true, false);
+        let (recording, height) = live_size(false, false, false);
+        let (translating, _) = live_size(true, false, false);
         assert_eq!(height, RECORDING_HEIGHT);
         assert!(recording >= 200.0);
         assert!(translating > recording);
@@ -558,13 +623,42 @@ mod tests {
     #[test]
     fn a_live_notice_widens_the_live_view_without_changing_its_height() {
         for translation_control in [false, true] {
-            let (normal, height) = live_size(translation_control, false);
-            let (widened, widened_height) = live_size(translation_control, true);
-            assert_eq!(widened_height, height);
-            assert!(widened > normal);
-            assert_eq!(widened, LIVE_NOTICE_WIDTH);
+            for subtitles in [false, true] {
+                let (normal, height) = live_size(translation_control, false, subtitles);
+                let (widened, widened_height) = live_size(translation_control, true, subtitles);
+                assert_eq!(widened_height, height);
+                assert!(widened > normal);
+                assert_eq!(widened, LIVE_NOTICE_WIDTH);
+            }
         }
         assert!(LIVE_NOTICE_DURATION > HINT_DURATION);
+    }
+
+    #[test]
+    fn live_subtitles_add_a_fixed_text_row_without_hiding_the_controls() {
+        for translation_control in [false, true] {
+            let (width, height) = live_size(translation_control, false, false);
+            let (subtitle_width, subtitle_height) = live_size(translation_control, false, true);
+            assert_eq!(height, RECORDING_HEIGHT);
+            assert_eq!(subtitle_height, SUBTITLE_HEIGHT);
+            assert!(subtitle_height > height);
+            assert!(subtitle_width >= width);
+        }
+        assert_eq!(live_size(false, false, true).0, SUBTITLE_WIDTH);
+    }
+
+    #[test]
+    fn subtitle_room_lasts_only_through_its_own_take() {
+        // Recognition after stop keeps the recording's size, so the last
+        // live text does not move while the final result is prepared.
+        assert!(keeps_subtitles(&AppPhase::Processing));
+        assert!(keeps_subtitles(&AppPhase::Injecting));
+        // The recording that reserved the room keeps it, and a finished or
+        // cancelled take never passes it on; each start reserves explicitly.
+        assert!(keeps_subtitles(&AppPhase::Recording));
+        for phase in [AppPhase::Idle, AppPhase::Completed, AppPhase::Error] {
+            assert!(!keeps_subtitles(&phase));
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@ use crate::{
         SystemTextInjector, TargetWindow,
     },
     input_monitor::InputMonitor,
+    recording_overlay,
     services::Services,
     state::{AppState, PipelineMode, PipelinePhase},
     types::Settings,
@@ -39,6 +40,9 @@ struct SettleTiming {
     quiet: Duration,
     limit: Duration,
     poll: Duration,
+    /// How long a quiet target may stay unready before the user is told
+    /// what the paste is waiting for.
+    hint: Duration,
 }
 
 /// Clicking, scrolling or typing during recording and recognition is normal.
@@ -47,44 +51,77 @@ const SETTLE_TIMING: SettleTiming = SettleTiming {
     quiet: Duration::from_millis(350),
     limit: Duration::from_secs(5),
     poll: Duration::from_millis(50),
+    hint: Duration::from_secs(1),
 };
 
+/// The result of [`settled_checkpoint`].
+#[derive(Debug, PartialEq, Eq)]
+struct Settled {
+    checkpoint: Option<u64>,
+    /// Whether it slept at least once, as opposed to settling on the first check.
+    waited: bool,
+}
+
 /// Returns a checkpoint taken once input has been quiet for `timing.quiet`,
-/// preferring a moment when `ready` also holds. At the limit, a quiet but
-/// unready target still yields a checkpoint so the outcome names the target
-/// as the reason. `None` means input never settled, the monitor stopped, or
-/// the operation was cancelled; the caller keeps its earlier checkpoint.
+/// preferring a moment when `ready` also holds. Quiet time counts from the
+/// last input the monitor observed, so input that ended before the wait adds
+/// no delay; a held shortcut or modifier is never quiet. At the limit, a
+/// quiet but unready target still yields a checkpoint so the outcome names
+/// the target as the reason. No checkpoint means input never settled, the
+/// monitor stopped, or the operation was cancelled; the caller keeps its
+/// earlier checkpoint. Once a quiet target has stayed unready for
+/// `timing.hint`, `on_unready` runs once so the user can act instead of
+/// waiting silently.
 async fn settled_checkpoint(
     monitor: &InputMonitor,
     cancel: &watch::Receiver<bool>,
     timing: SettleTiming,
     ready: impl Fn() -> bool,
-) -> Option<u64> {
+    on_unready: impl FnOnce(),
+) -> Settled {
     let started = Instant::now();
-    let mut last = monitor.checkpoint()?;
-    let mut quiet_since = Instant::now();
+    let mut quiet_since = monitor.last_input();
+    let quiet = |since: Option<Instant>| since.is_none_or(|at| at.elapsed() >= timing.quiet);
+    let mut unready_since = None;
+    let mut on_unready = Some(on_unready);
+    let mut waited = false;
+    let settled = |checkpoint, waited| Settled { checkpoint, waited };
     loop {
         if *cancel.borrow() {
-            return None;
+            return settled(None, waited);
         }
-        let current = monitor.checkpoint()?;
-        if current != last || monitor.shortcut_pending() {
-            last = current;
-            quiet_since = Instant::now();
+        let Some(mut current) = monitor.checkpoint() else {
+            return settled(None, waited);
+        };
+        // The monitor stamps input before publishing its sequence, so this
+        // is at least as recent as any input `current` includes.
+        quiet_since = quiet_since.max(monitor.last_input());
+        if monitor.shortcut_pending() {
+            quiet_since = Some(Instant::now());
         }
-        if quiet_since.elapsed() >= timing.quiet && ready() {
-            // Input during the readiness check would make this checkpoint stale.
-            let after = monitor.checkpoint()?;
-            if after == current {
-                return Some(current);
+        if quiet(quiet_since) {
+            if ready() {
+                // Input during the readiness check would make this checkpoint stale.
+                let Some(after) = monitor.checkpoint() else {
+                    return settled(None, waited);
+                };
+                if after == current {
+                    return settled(Some(current), waited);
+                }
+                current = after;
+                quiet_since = quiet_since.max(monitor.last_input());
+                unready_since = None;
+            } else if unready_since.get_or_insert_with(Instant::now).elapsed() >= timing.hint {
+                if let Some(on_unready) = on_unready.take() {
+                    on_unready();
+                }
             }
-            last = after;
-            quiet_since = Instant::now();
         }
         if started.elapsed() >= timing.limit {
-            return (quiet_since.elapsed() >= timing.quiet).then_some(last);
+            return settled(quiet(quiet_since).then_some(current), waited);
         }
         tokio::time::sleep(timing.poll).await;
+        waited = true;
     }
 }
 
@@ -101,8 +138,17 @@ pub(crate) struct LiveTask {
 }
 
 impl LiveTask {
-    pub(crate) async fn finish(self) -> Result<LiveDraft, String> {
+    /// Asks the live loop to stop without waiting for it. The loop checks this
+    /// before each snapshot and decode, so a stop signalled before audio
+    /// finalization starts no new live decode; one already running drains.
+    pub(crate) fn signal_stop(&self) {
         self.stop.send_replace(true);
+    }
+
+    /// Stops the live loop if it is still running and joins its owner, which
+    /// returns the draft for finalization.
+    pub(crate) async fn finish(self) -> Result<LiveDraft, String> {
+        self.signal_stop();
         self.task
             .await
             .map_err(|_| "live dictation task failed".to_string())
@@ -177,6 +223,13 @@ impl LiveDraft {
         }
     }
 
+    /// Whether `update` can still edit the target. Only then must a caller
+    /// let a held recording shortcut go first; a deferred final paste waits
+    /// for released keys while settling and is guarded against them.
+    pub(crate) fn edits_target_live(&self) -> bool {
+        !self.defer_insertion || self.session.is_some()
+    }
+
     /// Shows a new live hypothesis. An empty one is ignored; withdrawing text
     /// already shown is `retract`'s job.
     pub(crate) fn update(&mut self, text: &str) -> Result<(), injection::InjectionError> {
@@ -242,9 +295,26 @@ impl LiveDraft {
     /// paste: once input is quiet and the target is ready, the checkpoint is
     /// renewed, so only input during the paste itself stops it. Live sessions
     /// keep the recording-start checkpoint their replacement ranges rely on.
-    pub(crate) async fn settle_before_final(&mut self, cancel: &watch::Receiver<bool>) {
-        if !self.defer_insertion || self.pasted || self.session.is_some() {
-            return;
+    /// Returns whether it had to wait for input to settle.
+    pub(crate) async fn settle_before_final(&mut self, cancel: &watch::Receiver<bool>) -> bool {
+        self.settle_before_final_with_hint(cancel, || {}).await
+    }
+
+    /// `settle_before_final`, calling `on_unready` once if the original
+    /// field stays unfocused or its IME keeps composing for a while. The
+    /// wait limit and the outcome are the same.
+    pub(crate) async fn settle_before_final_with_hint(
+        &mut self,
+        cancel: &watch::Receiver<bool>,
+        on_unready: impl FnOnce(),
+    ) -> bool {
+        // Without an available input monitor there is nothing to wait for.
+        if !self.defer_insertion
+            || self.pasted
+            || self.session.is_some()
+            || self.monitor.checkpoint().is_none()
+        {
+            return false;
         }
         let ready =
             |draft: &Self| draft.injector.target_ready(&draft.target) && draft.focus_unchanged();
@@ -253,14 +323,22 @@ impl LiveDraft {
             .is_some_and(|checkpoint| self.monitor.unchanged_since(checkpoint))
             && ready(self)
         {
-            return;
+            return false;
         }
         let draft = &*self;
-        let settled =
-            settled_checkpoint(&draft.monitor, cancel, SETTLE_TIMING, || ready(draft)).await;
-        if let Some(checkpoint) = settled {
+        let settled = settled_checkpoint(
+            &draft.monitor,
+            cancel,
+            SETTLE_TIMING,
+            || ready(draft),
+            on_unready,
+        )
+        .await;
+        if let Some(checkpoint) = settled.checkpoint {
             self.renew_checkpoint(checkpoint);
         }
+        // Input that was already quiet with a ready target needed no wait.
+        settled.waited
     }
 
     fn renew_checkpoint(&mut self, checkpoint: u64) {
@@ -376,6 +454,11 @@ pub(crate) fn start(
     preview_enabled: bool,
 ) -> LiveTask {
     draft.monitor.observe_cancellation(Some(cancel.clone()));
+    if preview_enabled {
+        // Called while recording starts, after its phase was published, so a
+        // later stop or cancel always ends the subtitle room again.
+        recording_overlay::enable_live_subtitles(&app);
+    }
     let (stop, stopped) = watch::channel(false);
     let task = spawn_recording_owner(async move {
         if !preview_enabled {
@@ -398,6 +481,8 @@ pub(crate) fn start(
                 }
                 let state = app.state::<AppState>();
                 let _ = app.emit("app-state", state.publish_result(live.text().to_owned()));
+                // A retraction updates the subtitle like a revision does.
+                recording_overlay::show_live_subtitle(&app, live.text());
                 let result = match live {
                     LiveText::Revise(text) => draft.update(text),
                     LiveText::Retract(committed) => draft.retract(committed),
@@ -763,6 +848,7 @@ mod tests {
         quiet: Duration::from_millis(80),
         limit: Duration::from_millis(300),
         poll: Duration::from_millis(5),
+        hint: Duration::from_millis(150),
     };
 
     fn available_monitor() -> Arc<InputMonitor> {
@@ -771,14 +857,131 @@ mod tests {
         monitor
     }
 
+    fn ago(duration: Duration) -> Instant {
+        Instant::now()
+            .checked_sub(duration)
+            .expect("the clock is past the test offset")
+    }
+
+    #[tokio::test]
+    async fn input_that_ended_before_settling_adds_no_quiet_wait() {
+        let monitor = available_monitor();
+        monitor.test_record_input_at(ago(Duration::from_secs(1)));
+        let (_cancel, cancelled) = watch::channel(false);
+        let started = Instant::now();
+        let settled = settled_checkpoint(&monitor, &cancelled, FAST, || true, || {}).await;
+        // Settling on the first check is not reported as a wait.
+        assert_eq!(
+            settled,
+            Settled {
+                checkpoint: Some(1),
+                waited: false
+            }
+        );
+        assert!(started.elapsed() < FAST.quiet, "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn quiet_time_counts_from_the_last_input_not_from_the_wait() {
+        let timing = SettleTiming {
+            quiet: Duration::from_millis(200),
+            limit: Duration::from_secs(2),
+            ..FAST
+        };
+        let monitor = available_monitor();
+        let input = ago(Duration::from_millis(150));
+        monitor.test_record_input_at(input);
+        let (_cancel, cancelled) = watch::channel(false);
+        let started = Instant::now();
+        let settled = settled_checkpoint(&monitor, &cancelled, timing, || true, || {}).await;
+        assert_eq!(
+            settled,
+            Settled {
+                checkpoint: Some(1),
+                waited: true
+            }
+        );
+        // A full quiet window after the input, but not one after the start.
+        assert!(input.elapsed() >= timing.quiet);
+        assert!(started.elapsed() < timing.quiet, "{:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn a_held_shortcut_is_never_quiet_even_after_old_input() {
+        let monitor = available_monitor();
+        monitor.test_record_input_at(ago(Duration::from_secs(1)));
+        monitor.test_set_async_modifier_pending(true);
+        let (_cancel, cancelled) = watch::channel(false);
+        assert_eq!(
+            settled_checkpoint(&monitor, &cancelled, FAST, || true, || {})
+                .await
+                .checkpoint,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unready_target_is_reported_once_it_has_waited_for_the_hint_delay() {
+        let timing = SettleTiming {
+            limit: Duration::from_millis(600),
+            ..FAST
+        };
+        let monitor = available_monitor();
+        let (_cancel, cancelled) = watch::channel(false);
+        let started = Instant::now();
+        let reported = std::cell::Cell::new(None);
+        let checkpoint = settled_checkpoint(
+            &monitor,
+            &cancelled,
+            timing,
+            || false,
+            || reported.set(Some(started.elapsed())),
+        )
+        .await
+        .checkpoint;
+        // The safety outcome is unchanged: a quiet checkpoint at the limit.
+        assert_eq!(checkpoint, Some(0));
+        let reported = reported.get().expect("the wait was reported");
+        assert!(reported >= timing.hint, "{reported:?}");
+        assert!(reported < timing.limit, "{reported:?}");
+    }
+
+    #[tokio::test]
+    async fn a_target_that_becomes_ready_before_the_hint_delay_is_not_reported() {
+        let monitor = available_monitor();
+        let (_cancel, cancelled) = watch::channel(false);
+        let started = Instant::now();
+        let reported = std::cell::Cell::new(false);
+        let checkpoint = settled_checkpoint(
+            &monitor,
+            &cancelled,
+            FAST,
+            || started.elapsed() >= Duration::from_millis(40),
+            || reported.set(true),
+        )
+        .await
+        .checkpoint;
+        assert_eq!(checkpoint, Some(0));
+        assert!(!reported.get());
+    }
+
+    #[test]
+    fn only_a_draft_that_edits_the_target_live_waits_for_the_shortcut_first() {
+        let mut draft = deferred_test_draft();
+        assert!(!draft.edits_target_live());
+        draft.defer_insertion = false;
+        assert!(draft.edits_target_live());
+    }
+
     #[tokio::test]
     async fn clicks_during_recording_settle_to_a_fresh_checkpoint() {
         let mut draft = deferred_test_draft();
         draft.monitor.test_record_input();
         assert!(!draft.can_insert_final("final"));
         let (_cancel, cancelled) = watch::channel(false);
-        let checkpoint = settled_checkpoint(&draft.monitor, &cancelled, FAST, || true)
+        let checkpoint = settled_checkpoint(&draft.monitor, &cancelled, FAST, || true, || {})
             .await
+            .checkpoint
             .unwrap();
         draft.checkpoint = Some(checkpoint);
         assert!(draft.can_insert_final("final"));
@@ -793,6 +996,8 @@ mod tests {
         let busy = Arc::clone(&monitor);
         let done = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&done);
+        // The user is already typing when settling starts.
+        monitor.test_record_input();
         // Always runnable, so it records input between any two polls on this
         // single-threaded runtime, independent of timer resolution or stalls.
         let typing = tokio::spawn(async move {
@@ -802,10 +1007,27 @@ mod tests {
             }
         });
         let (_cancel, cancelled) = watch::channel(false);
-        let result = settled_checkpoint(&monitor, &cancelled, FAST, || true).await;
+        let result = settled_checkpoint(&monitor, &cancelled, FAST, || true, || {})
+            .await
+            .checkpoint;
         done.store(true, Ordering::Release);
         typing.await.unwrap();
         assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn settling_without_an_input_monitor_reports_no_wait() {
+        let (_cancel, cancelled) = watch::channel(false);
+        let mut draft = deferred_test_draft();
+        draft.monitor.test_set_available(false);
+        let waited = tokio::time::timeout(
+            Duration::from_millis(50),
+            draft.settle_before_final(&cancelled),
+        )
+        .await
+        .unwrap();
+        assert!(!waited);
+        assert_eq!(draft.checkpoint, Some(0));
     }
 
     #[tokio::test]
@@ -819,12 +1041,14 @@ mod tests {
                 "pasted" => draft.pasted = true,
                 _ => unreachable!(),
             }
-            tokio::time::timeout(
+            let waited = tokio::time::timeout(
                 Duration::from_millis(50),
                 draft.settle_before_final(&cancelled),
             )
             .await
             .unwrap();
+            // Skipping the settle is not reported as a wait.
+            assert!(!waited, "{case}");
             // The recording-start checkpoint is kept, so input still blocks.
             assert_eq!(draft.checkpoint, Some(0), "{case}");
             assert!(!draft.can_insert_final("final"), "{case}");
@@ -864,7 +1088,9 @@ mod tests {
         monitor.test_record_input();
         let (_cancel, cancelled) = watch::channel(false);
         let started = Instant::now();
-        let checkpoint = settled_checkpoint(&monitor, &cancelled, FAST, || false).await;
+        let checkpoint = settled_checkpoint(&monitor, &cancelled, FAST, || false, || {})
+            .await
+            .checkpoint;
         assert_eq!(checkpoint, monitor.checkpoint());
         assert!(started.elapsed() >= FAST.limit);
     }
@@ -875,13 +1101,17 @@ mod tests {
         let (cancel, cancelled) = watch::channel(false);
         cancel.send_replace(true);
         assert_eq!(
-            settled_checkpoint(&monitor, &cancelled, FAST, || true).await,
+            settled_checkpoint(&monitor, &cancelled, FAST, || true, || {})
+                .await
+                .checkpoint,
             None
         );
         let (_cancel, cancelled) = watch::channel(false);
         monitor.test_set_available(false);
         assert_eq!(
-            settled_checkpoint(&monitor, &cancelled, FAST, || true).await,
+            settled_checkpoint(&monitor, &cancelled, FAST, || true, || {})
+                .await
+                .checkpoint,
             None
         );
     }
@@ -1485,6 +1715,69 @@ mod tests {
                 .unwrap();
             assert_eq!(result, Ok(()));
             assert_eq!((updates, calls), (1, 1));
+            assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_signalled_before_audio_finalization_starts_no_new_decode() {
+        for signalled in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let audio = Arc::new(voiced_capture(directory.path()));
+            let recognizer = Arc::new(ScriptedRecognizer {
+                calls: AtomicUsize::new(0),
+                script: vec![Some("途中")],
+            });
+            let (_cancel, cancel) = watch::channel(false);
+            let (stop, stopped) = watch::channel(false);
+            // Stop holds the capture while it finalizes the recording.
+            let finalizing = audio.lock().await;
+            let task = tokio::spawn({
+                let audio = Arc::clone(&audio);
+                let recognizer = Arc::clone(&recognizer);
+                async move {
+                    let result = run(
+                        &audio,
+                        recognizer.as_ref(),
+                        None,
+                        None,
+                        cancel,
+                        stopped,
+                        Duration::from_millis(1),
+                        |_| {},
+                    )
+                    .await;
+                    assert_eq!(result, Ok(()));
+                    deferred_test_draft()
+                }
+            });
+            let task = LiveTask { stop, task };
+            // Let the loop wait for the capture held by the stop path.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            if signalled {
+                task.signal_stop();
+            }
+            drop(finalizing);
+            if !signalled {
+                // Without the early signal the waiting loop decodes again.
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while recognizer.calls.load(Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            // Joining still returns the draft for finalization.
+            tokio::time::timeout(Duration::from_secs(2), task.finish())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                recognizer.calls.load(Ordering::SeqCst) == 0,
+                signalled,
+                "signalled: {signalled}"
+            );
             assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
         }
     }

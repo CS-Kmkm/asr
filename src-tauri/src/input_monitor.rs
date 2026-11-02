@@ -5,6 +5,7 @@
 //! stop replacing a provisional transcript as soon as the user interacts.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 mod shortcut;
 
@@ -14,7 +15,7 @@ use std::{
     os::windows::process::CommandExt,
     process::{Child, ChildStdin, Stdio},
     sync::{Arc, Condvar, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[cfg(all(target_os = "windows", not(test)))]
@@ -22,6 +23,10 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub(crate) struct InputMonitor {
     sequence: std::sync::Arc<AtomicU64>,
+    /// When this process last saw the input sequence advance. It is stamped
+    /// before the sequence is published, so a reader that observes a new
+    /// sequence also observes a stamp at least as recent as that input.
+    last_input: std::sync::Arc<std::sync::Mutex<Option<Instant>>>,
     available: std::sync::Arc<AtomicBool>,
     shortcut_pending: std::sync::Arc<AtomicBool>,
     recording_shortcuts: std::sync::Mutex<Vec<String>>,
@@ -51,6 +56,7 @@ impl Default for InputMonitor {
     fn default() -> Self {
         Self {
             sequence: std::sync::Arc::new(AtomicU64::new(0)),
+            last_input: std::sync::Arc::new(std::sync::Mutex::new(None)),
             available: std::sync::Arc::new(AtomicBool::new(false)),
             shortcut_pending: std::sync::Arc::new(AtomicBool::new(false)),
             recording_shortcuts: std::sync::Mutex::new(Vec::new()),
@@ -200,6 +206,7 @@ impl InputMonitor {
                 *ready = false;
             }
             let sequence = Arc::clone(&self.sequence);
+            let last_input = Arc::clone(&self.last_input);
             let available = Arc::clone(&self.available);
             let shortcut_pending = Arc::clone(&self.shortcut_pending);
             let ready = Arc::clone(&self.ready);
@@ -230,6 +237,12 @@ impl InputMonitor {
                             if let Some(next) =
                                 event.get("sequence").and_then(serde_json::Value::as_u64)
                             {
+                                // Stamp before publishing (see `last_input`).
+                                if next > sequence.load(Ordering::Acquire) {
+                                    if let Ok(mut at) = last_input.lock() {
+                                        *at = Some(Instant::now());
+                                    }
+                                }
                                 sequence.fetch_max(next, Ordering::AcqRel);
                             }
                         }
@@ -277,6 +290,12 @@ impl InputMonitor {
             .then(|| self.sequence.load(Ordering::Acquire))
     }
 
+    /// When input last advanced the sequence, or `None` if this monitor has
+    /// observed none. Settling counts its quiet time from this moment.
+    pub(crate) fn last_input(&self) -> Option<Instant> {
+        self.last_input.lock().ok().and_then(|at| *at)
+    }
+
     pub(crate) fn unchanged_since(&self, checkpoint: u64) -> bool {
         !self.cancelled()
             && self.available.load(Ordering::Acquire)
@@ -295,27 +314,38 @@ impl InputMonitor {
             && self.sequence.load(Ordering::Acquire) == checkpoint
     }
 
+    /// Stops observing at once; the helper process exits in the background.
+    ///
+    /// Invariant: everything a later `start()` relies on changes here,
+    /// synchronously: the generation advances (so the old reader neither
+    /// records events nor reports its EOF), the child leaves the slot, and the
+    /// monitor is unavailable. The background thread owns only the detached
+    /// child and touches no shared state, so it can never mark a newer helper
+    /// unavailable.
     pub(crate) fn shutdown(&self) {
         #[cfg(all(target_os = "windows", not(test)))]
         {
             // Invalidate the reader before stopping its child so a delayed EOF
             // cannot mark a later helper process unavailable.
             self.generation.fetch_add(1, Ordering::AcqRel);
-            if let Ok(mut slot) = self.child.lock() {
-                if let Some(mut running) = slot.take() {
+            let running = self.child.lock().ok().and_then(|mut slot| slot.take());
+            self.available.store(false, Ordering::Release);
+            if let Some(mut running) = running {
+                // Waiting for the helper to exit would delay completion of
+                // the dictation that dropped this monitor.
+                std::thread::spawn(move || {
                     let _ = running.stdin.write_all(b"shutdown\n");
                     let _ = running.stdin.flush();
                     let deadline = Instant::now() + Duration::from_millis(500);
                     while Instant::now() < deadline {
                         if running.child.try_wait().ok().flatten().is_some() {
-                            self.available.store(false, Ordering::Release);
                             return;
                         }
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     let _ = running.child.kill();
                     let _ = running.child.wait();
-                }
+                });
             }
         }
         self.available.store(false, Ordering::Release);
@@ -328,6 +358,16 @@ impl InputMonitor {
 
     #[cfg(test)]
     pub(crate) fn test_record_input(&self) {
+        self.test_record_input_at(Instant::now());
+    }
+
+    /// Records input observed at `at`, stamped before the sequence advances
+    /// as the helper's reader does.
+    #[cfg(test)]
+    pub(crate) fn test_record_input_at(&self, at: Instant) {
+        if let Ok(mut last) = self.last_input.lock() {
+            *last = Some(at);
+        }
         self.sequence.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -694,6 +734,19 @@ mod tests {
         assert!(monitor.unchanged_since(checkpoint));
         monitor.test_record_input();
         assert!(!monitor.unchanged_since(checkpoint));
+    }
+
+    #[test]
+    fn input_stamps_the_moment_the_sequence_last_advanced() {
+        let monitor = InputMonitor::default();
+        monitor.test_set_available(true);
+        assert_eq!(monitor.last_input(), None);
+        let before = Instant::now();
+        monitor.test_record_input();
+        let stamped = monitor.last_input().expect("input is stamped");
+        assert!(stamped >= before);
+        monitor.test_record_input();
+        assert!(monitor.last_input().unwrap() >= stamped);
     }
 
     #[test]

@@ -195,6 +195,39 @@ button { color: inherit; border: 1px solid var(--border); border-radius: 8px; pa
   white-space: nowrap;
 }
 .correction-preview.pending { color: var(--text-muted); }
+/* A wait hint in the processing view keeps the warning color and wraps to
+   two lines instead of hiding its instruction behind an ellipsis. */
+.correction-preview.overlay-hint {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  color: var(--warning);
+  font-size: 10px;
+  line-height: 13px;
+  white-space: normal;
+}
+/* The controls keep their row; the subtitle wraps below them in the taller
+   window the backend sizes for takes with live recognition. */
+.recording-overlay.recording.with-subtitle {
+  flex-wrap: wrap;
+  align-content: center;
+  row-gap: 4px;
+}
+/* Two lines anchored to the bottom, so the newest words stay visible and
+   older ones are clipped at the top. */
+.live-subtitle {
+  flex: 0 0 100%;
+  min-width: 0;
+  height: 32px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 16px;
+  overflow-wrap: anywhere;
+}
 .recording-overlay.notice {
   /* The main window's toast rule (.notice) must not move or restyle the
      overlay notice, which fills its own small window. */

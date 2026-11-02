@@ -1133,6 +1133,8 @@ async fn start_owned_recording(
         }),
     );
     state.clear_result();
+    let live_preview = crate::privacy::live_preview_enabled(&settings);
+    recording_overlay::reserve_live_subtitles(draft.is_some() && live_preview);
     emit_state(
         &app,
         &state,
@@ -1153,7 +1155,7 @@ async fn start_owned_recording(
             prompt,
             settings.speech_locale.clone(),
             cancel,
-            crate::privacy::live_preview_enabled(&settings),
+            live_preview,
         )
     });
     *edit_slot = edit_session.take();

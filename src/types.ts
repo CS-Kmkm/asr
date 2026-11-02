@@ -25,6 +25,11 @@ export interface AudioDevice {
   isDefault: boolean;
 }
 
+// The current live recognition text, sent only to the recording overlay.
+export interface LiveSubtitle {
+  text: string;
+}
+
 export interface AudioLevel {
   rms: number;
   peak: number;

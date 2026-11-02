@@ -1,5 +1,5 @@
 //! Shared stop/capture/recognition lifecycle and mode dispatch.
-use super::{PipelineContext, RecordedTake};
+use super::{PipelineContext, RecordedTake, StopTimings};
 use crate::commands::{
     cancellation_copy, ensure_model_loaded_cancellable, failed_take_history_item,
     failed_take_message, microphone_disconnected, play_stop_cue, preserve_failed_take,
@@ -42,6 +42,7 @@ struct Captured {
     artifact_cleanup: TempArtifact,
     started: Instant,
     disconnected: bool,
+    stop_timings: StopTimings,
     translation_target: Option<String>,
     draft: Option<LiveDraft>,
     edit_session: Option<EditSession>,
@@ -85,23 +86,41 @@ impl RecordingDriver for Desktop<'_> {
             &services.voice_translation_target,
         )
         .await?;
+        // Stop live recognition first so it starts no window decode while the
+        // capture is finalized. It is joined below, after the stop cue.
+        if let Some(task) = &live_task {
+            task.signal_stop();
+        }
+        let audio_stop_started = Instant::now();
         let mut audio = services.audio.lock().await;
         let artifact_result = audio.stop().await;
+        let audio_stop_ms = audio_stop_started.elapsed().as_millis() as i64;
         // `stop` closes the input stream. Do not re-arm it while transcription is
         // running: on Bluetooth headsets an open microphone selects the low-quality
         // HFP playback profile until the stream is released.
         drop(audio);
+        let stop_settings = storage.get_settings();
         play_stop_cue(
-            storage
-                .get_settings()
+            stop_settings
+                .as_ref()
                 .map(|settings| settings.interaction_sounds)
                 .unwrap_or(false),
         );
+        // Warm the AI provider connection while the live task drains and the
+        // recording is recognized.
+        if let Ok(settings) = &stop_settings {
+            if artifact_result.is_ok() && services.lifecycle.dictation_test_id().is_none() {
+                crate::correction::prewarm_connection(settings, mode);
+            }
+        }
         // Keep the full artifact owned even if joining live work or loading settings fails.
         let mut artifact_cleanup = artifact_result
             .as_ref()
             .ok()
             .map(|artifact| TempArtifact::new(artifact.path.clone(), false));
+        // Stop waits for an in-flight live window before the final recognition.
+        let live_drain_started = Instant::now();
+        let live_drained = live_task.is_some();
         let draft = match live_task {
             Some(task) => Some(task.finish().await?),
             None if mode == PipelineMode::Edit
@@ -112,6 +131,7 @@ impl RecordingDriver for Desktop<'_> {
             }
             None => return Err("live dictation session is unavailable".into()),
         };
+        let live_drain_ms = live_drained.then(|| live_drain_started.elapsed().as_millis() as i64);
         let settings = storage.get_settings().map_err(command_error)?;
         let disconnected = microphone_disconnected(reason, &artifact_result);
         let artifact = artifact_result.map_err(|error| {
@@ -145,6 +165,10 @@ impl RecordingDriver for Desktop<'_> {
             artifact_cleanup,
             started,
             disconnected,
+            stop_timings: StopTimings {
+                audio_stop_ms,
+                live_drain_ms,
+            },
             translation_target,
             draft,
             edit_session,
@@ -180,6 +204,7 @@ impl RecordingDriver for Desktop<'_> {
             artifact,
             mut artifact_cleanup,
             started,
+            stop_timings,
             translation_target,
             draft,
             edit_session,
@@ -203,6 +228,13 @@ impl RecordingDriver for Desktop<'_> {
             mode,
             crate::app_context::history_category(app_context.as_ref()),
         );
+        // Stop-path timings are written once the take ends here or, after
+        // delivery, by `deliver`. Dictation tests record none.
+        let record_stop_timings = || {
+            if !services.lifecycle.is_dictation_test(operation_id) {
+                stop_timings.record(metrics, &settings.asr_backend);
+            }
+        };
         let correction_cancel = cancel.clone();
         // Defense in depth: model changes are refused while a recording is
         // active, but if the model is not marked ready (for example its load
@@ -210,6 +242,7 @@ impl RecordingDriver for Desktop<'_> {
         let model_ready =
             ensure_model_loaded_cancellable(app, services, &settings, Some(cancel.clone())).await;
         if services.lifecycle.is_cancelled(operation_id) {
+            record_stop_timings();
             report_temp_cleanup(app, &mut artifact_cleanup);
             emit_state(app, state, AppPhase::Idle, cancel_message);
             return Err(cancel_error.into());
@@ -230,6 +263,7 @@ impl RecordingDriver for Desktop<'_> {
             {
                 Ok(value) => Ok(value),
                 Err(asr::AsrError::Cancelled) => {
+                    record_stop_timings();
                     report_temp_cleanup(app, &mut artifact_cleanup);
                     emit_state(app, state, AppPhase::Idle, cancel_message);
                     return Err(cancel_error.into());
@@ -260,6 +294,7 @@ impl RecordingDriver for Desktop<'_> {
                         Some("asr_failed"),
                     )
                 };
+                record_stop_timings();
                 let asr_provider = model_identity(&settings)
                     .0
                     .unwrap_or_else(|| settings.asr_backend.clone());
@@ -298,6 +333,7 @@ impl RecordingDriver for Desktop<'_> {
             }
         };
         if services.lifecycle.is_cancelled(operation_id) {
+            record_stop_timings();
             emit_state(app, state, AppPhase::Idle, cancel_message);
             return Err(cancel_error.into());
         }
@@ -330,13 +366,14 @@ impl RecordingDriver for Desktop<'_> {
             app_context,
             translation_target,
             draft,
+            stop_timings,
         };
         Ok((take, edit_session, ask_session))
     }
     async fn deliver(
         &self,
         operation_id: u64,
-        _mode: PipelineMode,
+        mode: PipelineMode,
         recognized: Self::Recognized,
     ) -> Result<RecordingResult, String> {
         let Self {
@@ -356,9 +393,26 @@ impl RecordingDriver for Desktop<'_> {
         if services.lifecycle.is_dictation_test(operation_id) {
             return super::setup_tests::finish_dictation_test(context, take).await;
         }
-        if let Err(error) =
-            super::routing::route(&context, &mut take, &mut edit_session, &mut ask_session).await
-        {
+        let routed =
+            super::routing::route(&context, &mut take, &mut edit_session, &mut ask_session).await;
+        // Captured before the mode finish consumes the take; written after it.
+        let stop_timings = take.stop_timings;
+        // Attributed to the stop mode, like the `asr` metric of the same take,
+        // even when automatic routing changes the delivered mode.
+        let metric_mode = mode;
+        let metric_context = take.app_context.clone();
+        let asr_backend = take.settings.asr_backend.clone();
+        let record_stop_timings = || {
+            stop_timings.record(
+                storage.metrics_for(
+                    metric_mode,
+                    app_context::history_category(metric_context.as_ref()),
+                ),
+                &asr_backend,
+            );
+        };
+        if let Err(error) = routed {
+            record_stop_timings();
             if services.lifecycle.is_cancelled(operation_id) {
                 let (message, _) = cancellation_copy(take.mode);
                 emit_state(app, state, AppPhase::Idle, message);
@@ -368,14 +422,16 @@ impl RecordingDriver for Desktop<'_> {
             report_temp_cleanup(app, &mut take.artifact_cleanup);
             return Err(error);
         }
-        match take.mode {
+        let result = match take.mode {
             PipelineMode::Edit => super::edit::finish(context, take, edit_session).await,
             PipelineMode::Ask => super::ask::finish(context, take, ask_session).await,
             PipelineMode::Dictate | PipelineMode::Translate => {
                 super::dictate_translate::finish(context, take).await
             }
             PipelineMode::SelectedText => unreachable!("selected text does not record audio"),
-        }
+        };
+        record_stop_timings();
+        result
     }
 }
 

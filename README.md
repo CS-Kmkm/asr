@@ -489,6 +489,15 @@ Full usage and Phase 0 gate criteria are documented in
   Privacy requires explicit consent per text provider and speech endpoint before
   a request can be sent. Changing the speech backend or endpoint removes old
   speech consents, so returning to a previous endpoint requires consent again.
+  When a stopped recording will use a consented OpenAI or Gemini provider
+  (Translate, Edit, Ask, or Dictate with AI correction on), the app attempts to
+  warm a connection while the audio is recognized (a HEAD request without
+  credentials, text, or audio). Automatic voice mode does not warm on its own,
+  because it decides after recognition whether the provider is needed. The
+  request after recognition may reuse that connection if the provider keeps it
+  open; warming failures are ignored. The probe can run even if recognition
+  later fails or the take is cancelled. It does not warm a model or perform an
+  AI inference.
 - Live transcription preview may decode the same audio repeatedly. It is on by
   default for local backends (including VibeVoice) and off for OpenAI-compatible speech; enabling it
   with cloud speech causes multiple audio uploads. Privacy controls local and
@@ -505,6 +514,37 @@ Full usage and Phase 0 gate criteria are documented in
   deleted with the History retention window, and are removed by Delete all.
   Diagnostics groups new performance and outcome records by mode, category,
   event and provider; older records without context keep an unknown group.
+  The `dictation`/`voice_translate` and legacy `insertion` durations share a
+  stop-path span through output, diagnosis and input-monitor cleanup; they
+  exclude subsequent History/metric persistence and final cleanup. `insertion`
+  is an outcome record, not paste-only time. `asr` excludes preceding audio
+  finalization, live-task drain and model readiness/load. AI stage totals are
+  sampled after the provider result and validation, before metric persistence.
+  Additional timings are `audio_stop` (audio-lock wait, stream closure,
+  resampling, enhancement, voice detection and WAV creation), `live_drain`
+  (live-task finish/join after audio finalization, even without in-flight
+  inference; the live task is told to stop before audio finalization, so values
+  are not comparable with records made before that change),
+  `text_correction_first_output`/`voice_translation_first_output` (first nonempty
+  provider callback of a completed request, within the AI total; a nonstreaming
+  response calls back only with the completed text), `insertion_settle`
+  (recorded only when the take had to wait for quiet input or the original
+  field), and `insertion_paste` (the full commit operation, including safety
+  checks, clipboard, paste confirmation and restoration). First-output time
+  does not isolate connection setup or prove connection reuse.
+  The stages do not add up to `dictation`: settings and session handoff,
+  shortcut release, the live draft update, dictionary lookup, the automatic
+  voice mode decision and a target readiness check that needs no wait are not
+  timed separately. `audio_stop` and `live_drain` are recorded under the mode
+  the recording stopped in, like `asr`, even when automatic routing delivers
+  another mode. They are written once the take ends (after delivery, a
+  recognition failure or cancellation during recognition); stage timings are
+  written after the measured work.
+  These events do not cover every early failure or cancellation. `dictation`
+  success can include uncorrected fallback or failed insertion, whereas
+  `insertion` success requires confirmed paste. Timing-event success means an
+  observation was made, not that final delivery succeeded. Compare confirmed
+  pastes separately from unverified, clipboard-only, failed or cancelled takes.
 - New SQLite deletions overwrite freed record content using secure-delete.
   History deletions request a WAL checkpoint/truncation; an active external reader or
   database error can defer this until the next policy pass. Previously freed

@@ -326,6 +326,7 @@ def run_transcribe_loop(
     repeat: int,
     prompt: list[str] | None,
     record_device: bool = False,
+    language: str | None = None,
 ) -> list[dict[str, Any]]:
     """Run `repeat` transcriptions per audio file, return per-call records."""
     records: list[dict[str, Any]] = []
@@ -334,6 +335,8 @@ def run_transcribe_loop(
             payload: dict[str, Any] = {"command": "transcribe", "audio_path": str(audio)}
             if prompt:
                 payload["prompt"] = prompt
+            if language is not None:
+                payload["language"] = language
             response, wall_ms = session.request(payload)
             records.append(
                 {
@@ -386,7 +389,7 @@ def run_benchmark(args: argparse.Namespace, audio_paths: list[Path]) -> dict[str
             cold_load_ms.append(load_wall_ms)
             # One transcription per audio file counts as the "cold path"
             # (process start + load + first transcription).
-            cold_records.extend(run_transcribe_loop(session, audio_paths, 1, args.prompt, getattr(args, "record_device", False)))
+            cold_records.extend(run_transcribe_loop(session, audio_paths, 1, args.prompt, getattr(args, "record_device", False), getattr(args, "language", None)))
             if cold_i == 0:
                 model_name = load_resp.get("model", "?")
 
@@ -396,7 +399,7 @@ def run_benchmark(args: argparse.Namespace, audio_paths: list[Path]) -> dict[str
             {"command": "load", "quantization": args.quantization}
         )
         model_name = warm_load_resp.get("model", "?")
-        warm_records = run_transcribe_loop(session, audio_paths, args.repeat, args.prompt, getattr(args, "record_device", False))
+        warm_records = run_transcribe_loop(session, audio_paths, args.repeat, args.prompt, getattr(args, "record_device", False), getattr(args, "language", None))
 
     return {
         "config": {
@@ -405,6 +408,7 @@ def run_benchmark(args: argparse.Namespace, audio_paths: list[Path]) -> dict[str
             "device_policy": env.get("ASR_DEVICE", "auto"),
             "record_device": getattr(args, "record_device", False),
             "quantization": args.quantization,
+            "language": getattr(args, "language", None),
             "worker_cmd": cmd,
             "audio": [str(p) for p in audio_paths],
             "repeat": args.repeat,
@@ -445,6 +449,7 @@ def render_markdown(result: dict[str, Any]) -> str:
     lines.append("")
     lines.append(f"- backend: `{cfg['backend']}`  quantization: `{cfg['quantization']}`")
     lines.append(f"- model: `{cfg['model']}`")
+    lines.append(f"- language: `{cfg.get('language') or 'auto'}`")
     lines.append(f"- worker cmd: `{' '.join(cfg['worker_cmd'])}`")
     lines.append(f"- audio files: {len(cfg['audio'])}  repeat (warm): {cfg['repeat']}  cold runs: {cfg['cold_runs']}")
     lines.append(f"- timestamp: {cfg['timestamp']}")
@@ -485,6 +490,12 @@ def render_markdown(result: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------- #
 # Argument parsing / main
 # --------------------------------------------------------------------------- #
+def language_argument(value: str) -> str:
+    if not value.strip() or len(value) > 32:
+        raise argparse.ArgumentTypeError("language must be a nonempty string of at most 32 characters")
+    return value
+
+
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark an ASR worker over the JSONL protocol.",
@@ -493,6 +504,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--backend", default="mock", help="worker backend (default: mock)")
     parser.add_argument("--quantization", default="4bit", help="model quantization (default: 4bit)")
     parser.add_argument("--whisper-profile", choices=["standard", "fast"], default="standard", help="faster-whisper decode profile; fast uses beam_size=1 and VAD (experimental, default: standard)")
+    parser.add_argument("--language", type=language_argument, help="speech locale passed unchanged to the worker, e.g. ja-JP (default: backend language detection)")
     parser.add_argument(
         "--audio",
         action="append",
