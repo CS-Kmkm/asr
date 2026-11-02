@@ -24,6 +24,7 @@ mod dictate_translate;
 mod edit;
 mod routing;
 pub(crate) mod setup_tests;
+pub(crate) mod speculative;
 pub(crate) mod stop;
 pub(crate) mod take_trace;
 
@@ -48,6 +49,9 @@ struct RecordedTake {
     app_context: Option<crate::types::AppContext>,
     translation_target: Option<String>,
     draft: Option<crate::live_dictation::LiveDraft>,
+    /// Opt-in speculative correction of the last live hypothesis, started
+    /// after stop; `None` when it does not apply.
+    speculation: Option<speculative::Speculation>,
     stop_timings: StopTimings,
     /// Spans and outcome of this take; disabled for dictation tests.
     trace: take_trace::TakeTrace,

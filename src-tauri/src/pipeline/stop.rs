@@ -19,6 +19,7 @@ use std::time::Instant;
 use tauri::AppHandle;
 
 use super::orchestration::{RecordingDriver, RecordingEvents};
+use super::speculative::{CorrectionInputs, Speculation};
 use super::take_trace::{TakeTrace, PENDING};
 use crate::live_dictation::LiveDraft;
 use crate::storage::{TakeSpan, TakeStage};
@@ -255,6 +256,25 @@ impl RecordingDriver for Desktop<'_> {
             }
         };
         let correction_cancel = cancel.clone();
+        // Opt-in: start correcting the last live hypothesis now, after stop,
+        // in parallel with final recognition. Dropping it cancels it.
+        let speculation = if !settings.speculative_correction
+            || services.lifecycle.is_dictation_test(operation_id)
+            || services.lifecycle.is_cancelled(operation_id)
+        {
+            None
+        } else {
+            Speculation::begin(
+                &settings,
+                mode,
+                draft.as_ref().and_then(LiveDraft::last_hypothesis),
+                |hypothesis| {
+                    CorrectionInputs::resolve(storage, &settings, hypothesis, app_context.as_ref())
+                },
+                cancel.clone(),
+                super::speculative::provider_correction,
+            )
+        };
         // Defense in depth: model changes are refused while a recording is
         // active, but if the model is not marked ready (for example its load
         // failed, or a worker crash lost it), load it as a new recording would.
@@ -408,6 +428,7 @@ impl RecordingDriver for Desktop<'_> {
             app_context,
             translation_target,
             draft,
+            speculation,
             stop_timings,
             trace: trace.clone(),
         };
@@ -465,6 +486,18 @@ impl RecordingDriver for Desktop<'_> {
             }
             report_temp_cleanup(app, &mut take.artifact_cleanup);
             return Err(error);
+        }
+        // A speculative Dictate correction cannot serve another mode.
+        if take.mode != PipelineMode::Dictate {
+            if let Some(speculation) = take.speculation.take() {
+                speculation.discard(
+                    storage.metrics_for(
+                        metric_mode,
+                        app_context::history_category(metric_context.as_ref()),
+                    ),
+                    &take.settings.correction_provider,
+                );
+            }
         }
         trace.stage(TakeStage::Ai);
         let result = match take.mode {
