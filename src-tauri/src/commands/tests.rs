@@ -2890,6 +2890,35 @@ fn failed_takes_keep_what_retry_needs_for_each_mode() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn selected_text_blocking_work_leaves_the_async_owner_free() {
+    // On a single-threaded runtime, inline blocking work would stall every
+    // other task; on the blocking owner, a timer still fires meanwhile.
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let work = on_blocking_owner(move || {
+        released.recv().unwrap();
+        "captured"
+    });
+    let other_task = async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        release.send(()).unwrap();
+    };
+    let (value, ()) = tokio::join!(work, other_task);
+    assert_eq!(value, Some("captured"));
+}
+
+#[tokio::test]
+async fn a_panic_on_the_blocking_owner_unwinds_the_async_owner() {
+    use futures_util::FutureExt;
+    let unwound = std::panic::AssertUnwindSafe(on_blocking_owner(|| -> u8 {
+        panic!("capture failed");
+    }))
+    .catch_unwind()
+    .await;
+    let payload = unwound.unwrap_err();
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"capture failed"));
+}
+
 /// A command that prints one line and exits, and one that runs far longer
 /// than any test bound, using only tools every test machine has.
 fn quick_and_hung_commands() -> (std::process::Command, std::process::Command) {

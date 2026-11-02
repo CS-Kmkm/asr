@@ -1765,6 +1765,21 @@ struct SelectedTextMetricContext {
     app_category: Option<String>,
 }
 
+/// Run synchronous UI Automation, input-monitor or clipboard work on a
+/// blocking thread instead of the async owner, as Edit and Ask do. A panic
+/// there resumes in the owner, exactly as if the work had run inline, so the
+/// owner's guards still settle the phase. `None` only when the runtime is
+/// shutting down and the work never ran.
+async fn on_blocking_owner<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => Some(value),
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(_) => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_selected_text_translation(
     app: &AppHandle,
@@ -1790,7 +1805,16 @@ async fn run_selected_text_translation(
     // takes it first.
     let app_for_loss = app.clone();
     injector.report_clipboard_loss_on_drop(move || report_clipboard_not_restored(&app_for_loss));
-    let selection = injector.capture_selection();
+    // UI Automation capture is synchronous; it runs on a blocking thread so
+    // it never stalls the async runtime, and the injector comes back with it.
+    let Some((injector, selection)) = on_blocking_owner(move || {
+        let selection = injector.capture_selection();
+        (injector, selection)
+    })
+    .await
+    else {
+        return SelectedTextEnd::Failed(SelectedTextFailure::Incomplete);
+    };
     if services.lifecycle.is_cancelled(operation_id) {
         return SelectedTextEnd::Cancelled;
     }
@@ -1820,10 +1844,20 @@ async fn run_selected_text_translation(
     );
     let monitor = InputMonitor::default();
     monitor.observe_cancellation(Some(cancel.clone()));
-    if !monitor.start_for_recording(&settings.translation_hotkey, &[], true) {
-        return SelectedTextEnd::Failed(SelectedTextFailure::MonitorUnavailable);
-    }
-    let Some(checkpoint) = monitor.checkpoint() else {
+    // Starting the input-monitor helper blocks until it reports ready.
+    let hotkey = settings.translation_hotkey.clone();
+    let Some((monitor, checkpoint)) = on_blocking_owner(move || {
+        let checkpoint = monitor
+            .start_for_recording(&hotkey, &[], true)
+            .then(|| monitor.checkpoint())
+            .flatten();
+        (monitor, checkpoint)
+    })
+    .await
+    else {
+        return SelectedTextEnd::Failed(SelectedTextFailure::Incomplete);
+    };
+    let Some(checkpoint) = checkpoint else {
         return SelectedTextEnd::Failed(SelectedTextFailure::MonitorUnavailable);
     };
     if services.lifecycle.is_cancelled(operation_id) {
@@ -1846,20 +1880,36 @@ async fn run_selected_text_translation(
     // or copied, or find the operation committed and do nothing. The
     // lifecycle lock is held for the replacement, which its paste
     // verification bounds to about a second; lifecycle readers (hotkeys,
-    // Esc) wait that long instead of racing the paste.
-    let committed = services.lifecycle.commit_side_effect(operation_id, || {
-        let replaced = injector.replace_selection(&selection, &translated, &monitor, checkpoint);
-        // A replacement error happens before any paste, so the selection is
-        // unchanged and the clipboard is the fallback.
-        let failure_detail = if replaced == Err(injection::InjectionError::ClipboardProtected) {
-            InsertionDetail::ClipboardProtected
-        } else {
-            InsertionDetail::ClipboardUnavailable
-        };
-        let insertion =
-            edit_insertion_outcome(replaced, || injector.copy_to_clipboard(&translated));
-        Ok::<_, std::convert::Infallible>((insertion, failure_detail))
-    });
+    // Esc) wait that long instead of racing the paste. Like Edit and Ask,
+    // the replacement runs on a blocking thread, not the async owner.
+    let app_for_replacement = app.clone();
+    let replacement = translated.clone();
+    // The monitor comes back too, so it stops at the end of this owner as
+    // before.
+    let Some((injector, _monitor, committed)) = on_blocking_owner(move || {
+        let services = app_for_replacement.state::<Services>();
+        let committed = services.lifecycle.commit_side_effect(operation_id, || {
+            let replaced =
+                injector.replace_selection(&selection, &replacement, &monitor, checkpoint);
+            // A replacement error happens before any paste, so the selection
+            // is unchanged and the clipboard is the fallback.
+            let failure_detail = if replaced == Err(injection::InjectionError::ClipboardProtected) {
+                InsertionDetail::ClipboardProtected
+            } else {
+                InsertionDetail::ClipboardUnavailable
+            };
+            let insertion =
+                edit_insertion_outcome(replaced, || injector.copy_to_clipboard(&replacement));
+            Ok::<_, std::convert::Infallible>((insertion, failure_detail))
+        });
+        (injector, monitor, committed)
+    })
+    .await
+    else {
+        // The blocking task never ran (the runtime is shutting down), so
+        // nothing was pasted or copied.
+        return SelectedTextEnd::Failed(SelectedTextFailure::Incomplete);
+    };
     let (insertion, failure_detail) = match committed {
         Ok(Ok(outcome)) => outcome,
         Ok(Err(never)) => match never {},
