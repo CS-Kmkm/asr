@@ -299,14 +299,32 @@ async fn finish_ask(
     .await
     .ok_or("ask was cancelled")?;
     let generation_started = Instant::now();
-    let output = correction::generate_ask_text(
+    let generation_cancel = services
+        .lifecycle
+        .cancellation(operation_id)
+        .map_err(command_error)?;
+    // Only an answer that will be delivered to the panel is previewed there;
+    // replacements and caret drafts keep their target untouched until the
+    // validated result. The preview is display-only: nothing parses or acts
+    // on partial text, and dropping it without a final answer withdraws it.
+    let mut preview = answer_goes_to_panel(&action, &session.capture).then(|| {
+        answer_panel::LivePreview::new(
+            answer_panel::AppPreviewWindow(app),
+            &services.answer_panel,
+            operation_id,
+            generation_cancel.clone(),
+        )
+    });
+    let output = correction::generate_ask_text_streaming(
         &settings,
         &input,
         &generation_personalization.instruction(&ask::generation_prompt_with_target(&action)),
-        services
-            .lifecycle
-            .cancellation(operation_id)
-            .map_err(command_error)?,
+        generation_cancel,
+        |delta| {
+            if let Some(preview) = preview.as_mut() {
+                preview.push(delta);
+            }
+        },
     )
     .await;
     if !matches!(output, Err(correction::CorrectionError::Cancelled)) {
@@ -381,6 +399,7 @@ async fn finish_ask(
                 })?
             }
             _ => {
+                debug_assert!(answer_goes_to_panel(&action, &session.capture));
                 if services.lifecycle.is_cancelled(operation_id) {
                     return Err("ask was cancelled".into());
                 }
@@ -444,4 +463,54 @@ async fn finish_ask(
         duration_ms,
         latency_ms,
     })
+}
+
+/// Whether a generated answer is delivered to the answer panel (and so may be
+/// previewed there). Mirrors the delivery match in `finish_ask`.
+fn answer_goes_to_panel(action: &ask::AskAction, capture: &AskCapture) -> bool {
+    use ask::AskAction;
+    !matches!(
+        (action, capture),
+        (
+            AskAction::Rewrite
+                | AskAction::Shorten
+                | AskAction::Expand
+                | AskAction::ChangeTone
+                | AskAction::Translate { .. },
+            AskCapture::Selected(_),
+        ) | (AskAction::Draft, AskCapture::Caret(_))
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ask::AskAction;
+    use crate::injection::TargetWindow;
+
+    #[test]
+    fn only_answers_delivered_to_the_panel_are_previewed() {
+        let caret = AskCapture::Caret(TargetWindow {
+            window_handle: 1,
+            control_handle: 1,
+            process_id: 1,
+            thread_id: 1,
+            is_secure: false,
+        });
+        // A caret draft is typed into its target and is never previewed.
+        assert!(!answer_goes_to_panel(&AskAction::Draft, &caret));
+        for action in [AskAction::Answer, AskAction::Summarize, AskAction::Explain] {
+            assert!(answer_goes_to_panel(&action, &caret));
+            assert!(answer_goes_to_panel(&action, &AskCapture::Unavailable));
+        }
+        for action in [
+            AskAction::Rewrite,
+            AskAction::Draft,
+            AskAction::Translate {
+                target_language: "en".into(),
+            },
+        ] {
+            assert!(answer_goes_to_panel(&action, &AskCapture::Unavailable));
+        }
+    }
 }

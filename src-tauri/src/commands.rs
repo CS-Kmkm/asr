@@ -996,6 +996,20 @@ async fn start_owned_recording(
     );
     let app_context = context_target.and_then(app_context::from_target);
     services.observe_app_context(&app, app_context.as_ref());
+    // The dictionary prompt is a local read that depends only on the mode,
+    // the app context and the backend. It loads while the model readiness
+    // wait, the input-monitor start and the start cue run, and is awaited
+    // just before the microphone opens.
+    let prompt_load = {
+        let app = app.clone();
+        let context = app_context::asr_prompt_context(mode, app_context.as_ref()).cloned();
+        let backend = settings.asr_backend.clone();
+        tokio::task::spawn_blocking(move || {
+            app.state::<Storage>()
+                .dictionary_asr_prompt_for(context.as_ref(), &backend)
+                .unwrap_or_default()
+        })
+    };
     if let Some(target) = context_target.filter(|target| !target.is_this_app()) {
         recording_overlay::set_anchor(target.window_handle);
     }
@@ -1082,12 +1096,7 @@ async fn start_owned_recording(
             monitor.observe_cancellation(Some(cancel.clone()));
         }
     }
-    let prompt = storage
-        .dictionary_asr_prompt_for(
-            app_context::asr_prompt_context(mode, app_context.as_ref()),
-            &settings.asr_backend,
-        )
-        .unwrap_or_default();
+    let prompt = join_blocking(prompt_load).await.flatten();
     let capture_config = capture_config(&settings);
     let mut test = services.microphone_test.lock().await;
     let mut audio = services.audio.lock().await;
@@ -1765,6 +1774,27 @@ struct SelectedTextMetricContext {
     app_category: Option<String>,
 }
 
+/// Run synchronous UI Automation, input-monitor or clipboard work on a
+/// blocking thread instead of the async owner, as Edit and Ask do. A panic
+/// there resumes in the owner, exactly as if the work had run inline, so the
+/// owner's guards still settle the phase. `None` only when the runtime is
+/// shutting down and the work never ran.
+async fn on_blocking_owner<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    join_blocking(tokio::task::spawn_blocking(work)).await
+}
+
+/// The result of already spawned blocking work, with a panic resumed in the
+/// awaiting owner; `None` only when the runtime shut down before it ran.
+async fn join_blocking<T>(work: tokio::task::JoinHandle<T>) -> Option<T> {
+    match work.await {
+        Ok(value) => Some(value),
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(_) => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_selected_text_translation(
     app: &AppHandle,
@@ -1790,7 +1820,16 @@ async fn run_selected_text_translation(
     // takes it first.
     let app_for_loss = app.clone();
     injector.report_clipboard_loss_on_drop(move || report_clipboard_not_restored(&app_for_loss));
-    let selection = injector.capture_selection();
+    // UI Automation capture is synchronous; it runs on a blocking thread so
+    // it never stalls the async runtime, and the injector comes back with it.
+    let Some((injector, selection)) = on_blocking_owner(move || {
+        let selection = injector.capture_selection();
+        (injector, selection)
+    })
+    .await
+    else {
+        return SelectedTextEnd::Failed(SelectedTextFailure::Incomplete);
+    };
     if services.lifecycle.is_cancelled(operation_id) {
         return SelectedTextEnd::Cancelled;
     }
@@ -1820,10 +1859,20 @@ async fn run_selected_text_translation(
     );
     let monitor = InputMonitor::default();
     monitor.observe_cancellation(Some(cancel.clone()));
-    if !monitor.start_for_recording(&settings.translation_hotkey, &[], true) {
-        return SelectedTextEnd::Failed(SelectedTextFailure::MonitorUnavailable);
-    }
-    let Some(checkpoint) = monitor.checkpoint() else {
+    // Starting the input-monitor helper blocks until it reports ready.
+    let hotkey = settings.translation_hotkey.clone();
+    let Some((monitor, checkpoint)) = on_blocking_owner(move || {
+        let checkpoint = monitor
+            .start_for_recording(&hotkey, &[], true)
+            .then(|| monitor.checkpoint())
+            .flatten();
+        (monitor, checkpoint)
+    })
+    .await
+    else {
+        return SelectedTextEnd::Failed(SelectedTextFailure::Incomplete);
+    };
+    let Some(checkpoint) = checkpoint else {
         return SelectedTextEnd::Failed(SelectedTextFailure::MonitorUnavailable);
     };
     if services.lifecycle.is_cancelled(operation_id) {
@@ -1846,20 +1895,36 @@ async fn run_selected_text_translation(
     // or copied, or find the operation committed and do nothing. The
     // lifecycle lock is held for the replacement, which its paste
     // verification bounds to about a second; lifecycle readers (hotkeys,
-    // Esc) wait that long instead of racing the paste.
-    let committed = services.lifecycle.commit_side_effect(operation_id, || {
-        let replaced = injector.replace_selection(&selection, &translated, &monitor, checkpoint);
-        // A replacement error happens before any paste, so the selection is
-        // unchanged and the clipboard is the fallback.
-        let failure_detail = if replaced == Err(injection::InjectionError::ClipboardProtected) {
-            InsertionDetail::ClipboardProtected
-        } else {
-            InsertionDetail::ClipboardUnavailable
-        };
-        let insertion =
-            edit_insertion_outcome(replaced, || injector.copy_to_clipboard(&translated));
-        Ok::<_, std::convert::Infallible>((insertion, failure_detail))
-    });
+    // Esc) wait that long instead of racing the paste. Like Edit and Ask,
+    // the replacement runs on a blocking thread, not the async owner.
+    let app_for_replacement = app.clone();
+    let replacement = translated.clone();
+    // The monitor comes back too, so it stops at the end of this owner as
+    // before.
+    let Some((injector, _monitor, committed)) = on_blocking_owner(move || {
+        let services = app_for_replacement.state::<Services>();
+        let committed = services.lifecycle.commit_side_effect(operation_id, || {
+            let replaced =
+                injector.replace_selection(&selection, &replacement, &monitor, checkpoint);
+            // A replacement error happens before any paste, so the selection
+            // is unchanged and the clipboard is the fallback.
+            let failure_detail = if replaced == Err(injection::InjectionError::ClipboardProtected) {
+                InsertionDetail::ClipboardProtected
+            } else {
+                InsertionDetail::ClipboardUnavailable
+            };
+            let insertion =
+                edit_insertion_outcome(replaced, || injector.copy_to_clipboard(&replacement));
+            Ok::<_, std::convert::Infallible>((insertion, failure_detail))
+        });
+        (injector, monitor, committed)
+    })
+    .await
+    else {
+        // The blocking task never ran (the runtime is shutting down), so
+        // nothing was pasted or copied.
+        return SelectedTextEnd::Failed(SelectedTextFailure::Incomplete);
+    };
     let (insertion, failure_detail) = match committed {
         Ok(Ok(outcome)) => outcome,
         Ok(Err(never)) => match never {},
@@ -3629,12 +3694,40 @@ fn spawn_load_progress_forwarder(
     }))
 }
 
+/// Upper bound on one `nvidia-smi` query. A hung driver query then reports
+/// diagnostics as unavailable instead of keeping them pending indefinitely.
+pub(crate) const GPU_DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The output of `child` once it exits within `limit`; otherwise the child is
+/// killed and `None` returned. Its stdout must be small enough for the pipe,
+/// which holds for the single CSV line `nvidia-smi` prints per adapter.
+fn output_within(mut child: std::process::Child, limit: Duration) -> Option<std::process::Output> {
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 pub(crate) fn probe_gpu_diagnostics() -> GpuDiagnostics {
     let mut command = crate::environment::helper_command("nvidia-smi");
-    command.args([
-        "--query-gpu=name,driver_version,memory.total",
-        "--format=csv,noheader,nounits",
-    ]);
+    command
+        .args([
+            "--query-gpu=name,driver_version,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
     // The release app has no console for this console tool to share, so it
     // would otherwise open a window of its own.
     #[cfg(windows)]
@@ -3643,8 +3736,11 @@ pub(crate) fn probe_gpu_diagnostics() -> GpuDiagnostics {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let output = command.output();
-    if let Ok(output) = output {
+    let output = command
+        .spawn()
+        .ok()
+        .and_then(|child| output_within(child, GPU_DIAGNOSTICS_TIMEOUT));
+    if let Some(output) = output {
         if output.status.success() {
             let line = String::from_utf8_lossy(&output.stdout);
             let values: Vec<&str> = line

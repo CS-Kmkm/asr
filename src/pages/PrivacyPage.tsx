@@ -72,6 +72,11 @@ export function PrivacyPage({
         detailMode="inline"
         help={t("Preview can transcribe the same audio more than once. With a cloud speech backend, each preview sends another audio upload. Off by default for cloud speech.")}
         control={<Toggle label={t("Live transcription preview")} checked={settings.asrBackend === "openai-compatible" ? settings.cloudLivePreviewEnabled : settings.livePreviewEnabled ?? true} onChange={(enabled) => onSave(settings.asrBackend === "openai-compatible" ? { cloudLivePreviewEnabled: enabled } : { livePreviewEnabled: enabled })} />} />
+      {settings.asrBackend === "faster-whisper" && <SettingRow title={t("Faster live preview")}
+        detail={t("Greedy decoding for the preview only; the final text is unchanged.")}
+        detailMode="inline"
+        help={t("Off by default. Live preview asks faster-whisper for a single-candidate (greedy) decode instead of beam search, lowering GPU or CPU load while recording. Preview text can be less accurate; the final transcription after stopping always uses the normal decode.")}
+        control={<Toggle label={t("Faster live preview")} checked={settings.livePreviewFastDecode} disabled={!(settings.livePreviewEnabled ?? true)} onChange={(enabled) => onSave({ livePreviewFastDecode: enabled })} />} />}
     </section>
   );
 }

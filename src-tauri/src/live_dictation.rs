@@ -22,13 +22,78 @@ use tokio::sync::watch;
 #[cfg(test)]
 mod benchmark;
 mod segmentation;
-use segmentation::{append_utterance, Decision, Segmentation};
+use segmentation::{append_utterance, trailing_quiet, Decision, Segmentation};
 
 const LIVE_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Skips copying and enhancing the whole current utterance while the audio
+/// captured since the last full preparation cannot change its `Wait`.
+///
+/// A preparation runs whenever enough new audio may be due for a decode, the
+/// new audio could complete the shortest endpoint silence, or `MAX_DEFERRAL`
+/// of audio has arrived since the last one. Enhancement depends on
+/// whole-window statistics, so nothing prepared is reused: a preparation that
+/// runs sees exactly the audio it saw before this gate existed.
+#[derive(Default)]
+struct PreparationGate {
+    /// The window (raw audio since the cursor) at the last preparation that
+    /// ended in `Wait`, and the silence trailing its last voiced frame.
+    waited: Option<(Duration, Duration)>,
+}
+
+impl PreparationGate {
+    /// The longest audio a gate lets accumulate without a preparation.
+    const MAX_DEFERRAL: Duration = Duration::from_millis(1_000);
+    /// Slack for resampling rounding and frame alignment.
+    const TOLERANCE: Duration = Duration::from_millis(40);
+
+    /// Where the audio the last preparation did not see starts, relative to
+    /// the cursor; `None` when the next iteration must prepare anyway.
+    fn unseen_from(&self) -> Option<Duration> {
+        self.waited.map(|(window, _)| window)
+    }
+
+    fn should_prepare(&self, probe: &audio::AudioProbe, segmentation: &Segmentation) -> bool {
+        let Some((window, quiet)) = self.waited else {
+            return true;
+        };
+        let new = probe.duration().saturating_sub(window);
+        if new.is_zero() {
+            // The same audio prepares and plans exactly as before.
+            return false;
+        }
+        if new >= Self::MAX_DEFERRAL || segmentation.may_decode(probe.duration(), Self::TOLERANCE) {
+            return true;
+        }
+        // Silence now trails the last certainly voiced new frame, or adds to
+        // the silence the last preparation ended with.
+        let quiet = probe
+            .quiet_after_voice(segmentation::FRAME, segmentation::VOICE_HYSTERESIS as f32)
+            .unwrap_or(quiet + new);
+        quiet + Self::TOLERANCE >= segmentation.shortest_endpoint_silence(probe.duration())
+    }
+
+    fn waited(&mut self, window: Duration, trailing_quiet: Duration) {
+        self.waited = Some((window, trailing_quiet));
+    }
+
+    fn reset(&mut self) {
+        self.waited = None;
+    }
+}
 
 /// Default Dictate pastes only the final text once. Live provisional target
 /// insertion is an explicit opt-in because editors whose content cannot be
 /// read back keep the first unverified fragment. Other modes always defer.
+/// The cheaper greedy decode is an explicit opt-in for live preview only.
+fn preview_decoding(settings: &Settings) -> asr::PreviewDecoding {
+    if settings.live_preview_fast_decode {
+        asr::PreviewDecoding::Greedy
+    } else {
+        asr::PreviewDecoding::Standard
+    }
+}
+
 pub(crate) fn defers_target_insertion(mode: PipelineMode, settings: &Settings) -> bool {
     mode != PipelineMode::Dictate
         || settings.automatic_voice_mode
@@ -173,6 +238,9 @@ pub(crate) struct LiveDraft {
     attempted: bool,
     defer_insertion: bool,
     pub(crate) pasted: bool,
+    /// How this recording's live-preview requests decode, fixed from the
+    /// settings the recording started with.
+    preview_decoding: asr::PreviewDecoding,
 }
 
 impl LiveDraft {
@@ -220,6 +288,7 @@ impl LiveDraft {
             attempted: false,
             defer_insertion,
             pasted: false,
+            preview_decoding: preview_decoding(settings),
         }
     }
 
@@ -460,6 +529,7 @@ pub(crate) fn start(
         recording_overlay::enable_live_subtitles(&app);
     }
     let (stop, stopped) = watch::channel(false);
+    let decoding = draft.preview_decoding;
     let task = spawn_recording_owner(async move {
         if !preview_enabled {
             return draft;
@@ -470,6 +540,7 @@ pub(crate) fn start(
             services.transcriber.as_ref(),
             prompt.as_deref(),
             speech_locale.as_deref(),
+            decoding,
             cancel,
             stopped,
             LIVE_INTERVAL,
@@ -568,12 +639,14 @@ async fn run(
     transcriber: &dyn Transcriber,
     prompt: Option<&str>,
     speech_locale: Option<&str>,
+    decoding: asr::PreviewDecoding,
     mut cancel: watch::Receiver<bool>,
     mut stopped: watch::Receiver<bool>,
     interval: Duration,
     mut on_update: impl FnMut(&LiveText),
 ) -> Result<(), LiveFailure> {
     let mut segmentation = Segmentation::default();
+    let mut gate = PreparationGate::default();
     let mut cursor = Duration::ZERO;
     let mut completed = String::new();
     let mut displayed = String::new();
@@ -591,12 +664,23 @@ async fn run(
             if *cancel.borrow() || *stopped.borrow() {
                 return Ok(());
             }
+            if let Some(unseen) = gate.unseen_from() {
+                match audio.probe(cursor, cursor + unseen) {
+                    Ok(Some(probe)) if !gate.should_prepare(&probe, &segmentation) => continue,
+                    Ok(_) => {}
+                    Err(AudioError::NotCapturing) => return Ok(()),
+                    Err(_) => return Err(LiveFailure::Capture),
+                }
+            }
             match audio.snapshot(cursor) {
                 Ok(snapshot) => snapshot,
                 Err(AudioError::NotCapturing) => return Ok(()),
                 Err(_) => return Err(LiveFailure::Capture),
             }
         };
+        let window = snapshot.duration();
+        // Every outcome but `Wait` moves the cursor or the segmentation state.
+        gate.reset();
         let mut prepared = match tokio::task::spawn_blocking(move || snapshot.prepare())
             .await
             .map_err(|_| "live audio preparation failed")?
@@ -610,13 +694,19 @@ async fn run(
                 cursor += silence;
                 continue;
             }
-            Decision::Wait => continue,
+            Decision::Wait => {
+                gate.waited(window, trailing_quiet(&prepared));
+                continue;
+            }
             Decision::Decode {
                 samples,
                 endpoint,
                 voiced_until,
             } => (samples, endpoint, voiced_until),
         };
+        // After a partial decode the same audio would plan `Wait`, so the
+        // gate can hold off until new audio could change that.
+        let partial_quiet = (!endpoint).then(|| trailing_quiet(&prepared));
         prepared.samples.truncate(samples);
         let decoded_duration = prepared.duration();
         let artifact = tokio::task::spawn_blocking(move || prepared.into_artifact())
@@ -633,7 +723,13 @@ async fn run(
                 }
                 let inference_started = Instant::now();
                 let result = transcriber
-                    .transcribe_with_locale(&artifact.path, prompt, speech_locale, cancel.clone())
+                    .transcribe_preview(
+                        &artifact.path,
+                        prompt,
+                        speech_locale,
+                        decoding,
+                        cancel.clone(),
+                    )
                     .await;
                 let inference_cost = inference_started.elapsed();
                 cleanup.cleanup().map_err(command_error)?;
@@ -656,6 +752,9 @@ async fn run(
         segmentation.recognized(decoded_duration, voiced_until, inference_cost, endpoint);
         if endpoint {
             cursor += decoded_duration;
+        }
+        if let Some(quiet) = partial_quiet {
+            gate.waited(window, quiet);
         }
     }
 }
@@ -746,6 +845,7 @@ mod tests {
             attempted: false,
             defer_insertion: true,
             pasted: false,
+            preview_decoding: asr::PreviewDecoding::Standard,
         }
     }
 
@@ -817,6 +917,7 @@ mod tests {
                 &recognizer,
                 None,
                 None,
+                asr::PreviewDecoding::Standard,
                 cancel,
                 stopped,
                 Duration::from_millis(1),
@@ -1191,6 +1292,7 @@ mod tests {
             attempted: false,
             defer_insertion: false,
             pasted: false,
+            preview_decoding: asr::PreviewDecoding::Standard,
         };
         (draft, mock)
     }
@@ -1441,6 +1543,7 @@ mod tests {
                 &recognizer,
                 None,
                 None,
+                asr::PreviewDecoding::Standard,
                 cancel,
                 stopped,
                 Duration::from_millis(1),
@@ -1460,6 +1563,88 @@ mod tests {
         assert_eq!(recognizer.calls.load(Ordering::SeqCst), 2);
         assert_eq!(audio.lock().await.state(), CaptureState::Capturing);
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    /// Records how each live request asked to decode. Live recognition must
+    /// never use the final-recognition request.
+    struct DecodingRecognizer {
+        seen: std::sync::Mutex<Vec<asr::PreviewDecoding>>,
+    }
+    #[async_trait::async_trait]
+    impl Transcriber for DecodingRecognizer {
+        async fn load(&self, _: &str) -> Result<(), asr::AsrError> {
+            Ok(())
+        }
+        async fn transcribe(
+            &self,
+            _: &Path,
+            _: Option<&str>,
+            _: watch::Receiver<bool>,
+        ) -> Result<asr::Transcript, asr::AsrError> {
+            panic!("live recognition must send preview requests")
+        }
+        async fn transcribe_preview(
+            &self,
+            _: &Path,
+            _: Option<&str>,
+            _: Option<&str>,
+            decoding: asr::PreviewDecoding,
+            _: watch::Receiver<bool>,
+        ) -> Result<asr::Transcript, asr::AsrError> {
+            self.seen.lock().unwrap().push(decoding);
+            Ok(asr::Transcript {
+                text: "途中".into(),
+                segments: vec![],
+                model: "test".into(),
+                duration_ms: 1,
+            })
+        }
+        async fn shutdown(&self) -> Result<(), asr::AsrError> {
+            Ok(())
+        }
+        async fn reconfigure(&self, _: WorkerCommand) {}
+    }
+
+    #[tokio::test]
+    async fn live_requests_carry_the_recordings_preview_decoding() {
+        let mut settings = Settings::default();
+        assert_eq!(preview_decoding(&settings), asr::PreviewDecoding::Standard);
+        settings.live_preview_fast_decode = true;
+        assert_eq!(preview_decoding(&settings), asr::PreviewDecoding::Greedy);
+        for decoding in [asr::PreviewDecoding::Standard, asr::PreviewDecoding::Greedy] {
+            let directory = tempfile::tempdir().unwrap();
+            let audio: tokio::sync::Mutex<Box<dyn AudioCapture>> =
+                tokio::sync::Mutex::new(Box::new(Capture {
+                    directory: directory.path().to_owned(),
+                    snapshots: AtomicUsize::new(0),
+                    stages: vec![],
+                }));
+            let recognizer = DecodingRecognizer {
+                seen: std::sync::Mutex::new(vec![]),
+            };
+            let (_cancel, cancel) = watch::channel(false);
+            let (stop, stopped) = watch::channel(false);
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                run(
+                    &audio,
+                    &recognizer,
+                    None,
+                    None,
+                    decoding,
+                    cancel,
+                    stopped,
+                    Duration::from_millis(1),
+                    |_| {
+                        stop.send_replace(true);
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(*recognizer.seen.lock().unwrap(), [decoding]);
+        }
     }
 
     #[tokio::test]
@@ -1485,6 +1670,7 @@ mod tests {
                 &recognizer,
                 None,
                 None,
+                asr::PreviewDecoding::Standard,
                 cancel,
                 stopped,
                 Duration::from_millis(1),
@@ -1539,6 +1725,7 @@ mod tests {
                 &recognizer,
                 None,
                 None,
+                asr::PreviewDecoding::Standard,
                 cancel,
                 stopped,
                 Duration::from_millis(1),
@@ -1672,6 +1859,7 @@ mod tests {
                     &recognizer,
                     None,
                     None,
+                    asr::PreviewDecoding::Standard,
                     cancel,
                     stopped,
                     Duration::from_millis(1),
@@ -1741,6 +1929,7 @@ mod tests {
                         recognizer.as_ref(),
                         None,
                         None,
+                        asr::PreviewDecoding::Standard,
                         cancel,
                         stopped,
                         Duration::from_millis(1),
@@ -1800,6 +1989,7 @@ mod tests {
                 &recognizer,
                 None,
                 None,
+                asr::PreviewDecoding::Standard,
                 cancel,
                 stopped,
                 Duration::from_millis(1),
@@ -1851,6 +2041,7 @@ mod tests {
                 &recognizer,
                 None,
                 None,
+                asr::PreviewDecoding::Standard,
                 cancel,
                 stopped,
                 Duration::from_millis(1),
@@ -1908,6 +2099,7 @@ mod tests {
                 &recognizer,
                 None,
                 None,
+                asr::PreviewDecoding::Standard,
                 cancel,
                 stopped,
                 Duration::from_millis(1),
@@ -1919,5 +2111,286 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(recognizer.calls.load(Ordering::SeqCst), 2);
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    fn probe(window_ms: u64, tail: Vec<f32>) -> audio::AudioProbe {
+        audio::AudioProbe::for_test(
+            Duration::from_millis(window_ms),
+            tail,
+            &CaptureConfig::default(),
+        )
+    }
+
+    fn silence(ms: usize) -> Vec<f32> {
+        vec![0.0; ms * 24]
+    }
+
+    fn speech(ms: usize) -> Vec<f32> {
+        tone(ms as f64 / 1000.0)
+    }
+
+    #[test]
+    fn the_gate_prepares_whenever_a_wait_could_change() {
+        let segmentation = Segmentation::default();
+        // Segmentation after a partial decode of the first `until` ms.
+        let partial = |until: u64| {
+            let mut segmentation = Segmentation::default();
+            let until = Duration::from_millis(until);
+            segmentation.recognized(until, until, Duration::ZERO, false);
+            segmentation
+        };
+        let mut gate = PreparationGate::default();
+        // Without a waiting preparation every iteration prepares.
+        assert!(gate.should_prepare(&probe(800, silence(800)), &segmentation));
+
+        // Speech continues: 1 s window, no trailing silence at the last Wait.
+        gate.waited(Duration::from_millis(1_000), Duration::ZERO);
+        assert_eq!(gate.unseen_from(), Some(Duration::from_millis(1_000)));
+        // Nothing new: the same audio would plan the same Wait.
+        assert!(!gate.should_prepare(&probe(1_000, vec![]), &segmentation));
+        // Certainly voiced new audio cannot end the utterance yet.
+        assert!(!gate.should_prepare(&probe(1_150, speech(150)), &segmentation));
+        // A decode may be due once the window holds 1.2 s of new context.
+        assert!(gate.should_prepare(&probe(1_170, speech(170)), &segmentation));
+
+        // Quiet new audio may complete the endpoint silence: 650 ms, or 350 ms
+        // once the window could hold a 12-second utterance.
+        gate.waited(Duration::from_millis(600), Duration::from_millis(100));
+        assert!(!gate.should_prepare(&probe(1_000, silence(400)), &segmentation));
+        assert!(gate.should_prepare(&probe(1_110, silence(510)), &segmentation));
+        gate.waited(Duration::from_secs(12), Duration::from_millis(100));
+        assert!(!gate.should_prepare(&probe(12_150, silence(150)), &partial(12_000)));
+        assert!(gate.should_prepare(&probe(12_210, silence(210)), &partial(12_000)));
+        gate.waited(Duration::from_millis(600), Duration::from_millis(100));
+        // Voice ending the new audio restarts the silence count.
+        let mut tail = silence(100);
+        tail.extend(speech(200));
+        tail.extend(silence(100));
+        assert!(!gate.should_prepare(&probe(1_000, tail), &segmentation));
+        // Never more than the maximum deferral of audio without preparing.
+        let long_gap = partial(20_000);
+        gate.waited(Duration::from_secs(20), Duration::ZERO);
+        assert!(!gate.should_prepare(&probe(20_990, speech(990)), &long_gap));
+        assert!(gate.should_prepare(&probe(21_000, speech(1_000)), &long_gap));
+
+        gate.reset();
+        assert_eq!(gate.unseen_from(), None);
+    }
+
+    /// Audio grows by one live interval per loop iteration: speech after a
+    /// short silence, then silence. With `probes` off the capture cannot be
+    /// probed, which is the loop before the preparation gate.
+    struct GrowingCapture {
+        directory: PathBuf,
+        probes: bool,
+        signal: Vec<f32>,
+        ticks: Arc<AtomicUsize>,
+        probed: std::sync::atomic::AtomicBool,
+        snapshots: Arc<AtomicUsize>,
+        /// Raw samples copied (and so enhanced) by all snapshots.
+        copied: Arc<AtomicUsize>,
+    }
+
+    impl GrowingCapture {
+        const STEP: usize = 3_600; // 150 ms at 24 kHz.
+
+        fn new(
+            directory: &Path,
+            probes: bool,
+            ticks: Arc<AtomicUsize>,
+            snapshots: Arc<AtomicUsize>,
+            copied: Arc<AtomicUsize>,
+        ) -> Self {
+            let mut signal = silence(300);
+            signal.extend(speech(4_000));
+            signal.extend(silence(1_500));
+            Self {
+                directory: directory.to_owned(),
+                probes,
+                signal,
+                ticks,
+                probed: false.into(),
+                snapshots,
+                copied,
+            }
+        }
+
+        fn config(&self) -> CaptureConfig {
+            CaptureConfig {
+                artifact_directory: Some(self.directory.clone()),
+                ..CaptureConfig::default()
+            }
+        }
+
+        /// The recording so far, advancing once per loop iteration.
+        fn recorded(&self, advance: bool) -> Result<&[f32], AudioError> {
+            let tick = if advance {
+                self.ticks.fetch_add(1, Ordering::SeqCst) + 1
+            } else {
+                self.ticks.load(Ordering::SeqCst)
+            };
+            let length = tick * Self::STEP;
+            if length > self.signal.len() {
+                return Err(AudioError::NotCapturing);
+            }
+            Ok(&self.signal[..length])
+        }
+    }
+
+    fn index(at: Duration) -> usize {
+        (at.as_secs_f64() * 24_000.0).round() as usize
+    }
+
+    impl AudioCapture for GrowingCapture {
+        fn snapshot(&self, since: Duration) -> Result<AudioSnapshot, AudioError> {
+            let advance = !self.probed.swap(false, Ordering::SeqCst);
+            let recorded = self.recorded(advance)?;
+            let samples = recorded[index(since).min(recorded.len())..].to_vec();
+            self.snapshots.fetch_add(1, Ordering::SeqCst);
+            self.copied.fetch_add(samples.len(), Ordering::SeqCst);
+            Ok(AudioSnapshot::for_test(samples, self.config()))
+        }
+        fn probe(
+            &self,
+            since: Duration,
+            new_from: Duration,
+        ) -> Result<Option<audio::AudioProbe>, AudioError> {
+            self.probed.store(true, Ordering::SeqCst);
+            let recorded = self.recorded(true)?;
+            if !self.probes {
+                return Ok(None);
+            }
+            let start = index(since).min(recorded.len());
+            let tail = index(new_from).clamp(start, recorded.len());
+            Ok(Some(audio::AudioProbe::for_test(
+                Duration::from_secs_f64((recorded.len() - start) as f64 / 24_000.0),
+                recorded[tail..].to_vec(),
+                &self.config(),
+            )))
+        }
+        fn list_devices(&self) -> AudioFuture<'_, Vec<AudioDevice>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn arm(&mut self, _: CaptureConfig) -> AudioFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn disarm(&mut self) -> AudioFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn start(&mut self, _: CaptureConfig) -> AudioFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn stop(&mut self) -> AudioFuture<'_, AudioArtifact> {
+            panic!("live inference must not stop capture")
+        }
+        fn cancel(&mut self) -> AudioFuture<'_, ()> {
+            panic!("live inference must not cancel capture")
+        }
+        fn state(&self) -> CaptureState {
+            CaptureState::Capturing
+        }
+        fn level(&self) -> LevelMeter {
+            LevelMeter::default()
+        }
+    }
+
+    /// Records the iteration and the exact WAV bytes of every decode.
+    struct RecordingRecognizer {
+        ticks: Arc<AtomicUsize>,
+        decodes: std::sync::Mutex<Vec<(usize, Vec<u8>)>>,
+    }
+    #[async_trait::async_trait]
+    impl Transcriber for RecordingRecognizer {
+        async fn load(&self, _: &str) -> Result<(), asr::AsrError> {
+            Ok(())
+        }
+        async fn transcribe(
+            &self,
+            path: &Path,
+            _: Option<&str>,
+            _: watch::Receiver<bool>,
+        ) -> Result<asr::Transcript, asr::AsrError> {
+            let mut decodes = self.decodes.lock().unwrap();
+            decodes.push((self.ticks.load(Ordering::SeqCst), fs::read(path).unwrap()));
+            Ok(asr::Transcript {
+                text: format!("window {}", decodes.len()),
+                segments: vec![],
+                model: "test".into(),
+                duration_ms: 1,
+            })
+        }
+        async fn shutdown(&self) -> Result<(), asr::AsrError> {
+            Ok(())
+        }
+        async fn reconfigure(&self, _: WorkerCommand) {}
+    }
+
+    /// Decodes (iteration, WAV bytes), then preparations, samples prepared
+    /// and iterations.
+    async fn replay(probes: bool) -> (Vec<(usize, Vec<u8>)>, usize, usize, usize) {
+        let directory = tempfile::tempdir().unwrap();
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let copied = Arc::new(AtomicUsize::new(0));
+        let audio: tokio::sync::Mutex<Box<dyn AudioCapture>> =
+            tokio::sync::Mutex::new(Box::new(GrowingCapture::new(
+                directory.path(),
+                probes,
+                Arc::clone(&ticks),
+                Arc::clone(&snapshots),
+                Arc::clone(&copied),
+            )));
+        let recognizer = RecordingRecognizer {
+            ticks: Arc::clone(&ticks),
+            decodes: std::sync::Mutex::new(vec![]),
+        };
+        let (_cancel, cancel) = watch::channel(false);
+        let (_stop, stopped) = watch::channel(false);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run(
+                &audio,
+                &recognizer,
+                None,
+                None,
+                asr::PreviewDecoding::Standard,
+                cancel,
+                stopped,
+                Duration::from_millis(1),
+                |_| {},
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let decodes = recognizer.decodes.into_inner().unwrap();
+        (
+            decodes,
+            snapshots.load(Ordering::SeqCst),
+            copied.load(Ordering::SeqCst),
+            ticks.load(Ordering::SeqCst),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_gate_skips_preparations_without_changing_any_decoded_window() {
+        let (ungated, ungated_snapshots, ungated_copied, ticks) = replay(false).await;
+        let (gated, gated_snapshots, gated_copied, gated_ticks) = replay(true).await;
+        assert_eq!(ticks, gated_ticks);
+        // Partial windows during speech plus the utterance endpoint.
+        assert!(ungated.len() >= 3, "{} decodes", ungated.len());
+        // Every decode happens on the same iteration with byte-identical audio.
+        assert_eq!(gated.len(), ungated.len());
+        for ((gated_tick, gated_wav), (tick, wav)) in gated.iter().zip(&ungated) {
+            assert_eq!(gated_tick, tick);
+            assert!(gated_wav == wav, "decode at iteration {tick} changed");
+        }
+        // Preparations that remain are mostly short windows (leading
+        // silence, the endpoint); the long ones during speech are skipped.
+        eprintln!(
+            "{gated_snapshots} of {ungated_snapshots} preparations,              {gated_copied} of {ungated_copied} samples"
+        );
+        assert!(gated_snapshots < ungated_snapshots);
+        assert!(gated_copied * 2 <= ungated_copied);
     }
 }

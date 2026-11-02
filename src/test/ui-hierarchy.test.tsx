@@ -126,3 +126,21 @@ test("toggles are switches and cloud consent names use provider display names", 
   expect(screen.getByRole("switch", { name: "OpenAI: Cloud provider consent" }).getAttribute("aria-checked")).toBe("true");
   expect(screen.getByRole("switch", { name: "Gemini: Cloud provider consent" }).getAttribute("aria-checked")).toBe("false");
 });
+
+test("faster live preview is an opt-in for local faster-whisper preview only", () => {
+  const onSave = vi.fn();
+  const view = (settings: typeof defaultSettings) => <I18nProvider language="en"><PrivacyPage settings={settings} settingsLoaded onSave={onSave} /></I18nProvider>;
+  const fastPreview = () => screen.queryByRole("switch", { name: "Faster live preview" }) as HTMLButtonElement | null;
+  const app = render(view(defaultSettings));
+  expect(fastPreview()?.getAttribute("aria-checked")).toBe("false");
+  fireEvent.click(fastPreview()!);
+  expect(onSave).toHaveBeenCalledWith({ livePreviewFastDecode: true });
+  app.rerender(view({ ...defaultSettings, livePreviewFastDecode: true }));
+  expect(fastPreview()?.getAttribute("aria-checked")).toBe("true");
+  app.rerender(view({ ...defaultSettings, livePreviewEnabled: false }));
+  expect(fastPreview()?.disabled).toBe(true);
+  for (const asrBackend of ["openai-compatible", "vibevoice"] as const) {
+    app.rerender(view({ ...defaultSettings, asrBackend }));
+    expect(fastPreview()).toBeNull();
+  }
+});

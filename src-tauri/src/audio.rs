@@ -60,6 +60,14 @@ pub trait AudioCapture: Send {
     fn start(&mut self, config: CaptureConfig) -> AudioFuture<'_, ()>;
     /// Copy current audio without stopping or consuming the recording buffer.
     fn snapshot(&self, since: Duration) -> Result<AudioSnapshot, AudioError>;
+    /// How much audio follows `since`, with a copy of only the raw audio
+    /// after `new_from`, so a caller can decide whether a full `snapshot` is
+    /// worth taking. `None` when the capture cannot tell; the caller then
+    /// takes the snapshot as usual.
+    fn probe(&self, since: Duration, new_from: Duration) -> Result<Option<AudioProbe>, AudioError> {
+        let _ = (since, new_from);
+        Ok(None)
+    }
     fn stop(&mut self) -> AudioFuture<'_, AudioArtifact>;
     fn cancel(&mut self) -> AudioFuture<'_, ()>;
     #[cfg(test)]
@@ -165,6 +173,11 @@ pub struct AudioSnapshot {
 }
 
 impl AudioSnapshot {
+    /// Length of the raw audio, before resampling and enhancement.
+    pub(crate) fn duration(&self) -> Duration {
+        samples_to_duration(self.samples.len(), self.input_sample_rate)
+    }
+
     /// Processing and disk I/O run outside the capture lock and callback.
     #[cfg(test)]
     pub fn into_artifact(self) -> Result<AudioArtifact, AudioError> {
@@ -183,6 +196,66 @@ impl AudioSnapshot {
             config,
         }
     }
+}
+
+/// The newest raw audio of a recording (see `AudioCapture::probe`).
+pub struct AudioProbe {
+    /// Audio captured after `since`.
+    duration: Duration,
+    /// Raw mono samples captured after `new_from`.
+    tail: Vec<f32>,
+    input_sample_rate: u32,
+    enhancement: AudioEnhancementConfig,
+    vad: EnergyVadConfig,
+}
+
+impl AudioProbe {
+    pub(crate) fn duration(&self) -> Duration {
+        self.duration
+    }
+
+    /// Time after the last `frame`-long tail frame whose raw level means it
+    /// will be voice after enhancement, judging voice as a processed RMS of
+    /// `voice_ratio` x the VAD threshold. `None` when no tail frame is
+    /// certainly voice; quiet raw audio may still be voice once enhanced.
+    pub(crate) fn quiet_after_voice(&self, frame: Duration, voice_ratio: f32) -> Option<Duration> {
+        let floor = dsp::raw_voice_floor(self.enhancement, voice_ratio * self.vad.rms_threshold);
+        let frame_len = duration_to_samples(frame, self.input_sample_rate).max(1);
+        let frames = self.tail.len().div_ceil(frame_len);
+        (0..frames).rev().find_map(|index| {
+            let start = index * frame_len;
+            let end = (start + frame_len).min(self.tail.len());
+            (centered_rms(&self.tail[start..end]) >= floor)
+                .then(|| samples_to_duration(self.tail.len() - end, self.input_sample_rate))
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(duration: Duration, tail: Vec<f32>, config: &CaptureConfig) -> Self {
+        Self {
+            duration,
+            tail,
+            input_sample_rate: TARGET_SAMPLE_RATE,
+            enhancement: config.enhancement,
+            vad: config.vad,
+        }
+    }
+}
+
+/// RMS around the frame's mean, so a DC offset never looks like voice.
+/// Non-finite input yields NaN, which compares as not voiced.
+fn centered_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let count = samples.len() as f64;
+    let mean = samples.iter().map(|v| f64::from(*v)).sum::<f64>() / count;
+    let energy = samples
+        .iter()
+        .map(|v| (f64::from(*v) - mean).powi(2))
+        .sum::<f64>()
+        / count;
+    energy.sqrt() as f32
 }
 
 /// Enhanced audio shared by endpoint analysis and recognition. Applying gain
@@ -585,6 +658,34 @@ impl AudioCapture for CpalAudioCapture {
             input_sample_rate: active.input_sample_rate,
             config: active.config.clone(),
         })
+    }
+
+    fn probe(&self, since: Duration, new_from: Duration) -> Result<Option<AudioProbe>, AudioError> {
+        if !self.is_recording() {
+            return Err(AudioError::NotCapturing);
+        }
+        let active = self.active.as_ref().ok_or(AudioError::NotCapturing)?;
+        let shared = active
+            .shared
+            .lock()
+            .map_err(|_| AudioError::StreamFailure("capture buffer lock poisoned".into()))?;
+        if let Some(message) = &shared.stream_error {
+            return Err(AudioError::StreamFailure(message.clone()));
+        }
+        let rate = active.input_sample_rate;
+        // The same index rounding as `snapshot`, so durations line up.
+        let index = |at: Duration| {
+            ((at.as_secs_f64() * f64::from(rate)).round() as usize).min(shared.samples.len())
+        };
+        let start = index(since);
+        let tail = index(new_from).max(start);
+        Ok(Some(AudioProbe {
+            duration: samples_to_duration(shared.samples.len() - start, rate),
+            tail: shared.samples[tail..].to_vec(),
+            input_sample_rate: rate,
+            enhancement: active.config.enhancement,
+            vad: active.config.vad,
+        }))
     }
 
     fn list_devices(&self) -> AudioFuture<'_, Vec<AudioDevice>> {
@@ -1252,6 +1353,51 @@ mod tests {
                 },
             }),
         }
+    }
+
+    #[test]
+    fn probe_copies_only_the_unseen_tail_and_finds_certain_voice() {
+        let directory = tempfile::tempdir().unwrap();
+        // 1 s of speech, then 0.5 s of a pure DC offset (not voice).
+        let mut samples: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.1).sin() * 0.2).collect();
+        samples.extend(std::iter::repeat_n(0.3, 12_000));
+        let shared = Arc::new(Mutex::new(SharedCapture {
+            samples,
+            recording: true,
+            ..SharedCapture::default()
+        }));
+        let capture = recording_capture(&shared, directory.path());
+        let frame = Duration::from_millis(20);
+        let probe = capture
+            .probe(Duration::from_millis(250), Duration::from_millis(760))
+            .unwrap()
+            .unwrap();
+        assert_eq!(probe.duration(), Duration::from_millis(1_250));
+        // Frames start at the tail; speech ends on a frame boundary here.
+        assert_eq!(probe.tail.len(), 17_760);
+        assert_eq!(
+            probe.quiet_after_voice(frame, 0.2),
+            Some(Duration::from_millis(500))
+        );
+        // Only the offset is unseen: nothing in it is certainly voice.
+        let quiet = capture
+            .probe(Duration::ZERO, Duration::from_millis(1_000))
+            .unwrap()
+            .unwrap();
+        assert_eq!(quiet.tail.len(), 12_000);
+        assert_eq!(quiet.quiet_after_voice(frame, 0.2), None);
+        // A boundary before `since` never copies audio before it.
+        let clamped = capture
+            .probe(Duration::from_millis(1_400), Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        assert_eq!(clamped.tail.len(), 2_400);
+        // The stream error that fails a snapshot fails a probe too.
+        shared.lock().unwrap().stream_error = Some("device disconnected".into());
+        assert!(matches!(
+            capture.probe(Duration::ZERO, Duration::ZERO),
+            Err(AudioError::StreamFailure(_))
+        ));
     }
 
     #[tokio::test]

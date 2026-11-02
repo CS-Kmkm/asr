@@ -37,6 +37,35 @@ pub(super) fn enhance_audio_with_vad(
     }
 }
 
+/// Lowest gain `enhance_audio_with_vad` can apply to any frame: automatic
+/// gain is clamped to at least 0.5 and noise suppression never attenuates a
+/// frame below its level's minimum gain.
+fn minimum_enhancement_gain(config: AudioEnhancementConfig) -> f32 {
+    let automatic = if config.automatic_gain { 0.5 } else { 1.0 };
+    let suppression = match config.noise_suppression {
+        NoiseSuppressionLevel::Off => 1.0,
+        NoiseSuppressionLevel::Low => 0.45,
+        NoiseSuppressionLevel::Medium => 0.2,
+        NoiseSuppressionLevel::High => 0.08,
+    };
+    config.gain * automatic * suppression
+}
+
+/// Raw (pre-enhancement) frame RMS, after removing the frame's DC offset, at
+/// or above which the enhanced frame is expected to reach `processed_rms`
+/// whatever the rest of the recording does to the whole-window gain and
+/// noise floor. The factor of two leaves room for the high-pass and
+/// anti-alias filters and for frame alignment. It is a cheap estimate for
+/// skipping work, never a substitute for analysing the enhanced audio.
+pub(super) fn raw_voice_floor(config: AudioEnhancementConfig, processed_rms: f32) -> f32 {
+    let gain = minimum_enhancement_gain(config);
+    if gain.is_finite() && gain > 0.0 {
+        2.0 * processed_rms / gain
+    } else {
+        f32::INFINITY
+    }
+}
+
 fn sanitize_and_high_pass(samples: &mut [f32], sample_rate: u32) {
     let cutoff_hz = 70.0f32;
     let dt = 1.0 / sample_rate as f32;
@@ -291,5 +320,58 @@ mod tests {
         let before = dense.clone();
         suppress_stationary_noise(&mut dense, 24_000, NoiseSuppressionLevel::High, vad);
         assert_eq!(dense, before);
+    }
+
+    #[test]
+    fn a_frame_at_the_raw_voice_floor_stays_voiced_after_enhancement() {
+        let rate = 16_000;
+        let processed = 0.002;
+        let tone = |seconds: f32, rms: f32| -> Vec<f32> {
+            (0..(seconds * rate as f32) as usize)
+                .map(|i| {
+                    (i as f32 * 2.0 * std::f32::consts::PI * 300.0 / rate as f32).sin()
+                        * rms
+                        * 2f32.sqrt()
+                })
+                .collect()
+        };
+        for level in [
+            NoiseSuppressionLevel::Off,
+            NoiseSuppressionLevel::Low,
+            NoiseSuppressionLevel::Medium,
+            NoiseSuppressionLevel::High,
+        ] {
+            for gain in [0.5, 1.0, 2.0] {
+                for automatic_gain in [false, true] {
+                    let config = AudioEnhancementConfig {
+                        noise_suppression: level,
+                        gain,
+                        automatic_gain,
+                    };
+                    let floor = raw_voice_floor(config, processed);
+                    // Loud speech pushes automatic gain to its minimum and
+                    // near-threshold room noise raises the suppression floor.
+                    let mut samples = tone(1.0, 0.6);
+                    samples.extend(tone(0.5, 0.009));
+                    let start = samples.len();
+                    samples.extend(tone(0.2, floor.min(0.6)));
+                    let end = samples.len();
+                    samples.extend(tone(0.5, 0.009));
+                    enhance_audio_with_vad(&mut samples, rate, config, EnergyVadConfig::default());
+                    for frame in samples[start..end].chunks(320) {
+                        assert!(
+                            meter(frame).rms >= processed,
+                            "{level:?} gain {gain} automatic {automatic_gain}: {}",
+                            meter(frame).rms
+                        );
+                    }
+                }
+            }
+        }
+        let silent = AudioEnhancementConfig {
+            gain: 0.0,
+            ..AudioEnhancementConfig::default()
+        };
+        assert_eq!(raw_voice_floor(silent, processed), f32::INFINITY);
     }
 }

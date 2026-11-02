@@ -254,6 +254,17 @@ pub enum AsrError {
     Worker(WorkerError),
 }
 
+/// How a live-preview request asks the worker to decode. Final recognition
+/// never sends a preview request, so it always uses the worker defaults.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PreviewDecoding {
+    /// The same decoding as final recognition.
+    #[default]
+    Standard,
+    /// A single-candidate (greedy) decode, where the backend supports one.
+    Greedy,
+}
+
 #[async_trait]
 #[allow(
     clippy::double_must_use,
@@ -327,6 +338,20 @@ pub trait Transcriber: Send + Sync {
     ) -> Result<Transcript, AsrError> {
         let _ = locale;
         self.transcribe(audio_path, prompt, cancel).await
+    }
+    /// A live-preview request. `decoding` may ask for a cheaper decode than
+    /// final recognition, which uses `transcribe_with_locale` instead.
+    async fn transcribe_preview(
+        &self,
+        audio_path: &Path,
+        prompt: Option<&str>,
+        locale: Option<&str>,
+        decoding: PreviewDecoding,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Transcript, AsrError> {
+        let _ = decoding;
+        self.transcribe_with_locale(audio_path, prompt, locale, cancel)
+            .await
     }
     async fn shutdown(&self) -> Result<(), AsrError>;
     /// Reconfigure the worker command (for example when the ASR backend
@@ -679,22 +704,71 @@ impl JsonlTranscriber {
                 message: "Speech worker resources are missing".into(),
             }));
         }
-        if let Some(provision) = &command_spec.provision {
-            let _ = self.progress.send(LoadProgress {
-                stage: "setup".into(),
-                model: None,
-                completed_bytes: None,
-                total_bytes: None,
-            });
-            until_cancelled(
-                timeout(self.load_timeout, provision.prepare()),
-                cancel,
-                interrupt,
-            )
-            .await
-            .map_err(|_| AsrError::Cancelled)?
-            .map_err(|_| AsrError::Timeout)??;
+        let Some(provision) = &command_spec.provision else {
+            return self.start_process(command_spec, cancel, interrupt).await;
+        };
+        if !provision.is_synced_async().await {
+            self.provision(provision, cancel, interrupt).await?;
+            return self.start_process(command_spec, cancel, interrupt).await;
         }
+        // The environment still matches its last successful sync, so this
+        // spawn skipped it. A worker that then cannot start or import gets one
+        // full sync as a repair before the error is reported.
+        match self.start_process(command_spec, cancel, interrupt).await {
+            Err(error) if Self::repairable_start(&error) => {
+                self.provision(provision, cancel, interrupt).await?;
+                self.start_process(command_spec, cancel, interrupt).await
+            }
+            result => result,
+        }
+    }
+
+    /// A load failure that reports a backend package as not installed.
+    fn missing_dependency(error: &AsrError) -> bool {
+        matches!(error, AsrError::Worker(worker) if worker.code == "backend_unavailable")
+    }
+
+    /// Start failures a dependency sync could fix: the interpreter would not
+    /// run, or the worker exited, hung or answered garbage before its
+    /// handshake. A cancellation or a worker that answered (for example with
+    /// a version mismatch) is not one.
+    fn repairable_start(error: &AsrError) -> bool {
+        matches!(
+            error,
+            AsrError::Io(_) | AsrError::Protocol(_) | AsrError::Crashed | AsrError::Timeout
+        )
+    }
+
+    /// Sync the bundled worker environment, reporting it as the setup stage.
+    async fn provision(
+        &self,
+        provision: &crate::worker_setup::Provision,
+        cancel: &mut Option<watch::Receiver<bool>>,
+        interrupt: &mut watch::Receiver<u64>,
+    ) -> Result<(), AsrError> {
+        let _ = self.progress.send(LoadProgress {
+            stage: "setup".into(),
+            model: None,
+            completed_bytes: None,
+            total_bytes: None,
+        });
+        until_cancelled(
+            timeout(self.load_timeout, provision.prepare()),
+            cancel,
+            interrupt,
+        )
+        .await
+        .map_err(|_| AsrError::Cancelled)?
+        .map_err(|_| AsrError::Timeout)?
+    }
+
+    /// Start the worker process and complete its handshake.
+    async fn start_process(
+        &self,
+        command_spec: &WorkerCommand,
+        cancel: &mut Option<watch::Receiver<bool>>,
+        interrupt: &mut watch::Receiver<u64>,
+    ) -> Result<RunningWorker, AsrError> {
         // stderr carries the worker's internal_error details; persist it to the
         // rotating worker log when the app installed one.
         let mut command = worker_process_command(command_spec, crate::worker_log::is_installed());
@@ -1004,7 +1078,18 @@ impl JsonlTranscriber {
             Ok(Err(error)) => {
                 // The worker unloads its previous model before loading.
                 state.loaded_quantization = None;
-                if Self::requires_reset(&error) {
+                if let Some(provision) = state
+                    .command
+                    .provision
+                    .as_ref()
+                    .filter(|_| Self::missing_dependency(&error))
+                {
+                    // A skipped sync cannot catch a package that only the model
+                    // load imports. Forget the sync and restart the worker, so
+                    // the next load repairs the environment with a full sync.
+                    provision.forget_sync();
+                    state.reset().await;
+                } else if Self::requires_reset(&error) {
                     state.reset().await;
                 } else {
                     state.mark_not_resident();
@@ -1127,20 +1212,53 @@ fn load_request(id: u64, quantization: &str) -> Value {
 
 /// JSONL `transcribe` request. `language` carries the full speech locale tag
 /// (or null for automatic detection); the worker backend decides how much of
-/// it to honor.
+/// it to honor. Only a greedy preview request carries `decoding`, so every
+/// other request is exactly the request sent before that field existed.
 fn transcribe_request(
     id: u64,
     audio_path: &Path,
     prompt: Option<&str>,
     locale: Option<&str>,
+    decoding: PreviewDecoding,
 ) -> Value {
-    json!({
+    let mut request = json!({
         "id": id,
         "command": "transcribe",
         "audio_path": audio_path,
         "prompt": prompt,
         "language": locale,
-    })
+    });
+    if decoding == PreviewDecoding::Greedy {
+        request["decoding"] = json!("greedy");
+    }
+    request
+}
+
+impl JsonlTranscriber {
+    async fn transcribe_with_decoding(
+        &self,
+        audio_path: &Path,
+        prompt: Option<&str>,
+        locale: Option<&str>,
+        decoding: PreviewDecoding,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Transcript, AsrError> {
+        let request = transcribe_request(self.next_id(), audio_path, prompt, locale, decoding);
+        let response_timeout = transcription_timeout(
+            self.request_timeout,
+            wav_file_duration(audio_path).unwrap_or_default(),
+        );
+        let response = self
+            .protocol_request(request, cancel, response_timeout, true)
+            .await?;
+        match serde_json::from_value(response) {
+            Ok(transcript) => Ok(transcript),
+            Err(error) => {
+                self.reset().await;
+                Err(AsrError::Protocol(error.to_string()))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1265,21 +1383,26 @@ impl Transcriber for JsonlTranscriber {
         locale: Option<&str>,
         cancel: watch::Receiver<bool>,
     ) -> Result<Transcript, AsrError> {
-        let request = transcribe_request(self.next_id(), audio_path, prompt, locale);
-        let response_timeout = transcription_timeout(
-            self.request_timeout,
-            wav_file_duration(audio_path).unwrap_or_default(),
-        );
-        let response = self
-            .protocol_request(request, cancel, response_timeout, true)
-            .await?;
-        match serde_json::from_value(response) {
-            Ok(transcript) => Ok(transcript),
-            Err(error) => {
-                self.reset().await;
-                Err(AsrError::Protocol(error.to_string()))
-            }
-        }
+        self.transcribe_with_decoding(
+            audio_path,
+            prompt,
+            locale,
+            PreviewDecoding::Standard,
+            cancel,
+        )
+        .await
+    }
+
+    async fn transcribe_preview(
+        &self,
+        audio_path: &Path,
+        prompt: Option<&str>,
+        locale: Option<&str>,
+        decoding: PreviewDecoding,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Transcript, AsrError> {
+        self.transcribe_with_decoding(audio_path, prompt, locale, decoding, cancel)
+            .await
     }
 
     async fn shutdown(&self) -> Result<(), AsrError> {
@@ -1488,17 +1611,43 @@ mod tests {
     #[test]
     fn transcribe_request_carries_the_speech_locale() {
         let path = Path::new("recording.wav");
-        let request = transcribe_request(7, path, Some("terms"), Some("en-GB"));
+        let request = transcribe_request(
+            7,
+            path,
+            Some("terms"),
+            Some("en-GB"),
+            PreviewDecoding::Standard,
+        );
         assert_eq!(request["command"], "transcribe");
         assert_eq!(request["language"], "en-GB");
         assert_eq!(request["prompt"], "terms");
-        let automatic = transcribe_request(8, path, None, None);
+        let automatic = transcribe_request(8, path, None, None, PreviewDecoding::Standard);
         assert!(automatic
             .as_object()
             .unwrap()
             .get("language")
             .unwrap()
             .is_null());
+    }
+
+    #[test]
+    fn only_a_greedy_preview_request_carries_a_decoding_field() {
+        let path = Path::new("recording.wav");
+        let standard = transcribe_request(1, path, None, None, PreviewDecoding::Standard);
+        assert!(standard.as_object().unwrap().get("decoding").is_none());
+        assert_eq!(
+            standard,
+            json!({
+                "id": 1,
+                "command": "transcribe",
+                "audio_path": path,
+                "prompt": null,
+                "language": null,
+            })
+        );
+        let greedy = transcribe_request(2, path, None, None, PreviewDecoding::Greedy);
+        assert_eq!(greedy["decoding"], "greedy");
+        assert_eq!(PreviewDecoding::default(), PreviewDecoding::Standard);
     }
 
     #[test]
@@ -2571,6 +2720,174 @@ sys.stdin.read()
                 ["load 4bit", "transcribe", "transcribe"]
             );
             assert_eq!(mock.processes(), 1);
+            transcriber.shutdown().await.unwrap();
+        }
+
+        /// A bundled-worker layout whose `uv` is the test interpreter: run
+        /// as `uv sync ...` from the project directory, it executes the
+        /// `sync` script there, which logs the run and, when `installs`,
+        /// makes the worker importable by copying it to where the worker
+        /// command imports it from. Nothing is downloaded.
+        struct FakeProvision {
+            directory: tempfile::TempDir,
+            provision: crate::worker_setup::Provision,
+            command: WorkerCommand,
+        }
+
+        impl FakeProvision {
+            fn new(installs: bool) -> Option<Self> {
+                let python = python()?;
+                let directory = tempfile::tempdir().unwrap();
+                let source = directory.path().join("worker");
+                let site = directory.path().join("site");
+                std::fs::create_dir_all(&source).unwrap();
+                std::fs::create_dir_all(&site).unwrap();
+                std::fs::write(source.join("uv.lock"), "lock").unwrap();
+                std::fs::write(source.join("pyproject.toml"), "[project]").unwrap();
+                let quoted = |path: &Path| format!("{:?}", path.to_string_lossy());
+                let script = format!(
+                    "import shutil\n\
+                     with open({log}, 'a') as log:\n    log.write('sync\\n')\n\
+                     if {installs}:\n    shutil.copytree({worker}, {target}, dirs_exist_ok=True, \
+                     ignore=shutil.ignore_patterns('tests', '__pycache__'))\n",
+                    log = quoted(&directory.path().join("sync.log")),
+                    installs = if installs { "True" } else { "False" },
+                    worker = quoted(&repository_root().join("asr_worker")),
+                    target = quoted(&site.join("asr_worker")),
+                );
+                std::fs::write(source.join("sync"), script).unwrap();
+                let provision = crate::worker_setup::Provision {
+                    source,
+                    environment: directory.path().join("runtime"),
+                    vibevoice: false,
+                    uv: python.clone().into(),
+                };
+                // What uv would have created: the environment's interpreter
+                // (never run here) and its configuration.
+                std::fs::create_dir_all(provision.python().parent().unwrap()).unwrap();
+                std::fs::write(provision.python(), b"").unwrap();
+                std::fs::write(provision.environment.join("pyvenv.cfg"), "home = test").unwrap();
+                let mut command = WorkerCommand::python(python)
+                    .with_backend("mock")
+                    .with_current_dir(directory.path());
+                command
+                    .env
+                    .push(("PYTHONPATH".into(), site.to_string_lossy().into_owned()));
+                command.provision = Some(provision.clone());
+                Some(Self {
+                    directory,
+                    provision,
+                    command,
+                })
+            }
+
+            fn transcriber(&self) -> JsonlTranscriber {
+                JsonlTranscriber::new(
+                    self.command.clone(),
+                    Duration::from_secs(20),
+                    Duration::from_secs(20),
+                )
+            }
+
+            fn syncs(&self) -> usize {
+                std::fs::read_to_string(self.directory.path().join("sync.log"))
+                    .unwrap_or_default()
+                    .lines()
+                    .count()
+            }
+        }
+
+        fn setup_reported(progress: &mut broadcast::Receiver<LoadProgress>) -> bool {
+            std::iter::from_fn(|| progress.try_recv().ok()).any(|update| update.stage == "setup")
+        }
+
+        #[tokio::test]
+        async fn a_matching_environment_starts_the_worker_without_a_sync() {
+            let Some(fake) = FakeProvision::new(true) else {
+                return;
+            };
+            fake.provision.prepare().await.unwrap();
+            assert_eq!(fake.syncs(), 1);
+            let transcriber = fake.transcriber();
+            let mut progress = transcriber.load_progress().unwrap();
+            assert_eq!(transcriber.health().await.unwrap().backend, "mock");
+            assert_eq!(fake.syncs(), 1, "the recorded sync was reused");
+            assert!(!setup_reported(&mut progress));
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn an_unrecorded_environment_is_synced_before_the_worker_starts() {
+            let Some(fake) = FakeProvision::new(true) else {
+                return;
+            };
+            let transcriber = fake.transcriber();
+            let mut progress = transcriber.load_progress().unwrap();
+            assert_eq!(transcriber.health().await.unwrap().backend, "mock");
+            assert_eq!(fake.syncs(), 1);
+            assert!(setup_reported(&mut progress));
+            assert!(fake.provision.is_synced());
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_worker_that_fails_after_a_skipped_sync_is_repaired_once() {
+            let Some(fake) = FakeProvision::new(true) else {
+                return;
+            };
+            // The marker matches, but the environment lost the worker's
+            // imports, so the first start fails.
+            fake.provision.record_sync();
+            let transcriber = fake.transcriber();
+            let mut progress = transcriber.load_progress().unwrap();
+            assert_eq!(transcriber.health().await.unwrap().backend, "mock");
+            assert_eq!(fake.syncs(), 1);
+            assert!(setup_reported(&mut progress));
+            transcriber.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_repair_that_does_not_help_reports_the_start_failure() {
+            let Some(fake) = FakeProvision::new(false) else {
+                return;
+            };
+            fake.provision.record_sync();
+            let transcriber = fake.transcriber();
+            let result = transcriber.health().await;
+            assert!(
+                matches!(
+                    result,
+                    Err(AsrError::Crashed | AsrError::Io(_) | AsrError::Protocol(_))
+                ),
+                "{result:?}"
+            );
+            assert_eq!(fake.syncs(), 1, "one repair per start, not a loop");
+            assert!(transcriber.state.lock().await.running.is_none());
+        }
+
+        #[tokio::test]
+        async fn a_model_load_missing_a_package_makes_the_next_load_sync_again() {
+            let Some(mut fake) = FakeProvision::new(true) else {
+                return;
+            };
+            fake.provision.prepare().await.unwrap();
+            assert_eq!(fake.syncs(), 1);
+            // The worker starts, but the model load finds a package missing.
+            fake.command
+                .env
+                .push(("ASR_WORKER_MOCK_LOAD_ERROR".into(), "missing".into()));
+            let transcriber = fake.transcriber();
+            let result = transcriber.load("4bit").await;
+            assert!(
+                matches!(&result, Err(AsrError::Worker(error)) if error.code == "backend_unavailable"),
+                "{result:?}"
+            );
+            assert_eq!(fake.syncs(), 1, "the matching environment was reused");
+            assert!(!fake.provision.is_synced());
+            assert!(transcriber.state.lock().await.running.is_none());
+            // The next load restarts the worker after a full sync.
+            let _ = transcriber.load("4bit").await;
+            assert_eq!(fake.syncs(), 2);
             transcriber.shutdown().await.unwrap();
         }
 

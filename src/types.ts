@@ -98,6 +98,8 @@ export interface Settings {
   personalizationEnabled: boolean;
   globalStyleProfile: StyleProfile | null;
   scopedStyleProfiles: ScopedStyleProfile[];
+  /** Live preview only: greedy (single-candidate) decoding on faster-whisper. */
+  livePreviewFastDecode: boolean;
 }
 /**
  * Stored settings with the backend revision of the write that stored them.
@@ -282,4 +284,11 @@ export interface DictionaryCandidate {
   confidence: number;
   historyId: number | null;
   createdAt: string;
+}
+
+/** Unvalidated, in-progress Ask generation shown only in the answer panel; `active: false` withdraws it. */
+export interface AskAnswerPreview {
+  operationId: number;
+  text: string;
+  active: boolean;
 }

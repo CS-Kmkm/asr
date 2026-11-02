@@ -419,6 +419,31 @@ with _isolate_protocol_stdout() as output:
         self.assertTrue(response["ok"])
         self.assertEqual(backend.locale, "en-GB")
 
+    def test_only_a_flagged_request_passes_greedy_decoding(self) -> None:
+        class CapturingBackend(MockBackend):
+            calls: list[tuple] = []
+
+            def transcribe(self, audio_path, prompt, language=None, *args):  # type: ignore[no-untyped-def]
+                self.calls.append(args)
+                return super().transcribe(audio_path, prompt, language)
+
+        backend = CapturingBackend()
+        worker = Worker(backend)
+        worker.handle({"id": 1, "command": "load"})
+        with tempfile.NamedTemporaryFile(suffix=".wav") as audio:
+            request = {"command": "transcribe", "audio_path": audio.name}
+            final, _ = worker.handle({"id": 2, **request})
+            explicit_null, _ = worker.handle({"id": 3, **request, "decoding": None})
+            preview, _ = worker.handle({"id": 4, **request, "decoding": "greedy"})
+            rejected = [
+                worker.handle({"id": 5, **request, "decoding": value})[0]
+                for value in ["beam", "", ["greedy"], {"greedy": True}, 1]
+            ]
+        self.assertTrue(final["ok"] and explicit_null["ok"] and preview["ok"])
+        # A request without the flag calls the backend exactly as before.
+        self.assertEqual(backend.calls, [(), (), ("greedy",)])
+        self.assertTrue(all(response["error"]["code"] == "invalid_request" for response in rejected))
+
 
 class _ProgressBackend(MockBackend):
     def load(self, quantization: str) -> None:

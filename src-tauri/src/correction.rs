@@ -380,13 +380,27 @@ pub async fn generate_ask_text(
     instruction: &str,
     cancel: watch::Receiver<bool>,
 ) -> Result<String, CorrectionError> {
+    generate_ask_text_streaming(settings, input, instruction, cancel, |_| {}).await
+}
+
+/// The same single generation request as [`generate_ask_text`], forwarding
+/// each visible streamed delta to `on_update`. Deltas are untrusted partial
+/// model text for display only: callers must never parse, store or act on
+/// them, and the returned text stays the only validated result.
+pub async fn generate_ask_text_streaming(
+    settings: &Settings,
+    input: &str,
+    instruction: &str,
+    cancel: watch::Receiver<bool>,
+    on_update: impl FnMut(&str),
+) -> Result<String, CorrectionError> {
     let instruction = ask_instruction(instruction, settings);
     request_text(
         settings,
         input,
         &instruction,
         cancel,
-        |_| {},
+        on_update,
         true,
         OutputBudget::AskText,
     )
@@ -1670,6 +1684,30 @@ mod tests {
             socket.write_all(response.as_bytes()).unwrap();
         });
         (port, handler)
+    }
+
+    #[tokio::test]
+    async fn ask_generation_streams_visible_deltas_and_returns_the_trimmed_answer() {
+        let (port, handler) = serve_local_events_once(&[
+            r#"{"choices":[{"delta":{"content":"<think>hidden</think>"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":"\nThe answer"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":" is 42. "},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let mut preview = String::new();
+        let result = generate_ask_text_streaming(
+            &local_settings(port),
+            "input",
+            "fixed answer contract",
+            cancel,
+            |delta| preview.push_str(delta),
+        )
+        .await;
+        handler.join().unwrap();
+        assert_eq!(result.unwrap(), "The answer is 42.");
+        assert!(!preview.contains("hidden"));
+        assert_eq!(preview.trim(), "The answer is 42.");
     }
 
     #[tokio::test]

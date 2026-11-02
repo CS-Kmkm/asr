@@ -109,7 +109,11 @@ PATH に追加するか `ASR_UV` へ実行ファイルを指定してくださ�
 開発環境は配布版の実行には不要です。Setup でモデルを読み込むと、uv が Python 3.12 と
 必要なパッケージをユーザーデータ内へ構築します。初回はネットワークと空き容量が必要です。
 GPU 用の VibeVoice は追加依存を取得します。構築に失敗した場合は表示された案内に従い、
-再度モデルを読み込んでください。
+再度モデルを読み込んでください。構築に成功すると、依存ロック・アプリのバージョン・
+選択した追加依存などから求めた指紋を環境内に記録し、以降のワーカー起動では指紋が
+一致する間は依存の同期を省きます。省いた状態でワーカーが起動できなかった場合は、
+一度だけ同期をやり直してから再起動します。モデルの読み込みで依存パッケージの不足が報告された場合は、記録した
+指紋を消してワーカーを止め、次の読み込みで同期をやり直します。
 
 Setup では、モデル読み込み後に「音声認識をテスト」で録音し、停止して認識結果を
 確認できます。このテストでは AI 補正・文字挿入・履歴保存は行いません。一時録音は
@@ -348,6 +352,10 @@ Askの計画は、[OpenAIのStructured Outputs](https://developers.openai.com/ap
 [Gemini Interactionsの構造化出力](https://ai.google.dev/gemini-api/docs/structured-output)・対応するローカルAPIの
 JSON Schemaを要求します。OpenAIの古いモデルや対応を確認できないIDでは、従来どおりプロンプトでJSONを要求します。
 受信後はどちらも厳密に解析・権限判定し、形式の修復や別の操作への置換はしません。
+回答パネルに表示する回答（質問への回答・要約・説明など）は、生成中の文章を「回答を生成中…」の印付きプレビューとして
+同じパネルにだけ表示し（約100msごとに更新、読み上げ対象外）、完了後に確定した回答で置き換えます。
+プレビュー中はコピー・閉じるを無効にし、失敗やキャンセルではプレビューを取り消します。
+選択文の置換やカーソル位置への下書きは、従来どおり完成後にだけ挿入します。
 
 To keep API cost and latency low, the editor uses a compact instruction, sends
 only dictionary aliases actually found in the transcript, caps optional style
@@ -502,6 +510,11 @@ Full usage and Phase 0 gate criteria are documented in
   default for local backends (including VibeVoice) and off for OpenAI-compatible speech; enabling it
   with cloud speech causes multiple audio uploads. Privacy controls local and
   cloud preview separately; a local opt-in never enables cloud uploads.
+  With faster-whisper, Privacy's "Faster live preview" (off by default) asks
+  the worker to decode preview requests greedily (one candidate instead of
+  beam search) to lower load while recording; VAD and other options stay the
+  same, preview text may be less accurate, and the final transcription after
+  stopping always uses the normal decode.
 - History can be disabled; when disabled, transcript rows are not written
   (failed recordings kept for Retry are the exception described below).
 - 履歴は本文検索と追加読み込みに対応しています。録音を削除した後も「原文をコピー」「再補正」「指定言語へ翻訳」を使えます。

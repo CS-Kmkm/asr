@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, TextIO
 
-from .backends import Backend, BackendError, CancelCheck, QUANTIZATIONS, cancelled_error, create_backend
+from .backends import DECODINGS, Backend, BackendError, CancelCheck, QUANTIZATIONS, cancelled_error, create_backend
 from .diagnostics import log_exception
 from .decision import DecisionModel
 
@@ -218,12 +218,24 @@ class Worker:
                         "invalid_request",
                         "language must be a short string or null",
                     ), False
+                decoding = request.get("decoding")
+                if decoding is not None and (not isinstance(decoding, str) or decoding not in DECODINGS):
+                    return error_response(
+                        request_id,
+                        "invalid_request",
+                        "decoding must be greedy or null",
+                    ), False
                 if cancel_requested is not None and cancel_requested():
                     raise cancelled_error()
                 started = time.perf_counter()
                 self.backend.cancel_requested = cancel_requested
                 try:
-                    text, segments = self.backend.transcribe(audio_path, prompt, language)
+                    # Only a flagged (live-preview) request passes a decoding
+                    # hint; every other request keeps the backend defaults.
+                    if decoding is None:
+                        text, segments = self.backend.transcribe(audio_path, prompt, language)
+                    else:
+                        text, segments = self.backend.transcribe(audio_path, prompt, language, decoding)
                 finally:
                     self.backend.cancel_requested = None
                 # A backend that cannot stop early finishes; its result is

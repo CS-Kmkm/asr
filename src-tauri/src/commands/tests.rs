@@ -2889,3 +2889,79 @@ fn failed_takes_keep_what_retry_needs_for_each_mode() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn already_spawned_blocking_work_is_joined_with_its_result() {
+    let work = tokio::task::spawn_blocking(|| Some("prompt".to_owned()));
+    assert_eq!(join_blocking(work).await.flatten(), Some("prompt".into()));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn selected_text_blocking_work_leaves_the_async_owner_free() {
+    // On a single-threaded runtime, inline blocking work would stall every
+    // other task; on the blocking owner, a timer still fires meanwhile.
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let work = on_blocking_owner(move || {
+        released.recv().unwrap();
+        "captured"
+    });
+    let other_task = async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        release.send(()).unwrap();
+    };
+    let (value, ()) = tokio::join!(work, other_task);
+    assert_eq!(value, Some("captured"));
+}
+
+#[tokio::test]
+async fn a_panic_on_the_blocking_owner_unwinds_the_async_owner() {
+    use futures_util::FutureExt;
+    let unwound = std::panic::AssertUnwindSafe(on_blocking_owner(|| -> u8 {
+        panic!("capture failed");
+    }))
+    .catch_unwind()
+    .await;
+    let payload = unwound.unwrap_err();
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"capture failed"));
+}
+
+/// A command that prints one line and exits, and one that runs far longer
+/// than any test bound, using only tools every test machine has.
+fn quick_and_hung_commands() -> (std::process::Command, std::process::Command) {
+    let piped = |mut command: std::process::Command| {
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        command
+    };
+    if cfg!(windows) {
+        let mut quick = std::process::Command::new("cmd");
+        quick.args(["/C", "echo ready"]);
+        let mut hung = std::process::Command::new("ping");
+        hung.args(["-n", "60", "127.0.0.1"]);
+        (piped(quick), piped(hung))
+    } else {
+        let mut quick = std::process::Command::new("sh");
+        quick.args(["-c", "echo ready"]);
+        let mut hung = std::process::Command::new("sleep");
+        hung.arg("60");
+        (piped(quick), piped(hung))
+    }
+}
+
+#[test]
+fn a_prompt_gpu_query_answer_is_read() {
+    let (mut quick, _) = quick_and_hung_commands();
+    let output = output_within(quick.spawn().unwrap(), Duration::from_secs(10)).unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ready"));
+}
+
+#[test]
+fn a_hung_gpu_query_is_killed_at_the_deadline() {
+    let (_, mut hung) = quick_and_hung_commands();
+    let started = Instant::now();
+    assert!(output_within(hung.spawn().unwrap(), Duration::from_millis(300)).is_none());
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
