@@ -14,6 +14,7 @@ use crate::{
     injection::{InsertResult, InsertionDetail},
     personalization, recording_overlay,
     state::PipelineMode,
+    storage::{TakeOutcome, TakeSpan, TakeStage},
     types::{self, AppPhase, NewHistoryItem, RecordingResult},
 };
 use std::time::Instant;
@@ -78,6 +79,7 @@ async fn finish_owned(
         mut draft,
         // Recorded by the shared stop pipeline after delivery.
         stop_timings: _,
+        trace,
     } = take;
     let metrics = storage.metrics_for(mode, app_context::history_category(app_context.as_ref()));
     let duration_ms = artifact.duration.as_millis() as u64;
@@ -99,7 +101,9 @@ async fn finish_owned(
     // correction. Only a live draft edits the target here; a deferred final
     // paste waits for released keys while settling, so AI need not wait.
     if draft.edits_target_live() {
+        let release_started = Instant::now();
         draft.monitor.wait_for_shortcut_release().await;
+        trace.span_since(TakeSpan::ShortcutRelease, release_started);
     }
     if services.lifecycle.is_cancelled(operation_id) {
         emit_state(app, state, AppPhase::Idle, cancel_message);
@@ -168,6 +172,7 @@ async fn finish_owned(
         )
         .await;
         let translation_ms = translation_started.elapsed().as_millis() as i64;
+        trace.span(TakeSpan::Ai, translation_ms);
         // A failed or cancelled request has no comparable first output.
         first_output_ms = first_output_ms.filter(|_| result.is_ok());
         match classify_ai_stage(result) {
@@ -244,6 +249,7 @@ async fn finish_owned(
         )
         .await;
         let correction_ms = correction_started.elapsed().as_millis() as i64;
+        trace.span(TakeSpan::Ai, correction_ms);
         first_output_ms = first_output_ms.filter(|_| result.is_ok());
         match result {
             Ok(corrected) => {
@@ -286,10 +292,14 @@ async fn finish_owned(
     } else {
         emit_correction_preview(app, &transcript.text, "final");
     }
+    if let Some(first_output_ms) = first_output_ms {
+        trace.span(TakeSpan::AiFirstOutput, first_output_ms);
+    }
     if services.lifecycle.is_cancelled(operation_id) {
         emit_state(app, state, AppPhase::Idle, cancel_message);
         return Err(cancel_error.into());
     }
+    trace.stage(TakeStage::Delivery);
 
     emit_stage(
         app,
@@ -310,6 +320,7 @@ async fn finish_owned(
     // committed and changes nothing.
     let app_for_insertion = app.clone();
     let text_for_insertion = final_text.clone();
+    let trace_for_insertion = trace.clone();
     let runtime = tokio::runtime::Handle::current();
     let (committed, clipboard_lost, insertion_detail, settle_ms, paste_ms) =
         tokio::task::spawn_blocking(move || {
@@ -335,6 +346,16 @@ async fn finish_owned(
                 }
             });
             let paste_ms = paste_started.elapsed().as_millis() as i64;
+            let trace = trace_for_insertion;
+            if let Some(settle_ms) = settle_ms {
+                trace.span(TakeSpan::Settle, settle_ms);
+            }
+            if let CommittedOutput::Ran(inserted) = &committed {
+                trace.span(TakeSpan::Paste, paste_ms);
+                if inserted.is_ok() {
+                    trace.delivered();
+                }
+            }
             let clipboard_lost = draft.injector.take_clipboard_not_restored();
             let insertion_detail = match &committed {
                 CommittedOutput::Ran(Ok(_)) if translation_failed => Some("translation_failed"),
@@ -351,7 +372,10 @@ async fn finish_owned(
                 _ => None,
             };
             recording_overlay::set_phase(&app_for_insertion, &AppPhase::Completed);
+            // Dropping the draft stops its input-monitor helper.
+            let helper_exit_started = Instant::now();
             drop(draft);
+            trace.span_since(TakeSpan::HelperExit, helper_exit_started);
             (
                 committed,
                 clipboard_lost,
@@ -390,6 +414,7 @@ async fn finish_owned(
     // Reserved before the History save so a Delete all that starts from here
     // on also waits for this take's deferred metrics.
     let completion_slot = storage.reserve_completion();
+    let history_save_started = Instant::now();
     let history_save_status = save_history(
         storage,
         &NewHistoryItem {
@@ -420,6 +445,7 @@ async fn finish_owned(
         },
         Some(&artifact.path),
     );
+    trace.span_since(TakeSpan::HistorySave, history_save_started);
     // Only an AI correction of a Dictate transcript proposes a spelling; a
     // translation is a different text, not a correction of the transcript.
     if mode == PipelineMode::Dictate && processed_text.is_some() {
@@ -450,10 +476,12 @@ async fn finish_owned(
         history_save_status,
         artifact_cleanup,
         reservation: completion_slot,
+        trace: trace.clone(),
     };
     let insertion = match insertion_result {
         Ok(insertion) => insertion,
         Err(error) => {
+            trace.outcome(TakeOutcome::InsertionFailed);
             // The clipboard is not overwritten after an insertion error (it
             // may hold data that could not be preserved); keep the text here.
             let _ = app.emit("app-state", state.publish_result(final_text.clone()));
@@ -618,6 +646,7 @@ struct DeferredCompletion {
     history_save_status: crate::pipeline::finish::HistorySaveStatus,
     artifact_cleanup: crate::TempArtifact,
     reservation: crate::storage::CompletionReservation,
+    trace: super::take_trace::TakeTrace,
 }
 
 impl DeferredCompletion {
@@ -635,6 +664,7 @@ impl DeferredCompletion {
             history_save_status,
             artifact_cleanup,
             reservation,
+            trace,
         } = self;
         (
             reservation,
@@ -645,6 +675,7 @@ impl DeferredCompletion {
                 metrics,
                 history_save_status,
                 artifact_cleanup,
+                trace,
             },
         )
     }
@@ -658,12 +689,14 @@ struct CompletionJob {
     metrics: TakeMetrics,
     history_save_status: crate::pipeline::finish::HistorySaveStatus,
     artifact_cleanup: crate::TempArtifact,
+    trace: super::take_trace::TakeTrace,
 }
 
 impl CompletionJob {
     /// Writes the metrics, reports a persistence failure with the same
     /// status as before, then removes the temporary capture.
     fn run(mut self) {
+        let job_started = Instant::now();
         let metric_failed = self.metrics.record(self.storage.metrics_for(
             self.metrics.mode,
             app_context::history_category(self.app_context.as_ref()),
@@ -674,6 +707,8 @@ impl CompletionJob {
             emit_status(&self.app, kind, message);
         }
         report_temp_cleanup(&self.app, &mut self.artifact_cleanup);
+        // The take's record is queued after this job, so it includes this.
+        self.trace.span_since(TakeSpan::CompletionJob, job_started);
     }
 }
 

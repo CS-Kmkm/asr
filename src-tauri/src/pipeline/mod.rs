@@ -25,6 +25,7 @@ mod edit;
 mod routing;
 pub(crate) mod setup_tests;
 pub(crate) mod stop;
+pub(crate) mod take_trace;
 
 #[derive(Clone, Copy)]
 pub(crate) struct PipelineContext<'a> {
@@ -48,6 +49,8 @@ struct RecordedTake {
     translation_target: Option<String>,
     draft: Option<crate::live_dictation::LiveDraft>,
     stop_timings: StopTimings,
+    /// Spans and outcome of this take; disabled for dictation tests.
+    trace: take_trace::TakeTrace,
 }
 
 /// Stop-path stage timings. They are written after delivery (or after a

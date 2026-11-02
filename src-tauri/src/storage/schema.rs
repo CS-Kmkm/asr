@@ -36,7 +36,48 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         apply: migrate_v3_metric_context,
         min_reader_version: 1,
     },
+    Migration {
+        apply: migrate_v4_take_spans,
+        min_reader_version: 1,
+    },
 ];
+
+/// Version 4: one content-free row per recording take (spans and a terminal
+/// outcome under a random take id). Kept apart from `metrics` so historical
+/// summaries keep their meaning; `version` separates later record shapes.
+/// Span columns are NULL when the span did not happen on that take.
+fn migrate_v4_take_spans(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS take_spans (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           take_id TEXT NOT NULL UNIQUE,
+           version INTEGER NOT NULL,
+           created_at TEXT NOT NULL,
+           mode TEXT,
+           outcome TEXT NOT NULL,
+           stage TEXT,
+           record_ready_ms INTEGER,
+           model_ensure_ms INTEGER,
+           audio_stop_ms INTEGER,
+           live_drain_ms INTEGER,
+           asr_ms INTEGER,
+           shortcut_release_ms INTEGER,
+           route_ms INTEGER,
+           plan_ms INTEGER,
+           ai_ms INTEGER,
+           first_output_ms INTEGER,
+           settle_ms INTEGER,
+           paste_ms INTEGER,
+           helper_exit_ms INTEGER,
+           history_save_ms INTEGER,
+           completion_job_ms INTEGER,
+           stop_to_delivery_ms INTEGER,
+           stop_to_next_take_ms INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_take_spans_created_at ON take_spans(created_at);",
+    )?;
+    Ok(())
+}
 
 fn migrate_v3_metric_context(connection: &Connection) -> Result<(), StorageError> {
     if !column_exists(connection, "metrics", "mode")? {

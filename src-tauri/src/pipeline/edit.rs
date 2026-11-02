@@ -12,6 +12,7 @@ use crate::{
     emit_stage, emit_state, emit_status, injection,
     injection::{InsertResult, InsertionDetail},
     recording_overlay,
+    storage::{TakeOutcome, TakeSpan, TakeStage},
     types::{self, AppPhase, NewHistoryItem, RecordingResult},
 };
 use std::time::Instant;
@@ -37,6 +38,7 @@ pub(crate) async fn finish(
         started,
         correction_cancel,
         app_context,
+        trace,
         ..
     } = take;
     let metrics = storage.metrics_for(
@@ -74,7 +76,7 @@ pub(crate) async fn finish(
     .await
     .ok_or("editing was cancelled")?;
     let edit_started = Instant::now();
-    let edited = match correction::edit_selected_text(
+    let edit_result = correction::edit_selected_text(
         &settings,
         &source_text,
         &instruction_text,
@@ -82,8 +84,9 @@ pub(crate) async fn finish(
         correction_cancel,
         |delta| emit_correction_preview(app, delta, "streaming"),
     )
-    .await
-    {
+    .await;
+    trace.span_since(TakeSpan::Ai, edit_started);
+    let edited = match edit_result {
         Ok(edited) => edited,
         Err(correction::CorrectionError::Cancelled) => {
             emit_state(app, state, AppPhase::Idle, "Editing cancelled.");
@@ -117,11 +120,14 @@ pub(crate) async fn finish(
         emit_state(app, state, AppPhase::Idle, "Editing cancelled.");
         return Err("editing was cancelled".into());
     }
+    let release_started = Instant::now();
     session.monitor.wait_for_shortcut_release().await;
+    trace.span_since(TakeSpan::ShortcutRelease, release_started);
     if services.lifecycle.is_cancelled(operation_id) {
         emit_state(app, state, AppPhase::Idle, "Editing cancelled.");
         return Err("editing was cancelled".into());
     }
+    trace.stage(TakeStage::Delivery);
     emit_state(
         app,
         state,
@@ -130,8 +136,10 @@ pub(crate) async fn finish(
     );
     let app_for_insertion = app.clone();
     let edited_for_insertion = edited.clone();
+    let trace_for_insertion = trace.clone();
     let (session, committed) = tokio::task::spawn_blocking(move || {
         let services = app_for_insertion.state::<crate::Services>();
+        let paste_started = Instant::now();
         let committed = commit_edit_replacement(
             &services.lifecycle,
             operation_id,
@@ -145,6 +153,12 @@ pub(crate) async fn finish(
             },
             || session.injector.copy_to_clipboard(&edited_for_insertion),
         );
+        if let CommittedOutput::Ran((insertion, _)) = &committed {
+            trace_for_insertion.span_since(TakeSpan::Paste, paste_started);
+            if insertion.is_some() {
+                trace_for_insertion.delivered();
+            }
+        }
         (session, committed)
     })
     .await
@@ -177,6 +191,7 @@ pub(crate) async fn finish(
         None => ("insertion_failed", EDIT_CLIPBOARD_UNAVAILABLE),
     };
     let latency_ms = started.elapsed().as_millis() as u64;
+    let history_save_started = Instant::now();
     let (history_save_status, metric_failed) = persist_edit_completion(
         storage,
         &NewHistoryItem {
@@ -205,7 +220,10 @@ pub(crate) async fn finish(
         settings.correction_provider.as_str(),
         edit_started.elapsed().as_millis() as i64,
     );
+    // Includes the `edit_generation` metric written with the History item.
+    trace.span_since(TakeSpan::HistorySave, history_save_started);
     let Some(insertion) = insertion else {
+        trace.outcome(TakeOutcome::InsertionFailed);
         // Persist before returning: neither the target nor the clipboard
         // received the edit, and closing the app must not lose the result.
         state.publish_result(edited.clone());
