@@ -23,6 +23,7 @@ const fieldLabels = {
   autoStart: "Start with Windows",
   clipboardRestore: "Restore clipboard",
   liveTargetInsertion: "Live text insertion (experimental)",
+  livePreviewFastDecode: "Faster live preview",
   noiseSuppression: "Noise suppression",
   inputGainPercent: "Input gain",
   automaticGain: "Automatic gain",

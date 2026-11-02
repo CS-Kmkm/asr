@@ -76,7 +76,7 @@ export function PrivacyPage({
         detail={t("Greedy decoding for the preview only; the final text is unchanged.")}
         detailMode="inline"
         help={t("Off by default. Live preview asks faster-whisper for a single-candidate (greedy) decode instead of beam search, lowering GPU or CPU load while recording. Preview text can be less accurate; the final transcription after stopping always uses the normal decode.")}
-        control={<Toggle label={t("Faster live preview")} checked={settings.livePreviewFastDecode ?? false} disabled={!(settings.livePreviewEnabled ?? true)} onChange={(enabled) => onSave({ livePreviewFastDecode: enabled })} />} />}
+        control={<Toggle label={t("Faster live preview")} checked={settings.livePreviewFastDecode} disabled={!(settings.livePreviewEnabled ?? true)} onChange={(enabled) => onSave({ livePreviewFastDecode: enabled })} />} />}
     </section>
   );
 }

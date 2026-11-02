@@ -196,6 +196,7 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 | `audio_path` | 文字列(非空) | 必須 | 音声ファイルのパス。非空文字列でなければ `invalid_audio_path`、ファイルが存在しなければ `audio_not_found`。 |
 | `prompt` | 文字列 / 文字列リスト / `null` / 省略 | 任意 | 認識ヒント(辞書語など)。詳細は下記。 |
 | `language` | 文字列(32文字以下) / `null` / 省略 | 任意 | 音声の言語(例 `ja`、`en-GB`)。それ以外の型や長すぎる値は `invalid_request`。faster-whisper と openai-compatible は地域部分を除いたベース言語として渡す。VibeVoice は transformers の `apply_transcription_request` が言語引数を持たないため無視する。 |
+| `decoding` | `"greedy"` / `null` / 省略 | 任意 | ライブプレビューの認識だけが、設定「ライブプレビューを軽量化」がオンのときに `"greedy"` を送る。faster-whisper は `beam_size=1`・`best_of=1` で認識し、VAD などほかの設定は変えない。ほかのバックエンドは無視する。それ以外の値は `invalid_request`。停止後の最終認識のリクエストには含まれない。 |
 
 **`prompt` の扱い:**
 
@@ -424,7 +425,7 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
 | `decision_release_invalid` | decision.py | 固定リビジョンの実装を読み込めない。 |
 | `decision_not_loaded` | decision.py | 判断モデルの読み込み前に判定を要求した。 |
 | `invalid_decision_input` | decision.py | モデル・量子化の不一致、発話の長さ・型、選択状態の型、許可されない state のフィールド。 |
-| `invalid_request` | worker.py | リクエストがJSONオブジェクトでない / `id` が欠落 / `quantization` が文字列でない / 判断モデルの `model` が文字列でない / `prompt` の型が不正(非文字列要素を含むリスト、文字列・リスト・null以外) / `language` が文字列・null 以外、または32文字超。 |
+| `invalid_request` | worker.py | リクエストがJSONオブジェクトでない / `id` が欠落 / `quantization` が文字列でない / 判断モデルの `model` が文字列でない / `prompt` の型が不正(非文字列要素を含むリスト、文字列・リスト・null以外) / `language` が文字列・null 以外、または32文字超 / `decoding` が `"greedy"`・null 以外。 |
 | `invalid_json` | worker.py (`serve`) | 受信行がJSONとして解釈できない(`JSONDecodeError`)。`id` は `null`。 |
 | `model_not_loaded` | worker.py | `load` 成功前に `transcribe` を要求した。 |
 | `invalid_audio_path` | worker.py | `audio_path` が非空文字列でない。 |
