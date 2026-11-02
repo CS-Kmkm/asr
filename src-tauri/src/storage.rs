@@ -1,3 +1,4 @@
+mod completion_queue;
 mod history;
 mod history_audio;
 mod metrics;
@@ -117,6 +118,8 @@ pub struct Storage {
     /// policy pass retries it even when it deletes nothing. Starts set, so
     /// the first pass of a run also truncates whatever an earlier run left.
     wal_checkpoint_pending: Arc<AtomicBool>,
+    /// Work a delivered take deferred; privacy deletions wait for it.
+    completions: Arc<completion_queue::CompletionQueue>,
 }
 
 /// Builds without the V2 `shortcuts` field read one scalar chord per mode.
@@ -902,11 +905,34 @@ impl Storage {
             settings_writes: Arc::new(Mutex::new(())),
             settings_revision: Arc::new(AtomicU64::new(0)),
             wal_checkpoint_pending: Arc::new(AtomicBool::new(true)),
+            completions: Arc::default(),
         }
     }
 
     fn connection(&self) -> Result<MutexGuard<'_, Connection>, StorageError> {
         self.connection.lock().map_err(|_| StorageError::Lock)
+    }
+
+    /// Runs `job` on a background thread after every job deferred before it.
+    /// A delivered take defers its remaining persistence and cleanup here so
+    /// the next take need not wait; the job owns what it writes or removes.
+    /// Delete all and settings saves (retention changes) first wait for every
+    /// queued job, so none of its writes lands after such a deletion.
+    pub fn defer_completion(&self, job: impl FnOnce() + Send + 'static) {
+        self.completions.push(Box::new(job));
+    }
+
+    /// Waits up to `timeout` for every deferred job queued so far, as at app
+    /// exit. Returns whether they all finished.
+    pub fn drain_deferred_completions(&self, timeout: std::time::Duration) -> bool {
+        self.completions.drain(Some(timeout))
+    }
+
+    /// Waits for every deferred job queued so far before a privacy deletion.
+    /// Jobs only write storage, emit events and remove temporary files, so
+    /// they finish without anything this caller holds.
+    fn wait_for_deferred_completions(&self) {
+        self.completions.drain(None);
     }
 
     /// Advances the settings revision after a committed write of the
@@ -1104,6 +1130,8 @@ impl Storage {
         &self,
         settings: &Settings,
     ) -> Result<u64, StorageError> {
+        // A retention change also purges what deferred completions write.
+        self.wait_for_deferred_completions();
         let now = Utc::now();
         let mut connection = self.connection()?;
         // IMMEDIATE takes the write lock before the read, so a concurrent
@@ -2565,6 +2593,77 @@ mod tests {
                 assert!(!fs::read(file).is_ok_and(|bytes| contains(&bytes)));
             }
         }
+    }
+
+    /// Queues a completion job that writes one metric once `gate` opens.
+    fn defer_gated_metric(storage: &Storage) -> std::sync::mpsc::Sender<()> {
+        let (open, gate) = std::sync::mpsc::channel::<()>();
+        let job_storage = storage.clone();
+        storage.defer_completion(move || {
+            let _ = gate.recv();
+            job_storage
+                .add_metric("dictation", None, Some(1), true, None)
+                .unwrap();
+        });
+        open
+    }
+
+    #[test]
+    fn delete_all_waits_for_deferred_completions_queued_before_it() {
+        let storage = Storage::in_memory().unwrap();
+        storage.add_history(&item()).unwrap();
+        let open = defer_gated_metric(&storage);
+        let deleting = {
+            let storage = storage.clone();
+            std::thread::spawn(move || storage.delete_all_history().unwrap())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!deleting.is_finished(), "Delete all overtook a pending job");
+        open.send(()).unwrap();
+        assert_eq!(deleting.join().unwrap(), 1);
+        // The deferred metric was written first and deleted with the rest.
+        assert!(storage.diagnostics().unwrap().summaries.is_empty());
+        assert!(storage
+            .list_history(HistoryFilter::All, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_retention_change_waits_for_deferred_completions_queued_before_it() {
+        let storage = Storage::in_memory().unwrap();
+        let open = defer_gated_metric(&storage);
+        let saving = {
+            let storage = storage.clone();
+            std::thread::spawn(move || {
+                storage
+                    .update_settings_and_apply_history_policy(&Settings {
+                        history_retention: HistoryRetention::Never,
+                        ..Settings::default()
+                    })
+                    .unwrap();
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!saving.is_finished(), "the retention change overtook a job");
+        open.send(()).unwrap();
+        saving.join().unwrap();
+        assert!(storage.diagnostics().unwrap().summaries.is_empty());
+        // Later deferred work follows the new setting: nothing is recorded.
+        let open = defer_gated_metric(&storage);
+        open.send(()).unwrap();
+        assert!(storage.drain_deferred_completions(std::time::Duration::from_secs(10)));
+        assert!(storage.diagnostics().unwrap().summaries.is_empty());
+    }
+
+    #[test]
+    fn the_exit_drain_is_bounded_and_completes_queued_work() {
+        let storage = Storage::in_memory().unwrap();
+        let open = defer_gated_metric(&storage);
+        assert!(!storage.drain_deferred_completions(std::time::Duration::from_millis(20)));
+        open.send(()).unwrap();
+        assert!(storage.drain_deferred_completions(std::time::Duration::from_secs(10)));
+        assert_eq!(storage.diagnostics().unwrap().summaries.len(), 1);
     }
 
     fn wal_len(database: &Path) -> u64 {

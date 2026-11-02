@@ -69,7 +69,7 @@ async fn finish_owned(
         settings,
         transcript,
         artifact,
-        mut artifact_cleanup,
+        artifact_cleanup,
         started,
         correction_cancel,
         mode,
@@ -423,60 +423,30 @@ async fn finish_owned(
         let _ =
             storage.add_dictionary_candidate_from_correction(&transcript.text, &final_text, None);
     }
-    let mode_metric = if mode == PipelineMode::Translate {
-        "voice_translate"
-    } else {
-        "dictation"
-    };
-    let metric_result = metrics.add_metric(
-        mode_metric,
-        Some(&settings.asr_backend),
-        Some(latency_ms as i64),
-        !translation_failed,
-        translation_failed.then_some("translation_failed"),
-    );
-    // The pipeline metric above records recognition; this one records whether
-    // the text reached the target, as `outcome` or `outcome:reason` codes.
-    let insertion_code = insertion_detail.map_or_else(
-        || insertion_label.to_owned(),
-        |detail| format!("{insertion_label}:{detail}"),
-    );
-    let insertion_metric = metrics.add_metric(
-        "insertion",
-        Some(mode_metric),
-        Some(latency_ms as i64),
-        inserted,
-        (!inserted).then_some(insertion_code.as_str()),
-    );
-    // Stage timings are written after delivery so their commits stay off the
-    // measured path.
-    record_first_output(
-        metrics,
-        if mode == PipelineMode::Translate {
-            "voice_translation_first_output"
-        } else {
-            "text_correction_first_output"
+    // History and dictionary candidates stay above: the History and
+    // Dictionary pages re-read them when the completed phase is published.
+    // Metrics and temporary-audio cleanup are deferred past the lifecycle
+    // guard, in take order, and reported as before once they ran.
+    let deferred = DeferredCompletion {
+        app: app.clone(),
+        storage: storage.clone(),
+        app_context: app_context.clone(),
+        metrics: TakeMetrics {
+            mode,
+            asr_backend: settings.asr_backend.clone(),
+            correction_provider: settings.correction_provider.clone(),
+            latency_ms: latency_ms as i64,
+            translation_failed,
+            insertion_label,
+            insertion_detail,
+            inserted,
+            first_output_ms,
+            settle_ms,
+            paste_ms,
         },
-        &settings.correction_provider,
-        first_output_ms,
-    );
-    if let Some(settle_ms) = settle_ms {
-        let _ = metrics.add_metric(
-            "insertion_settle",
-            Some(mode_metric),
-            Some(settle_ms),
-            true,
-            None,
-        );
-    }
-    let _ = metrics.add_metric(
-        "insertion_paste",
-        Some(mode_metric),
-        Some(paste_ms),
-        inserted,
-        None,
-    );
-    let metric_failed = metric_result.is_err() || insertion_metric.is_err();
+        history_save_status,
+        artifact_cleanup,
+    };
     let insertion = match insertion_result {
         Ok(insertion) => insertion,
         Err(error) => {
@@ -484,17 +454,12 @@ async fn finish_owned(
             // may hold data that could not be preserved); keep the text here.
             let _ = app.emit("app-state", state.publish_result(final_text.clone()));
             emit_state(app, state, AppPhase::Error, INSERTION_FAILED);
-            if let Some((kind, message)) =
-                completion_persistence_warning(history_save_status, metric_failed)
-            {
-                emit_status(app, kind, message);
-            }
             recording_overlay::show_insertion_notice(
                 app,
                 injection::notice_outcome(insertion_label, clipboard_lost),
                 insertion_detail,
             );
-            report_temp_cleanup(app, &mut artifact_cleanup);
+            deferred.queue();
             return Err(command_error(error));
         }
     };
@@ -525,11 +490,6 @@ async fn finish_owned(
     let snapshot = state.complete(final_text.clone(), completion.into());
     let _ = app.emit("app-state", snapshot);
     emit_status(app, insertion_label, completion);
-    if let Some((kind, message)) =
-        completion_persistence_warning(history_save_status, metric_failed)
-    {
-        emit_status(app, kind, message);
-    }
     if !inserted {
         // With opt-in live insertion the raw draft may already be in the field.
         let notice = match insertion {
@@ -551,7 +511,7 @@ async fn finish_owned(
             completion,
         );
     }
-    report_temp_cleanup(app, &mut artifact_cleanup);
+    deferred.queue();
     Ok(RecordingResult {
         text: final_text,
         insertion: insertion_label.into(),
@@ -564,6 +524,116 @@ async fn finish_owned(
 fn note_first_output(first_output_ms: &mut Option<i64>, started: Instant, delta: &str) {
     if first_output_ms.is_none() && !delta.is_empty() {
         *first_output_ms = Some(started.elapsed().as_millis() as i64);
+    }
+}
+
+/// The usage metrics of one delivered take, all measured before delivery
+/// ended; only their writes are deferred.
+struct TakeMetrics {
+    mode: PipelineMode,
+    asr_backend: String,
+    correction_provider: String,
+    latency_ms: i64,
+    translation_failed: bool,
+    insertion_label: &'static str,
+    insertion_detail: Option<&'static str>,
+    inserted: bool,
+    first_output_ms: Option<i64>,
+    settle_ms: Option<i64>,
+    paste_ms: i64,
+}
+
+impl TakeMetrics {
+    /// Writes the metrics; returns whether a mode or insertion record failed.
+    fn record(&self, metrics: crate::storage::MetricRecorder<'_>) -> bool {
+        let translate = self.mode == PipelineMode::Translate;
+        let mode_metric = if translate {
+            "voice_translate"
+        } else {
+            "dictation"
+        };
+        let metric_result = metrics.add_metric(
+            mode_metric,
+            Some(&self.asr_backend),
+            Some(self.latency_ms),
+            !self.translation_failed,
+            self.translation_failed.then_some("translation_failed"),
+        );
+        // The pipeline metric above records recognition; this one records
+        // whether the text reached the target, as `outcome` or
+        // `outcome:reason` codes.
+        let insertion_code = self.insertion_detail.map_or_else(
+            || self.insertion_label.to_owned(),
+            |detail| format!("{}:{detail}", self.insertion_label),
+        );
+        let insertion_metric = metrics.add_metric(
+            "insertion",
+            Some(mode_metric),
+            Some(self.latency_ms),
+            self.inserted,
+            (!self.inserted).then_some(insertion_code.as_str()),
+        );
+        record_first_output(
+            metrics,
+            if translate {
+                "voice_translation_first_output"
+            } else {
+                "text_correction_first_output"
+            },
+            &self.correction_provider,
+            self.first_output_ms,
+        );
+        if let Some(settle_ms) = self.settle_ms {
+            let _ = metrics.add_metric(
+                "insertion_settle",
+                Some(mode_metric),
+                Some(settle_ms),
+                true,
+                None,
+            );
+        }
+        let _ = metrics.add_metric(
+            "insertion_paste",
+            Some(mode_metric),
+            Some(self.paste_ms),
+            self.inserted,
+            None,
+        );
+        metric_result.is_err() || insertion_metric.is_err()
+    }
+}
+
+/// What a delivered take still writes and removes after it is shown as
+/// complete. The completion job owns it, including the temporary capture,
+/// and runs after the lifecycle guard is released, in take order.
+struct DeferredCompletion {
+    app: tauri::AppHandle,
+    storage: crate::storage::Storage,
+    app_context: Option<types::AppContext>,
+    metrics: TakeMetrics,
+    history_save_status: crate::pipeline::finish::HistorySaveStatus,
+    artifact_cleanup: crate::TempArtifact,
+}
+
+impl DeferredCompletion {
+    fn queue(self) {
+        let storage = self.storage.clone();
+        storage.defer_completion(move || self.run());
+    }
+
+    /// Writes the metrics, reports a persistence failure with the same
+    /// status as before, then removes the temporary capture.
+    fn run(mut self) {
+        let metric_failed = self.metrics.record(self.storage.metrics_for(
+            self.metrics.mode,
+            app_context::history_category(self.app_context.as_ref()),
+        ));
+        if let Some((kind, message)) =
+            completion_persistence_warning(self.history_save_status, metric_failed)
+        {
+            emit_status(&self.app, kind, message);
+        }
+        report_temp_cleanup(&self.app, &mut self.artifact_cleanup);
     }
 }
 
@@ -603,6 +673,63 @@ mod tests {
         note_first_output(&mut first, started - Duration::from_secs(60), "later");
         note_first_output(&mut first, started, "");
         assert_eq!(first, Some(observed));
+    }
+
+    fn take_metrics(latency_ms: i64) -> TakeMetrics {
+        TakeMetrics {
+            mode: PipelineMode::Dictate,
+            asr_backend: "faster-whisper".into(),
+            correction_provider: "openai".into(),
+            latency_ms,
+            translation_failed: false,
+            insertion_label: "clipboard_only",
+            insertion_detail: Some("target_changed"),
+            inserted: false,
+            first_output_ms: Some(5),
+            settle_ms: None,
+            paste_ms: 7,
+        }
+    }
+
+    #[test]
+    fn deferred_take_metrics_keep_their_records_and_take_order() {
+        let storage = crate::storage::Storage::in_memory().unwrap();
+        for latency_ms in [100, 200, 300] {
+            let job_storage = storage.clone();
+            let metrics = take_metrics(latency_ms);
+            storage.defer_completion(move || {
+                assert!(!metrics.record(job_storage.metrics_for(PipelineMode::Dictate, None)));
+            });
+        }
+        assert!(storage.drain_deferred_completions(Duration::from_secs(10)));
+        let report = storage.diagnostics().unwrap();
+        let summary = |event: &str| {
+            report
+                .summaries
+                .iter()
+                .find(|row| row.event_type == event)
+                .unwrap_or_else(|| panic!("missing {event}"))
+        };
+        assert_eq!(summary("dictation").count, 3);
+        assert_eq!(summary("dictation").p50_ms, Some(200));
+        assert_eq!(summary("insertion").successes, 0);
+        assert_eq!(summary("text_correction_first_output").count, 3);
+        assert_eq!(summary("insertion_paste").count, 3);
+        assert!(report
+            .summaries
+            .iter()
+            .all(|row| row.event_type != "insertion_settle"));
+        assert!(report
+            .outcomes
+            .iter()
+            .any(|row| row.event_type == "insertion"
+                && row.code.as_deref() == Some("clipboard_only:target_changed")
+                && row.count == 3));
+        // Take order: each take's records follow the previous take's.
+        assert_eq!(
+            storage.metric_durations_for_test("dictation"),
+            vec![100, 200, 300]
+        );
     }
 
     #[test]

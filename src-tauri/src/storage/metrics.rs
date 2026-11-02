@@ -118,6 +118,21 @@ impl Storage {
         }
     }
 
+    /// The durations of `event_type` records in the order they were written.
+    #[cfg(test)]
+    pub(crate) fn metric_durations_for_test(&self, event_type: &str) -> Vec<i64> {
+        let connection = self.connection().unwrap();
+        let mut statement = connection
+            .prepare("SELECT duration_ms FROM metrics WHERE event_type = ?1 ORDER BY id")
+            .unwrap();
+        let durations = statement
+            .query_map([event_type], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        durations
+    }
+
     pub fn diagnostics(&self) -> Result<StorageDiagnostics, StorageError> {
         let connection = self.connection()?;
         let database_ok = connection.query_row("PRAGMA quick_check(1)", [], |row| {

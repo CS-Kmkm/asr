@@ -198,6 +198,8 @@ impl Storage {
     }
 
     pub fn delete_all_history(&self) -> Result<u64, StorageError> {
+        // Metrics a delivered take deferred are removed too, not written after.
+        self.wait_for_deferred_completions();
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         let filenames = {
