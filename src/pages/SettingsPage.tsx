@@ -341,11 +341,11 @@ export function SettingsPage({
           detailMode="inline"
           help={t("Off by default: Dictate inserts only the final text once. When on, partial text is typed into the target while you speak; some editors and browser fields may keep only the first part.")}
           control={<Toggle label={t("Live text insertion (experimental)")} checked={settings.liveTargetInsertion} onChange={(value) => onSave({ liveTargetInsertion: value })} />} />
-        {settings.asrBackend !== "openai-compatible" && <SettingRow title={t("Incremental final transcription")}
+        {settings.asrBackend !== "openai-compatible" && <SettingRow title={t("Incremental final transcription (experimental)")}
           detail={t("Transcribes finished parts while you record, so long recordings finish sooner. Results may differ slightly.")}
           detailMode="inline"
-          help={t("On by default. Local speech models only; a cloud speech backend always transcribes the whole recording. While you record, parts that end in a pause of about a second are transcribed with the normal final settings; after stopping, only the rest is transcribed and the parts are joined in order. Each part is transcribed on its own, so the text can differ slightly from transcribing the whole recording at once. If the settings, dictionary or model change during the recording, or a part fails, the whole recording is transcribed as before. Uses the speech model more while recording.")}
-          control={<Toggle label={t("Incremental final transcription")} checked={settings.incrementalFinalAsr} onChange={(value) => onSave({ incrementalFinalAsr: value })} />} />}
+          help={t("Off by default. Local speech models only; a cloud speech backend always transcribes the whole recording. While you record, parts that end in a pause of about a second are transcribed with the normal final settings; after stopping, only the rest is transcribed and the parts are joined in order. Each part is transcribed on its own, so the text can differ slightly from transcribing the whole recording at once. If the settings, dictionary or model change during the recording, or a part fails, the whole recording is transcribed as before. Uses the speech model more while recording.")}
+          control={<Toggle label={t("Incremental final transcription (experimental)")} checked={settings.incrementalFinalAsr} onChange={(value) => onSave({ incrementalFinalAsr: value })} />} />}
         <SettingRow title={t("Noise suppression")}
           control={<StepSlider label={t("Noise suppression")} value={settings.noiseSuppression}
             options={[{ value: "off", label: t("Off") }, { value: "low", label: t("Low") }, { value: "medium", label: t("Medium") }, { value: "high", label: t("High") }] as const}
