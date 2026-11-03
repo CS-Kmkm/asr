@@ -707,7 +707,7 @@ def worker_env(args: argparse.Namespace) -> dict[str, str]:
         # An explicit profile prevents ambient settings from contaminating A/B runs.
         env["ASR_WHISPER_DECODE_PROFILE"] = profile
     elif profile != "standard":
-        raise BenchError("--whisper-profile fast requires --backend faster-whisper")
+        raise BenchError(f"--whisper-profile {profile} requires --backend faster-whisper")
     return env
 
 
@@ -981,7 +981,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--backend", default="mock", help="worker backend (default: mock)")
     parser.add_argument("--quantization", default="4bit", help="model quantization (default: 4bit)")
-    parser.add_argument("--whisper-profile", choices=["standard", "fast"], default="standard", help="faster-whisper decode profile; fast uses beam_size=1 and VAD (experimental, default: standard)")
+    parser.add_argument("--whisper-profile", choices=["standard", "fast", "greedy"], default="standard", help="faster-whisper decode profile: standard keeps library defaults (beam_size=5, VAD off); fast uses beam_size=1 and VAD; greedy changes only beam_size=1, keeping VAD off (default: standard)")
     parser.add_argument("--language", type=language_argument, help="speech locale passed unchanged to the worker, e.g. ja-JP (default: backend language detection)")
     parser.add_argument(
         "--audio",
