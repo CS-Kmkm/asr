@@ -493,7 +493,11 @@ fn joining_concatenates_by_audio_order_and_never_deduplicates() {
 
 #[test]
 fn only_an_enabled_local_backend_plans_incremental_recognition() {
-    assert!(Take::plan(&Settings::default()).is_none());
+    let off = Settings {
+        incremental_final_asr: false,
+        ..Settings::default()
+    };
+    assert!(Take::plan(&off).is_none());
     assert!(matches!(Take::plan(&settings()), Some(Take::Planned(_))));
     let cloud = Settings {
         asr_backend: "openai-compatible".into(),
@@ -677,7 +681,10 @@ async fn off_sends_exactly_the_whole_recording_request_and_records_nothing() {
     let transcriber = Bursts::new();
     let (_cancel, cancel) = watch::channel(false);
     let mut recorded = false;
-    let settings = Settings::default();
+    let settings = Settings {
+        incremental_final_asr: false,
+        ..Settings::default()
+    };
     let transcript = transcribe_final(
         &transcriber,
         Take::plan(&settings),

@@ -24,7 +24,7 @@ const fieldLabels = {
   clipboardRestore: "Restore clipboard",
   liveTargetInsertion: "Live text insertion (experimental)",
   livePreviewFastDecode: "Faster live preview",
-  incrementalFinalAsr: "Incremental final transcription (experimental)",
+  incrementalFinalAsr: "Incremental final transcription",
   speculativeCorrection: "Speculative correction (experimental)",
   noiseSuppression: "Noise suppression",
   inputGainPercent: "Input gain",

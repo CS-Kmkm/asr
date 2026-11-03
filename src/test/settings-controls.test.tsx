@@ -27,17 +27,17 @@ test("automatic routing requires opt-in and its controls cannot change during re
   expect((screen.getByRole("combobox", { name: "Decision model quantization" }) as HTMLSelectElement).disabled).toBe(true);
 });
 
-test("incremental final transcription is an opt-in for local speech backends only", () => {
+test("incremental final transcription is on by default for local speech backends only", () => {
   const save = vi.fn();
-  const name = "Incremental final transcription (experimental)";
+  const name = "Incremental final transcription";
   const view = (settings: typeof defaultSettings) => <I18nProvider language="en"><SettingsPage section="input" settings={settings} onSave={save} devices={[]} recording={false} /></I18nProvider>;
   const app = render(view(defaultSettings));
   const toggle = screen.getByRole("switch", { name });
-  expect(toggle.getAttribute("aria-checked")).toBe("false");
+  expect(toggle.getAttribute("aria-checked")).toBe("true");
   fireEvent.click(toggle);
-  expect(save).toHaveBeenCalledWith({ incrementalFinalAsr: true });
-  app.rerender(view({ ...defaultSettings, incrementalFinalAsr: true }));
-  expect(screen.getByRole("switch", { name }).getAttribute("aria-checked")).toBe("true");
+  expect(save).toHaveBeenCalledWith({ incrementalFinalAsr: false });
+  app.rerender(view({ ...defaultSettings, incrementalFinalAsr: false }));
+  expect(screen.getByRole("switch", { name }).getAttribute("aria-checked")).toBe("false");
   app.rerender(view({ ...defaultSettings, asrBackend: "vibevoice" }));
   expect(screen.getByRole("switch", { name })).toBeTruthy();
   app.rerender(view({ ...defaultSettings, asrBackend: "openai-compatible", incrementalFinalAsr: true }));

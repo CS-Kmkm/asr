@@ -4415,22 +4415,22 @@ mod tests {
     }
 
     #[test]
-    fn incremental_final_asr_defaults_off_and_an_unreadable_value_repairs_only_itself() {
+    fn incremental_final_asr_defaults_on_and_an_unreadable_value_repairs_only_itself() {
         let mut saved = serde_json::to_value(Settings::default()).unwrap();
         saved["inputGainPercent"] = serde_json::json!(125);
         saved.as_object_mut().unwrap().remove("incrementalFinalAsr");
         let old = load_settings(&saved.to_string());
-        assert!(!old.settings.incremental_final_asr);
+        assert!(old.settings.incremental_final_asr);
         assert!(old.repairs.is_empty());
-        saved["incrementalFinalAsr"] = serde_json::json!(true);
+        saved["incrementalFinalAsr"] = serde_json::json!(false);
         assert!(
-            load_settings(&saved.to_string())
+            !load_settings(&saved.to_string())
                 .settings
                 .incremental_final_asr
         );
         saved["incrementalFinalAsr"] = serde_json::json!("yes");
         let repaired = load_settings(&saved.to_string());
-        assert!(!repaired.settings.incremental_final_asr);
+        assert!(repaired.settings.incremental_final_asr);
         assert_eq!(repaired.settings.input_gain_percent, 125);
         assert_eq!(
             repaired.repairs.fields(),
