@@ -515,8 +515,8 @@ Full usage and Phase 0 gate criteria are documented in
   beam search) to lower load while recording; VAD and other options stay the
   same, preview text may be less accurate, and the final transcription after
   stopping always uses the normal decode.
-- Settings > Input "Incremental final transcription" (on by default, local
-  speech backends only) lets Dictate and Translate transcribe
+- Settings > Input "Incremental final transcription (experimental)" (off by
+  default, local speech backends only) lets Dictate and Translate transcribe
   parts of the recording that end in a pause of at least about a second while
   recording, with the normal final-recognition request, and transcribe only
   the rest after stopping; the parts are joined in audio order. Each part is
