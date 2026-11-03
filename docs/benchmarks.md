@@ -432,3 +432,31 @@ healthの時間は認識の計測値に含めない。保存先は計測前に�
 失敗した場合は結果をコンソールにも出力する。計測が途中で失敗すると、予約した空ファイルが
 残る場合があるため、再実行には新しい保存先を指定する。
 mockのsmokeテストは計測経路だけを確認し、速度・精度の採否根拠には使わない。
+
+### 5.9 manifestによる一括計測と精度比較
+
+固定した`asr-bench-manifest/1`を使うと、音声・参照文・言語・出典を揃えて比較できる。
+`audio_path`はmanifestのディレクトリ基準で解決する。各項目の言語を認識要求に使い、
+`--language`を明示した場合は全項目をその言語で認識する。`--manifest`は通常の音声指定と併用できない。
+
+```powershell
+uv run scripts/bench_asr.py --backend mock --manifest bench_data/manifests/public-smoke-v1.json --repeat 1 --cold-runs 1 --json --output bench_data/mock-smoke-v1.json
+uv run scripts/score_asr.py --bench bench_data/mock-smoke-v1.json --manifest bench_data/manifests/public-smoke-v1.json --csv bench_data/score-smoke-v1.csv --json --output bench_data/score-smoke-v1.json
+uv run scripts/score_asr.py --bench bench_data/mock-smoke-v2.json --manifest bench_data/manifests/public-smoke-v1.json --baseline bench_data/score-smoke-v1.json --output bench_data/comparison-smoke-v2.md
+```
+
+最後の行は、同じmanifestで2回目の計測結果を`bench_data/mock-smoke-v2.json`に保存した後に実行する。
+保存先は毎回新しい名前にする。両スクリプトの`--output`とscoreの`--csv`は既存ファイルを拒否する。
+scoreの既定出力はMarkdown、`--json`はJSONとし、`--output`を省略すると標準出力へ出す。
+rawはUnicode NFCと前後の空白除去だけを行い、内部の空白・句読点・大小文字・文字幅を保持する。
+normalizedは既存のCER/WER正規化オプションに従う。
+項目別、全体、出典と言語の組み合わせ別に、編集数の合計÷参照長の合計（マイクロ平均）を報告する。
+繰り返し認識はwarm優先の最初の文を採点し、認識文の不一致、manifest項目の欠落、余剰音声も報告する。
+`ja`で始まる言語は固定でCERのみとし、raw・normalizedともWERは`null`、理由は
+`ja: no word segmentation; CER is primary`とする。全体WERも日本語を除いて集計する。
+`--baseline`は全体・出典と言語別の指標差（今回−前回）と、backend・model・量子化・profile・device・
+manifest名などの条件差を表示する。配列は件数と短いハッシュで示す。実行コマンド、音声パス・形式の一覧、
+manifestのローカルパスの差は、条件差とは別の参考情報（machine-local）として表示する。
+採点件数と欠落件数の差も表示する。元のbench条件はscore JSONの`config`に保存する。
+計測時と採点時のmanifest名・件数が異なる場合や項目が欠落した場合は、標準エラーとJSONの`warnings`で通知する。
+調整にはdevを使い、holdoutは最終比較に限定する。

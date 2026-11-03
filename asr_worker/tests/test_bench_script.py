@@ -562,5 +562,151 @@ class SmokeParityTests(IsolatedWorkerTestCase):
         self.assertTrue(all("device" in sample for sample in report["warm"]["samples"]))
         self.assertIn("live preview load", bench_asr.render_markdown(report))
 
+class ManifestBenchTests(IsolatedWorkerTestCase):
+    def _fixture(self, root: Path) -> Path:
+        import wave
+
+        items = []
+        for item_id, language in (("tiny-ja", "ja-JP"), ("tiny-en", "en-US")):
+            audio = root / "audio" / f"{item_id}.wav"
+            audio.parent.mkdir(exist_ok=True)
+            with wave.open(str(audio), "wb") as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(16000)
+                stream.writeframes(b"\0\0" * 160)
+            items.append({
+                "id": item_id, "audio_path": f"../audio/{item_id}.wav", "reference": "synthetic",
+                "language": language, "source": "fixture", "duration": 0.01,
+                "split": "test", "pool": "dev", "dataset_id": "synthetic", "revision": "synthetic",
+                "locale": language, "item_id": item_id, "group": item_id, "speaker": None,
+                "audio_sha256": "0" * 64, "source_audio_sha256": "0" * 64,
+                "provenance": "synthetic", "license": "test",
+            })
+        manifest = root / "manifests" / "synthetic-smoke.json"
+        manifest.parent.mkdir(exist_ok=True)
+        manifest.write_text(json.dumps({
+            "schema": "asr-bench-manifest/1", "name": "synthetic-smoke", "created_by": "test",
+            "selection": {"profile": "smoke", "seed": 1},
+            "sources": [{"source": "fixture", "license": "test", "revision": "synthetic"}], "items": items,
+        }), encoding="utf-8")
+        return manifest
+
+    def test_manifest_mock_benchmark_and_language_override(self) -> None:
+        for override in ([], ["--language", "fr-FR"]):
+            with self.subTest(override=override), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                manifest = self._fixture(root)
+                output = root / "result.json"
+                self.assertEqual(bench_asr.main([
+                    "--manifest", str(manifest), "--repeat", "2", "--cold-runs", "1",
+                    "--json", "--output", str(output), *override,
+                ]), 0)
+                result = json.loads(output.read_text(encoding="utf-8"))
+                expected = ["fr-FR"] * 4 if override else ["ja-JP", "ja-JP", "en-US", "en-US"]
+                self.assertEqual([r["language"] for r in result["warm"]["samples"]], expected)
+                expected_cold = ["fr-FR"] * 2 if override else ["ja-JP", "en-US"]
+                self.assertEqual([r["language"] for r in result["cold"]["samples"]], expected_cold)
+                self.assertEqual(Path(result["config"]["audio"][0]), root / "audio" / "tiny-ja.wav")
+                self.assertEqual(result["config"]["manifest"], {
+                    "name": "synthetic-smoke", "schema": "asr-bench-manifest/1", "path": str(manifest),
+                    "sources": [{"source": "fixture", "license": "test", "revision": "synthetic"}], "item_count": 2,
+                })
+                self.assertEqual(result["config"]["language_source"], "argument" if override else "manifest")
+                markdown = bench_asr.render_markdown(result)
+                self.assertIn("manifest: `synthetic-smoke`", markdown)
+                self.assertIn("language: `fr-FR`" if override else "language: `per-item (manifest)`", markdown)
+
+    def test_manifest_language_reaches_final_and_preview_requests(self) -> None:
+        class Session:
+            def __init__(self) -> None:
+                self.requests = []
+
+            def request(self, payload: dict) -> tuple[dict, float]:
+                self.requests.append(payload)
+                return {"text": "synthetic", "duration_ms": 0}, 1.0
+
+        session = Session()
+        paths = [Path("ja.wav"), Path("en.wav")]
+        conditions = bench_asr.RequestConditions(
+            item_languages=dict(zip(paths, ("ja-JP", "en-US"))),
+            live=bench_asr.LivePreviewLoad(recording_s=0.01),
+        )
+
+        def preview(worker, audio, item_conditions):  # noqa: ANN001, ANN202
+            worker.request(bench_asr.transcribe_payload(audio, item_conditions, preview=True))
+            return {"live_drain_ms": 0.0, "preview_wall_ms": [1.0]}
+
+        with patch.object(bench_asr, "simulate_live_preview", side_effect=preview):
+            bench_asr.run_transcribe_loop(session, paths, 1, conditions)
+        self.assertEqual([r["language"] for r in session.requests], ["ja-JP", "ja-JP", "en-US", "en-US"])
+        self.assertTrue(all(set(r) == {"command", "audio_path", "prompt", "language"} for r in session.requests))
+
+    def test_manifest_rejects_conflicting_audio_inputs_and_bad_manifest(self) -> None:
+        import contextlib
+        import io
+
+        for flags in (["--audio", "x.wav"], ["x.wav"], ["--smoke"]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                bench_asr.parse_args(["--manifest", "m.json", *flags])
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            bench_asr.parse_args(["x.wav"])
+        self.assertEqual(bench_asr.parse_args(["--audio", "x.wav", "--audio", "y.wav"]).audio, ["x.wav", "y.wav"])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._fixture(Path(tmp))
+            data = json.loads(path.read_text(encoding="utf-8"))
+            for change in ("schema", "duplicate", "missing_audio", "empty"):
+                invalid = json.loads(json.dumps(data))
+                if change == "schema":
+                    invalid["schema"] = "unknown"
+                elif change == "duplicate":
+                    invalid["items"].append(invalid["items"][0])
+                elif change == "empty":
+                    invalid["items"] = []
+                else:
+                    invalid["items"][0]["id"] = "missing"
+                    invalid["items"][0]["audio_path"] = "audio/missing.wav"
+                path.write_text(json.dumps(invalid), encoding="utf-8")
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(bench_asr.main(["--manifest", str(path)]), 1)
+
+    def test_manifest_output_never_overwrites(self) -> None:
+        import contextlib
+        import io
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = self._fixture(root)
+            output = root / "result.json"
+            output.write_text("keep", encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()), patch.object(bench_asr, "run_benchmark") as run:
+                self.assertEqual(bench_asr.main(["--manifest", str(path), "--output", str(output)]), 1)
+                run.assert_not_called()
+            self.assertEqual(output.read_text(encoding="utf-8"), "keep")
+
+    def test_manifest_loader_registers_and_caches_scorer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(sys.modules):
+            path = self._fixture(Path(tmp).resolve())
+            sys.modules.pop("_bench_score_manifest", None)
+            original = bench_asr.importlib.util.spec_from_file_location
+            with patch.object(bench_asr.importlib.util, "spec_from_file_location", wraps=original) as make_spec:
+                bench_asr.load_manifest(path)
+                scorer = sys.modules["_bench_score_manifest"]
+                bench_asr.load_manifest(path)
+            self.assertEqual(make_spec.call_count, 1)
+            self.assertIs(scorer, sys.modules[scorer.__name__])
+
+    def test_non_manifest_language_source_is_auto_or_argument(self) -> None:
+        for flags, expected in (([], "auto"), (["--language", "ja-JP"], "argument")):
+            with tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / "result.json"
+                self.assertEqual(bench_asr.main([
+                    "--smoke", "--cold-runs", "0", "--repeat", "1", "--json", "--output", str(output), *flags,
+                ]), 0)
+                result = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(result["config"]["language_source"], expected)
+                self.assertNotIn("manifest", result["config"])
+
+
 if __name__ == "__main__":
     unittest.main()
