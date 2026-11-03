@@ -1,6 +1,6 @@
 # 公開データセットによるバッチ評価
 
-この手順は、FLEURS の日本語・英語と LibriSpeech の英語を使って、同じ発話集合で ASR を比較するためのものです。
+この手順は、FLEURS の日本語（既定）で同じ発話集合を使い ASR を比較するためのものです。本プロジェクトの評価対象は日本語であり、FLEURS 英語と LibriSpeech は必要な場合だけ `--source` で明示指定します（既定では取得・構築しません）。
 取得は明示的な `fetch` 実行時だけ行います。`build`、`lock`、計測、採点は取得済みデータを使います。
 
 ## ライセンスと出典
@@ -25,7 +25,7 @@ Common Voice と ReazonSpeech の自動取得は、この段階では実装し�
 まず公開元とライセンスを確認し、同意する場合のみ取得します。
 
 ```powershell
-uv run scripts/bench_data.py fetch --source fleurs:ja_jp --source fleurs:en_us --source librispeech:test-clean --accept-license
+uv run scripts/bench_data.py fetch --source fleurs:ja_jp --accept-license
 ```
 
 各ファイルについて、ライセンス、URL、概算サイズを先に表示します。
@@ -41,7 +41,7 @@ HTTP 応答にサイズがある場合は、本文を取得する前にバイト
 初回の動作確認用に、各ソースから30件を選択します。
 
 ```powershell
-uv run scripts/bench_data.py build --source fleurs:ja_jp --source fleurs:en_us --source librispeech:test-clean --profile smoke --seed 20261103 --out public-smoke-v1
+uv run scripts/bench_data.py build --source fleurs:ja_jp --profile smoke --seed 20261103 --out public-smoke-v1
 uv run scripts/bench_asr.py --backend mock --manifest bench_data/manifests/public-smoke-v1.json --json --output bench_data/mock-smoke-v1.json
 uv run scripts/score_asr.py --bench bench_data/mock-smoke-v1.json --manifest bench_data/manifests/public-smoke-v1.json
 ```
@@ -110,7 +110,7 @@ uv run scripts/bench_data.py lock --manifest bench_data/manifests/public-smoke-v
 別PCでは、同じソースをライセンス同意のうえ取得してから再構築します。
 
 ```powershell
-uv run scripts/bench_data.py fetch --source fleurs:ja_jp --source fleurs:en_us --source librispeech:test-clean --accept-license
+uv run scripts/bench_data.py fetch --source fleurs:ja_jp --accept-license
 uv run scripts/bench_data.py build --lock docs/eval_set/public/public-smoke-v1.lock.json --out public-smoke-v1
 ```
 

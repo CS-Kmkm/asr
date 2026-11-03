@@ -90,7 +90,7 @@ for _split, _size in (("test-clean", "approximately 347 MB"), ("test-other", "ap
         "librispeech", _split, "openslr/12", _split, "openslr-12", "en-US",
         f"https://www.openslr.org/resources/12/{_split}.tar.gz", _size, kind="librispeech",
     )
-DEFAULT_SOURCES = ("fleurs:ja_jp", "fleurs:en_us", "librispeech:test-clean")
+DEFAULT_SOURCES = ("fleurs:ja_jp",)
 
 
 @dataclass(frozen=True)
