@@ -204,13 +204,15 @@ class WorkerEnvTests(IsolatedWorkerTestCase):
             self.assertEqual(output.read_bytes(), original)
 
     def test_whisper_profile_is_explicit_and_cannot_be_claimed_for_other_backends(self):
-        with patch.dict(os.environ, {"ASR_WHISPER_DECODE_PROFILE": "fast"}):
-            standard = bench_asr.worker_env(argparse.Namespace(backend="faster-whisper", whisper_profile="standard"))
-            fast = bench_asr.worker_env(argparse.Namespace(backend="faster-whisper", whisper_profile="fast"))
-        self.assertEqual(standard["ASR_WHISPER_DECODE_PROFILE"], "standard")
-        self.assertEqual(fast["ASR_WHISPER_DECODE_PROFILE"], "fast")
-        with self.assertRaises(bench_asr.BenchError):
-            bench_asr.worker_env(argparse.Namespace(backend="mock", whisper_profile="fast"))
+        for profile in ["standard", "fast", "greedy"]:
+            with self.subTest(profile=profile), patch.dict(os.environ, {"ASR_WHISPER_DECODE_PROFILE": "fast"}):
+                args = bench_asr.parse_args(["--backend", "faster-whisper", "--whisper-profile", profile])
+                env = bench_asr.worker_env(args)
+                self.assertEqual(env["ASR_WHISPER_DECODE_PROFILE"], profile)
+                if profile != "standard":
+                    args.backend = "mock"
+                    with self.assertRaisesRegex(bench_asr.BenchError, f"--whisper-profile {profile} requires --backend faster-whisper"):
+                        bench_asr.worker_env(args)
 
     def test_worker_stderr_is_requested_as_utf8(self) -> None:
         with patch.dict(os.environ, {}, clear=False):

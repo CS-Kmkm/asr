@@ -550,8 +550,8 @@ class TranscribeWithFakeModuleTests(IsolatedWorkerTestCase):
             backend.transcribe(Path("audio.wav"), None)
         self.assertIsNone(_FakeWhisperModel.last_transcribe_kwargs["hotwords"])
 
-    def test_fast_profile_is_explicit_and_standard_keeps_library_decode_defaults(self):
-        for profile in ["standard", "fast"]:
+    def test_profiles_change_only_their_explicit_decode_options(self):
+        for profile in ["standard", "fast", "greedy"]:
             with self.subTest(profile=profile), patch.dict(os.environ, {"ASR_WHISPER_DECODE_PROFILE": profile}), patch.dict(sys.modules, _install_fake_faster_whisper()):
                 backend = FasterWhisperBackend()
                 backend.load("4bit")
@@ -559,15 +559,23 @@ class TranscribeWithFakeModuleTests(IsolatedWorkerTestCase):
                 options = _FakeWhisperModel.last_transcribe_kwargs
                 self.assertEqual(options["language"], "ja")
                 self.assertEqual(options["hotwords"], "dictionary")
-                if profile == "fast":
+                if profile in {"fast", "greedy"}:
                     self.assertEqual(options["beam_size"], 1)
-                    self.assertTrue(options["vad_filter"])
                 else:
                     self.assertNotIn("beam_size", options)
+                if profile == "fast":
+                    self.assertTrue(options["vad_filter"])
+                else:
                     self.assertNotIn("vad_filter", options)
+                expected = {"audio_path": "audio.wav", "language": "ja", "hotwords": "dictionary"}
+                if profile != "standard":
+                    expected["beam_size"] = 1
+                if profile == "fast":
+                    expected["vad_filter"] = True
+                self.assertEqual(options, expected)
 
     def test_greedy_request_changes_only_beam_and_best_of(self):
-        for profile in ["standard", "fast"]:
+        for profile in ["standard", "fast", "greedy"]:
             with self.subTest(profile=profile), patch.dict(os.environ, {"ASR_WHISPER_DECODE_PROFILE": profile}), patch.dict(sys.modules, _install_fake_faster_whisper()):
                 backend = FasterWhisperBackend()
                 backend.load("4bit")
@@ -593,6 +601,7 @@ class TranscribeWithFakeModuleTests(IsolatedWorkerTestCase):
             with self.assertRaises(BackendError) as caught:
                 FasterWhisperBackend()
         self.assertEqual(caught.exception.code, "invalid_decode_profile")
+        self.assertIn("standard, fast, or greedy", str(caught.exception))
 
     def test_regional_locale_uses_supported_base_language(self) -> None:
         backend = FasterWhisperBackend()
