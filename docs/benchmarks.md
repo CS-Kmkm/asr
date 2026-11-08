@@ -1,5 +1,8 @@
 # ASR ベンチマークと Phase 0 ゲート判定
 
+OpenWhisprとの日本語エンジン比較の条件・再現手順・結果は
+[競合比較](competitor_comparison.md)を参照。
+
 本ドキュメントは、計画書 (`docs/local_ai_voice_input_implementation_plan.md`) の
 **Phase 0(技術検証, §15)** が定める
 
