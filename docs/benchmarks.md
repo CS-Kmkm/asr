@@ -129,7 +129,7 @@ warm は単一プロセスで `--repeat` 回反復して定常状態を測定。
 
 実運用で言語を指定している場合は、同じ値を `--language ja-JP` などで渡す。
 省略時はbackendの言語自動判定を使う。指定値はcold/warm両方の要求と結果の
-`config.language`に保持される。既存の`--whisper-profile standard|fast`比較でも
+`config.language`に保持される。既存の`--whisper-profile standard|fast|greedy`比較でも
 言語・音声・辞書・量子化をそろえること。`fast`はbeam=1とVADを同時に変更する
 実験用profileであり、アプリの既定設定は変わらない。
 
@@ -360,7 +360,7 @@ uv run python scripts\bench_asr.py --repeat 10 --audio bench_audio\ja_3s.wav `
 |---|---|---|
 | `--backend` | `mock` | ワーカーのバックエンド(`asr_worker --backend` に渡る) |
 | `--quantization` | `4bit` | `load` に渡す量子化 |
-| `--whisper-profile` | `standard` | faster-whisperのみ。実験用`fast`はbeam_size=1とVADを指定 |
+| `--whisper-profile` | `standard` | faster-whisperのみ。`standard`はライブラリ既定、実験用`fast`はbeam_size=1とVAD、`greedy`はbeam_size=1のみ(VADなし) |
 | `--audio WAV` | (なし) | 計測対象 WAV。複数指定可(繰り返し) |
 | `--repeat` | `5` | warm の 1 音声あたり反復回数 |
 | `--cold-runs` | `1` | プロセス再起動込み cold 計測の回数 |
@@ -402,11 +402,18 @@ uv run python scripts\bench_asr.py --repeat 10 --audio bench_audio\ja_3s.wav `
 - ワーカーがエラー応答(`ok:false`)を返した場合は、その `code`/`message` を表示して
   終了コード 1 で停止する(例: `gpu_oom`, `model_load_failed`)。
 
-### 5.8 実験用Fastプロファイルの比較
+### 5.8 実験用Fast・Greedyプロファイルの比較
 
 既定の`standard`はライブラリのデコード設定を維持する。`fast`は`beam_size=1`と
 `vad_filter=True`だけを変更する実験用の選択であり、アプリの既定には採用していない。
-ワーカー単体では`ASR_WHISPER_DECODE_PROFILE=standard|fast`で指定できる。
+`greedy`は`beam_size=1`だけを変更し、VADは無効のまま音声全体を処理する。
+temperature fallbackなど、ほかの設定は`standard`と同じライブラリ既定を維持する。
+OpenWhisprのwhisper.cpp既定(greedy)との速度比較や低遅延設定の評価に使う。
+ただし一致するのはtemperature 0の探索だけである。`best_of`はライブラリ既定の5のままなので、
+fallbackのtemperatureでは5候補をサンプリングする(OpenWhisprは2候補)。fallbackに入る条件も
+faster-whisperは圧縮率とlog probability、whisper.cppはentropyとlog probabilityで異なる。
+fallbackの多い音声では、この差が速度比較に混ざる。
+ワーカー単体では`ASR_WHISPER_DECODE_PROFILE=standard|fast|greedy`で指定できる。
 ベンチマークの`--whisper-profile`は環境変数より優先され、選択をJSONのconfigに記録する。
 
 同じモデル・デバイス・量子化・辞書・録音を使い、変更する条件をプロファイルだけにする。
@@ -414,7 +421,7 @@ uv run python scripts\bench_asr.py --repeat 10 --audio bench_audio\ja_3s.wav `
 CPU比較は`ASR_DEVICE=cpu`、GPU比較は`cuda`で固定し、`auto`の切り替えを比較に混ぜない。
 
 ```powershell
-$taskRunDir = Join-Path .diagnostics ("fast-profile-" + (Get-Date -Format yyyyMMdd-HHmmss-fff))
+$taskRunDir = Join-Path .diagnostics ("decode-profile-" + (Get-Date -Format yyyyMMdd-HHmmss-fff))
 New-Item -ItemType Directory -Path $taskRunDir -ErrorAction Stop | Out-Null
 $taskPreviousDevice = $env:ASR_DEVICE
 try {
@@ -423,9 +430,12 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "Standard benchmark failed" }
   uv run scripts/bench_asr.py --backend faster-whisper --audio bench_audio/quiet/ja_short_01.wav --repeat 10 --whisper-profile fast --record-device --json --output (Join-Path $taskRunDir fast.json)
   if ($LASTEXITCODE -ne 0) { throw "Fast benchmark failed" }
+  uv run scripts/bench_asr.py --backend faster-whisper --audio bench_audio/quiet/ja_short_01.wav --repeat 10 --whisper-profile greedy --record-device --json --output (Join-Path $taskRunDir greedy.json)
+  if ($LASTEXITCODE -ne 0) { throw "Greedy benchmark failed" }
 } finally { $env:ASR_DEVICE = $taskPreviousDevice }
 uv run scripts/score_asr.py --bench (Join-Path $taskRunDir standard.json) --ref docs/eval_set/references.json --terms docs/eval_set/terms.txt
 uv run scripts/score_asr.py --bench (Join-Path $taskRunDir fast.json) --ref docs/eval_set/references.json --terms docs/eval_set/terms.txt
+uv run scripts/score_asr.py --bench (Join-Path $taskRunDir greedy.json) --ref docs/eval_set/references.json --terms docs/eval_set/terms.txt
 ```
 
 実行順を逆にした比較も新しい結果フォルダーへ保存する。日本語・英語・混在、短文・長文と

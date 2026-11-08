@@ -198,6 +198,12 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 | `language` | 文字列(32文字以下) / `null` / 省略 | 任意 | 音声の言語(例 `ja`、`en-GB`)。それ以外の型や長すぎる値は `invalid_request`。faster-whisper と openai-compatible は地域部分を除いたベース言語として渡す。VibeVoice は transformers の `apply_transcription_request` が言語引数を持たないため無視する。 |
 | `decoding` | `"greedy"` / `null` / 省略 | 任意 | ライブプレビューの認識だけが、設定「ライブプレビューを軽量化」がオンのときに `"greedy"` を送る。faster-whisper は `beam_size=1`・`best_of=1` で認識し、VAD などほかの設定は変えない。ほかのバックエンドは無視する。それ以外の値は `invalid_request`。停止後の最終認識のリクエストには含まれない。 |
 
+faster-whisperの起動時プロファイルは`ASR_WHISPER_DECODE_PROFILE`で指定する。
+`standard`(既定)はライブラリ既定(beam_size=5、VAD無効)、`fast`は`beam_size=1`と
+`vad_filter=True`、`greedy`は`beam_size=1`だけを変更してVAD無効のまま音声全体を処理する。
+temperature fallbackなど、ほかの設定はすべてライブラリ既定を維持する。
+リクエストの`decoding="greedy"`はどのプロファイルにも追加で適用され、`best_of=1`も指定する。プロセス全体の`greedy`プロファイルは`best_of`を変えないため(既定5)、同じ名前でもfallback時の候補数が異なる。
+
 設定「増分の最終文字起こし」がオンのとき、録音中に確定した区間と停止後の残り(末尾)の認識も、停止後の最終認識と同じ `transcribe` リクエスト(同じ `prompt`・`language`、`decoding` なし)を区間ごとの WAV に対して送る。プロトコルに追加のフィールドはなく、ワーカー側の扱いも通常の最終認識と同じ。前の区間の認識結果を `prompt` に含めることはない。
 
 **`prompt` の扱い:**
@@ -439,7 +445,7 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
 | `backend_unavailable` | backends.py | faster-whisper、VibeVoice、HTTP バックエンドの必要パッケージがない。 |
 | `gpu_oom` | backends.py(例外マッピング / mock) | CPUロード・CPU推論・CPU再試行以外の文脈で GPU メモリ不足を捕捉した。ホストの割り当て失敗は `cpu_oom`。load/transcribe両方で発生しうる。 |
 | `cpu_oom` | backends.py(ホストメモリの例外マッピング) | CPUロード・推論・再試行中のメモリ不足、または CUDA/VibeVoice を含む処理のホスト割り当て失敗を捕捉した。小さいモデルや他アプリの終了で再試行する。推論中なら短い録音も検討する。 |
-| `invalid_decode_profile` | backends.py(faster-whisper生成時) | 起動時の設定エラー。stderrへ案内し終了コード2で終了する。JSONL応答はない。ASR_WHISPER_DECODE_PROFILEにはstandardかfastを指定する。 |
+| `invalid_decode_profile` | backends.py(faster-whisper生成時) | 起動時の設定エラー。stderrへ案内し終了コード2で終了する。JSONL応答はない。ASR_WHISPER_DECODE_PROFILEにはstandard、fast、greedyのいずれかを指定する。 |
 | `gpu_unsupported` | backends.py (`VibeVoiceBackend.load`) | CUDA GPUが利用不可、またはモデルがCUDAに配置されなかった(CPUフォールバック無効)。 |
 | `hf_auth_required` | backends.py(例外マッピング) | Hugging Faceのgatedモデル、無効なトークン、または401/403応答によりモデルを取得できない。 |
 | `hf_repository_unavailable` | backends.py(例外マッピング) | Hugging FaceのモデルIDが存在しない、またはprivateモデルへの読取権限がない。 |

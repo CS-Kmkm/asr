@@ -620,8 +620,8 @@ class FasterWhisperBackend(ProgressReporting):
         self.device: str | None = None
         self._model_source: str | None = None
         self.decode_profile = os.environ.get("ASR_WHISPER_DECODE_PROFILE", "standard").strip().lower()
-        if self.decode_profile not in {"standard", "fast"}:
-            raise BackendError("invalid_decode_profile", "ASR_WHISPER_DECODE_PROFILE must be standard or fast")
+        if self.decode_profile not in {"standard", "fast", "greedy"}:
+            raise BackendError("invalid_decode_profile", "ASR_WHISPER_DECODE_PROFILE must be standard, fast, or greedy")
 
     def load(self, quantization: str) -> None:
         if quantization not in QUANTIZATIONS:
@@ -803,14 +803,17 @@ class FasterWhisperBackend(ProgressReporting):
     def decode_options(self, decoding: str | None) -> dict[str, Any]:
         """faster-whisper options beyond its library defaults for one request.
 
-        The process-wide ``fast`` profile trades beam search and adds VAD. A
+        The process-wide ``fast`` profile trades beam search and adds VAD;
+        the ``greedy`` profile changes only beam_size to 1, leaving VAD off. A
         ``greedy`` request (live preview only) switches beam search and
         best-of sampling to a single candidate and changes nothing else, so
         VAD and every other option stay as the profile sets them.
         """
-        options: dict[str, Any] = (
-            {"beam_size": 1, "vad_filter": True} if self.decode_profile == "fast" else {}
-        )
+        options: dict[str, Any] = {}
+        if self.decode_profile in {"fast", "greedy"}:
+            options["beam_size"] = 1
+        if self.decode_profile == "fast":
+            options["vad_filter"] = True
         if decoding == GREEDY_DECODING:
             options.update(beam_size=1, best_of=1)
         return options
