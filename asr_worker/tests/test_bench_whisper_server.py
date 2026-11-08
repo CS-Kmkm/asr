@@ -123,7 +123,9 @@ class WhisperServerBenchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(prefix="test_whisper_server_")
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        # Windows CI may expose TEMP through an 8.3 alias (RUNNER~1), while
+        # the harness resolves model/executable paths to their long form.
+        self.root = Path(self.temp.name).resolve()
         self.stub = self.root / "stub.py"
         self.stub.write_text(_SERVER, encoding="utf-8")
         self.model = self.root / "ggml-synthetic.bin"
