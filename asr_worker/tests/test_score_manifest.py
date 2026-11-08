@@ -323,13 +323,14 @@ class ManifestScoreTests(unittest.TestCase):
         self.assertEqual([d["condition"] for d in differences[:6]],
                          ["backend", "model", "quantization", "whisper_decode_profile", "device_policy", "manifest.name"])
         by_key = {d["condition"]: d for d in differences}
-        for key in ("worker_cmd", "audio", "audio_format", "manifest.path", "scoring_manifest.path"):
+        for key in ("worker_cmd", "audio", "manifest.path", "scoring_manifest.path"):
             self.assertNotIn(key, by_key)
+        self.assertIn("audio_format", by_key)
         self.assertEqual(by_key["scored_item_count"], {"condition": "scored_item_count", "baseline": 2, "current": 3})
         self.assertEqual(by_key["missing_item_count"]["baseline"], 2)
         self.assertEqual(by_key["missing_item_count"]["current"], 1)
         informational = {d["key"]: d for d in comparison["informational"]}
-        self.assertEqual(set(informational), {"worker_cmd", "audio", "audio_format", "manifest.path", "scoring_manifest.path"})
+        self.assertEqual(set(informational), {"worker_cmd", "audio", "manifest.path", "scoring_manifest.path"})
         summary = informational["audio"]["current"]
         self.assertEqual(summary["count"], 100)
         self.assertEqual(len(summary["sha256"]), 12)
@@ -348,16 +349,26 @@ class ManifestScoreTests(unittest.TestCase):
         result["config"]["worker_cmd"] = ["local-python"]
         previous = copy.deepcopy(result)
         previous["config"]["audio"] = [str(self.root / "other-pc" / "en.wav")]
-        previous["config"]["audio_format"] = [{"sample_rate": 24000}]
         previous["config"]["worker_cmd"] = ["other-python"]
         previous["config"]["manifest"]["path"] = "other/manifest.json"
         previous["manifest"]["path"] = "other/scoring.json"
         comparison = score_asr.compare_baseline(result, previous)
         self.assertEqual(comparison["differing_conditions"], [])
-        self.assertEqual(len(comparison["informational"]), 5)
+        self.assertEqual(len(comparison["informational"]), 4)
         markdown = score_asr.render_baseline_markdown(comparison)
         self.assertIn("Differing conditions: none", markdown)
         self.assertIn("Informational (machine-local)", markdown)
+
+    def test_audio_format_changes_are_comparison_conditions(self) -> None:
+        result = self.score()
+        result["config"]["audio_format"] = [{"sample_rate": 16000, "channels": 1, "sample_width_bytes": 2}]
+        for field, value in (("sample_rate", 24000), ("channels", 2), ("sample_width_bytes", 3)):
+            with self.subTest(field=field):
+                previous = copy.deepcopy(result)
+                previous["config"]["audio_format"][0][field] = value
+                comparison = score_asr.compare_baseline(result, previous)
+                self.assertEqual([item["condition"] for item in comparison["differing_conditions"]], ["audio_format"])
+                self.assertNotIn("Differing conditions: none", score_asr.render_baseline_markdown(comparison))
 
     def test_manifest_markdown_reuses_header_and_distinguishes_counts_and_terms(self) -> None:
         opts = self.options()

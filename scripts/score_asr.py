@@ -694,7 +694,7 @@ def compare_baseline(result: dict[str, Any], baseline: dict[str, Any]) -> dict[s
                 "worker_health.device", "worker_health.compute_type", "observed_devices", "device",
                 "manifest.name", "scoring_manifest.name", "scored_item_count", "missing_item_count"]
     ordered = sorted(current.keys() | previous.keys(), key=lambda key: (priority.index(key) if key in priority else len(priority), key))
-    machine_local = {"worker_cmd", "audio", "audio_format", "manifest.path", "scoring_manifest.path"}
+    machine_local = {"worker_cmd", "audio", "manifest.path", "scoring_manifest.path"}
     return {
         "overall": overall, "groups": groups,
         "differing_conditions": [{"condition": key, "baseline": previous.get(key), "current": current.get(key)}
