@@ -213,12 +213,160 @@ Jobへの割当をOSが拒否した場合は警告を出し、通常の終了処
 
 ## 未測定項目
 
-- 製品E2Eの録音停止→貼り付け完了、録音前処理、クリップボード・挿入処理。
+- 製品E2Eのうち、devセット・holdoutでの計測、toggleモード、VS Code・ブラウザ・ターミナル・IME有効時の
+  貼り付け（停止→貼り付けはsmoke 30件・専用EDITだけ測定済み）。
 - first partial、ライブ認識、VAD、整文、辞書適用を含むUX。
 - CPU使用率、RAM、プロセス単位のVRAM、消費電力、CPU専用動作
   （VRAMは下の結果でGPU全体の外部サンプリング値のみ記録）。
 - Handy / Amicalの製品・エンジン比較。
 - Nemotron / sherpa-onnx。
+
+## B: 製品E2E
+
+`scripts/bench_e2e.py`は、Windows 11上でアプリのグローバルホットキーを操作し、
+固定manifestのWAVをVB-CABLEへ等速再生する。録音停止のキー送信から、ハーネス自身が
+所有するネイティブの複数行EDITへの最初の変更（`stop_to_first_paste_ms`）と、
+最後の変更（`stop_to_settled_ms`）までを測る。最後の変更後に既定で1,500 msの
+無変更期間を確認するが、その待機時間はsettledの値には加算しない。
+エンジン比較AのJSONL/HTTP往復とは境界が異なり、その数値を製品E2Eの値として扱わない。
+first partial、IMEの未確定文字列、入力中のライブプレビューの応答は測定対象外である。
+
+### 準備と条件
+
+1. VB-CABLEを事前にインストールする。インストールで変わったWindowsの既定の再生・
+   録音デバイスは元に戻し、アプリのマイクだけを`CABLE Output`に指定する。
+   ハーネスの再生先は`CABLE Input`であり、通常のスピーカーへの再生は行わない。
+2. 比較するアプリを一つずつ起動し、対象外のアプリのグローバルホットキーを無効にする。
+   ローカルASR、日本語、AI整文オフ、hold操作に揃える。辞書・ライブプレビューもオフにする。
+   アプリのバージョン、モデル、量子化、GPU、ホットキー、関連設定を各runに記録する。
+   モデルや内部処理を揃えられない場合は`--condition`で違いを明示する。
+3. 前節で固定した日本語の`$manifest`を両製品で共用する。準備済みの16 kHz mono PCM16 WAVを
+   使い、ハーネスはデータセットやモデルを取得しない。初回は`--limit 1`の別runで動作を確認する。
+4. アプリとハーネスは通常権限で動かし、実行中は管理者権限のウィンドウを開かない。
+   両製品で変更できる場合は、同じWinキーなしのホットキー（以下では`Ctrl+Shift+Space`）に揃える。
+   本アプリを`Ctrl+Win`で使う場合は、対応するコマンドの`--hotkey`も`Ctrl+Win`へ変更し、
+   Winキーのマスクに関する下記の制約を条件として記録する。
+
+### 実行と採点
+
+新しい結果ディレクトリを作る。バージョンと条件の入力・アプリ設定はカウントダウン前に済ませる。
+`$manifest`は前節で作成したローカルmanifestのパスであり、再buildしない。
+
+```powershell
+$e2eRoot = Join-Path bench_data ("e2e-" + (Get-Date -Format yyyyMMdd-HHmmss-fff))
+New-Item -ItemType Directory -Path $e2eRoot -ErrorAction Stop | Out-Null
+if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { throw 'Set $manifest to the frozen Japanese manifest' }
+$localVersion = Read-Host 'Local Voice Input version'
+$localModel = Read-Host 'Local Voice Input model and quantization'
+uv run scripts/bench_e2e.py --manifest $manifest --app-label "local-voice-input-$localVersion" --hotkey 'Ctrl+Shift+Space' --mode hold --playback-device 'CABLE Input' --pre-roll-ms 600 --tail-ms 300 --settle-ms 1500 --timeout-s 30 --warmup 1 --gap-s 2 --condition 'asr=local' --condition 'language=ja' --condition 'cleanup=off' --condition 'live-preview=off' --condition "model=$localModel" --output (Join-Path $e2eRoot local.json)
+if ($LASTEXITCODE -ne 0) { throw 'Local product E2E failed' }
+```
+
+本アプリのホットキーを無効にしてから、OpenWhisprを同条件に設定して実行する。
+
+```powershell
+$owVersion = Read-Host 'OpenWhispr version'
+$owModel = Read-Host 'OpenWhispr model and quantization'
+uv run scripts/bench_e2e.py --manifest $manifest --app-label "openwhispr-$owVersion" --hotkey 'Ctrl+Shift+Space' --mode hold --playback-device 'CABLE Input' --pre-roll-ms 600 --tail-ms 300 --settle-ms 1500 --timeout-s 30 --warmup 1 --gap-s 2 --condition 'asr=local' --condition 'language=ja' --condition 'cleanup=off' --condition 'live-preview=off' --condition "model=$owModel" --output (Join-Path $e2eRoot openwhispr.json)
+if ($LASTEXITCODE -ne 0) { throw 'OpenWhispr product E2E failed' }
+foreach ($arm in @('local', 'openwhispr')) {
+  uv run scripts/score_asr.py --bench (Join-Path $e2eRoot "$arm.json") --manifest $manifest --json --output (Join-Path $e2eRoot "$arm.score.json")
+  if ($LASTEXITCODE -ne 0) { throw "Product E2E scoring failed: $arm" }
+}
+```
+
+warmupは最初の音声で1回行い、集計・採点から除外する。その後はmanifestの各項目を1回ずつ測る。
+toggle専用の製品ではアプリの設定と`--mode toggle`を一致させ、holdと異なる条件として記録する。
+holdの停止時刻はキー解放のSendInput呼び出し直前、toggleは2回目の押下呼び出し直前である。
+tapの押下と解放の間には40 ms置くが、toggleの停止時刻は押下のままである。
+ホットキーにはCtrl・Alt・Winのいずれかが必要で、修飾キーのみならWinを必須とする。
+Winキーの解放前、および修飾キーのみの組合せのAlt解放前には、未割当キー`0xE8`を送り、
+スタートメニューやAltメニューの表示を抑制する。Winマスクの有無は`config.win_mask_used`に残る。
+このマスク入力をユーザー操作とみなす製品では、入力が静まるのを待つガードが延長される可能性がある。
+`Ctrl+Win`で測ったrunにはこの制約があり、同じWinなしの組合せによる比較と区別する。
+
+### 安全と結果の読み方
+
+開始前に3秒のカウントダウンと「do not touch keyboard/mouse」を表示する。
+実行中はPCを操作せず、管理者権限のウィンドウや通知による割り込みも避ける。
+試行前にGetAsyncKeyStateで修飾キーが押されていないことを確認し、押されていれば送信せず中断する。
+GetLastInputInfoによる1秒以上の入力アイドルを待ち、10秒以内に満たせなければ中断する。
+キー送信前には自身のウィンドウのフォーカスを確認するが、確認とOSの入力配送は不可分ではない。
+
+hold中のフォーカス逸脱では、キー解放の前に最大500 msだけ再フォーカスを試す。
+戻せなかった場合もキーは解放するが、ラン全体を中断する。**この解放自体が録音停止であり、
+製品がその時点でフォーカスされている別のウィンドウへ貼り付ける可能性がある。**
+戻せた試行や停止後の貼り付け時の逸脱は`focus_lost`とexe名だけを記録する。
+`focus_lost`が3試行連続した場合はwarmup中でも中断する。
+toggleは開始tapから停止tapの完了までに失敗すると、キーを解放してラン全体を中断する。
+toggleではキー解放だけで録音が止まるとは限らないため、中断後は対象製品の録音状態を確認する。
+
+各キー解放後にGetAsyncKeyStateで注入キー（マスクを含む）が上がったことを確認し、
+残っていればキーアップを1回再送する。それでも下がっていれば明示的なエラーで中断する。
+Ctrl+Cではfinallyで解放し、コンソールのCLOSE・LOGOFF・SHUTDOWN通知にもキー解放ハンドラーを登録する。
+計測ウィンドウが閉じられたりスレッドが終了したりした場合は中断し、スレッド間メッセージは
+SendMessageTimeoutWで待機を制限する。
+
+クリップボードには試行ごとに一意のsentinelを置き、貼り付け後に同じ内容へ戻ったかを
+`clipboard_restored`として記録する。sentinel未設定や停止後の変更なしの場合はnullとする。
+読み取り失敗は`clipboard_error`に残し、試行のstatusは変えない。falseだけでも試行を失敗にしない。
+復元率の分母は`change_events > 0`の全試行で、一致を確認できた試行の割合である。
+sentinelには`ExcludeClipboardContentFromMonitorProcessing`形式を付けて履歴への取り込みを抑制する。
+終了時は`gap_s`だけ待ってから元のテキストを復元する。
+開始時のクリップボードが空か、復元可能なプレーンテキスト形式だけであることを確認する。
+画像・ファイル・HTML・リッチテキストなどが含まれる場合は、sentinelやキーを送る前に中断する。
+その場合は必要な内容を保存し、短いプレーンテキストをコピーしてから再実行する。
+停止後の待機中もフォーカスを監視し、EDITに変更がなくても逸脱は`focus_lost`として記録する。
+音声の複製、スクリーンショット、キー操作ログは保存しない。認識文と結果JSONはローカルに保管する。
+`--output`は既存ファイルを拒否する。結果の書き込みに失敗した場合はJSONをstdoutにも出す。
+
+`e2e.counts`は`ok`・`empty`・`timeout`・`focus_lost`・`error`の件数であり、
+成功率の分母はwarmupを除く全試行である。期限内に変更がなければtimeout、空文字へ変わって安定すればempty、
+変更が続いて安定確認できなければerrorとする。p50/p95は非空で安定したok試行だけを使う。
+`wall_ms`はok時の最初の変更までの値、非ok時と不明な`duration_ms`はNaNである。
+CERには失敗試行の空文字や途中までの文も含まれるので、成功率とともに読む。
+停止直前のEDIT文字列を取得し、最終文字列の接頭辞と一致すれば、その後ろの挿入分だけを`text`とする。
+接頭辞が一致しなければ全文を残す。停止前の変更や接頭辞の不一致は`pre_stop_changes`で示す。
+EN_CHANGEの時刻と文字列は同じロックで取得し、安定待ちの現在時刻も同じロックで読む。
+通知が出ないWM_SETTEXTやUIA ValuePatternによる挿入には、10 ms間隔のWM_GETTEXTLENGTHと文字列の
+補助ポーリングを使う。`detected_by`は最初の変更の検出方法（`en_change`または`poll`、変更なしならnull）で、
+pollの値にはポーリング間隔による検出遅延が含まれる。
+`audio_duration_ms`はWAVの長さ、`play_start_lag_ms`は再生要求からWAV読込・waveOut準備を経て
+バッファを送るまでの時間、`playback_ms`は送信からバッファ完了通知までの時間を表す。
+Windows build、再生デバイス名、manifest条件、各待機時間もconfigに残る。
+Win32 UIテストは`ASR_E2E_WIN32_TESTS=1`を明示した場合だけ動く。通常のテストでは実キー送信・
+音声再生・フォーカスを持つウィンドウの作成を行わない。
+
+### 2026-11-03 初回計測（製品E2E B、日本語のみ）
+
+環境はエンジン比較Aと同じ（RTX 3060 12 GB、Windows 11 10.0.26300）。音声は`ja-smoke-v1`
+（FLEURS `ja_jp` test、30件、7.9–18.5秒）。各製品をholdモードで1件warmup後に30件。
+1回に起動する製品は1つだけで、VB-CABLE経由で同じWAVを実時間再生した。
+この計測は本節の安全修正（中断条件、停止後テキストの切り出しなど）の前の版で行った。
+停止・最初の貼り付け・安定の時刻定義は修正前後で同じで、各試行の前にEDITを空にしているため
+`text`の内容も変わらない。修正後の版でも実機2試行で動作を確認した。
+
+| 製品・バージョン / 設定 | 成功率 | first paste p50 / p95 (ms) | clipboard復元率 | raw / normalized CER | 末尾の幻覚文 |
+|---|---:|---:|---:|---:|---:|
+| OpenWhispr 1.11.0 / Whisper Turbo ggml f16、CUDA、日本語、AI補正オフ、Ctrl+Win hold | 30/30 | 685 / 785 | 30/30 | 10.04% / 7.32% | 0 |
+| 本アプリ main@2ecf602 / faster-whisper turbo `bf16`(float16)、standard、補正オフ、増分最終認識オン（既定）、Ctrl+Shift+Space hold | 29/30 | 547 / 763 | 29/29 | 19.71% / 15.65% | 9 |
+| 本アプリ 同上、増分最終認識オフ | 29/30 | 591 / 770 | 29/29 | 14.07% / 8.85% | 0 |
+
+本アプリの音声処理は既定値（ノイズ抑制medium、ゲイン100%、自動ゲインオン）にした。
+OpenWhisprは音声処理なし（getUserMediaのecho cancel / noise suppression / AGCはオフ）で、
+「マイクを準備しておく」が60秒だった。OpenWhisprはWin chordなので0xE8マスクを使った。
+
+読み方:
+
+- 3条件とも成功した29件で比べると、normalized CERは OpenWhispr 7.39%、本アプリ増分オン 13.34%、
+  増分オフ 6.36%。本アプリの停止→貼り付けは29件中、増分オンで25件、増分オフで24件がOpenWhisprより速い。
+- **増分最終認識オンでは29件中9件の末尾に「ご視聴ありがとうございました」「ありがとうございました」
+  「それではまた」が付いた**（増分オフとOpenWhisprでは0件）。これがCER悪化の主因で、
+  無音区間で区切った末尾の短い区間を単独で認識したときのWhisperの幻覚と考えられる。
+- 本アプリの失敗1件は両条件とも同じ項目（`…9478046545`）で、RMS 26・ピーク263と他の項目の中央値
+  （RMS 2,703）より約40 dB小さい。本アプリは貼り付けも履歴も残さず、OpenWhisprは認識できた。
+- OpenWhisprのCER（7.32%）はエンジン単体（6.32%）より高い。仮想ケーブル経由の録音・
+  開始と停止のタイミングによる差を含む。30件と少なく、p95の信頼性は低い。
 
 ## 結果
 
