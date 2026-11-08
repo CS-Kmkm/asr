@@ -45,6 +45,7 @@ import argparse
 import contextlib
 import csv
 import hashlib
+import importlib.util
 import io
 import json
 import math
@@ -78,6 +79,27 @@ SMOKE_FREQ_HZ = 440.0
 
 class BenchError(RuntimeError):
     """Raised for any unrecoverable benchmark failure (clean exit, no hang)."""
+
+
+def load_manifest(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Share the scorer's loader, including when this script is loaded by file path."""
+    module_name = "_bench_score_manifest"
+    scorer = sys.modules.get(module_name)
+    if scorer is None:
+        spec = importlib.util.spec_from_file_location(module_name, Path(__file__).with_name("score_asr.py"))
+        assert spec is not None and spec.loader is not None
+        scorer = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = scorer
+        try:
+            spec.loader.exec_module(scorer)
+        except BaseException:
+            sys.modules.pop(module_name, None)
+            raise
+    try:
+        manifest = scorer.load_manifest(path)
+    except (OSError, ValueError) as exc:
+        raise BenchError(f"could not load manifest: {exc}") from exc
+    return manifest, scorer.manifest_conditions(manifest, path)
 
 
 # --------------------------------------------------------------------------- #
@@ -530,6 +552,7 @@ class RequestConditions:
     language: str | None = None
     idle_gap_s: float = 0.0
     live: LivePreviewLoad | None = None
+    item_languages: dict[Path, str] | None = None
 
 
 def transcribe_payload(audio: Path, conditions: RequestConditions, *, preview: bool = False) -> dict[str, Any]:
@@ -646,17 +669,22 @@ def run_transcribe_loop(
     """
     records: list[dict[str, Any]] = []
     for audio in audio_paths:
+        item_conditions = conditions
+        if conditions.item_languages is not None and conditions.language is None:
+            item_conditions = replace(conditions, language=conditions.item_languages[audio])
         for _ in range(repeat):
             if conditions.idle_gap_s > 0:
                 _sleep(conditions.idle_gap_s)
-            live = simulate_live_preview(session, audio, conditions) if conditions.live else None
-            response, wall_ms = session.request(transcribe_payload(audio, conditions))
+            live = simulate_live_preview(session, audio, item_conditions) if conditions.live else None
+            response, wall_ms = session.request(transcribe_payload(audio, item_conditions))
             record: dict[str, Any] = {
                 "audio": str(audio),
                 "wall_ms": wall_ms,
                 "duration_ms": float(response.get("duration_ms", float("nan"))),
                 "text": response.get("text", ""),
             }
+            if conditions.item_languages is not None:
+                record["language"] = item_conditions.language
             if live is not None:
                 record["live_drain_ms"] = live["live_drain_ms"]
                 record["stop_to_final_ms"] = live["live_drain_ms"] + wall_ms
@@ -780,6 +808,11 @@ def run_benchmark(args: argparse.Namespace, audio_paths: list[Path]) -> dict[str
     cmd = build_worker_cmd(args)
     env = worker_env(args)
     conditions, condition_config = request_conditions(args)
+    manifest = getattr(args, "manifest_data", None)
+    if manifest is not None:
+        conditions = replace(conditions, item_languages={Path(item["audio_path"]): item["language"] for item in manifest["items"]})
+        condition_config["manifest"] = args.manifest_conditions
+    condition_config["language_source"] = "argument" if conditions.language is not None else "manifest" if manifest is not None else "auto"
     # Cold runs measure process start + load + the first request only; the
     # idle gap and live-preview load apply to warm requests.
     cold_conditions = replace(conditions, idle_gap_s=0.0, live=None)
@@ -890,7 +923,10 @@ def render_markdown(result: dict[str, Any]) -> str:
             "- devices observed after requests: "
             + ", ".join(f"`{item['device'] or '-'}/{item['compute_type'] or '-'}`" for item in observed)
         )
-    lines.append(f"- language: `{cfg.get('language') or 'auto'}`")
+    language = "per-item (manifest)" if cfg.get("language_source") == "manifest" else cfg.get("language") or "auto"
+    lines.append(f"- language: `{language}`")
+    if cfg.get("manifest"):
+        lines.append(f"- manifest: `{cfg['manifest']['name']}`")
     prompt = cfg.get("prompt")
     if prompt is not None:
         lines.append(
@@ -990,6 +1026,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         metavar="WAV",
         help="path to a wav file to transcribe; repeatable",
     )
+    parser.add_argument("--manifest", metavar="FILE", help="benchmark audio and per-item languages from a frozen manifest")
     parser.add_argument("--repeat", type=int, default=5, help="warm transcriptions per audio (default: 5)")
     parser.add_argument(
         "--cold-runs",
@@ -1035,7 +1072,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         action="store_true",
         help="generate a synthetic wav and run a self-contained mock benchmark",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.manifest and (args.audio or args.smoke):
+        parser.error("--manifest cannot be combined with --audio or --smoke")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1073,7 +1113,11 @@ def main(argv: list[str] | None = None) -> int:
                 _emit(result, args)
                 return 0
 
-        audio_paths = [Path(p) for p in args.audio]
+        if args.manifest:
+            args.manifest_data, args.manifest_conditions = load_manifest(Path(args.manifest))
+            audio_paths = [Path(item["audio_path"]) for item in args.manifest_data["items"]]
+        else:
+            audio_paths = [Path(p) for p in args.audio]
         if not audio_paths:
             raise BenchError("no audio supplied; pass --audio WAV (or use --smoke)")
         missing = [p for p in audio_paths if not p.is_file()]
