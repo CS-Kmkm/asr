@@ -243,6 +243,8 @@ def wait_for_paste(window: Any, stop: float, args: argparse.Namespace, clock: An
                   "detected_by": changes[0].detected_by if changes else None,
                   "stop_to_first_paste_ms": first, "stop_to_settled_ms": last}
         lost = next((event.focus_process for event in changes if event.focus_process is not None), None)
+        if lost is None:
+            lost = window.focus_process()
         if lost is not None:
             return {**result, "status": "focus_lost", "focus_process": lost}
         if changes and changes[-1].at + args.settle_ms / 1000 <= min(now, deadline):
@@ -427,6 +429,7 @@ class WinAPI:
             types = {"OpenClipboard": (wt.HWND,), "IsClipboardFormatAvailable": (wt.UINT,)}.get(name, ())
             bind(self.user, name, wt.BOOL, *types)
         bind(self.user, "GetClipboardData", wt.HANDLE, wt.UINT)
+        bind(self.user, "EnumClipboardFormats", wt.UINT, wt.UINT)
         bind(self.user, "SetClipboardData", wt.HANDLE, wt.UINT, wt.HANDLE)
         bind(self.user, "RegisterClipboardFormatW", wt.UINT, wt.LPCWSTR)
         bind(self.kernel, "GlobalAlloc", wt.HANDLE, wt.UINT, ctypes.c_size_t)
@@ -713,16 +716,42 @@ class Clipboard:
 
     def read(self) -> str | None:
         with self.opened():
-            if not self.api.user.IsClipboardFormatAvailable(13):
+            return self._read_opened()
+
+    def snapshot_plain_text(self) -> str | None:
+        # Enumerate and read under one clipboard lock. Text accompanying HTML,
+        # images or file lists is insufficient to restore the original payload.
+        with self.opened():
+            formats = []
+            current = 0
+            while True:
+                ctypes.set_last_error(0)
+                current = self.api.user.EnumClipboardFormats(current)
+                if not current:
+                    if ctypes.get_last_error():
+                        raise BenchError("could not inspect clipboard formats; clipboard was not changed")
+                    break
+                formats.append(current)
+            if not formats:
                 return None
-            handle = self.api.user.GetClipboardData(13)
-            pointer = self.api.kernel.GlobalLock(handle) if handle else None
-            if not pointer:
-                raise BenchError("could not read clipboard text")
-            try:
-                return ctypes.wstring_at(pointer)
-            finally:
-                self.api.kernel.GlobalUnlock(handle)
+            if any(format_id not in {1, 7, 13, 16} for format_id in formats) or 13 not in formats:
+                raise BenchError("clipboard contains formats this benchmark cannot restore; copy plain text before retrying; clipboard was not changed")
+            text = self._read_opened()
+            if text is None:
+                raise BenchError("could not snapshot clipboard text; clipboard was not changed")
+            return text
+
+    def _read_opened(self) -> str | None:
+        if not self.api.user.IsClipboardFormatAvailable(13):
+            return None
+        handle = self.api.user.GetClipboardData(13)
+        pointer = self.api.kernel.GlobalLock(handle) if handle else None
+        if not pointer:
+            raise BenchError("could not read clipboard text")
+        try:
+            return ctypes.wstring_at(pointer)
+        finally:
+            self.api.kernel.GlobalUnlock(handle)
 
     def _set_data(self, format_id: int, data: bytes) -> None:
         handle = self.api.kernel.GlobalAlloc(0x2, len(data))
@@ -819,9 +848,7 @@ class WavePlayer:
 def run_benchmark(args: argparse.Namespace, manifest: dict[str, Any], conditions: dict[str, Any],
                   window: Any, audio: Any, clipboard: Any, keys: Keyboard,
                   clock: Any = time, windows_build: str = "unknown") -> dict[str, Any]:
-    original = clipboard.read()
-    if original is None:
-        print("[bench_e2e] clipboard has no Unicode text; non-text formats cannot be restored; clearing at end", file=sys.stderr)
+    original = clipboard.snapshot_plain_text()
     try:
         print("[bench_e2e] do not touch keyboard/mouse during the run", file=sys.stderr)
         for remaining in (3, 2, 1):

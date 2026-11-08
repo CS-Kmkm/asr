@@ -84,6 +84,9 @@ class FakeClipboard:
     def read(self) -> str | None:
         return self.text
 
+    def snapshot_plain_text(self) -> str | None:
+        return self.text
+
     def write(self, text: str | None, *, exclude_from_history: bool = False) -> None:
         self.writes.append(text)
         self.exclusions.append(exclude_from_history)
@@ -577,7 +580,7 @@ class RunAndOutputTests(SyntheticFixture):
         self.assertEqual(result["config"]["windows_build"], "10.0.fake")
         self.assertEqual(result["config"]["playback_device"], "CABLE Input (fake)")
 
-    def test_clipboard_restored_on_interrupt_and_nontext_cleared(self) -> None:
+    def test_clipboard_restored_on_interrupt_and_empty_restored(self) -> None:
         self.audio.play = Mock(side_effect=KeyboardInterrupt)
         with self.assertRaises(KeyboardInterrupt):
             self.run_fake()
@@ -590,7 +593,22 @@ class RunAndOutputTests(SyntheticFixture):
             bench.run_benchmark(self.args, self.manifest, self.conditions, self.window, self.audio,
                                 self.clipboard, self.keys, self.clock)
         self.assertIsNone(self.clipboard.text)
-        self.assertIn("non-text", stderr.getvalue())
+        self.assertNotIn("non-text", stderr.getvalue())
+
+    def test_unrestorable_clipboard_refuses_before_input_audio_or_writes(self) -> None:
+        self.clipboard.snapshot_plain_text = Mock(side_effect=bench.BenchError("cannot restore"))
+        with self.assertRaisesRegex(bench.BenchError, "cannot restore"):
+            self.run_fake()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.audio.calls, [])
+        self.assertEqual(self.clipboard.writes, [])
+
+    def test_focus_loss_without_edit_changes_is_not_a_timeout(self) -> None:
+        self.args.warmup = 0
+        self.window.focus_process = lambda: "other.exe" if self.clock.now >= 4.04 else None
+        result = self.run_fake()
+        self.assertEqual(result["warm"]["samples"][0]["status"], "focus_lost")
+        self.assertEqual(result["warm"]["samples"][0]["change_events"], 0)
 
     def test_stats_and_json_can_be_scored_by_shared_scorer(self) -> None:
         self.paste_on_stop()
@@ -783,6 +801,39 @@ class ValidationTests(SyntheticFixture):
 
 
 class WindowAndClipboardTests(unittest.TestCase):
+    def test_initial_clipboard_snapshot_rejects_nontext_and_rich_formats(self) -> None:
+        for formats in ([2], [15], [13, 0xC002], [1, 7, 16]):
+            with self.subTest(formats=formats):
+                api = Mock()
+                api.user.EnumClipboardFormats.side_effect = [*formats, 0]
+                clipboard = bench.Clipboard(api, 123)
+                clipboard._read_opened = Mock(return_value="text")
+                with patch.object(ctypes, "set_last_error", create=True), patch.object(ctypes, "get_last_error", return_value=0, create=True):
+                    with self.assertRaisesRegex(bench.BenchError, "copy plain text"):
+                        clipboard.snapshot_plain_text()
+                clipboard._read_opened.assert_not_called()
+                api.user.EmptyClipboard.assert_not_called()
+
+    def test_initial_clipboard_snapshot_accepts_empty_and_plain_text_only(self) -> None:
+        for formats, expected in (([], None), ([1, 7, 13, 16], "text")):
+            with self.subTest(formats=formats):
+                api = Mock()
+                api.user.EnumClipboardFormats.side_effect = [*formats, 0]
+                clipboard = bench.Clipboard(api, 123)
+                clipboard._read_opened = Mock(return_value="text")
+                with patch.object(ctypes, "set_last_error", create=True), patch.object(ctypes, "get_last_error", return_value=0, create=True):
+                    self.assertEqual(clipboard.snapshot_plain_text(), expected)
+                api.user.EmptyClipboard.assert_not_called()
+
+    def test_initial_clipboard_enumeration_error_preserves_contents(self) -> None:
+        api = Mock()
+        api.user.EnumClipboardFormats.return_value = 0
+        clipboard = bench.Clipboard(api, 123)
+        with patch.object(ctypes, "set_last_error", create=True), patch.object(ctypes, "get_last_error", return_value=5, create=True):
+            with self.assertRaisesRegex(bench.BenchError, "could not inspect"):
+                clipboard.snapshot_plain_text()
+        api.user.EmptyClipboard.assert_not_called()
+
     def test_capture_and_waiter_clock_share_lock_and_poll_detects_same_length_rewrites(self) -> None:
         api = Mock()
         window = bench.TargetWindow(api)
