@@ -5,8 +5,8 @@
 
 | 分類 | 契約 | 扱い |
 |---|---|---|
-| active | [小音量入力の通知 — #94](quiet-input-feedback.md) | 実機smoke 30件完走（29/30、正規化CER 8.85%で基準同等）、元設定復元済み。極小音量の日本語通知・入力設定導線も実機確認済み。PR #97 のmerge待ち |
-| completed | [PR #90〜#95 のレビュー・統合](pr-90-95-review-and-integration.md) | 5件とCI追補 #96 をマージ、レビュー指摘3件を修正、対応ブランチ6本を削除。最終CI全5ジョブ成功。#81/#86/#94 の残件は継続 |
+| completed | [小音量入力の通知 — #94](quiet-input-feedback.md) | 実機smoke 30件完走（29/30、正規化CER 8.85%で基準同等）、元設定復元済み。極小音量の通知・入力設定導線も実機確認。PR #97 merge・issueクローズ・ブランチ削除済み |
+| completed | [PR #90〜#95 のレビュー・統合](pr-90-95-review-and-integration.md) | 5件とCI追補 #96 をマージ、レビュー指摘3件を修正、対応ブランチ6本を削除。最終CI全5ジョブ成功。#81/#86 の残件は継続 |
 | active | [残りの高速化](remaining-latency-improvements.md) | WAV直接読込・保存の非同期化・起動/録音開始の並列化・Askの途中表示など。subagentで実装中 |
 | active | [停止→挿入の遅延修正](stop-to-insert-latency-fixes.md) | IME誤判定・挿入待ち・入力監視終了・ライブ字幕などを実装。自動テスト・独立監査完了。Windows実機確認は未実施 |
 | completed | [ASR高速化の実装調査](asr-performance-audit.md) | Claude `6043cb09…` の途中成果を回収し現行コードを再確認。[調査報告](../asr-performance-audit.md)の独立レビュー・指摘修正完了。高速化実装・実機計測は別工程 |
