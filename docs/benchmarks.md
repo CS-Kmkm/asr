@@ -1,5 +1,9 @@
 # ASR ベンチマークと Phase 0 ゲート判定
 
+人が読み直さずに日本語ASRを評価する手順は、
+[公開音声による評価](eval_set/public_datasets.md)を参照してください。
+固定済みのFLEURS＋JVNV、batch採点、実時間streaming replayを利用できます。
+
 OpenWhisprとの日本語エンジン比較の条件・再現手順・結果は
 [競合比較](competitor_comparison.md)を参照。
 

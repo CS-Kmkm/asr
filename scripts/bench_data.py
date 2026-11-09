@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import contextlib
 import hashlib
 import http.client
 import io
@@ -19,6 +20,7 @@ import tempfile
 import urllib.error
 import urllib.request
 import wave
+import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -91,6 +93,11 @@ for _split, _size in (("test-clean", "approximately 347 MB"), ("test-other", "ap
         f"https://www.openslr.org/resources/12/{_split}.tar.gz", _size, kind="librispeech",
     )
 DEFAULT_SOURCES = ("fleurs:ja_jp",)
+SOURCES["jvnv:ver1"] = Source(
+    "jvnv", "ver1", "jvnv", "all", "ver1-20231021", "ja-JP",
+    "https://ss-takashi.sakura.ne.jp/corpus/jvnv/jvnv_ver1.zip",
+    "approximately 1.78 GB", kind="jvnv", license="CC-BY-SA-4.0",
+)
 
 
 @dataclass(frozen=True)
@@ -213,7 +220,7 @@ def select_items(items: list[Candidate], count: int, seed: int, pool: str, holdo
         raise DataError("seed must be nonnegative")
     assign_pool("", "", holdout_percent)  # Validate the percentage even for an empty candidate list.
     eligible = [item for item in items if assign_pool(item.source, item.group, holdout_percent) == pool]
-    if kind == "librispeech":
+    if kind in {"librispeech", "jvnv"}:
         speakers: dict[str, list[Candidate]] = defaultdict(list)
         for item in eligible:
             speakers[item.group].append(item)
@@ -349,7 +356,7 @@ def source_downloads(spec: Source) -> list[tuple[str, str, str]]:
         if not spec.tsv_url:
             raise DataError(f"missing tsv_url for source {spec.key}")
         return [archive, (spec.tsv_url, "test.tsv", "unknown (TSV; server size printed before transfer)")]
-    if spec.kind == "librispeech":
+    if spec.kind in {"librispeech", "jvnv"}:
         return [archive]
     raise DataError(f"unsupported source kind: {spec.kind}")
 
@@ -379,6 +386,8 @@ def flac_duration(header: bytes) -> float:
 
 
 def load_candidates(cache: Path, spec: Source) -> list[Candidate]:
+    if spec.kind == "jvnv":
+        return load_jvnv_candidates(spec.archive(cache), spec)
     if spec.kind == "fleurs":
         if not spec.tsv_url:
             raise DataError(f"missing tsv_url for source {spec.key}")
@@ -420,6 +429,59 @@ def load_candidates(cache: Path, spec: Source) -> list[Candidate]:
         raise DataError(f"missing LibriSpeech transcript item: {min(missing)}")
     return [Candidate(spec.source, spec.config, item_id, member, references[item_id], duration, speaker, speaker)
             for item_id, (member, duration, speaker) in sorted(audio.items())]
+
+
+def load_jvnv_candidates(path: Path, spec: Source) -> list[Candidate]:
+    """Use regular-session scripts verbatim; free-session NV wording varies."""
+    with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+        if len(names) != len(set(names)):
+            raise DataError("duplicate JVNV archive member")
+        references = {}
+        text = archive.read("jvnv_v1/transcription.csv").decode("utf-8-sig")
+        for line, row in enumerate(csv.reader(io.StringIO(text), delimiter="|"), 1):
+            if len(row) != 3 or not row[2].strip() or row[0] in references:
+                raise DataError(f"JVNV transcript line {line}: invalid/duplicate script")
+            references[row[0]] = row[2]
+        items = []
+        for name in sorted(names):
+            match = re.fullmatch(r"jvnv_v1/(F[12]|M[12])/([a-z]+)/regular/((F[12]|M[12])_([a-z]+)_regular_\d+)\.wav", name)
+            if match is None:
+                continue
+            speaker, emotion, item_id, file_speaker, file_emotion = match.groups()
+            script = item_id.split("_", 1)[1]
+            if speaker != file_speaker or emotion != file_emotion or script not in references:
+                raise DataError(f"JVNV audio/script mismatch: {name}")
+            with archive.open(name) as stream, wave.open(stream, "rb") as audio:
+                duration = audio.getnframes() / audio.getframerate()
+            if duration <= 0:
+                raise DataError(f"JVNV empty audio: {name}")
+            items.append(Candidate(spec.source, spec.config, item_id, name, references[script],
+                                   duration, speaker, speaker))
+        if not items:
+            raise DataError("no JVNV regular-session audio found")
+        return items
+
+
+@contextlib.contextmanager
+def archive_members(path: Path):
+    """Expose file streams without extracting untrusted archive paths."""
+    if path.suffix == ".zip":
+        with zipfile.ZipFile(path) as archive:
+            def entries():
+                for info in archive.infolist():
+                    if not info.is_dir():
+                        with archive.open(info) as stream:
+                            yield info.filename, stream
+            yield entries()
+    else:
+        with tarfile.open(path, "r|*") as archive:
+            def entries():
+                for info in archive:
+                    if info.isfile():
+                        with archive.extractfile(info) as stream:
+                            yield info.name.removeprefix("./"), stream
+            yield entries()
 
 
 def convert_audio(data: bytes, destination: Path) -> float:
@@ -477,6 +539,10 @@ def read_document(path: Path, schema: str) -> dict[str, Any]:
         seen.add(item["id"])
         for field in ("audio_sha256", "source_audio_sha256"):
             validate_hash(item[field], field, context)
+        if "reference_sha256" in item:
+            if not isinstance(item["reference_sha256"], str):
+                raise DataError(f"invalid reference_sha256 in {context}")
+            validate_hash(item["reference_sha256"], "reference_sha256", context)
         if item["pool"] not in {"dev", "holdout"}:
             raise DataError(f"invalid pool in {context}")
         if schema == MANIFEST_SCHEMA and (not math.isfinite(item["duration"]) or item["duration"] <= 0):
@@ -529,7 +595,9 @@ def lock_manifest(manifest: Path, output: Path) -> None:
         "created_by": "scripts/bench_data.py",
         "selection": {key: document["selection"][key] for key in SELECTION_FIELDS},
         "sources": [{key: metadata[key] for key in SOURCE_FIELDS} for metadata in document["sources"]],
-        "items": [{key: item[key] for key in LOCK_ITEM_FIELDS} for item in document["items"]],
+        "items": [{**{key: item[key] for key in LOCK_ITEM_FIELDS},
+                   "reference_sha256": hashlib.sha256(item["reference"].encode("utf-8")).hexdigest()}
+                  for item in document["items"]],
     }
     write_json_new(output, lock)
 
@@ -570,6 +638,8 @@ def build(cache: Path, sources: list[Source], name: str, selection: dict[str, An
                             "pool": assign_pool(item.source, item.group, selection["holdout_percent"])}
                 if any(entry[field] != value for field, value in expected.items()) or expected["pool"] != selection["pool"]:
                     raise DataError(f"locked item metadata/pool mismatch: {entry['id']}")
+                if "reference_sha256" in entry and hashlib.sha256(item.reference.encode("utf-8")).hexdigest() != entry["reference_sha256"]:
+                    raise DataError(f"reference_sha256 mismatch: {entry['id']}")
                 chosen.append(item)
         metadata.append(spec.metadata(archive_hash))
         selected.extend(chosen)
@@ -591,16 +661,13 @@ def build(cache: Path, sources: list[Source], name: str, selection: dict[str, An
         built = {}
         for spec in sources:
             wanted = {item.member: item for item in selected if item.source == spec.source and item.config == spec.config}
-            with tarfile.open(spec.archive(cache), "r|*") as archive:
-                for member in archive:
-                    member_name = member.name.removeprefix("./")
+            with archive_members(spec.archive(cache)) as members:
+                for member_name, stream in members:
                     if member_name not in wanted:
                         continue
                     candidate = wanted[member_name]
-                    if candidate.id in built or not member.isfile():
+                    if candidate.id in built:
                         raise DataError(f"duplicate/non-file selected archive member: {member_name}")
-                    stream = archive.extractfile(member)
-                    assert stream is not None
                     data = stream.read()
                     original_hash = hashlib.sha256(data).hexdigest()
                     if candidate.id in expected_hashes and original_hash != expected_hashes[candidate.id]:
@@ -703,7 +770,7 @@ def main(argv: list[str] | None = None) -> int:
                          "holdout_percent": percent, "strata": "duration-tertile"}
         print(build(args.cache_dir, sources, args.out, selection, locked))
         return 0
-    except (DataError, OSError, ValueError, tarfile.TarError,
+    except (DataError, OSError, ValueError, tarfile.TarError, zipfile.BadZipFile, KeyError,
             urllib.error.URLError, http.client.HTTPException) as exc:
         print(f"[bench_data] error: {exc}", file=sys.stderr)
         return 1
