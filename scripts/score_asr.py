@@ -563,6 +563,19 @@ def score_manifest(bench: dict[str, Any], manifest: dict[str, Any], path: Path, 
         warnings.append(f"{len(missing)} manifest item(s) missing from bench result")
     for warning in warnings:
         print(f"[score_asr] warning: {warning}", file=sys.stderr)
+    streaming = {}
+    if config.get("mode") == "streaming-realtime":
+        samples = bench.get("warm", {}).get("samples", [])
+        for metric in ("first_partial_ms", "first_stable_ms", "flush_to_final_ms", "replay_rtf", "stable_retractions"):
+            values = sorted(sample[metric] for sample in samples if isinstance(sample.get(metric), (float, int))
+                            and not isinstance(sample[metric], bool) and math.isfinite(sample[metric]))
+            if values:
+                def quantile(fraction):
+                    rank = (len(values) - 1) * fraction
+                    lo = int(rank)
+                    hi = min(lo + 1, len(values) - 1)
+                    return values[lo] + (values[hi] - values[lo]) * (rank - lo)
+                streaming[metric] = {"count": len(values), "p50": quantile(0.5), "p95": quantile(0.95)}
     return {
         "mode": "manifest", "manifest": manifest_conditions(manifest, path), "rows": rows,
         "overall": _aggregate_manifest(rows),
@@ -572,6 +585,7 @@ def score_manifest(bench: dict[str, Any], manifest: dict[str, Any], path: Path, 
         "divergent_audio": matched["divergent_audio"], "config": bench.get("config", {}),
         "warnings": warnings,
         "normalization": {key: value for key, value in vars(opts).items() if key != "terms"},
+        **({"streaming": streaming} if config.get("mode") == "streaming-realtime" else {}),
     }
 
 
@@ -775,6 +789,14 @@ def render_condition_header(cfg: dict[str, Any]) -> list[str]:
     ]
     if cfg.get("whisper_decode_profile") is not None:
         lines.append(f"- profile: `{cfg['whisper_decode_profile']}`")
+    if "runtime" in cfg or "model_revision" in cfg:
+        lines.append(f"- runtime: `{cfg.get('runtime') or 'unknown'}`  model revision: `{cfg.get('model_revision') or 'unverified'}`")
+    if cfg.get("mode") == "streaming-realtime":
+        lines.append(f"- mode: `streaming-realtime`  chunk: `{cfg.get('chunk_ms')} ms`")
+        for identity in cfg.get("identities", []):
+            label = json.dumps(identity, ensure_ascii=False, sort_keys=True)
+            if f"- adapter identity: `{label}`" not in lines:
+                lines.append(f"- adapter identity: `{label}`")
     health = cfg.get("worker_health") or {}
     if health or "device_policy" in cfg:
         lines.append(f"- device: `{health.get('device') or '?'}`  compute type: `{health.get('compute_type') or '?'}`"
@@ -861,6 +883,13 @@ def render_manifest_markdown(result: dict[str, Any]) -> str:
         if result[field]:
             lines.append(f"- {field}: " + ", ".join(result[field]))
     lines.extend(f"- WARNING: {warning}" for warning in result.get("warnings", []))
+    streaming = result.get("streaming")
+    if streaming:
+        lines.extend(["", "## Real-time streaming (source start to local event receipt)", "",
+                      "| metric | count | p50 | p95 |", "|---|---:|---:|---:|"])
+        for metric, summary in streaming.items():
+            lines.append(f"| {metric} | {summary['count']} | {summary['p50']:.3f} | {summary['p95']:.3f} |")
+        lines.append("\nReplay RTF includes real-time pacing; it is not pure inference RTF. Missing partial/stable events are excluded from their latency quantiles.")
     return "\n".join(lines)
 
 

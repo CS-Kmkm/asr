@@ -881,6 +881,8 @@ def run_benchmark(args: argparse.Namespace, audio_paths: list[Path]) -> dict[str
             "cold_runs": args.cold_runs,
             "timeout_s": args.timeout,
             "model": model_name,
+            "model_revision": getattr(args, "model_revision", None),
+            "runtime": getattr(args, "runtime", None) or ("ctranslate2" if args.backend == "faster-whisper" else args.backend),
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         },
         "warm": warm,
@@ -1067,6 +1069,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a markdown summary")
     parser.add_argument("--output", metavar="PATH", help="write UTF-8 results to a new file; existing files are never overwritten")
     parser.add_argument("--record-device", action="store_true", help="query worker health after every transcription and record actual device/compute type (requires health support)")
+    parser.add_argument("--model-revision", help="verified model commit or content digest; null means unverified, never infer from a model name")
+    parser.add_argument("--runtime", help="execution runtime label, e.g. nemo or speech.cpp; device is recorded separately by --record-device")
     parser.add_argument(
         "--smoke",
         action="store_true",

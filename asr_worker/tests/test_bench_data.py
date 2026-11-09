@@ -11,6 +11,7 @@ import tarfile
 import tempfile
 import unittest
 import wave
+import zipfile
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -298,7 +299,7 @@ class CliTests(unittest.TestCase):
         lock = Path(self.temporary.name) / "tracked.lock.json"
         self.assertEqual(self.run_cli("lock", "--manifest", str(manifest), "--output", str(lock)), 0, self.stderr.getvalue())
         content = lock.read_text(encoding="utf-8")
-        for forbidden in ("reference", "audio_path", "生の文", "private selection", "private source", "provenance"):
+        for forbidden in ('"reference":', '"audio_path":', "生の文", "private selection", "private source", "provenance"):
             self.assertNotIn(forbidden, content)
         snapshot = lock.read_bytes()
         self.assertEqual(self.run_cli("lock", "--manifest", str(manifest), "--output", str(lock)), 1)
@@ -658,6 +659,53 @@ class CliTests(unittest.TestCase):
         tsv.write_text("1\tone.wav\tRAW\tnormal\tchars\t1600\tfemale\n", encoding="utf-8")
         record_cache(tsv, alias.tsv_url)
         self.assertEqual(bench_data.load_candidates(self.cache, alias)[0].source, "alias")
+
+
+class JvnvTests(unittest.TestCase):
+    def test_official_layout_build_lock_rebuild_and_speaker_pools(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp).resolve()
+            spec = bench_data.SOURCES["jvnv:ver1"]
+            spec.directory(cache).mkdir(parents=True)
+            with zipfile.ZipFile(spec.archive(cache), "w") as archive:
+                archive.writestr("jvnv_v1/transcription.csv", "anger_regular_01|ああ|ああ、違います。\n")
+                for speaker in ("F1", "F2", "M1", "M2"):
+                    archive.writestr(f"jvnv_v1/{speaker}/anger/regular/{speaker}_anger_regular_01.wav", wav_bytes())
+                archive.writestr("jvnv_v1/F1/anger/free/F1_anger_free_01.wav", wav_bytes())
+            record_cache(spec.archive(cache), spec.url)
+            candidates = bench_data.load_candidates(cache, spec)
+            self.assertEqual(len(candidates), 4)
+            self.assertTrue(all(item.reference == "ああ、違います。" for item in candidates))
+            pools = {pool: {item.speaker for item in bench_data.select_items(candidates, 1, 1, pool, kind="jvnv")}
+                     for pool in ("dev", "holdout")}
+            self.assertFalse(pools["dev"] & pools["holdout"])
+            selection = {"profile": "smoke", "seed": 1, "count_per_source": 1, "pool": "dev",
+                         "holdout_percent": 50, "strata": "duration-tertile"}
+            manifest = bench_data.build(cache, [spec], "first", selection)
+            lock = cache / "test.lock.json"
+            bench_data.lock_manifest(manifest, lock)
+            locked = bench_data.read_document(lock, bench_data.LOCK_SCHEMA)
+            self.assertNotIn("reference", locked["items"][0])
+            self.assertEqual(locked["items"][0]["reference_sha256"], hashlib.sha256("ああ、違います。".encode()).hexdigest())
+            rebuilt = bench_data.build(cache, [spec], "rebuilt", selection, locked)
+            first, second = bench_data.read_json(manifest), bench_data.read_json(rebuilt)
+            for field in ("id", "reference", "source_audio_sha256", "audio_sha256", "speaker"):
+                self.assertEqual(first["items"][0][field], second["items"][0][field])
+            self.assertEqual(first["sources"][0]["license"], "CC-BY-SA-4.0")
+            locked["items"][0]["reference_sha256"] = "0" * 64
+            with self.assertRaisesRegex(bench_data.DataError, "reference_sha256 mismatch"):
+                bench_data.build(cache, [spec], "changed-reference", selection, locked)
+
+    def test_mismatched_script_and_duplicate_csv_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bad.zip"
+            spec = bench_data.SOURCES["jvnv:ver1"]
+            for text in ("anger_regular_01|あ|本文\nanger_regular_01|あ|重複\n", "anger_regular_02|あ|本文\n"):
+                with zipfile.ZipFile(path, "w") as archive:
+                    archive.writestr("jvnv_v1/transcription.csv", text)
+                    archive.writestr("jvnv_v1/F1/anger/regular/F1_anger_regular_01.wav", wav_bytes())
+                with self.assertRaises(bench_data.DataError):
+                    bench_data.load_jvnv_candidates(path, spec)
 
 
 if __name__ == "__main__":
