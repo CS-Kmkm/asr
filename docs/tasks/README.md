@@ -5,7 +5,7 @@
 
 | 分類 | 契約 | 扱い |
 |---|---|---|
-| active | [公開音声ベンチマーク — #86](issue-86-public-benchmark.md) | FLEURS＋JVNV固定、batch実認識60件、実時間streaming replay・採点を実装。独立レビュー・PR統合中 |
+| completed | [公開音声ベンチマーク — #86](issue-86-public-benchmark.md) | FLEURS＋JVNV固定、batch実認識60件、実時間streaming replay・採点を実装。独立レビュー完了、PR #98 merge・Issueクローズ・実装ブランチ削除済み。実engine結合は #82 |
 | completed | [小音量入力の通知 — #94](quiet-input-feedback.md) | 実機smoke 30件完走（29/30、正規化CER 8.85%で基準同等）、元設定復元済み。極小音量の通知・入力設定導線も実機確認。PR #97 merge・issueクローズ・ブランチ削除済み |
 | completed | [PR #90〜#95 のレビュー・統合](pr-90-95-review-and-integration.md) | 5件とCI追補 #96 をマージ、レビュー指摘3件を修正、対応ブランチ6本を削除。最終CI全5ジョブ成功。#81/#86 の残件は継続 |
 | active | [残りの高速化](remaining-latency-improvements.md) | WAV直接読込・保存の非同期化・起動/録音開始の並列化・Askの途中表示など。subagentで実装中 |
