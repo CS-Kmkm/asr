@@ -24,6 +24,15 @@ async function emit(name: string, payload: unknown) {
 }
 const processing: AppState = { phase: "processing", stage: "transcribing", operation: "recording", operationId: 1, message: "changed English wording", messageCode: null, lastResult: null, updatedAt: "now" };
 
+test("quiet-input failure remains readable in Japanese with the main window hidden", async () => {
+  render(<I18nProvider language="ja"><RecordingOverlay /></I18nProvider>);
+  await emit("overlay-message", {
+    severity: "failure", durationMs: 8000,
+    message: "No speech was detected. Your audio may be too quiet. Check your microphone and Input gain in Input settings.",
+  });
+  expect(screen.getByText("音声を検出できませんでした。入力音量が小さすぎる可能性があります。入力設定でマイクと入力ゲインを確認してください。")).toBeTruthy();
+});
+
 test("generated Ask answers stay verbatim when displayed and copied; notices alone translate", async () => {
   render(<I18nProvider language="ja"><AskAnswerPanel /></I18nProvider>);
   await waitFor(() => expect(getAskAnswer).toHaveBeenCalledOnce());

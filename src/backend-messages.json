@@ -1,4 +1,5 @@
 {
+  "No speech was detected. Your audio may be too quiet. Check your microphone and Input gain in Input settings.": {"code":"capture_no_voice_detected","ja":"音声を検出できませんでした。入力音量が小さすぎる可能性があります。入力設定でマイクと入力ゲインを確認してください。"},
   "Allow the required providers in Privacy before using this voice mode. The transcript remains available in this app.": {"code":"voice_mode_consent_required","ja":"この音声モードを使う前に、プライバシー設定で必要なプロバイダーへの送信を許可してください。文字起こし結果はアプリ内に残っています。"},
   "The decision model could not be released. Restart the app if GPU memory remains in use.": {"code":"decision_model_unload_failed","ja":"判断モデルを解放できませんでした。GPUメモリが使用されたままの場合はアプリを再起動してください。"},
   "The decision model is not ready. Load it in Models before automatic routing; the transcript remains available in this app.": {"code":"decision_model_not_ready","ja":"判断モデルの準備ができていません。自動判定を使う前にモデル画面で読み込んでください。文字起こし結果はアプリ内に残っています。"},
