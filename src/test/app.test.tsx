@@ -133,6 +133,95 @@ async function emit(name: string, payload: unknown) {
 async function phase(value: string) {
   await emit("app-state", { phase: value, stage: value, operation: "dictate", operationId: 1, message: null, messageCode: null, lastResult: null });
 }
+
+test("a held recording rejected as quiet keeps one notice with an input-settings action", async () => {
+  await openSettings();
+  await emit("app-state", {
+    phase: "error", stage: "error", operationId: 94, operation: "dictate",
+    message: "No speech was detected. Your audio may be too quiet. Check your microphone and Input gain in Input settings.",
+    messageCode: "capture_no_voice_detected",
+  });
+  const notice = screen.getByRole("alert");
+  expect(notice.textContent).toContain("may be too quiet");
+  fireEvent.click(within(notice).getByRole("button", { name: "Input settings" }));
+  expect((await screen.findByText("Input gain")).closest("[hidden]")).toBeNull();
+  // A repeated phase snapshot must not enqueue a second copy.
+  await emit("app-state", {
+    phase: "error", stage: "error", operationId: 94, operation: "dictate",
+    message: "No speech was detected. Your audio may be too quiet. Check your microphone and Input gain in Input settings.",
+    messageCode: "capture_no_voice_detected",
+  });
+  await emit("status", {
+    kind: "error", code: "capture_no_voice_detected",
+    message: "No speech was detected. Your audio may be too quiet. Check your microphone and Input gain in Input settings.",
+  });
+  fireEvent.click(within(notice).getByRole("button", { name: "Dismiss notification" }));
+  await emit("app-state", {
+    phase: "error", stage: "error", operationId: 94, operation: "dictate",
+    message: "No speech was detected. Your audio may be too quiet. Check your microphone and Input gain in Input settings.",
+    messageCode: "capture_no_voice_detected",
+  });
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
+test("quiet-input recovery opens the input section in Japanese", async () => {
+  settings.uiLanguage = "ja";
+  const view = render(<App />);
+  await screen.findByRole("button", { name: "設定" });
+  await emit("app-state", {
+    phase: "error", stage: "error", operationId: 94, operation: "dictate",
+    message: "No speech was detected. Your audio may be too quiet. Check your microphone and Input gain in Input settings.",
+    messageCode: "capture_no_voice_detected",
+  });
+  const notice = view.container.querySelector(".notice")!;
+  fireEvent.click(within(notice as HTMLElement).getByRole("button", { name: "入力設定" }));
+  expect((await screen.findByText("入力ゲイン")).closest("[hidden]")).toBeNull();
+});
+
+test("a stop command rejection merges with the quiet-input phase notice", async () => {
+  const view = render(<App />);
+  await screen.findByRole("button", { name: "Start recording" });
+  await phase("recording");
+  const stopping = deferred<Awaited<ReturnType<typeof stopRecording>>>();
+  vi.mocked(stopRecording).mockReturnValueOnce(stopping.promise);
+  fireEvent.click(screen.getByRole("button", { name: "Stop and transcribe" }));
+  const message = "No speech was detected. Your audio may be too quiet. Check your microphone and Input gain in Input settings.";
+  await emit("app-state", {
+    phase: "error", stage: "error", operationId: 1, operation: "dictate",
+    message, messageCode: "capture_no_voice_detected",
+  });
+  await act(async () => { stopping.reject(message); });
+  const notice = view.container.querySelector(".notice")!;
+  expect(within(notice as HTMLElement).getAllByRole("button", { name: "Input settings" })).toHaveLength(1);
+  fireEvent.click(within(notice as HTMLElement).getByRole("button", { name: "Dismiss notification" }));
+  expect(view.container.querySelector(".notice")).toBeNull();
+});
+
+test.each([false, true])("late quiet errors do not resurrect a dismissed notice (new take: %s)", async (newTake) => {
+  const view = render(<App />);
+  await screen.findByRole("button", { name: "Start recording" });
+  await phase("recording");
+  const stopping = deferred<Awaited<ReturnType<typeof stopRecording>>>();
+  vi.mocked(stopRecording).mockReturnValueOnce(stopping.promise);
+  fireEvent.click(screen.getByRole("button", { name: "Stop and transcribe" }));
+  const message = "No speech was detected. Your audio may be too quiet. Check your microphone and Input gain in Input settings.";
+  await emit("app-state", { phase: "error", stage: "error", operationId: 1, message, messageCode: "capture_no_voice_detected" });
+  fireEvent.click(within(view.container.querySelector(".notice") as HTMLElement).getByRole("button", { name: "Dismiss notification" }));
+  if (newTake) await emit("app-state", { phase: "recording", stage: "recording", operationId: 2 });
+  await emit("status", { kind: "error", code: "capture_no_voice_detected", message });
+  expect(view.container.querySelector(".notice")).toBeNull();
+  await act(async () => { stopping.reject(message); });
+  expect(view.container.querySelector(".notice")).toBeNull();
+});
+
+test("an IPC-only quiet error still offers recovery before a phase event arrives", async () => {
+  const view = render(<App />);
+  await screen.findByRole("button", { name: "Start recording" });
+  await phase("recording");
+  vi.mocked(stopRecording).mockRejectedValueOnce("No speech was detected. Your audio may be too quiet. Check your microphone and Input gain in Input settings.");
+  fireEvent.click(screen.getByRole("button", { name: "Stop and transcribe" }));
+  expect(await within(view.container).findByRole("button", { name: "Input settings" })).toBeTruthy();
+});
 async function navigate(name: string) {
   if (["Privacy", "Models", "Setup", "Diagnostics"].includes(name) && !screen.queryByRole("button", { name })) {
     fireEvent.click(await screen.findByRole("button", { name: "Settings" }));

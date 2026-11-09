@@ -1891,6 +1891,42 @@ mod tests {
     }
 
     #[test]
+    fn energy_gate_rejects_quiet_speech_and_stationary_noise() {
+        let rate = TARGET_SAMPLE_RATE;
+        let config = CaptureConfig::default();
+        let mut seed = 94u32;
+        let noise: Vec<f32> = (0..rate * 2)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed as f64 / u32::MAX as f64 * 2.0 - 1.0) as f32 * 0.001
+            })
+            .collect();
+        let quiet_speech: Vec<f32> = (0..rate * 2)
+            .map(|i| {
+                let t = i as f32 / rate as f32;
+                let envelope = (t * std::f32::consts::TAU * 3.0).sin().max(0.0);
+                (t * std::f32::consts::TAU * 300.0).sin() * envelope * 0.001
+            })
+            .collect();
+        let hum: Vec<f32> = (0..rate * 2)
+            .map(|i| (i as f32 / rate as f32 * std::f32::consts::TAU * 60.0).sin() * 0.001)
+            .collect();
+        for (name, samples) in [
+            ("noise", noise),
+            ("quiet speech", quiet_speech),
+            ("hum", hum),
+        ] {
+            assert!(
+                matches!(
+                    finalize_samples(samples, rate, &config),
+                    Err(AudioError::NoVoiceDetected)
+                ),
+                "{name} is rejected by the energy gate",
+            );
+        }
+    }
+
+    #[test]
     fn energy_vad_reports_voice_and_trailing_silence() {
         let mut samples = vec![0.1; 2_400];
         samples.extend(vec![0.0; 1_200]);

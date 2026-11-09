@@ -31,6 +31,36 @@ use crate::{
 use crate::{AskSession, EditSession};
 use tokio::sync::watch;
 
+const NO_VOICE_CAPTURED: &str = "No speech was detected. Your audio may be too quiet. Check your microphone and Input gain in Input settings.";
+
+/// Energy detection cannot distinguish silence from speech below its floor.
+/// Use the same actionable copy for the overlay and the IPC caller so a
+/// hotkey/UI error does not replace it with an untranslated diagnostic.
+pub(super) fn report_capture_failure(
+    error: crate::audio::AudioError,
+    disconnected: bool,
+    publish: impl FnOnce(&'static str),
+) -> String {
+    let no_voice = matches!(error, crate::audio::AudioError::NoVoiceDetected) && !disconnected;
+    let message = capture_failure_message(no_voice, disconnected);
+    publish(message);
+    if no_voice {
+        message.to_owned()
+    } else {
+        command_error(error)
+    }
+}
+
+fn capture_failure_message(no_voice: bool, disconnected: bool) -> &'static str {
+    if disconnected {
+        MICROPHONE_DISCONNECTED_WITHOUT_SPEECH
+    } else if no_voice {
+        NO_VOICE_CAPTURED
+    } else {
+        "No usable speech was captured. Start a new recording and try again."
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Desktop<'a> {
     app: &'a AppHandle,
@@ -152,17 +182,9 @@ impl RecordingDriver for Desktop<'_> {
         let settings = storage.get_settings().map_err(command_error)?;
         let disconnected = microphone_disconnected(reason, &artifact_result);
         let artifact = artifact_result.map_err(|error| {
-            emit_state(
-                app,
-                state,
-                AppPhase::Error,
-                if disconnected {
-                    MICROPHONE_DISCONNECTED_WITHOUT_SPEECH
-                } else {
-                    "No usable speech was captured. Start a new recording and try again."
-                },
-            );
-            command_error(error)
+            report_capture_failure(error, disconnected, |message| {
+                emit_state(app, state, AppPhase::Error, message);
+            })
         })?;
         if disconnected {
             emit_status(app, "microphone_disconnected", MICROPHONE_DISCONNECTED);
@@ -530,4 +552,45 @@ pub(crate) async fn run(
         reason,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::AudioError;
+
+    #[test]
+    fn rejected_speech_has_localized_recovery_guidance() {
+        let state = AppState::default();
+        let error = report_capture_failure(AudioError::NoVoiceDetected, false, |message| {
+            state.transition_stage(AppStage::Error, Some(message.into()));
+        });
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.message_code.as_deref(),
+            Some("capture_no_voice_detected"),
+        );
+        assert_eq!(snapshot.message.as_deref(), Some(error.as_str()));
+        assert!(error.contains("may be too quiet"));
+        assert!(error.contains("Input gain"));
+    }
+
+    #[test]
+    fn microphone_failure_takes_precedence_over_the_speech_gate() {
+        let error = report_capture_failure(AudioError::NoVoiceDetected, true, |message| {
+            assert_eq!(message, MICROPHONE_DISCONNECTED_WITHOUT_SPEECH);
+        });
+        assert_eq!(error, command_error(AudioError::NoVoiceDetected));
+        let error = report_capture_failure(
+            AudioError::StreamFailure("disconnected".into()),
+            true,
+            |message| {
+                assert_eq!(message, MICROPHONE_DISCONNECTED_WITHOUT_SPEECH);
+            },
+        );
+        assert_eq!(
+            error,
+            command_error(AudioError::StreamFailure("disconnected".into()))
+        );
+    }
 }

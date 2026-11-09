@@ -202,6 +202,10 @@ impl Resolver<'_> {
             ("lib.rs", "emit_state" | "emit_stage", "message")
                 | ("pipeline/stop.rs", "run", "message")
                 | ("pipeline/stop.rs", "stage", "message")
+                // report_capture_failure's callback forwards only the copy
+                // from capture_failure_message, checked by the catalogue's
+                // message-producer tests.
+                | ("pipeline/stop.rs", "capture", "message")
                 | ("pipeline/orchestration.rs", "run", "message")
                 // TerminalPhaseGuard forwards its checked terminal-state messages.
                 | ("pipeline/history_text.rs", "run", "message")

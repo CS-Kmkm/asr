@@ -186,13 +186,11 @@ impl RecordingDriver for FakeDriver {
         _: Instant,
         _: &TakeTrace,
     ) -> Result<AudioArtifact, String> {
-        let artifact = self
-            .audio
-            .lock()
-            .await
-            .stop()
-            .await
-            .map_err(|e| e.to_string())?;
+        let artifact = self.audio.lock().await.stop().await.map_err(|error| {
+            crate::pipeline::stop::report_capture_failure(error, false, |message| {
+                self.stage(AppStage::Error, message);
+            })
+        })?;
         if self.fault == Fault::CancelCapture {
             self.lifecycle.cancel().unwrap();
         }
@@ -255,6 +253,22 @@ const MODES: [PipelineMode; 4] = [
     PipelineMode::Edit,
     PipelineMode::Ask,
 ];
+#[tokio::test]
+async fn a_no_voice_capture_reports_the_same_error_without_recognition_or_delivery() {
+    for mode in MODES {
+        let driver = FakeDriver::new(mode, Fault::Capture);
+        let error = run(&driver, StopReason::User).await.unwrap_err();
+        let snapshot = driver.state.snapshot();
+        assert_eq!(snapshot.message.as_deref(), Some(error.as_str()));
+        assert_eq!(
+            snapshot.message_code.as_deref(),
+            Some("capture_no_voice_detected")
+        );
+        assert_eq!(driver.transcriber.calls.load(Ordering::SeqCst), 0);
+        assert!(driver.deliveries.lock().unwrap().is_empty());
+        assert_eq!(driver.lifecycle.phase(), PipelinePhase::Idle);
+    }
+}
 #[tokio::test]
 async fn all_recording_modes_stop_recognize_dispatch_and_release_the_lifecycle() {
     for mode in MODES {

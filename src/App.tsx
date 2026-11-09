@@ -3,6 +3,7 @@ import { RecordingOverlay } from "./windows/RecordingOverlay";
 import { useNoticeQueue, type Notice } from "./hooks/useNoticeQueue";
 import { useSettings } from "./hooks/useSettings";
 import { useAudioDevices } from "./hooks/useAudioDevices";
+import backendMessages from "./backend-messages.json";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -123,6 +124,8 @@ const isRecordingOverlay = windowLabel === "recording-overlay";
 const isAskAnswer = windowLabel === "ask-answer";
 // Notices that only describe model preparation and are cleared once it ends.
 const MODEL_PREPARATION_KINDS = ["model_loading", "model_downloading", "worker_setup"];
+const NO_VOICE_CODE = "capture_no_voice_detected";
+const NO_VOICE_MESSAGE = Object.entries(backendMessages).find(([, entry]) => entry.code === NO_VOICE_CODE)?.[0];
 
 const WARNING_STATUS_KINDS = new Set([
   "decision_model_unavailable",
@@ -270,10 +273,19 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   const [gpuChecking, setGpuChecking] = useState(false);
   const { notice, push: pushNotice, dismiss: dismissNotice, clear: clearNotices, removeKinds: removeNoticeKinds } = useNoticeQueue();
   const noticeOperationRef = useRef(0);
+  const quietNoticeOperationRef = useRef<number | null | undefined>(undefined);
   const [startupHotkeyWarnings, setStartupHotkeyWarnings] = useState<string[]>([]);
   const [inactiveShortcuts, setInactiveShortcuts] = useState<string[]>([]);
-  const showNotice = (message: string, severity: Notice["severity"] = "info") =>
-    pushNotice({ message, severity });
+  const showQuietInputNotice = (message: string, operationId: number | null) => {
+    if (typeof operationId === "number" && operationId < noticeOperationRef.current) return;
+    if (quietNoticeOperationRef.current === operationId) return;
+    quietNoticeOperationRef.current = operationId;
+    pushNotice({ message, severity: "error", code: NO_VOICE_CODE });
+  };
+  const showNotice = (message: string, severity: Notice["severity"] = "info", operationId: number | null = noticeOperationRef.current) => {
+    if (message === NO_VOICE_MESSAGE) showQuietInputNotice(message, operationId);
+    else pushNotice({ message, severity });
+  };
   const applyModelStatus = (next: ModelStatus) => {
     modelStatusRevisionRef.current += 1;
     modelPreparationActiveRef.current = next.state === "loading";
@@ -318,6 +330,11 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
         noticeOperationRef.current = id;
       } else if (noticeOperationRef.current > 0) return;
       setState(next);
+      // Hold-release callers discard the stop result. Keep this recovery
+      // notice in the main window too, including a snapshot read after launch.
+      if (next.phase === "error" && next.messageCode === NO_VOICE_CODE && next.message) {
+        showQuietInputNotice(next.message, id);
+      }
     };
     Promise.all([
       getAppState(),
@@ -351,6 +368,10 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       listen<GpuDiagnostics>("gpu-diagnostics", (event) => setGpu(event.payload)),
       listen<{ kind: string; code?: string; outcome?: string; message: string }>("status", (event) => {
         if (MODEL_PREPARATION_KINDS.includes(event.payload.kind) && !modelPreparationActiveRef.current) return;
+        // Quiet capture always publishes the operation-scoped error state.
+        // This later hotkey status has no operation id; it must not resurrect
+        // a dismissed notice or attach an old error to a newer recording.
+        if (event.payload.code === NO_VOICE_CODE) return;
         pushNotice({
           message: event.payload.message,
           code: event.payload.code,
@@ -560,6 +581,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
 
   async function toggleRecording() {
     if (recordingActionRef.current) return;
+    const operationId = state.operationId;
     recordingActionRef.current = true;
     setRecordingAction(true);
     try {
@@ -574,7 +596,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
         await startRecording();
       }
     } catch (error) {
-      showNotice(String(error), "error");
+      showNotice(String(error), "error", operationId);
       try {
         setState(await getAppState());
       } catch {
@@ -954,6 +976,11 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             </button>
             {shownProgress && !progressNoticeHidden && <ModelProgressBar progress={shownProgress} />}
           </div>
+          {shownNotice?.code === NO_VOICE_CODE && (
+            <button className="text-button notice-action" onClick={() => { setSettingsSection("input"); setPage("settings"); }}>
+              {t("Input settings")}
+            </button>
+          )}
           <IconButton icon="copy" label={t("Copy notification")} className="notice-action" onClick={() => void copyNotice()} />
           {noticeCopied && <span className="notice-copied">{t("Copied")}</span>}
           <IconButton
