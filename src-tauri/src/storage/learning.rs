@@ -5,12 +5,12 @@
 //! one changed term pair is stored, never the edited text, and it changes
 //! nothing until the user confirms it into a chosen scope.
 use super::{
-    has_code_or_url, is_sentence_start_capitalization, read_dictionary_entries, represented_entry,
-    span_token, Storage, StorageError,
+    has_code_or_url, is_sentence_start_capitalization, load_settings, read_dictionary_entries,
+    represented_entry, span_token, stored_settings_row, Storage, StorageError,
 };
 use crate::types::{DictionaryCandidate, DictionaryMode, HistoryRetention, DICTIONARY_MODES};
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 pub(super) const USER_EDIT_ORIGIN: &str = "user_edit";
 pub(super) const LEARNED_SOURCE: &str = "learned";
@@ -122,6 +122,50 @@ fn script(span: &str) -> Option<Script> {
     }
 }
 
+/// Whether `original -> preferred` changes more than one term: two changed
+/// regions with an unchanged word boundary (a space or a hiragana particle)
+/// between them, as in `Kubernetis and Dockre -> Kubernetes and Docker`.
+/// Changes inside one term (`open ai -> OpenAI`) do not count.
+fn changes_several_terms(original: &str, preferred: &str) -> bool {
+    let left = original.chars().collect::<Vec<_>>();
+    let right = preferred.chars().collect::<Vec<_>>();
+    // Longest common subsequence, walked to find the common runs.
+    let mut table = vec![vec![0usize; right.len() + 1]; left.len() + 1];
+    for i in (0..left.len()).rev() {
+        for j in (0..right.len()).rev() {
+            table[i][j] = if left[i] == right[j] {
+                table[i + 1][j + 1] + 1
+            } else {
+                table[i + 1][j].max(table[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut changed = false;
+    let mut run = Vec::new();
+    while i < left.len() && j < right.len() {
+        if left[i] == right[j] {
+            run.push(left[i]);
+            i += 1;
+            j += 1;
+            continue;
+        }
+        // A common run between two changes that holds a word boundary
+        // separates independent edits.
+        if changed && run.iter().any(|c| *c == ' ' || is_hiragana(*c)) {
+            return true;
+        }
+        run.clear();
+        changed = true;
+        if table[i + 1][j] >= table[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    false
+}
+
 fn edit_distance(left: &[char], right: &[char]) -> usize {
     let mut previous = (0..=right.len()).collect::<Vec<_>>();
     for (row, left_char) in left.iter().enumerate() {
@@ -192,7 +236,7 @@ pub(crate) fn detect_edit_candidate(before: &str, after: &str) -> Option<(String
     if !allowed(original) || !allowed(preferred) || preferred.chars().count() < 2 {
         return None;
     }
-    if preferred.chars().all(is_hiragana) {
+    if preferred.chars().all(is_hiragana) || changes_several_terms(original, preferred) {
         return None;
     }
     let digits = |span: &str| {
@@ -244,16 +288,7 @@ impl Storage {
         edited: &str,
     ) -> Result<EditProposal, StorageError> {
         let settings = self.get_settings()?;
-        if !settings.personalization_learning {
-            return Err(StorageError::Validation(
-                "learning from edits is off".into(),
-            ));
-        }
-        if settings.history_retention == HistoryRetention::Never {
-            return Err(StorageError::Validation(
-                "History is off, so suggestions are not stored".into(),
-            ));
-        }
+        learning_allowed(&settings)?;
         if edited.chars().count() > MAX_EDITED_CHARS
             || edited.chars().any(|c| c.is_control() && !c.is_whitespace())
         {
@@ -275,33 +310,59 @@ impl Storage {
             .processed_text
             .as_deref()
             .unwrap_or(&item.transcript_text);
-        let none = |outcome| {
-            Ok(EditProposal {
-                outcome,
-                candidate: None,
-            })
-        };
         let Some((original, preferred)) = detect_edit_candidate(shown, edited) else {
-            return none(EditProposalOutcome::NoTermChange);
+            return Ok(EditProposal {
+                outcome: EditProposalOutcome::NoTermChange,
+                candidate: None,
+            });
         };
-        let connection = self.connection()?;
-        let seen: bool = connection.query_row(
+        self.store_edit_proposal(history_id, &original, &preferred)
+    }
+
+    /// Stores a detected pair. Settings and the History row are checked
+    /// again while the connection is held for the insert, so a concurrent
+    /// command that turned learning or History off (and purged) since the
+    /// first check wins and nothing is stored.
+    fn store_edit_proposal(
+        &self,
+        history_id: i64,
+        original: &str,
+        preferred: &str,
+    ) -> Result<EditProposal, StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let settings = stored_settings_row(&transaction)?
+            .map(|raw| load_settings(&raw).settings)
+            .unwrap_or_default();
+        learning_allowed(&settings)?;
+        let eligible: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dictation_history WHERE id = ?1 AND expires_at IS NULL)",
+            [history_id],
+            |row| row.get(0),
+        )?;
+        if !eligible {
+            return Err(StorageError::Validation("history item not found".into()));
+        }
+        let seen: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM dictionary_candidates WHERE original_span = ?1 AND preferred_span = ?2
               UNION SELECT 1 FROM dictionary_candidate_decisions WHERE original_span = ?1 AND preferred_span = ?2)",
             params![original, preferred],
             |row| row.get(0),
         )?;
-        if seen || represented_entry(&read_dictionary_entries(&connection)?, &preferred).is_some() {
-            return none(EditProposalOutcome::AlreadyKnown);
+        if seen || represented_entry(&read_dictionary_entries(&transaction)?, preferred).is_some() {
+            return Ok(EditProposal {
+                outcome: EditProposalOutcome::AlreadyKnown,
+                candidate: None,
+            });
         }
         let now = Utc::now().to_rfc3339();
-        connection.execute(
+        transaction.execute(
             "INSERT INTO dictionary_candidates(original_span, preferred_span, confidence, history_id, created_at, updated_at, origin)
              VALUES (?1, ?2, 1.0, ?3, ?4, ?4, ?5)",
             params![original, preferred, history_id, now, USER_EDIT_ORIGIN],
         )?;
-        let id = connection.last_insert_rowid();
-        let candidate = connection
+        let id = transaction.last_insert_rowid();
+        let candidate = transaction
             .query_row(
                 "SELECT id, original_span, preferred_span, confidence, history_id, created_at, origin
                  FROM dictionary_candidates WHERE id = ?1",
@@ -319,6 +380,7 @@ impl Storage {
                 },
             )
             .optional()?;
+        transaction.commit()?;
         Ok(EditProposal {
             outcome: EditProposalOutcome::Proposed,
             candidate,
@@ -326,21 +388,16 @@ impl Storage {
     }
 
     /// Deletes everything learned from edits: pending suggestions, learned
-    /// entries, and the confirm/reject decisions for those pairs. Manual and
-    /// auto-added entries stay. Returns how many rows were deleted.
+    /// entries (even if edited since), and every confirm/reject decision made
+    /// on an edit suggestion. Manual and auto-added entries stay. The WAL is
+    /// truncated afterwards like other privacy deletions. Returns how many
+    /// rows were deleted.
     pub fn delete_learned_personalization(&self) -> Result<usize, StorageError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         let decisions = transaction.execute(
-            "DELETE FROM dictionary_candidate_decisions WHERE EXISTS (
-               SELECT 1 FROM dictionary_entries
-               WHERE source = ?1 AND reading = original_span AND surface = preferred_span
-             ) OR EXISTS (
-               SELECT 1 FROM dictionary_candidates
-               WHERE origin = ?2 AND dictionary_candidates.original_span = dictionary_candidate_decisions.original_span
-                 AND dictionary_candidates.preferred_span = dictionary_candidate_decisions.preferred_span
-             )",
-            params![LEARNED_SOURCE, USER_EDIT_ORIGIN],
+            "DELETE FROM dictionary_candidate_decisions WHERE origin = ?1",
+            [USER_EDIT_ORIGIN],
         )?;
         let entries = transaction.execute(
             "DELETE FROM dictionary_entries WHERE source = ?1",
@@ -348,8 +405,23 @@ impl Storage {
         )?;
         let candidates = delete_pending_edit_candidates(&transaction)?;
         transaction.commit()?;
+        self.checkpoint_after_deletion(&connection);
         Ok(decisions + entries + candidates)
     }
+}
+
+fn learning_allowed(settings: &crate::types::Settings) -> Result<(), StorageError> {
+    if !settings.personalization_learning {
+        return Err(StorageError::Validation(
+            "learning from edits is off".into(),
+        ));
+    }
+    if settings.history_retention == HistoryRetention::Never {
+        return Err(StorageError::Validation(
+            "History is off, so suggestions are not stored".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -412,6 +484,12 @@ mod tests {
             ("同じ文です", "同じ文です"),
             ("行1\n行2", "行1\n行3と行4"),
             ("Use the API", "Use the"),
+            ("Kubernetis and Dockre", "Kubernetes and Docker"),
+            (
+                "use Kubernetis and Dockre now",
+                "use Kubernetes and Docker now",
+            ),
+            ("機会学習と深相学習", "機械学習と深層学習"),
         ] {
             assert_eq!(pair(before, after), None, "{before} -> {after}");
         }
@@ -616,6 +694,163 @@ mod tests {
                 .outcome,
             EditProposalOutcome::Proposed
         );
+    }
+
+    fn propose(storage: &Storage, id: i64) -> EditProposalOutcome {
+        storage
+            .propose_dictionary_candidate_from_edit(id, "変更はGitHubにプッシュします")
+            .unwrap()
+            .outcome
+    }
+
+    #[test]
+    fn single_term_merges_still_count_as_one_change() {
+        assert_eq!(
+            pair("use open ai today", "use OpenAI today"),
+            Some(("open ai".into(), "OpenAI".into()))
+        );
+        assert!(!changes_several_terms("open ai", "OpenAI"));
+        assert!(changes_several_terms(
+            "Kubernetis and Dockre",
+            "Kubernetes and Docker"
+        ));
+    }
+
+    #[test]
+    fn deleting_learned_data_also_forgets_rejected_and_edited_learning() {
+        let (storage, id) = storage_with_history(true);
+        // Rejected edit suggestion: the decision must not survive deletion.
+        let rejected = storage
+            .propose_dictionary_candidate_from_edit(id, "変更はGitHubにプッシュします")
+            .unwrap()
+            .candidate
+            .unwrap();
+        assert!(storage.reject_dictionary_candidate(rejected.id).unwrap());
+        assert_eq!(propose(&storage, id), EditProposalOutcome::AlreadyKnown);
+        // A correction-derived decision is not learning data and stays.
+        let correction = storage
+            .add_dictionary_candidate_from_correction("open ai", "OpenAI", None)
+            .unwrap()
+            .unwrap();
+        assert!(storage.reject_dictionary_candidate(correction).unwrap());
+        storage.delete_learned_personalization().unwrap();
+        assert_eq!(propose(&storage, id), EditProposalOutcome::Proposed);
+        let decisions: Vec<String> = storage
+            .connection()
+            .unwrap()
+            .prepare("SELECT origin FROM dictionary_candidate_decisions")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(decisions, vec!["correction".to_owned()]);
+
+        // A confirmed learned entry edited afterwards is still learned data.
+        let candidate = storage.list_dictionary_candidates().unwrap()[0].clone();
+        let entry = storage
+            .confirm_dictionary_candidate(candidate.id)
+            .unwrap()
+            .unwrap();
+        let aliases = Vec::new();
+        storage
+            .update_dictionary_entry(
+                entry.id,
+                &NewDictionaryEntry {
+                    reading: "ぎっとはぶ",
+                    surface: "GitHub Enterprise",
+                    category: None,
+                    aliases: &aliases,
+                    priority: 1,
+                    app_scope: None,
+                },
+            )
+            .unwrap();
+        storage.delete_learned_personalization().unwrap();
+        assert!(storage.list_dictionary().unwrap().is_empty());
+        assert_eq!(propose(&storage, id), EditProposalOutcome::Proposed);
+    }
+
+    #[test]
+    fn a_proposal_rechecks_learning_and_history_when_it_stores() {
+        // The first check passed, then another command changed settings
+        // before the insert: the store step must refuse and write nothing.
+        for settings in [
+            Settings::default(),
+            Settings {
+                history_retention: HistoryRetention::Never,
+                ..learning_on()
+            },
+        ] {
+            let (storage, id) = storage_with_history(true);
+            let (original, preferred) = detect_edit_candidate(
+                "変更はぎっとはぶにプッシュします",
+                "変更はGitHubにプッシュします",
+            )
+            .unwrap();
+            save(&storage, settings);
+            assert!(storage
+                .store_edit_proposal(id, &original, &preferred)
+                .is_err());
+            assert_eq!(
+                storage
+                    .connection()
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM dictionary_candidates", [], |row| row
+                        .get::<_, i64>(
+                        0
+                    ))
+                    .unwrap(),
+                0
+            );
+        }
+        // A History row deleted in between is not eligible either.
+        let (storage, id) = storage_with_history(true);
+        storage.delete_history(id).unwrap();
+        assert!(storage
+            .store_edit_proposal(id, "ぎっとはぶ", "GitHub")
+            .is_err());
+    }
+
+    #[test]
+    fn deleting_learned_data_removes_it_from_database_and_wal_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("learned.sqlite3");
+        let storage = Storage::open(&path).unwrap();
+        save(&storage, learning_on());
+        let sentinel = "LearnedSentinelSpelling";
+        let aliases = Vec::new();
+        storage
+            .add_dictionary_entry(&NewDictionaryEntry {
+                reading: "sentinel reading",
+                surface: sentinel,
+                category: None,
+                aliases: &aliases,
+                priority: 0,
+                app_scope: None,
+            })
+            .unwrap();
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE dictionary_entries SET source = ?1",
+                [LEARNED_SOURCE],
+            )
+            .unwrap();
+        let files = [path.clone(), directory.path().join("learned.sqlite3-wal")];
+        let contains = |bytes: &[u8]| {
+            bytes
+                .windows(sentinel.len())
+                .any(|part| part == sentinel.as_bytes())
+        };
+        assert!(files
+            .iter()
+            .any(|file| std::fs::read(file).is_ok_and(|bytes| contains(&bytes))));
+        storage.delete_learned_personalization().unwrap();
+        for file in files {
+            assert!(!std::fs::read(file).is_ok_and(|bytes| contains(&bytes)));
+        }
     }
 
     #[test]

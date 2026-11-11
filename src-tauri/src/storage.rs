@@ -2003,7 +2003,7 @@ impl Storage {
             Some(id) => id,
             None => insert_dictionary_entry(&transaction, &entry, source, None, &scope.modes)?,
         };
-        transaction.execute("INSERT OR IGNORE INTO dictionary_candidate_decisions(original_span, preferred_span, created_at) VALUES (?1, ?2, ?3)", params![reading, surface, Utc::now().to_rfc3339()])?;
+        transaction.execute("INSERT OR IGNORE INTO dictionary_candidate_decisions(original_span, preferred_span, created_at, origin) VALUES (?1, ?2, ?3, ?4)", params![reading, surface, Utc::now().to_rfc3339(), origin])?;
         transaction.execute(
             "DELETE FROM dictionary_candidates WHERE original_span = ?1 AND preferred_span = ?2",
             params![reading, surface],
@@ -2020,15 +2020,21 @@ impl Storage {
         let transaction = connection.transaction()?;
         let candidate = transaction
             .query_row(
-                "SELECT original_span, preferred_span FROM dictionary_candidates WHERE id = ?1",
+                "SELECT original_span, preferred_span, origin FROM dictionary_candidates WHERE id = ?1",
                 [id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((original, preferred)) = candidate else {
+        let Some((original, preferred, origin)) = candidate else {
             return Ok(false);
         };
-        transaction.execute("INSERT OR IGNORE INTO dictionary_candidate_decisions(original_span, preferred_span, created_at) VALUES (?1, ?2, ?3)", params![original, preferred, Utc::now().to_rfc3339()])?;
+        transaction.execute("INSERT OR IGNORE INTO dictionary_candidate_decisions(original_span, preferred_span, created_at, origin) VALUES (?1, ?2, ?3, ?4)", params![original, preferred, Utc::now().to_rfc3339(), origin])?;
         transaction.execute(
             "DELETE FROM dictionary_candidates WHERE original_span = ?1 AND preferred_span = ?2",
             params![original, preferred],

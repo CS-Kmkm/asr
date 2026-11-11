@@ -47,12 +47,18 @@ pub(super) const MIGRATIONS: &[Migration] = &[
 ];
 
 /// Version 5 (Issue #85): optional per-entry text modes (NULL = every mode)
-/// and the origin of a suggestion. Older builds ignore both columns, so an
+/// and the origin of a suggestion and of each confirm/reject decision. Older builds ignore both columns, so an
 /// entry limited to some modes applies to every mode there and a learned
 /// entry reads as auto-added.
 fn migrate_v5_dictionary_learning(connection: &Connection) -> Result<(), StorageError> {
     if !column_exists(connection, "dictionary_entries", "modes")? {
         connection.execute("ALTER TABLE dictionary_entries ADD COLUMN modes TEXT", [])?;
+    }
+    if !column_exists(connection, "dictionary_candidate_decisions", "origin")? {
+        connection.execute(
+            "ALTER TABLE dictionary_candidate_decisions ADD COLUMN origin TEXT NOT NULL DEFAULT 'correction'",
+            [],
+        )?;
     }
     if !column_exists(connection, "dictionary_candidates", "origin")? {
         connection.execute(
