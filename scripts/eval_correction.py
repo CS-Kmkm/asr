@@ -359,6 +359,34 @@ def edit_ratio(source: str, output: str) -> float:
 # --------------------------------------------------------------------------
 
 
+def url_key(url: str) -> str:
+    """A URL compared case-sensitively except for its scheme and host."""
+    url = _strip_url(unicodedata.normalize("NFKC", url).strip())
+    match = re.match(r"^([A-Za-z][A-Za-z0-9+.-]*://)([^/?#]*)(.*)$", url, re.S)
+    if not match:
+        return url
+    return match.group(1).lower() + match.group(2).lower() + match.group(3)
+
+
+def code_key(span: str) -> str:
+    """Code compares exactly (after NFKC): `cargo test` is not `cargo TEST`."""
+    return unicodedata.normalize("NFKC", span)
+
+
+def matches_rule(output: str, kind: str, pattern: str) -> bool:
+    """Whether ``pattern`` of rule ``kind`` occurs in ``output``.
+
+    Prose is case-folded (see :func:`contains`); code spans compare exactly
+    and URLs case-sensitively except scheme and host.
+    """
+    if kind == "code":
+        return code_key(pattern) in code_key(output)
+    if kind == "url":
+        wanted = url_key(pattern)
+        return any(url_key(url) == wanted or url_key(url).startswith(wanted + "/") for url in urls(output))
+    return contains(output, pattern)
+
+
 def added_facts(case: dict[str, Any], output: str) -> list[str]:
     """``added:<type>`` codes for values in the output the transcript lacks."""
     transcript = case["transcript"]
@@ -369,11 +397,12 @@ def added_facts(case: dict[str, Any], output: str) -> list[str]:
     source_numbers = set(numbers(transcript))
     if any(value not in source_numbers and normalize(value) not in allowed for value in numbers(output)):
         failures.append("added:number")
-    source_urls = {normalize(url) for url in urls(transcript)}
-    if any(normalize(url) not in source_urls and normalize(url) not in allowed for url in urls(output)):
+    allowed_exact = {unicodedata.normalize("NFKC", item) for item in rules.get("allow_new", [])}
+    source_urls = {url_key(url) for url in urls(transcript)}
+    if any(url_key(url) not in source_urls and url_key(url) not in allowed_exact for url in urls(output)):
         failures.append("added:url")
-    source_code = {normalize(span) for span in code_spans(transcript)}
-    if any(normalize(span) not in source_code and normalize(span) not in allowed for span in code_spans(output)):
+    source_code = {code_key(span) for span in code_spans(transcript)}
+    if any(code_key(span) not in source_code and code_key(span) not in allowed_exact for span in code_spans(output)):
         failures.append("added:code")
     source_text = _spaceless(normalize(transcript))
     if any(
@@ -389,10 +418,10 @@ def score_output(case: dict[str, Any], output: str) -> dict[str, Any]:
     rules = case["rules"]
     failures: set[str] = set()
     for group in rules.get("require", []):
-        if not any(contains(output, alternative) for alternative in group["any"]):
+        if not any(matches_rule(output, group["kind"], alternative) for alternative in group["any"]):
             failures.add(f"dropped:{group['kind']}")
     for group in rules.get("forbid", []):
-        if any(contains(output, alternative) for alternative in group["any"]):
+        if any(matches_rule(output, group["kind"], alternative) for alternative in group["any"]):
             failures.add(f"forbidden:{group['kind']}")
     failures.update(added_facts(case, output))
     ratio = edit_ratio(case["transcript"], output)

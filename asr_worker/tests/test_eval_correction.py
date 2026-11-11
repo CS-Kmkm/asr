@@ -138,6 +138,22 @@ class ScorerTests(unittest.TestCase):
             evaluation.score_output(case, "Open https://example.com/b and run `make build`.")["failures"],
         )
 
+    def test_code_is_case_sensitive_and_urls_only_fold_scheme_and_host(self):
+        case = _case(language="en", transcript="Run `cargo test` and open https://Example.com/Docs/Setup now.",
+                     reference="Run `cargo test` and open https://Example.com/Docs/Setup now.")
+        case["rules"] = {"require": [{"kind": "code", "any": ["`cargo test`"]}, {"kind": "url", "any": ["https://Example.com/Docs/Setup"]}]}
+        self.assertTrue(evaluation.score_output(case, "Run `cargo test` and open HTTPS://example.COM/Docs/Setup now.")["pass"])
+        self.assertEqual(
+            ["added:code", "dropped:code"],
+            evaluation.score_output(case, "Run `cargo TEST` and open https://Example.com/Docs/Setup now.")["failures"],
+        )
+        self.assertEqual(
+            ["added:url", "dropped:url"],
+            evaluation.score_output(case, "Run `cargo test` and open https://Example.com/docs/Setup now.")["failures"],
+        )
+        # Prose stays case-insensitive.
+        self.assertTrue(evaluation.contains("Please SEND it", "please send"))
+
     def test_edge_whitespace_patterns_match_only_as_words(self):
         self.assertTrue(evaluation.contains("um so please", "um "))
         self.assertFalse(evaluation.contains("summary first", "um "))
