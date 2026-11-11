@@ -958,5 +958,33 @@
   "Finish the current recording before recording a shortcut.": {
     "code": "shortcut_capture_busy",
     "ja": "ショートカットを記録する前に、現在の録音・処理を終了してください。"
+  },
+  "The model cache location is unavailable.": {
+    "code": "model_cache_unavailable",
+    "ja": "モデルの保存場所を確認できません。"
+  },
+  "Only managed Japanese speech models can be removed.": {
+    "code": "model_cache_unmanaged",
+    "ja": "削除できるのは、アプリが管理する日本語モデルだけです。"
+  },
+  "Wait for the speech model to finish loading before removing a model.": {
+    "code": "model_cache_loading",
+    "ja": "モデルの読み込みが終わってから削除してください。"
+  },
+  "This model is loaded. Load a different model before removing its downloaded file.": {
+    "code": "model_cache_in_use",
+    "ja": "このモデルは読み込み済みです。別のモデルを読み込んでから、ダウンロード済みファイルを削除してください。"
+  },
+  "The model file could not be inspected.": {
+    "code": "model_cache_inspect_failed",
+    "ja": "モデルファイルを確認できませんでした。"
+  },
+  "The model cache entry is not a regular file; it was left unchanged.": {
+    "code": "model_cache_not_regular",
+    "ja": "モデルの保存項目が通常のファイルではないため、変更していません。"
+  },
+  "The model file could not be removed. It may be in use; switch to another model and try again.": {
+    "code": "model_cache_remove_failed",
+    "ja": "モデルファイルを削除できませんでした。使用中の可能性があります。別のモデルに切り替えてから再試行してください。"
   }
 }

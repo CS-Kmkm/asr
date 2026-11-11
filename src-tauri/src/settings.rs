@@ -114,7 +114,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
         && settings
             .model_id
             .as_deref()
-            .is_some_and(|id| !types::SPEECH_CPP_MODEL_IDS.contains(&id.trim()))
+            .is_some_and(|id| !crate::model_catalog::is_speech_cpp_model(id.trim()))
     {
         return Err("speech.cpp model ID must be haas-ja-v1.0 or parakeet-tdt_ctc-0.6b-ja".into());
     }
@@ -206,7 +206,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
     }
     for model in &settings.custom_models {
         if model.asr_backend == "speech-cpp"
-            && !types::SPEECH_CPP_MODEL_IDS.contains(&model.model_id.trim())
+            && !crate::model_catalog::is_speech_cpp_model(model.model_id.trim())
         {
             return Err(
                 "speech.cpp model ID must be haas-ja-v1.0 or parakeet-tdt_ctc-0.6b-ja".into(),
@@ -239,8 +239,8 @@ mod tests {
             ..Settings::default()
         };
         assert!(validate(&settings).is_ok());
-        for id in types::SPEECH_CPP_MODEL_IDS {
-            settings.model_id = Some(id.into());
+        for model in crate::model_catalog::managed_models() {
+            settings.model_id = Some(model.model_id.into());
             assert!(validate(&settings).is_ok());
         }
         settings.model_id = Some("stale-whisper-id".into());

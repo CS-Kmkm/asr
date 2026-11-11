@@ -633,3 +633,8 @@ details[open] > summary { color: var(--text); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+.model-details { margin-top: 20px; }
+.model-details h3 { font-size: 15px; margin: 0 0 4px; overflow-wrap: anywhere; }
+.model-facts dd { text-align: right; overflow-wrap: anywhere; min-width: 0; }
+.model-catalog-list { list-style: none; padding: 0; margin: 8px 0 0; display: grid; gap: 10px; }
+.model-catalog-list p { margin: 4px 0 0; color: var(--text-muted); }

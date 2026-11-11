@@ -311,3 +311,11 @@ export interface AskAnswerPreview {
   text: string;
   active: boolean;
 }
+
+export interface ManagedModelCache {
+  modelId: string;
+  /** `present`: expected size (SHA256 is verified again at load). */
+  state: "present" | "incomplete" | "missing" | "unsafe";
+  sizeBytes: number | null;
+  expectedBytes: number;
+}

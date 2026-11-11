@@ -1,5 +1,6 @@
 pub(crate) mod credentials;
 pub(crate) mod history_text;
+pub(crate) mod model_cache;
 pub(crate) mod recent_apps;
 pub(crate) mod setup_tests;
 
@@ -2817,12 +2818,32 @@ impl ModelChangeGate {
         &self,
         phase: impl FnOnce() -> PipelinePhase,
     ) -> Result<ModelChangeGuard<'_>, String> {
+        self.begin_exclusive(
+            phase,
+            "Finish the current voice operation before changing API keys.",
+        )
+    }
+
+    /// Keeps pipeline starts and model changes out while a cached model file
+    /// is removed, so no recording can begin loading the file being deleted.
+    fn begin_model_cache_change(
+        &self,
+        phase: impl FnOnce() -> PipelinePhase,
+    ) -> Result<ModelChangeGuard<'_>, String> {
+        self.begin_exclusive(phase, MODEL_CHANGE_WHILE_BUSY)
+    }
+
+    fn begin_exclusive(
+        &self,
+        phase: impl FnOnce() -> PipelinePhase,
+        busy: &str,
+    ) -> Result<ModelChangeGuard<'_>, String> {
         let mut changing = self.changing();
         if *changing {
             return Err(MODEL_CHANGE_IN_PROGRESS.into());
         }
         if phase() != PipelinePhase::Idle {
-            return Err("Finish the current voice operation before changing API keys.".into());
+            return Err(busy.into());
         }
         *changing = true;
         Ok(ModelChangeGuard { gate: self })
@@ -3401,6 +3422,10 @@ pub(crate) async fn ensure_model_loaded(
 
 pub(crate) const MODEL_LOAD_CANCELLED: &str = "Speech model loading was cancelled.";
 
+/// Held shared for the whole of every speech-model load; cache removal takes
+/// it exclusively without waiting, so it never deletes a file being loaded.
+pub(crate) static MODEL_FILES: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
 fn is_prepared_model(status: &ModelStatus, settings: &Settings) -> bool {
     status.installed
         && status.state == "ready"
@@ -3429,6 +3454,7 @@ pub(crate) async fn ensure_model_loaded_cancellable(
             return Ok(status);
         }
     }
+    let _model_files = MODEL_FILES.read().await;
     emit_status(app, "model_loading", "Loading the speech model.");
     let loading = ModelStatus {
         model_id: model_id.clone(),
