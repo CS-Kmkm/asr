@@ -132,7 +132,13 @@ fn conservative_rejection(
     edits: FactEdits,
 ) -> Option<ProtectedContentKind> {
     let corrected = &strip_ordered_list_markers(corrected);
-    let normalize = |text: &str| text.nfkc().collect::<String>().to_lowercase();
+    // NFKC leaves the minus sign (U+2212) alone; it is the same sign as `-`.
+    let normalize = |text: &str| {
+        text.nfkc()
+            .collect::<String>()
+            .to_lowercase()
+            .replace('\u{2212}', "-")
+    };
     let (source, output) = (normalize(transcript), normalize(corrected));
     if !facts_preserved(&source, &output, &output, ProtectedKind::NumberValue, edits) {
         return Some(ProtectedContentKind::Number);
@@ -628,7 +634,7 @@ pub(super) fn fact_occurrences(text: &str, kind: ProtectedKind) -> Vec<FactOccur
             .into_iter()
             .map(|(range, value)| {
                 let unit = number_unit(text, &range);
-                let value = number_value(&value).unwrap_or(value);
+                let value = number_value_key(text, &range, &value);
                 (range, FactKey { value, unit })
             })
             .collect(),
@@ -1029,6 +1035,69 @@ pub(super) fn number_occurrences(text: &str) -> Vec<(std::ops::Range<usize>, Str
     spans
 }
 
+/// Latin unit words that may follow a number after one space (`2.5 GB`).
+/// Units written without a space are taken from the token itself.
+const LATIN_UNITS: [&str; 44] = [
+    "b", "kb", "mb", "gb", "tb", "pb", "kib", "mib", "gib", "tib", "bit", "bits", "bps", "kbps",
+    "mbps", "gbps", "ms", "s", "sec", "secs", "min", "mins", "h", "hr", "hrs", "km", "m", "cm",
+    "mm", "kg", "g", "mg", "ml", "px", "fps", "hz", "khz", "mhz", "ghz", "pm", "am", "usd", "jpy",
+    "x",
+];
+
+/// The comparison key of a number in lower-cased NFKC text: the sign, any
+/// letters glued before it (`mp3`), its value (see [`number_value`]) and a
+/// Latin unit (`gb`, `ms`, `%`). Only equivalent spellings share a key:
+/// `-4` and `+4`, `2.5gb` and `2.5tb` differ; `2.5GB` and `2.5 GB` match.
+/// A hyphen glued to a word (`gpt-4`) is not a sign.
+pub(super) fn number_value_key(text: &str, range: &std::ops::Range<usize>, token: &str) -> String {
+    let glued_to_word = text[..range.start]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_ascii_alphanumeric());
+    let sign = if token.starts_with('-') && !glued_to_word {
+        "-"
+    } else {
+        ""
+    };
+    let body = token.trim_start_matches(['-', '+', ' ', '\t']);
+    let prefix: String = body
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
+    let mut suffix: String = body
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if suffix.len() == body.len() {
+        suffix.clear();
+    }
+    let rest = &text[range.end..];
+    if suffix.is_empty() {
+        let after_space = rest.strip_prefix(' ').unwrap_or(rest);
+        if after_space.starts_with('%') {
+            suffix.push('%');
+        } else {
+            let word: String = after_space
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .collect();
+            let ends = after_space[word.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric());
+            if ends && LATIN_UNITS.contains(&word.as_str()) {
+                suffix = word;
+            }
+        }
+    }
+    let value = number_value(token).unwrap_or_else(|| body.to_owned());
+    format!("{sign}{prefix}{value}{suffix}")
+}
+
 /// The decimal value of a number token, ignoring how it was written:
 /// `3,000`, `３０００`, `三千` and `3千` are all `3000`, `mp3` is `3`, and
 /// `2.5gb` is `2.5`. Signs are dropped. Returns `None` for tokens it cannot
@@ -1416,6 +1485,32 @@ mod conservative_tests {
                 Some(code),
                 "{source} => {output}"
             );
+        }
+    }
+
+    #[test]
+    fn number_keys_keep_signs_and_latin_units() {
+        for (source, output) in [
+            ("気温は-4度です", "気温は+4度です"),
+            ("offset -4 here", "offset 4 here"),
+            ("最大2.5GBまで", "最大2.5TBまで"),
+            ("timeout 300ms please", "timeout 300s please"),
+            ("CPU 50% used", "CPU 50 used"),
+        ] {
+            assert_eq!(
+                rejection(source, output),
+                Some("protected_number_changed"),
+                "{source} => {output}"
+            );
+        }
+        for (source, output) in [
+            ("最大2.5GBまで", "最大2.5 GBまで"),
+            ("気温は-4度です", "気温は−4度です"),
+            ("offset +4 here", "offset 4 here"),
+            ("use GPT 4 now", "use GPT-4 now"),
+            ("CPU 50 % used", "CPU 50% used"),
+        ] {
+            assert_eq!(rejection(source, output), None, "{source} => {output}");
         }
     }
 
