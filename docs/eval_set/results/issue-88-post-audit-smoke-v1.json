@@ -1,0 +1,94 @@
+{
+  "scope": "Post-audit environment/lifecycle/device-metadata changes; three fixed holdout clips per model, compare exact text to first warm baseline, no transcript publication",
+  "models": {
+    "haas": {
+      "health": {
+        "backend": "speech-cpp",
+        "loaded": true,
+        "device": "vulkan",
+        "computeType": "Q8_0",
+        "deviceName": "NVIDIA GeForce RTX 3060"
+      },
+      "baseline_result_sha256": "a4bc83f7d35342753b43c0c565efe0531d251edd53e2a3a86aa795555584d02e",
+      "rows": [
+        {
+          "audio_sha256": "a4975b9fe15f9340f06e0acdf3b0cc810f522700bdec1b267f85d901987fa29a",
+          "matches_first_warm_baseline": true,
+          "output_sha256": "ae7c5bd569f395fe5c808af4e561543c1675edfd21098ce8d9d53fb89eaffcc1",
+          "wall_ms": 143.28539999951317
+        },
+        {
+          "audio_sha256": "5301de57b29e164edc845e626e9a91c933e6e4946c248106fb0540e85c348317",
+          "matches_first_warm_baseline": true,
+          "output_sha256": "29ad9a9486f27393870d364007cc7426cb12a6652b5923c635554fb22f2d9ca4",
+          "wall_ms": 107.80429999977059
+        },
+        {
+          "audio_sha256": "3adf6a696de291e6b263989973a8c0a7795ee81f88167571db7de2e52728e972",
+          "matches_first_warm_baseline": true,
+          "output_sha256": "af92513539c2039e261ffce30d404e5f5cced25f3cb606d1e9b5f9ea40e932c2",
+          "wall_ms": 49.36490000000049
+        }
+      ]
+    },
+    "parakeet": {
+      "health": {
+        "backend": "speech-cpp",
+        "loaded": true,
+        "device": "vulkan",
+        "computeType": "Q8_0",
+        "deviceName": "NVIDIA GeForce RTX 3060"
+      },
+      "baseline_result_sha256": "4b09ee9dadb038ecc4a8b3fed5e782eb208c74569dc04396b614944e03394526",
+      "rows": [
+        {
+          "audio_sha256": "a4975b9fe15f9340f06e0acdf3b0cc810f522700bdec1b267f85d901987fa29a",
+          "matches_first_warm_baseline": true,
+          "output_sha256": "bb8eaf455dff33930d0fd3a513c641c0920c4300f703c881b765005141acc2d6",
+          "wall_ms": 110.80469999978959
+        },
+        {
+          "audio_sha256": "5301de57b29e164edc845e626e9a91c933e6e4946c248106fb0540e85c348317",
+          "matches_first_warm_baseline": true,
+          "output_sha256": "f069fb78561a7b54a35575f77cecff6661d2c1b4e353e6ef52201543134061ef",
+          "wall_ms": 92.60769999946206
+        },
+        {
+          "audio_sha256": "3adf6a696de291e6b263989973a8c0a7795ee81f88167571db7de2e52728e972",
+          "matches_first_warm_baseline": true,
+          "output_sha256": "323ae94f2d41ea1aab6e21dd746139bcf1806f9d0d1c644d46b86566098ffa9a",
+          "wall_ms": 47.06140000052983
+        }
+      ]
+    },
+    "whisper": {
+      "health": {
+        "backend": "faster-whisper",
+        "loaded": true,
+        "device": "cuda",
+        "computeType": "float16"
+      },
+      "baseline_result_sha256": "bde57375e52ec37632d4831544f4ba814e758cf6a7590c6b8e046a9e39740a17",
+      "rows": [
+        {
+          "audio_sha256": "a4975b9fe15f9340f06e0acdf3b0cc810f522700bdec1b267f85d901987fa29a",
+          "matches_first_warm_baseline": true,
+          "output_sha256": "2a36c71f33e0d222c0a1b0496d619fc5a9ef8b53336c87f992f96f9071b2668e",
+          "wall_ms": 427.07140000038635
+        },
+        {
+          "audio_sha256": "5301de57b29e164edc845e626e9a91c933e6e4946c248106fb0540e85c348317",
+          "matches_first_warm_baseline": true,
+          "output_sha256": "4d9a2499fd50f4296e8d4fc7b6a7779063bfb2c99ac176c9c9170b7b8a0d85b8",
+          "wall_ms": 436.8130000002566
+        },
+        {
+          "audio_sha256": "3adf6a696de291e6b263989973a8c0a7795ee81f88167571db7de2e52728e972",
+          "matches_first_warm_baseline": true,
+          "output_sha256": "4aaa3591610ed1128cc693a2171694dc94573d2a749aa3e1f6613d3cb09c4887",
+          "wall_ms": 369.91519999992306
+        }
+      ]
+    }
+  }
+}

@@ -309,7 +309,15 @@ impl Default for VoiceShortcuts {
     }
 }
 
-pub const ASR_BACKENDS: [&str; 4] = ["vibevoice", "faster-whisper", "openai-compatible", "mock"];
+pub const ASR_BACKENDS: [&str; 5] = [
+    "vibevoice",
+    "faster-whisper",
+    "openai-compatible",
+    "speech-cpp",
+    "mock",
+];
+pub const SPEECH_CPP_SUPPORTED: bool = cfg!(all(target_os = "windows", target_arch = "x86_64"));
+pub const SPEECH_CPP_MODEL_IDS: [&str; 2] = ["haas-ja-v1.0", "parakeet-tdt_ctc-0.6b-ja"];
 pub const CORRECTION_PROVIDERS: [&str; 3] = ["openai", "gemini", "local"];
 pub const CORRECTION_MODES: [&str; 2] = ["conservative", "intent_aware"];
 pub const OPENAI_REASONING_EFFORTS: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];
@@ -673,6 +681,7 @@ pub struct ModelStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GpuDiagnostics {
+    pub speech_cpp_supported: bool,
     pub status: String,
     pub adapter_name: Option<String>,
     pub driver_version: Option<String>,

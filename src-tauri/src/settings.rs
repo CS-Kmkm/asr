@@ -81,7 +81,8 @@ pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
     }
     if !types::ASR_BACKENDS.contains(&settings.asr_backend.as_str()) {
         return Err(
-            "asr backend must be vibevoice, faster-whisper, openai-compatible, or mock".into(),
+            "asr backend must be vibevoice, faster-whisper, openai-compatible, speech-cpp, or mock"
+                .into(),
         );
     }
     if !types::CORRECTION_PROVIDERS.contains(&settings.correction_provider.as_str()) {
@@ -108,6 +109,22 @@ pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
     }
     if settings.custom_models.len() > 100 {
         return Err("at most 100 custom models can be saved".into());
+    }
+    if settings.asr_backend == "speech-cpp"
+        && settings
+            .model_id
+            .as_deref()
+            .is_some_and(|id| !types::SPEECH_CPP_MODEL_IDS.contains(&id.trim()))
+    {
+        return Err("speech.cpp model ID must be haas-ja-v1.0 or parakeet-tdt_ctc-0.6b-ja".into());
+    }
+    if settings.asr_backend == "speech-cpp"
+        && settings
+            .speech_locale
+            .as_deref()
+            .is_some_and(|locale| locale != "ja-JP")
+    {
+        return Err("Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.".into());
     }
     let api_url = settings.api_base_url.trim();
     if api_url.len() > 2048
@@ -188,6 +205,13 @@ pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
         );
     }
     for model in &settings.custom_models {
+        if model.asr_backend == "speech-cpp"
+            && !types::SPEECH_CPP_MODEL_IDS.contains(&model.model_id.trim())
+        {
+            return Err(
+                "speech.cpp model ID must be haas-ja-v1.0 or parakeet-tdt_ctc-0.6b-ja".into(),
+            );
+        }
         if !types::ASR_BACKENDS.contains(&model.asr_backend.as_str()) {
             return Err("custom model backend is not supported".into());
         }
@@ -207,6 +231,49 @@ pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn japanese_model_settings_reject_stale_ids() {
+        let mut settings = Settings {
+            asr_backend: "speech-cpp".into(),
+            ..Settings::default()
+        };
+        assert!(validate(&settings).is_ok());
+        for id in types::SPEECH_CPP_MODEL_IDS {
+            settings.model_id = Some(id.into());
+            assert!(validate(&settings).is_ok());
+        }
+        settings.model_id = Some("stale-whisper-id".into());
+        assert!(validate(&settings)
+            .unwrap_err()
+            .contains("speech.cpp model ID"));
+        settings.model_id = None;
+        settings.custom_models.push(types::CustomModel {
+            asr_backend: "speech-cpp".into(),
+            model_id: "unsupported".into(),
+        });
+        assert!(validate(&settings).is_err());
+        settings.custom_models[0].model_id = "haas-ja-v1.0".into();
+        assert!(validate(&settings).is_ok());
+    }
+
+    #[test]
+    fn japanese_models_require_japanese_or_automatic_locale_before_recording() {
+        let mut settings = Settings {
+            asr_backend: "speech-cpp".into(),
+            ..Settings::default()
+        };
+        for locale in [None, Some("ja-JP")] {
+            settings.speech_locale = locale.map(str::to_owned);
+            assert!(validate(&settings).is_ok());
+        }
+        settings.speech_locale = Some("en-US".into());
+        assert!(validate(&settings)
+            .unwrap_err()
+            .contains("Japanese speech models require"));
+        settings.asr_backend = "faster-whisper".into();
+        assert!(validate(&settings).is_ok());
+    }
 
     #[test]
     fn settings_validation_rejects_an_unselectable_translation_target() {

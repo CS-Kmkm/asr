@@ -5,8 +5,76 @@ import { defaultSettings } from "../api";
 import { I18nProvider } from "../i18n";
 import { SetupPage } from "../pages/SetupPage";
 import { ModelsPage } from "../pages/ModelsPage";
-import type { ModelStatus } from "../types";
+import type { ModelStatus, GpuDiagnostics } from "../types";
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
+
+const supportedJapaneseGpu: GpuDiagnostics = { status: "unavailable", adapterName: null, driverVersion: null, memoryTotalMb: null, recommendation: "", speechCppSupported: true };
+
+test.each(["4bit", "bf16"] as const)("Japanese model changes preserve Whisper %s format after settings are persisted", (format) => {
+  const configure = vi.fn();
+  const settings = { ...defaultSettings, modelQuantization: format };
+  const options = [{ value: "faster-whisper", label: "Whisper model" }, { value: "speech-cpp", label: "Japanese models (Vulkan)" }] as const;
+  const props = { gpu: supportedJapaneseGpu, asrBackendOptions: [...options], modelLoading: false, onConfigureModel: configure, onSaveCustomModel: async () => true, onDiagnoseGpu: vi.fn() };
+  const view = render(<I18nProvider language="en"><ModelsPage settings={settings} {...props} /></I18nProvider>);
+  const backend = screen.getByRole("combobox", { name: "ASR backend" });
+  fireEvent.change(backend, { target: { value: "builtin:speech-cpp" } });
+  fireEvent.change(screen.getByRole("combobox", { name: "Japanese model" }), { target: { value: "parakeet-tdt_ctc-0.6b-ja" } });
+  expect((backend as HTMLSelectElement).value).toBe("builtin:speech-cpp");
+  expect(screen.queryByRole("textbox", { name: "API base URL" })).toBeNull();
+  expect(screen.queryByRole("combobox", { name: "Load format" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Load Model" }));
+  expect(configure.mock.calls[0][0]).toMatchObject({ asrBackend: "speech-cpp", modelId: "parakeet-tdt_ctc-0.6b-ja", modelQuantization: format });
+  view.rerender(<I18nProvider language="en"><ModelsPage {...props} settings={{ ...settings, ...configure.mock.calls[0][0] }} /></I18nProvider>);
+  fireEvent.change(backend, { target: { value: "builtin:faster-whisper" } });
+  fireEvent.click(screen.getByRole("button", { name: "Load Model" }));
+  expect(configure.mock.calls[1][0]).toMatchObject({ asrBackend: "faster-whisper", modelId: null, modelQuantization: format });
+});
+
+test("unsupported platforms cannot select or load Japanese models", () => {
+  render(<I18nProvider language="en"><ModelsPage settings={{ ...defaultSettings, asrBackend: "speech-cpp" }} gpu={{ ...supportedJapaneseGpu, speechCppSupported: false }}
+    asrBackendOptions={[{ value: "speech-cpp", label: "Japanese models (Vulkan)" }]}
+    modelLoading={false} onConfigureModel={vi.fn()} onSaveCustomModel={async () => true} onDiagnoseGpu={vi.fn()} /></I18nProvider>);
+  expect((screen.getByRole("option", { name: "Japanese models (Vulkan)" }) as HTMLOptionElement).disabled).toBe(true);
+  expect((screen.getByRole("button", { name: "Load Model" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.getByText("Japanese Vulkan models require Windows x64. Select faster-whisper on this system.")).toBeTruthy();
+});
+
+test("unchecked Japanese platform has an actionable diagnostics explanation", () => {
+  render(<I18nProvider language="en"><ModelsPage settings={{ ...defaultSettings, asrBackend: "speech-cpp" }} gpu={null}
+    asrBackendOptions={[{ value: "speech-cpp", label: "Japanese models (Vulkan)" }]}
+    modelLoading={false} onConfigureModel={vi.fn()} onSaveCustomModel={async () => true} onDiagnoseGpu={vi.fn()} /></I18nProvider>);
+  expect((screen.getByRole("button", { name: "Load Model" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.getByText("Platform support has not been checked. Open GPU and run diagnostics to enable Japanese models.")).toBeTruthy();
+});
+
+test("Japanese model load is blocked with a clear language hint for English input", () => {
+  render(<I18nProvider language="en"><ModelsPage settings={{ ...defaultSettings, asrBackend: "speech-cpp", speechLocale: "en-US" }} gpu={supportedJapaneseGpu}
+    asrBackendOptions={[{ value: "speech-cpp", label: "Japanese models (Vulkan)" }]}
+    modelLoading={false} onConfigureModel={vi.fn()} onSaveCustomModel={async () => true} onDiagnoseGpu={vi.fn()} /></I18nProvider>);
+  expect((screen.getByRole("button", { name: "Load Model" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.getByText("Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.")).toBeTruthy();
+});
+
+test("legacy unknown Japanese model IDs normalize to the pinned default on explicit Load", () => {
+  const configure = vi.fn();
+  render(<I18nProvider language="en"><ModelsPage settings={{ ...defaultSettings, asrBackend: "speech-cpp", modelId: "stale-whisper-id" }} gpu={supportedJapaneseGpu}
+    asrBackendOptions={[{ value: "speech-cpp", label: "Japanese models (Vulkan)" }]}
+    modelLoading={false} onConfigureModel={configure} onSaveCustomModel={async () => true} onDiagnoseGpu={vi.fn()} /></I18nProvider>);
+  expect((screen.getByRole("combobox", { name: "Japanese model" }) as HTMLSelectElement).value).toBe("haas-ja-v1.0");
+  fireEvent.click(screen.getByRole("button", { name: "Load Model" }));
+  expect(configure.mock.calls[0][0].modelId).toBe("haas-ja-v1.0");
+});
+
+test("pinned Japanese backend cannot save arbitrary speech.cpp model IDs", () => {
+  render(<I18nProvider language="en"><ModelsPage settings={{ ...defaultSettings, asrBackend: "speech-cpp", modelId: "haas-ja-v1.0" }} gpu={null}
+    asrBackendOptions={[{ value: "speech-cpp", label: "Japanese models (Vulkan)" }]}
+    modelLoading={false} onConfigureModel={vi.fn()} onSaveCustomModel={async () => true} onDiagnoseGpu={vi.fn()} /></I18nProvider>);
+  expect(screen.queryByRole("group", { name: "Additional Models" })).toBeNull();
+  fireEvent.change(screen.getByRole("combobox", { name: "ASR backend" }), { target: { value: "__additional_model__" } });
+  const dialog = screen.getByRole("dialog", { name: "Add an ASR model" });
+  expect(within(dialog).queryByRole("option", { name: "Japanese models (Vulkan)" })).toBeNull();
+  expect((within(dialog).getByRole("combobox") as HTMLSelectElement).value).toBe("faster-whisper");
+});
 
 test("Setup requires a ready model and renders preparation progress", () => {
   const props = { settings: defaultSettings, devices: [], gpu: null, gpuChecking: false, onSettingsChange: vi.fn(), onConfigureModel: vi.fn(), onDiagnoseGpu: vi.fn(), onFinish: vi.fn() };

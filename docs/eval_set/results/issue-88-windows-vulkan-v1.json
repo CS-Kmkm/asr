@@ -1,0 +1,364 @@
+{
+  "schema": "asr-japanese-comparison/1",
+  "date_jst": "2026-11-10",
+  "manifest": "practical-ja-holdout-v1",
+  "manifest_sha256": "019651227d41bf2746740f2f3f78209c130c9c83e4e38d0a14b41eeb7d63d515",
+  "lock_sha256": "5cb5b37badcd736206105b014cf59b3219b46543b1daf0df2eb2f6480728f271",
+  "unique_audio": 200,
+  "warm_repeats": 2,
+  "restarted_process_passes": 1,
+  "accuracy_sample": "first warm output per audio",
+  "timing_scope": "JSONL request/response; HTTP included for speech.cpp; not paste E2E",
+  "gpu_scope": "500ms device-wide samples, includes other apps and startup",
+  "literal_probe_policy": "NFKC/casefold; reference occurrences retained by substring occurrence count capped at reference count; unaligned surface checks only, not semantic accuracy. Negation regex: なかった|ません|ない. Digit regex: [0-9]+(?:[.,][0-9]+)*. Terms are docs/eval_set/terms.txt.",
+  "models": {
+    "haas": {
+      "source_result_sha256": "a4bc83f7d35342753b43c0c565efe0531d251edd53e2a3a86aa795555584d02e",
+      "model": "speech.cpp:haas-ja-v1.0:Q8_0",
+      "revision": "6b965d5007ba780585de51549d57a8c1c0d67c7e",
+      "runtime": "speech.cpp-0.10.1",
+      "observed_devices": [
+        {
+          "device": "vulkan",
+          "compute_type": "Q8_0"
+        }
+      ],
+      "overall": {
+        "files": 200,
+        "raw": {
+          "cer": {
+            "errors": 750,
+            "ref_len": 9187,
+            "cer": 0.08163709589637531
+          },
+          "wer": null,
+          "wer_reason": "ja: no word segmentation; CER is primary"
+        },
+        "normalized": {
+          "cer": {
+            "errors": 368,
+            "ref_len": 8511,
+            "cer": 0.04323816237809893
+          },
+          "wer": null,
+          "wer_reason": "ja: no word segmentation; CER is primary"
+        }
+      },
+      "groups": [
+        {
+          "source": "fleurs",
+          "language": "ja-JP",
+          "files": 100,
+          "raw": {
+            "cer": {
+              "errors": 364,
+              "ref_len": 5383,
+              "cer": 0.06762028608582575
+            },
+            "wer": null,
+            "wer_reason": "ja: no word segmentation; CER is primary"
+          },
+          "normalized": {
+            "cer": {
+              "errors": 203,
+              "ref_len": 5034,
+              "cer": 0.040325784664282875
+            },
+            "wer": null,
+            "wer_reason": "ja: no word segmentation; CER is primary"
+          }
+        },
+        {
+          "source": "jvnv",
+          "language": "ja-JP",
+          "files": 100,
+          "raw": {
+            "cer": {
+              "errors": 386,
+              "ref_len": 3804,
+              "cer": 0.10147213459516298
+            },
+            "wer": null,
+            "wer_reason": "ja: no word segmentation; CER is primary"
+          },
+          "normalized": {
+            "cer": {
+              "errors": 165,
+              "ref_len": 3477,
+              "cer": 0.04745470232959448
+            },
+            "wer": null,
+            "wer_reason": "ja: no word segmentation; CER is primary"
+          }
+        }
+      ],
+      "warm_wall_ms": {
+        "count": 400,
+        "min": 21.195600000282866,
+        "p50": 55.91819999972358,
+        "p95": 96.87249500047979,
+        "max": 154.89739999975427
+      },
+      "load_request_ms": {
+        "count": 1,
+        "min": 1502.4593999996796,
+        "p50": 1502.4593999996796,
+        "p95": 1502.4593999996796,
+        "max": 1502.4593999996796
+      },
+      "first_request_after_restart_wall_ms": 5171.908399999666,
+      "completed_requests": 600,
+      "literal_probes": {
+        "digits": {
+          "reference_occurrences": 53,
+          "retained_occurrences": 41,
+          "items": 35
+        },
+        "negation": {
+          "reference_occurrences": 52,
+          "retained_occurrences": 52,
+          "items": 42
+        },
+        "terms": {
+          "reference_occurrences": 0,
+          "retained_occurrences": 0,
+          "items": 0
+        }
+      },
+      "gpu_memory_used_mib_max": 2034.0,
+      "gpu_utilization_percent_max": 100.0
+    },
+    "parakeet": {
+      "source_result_sha256": "4b09ee9dadb038ecc4a8b3fed5e782eb208c74569dc04396b614944e03394526",
+      "model": "speech.cpp:parakeet-tdt_ctc-0.6b-ja:Q8_0",
+      "revision": "f7cb5387e1e76385456b7a792054565ecf177417",
+      "runtime": "speech.cpp-0.10.1",
+      "observed_devices": [
+        {
+          "device": "vulkan",
+          "compute_type": "Q8_0"
+        }
+      ],
+      "overall": {
+        "files": 200,
+        "raw": {
+          "cer": {
+            "errors": 1197,
+            "ref_len": 9187,
+            "cer": 0.130292805050615
+          },
+          "wer": null,
+          "wer_reason": "ja: no word segmentation; CER is primary"
+        },
+        "normalized": {
+          "cer": {
+            "errors": 733,
+            "ref_len": 8511,
+            "cer": 0.08612383973681119
+          },
+          "wer": null,
+          "wer_reason": "ja: no word segmentation; CER is primary"
+        }
+      },
+      "groups": [
+        {
+          "source": "fleurs",
+          "language": "ja-JP",
+          "files": 100,
+          "raw": {
+            "cer": {
+              "errors": 483,
+              "ref_len": 5383,
+              "cer": 0.08972691807542263
+            },
+            "wer": null,
+            "wer_reason": "ja: no word segmentation; CER is primary"
+          },
+          "normalized": {
+            "cer": {
+              "errors": 301,
+              "ref_len": 5034,
+              "cer": 0.05979340484704013
+            },
+            "wer": null,
+            "wer_reason": "ja: no word segmentation; CER is primary"
+          }
+        },
+        {
+          "source": "jvnv",
+          "language": "ja-JP",
+          "files": 100,
+          "raw": {
+            "cer": {
+              "errors": 714,
+              "ref_len": 3804,
+              "cer": 0.18769716088328076
+            },
+            "wer": null,
+            "wer_reason": "ja: no word segmentation; CER is primary"
+          },
+          "normalized": {
+            "cer": {
+              "errors": 432,
+              "ref_len": 3477,
+              "cer": 0.12424503882657463
+            },
+            "wer": null,
+            "wer_reason": "ja: no word segmentation; CER is primary"
+          }
+        }
+      ],
+      "warm_wall_ms": {
+        "count": 400,
+        "min": 21.593399999801477,
+        "p50": 52.745349999440805,
+        "p95": 94.17278499959134,
+        "max": 132.32609999977285
+      },
+      "load_request_ms": {
+        "count": 1,
+        "min": 1984.288700000434,
+        "p50": 1984.288700000434,
+        "p95": 1984.288700000434,
+        "max": 1984.288700000434
+      },
+      "first_request_after_restart_wall_ms": 153.5500999998476,
+      "completed_requests": 600,
+      "literal_probes": {
+        "digits": {
+          "reference_occurrences": 53,
+          "retained_occurrences": 45,
+          "items": 35
+        },
+        "negation": {
+          "reference_occurrences": 52,
+          "retained_occurrences": 52,
+          "items": 42
+        },
+        "terms": {
+          "reference_occurrences": 0,
+          "retained_occurrences": 0,
+          "items": 0
+        }
+      },
+      "gpu_memory_used_mib_max": 1984.0,
+      "gpu_utilization_percent_max": 79.0
+    },
+    "whisper": {
+      "source_result_sha256": "bde57375e52ec37632d4831544f4ba814e758cf6a7590c6b8e046a9e39740a17",
+      "model": "faster-whisper:mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+      "revision": "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
+      "runtime": "ctranslate2",
+      "observed_devices": [
+        {
+          "device": "cuda",
+          "compute_type": "float16"
+        }
+      ],
+      "overall": {
+        "files": 200,
+        "raw": {
+          "cer": {
+            "errors": 963,
+            "ref_len": 9187,
+            "cer": 0.1048220311309459
+          },
+          "wer": null,
+          "wer_reason": "ja: no word segmentation; CER is primary"
+        },
+        "normalized": {
+          "cer": {
+            "errors": 407,
+            "ref_len": 8511,
+            "cer": 0.04782046763012572
+          },
+          "wer": null,
+          "wer_reason": "ja: no word segmentation; CER is primary"
+        }
+      },
+      "groups": [
+        {
+          "source": "fleurs",
+          "language": "ja-JP",
+          "files": 100,
+          "raw": {
+            "cer": {
+              "errors": 453,
+              "ref_len": 5383,
+              "cer": 0.08415381757384358
+            },
+            "wer": null,
+            "wer_reason": "ja: no word segmentation; CER is primary"
+          },
+          "normalized": {
+            "cer": {
+              "errors": 218,
+              "ref_len": 5034,
+              "cer": 0.04330552244735797
+            },
+            "wer": null,
+            "wer_reason": "ja: no word segmentation; CER is primary"
+          }
+        },
+        {
+          "source": "jvnv",
+          "language": "ja-JP",
+          "files": 100,
+          "raw": {
+            "cer": {
+              "errors": 510,
+              "ref_len": 3804,
+              "cer": 0.13406940063091483
+            },
+            "wer": null,
+            "wer_reason": "ja: no word segmentation; CER is primary"
+          },
+          "normalized": {
+            "cer": {
+              "errors": 189,
+              "ref_len": 3477,
+              "cer": 0.054357204486626405
+            },
+            "wer": null,
+            "wer_reason": "ja: no word segmentation; CER is primary"
+          }
+        }
+      ],
+      "warm_wall_ms": {
+        "count": 400,
+        "min": 306.4347999998063,
+        "p50": 389.9151499999789,
+        "p95": 507.9222600003049,
+        "max": 633.6115000003701
+      },
+      "load_request_ms": {
+        "count": 1,
+        "min": 32411.371600000166,
+        "p50": 32411.371600000166,
+        "p95": 32411.371600000166,
+        "max": 32411.371600000166
+      },
+      "first_request_after_restart_wall_ms": 414.57919999993464,
+      "completed_requests": 600,
+      "literal_probes": {
+        "digits": {
+          "reference_occurrences": 53,
+          "retained_occurrences": 45,
+          "items": 35
+        },
+        "negation": {
+          "reference_occurrences": 52,
+          "retained_occurrences": 52,
+          "items": 42
+        },
+        "terms": {
+          "reference_occurrences": 0,
+          "retained_occurrences": 0,
+          "items": 0
+        }
+      },
+      "gpu_memory_used_mib_max": 3651.0,
+      "gpu_utilization_percent_max": 100.0
+    }
+  }
+}

@@ -178,13 +178,14 @@ impl WorkerHealth {
                 "faster-whisper",
                 "vibevoice",
                 "openai-compatible",
+                "speech-cpp",
                 "unknown",
             ]
             .contains(&health.backend.as_str())
             || health
                 .device
                 .as_deref()
-                .is_some_and(|v| !["cpu", "cuda"].contains(&v))
+                .is_some_and(|v| !["cpu", "cuda", "vulkan"].contains(&v))
             || health.compute_type.as_deref().is_some_and(|v| {
                 ![
                     "int8",
@@ -198,6 +199,7 @@ impl WorkerHealth {
                     "4bit",
                     "8bit",
                     "bf16",
+                    "Q8_0",
                 ]
                 .contains(&v)
             })
@@ -1488,6 +1490,15 @@ mod tests {
         assert_eq!(health.device.as_deref(), Some("cpu"));
         assert_eq!(health.python_version, "3.12.8");
         assert_eq!(serde_json::to_value(&health).unwrap(), response["health"]);
+        let mut vulkan = response.clone();
+        vulkan["health"]["backend"] = json!("speech-cpp");
+        vulkan["health"]["device"] = json!("vulkan");
+        vulkan["health"]["computeType"] = json!("Q8_0");
+        vulkan["health"]["deviceName"] = json!("NVIDIA GeForce RTX 3060");
+        assert_eq!(
+            WorkerHealth::parse(&vulkan).unwrap().device.as_deref(),
+            Some("vulkan")
+        );
         for (field, value) in [
             ("loaded", json!(false)),
             ("device", json!("unexpected")),
@@ -1505,7 +1516,13 @@ mod tests {
 
     #[test]
     fn worker_commands_never_inherit_text_provider_secrets() {
-        for backend in ["mock", "faster-whisper", "vibevoice", "openai-compatible"] {
+        for backend in [
+            "mock",
+            "faster-whisper",
+            "vibevoice",
+            "openai-compatible",
+            "speech-cpp",
+        ] {
             let mut spec = WorkerCommand::python("python").with_backend(backend);
             for name in ["OPENAI_API_KEY", "GEMINI_API_KEY", "ASR_API_KEY"] {
                 spec.env.push((name.into(), "synthetic-test-secret".into()));

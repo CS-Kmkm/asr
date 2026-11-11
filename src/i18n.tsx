@@ -23,6 +23,13 @@ const backendTemplates = Object.entries(backendCatalogue).filter(([, entry]) => 
 });
 
 const en = {
+  "Platform support has not been checked. Open GPU and run diagnostics to enable Japanese models.": "Platform support has not been checked. Open GPU and run diagnostics to enable Japanese models.",
+  "Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.": "Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.",
+  "Japanese Vulkan models require Windows x64. Select faster-whisper on this system.": "Japanese Vulkan models require Windows x64. Select faster-whisper on this system.",
+  "Japanese models (Vulkan)": "Japanese models (Vulkan)",
+  "Japanese model": "Japanese model",
+  "Japanese only. Vulkan encoder and CPU decoder; Q8_0. Downloads about 690 MB on first load.": "Japanese only. Vulkan encoder and CPU decoder; Q8_0. Downloads about 690 MB on first load.",
+  "Haas: Apache-2.0. Parakeet Japanese: CC-BY-4.0. Both use greedy TDT; CTC is unavailable in this runtime.": "Haas: Apache-2.0. Parakeet Japanese: CC-BY-4.0. Both use greedy TDT; CTC is unavailable in this runtime.",
   "Enable automatic voice mode, then use Load model on the Models page to prepare the local decision model. Recording never downloads or loads decision weights. Install the decision extra for a source checkout. Unavailable or uncertain decisions keep selected text unchanged.": "Enable automatic voice mode, then use Load model on the Models page to prepare the local decision model. Recording never downloads or loads decision weights. Install the decision extra for a source checkout. Unavailable or uncertain decisions keep selected text unchanged.",
   "Automatic voice mode": "Automatic voice mode",
   "Decision model": "Decision model",
@@ -432,6 +439,13 @@ const en = {
 } as const;
 export type MessageKey = keyof typeof en | keyof typeof backendMessages;
 const ja: Record<keyof typeof en, string> = {
+  "Platform support has not been checked. Open GPU and run diagnostics to enable Japanese models.": "対応環境をまだ確認していません。下のGPUを開いて診断を実行すると、日本語モデルの対応状況を確認できます。",
+  "Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.": "日本語モデルには認識言語の日本語または自動設定が必要です。設定で日本語を選ぶか、faster-whisperに切り替えてください。",
+  "Japanese Vulkan models require Windows x64. Select faster-whisper on this system.": "日本語VulkanモデルにはWindows x64が必要です。この環境ではfaster-whisperを選択してください。",
+  "Japanese models (Vulkan)": "日本語モデル（Vulkan）",
+  "Japanese model": "日本語モデル",
+  "Japanese only. Vulkan encoder and CPU decoder; Q8_0. Downloads about 690 MB on first load.": "日本語専用。エンコーダーはVulkan、デコーダーはCPUで動作（Q8_0）。初回読み込み時に約690 MBを取得します。",
+  "Haas: Apache-2.0. Parakeet Japanese: CC-BY-4.0. Both use greedy TDT; CTC is unavailable in this runtime.": "Haas：Apache-2.0、Parakeet Japanese：CC-BY-4.0。両モデルともTDTの貪欲デコードを使用します。この実行環境ではCTCは利用できません。",
   "Enable automatic voice mode, then use Load model on the Models page to prepare the local decision model. Recording never downloads or loads decision weights. Install the decision extra for a source checkout. Unavailable or uncertain decisions keep selected text unchanged.": "音声モードの自動判定を有効にし、モデル画面の「モデルを読み込む」で判断モデルを準備してください。録音開始時には判断モデルの取得・読み込みを行いません。ソースから使う場合は decision 追加依存が必要です。判定できない場合や確信度が低い場合、選択した文章は変更しません。",
   "Automatic voice mode": "音声モードの自動判定",
   "Decision model": "判断モデル",

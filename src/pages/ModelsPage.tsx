@@ -110,9 +110,10 @@ export function ModelsPage({
   }, [modalOpen]);
 
   const customModels = useMemo(() => {
-    const saved = [...settings.customModels];
+    const saved = settings.customModels.filter((model) => model.asrBackend !== "speech-cpp");
     if (
       settings.modelId &&
+      settings.asrBackend !== "speech-cpp" &&
       !saved.some(
         (model) =>
           model.asrBackend === settings.asrBackend && model.modelId === settings.modelId,
@@ -123,17 +124,23 @@ export function ModelsPage({
     return saved;
   }, [settings.asrBackend, settings.customModels, settings.modelId]);
 
+  const japaneseLocaleSupported = settings.speechLocale === null || settings.speechLocale === "ja-JP";
   const localizedBackendDetails: Record<AsrBackend, string> = {
     "faster-whisper": t("Fast local transcription on CPU or CUDA."),
     vibevoice: t("Long-form transcription on a CUDA GPU."),
     "openai-compatible": t("OpenAI Audio Transcriptions API or a compatible local server."),
+    "speech-cpp": !gpu ? t("Platform support has not been checked. Open GPU and run diagnostics to enable Japanese models.")
+      : !gpu.speechCppSupported ? t("Japanese Vulkan models require Windows x64. Select faster-whisper on this system.")
+      : !japaneseLocaleSupported ? t("Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.")
+      : t("Japanese only. Vulkan encoder and CPU decoder; Q8_0. Downloads about 690 MB on first load."),
   };
-  const selectedValue = additionalModelId
+  const japaneseModelId = additionalModelId === "parakeet-tdt_ctc-0.6b-ja" ? additionalModelId : "haas-ja-v1.0";
+  const selectedValue = additionalModelId && backend !== "speech-cpp"
     ? customModelValue({ asrBackend: backend, modelId: additionalModelId })
     : builtinValue(backend);
 
   function openAdditionalModelModal() {
-    setDraftBackend(backend);
+    setDraftBackend(backend === "speech-cpp" ? "faster-whisper" : backend);
     setDraftModelId("");
     setModalOpen(true);
   }
@@ -189,7 +196,7 @@ export function ModelsPage({
               >
                 <optgroup label={t("Built-in backends")}>
                   {asrBackendOptions.map((option) => (
-                    <option key={option.value} value={builtinValue(option.value)}>
+                    <option key={option.value} value={builtinValue(option.value)} disabled={option.value === "speech-cpp" && gpu?.speechCppSupported !== true}>
                       {t(option.label)}
                     </option>
                   ))}
@@ -241,6 +248,12 @@ export function ModelsPage({
                 }
               />
             </>
+          ) : backend === "speech-cpp" ? (
+            <SettingRow title={t("Japanese model")} detail={t("Haas: Apache-2.0. Parakeet Japanese: CC-BY-4.0. Both use greedy TDT; CTC is unavailable in this runtime.")}
+              control={<select aria-label={t("Japanese model")} value={japaneseModelId} onChange={(event) => setAdditionalModelId(event.target.value)}>
+                <option value="haas-ja-v1.0">Haas-ja-v1.0</option>
+                <option value="parakeet-tdt_ctc-0.6b-ja">Parakeet TDT-CTC 0.6B Japanese (TDT)</option>
+              </select>} />
           ) : (
             <SettingRow
               title={t("Load format")}
@@ -266,13 +279,13 @@ export function ModelsPage({
             onConfigureModel({
               asrBackend: backend,
               asrDevice: device,
-              modelId: additionalModelId || null,
+              modelId: backend === "speech-cpp" ? japaneseModelId : additionalModelId || null,
               modelQuantization: quantization,
               apiBaseUrl: apiBaseUrl.trim(),
               apiKeyEnvVar: apiKeyEnvVar.trim(),
             })
           }
-          disabled={modelLoading}
+          disabled={modelLoading || (backend === "speech-cpp" && (gpu?.speechCppSupported !== true || !japaneseLocaleSupported))}
         >
           {modelLoading ? t("Loading...") : model?.state === "error" ? t("Retry") : t("Load Model")}
         </button>

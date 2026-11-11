@@ -147,7 +147,7 @@ export type HistoryRetention = "never" | "24_hours" | "one_week" | "one_month" |
 export type HistoryTextAction = { kind: "correct"; profile: string | null } | { kind: "translate"; target: string };
 export type HistoryFilter = "all" | "dictate" | "translate" | "edit" | "ask";
 
-export type AsrBackend = "vibevoice" | "faster-whisper" | "openai-compatible";
+export type AsrBackend = "vibevoice" | "faster-whisper" | "openai-compatible" | "speech-cpp";
 export type ModelQuantization = "4bit" | "8bit" | "bf16";
 export type NoiseSuppression = "off" | "low" | "medium" | "high";
 export type CorrectionProvider = "openai" | "gemini" | "local";
@@ -208,6 +208,7 @@ export interface ModelProgress {
 }
 
 export interface GpuDiagnostics {
+  speechCppSupported?: boolean;
   status: "available" | "unavailable" | "unsupported";
   adapterName: string | null;
   driverVersion: string | null;

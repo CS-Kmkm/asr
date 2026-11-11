@@ -1,0 +1,15 @@
+{
+  "scope": "Actual pinned archive atomically extracted into absent runtime directory; archive and one model preseeded from verified local artifacts to avoid redundant download. Worker JSONL dispatcher load/transcribe/health/shutdown, not GUI paste.",
+  "runtime_files_verified": true,
+  "matches_baseline_text": true,
+  "health": {
+    "backend": "speech-cpp",
+    "loaded": true,
+    "device": "vulkan",
+    "computeType": "Q8_0",
+    "deviceName": "NVIDIA GeForce RTX 3060"
+  },
+  "model_sha256": "cd5f60b2f1c411404b83fca4a65e3ce30a26d9e951b6a346529e65f22758afeb",
+  "archive_sha256": "a8fe0e4b4f463c460e7ace9d38c363bec08b254cac5a7f764b7967af35d4fa1a",
+  "shutdown_cleared_loaded": true
+}

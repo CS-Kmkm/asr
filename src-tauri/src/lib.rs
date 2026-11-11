@@ -82,6 +82,10 @@ pub(crate) fn model_identity(settings: &Settings) -> (Option<String>, String) {
             Some(custom_model.unwrap_or("microsoft/VibeVoice-ASR-HF").into()),
             "VibeVoice requires a CUDA GPU; downloads from Hugging Face on first load.".into(),
         ),
+        "speech-cpp" => (
+            Some(format!("speech.cpp:{}:Q8_0", custom_model.unwrap_or("haas-ja-v1.0"))),
+            "Japanese only. speech.cpp uses Vulkan, with Q8_0 weights and CPU decoding. The runtime and model download on first load.".into(),
+        ),
         "openai-compatible" => (
             Some(format!(
                 "openai-compatible:{}",
@@ -193,6 +197,7 @@ pub(crate) fn worker_command_with_speech_key(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .or_else(|| (settings.asr_backend == "speech-cpp").then_some("haas-ja-v1.0"))
     {
         command.env.push(("ASR_MODEL_ID".into(), model_id.into()));
     }
@@ -1445,6 +1450,7 @@ async fn initialize_model_runtime(app: AppHandle, settings: Settings) {
         let diagnostics = tauri::async_runtime::spawn_blocking(commands::probe_gpu_diagnostics)
             .await
             .unwrap_or_else(|_| GpuDiagnostics {
+                speech_cpp_supported: crate::types::SPEECH_CPP_SUPPORTED,
                 status: "unavailable".into(),
                 adapter_name: None,
                 driver_version: None,

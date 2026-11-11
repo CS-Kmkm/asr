@@ -187,7 +187,10 @@ fn capture_config(settings: &Settings) -> CaptureConfig {
         device_id: settings.microphone_id.clone(),
         // Whisper consumes 16 kHz internally. Avoid a larger intermediate WAV
         // and a second resampling pass for that backend.
-        target_sample_rate: if settings.asr_backend == "faster-whisper" {
+        target_sample_rate: if matches!(
+            settings.asr_backend.as_str(),
+            "faster-whisper" | "speech-cpp"
+        ) {
             16_000
         } else {
             crate::audio::TARGET_SAMPLE_RATE
@@ -3791,6 +3794,7 @@ pub(crate) fn probe_gpu_diagnostics() -> GpuDiagnostics {
             if values.len() == 3 {
                 let memory = values[2].parse::<u64>().ok();
                 return GpuDiagnostics {
+                    speech_cpp_supported: crate::types::SPEECH_CPP_SUPPORTED,
                     status: "available".into(),
                     adapter_name: Some(values[0].into()),
                     driver_version: Some(values[1].into()),
@@ -3806,6 +3810,7 @@ pub(crate) fn probe_gpu_diagnostics() -> GpuDiagnostics {
         }
     }
     GpuDiagnostics {
+        speech_cpp_supported: crate::types::SPEECH_CPP_SUPPORTED,
         status: "unavailable".into(),
         adapter_name: None,
         driver_version: None,

@@ -1760,6 +1760,7 @@ fn only_recordings_fall_back_to_the_default_microphone() {
 fn capture_rate_matches_the_local_decoder() {
     for (backend, rate) in [
         ("faster-whisper", 16_000),
+        ("speech-cpp", 16_000),
         ("vibevoice", 24_000),
         ("openai-compatible", 24_000),
     ] {

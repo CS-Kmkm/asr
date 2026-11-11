@@ -351,6 +351,7 @@ export async function runGpuDiagnostics(): Promise<GpuDiagnostics> {
   if (!inTauri) {
     return {
       status: "unsupported",
+      speechCppSupported: false,
       adapterName: null,
       driverVersion: null,
       memoryTotalMb: null,

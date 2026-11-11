@@ -1,7 +1,7 @@
 # Local Voice Input
 
 Privacy-first Windows voice input built with Tauri, Rust, React, and a persistent
-Python ASR worker (VibeVoice, faster-whisper, or an OpenAI-compatible API).
+Python ASR worker (VibeVoice, faster-whisper, speech.cpp, or an OpenAI-compatible API).
 
 ## Current workflow
 
@@ -10,7 +10,7 @@ again to stop. Settingsの「押している間だけ録音」をモード別に
 短い押下は無視します。開始・停止のタイミングはWindowsのキー通知に依存し、200ミリ秒の境界は厳密ではありません。
 準備中に離した場合は録音を取り消します。既定は従来のtoggleです。待機録音・停止後の追加録音は行いません。
 押下中は、ショートカットやhold設定の変更を保存できません。
-The Windows capture backend converts input to a temporary 16 kHz (faster-whisper) or 24 kHz
+The Windows capture backend converts input to a temporary 16 kHz (faster-whisper or speech-cpp) or 24 kHz
 mono PCM WAV, and sends it to the persistent JSONL worker. While you speak,
 partial text appears only in the recording overlay. After transcription and any
 AI correction, the final text is pasted once into the captured target with the
@@ -200,8 +200,28 @@ when you are done.
 
 ## Backends
 
-Three ASR backends are supported. The backend is selected via the `--backend`
+Four ASR backends are supported. The backend is selected via the `--backend`
 argument to the worker or the `ASR_WORKER_BACKEND` environment variable.
+
+Haas-ja-v1.0／Parakeet Japaneseはモデル画面の「日本語モデル（Vulkan）」から選択できます。
+Windows x64用のランタイムと固定Q8_0重みを初回ロード時に取得し、アプリがサーバーの起動・終了を管理します。
+日本語専用で、既定のWhisperは変更していません。
+導入要件・比較結果・制限は[日本語モデル比較](docs/japanese_model_comparison.md)を参照してください。
+
+### speech-cpp (Japanese, Windows x64/Vulkan)
+
+今回の導入範囲はWindowsネイティブです。Haas／ParakeetはVulkan経路で利用し、
+WSL・Docker・NeMoの導入は不要です。追加評価と標準モデルの選定は後回しにし、Whisperの既定は維持します。
+
+モデル画面で「日本語モデル（Vulkan）」を選び、Haas-ja-v1.0またはParakeet Japaneseを選んで
+「モデルを読み込む」を押します。アプリがローカルサーバーを管理し、固定したランタイムと
+Q8_0重みをSHA256で検証します（初回取得は約690 MB）。Windows x64とVulkanが必要で、
+非対応環境では選択できません。日本語専用で、エンコーダーはVulkan、TDTデコーダーはCPUを使います。
+CTCは未対応です。Whisperの既定モデルと読み込み形式は変更しません。
+
+JSONLワーカーでは `--backend speech-cpp` と、`ASR_MODEL_ID=haas-ja-v1.0` または
+`ASR_MODEL_ID=parakeet-tdt_ctc-0.6b-ja` を指定します。
+詳細は[導入方法・既存の比較記録・制限](docs/japanese_model_comparison.md)を参照してください。
 
 ### faster-whisper (default, CPU-capable)
 
@@ -657,9 +677,10 @@ Full usage and Phase 0 gate criteria are documented in
   and code-editor fields) receive one unverified paste, and live text insertion
   in them may keep only the first fragment.
 - Elevated applications, password controls, and secure controls are not forced.
-- Model download progress is displayed during preparation. Resuming interrupted
-  downloads and checksum verification remain future model management work;
-  Transformers manages the current cache download.
+- Model download progress is displayed during preparation. speech-cpp verifies
+  its pinned runtime/model SHA256; its counters are per artifact. General model
+  management and resumable downloads remain future work. Transformers and
+  Hugging Face manage the other backend caches.
 - The default shortcut is registered at startup, and persisted custom shortcuts
   are re-registered on launch. If another app holds a saved hotkey, the app
   names the action that stays unavailable; saving other settings still works,
