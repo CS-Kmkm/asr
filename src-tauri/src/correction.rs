@@ -3,6 +3,7 @@ mod transport;
 use budget::OutputBudget;
 pub(crate) use transport::prewarm_connection;
 mod fact_check;
+mod polarity;
 #[cfg(not(test))]
 use fact_check::accept_provider_correction;
 #[cfg(test)]
@@ -117,6 +118,8 @@ pub(crate) enum ProtectedContentKind {
     Url,
     Code,
     Uncertainty,
+    Negation,
+    Question,
 }
 
 impl ProtectedContentKind {
@@ -127,6 +130,8 @@ impl ProtectedContentKind {
             Self::Url => "protected_url_changed",
             Self::Code => "protected_code_changed",
             Self::Uncertainty => "protected_uncertainty_changed",
+            Self::Negation => "protected_negation_changed",
+            Self::Question => "protected_question_changed",
         }
     }
 }
