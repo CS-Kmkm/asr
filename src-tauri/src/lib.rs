@@ -1751,6 +1751,8 @@ pub fn run() {
             commands::list_dictionary_candidates,
             commands::confirm_dictionary_candidate,
             commands::reject_dictionary_candidate,
+            commands::propose_dictionary_candidate_from_edit,
+            commands::delete_learned_personalization,
             commands::copy_history_item,
             commands::copy_to_clipboard,
             commands::get_ask_answer,

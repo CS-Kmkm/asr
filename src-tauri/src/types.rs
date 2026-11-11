@@ -217,6 +217,11 @@ pub struct Settings {
     pub custom_models: Vec<CustomModel>,
     #[serde(default)]
     pub personalization_enabled: bool,
+    /// Opt-in (Issue #85): a History edit the user submits may propose a
+    /// preferred-spelling suggestion. Off by default; turning it off deletes
+    /// pending suggestions from edits. Nothing is learned without a submit.
+    #[serde(default)]
+    pub personalization_learning: bool,
     #[serde(default)]
     pub global_style_profile: Option<StyleProfile>,
     #[serde(default)]
@@ -492,6 +497,7 @@ impl Default for Settings {
             correction_improve_clarity: true,
             custom_models: Vec::new(),
             personalization_enabled: false,
+            personalization_learning: false,
             global_style_profile: None,
             scoped_style_profiles: Vec::new(),
         }
@@ -621,6 +627,30 @@ pub struct DictionaryEntry {
     pub app_scope: Option<String>,
     pub source: String,
     pub created_at: String,
+    /// Modes whose AI text step uses this entry; empty means every mode.
+    #[serde(default)]
+    pub modes: Vec<String>,
+}
+
+/// Text modes an entry can be limited to. ASR hints ignore the limit,
+/// because recognition runs before automatic voice routing picks a mode.
+pub const DICTIONARY_MODES: [&str; 3] = ["dictate", "edit", "ask"];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DictionaryMode {
+    Dictate,
+    Edit,
+    Ask,
+}
+
+impl DictionaryMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dictate => "dictate",
+            Self::Edit => "edit",
+            Self::Ask => "ask",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -646,6 +676,19 @@ pub struct DictionaryEntryInput {
     pub priority: i64,
     #[serde(default)]
     pub app_scope: Option<String>,
+    /// Empty means every mode.
+    #[serde(default)]
+    pub modes: Vec<String>,
+}
+
+/// Where a confirmed suggestion applies; chosen by the user at confirmation.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateScopeInput {
+    #[serde(default)]
+    pub app_scope: Option<String>,
+    #[serde(default)]
+    pub modes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -659,6 +702,9 @@ pub struct DictionaryCandidate {
     pub confidence: f64,
     pub history_id: Option<i64>,
     pub created_at: String,
+    /// `correction` (an AI correction changed a spelling) or `user_edit`
+    /// (the user submitted an edited History text).
+    pub origin: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

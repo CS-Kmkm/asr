@@ -19,6 +19,8 @@ import {
   retryHistoryItem,
   reprocessHistoryText,
   confirmDictionaryCandidate,
+  deleteLearnedPersonalization,
+  proposeDictionaryCandidateFromEdit,
   importDictionaryCsv,
   listDictionaryCandidates,
   rejectDictionaryCandidate,
@@ -43,6 +45,7 @@ import type {
   AsrBackend,
   CustomModel,
   DictionaryEntry,
+  CandidateScope,
   DictionaryCandidate,
   DictionaryEntryInput,
   GpuDiagnostics,
@@ -765,11 +768,28 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
     }
   }
 
-  async function confirmCandidate(id: number) {
+  async function confirmCandidate(id: number, scope?: CandidateScope) {
     try {
-      await confirmDictionaryCandidate(id);
+      await confirmDictionaryCandidate(id, scope);
       await refreshDictionary();
       showNotice(t("Dictionary candidate confirmed."), "success");
+    } catch (error) { showNotice(String(error), "error"); }
+  }
+
+  async function teachSpelling(id: number, editedText: string): Promise<boolean> {
+    try {
+      const proposal = await proposeDictionaryCandidateFromEdit(id, editedText);
+      if (proposal.outcome === "proposed") showNotice(t("Suggestion added to Dictionary for review."), "success");
+      else showNotice(t(proposal.outcome === "already_known" ? "This spelling is already known or was decided before." : "No single word or term changed, so nothing was suggested."), "info");
+      return proposal.outcome === "proposed";
+    } catch (error) { showNotice(String(error), "error"); return false; }
+  }
+
+  async function deleteLearned() {
+    try {
+      await deleteLearnedPersonalization();
+      await refreshDictionary();
+      showNotice(t("Learned data deleted."), "success");
     } catch (error) { showNotice(String(error), "error"); }
   }
 
@@ -926,6 +946,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             onAudioError={() => void reportHistoryAudioFailure()}
             retryActive={state.operation === "retry" && (state.phase === "processing" || state.phase === "injecting")}
             onCancelRetry={() => void cancelRecording()}
+            onTeach={teachSpelling}
           />
         )}
 
@@ -937,7 +958,10 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
             onUpdate={updateDictionary}
             onDelete={(id) => void removeDictionary(id)}
             onImport={importDictionary}
-            onConfirmCandidate={(id) => void confirmCandidate(id)}
+            onConfirmCandidate={(id, scope) => void confirmCandidate(id, scope)}
+            learning={settings.personalizationLearning}
+            onToggleLearning={(personalizationLearning) => void saveSettings({ personalizationLearning }).then(() => refreshDictionary()).catch((error) => showNotice(String(error), "error"))}
+            onDeleteLearned={() => void deleteLearned()}
             onRejectCandidate={(id) => void rejectCandidate(id)}
           />
         )}

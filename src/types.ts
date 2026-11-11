@@ -98,6 +98,8 @@ export interface Settings {
   correctionImproveClarity: boolean;
   customModels: CustomModel[];
   personalizationEnabled: boolean;
+  /** Opt-in: a submitted History edit may propose a spelling suggestion. */
+  personalizationLearning: boolean;
   globalStyleProfile: StyleProfile | null;
   scopedStyleProfiles: ScopedStyleProfile[];
   /** Live preview only: greedy (single-candidate) decoding on faster-whisper. */
@@ -282,8 +284,23 @@ export interface DictionaryEntry {
   aliases: string[];
   priority: number;
   appScope: string | null;
-  source: "manual" | "auto";
+  source: "manual" | "auto" | "learned";
   createdAt: string;
+  /** Modes whose AI text step uses the entry; empty or missing means every mode. */
+  modes?: DictionaryMode[];
+}
+
+export type DictionaryMode = "dictate" | "edit" | "ask";
+export const dictionaryModes: DictionaryMode[] = ["dictate", "edit", "ask"];
+
+export interface CandidateScope {
+  appScope: string | null;
+  modes: DictionaryMode[];
+}
+
+export interface EditProposal {
+  outcome: "proposed" | "no_term_change" | "already_known";
+  candidate: DictionaryCandidate | null;
 }
 
 export interface DictionaryEntryInput {
@@ -293,6 +310,7 @@ export interface DictionaryEntryInput {
   aliases?: string[];
   priority?: number;
   appScope?: string | null;
+  modes?: DictionaryMode[];
 }
 
 export interface DictionaryCandidate {
@@ -303,6 +321,8 @@ export interface DictionaryCandidate {
   confidence: number;
   historyId: number | null;
   createdAt: string;
+  /** `user_edit`: from an edit the user submitted; `correction`: from an AI correction. */
+  origin?: "correction" | "user_edit";
 }
 
 /** Unvalidated, in-progress Ask generation shown only in the answer panel; `active: false` withdraws it. */

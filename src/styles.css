@@ -638,3 +638,8 @@ details[open] > summary { color: var(--text); }
 .model-facts dd { text-align: right; overflow-wrap: anywhere; min-width: 0; }
 .model-catalog-list { list-style: none; padding: 0; margin: 8px 0 0; display: grid; gap: 10px; }
 .model-catalog-list p { margin: 4px 0 0; color: var(--text-muted); }
+
+.mode-choice { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; border: 0; padding: 0; margin: 0; }
+.mode-choice legend { float: left; margin-right: 0.5rem; font-weight: 600; }
+.candidate-scope { margin-top: 0.25rem; }
+.candidate-scope > label { display: inline-flex; gap: 0.5rem; align-items: center; margin-top: 0.25rem; }

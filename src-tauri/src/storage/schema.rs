@@ -40,7 +40,28 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         apply: migrate_v4_take_spans,
         min_reader_version: 1,
     },
+    Migration {
+        apply: migrate_v5_dictionary_learning,
+        min_reader_version: 1,
+    },
 ];
+
+/// Version 5 (Issue #85): optional per-entry text modes (NULL = every mode)
+/// and the origin of a suggestion. Older builds ignore both columns, so an
+/// entry limited to some modes applies to every mode there and a learned
+/// entry reads as auto-added.
+fn migrate_v5_dictionary_learning(connection: &Connection) -> Result<(), StorageError> {
+    if !column_exists(connection, "dictionary_entries", "modes")? {
+        connection.execute("ALTER TABLE dictionary_entries ADD COLUMN modes TEXT", [])?;
+    }
+    if !column_exists(connection, "dictionary_candidates", "origin")? {
+        connection.execute(
+            "ALTER TABLE dictionary_candidates ADD COLUMN origin TEXT NOT NULL DEFAULT 'correction'",
+            [],
+        )?;
+    }
+    Ok(())
+}
 
 /// Version 4: one content-free row per recording take (spans and a terminal
 /// outcome under a random take id). Kept apart from `metrics` so historical

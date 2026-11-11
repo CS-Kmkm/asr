@@ -13,7 +13,7 @@ import type {
   Settings,
   SettingsSnapshot,
   RecordingResult,
-  DictionaryCandidate, DictionaryEntry,
+  CandidateScope, DictionaryCandidate, DictionaryEntry, EditProposal,
   DictionaryEntryInput,
   HistoryFilter,
   HistoryAudioPayload,
@@ -126,6 +126,7 @@ export const defaultSettings: Settings = {
   correctionImproveClarity: true,
   customModels: [],
   personalizationEnabled: false,
+  personalizationLearning: false,
   globalStyleProfile: null,
   scopedStyleProfiles: [],
 };
@@ -377,7 +378,7 @@ export async function getGpuDiagnostics(): Promise<GpuDiagnostics> {
   return invoke("get_gpu_diagnostics");
 }
 
-export async function listDictionary(query?: string, source?: "manual" | "auto" | "all"): Promise<DictionaryEntry[]> {
+export async function listDictionary(query?: string, source?: "manual" | "auto" | "learned" | "all"): Promise<DictionaryEntry[]> {
   if (!inTauri) return [];
   return invoke("list_dictionary", { query: query || null, source: source === "all" ? null : source || null });
 }
@@ -394,6 +395,7 @@ export async function addDictionaryEntry(entry: DictionaryEntryInput): Promise<D
       appScope: entry.appScope ?? null,
       source: "manual",
       createdAt: new Date().toISOString(),
+      modes: entry.modes ?? [],
     };
   }
   return invoke("add_dictionary_entry", { entry });
@@ -414,9 +416,21 @@ export async function listDictionaryCandidates(): Promise<DictionaryCandidate[]>
   return invoke("list_dictionary_candidates");
 }
 
-export async function confirmDictionaryCandidate(id: number): Promise<DictionaryEntry> {
+export async function confirmDictionaryCandidate(id: number, scope?: CandidateScope): Promise<DictionaryEntry> {
   if (!inTauri) throw new Error("Dictionary candidates require the desktop application.");
-  return invoke("confirm_dictionary_candidate", { id });
+  return invoke("confirm_dictionary_candidate", { id, scope: scope ?? null });
+}
+
+/** Submits the user's edit of a History dictation; only the changed term pair is kept. */
+export async function proposeDictionaryCandidateFromEdit(historyId: number, editedText: string): Promise<EditProposal> {
+  if (!inTauri) throw new Error("Learning from edits requires the desktop application.");
+  return invoke("propose_dictionary_candidate_from_edit", { historyId, editedText });
+}
+
+/** Deletes suggestions from edits and learned entries; returns the number of deleted rows. */
+export async function deleteLearnedPersonalization(): Promise<number> {
+  if (!inTauri) return 0;
+  return invoke("delete_learned_personalization");
 }
 
 export async function rejectDictionaryCandidate(id: number): Promise<void> {

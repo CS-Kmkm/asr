@@ -1,4 +1,6 @@
 mod completion_queue;
+mod learning;
+pub use learning::EditProposal;
 mod history;
 mod history_audio;
 mod metrics;
@@ -310,14 +312,20 @@ fn purge_history(
             [now.to_rfc3339()],
         )?;
     }
+    // Suggestions from edits exist only while learning is on.
+    let learned = if settings.personalization_learning {
+        0
+    } else {
+        learning::delete_pending_edit_candidates(connection)?
+    };
     let cutoff = match HistoryCutoff::at(settings.history_retention, now) {
-        HistoryCutoff::KeepAll => return Ok(!removed.is_empty()),
+        HistoryCutoff::KeepAll => return Ok(!removed.is_empty() || learned > 0),
         HistoryCutoff::RemoveAll => None,
         HistoryCutoff::Before(cutoff) => Some(cutoff),
     };
     let candidates = purge_dictionary_candidates_before(connection, cutoff.as_deref())?;
     let metrics = purge_metrics_before(connection, cutoff.as_deref())?;
-    Ok(!removed.is_empty() || candidates > 0 || metrics > 0)
+    Ok(!removed.is_empty() || candidates > 0 || metrics > 0 || learned > 0)
 }
 
 /// Reads the stored settings while the caller holds the connection, so a
@@ -1658,9 +1666,12 @@ impl Storage {
         source: Option<&str>,
     ) -> Result<Vec<DictionaryEntry>, StorageError> {
         let source = source.filter(|value| !value.is_empty() && *value != "all");
-        if !matches!(source, None | Some("manual") | Some("auto")) {
+        if !matches!(
+            source,
+            None | Some("manual") | Some("auto") | Some("learned")
+        ) {
             return Err(StorageError::Validation(
-                "source must be manual or auto".into(),
+                "source must be manual, auto or learned".into(),
             ));
         }
         let query = query.unwrap_or("").trim().to_lowercase();
@@ -1683,30 +1694,62 @@ impl Storage {
             .collect())
     }
 
+    #[cfg(test)]
     pub fn add_dictionary_entry(
         &self,
         entry: &NewDictionaryEntry<'_>,
     ) -> Result<i64, StorageError> {
-        let connection = self.connection()?;
-        insert_dictionary_entry(&connection, entry, "manual", None)
+        self.add_dictionary_entry_with_modes(entry, &[])
     }
 
+    /// Adds a manual entry limited to `modes` (empty = every mode).
+    pub fn add_dictionary_entry_with_modes(
+        &self,
+        entry: &NewDictionaryEntry<'_>,
+        modes: &[String],
+    ) -> Result<i64, StorageError> {
+        let connection = self.connection()?;
+        insert_dictionary_entry(&connection, entry, "manual", None, modes)
+    }
+
+    #[cfg(test)]
+    /// Updates an entry and keeps its stored modes.
     pub fn update_dictionary_entry(
         &self,
         id: i64,
         entry: &NewDictionaryEntry<'_>,
     ) -> Result<bool, StorageError> {
+        self.update_dictionary_entry_in(id, entry, None)
+    }
+
+    /// Updates an entry and replaces its modes (empty = every mode).
+    pub fn update_dictionary_entry_with_modes(
+        &self,
+        id: i64,
+        entry: &NewDictionaryEntry<'_>,
+        modes: &[String],
+    ) -> Result<bool, StorageError> {
+        self.update_dictionary_entry_in(id, entry, Some(modes))
+    }
+
+    fn update_dictionary_entry_in(
+        &self,
+        id: i64,
+        entry: &NewDictionaryEntry<'_>,
+        modes: Option<&[String]>,
+    ) -> Result<bool, StorageError> {
         let connection = self.connection()?;
         let existing = read_dictionary_entries(&connection)?;
-        if !existing.iter().any(|current| current.id == id) {
+        let Some(current) = existing.iter().find(|current| current.id == id) else {
             return Ok(false);
-        }
+        };
         validate_dictionary_entry(entry)?;
         validate_dictionary_collisions(&existing, entry, Some(id))?;
+        let modes = learning::stored_modes(modes.unwrap_or(&current.modes))?;
         let scope = normalized_scope(entry.app_scope);
         Ok(connection.execute(
             "UPDATE dictionary_entries SET reading = ?1, surface = ?2, category = ?3, aliases = ?4,
-             priority = ?5, app_scope = ?6, updated_at = ?7 WHERE id = ?8",
+             priority = ?5, app_scope = ?6, updated_at = ?7, modes = ?9 WHERE id = ?8",
             params![
                 entry.reading.trim(),
                 entry.surface.trim(),
@@ -1718,7 +1761,8 @@ impl Storage {
                 entry.priority,
                 scope,
                 Utc::now().to_rfc3339(),
-                id
+                id,
+                modes
             ],
         )? > 0)
     }
@@ -1810,11 +1854,12 @@ impl Storage {
                 app_scope: normalized_scope(entry.app_scope),
                 source: "manual".into(),
                 created_at: String::new(),
+                modes: Vec::new(),
             });
         }
         let transaction = connection.unchecked_transaction()?;
         for value in &values {
-            insert_dictionary_entry(&transaction, &value.as_new(), "manual", None)?;
+            insert_dictionary_entry(&transaction, &value.as_new(), "manual", None, &[])?;
         }
         transaction.commit()?;
         Ok(values.len())
@@ -1883,7 +1928,7 @@ impl Storage {
         // Like History, expired candidate text is purged before it is read.
         self.apply_history_policy(&settings)?;
         let connection = self.connection()?;
-        let mut statement = connection.prepare("SELECT id, original_span, preferred_span, confidence, history_id, created_at FROM dictionary_candidates ORDER BY created_at DESC")?;
+        let mut statement = connection.prepare("SELECT id, original_span, preferred_span, confidence, history_id, created_at, origin FROM dictionary_candidates ORDER BY created_at DESC")?;
         let rows = statement.query_map([], |row| {
             Ok(DictionaryCandidate {
                 id: row.get(0)?,
@@ -1892,25 +1937,48 @@ impl Storage {
                 confidence: row.get(3)?,
                 history_id: row.get(4)?,
                 created_at: row.get(5)?,
+                origin: row.get(6)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    #[cfg(test)]
     pub fn confirm_dictionary_candidate(
         &self,
         id: i64,
     ) -> Result<Option<DictionaryEntry>, StorageError> {
+        self.confirm_dictionary_candidate_in(id, &crate::types::CandidateScopeInput::default())
+    }
+
+    /// Confirms a suggestion into the scope the user chose. A suggestion from
+    /// the user's own edit becomes a `learned` entry, one from an AI
+    /// correction an `auto` entry.
+    pub fn confirm_dictionary_candidate_in(
+        &self,
+        id: i64,
+        scope: &crate::types::CandidateScopeInput,
+    ) -> Result<Option<DictionaryEntry>, StorageError> {
+        crate::personalization::validate_dictionary_scope(
+            scope.app_scope.as_deref().map(str::trim),
+        )
+        .map_err(|error| StorageError::Validation(error.into()))?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         let candidate = transaction
             .query_row(
-                "SELECT original_span, preferred_span FROM dictionary_candidates WHERE id = ?1",
+                "SELECT original_span, preferred_span, origin FROM dictionary_candidates WHERE id = ?1",
                 [id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((reading, surface)) = candidate else {
+        let Some((reading, surface, origin)) = candidate else {
             return Ok(None);
         };
         let aliases = Vec::new();
@@ -1920,7 +1988,12 @@ impl Storage {
             category: None,
             aliases: &aliases,
             priority: 0,
-            app_scope: None,
+            app_scope: scope.app_scope.as_deref(),
+        };
+        let source = if origin == learning::USER_EDIT_ORIGIN {
+            learning::LEARNED_SOURCE
+        } else {
+            "auto"
         };
         // A candidate proposed before a matching entry existed resolves to
         // that entry unchanged instead of creating a duplicate or failing.
@@ -1928,7 +2001,7 @@ impl Storage {
         let match_id = represented_entry(&existing, &surface).map(|item| item.id);
         let result_id = match match_id {
             Some(id) => id,
-            None => insert_dictionary_entry(&transaction, &entry, "auto", None)?,
+            None => insert_dictionary_entry(&transaction, &entry, source, None, &scope.modes)?,
         };
         transaction.execute("INSERT OR IGNORE INTO dictionary_candidate_decisions(original_span, preferred_span, created_at) VALUES (?1, ?2, ?3)", params![reading, surface, Utc::now().to_rfc3339()])?;
         transaction.execute(
@@ -2030,16 +2103,20 @@ impl Storage {
         Ok((!terms.is_empty()).then(|| terms.join("\n")))
     }
 
+    /// Terms for one text mode's AI step: app/category scope and the entry's
+    /// modes must both match.
     pub fn dictionary_correction_terms(
         &self,
         transcript: &str,
         context: Option<&crate::types::AppContext>,
+        mode: crate::types::DictionaryMode,
     ) -> Result<Vec<crate::dictionary::CorrectionTerm>, StorageError> {
         let transcript = crate::dictionary::fold(transcript);
         Ok(self
             .list_dictionary()?
             .into_iter()
             .filter(|entry| scope_matches(entry.app_scope.as_deref(), context))
+            .filter(|entry| learning::mode_matches(&entry.modes, mode))
             .filter_map(|entry| {
                 let surface = entry.surface.trim();
                 let surface_folded = crate::dictionary::fold(surface);
@@ -2072,7 +2149,11 @@ impl Storage {
         context: Option<&crate::types::AppContext>,
     ) -> Result<Vec<String>, StorageError> {
         Ok(self
-            .dictionary_correction_terms(transcript, context)?
+            .dictionary_correction_terms(
+                transcript,
+                context,
+                crate::types::DictionaryMode::Dictate,
+            )?
             .iter()
             .map(|term| term.prompt_hint())
             .collect())
@@ -2300,7 +2381,7 @@ fn read_dictionary_entries<C: std::ops::Deref<Target = Connection>>(
     connection: &C,
 ) -> Result<Vec<DictionaryEntry>, StorageError> {
     let mut statement = connection.prepare(
-        "SELECT id, reading, surface, category, aliases, priority, app_scope, source, created_at
+        "SELECT id, reading, surface, category, aliases, priority, app_scope, source, created_at, modes
          FROM dictionary_entries ORDER BY priority DESC, surface ASC",
     )?;
     let rows = statement.query_map([], |row| {
@@ -2314,11 +2395,22 @@ fn read_dictionary_entries<C: std::ops::Deref<Target = Connection>>(
             row.get::<_, Option<String>>(6)?,
             row.get::<_, String>(7)?,
             row.get::<_, String>(8)?,
+            row.get::<_, Option<String>>(9)?,
         ))
     })?;
     rows.map(|row| {
-        let (id, reading, surface, category, aliases, priority, app_scope, source, created_at) =
-            row?;
+        let (
+            id,
+            reading,
+            surface,
+            category,
+            aliases,
+            priority,
+            app_scope,
+            source,
+            created_at,
+            modes,
+        ) = row?;
         Ok(DictionaryEntry {
             id,
             reading,
@@ -2329,6 +2421,7 @@ fn read_dictionary_entries<C: std::ops::Deref<Target = Connection>>(
             app_scope: normalized_scope(app_scope.as_deref()),
             source,
             created_at,
+            modes: learning::read_modes(modes.as_deref()),
         })
     })
     .collect()
@@ -2339,14 +2432,16 @@ fn insert_dictionary_entry<C: std::ops::Deref<Target = Connection>>(
     entry: &NewDictionaryEntry<'_>,
     source: &str,
     excluded_id: Option<i64>,
+    modes: &[String],
 ) -> Result<i64, StorageError> {
     validate_dictionary_entry(entry)?;
     validate_dictionary_collisions(&read_dictionary_entries(connection)?, entry, excluded_id)?;
+    let modes = learning::stored_modes(modes)?;
     let now = Utc::now().to_rfc3339();
     connection.execute(
-        "INSERT INTO dictionary_entries(reading, surface, category, aliases, priority, app_scope, source, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-        params![entry.reading.trim(), entry.surface.trim(), entry.category.map(str::trim).filter(|value| !value.is_empty()), serde_json::to_string(entry.aliases)?, entry.priority, normalized_scope(entry.app_scope), source, now],
+        "INSERT INTO dictionary_entries(reading, surface, category, aliases, priority, app_scope, source, created_at, updated_at, modes)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)",
+        params![entry.reading.trim(), entry.surface.trim(), entry.category.map(str::trim).filter(|value| !value.is_empty()), serde_json::to_string(entry.aliases)?, entry.priority, normalized_scope(entry.app_scope), source, now, modes],
     )?;
     Ok(connection.last_insert_rowid())
 }
@@ -6036,7 +6131,13 @@ mod tests {
         let settings = Settings::default();
         let (cancel_tx, cancel) = tokio::sync::watch::channel(false);
         let resolution = crate::pipeline::personalization::resolve(
-            &storage, &settings, None, "spoken", None, cancel,
+            &storage,
+            &settings,
+            None,
+            crate::types::DictionaryMode::Dictate,
+            "spoken",
+            None,
+            cancel,
         );
         tokio::pin!(resolution);
         tokio::select! { biased; _ = &mut resolution => panic!("read completed while connection was locked"), _ = tokio::task::yield_now() => {} }
@@ -6388,6 +6489,7 @@ mod tests {
                 app_scope: Some("app:code".into()),
                 source: "manual".into(),
                 created_at: storage.list_dictionary().unwrap()[0].created_at.clone(),
+                modes: Vec::new(),
             }]
         );
     }
