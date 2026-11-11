@@ -213,3 +213,32 @@ class SpeechCppTests(IsolatedWorkerTestCase):
         with self.assertRaises(BackendError) as caught:
             backend.transcribe(Path('absent.wav'), None, 'ja')
         self.assertEqual(caught.exception.code, 'speech_cpp_unavailable')
+
+
+class SharedCatalogTests(IsolatedWorkerTestCase):
+    """The UI/Rust catalog must describe exactly the artifacts the worker pins."""
+
+    def test_catalog_matches_pinned_artifacts(self):
+        import json
+        from asr_worker import speech_cpp
+
+        catalog_path = Path(__file__).resolve().parents[2] / 'src' / 'asr-model-catalog.json'
+        catalog = json.loads(catalog_path.read_text(encoding='utf-8'))
+        runtime = catalog['runtimes']['speech-cpp']
+        self.assertEqual(runtime['version'], speech_cpp.VERSION)
+        self.assertEqual(runtime['archive'], speech_cpp.ARCHIVE)
+        self.assertEqual(runtime['archiveSha256'], speech_cpp.ARCHIVE_SHA256)
+        entries = {
+            entry['modelId']: entry for entry in catalog['models']
+            if entry['backend'] == 'speech-cpp' and entry['availability'] == 'available'
+        }
+        self.assertEqual(set(entries), set(speech_cpp.MODELS))
+        for model_id, pinned in speech_cpp.MODELS.items():
+            entry = entries[model_id]
+            self.assertEqual(entry['source'], {
+                'repo': pinned['repo'], 'revision': pinned['revision'], 'file': pinned['file'],
+                'sha256': pinned['sha256'], 'sizeBytes': pinned['size'],
+            })
+            self.assertEqual(entry['license'], pinned['license'])
+            self.assertEqual(entry['devices'], ['vulkan'])
+            self.assertEqual(entry['languageScope'], 'japanese_only')

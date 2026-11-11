@@ -5,6 +5,7 @@ import type {
   GpuDiagnostics,
   StorageDiagnostics,
   WorkerHealth,
+  ManagedModelCache,
   CredentialProvider,
   CredentialStatus,
   HistoryItem,
@@ -29,6 +30,16 @@ export async function getStorageDiagnostics(): Promise<StorageDiagnostics | null
 export async function getWorkerHealth(): Promise<WorkerHealth | null> {
   if (!inTauri) return null;
   return invoke("get_worker_health");
+}
+
+export async function getAsrModelCacheStatus(): Promise<ManagedModelCache[]> {
+  if (!inTauri) return [];
+  return invoke("get_asr_model_cache_status");
+}
+
+export async function deleteAsrModelCache(modelId: string): Promise<ManagedModelCache[]> {
+  if (!inTauri) throw new Error("Model files can be removed only in the desktop app.");
+  return invoke("delete_asr_model_cache", { modelId });
 }
 
 export async function getProviderCredentials(): Promise<CredentialStatus[]> {

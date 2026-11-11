@@ -11,6 +11,8 @@ import type {
 } from "../types";
 import { translateAppMessage, useI18n } from "../i18n";
 import type { MessageKey } from "../i18n";
+import { ModelCatalogOverview, ModelDetails } from "../components/ModelDetails";
+import { modelCatalog } from "../modelCatalog";
 
 type ModelConfiguration = Pick<
   Settings,
@@ -22,6 +24,10 @@ type ModelConfiguration = Pick<
   | "apiKeyEnvVar"
 >;
 const ADDITIONAL_MODEL_VALUE = "__additional_model__";
+const japaneseModels = modelCatalog.models.filter(
+  (model) => model.availability === "available" && model.backend === "speech-cpp" && model.modelId,
+);
+const defaultJapaneseModelId = japaneseModels[0]?.modelId ?? "haas-ja-v1.0";
 
 function builtinValue(backend: AsrBackend) {
   return `builtin:${backend}`;
@@ -134,7 +140,7 @@ export function ModelsPage({
       : !japaneseLocaleSupported ? t("Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.")
       : t("Japanese only. Vulkan encoder and CPU decoder; Q8_0. Downloads about 690 MB on first load."),
   };
-  const japaneseModelId = additionalModelId === "parakeet-tdt_ctc-0.6b-ja" ? additionalModelId : "haas-ja-v1.0";
+  const japaneseModelId = japaneseModels.some((entry) => entry.modelId === additionalModelId) ? additionalModelId : defaultJapaneseModelId;
   const selectedValue = additionalModelId && backend !== "speech-cpp"
     ? customModelValue({ asrBackend: backend, modelId: additionalModelId })
     : builtinValue(backend);
@@ -251,8 +257,7 @@ export function ModelsPage({
           ) : backend === "speech-cpp" ? (
             <SettingRow title={t("Japanese model")} detail={t("Haas: Apache-2.0. Parakeet Japanese: CC-BY-4.0. Both use greedy TDT; CTC is unavailable in this runtime.")}
               control={<select aria-label={t("Japanese model")} value={japaneseModelId} onChange={(event) => setAdditionalModelId(event.target.value)}>
-                <option value="haas-ja-v1.0">Haas-ja-v1.0</option>
-                <option value="parakeet-tdt_ctc-0.6b-ja">Parakeet TDT-CTC 0.6B Japanese (TDT)</option>
+                {japaneseModels.map((entry) => <option key={entry.id} value={entry.modelId ?? ""}>{entry.displayName}</option>)}
               </select>} />
           ) : (
             <SettingRow
@@ -297,6 +302,7 @@ export function ModelsPage({
         </div>}
         </div>
         {progress && <ModelProgressBar progress={progress} />}
+        <ModelDetails backend={backend} modelId={backend === "speech-cpp" ? japaneseModelId : additionalModelId || null} model={model} />
       </article>
 
       <details className="panel span-2 utility-disclosure"><summary>{t("GPU")}</summary>
@@ -308,6 +314,8 @@ export function ModelsPage({
           {t("Run diagnostics")}
         </button>
       </details>
+
+      <ModelCatalogOverview />
 
       {modalOpen && (
         <dialog ref={modalRef} className="model-dialog" aria-labelledby="additional-model-title"

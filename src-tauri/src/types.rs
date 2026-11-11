@@ -317,7 +317,6 @@ pub const ASR_BACKENDS: [&str; 5] = [
     "mock",
 ];
 pub const SPEECH_CPP_SUPPORTED: bool = cfg!(all(target_os = "windows", target_arch = "x86_64"));
-pub const SPEECH_CPP_MODEL_IDS: [&str; 2] = ["haas-ja-v1.0", "parakeet-tdt_ctc-0.6b-ja"];
 pub const CORRECTION_PROVIDERS: [&str; 3] = ["openai", "gemini", "local"];
 pub const CORRECTION_MODES: [&str; 2] = ["conservative", "intent_aware"];
 pub const OPENAI_REASONING_EFFORTS: [&str; 6] = ["none", "low", "medium", "high", "xhigh", "max"];

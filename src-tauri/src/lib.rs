@@ -14,6 +14,7 @@ mod injection;
 mod input_monitor;
 mod live_dictation;
 mod messages;
+mod model_catalog;
 mod personalization;
 mod pipeline;
 mod privacy;
@@ -1716,6 +1717,8 @@ pub fn run() {
             commands::get_gpu_diagnostics,
             commands::get_storage_diagnostics,
             commands::get_worker_health,
+            commands::model_cache::get_asr_model_cache_status,
+            commands::model_cache::delete_asr_model_cache,
             commands::credentials::get_provider_credentials,
             commands::credentials::update_provider_credential,
             commands::run_gpu_diagnostics,

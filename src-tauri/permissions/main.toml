@@ -5,6 +5,8 @@ commands.allow = [
     "get_provider_credentials",
     "update_provider_credential",
     "get_worker_health",
+    "get_asr_model_cache_status",
+    "delete_asr_model_cache",
     "get_storage_diagnostics",
     "open_diagnostics_folder",
     "list_audio_devices",
