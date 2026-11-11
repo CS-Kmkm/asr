@@ -21,9 +21,11 @@ const JA_NEGATIONS: [&str; 8] = [
     "なし",
 ];
 /// Phrases whose negative morphemes do not negate the statement: obligation
-/// (しなければならない = must), hedges (かもしれない), and spoken repair cues
-/// (Aじゃなくて B). They are masked before counting, longest first.
-const JA_NON_NEGATIONS: [&str; 22] = [
+/// (しなければならない = must), hedges (かもしれない), spoken repair cues
+/// (Aじゃなくて B), and affirmative adverbs built on なく (少なくとも = at
+/// least, 間もなく = soon). They are masked before counting, longest first
+/// where one contains another.
+const JA_NON_NEGATIONS: &[&str] = &[
     "なければなりません",
     "なければいけません",
     "なくてはなりません",
@@ -45,14 +47,28 @@ const JA_NON_NEGATIONS: [&str; 22] = [
     "じゃなく",
     "なくちゃ",
     "なきゃ",
+    "少なくとも",
+    "すくなくとも",
     "まもなく",
+    "間もなく",
+    "ほどなく",
+    "程なく",
+    "もれなく",
+    "漏れなく",
+    "くまなく",
+    "隈なく",
+    "何気なく",
+    "なにげなく",
+    "さりげなく",
 ];
 const EN_NEGATIONS: [&str; 10] = [
     "not", "never", "no", "none", "nothing", "nobody", "neither", "nor", "cannot", "without",
 ];
-/// A negation more than this many characters before a repair cue is not
-/// part of the repaired phrase.
-const REPAIR_REACH_CHARS: usize = 80;
+/// The most text a repaired negated predicate may carry after its negation
+/// before the repair cue: a kana auxiliary tail (ないでください) or a few
+/// English words (don't merge it, actually ...).
+const REPAIR_TAIL_KANA: usize = 6;
+const REPAIR_TAIL_WORDS: usize = 3;
 
 /// NFKC, lower case, typographic apostrophes as ASCII, and non-negating
 /// phrases replaced by `#` of the same byte length so offsets still line up
@@ -64,7 +80,7 @@ fn prepared(text: &str) -> (String, String) {
         .to_lowercase()
         .replace('\u{2019}', "'");
     let mut masked = normalized.clone();
-    for phrase in JA_NON_NEGATIONS {
+    for phrase in JA_NON_NEGATIONS.iter().copied() {
         masked = masked.replace(phrase, &"#".repeat(phrase.len()));
     }
     (normalized, masked)
@@ -119,17 +135,33 @@ fn english_words(text: &str) -> Vec<(usize, usize)> {
     words
 }
 
-/// Whether a later repair cue in the same sentence may replace this span.
+/// Whether a repair cue directly follows the negated predicate, so the repair
+/// replaces that predicate (行かない、いや行きます). Only the predicate's own
+/// tail may stand between them: kana auxiliaries or a few English words, with
+/// no clause break. A cue that repairs something later in the sentence
+/// (送らないで、会議は3時、いや4時) leaves the negation in force.
 fn repaired(text: &str, end: usize) -> bool {
     let tail = &text[end..];
     let Some((cue_at, _)) = find_repair_cue(tail) else {
         return false;
     };
-    let before = &tail[..cue_at];
-    before.chars().count() <= REPAIR_REACH_CHARS
-        && !before
-            .char_indices()
-            .any(|(index, character)| is_sentence_break_at(before, index, character))
+    let separator = |c: char| c.is_whitespace() || matches!(c, '、' | ',' | '，');
+    let between = tail[..cue_at].trim_matches(separator);
+    if between
+        .char_indices()
+        .any(|(index, c)| (separator(c) && c != ' ') || is_sentence_break_at(between, index, c))
+    {
+        return false;
+    }
+    let kana_tail = between.chars().count() <= REPAIR_TAIL_KANA
+        && between
+            .chars()
+            .all(|c| matches!(c, '\u{3041}'..='\u{3096}' | 'ー'));
+    let word_tail = between.split_whitespace().count() <= REPAIR_TAIL_WORDS
+        && between
+            .chars()
+            .all(|c| c.is_ascii_alphabetic() || c == ' ' || c == '\'');
+    kana_tail || word_tail
 }
 
 /// The output must keep every negation of the source and add none.
@@ -179,22 +211,35 @@ pub(super) fn negation_preserved(source: &str, output: &str, edits: FactEdits) -
 /// Japanese polite question endings, counted only where a sentence ends.
 const JA_QUESTION_ENDINGS: [&str; 4] = ["でしょうか", "ませんか", "ですか", "ますか"];
 
-fn is_question(text: &str) -> bool {
+/// The number of question sentences: sentences ending in `?`, or in a polite
+/// Japanese question ending (ですか) without a mark.
+fn question_count(text: &str) -> usize {
     let text = text.nfkc().collect::<String>();
-    text.contains('?')
-        || JA_QUESTION_ENDINGS.iter().any(|ending| {
-            text.match_indices(ending).any(|(at, _)| {
-                text[at + ending.len()..].chars().next().is_none_or(|next| {
-                    next.is_whitespace() || matches!(next, '。' | '.' | '!' | '」')
-                })
-            })
-        })
+    let mut count = 0;
+    let mut sentence = String::new();
+    for character in text.chars().chain(std::iter::once('\n')) {
+        if matches!(character, '。' | '!' | '?' | '\n') {
+            let trimmed = sentence.trim_end_matches(|c: char| c.is_whitespace() || c == '」');
+            if character == '?'
+                || JA_QUESTION_ENDINGS
+                    .iter()
+                    .any(|ending| trimmed.ends_with(ending))
+            {
+                count += 1;
+            }
+            sentence.clear();
+        } else {
+            sentence.push(character);
+        }
+    }
+    count
 }
 
-/// A spoken question stays a question: an output without any question form
-/// is an answer or a statement, not an edit of the transcript.
+/// Every spoken question stays a question: an output with fewer question
+/// sentences answered or restated one (確認できますか。送信できますか。 ->
+/// 確認できますか。送信できます。).
 pub(super) fn question_preserved(source: &str, output: &str) -> bool {
-    !is_question(source) || is_question(output)
+    question_count(output) >= question_count(source)
 }
 
 #[cfg(test)]
@@ -290,6 +335,71 @@ mod tests {
             "送らないで、確認してください。",
             merge
         ));
+    }
+
+    #[test]
+    fn an_unrelated_repair_cue_does_not_license_dropping_a_prohibition() {
+        assert!(!negation_preserved(
+            "本番には送らないで、会議は3時、いや4時です",
+            "本番には送って、会議は4時です",
+            ALL
+        ));
+        assert!(!negation_preserved(
+            "Don't deploy today, the meeting is at 3, actually 4.",
+            "Deploy today, the meeting is at 4.",
+            ALL
+        ));
+        // The cue right after the negated predicate still repairs it.
+        assert!(negation_preserved(
+            "送らないでください、いや、送ってください",
+            "送ってください",
+            ALL
+        ));
+        assert!(negation_preserved(
+            "don't merge it, actually merge it",
+            "Merge it.",
+            ALL
+        ));
+    }
+
+    #[test]
+    fn affirmative_adverbs_built_on_naku_are_not_negations() {
+        for (source, output) in [
+            ("少なくとも3人必要です", "最低3人必要です"),
+            ("間もなく始まります", "もうすぐ始まります"),
+            ("ほどなく届きます", "すぐに届きます"),
+            ("もれなく確認してください", "すべて確認してください"),
+            ("さりげなく伝えます", "控えめに伝えます"),
+        ] {
+            assert!(
+                negation_preserved(source, output, NONE),
+                "{source} => {output}"
+            );
+        }
+        // A real negation next to them still counts.
+        assert!(!negation_preserved(
+            "少なくとも3人は来ない",
+            "少なくとも3人は来る",
+            NONE
+        ));
+    }
+
+    #[test]
+    fn every_question_sentence_must_stay_a_question() {
+        assert!(!question_preserved(
+            "確認できますか。送信できますか。",
+            "確認できますか。送信できます。"
+        ));
+        assert!(!question_preserved(
+            "Can you check? Can you send it?",
+            "Can you check? I can send it."
+        ));
+        assert!(question_preserved(
+            "確認できますか。送信できますか。",
+            "確認できますか？送信できますか？"
+        ));
+        assert_eq!(question_count("必要ですかどうか確認します。"), 0);
+        assert_eq!(question_count("いいですか？ 明日来ますか"), 2);
     }
 
     #[test]
