@@ -1,0 +1,668 @@
+{
+  "schema": "correction-eval/1",
+  "name": "correction-offline-v1",
+  "provenance": "Synthetic sentences written by hand for this repository. No recordings, no real transcripts, no personal data. Names, URLs and figures are fictional.",
+  "license": "Same as the repository (MIT).",
+  "cases": [
+    {
+      "id": "ja-filler-numbers-01",
+      "language": "ja",
+      "categories": ["filler", "numbers_units"],
+      "correction_mode": "conservative",
+      "transcript": "えーと、明日の定例会議は10時から、えー、第2会議室で行います。",
+      "reference": "明日の定例会議は10時から第2会議室で行います。",
+      "allowed_changes": ["Remove the fillers えーと and えー", "Adjust punctuation"],
+      "forbidden_changes": ["Change the time or the room number"],
+      "rules": {
+        "require": [
+          {"kind": "number", "any": ["10時"]},
+          {"kind": "number", "any": ["第2会議室"]}
+        ],
+        "forbid": [{"kind": "filler", "any": ["えーと", "えー"]}]
+      },
+      "fixtures": [
+        {"id": "time-changed", "output": "明日の定例会議は11時から第2会議室で行います。", "expect_failures": ["added:number", "dropped:number"], "guard": "reject"},
+        {"id": "fillers-left", "output": "えーと、明日の定例会議は10時から、えー、第2会議室で行います。", "expect_failures": ["forbidden:filler"], "guard": "accept"}
+      ]
+    },
+    {
+      "id": "ja-self-correction-time-01",
+      "language": "ja",
+      "categories": ["self_correction", "numbers_units"],
+      "correction_mode": "conservative",
+      "transcript": "打ち合わせは14時、いや15時に変更します。",
+      "reference": "打ち合わせは15時に変更します。",
+      "allowed_changes": ["Drop the superseded 14時 and the cue いや"],
+      "forbidden_changes": ["Keep 14時 as the final time", "Drop 15時"],
+      "rules": {
+        "require": [{"kind": "self_correction", "any": ["15時"]}],
+        "forbid": [{"kind": "self_correction", "any": ["14時"]}]
+      },
+      "fixtures": [
+        {"id": "unresolved", "output": "打ち合わせは14時、いや15時に変更します。", "expect_failures": ["forbidden:self_correction"], "guard": "accept"},
+        {"id": "kept-wrong-value", "output": "打ち合わせは14時に変更します。", "expect_failures": ["dropped:self_correction", "forbidden:self_correction"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "ja-self-correction-count-01",
+      "language": "ja",
+      "categories": ["self_correction", "numbers_units"],
+      "correction_mode": "conservative",
+      "transcript": "参加者は5人、じゃなくて6人です。会場は2階です。",
+      "reference": "参加者は6人です。会場は2階です。",
+      "allowed_changes": ["Drop 5人 and じゃなくて"],
+      "forbidden_changes": ["Change the floor", "Keep 5人"],
+      "rules": {
+        "require": [
+          {"kind": "self_correction", "any": ["6人"]},
+          {"kind": "number", "any": ["2階"]}
+        ],
+        "forbid": [{"kind": "self_correction", "any": ["5人"]}]
+      },
+      "fixtures": [
+        {"id": "floor-changed", "output": "参加者は6人です。会場は3階です。", "expect_failures": ["added:number", "dropped:number"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "ja-self-correction-place-01",
+      "language": "ja",
+      "categories": ["self_correction", "long_memo"],
+      "correction_mode": "intent_aware",
+      "transcript": "集合場所は東京オフィスです。持ち物はノートパソコンと社員証。あ、集合場所は東京じゃなくて大阪オフィスでした。",
+      "reference": "集合場所は大阪オフィスです。持ち物はノートパソコンと社員証です。",
+      "allowed_changes": ["Apply the later place correction to the whole memo", "Drop the repair sentence"],
+      "forbidden_changes": ["Keep 東京 as the meeting place", "Drop an item to bring"],
+      "rules": {
+        "require": [
+          {"kind": "self_correction", "any": ["大阪"]},
+          {"kind": "proposition", "any": ["ノートパソコン"]},
+          {"kind": "proposition", "any": ["社員証"]}
+        ],
+        "forbid": [{"kind": "self_correction", "any": ["東京"]}]
+      },
+      "fixtures": [
+        {"id": "kept-first-place", "output": "集合場所は東京オフィスです。持ち物はノートパソコンと社員証です。", "expect_failures": ["dropped:self_correction", "forbidden:self_correction"], "guard": "not_detectable"},
+        {"id": "dropped-item", "output": "集合場所は大阪オフィスです。持ち物はノートパソコンです。", "expect_failures": ["dropped:proposition"], "guard": "not_detectable"}
+      ]
+    },
+    {
+      "id": "ja-negation-request-01",
+      "language": "ja",
+      "categories": ["negation"],
+      "correction_mode": "conservative",
+      "transcript": "このファイルはまだ送らないでください。確認が終わってから送ります。",
+      "reference": "このファイルはまだ送らないでください。確認が終わってから送ります。",
+      "allowed_changes": ["Punctuation only"],
+      "forbidden_changes": ["Turn the prohibition into a request", "Drop either sentence"],
+      "rules": {
+        "require": [
+          {"kind": "negation", "any": ["送らないで", "送信しないで"]},
+          {"kind": "proposition", "any": ["確認が終わってから"]}
+        ],
+        "forbid": [{"kind": "negation", "any": ["まだ送ってください", "今すぐ送って"]}]
+      },
+      "fixtures": [
+        {"id": "polarity-flipped", "output": "このファイルはまだ送ってください。確認が終わってから送ります。", "expect_failures": ["dropped:negation", "forbidden:negation"], "guard": "reject"},
+        {"id": "condition-dropped", "output": "このファイルはまだ送らないでください。", "expect_failures": ["dropped:proposition"], "guard": "not_detectable"}
+      ]
+    },
+    {
+      "id": "ja-negation-cancel-01",
+      "language": "ja",
+      "categories": ["negation", "numbers_units"],
+      "correction_mode": "intent_aware",
+      "transcript": "来週の定例は中止ではありません。時間だけ30分短くします。",
+      "reference": "来週の定例は中止ではありません。時間だけ30分短くします。",
+      "allowed_changes": ["Light rewording that keeps both facts"],
+      "forbidden_changes": ["State that the meeting is cancelled", "Lengthen instead of shorten"],
+      "rules": {
+        "require": [
+          {"kind": "negation", "any": ["中止ではありません", "中止ではない", "中止しません", "中止しない"]},
+          {"kind": "number", "any": ["30分"]},
+          {"kind": "proposition", "any": ["短く"]}
+        ],
+        "forbid": [{"kind": "proposition", "any": ["延長"]}]
+      },
+      "fixtures": [
+        {"id": "cancelled", "output": "来週の定例は中止です。時間だけ30分短くします。", "expect_failures": ["dropped:negation"], "guard": "reject"},
+        {"id": "direction-flipped", "output": "来週の定例は中止ではありません。時間を30分延長します。", "expect_failures": ["dropped:proposition", "forbidden:proposition"], "guard": "not_detectable"}
+      ]
+    },
+    {
+      "id": "ja-obligation-rewrite-01",
+      "language": "ja",
+      "categories": ["negation"],
+      "correction_mode": "conservative",
+      "transcript": "申請書は金曜日までに提出しなければなりません。",
+      "reference": "申請書は金曜日までに提出しなければなりません。",
+      "allowed_changes": ["Rephrase the obligation, e.g. 提出する必要があります"],
+      "forbidden_changes": ["Turn the obligation into a prohibition or an option"],
+      "rules": {
+        "require": [
+          {"kind": "proposition", "any": ["金曜日まで", "金曜まで"]},
+          {"kind": "proposition", "any": ["なければなりません", "なければならない", "必要があります", "必要がある"]}
+        ],
+        "forbid": [{"kind": "negation", "any": ["提出しないで", "提出しなくても", "提出は不要"]}]
+      },
+      "fixtures": [
+        {"id": "obligation-rephrased", "output": "申請書は金曜日までに提出する必要があります。", "expect_failures": [], "guard": "accept"},
+        {"id": "made-optional", "output": "申請書は金曜日までに提出しなくてもかまいません。", "expect_failures": ["dropped:proposition", "forbidden:negation"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "ja-numbers-budget-01",
+      "language": "ja",
+      "categories": ["numbers_units"],
+      "correction_mode": "intent_aware",
+      "transcript": "予算は3,000万円で、納期は12月15日、担当は4名です。",
+      "reference": "予算は3,000万円で、納期は12月15日、担当は4名です。",
+      "allowed_changes": ["Format as a list", "Punctuation"],
+      "forbidden_changes": ["Change any amount, date or headcount"],
+      "rules": {
+        "require": [
+          {"kind": "number", "any": ["3,000万円", "3000万円"]},
+          {"kind": "number", "any": ["12月15日"]},
+          {"kind": "number", "any": ["4名", "4人"]}
+        ]
+      },
+      "fixtures": [
+        {"id": "budget-changed", "output": "予算は300万円で、納期は12月15日、担当は4名です。", "expect_failures": ["added:number", "dropped:number"], "guard": "reject"},
+        {"id": "as-list", "output": "- 予算: 3,000万円\n- 納期: 12月15日\n- 担当: 4名", "expect_failures": [], "guard": "accept"}
+      ]
+    },
+    {
+      "id": "ja-numbers-units-01",
+      "language": "ja",
+      "categories": ["numbers_units", "technical_terms"],
+      "correction_mode": "conservative",
+      "transcript": "アップロードできるファイルは最大2.5GBまでで、タイムアウトは30秒に設定してください。",
+      "reference": "アップロードできるファイルは最大2.5GBまでで、タイムアウトは30秒に設定してください。",
+      "allowed_changes": ["Punctuation"],
+      "forbidden_changes": ["Change 2.5GB or 30秒, including the unit"],
+      "rules": {
+        "require": [
+          {"kind": "number", "any": ["2.5GB"]},
+          {"kind": "number", "any": ["30秒"]}
+        ]
+      },
+      "fixtures": [
+        {"id": "decimal-dropped", "output": "アップロードできるファイルは最大25GBまでで、タイムアウトは30秒に設定してください。", "expect_failures": ["added:number", "dropped:number"], "guard": "reject"},
+        {"id": "unit-changed", "output": "アップロードできるファイルは最大2.5GBまでで、タイムアウトは30分に設定してください。", "expect_failures": ["dropped:number"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "ja-numbers-normalize-01",
+      "language": "ja",
+      "categories": ["numbers_units"],
+      "correction_mode": "conservative",
+      "transcript": "会議室は３階の３０２号室で、参加者は三人です。",
+      "reference": "会議室は3階の302号室で、参加者は三人です。",
+      "allowed_changes": ["Full-width digits to half-width", "Kanji numerals to digits"],
+      "forbidden_changes": ["Change the floor, room or headcount"],
+      "rules": {
+        "require": [
+          {"kind": "number", "any": ["3階"]},
+          {"kind": "number", "any": ["302号室"]},
+          {"kind": "number", "any": ["三人", "3人"]}
+        ],
+        "allow_new": ["3"]
+      },
+      "fixtures": [
+        {"id": "kanji-to-digits", "output": "会議室は3階の302号室で、参加者は3人です。", "expect_failures": [], "guard": "accept"},
+        {"id": "room-changed", "output": "会議室は3階の320号室で、参加者は三人です。", "expect_failures": ["added:number", "dropped:number"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "ja-url-01",
+      "language": "ja",
+      "categories": ["url_code"],
+      "correction_mode": "conservative",
+      "transcript": "えっと、手順は https://example.com/docs/setup に書いてあるので、そちらを見てください。",
+      "reference": "手順は https://example.com/docs/setup に書いてあるので、そちらを見てください。",
+      "allowed_changes": ["Remove the filler"],
+      "forbidden_changes": ["Change any character of the URL"],
+      "rules": {
+        "require": [{"kind": "url", "any": ["https://example.com/docs/setup"]}],
+        "forbid": [{"kind": "filler", "any": ["えっと"]}]
+      },
+      "fixtures": [
+        {"id": "url-path-changed", "output": "手順は https://example.com/doc/setup に書いてあるので、そちらを見てください。", "expect_failures": ["added:url", "dropped:url"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "ja-code-01",
+      "language": "ja",
+      "categories": ["url_code", "technical_terms"],
+      "correction_mode": "intent_aware",
+      "transcript": "設定ファイルの`max_retries`を3にして、`timeout_ms`はそのままにしてください。",
+      "reference": "設定ファイルの`max_retries`を3にして、`timeout_ms`はそのままにしてください。",
+      "allowed_changes": ["Punctuation", "List formatting"],
+      "forbidden_changes": ["Rename either identifier", "Change the value 3"],
+      "rules": {
+        "require": [
+          {"kind": "code", "any": ["`max_retries`"]},
+          {"kind": "code", "any": ["`timeout_ms`"]},
+          {"kind": "number", "any": ["3に"]}
+        ]
+      },
+      "fixtures": [
+        {"id": "identifier-renamed", "output": "設定ファイルの`maxRetries`を3にして、`timeout_ms`はそのままにしてください。", "expect_failures": ["added:code", "dropped:code"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "ja-term-dictionary-01",
+      "language": "ja",
+      "categories": ["technical_terms"],
+      "correction_mode": "intent_aware",
+      "dictionary": [{"surface": "GitHub", "readings": ["ぎっとはぶ"]}],
+      "transcript": "変更はぎっとはぶにプッシュして、レビューを依頼してください。",
+      "reference": "変更はGitHubにプッシュして、レビューを依頼してください。",
+      "allowed_changes": ["Spell the dictionary term as GitHub"],
+      "forbidden_changes": ["Use a different service name"],
+      "rules": {
+        "require": [
+          {"kind": "term", "any": ["GitHub"]},
+          {"kind": "proposition", "any": ["レビュー"]}
+        ],
+        "forbid": [{"kind": "term", "any": ["ぎっとはぶ"]}]
+      },
+      "fixtures": [
+        {"id": "wrong-service", "output": "変更はGitLabにプッシュして、レビューを依頼してください。", "expect_failures": ["added:name", "dropped:term"], "guard": "reject"},
+        {"id": "reading-kept", "output": "変更はぎっとはぶにプッシュして、レビューを依頼してください。", "expect_failures": ["dropped:term", "forbidden:term"], "guard": "accept"}
+      ]
+    },
+    {
+      "id": "ja-term-latin-01",
+      "language": "ja",
+      "categories": ["technical_terms"],
+      "correction_mode": "conservative",
+      "transcript": "Kubernetesのpodが再起動を繰り返しているので、kubectl logsで確認します。",
+      "reference": "Kubernetesのpodが再起動を繰り返しているので、kubectl logsで確認します。",
+      "allowed_changes": ["Punctuation"],
+      "forbidden_changes": ["Change the product or command names"],
+      "rules": {
+        "require": [
+          {"kind": "name", "any": ["Kubernetes"]},
+          {"kind": "term", "any": ["kubectl logs"]}
+        ]
+      },
+      "fixtures": [
+        {"id": "product-swapped", "output": "Dockerのpodが再起動を繰り返しているので、kubectl logsで確認します。", "expect_failures": ["added:name", "dropped:name"], "guard": "not_detectable"}
+      ]
+    },
+    {
+      "id": "ja-repetition-slip-01",
+      "language": "ja",
+      "categories": ["slip", "filler"],
+      "correction_mode": "conservative",
+      "transcript": "サーバーを、サーバーを再起動してから、あの、ログを確認します。",
+      "reference": "サーバーを再起動してから、ログを確認します。",
+      "allowed_changes": ["Remove the restart repetition and the filler"],
+      "forbidden_changes": ["Drop either step or change their order"],
+      "rules": {
+        "require": [
+          {"kind": "proposition", "any": ["再起動"]},
+          {"kind": "proposition", "any": ["ログを確認"]}
+        ],
+        "forbid": [
+          {"kind": "filler", "any": ["サーバーを、サーバーを", "あの、"]}
+        ]
+      },
+      "fixtures": [
+        {"id": "step-dropped", "output": "サーバーを再起動します。", "expect_failures": ["dropped:proposition", "edit_ratio"], "guard": "not_detectable"}
+      ]
+    },
+    {
+      "id": "ja-slip-word-01",
+      "language": "ja",
+      "categories": ["slip", "self_correction"],
+      "correction_mode": "conservative",
+      "transcript": "請求書を明日、あ、間違えた、明後日までに送ります。",
+      "reference": "請求書を明後日までに送ります。",
+      "allowed_changes": ["Resolve the spoken slip to 明後日"],
+      "forbidden_changes": ["Keep 明日 as the deadline"],
+      "rules": {
+        "require": [{"kind": "self_correction", "any": ["明後日"]}],
+        "forbid": [{"kind": "self_correction", "any": ["明日まで", "間違えた"]}]
+      },
+      "fixtures": [
+        {"id": "kept-slip", "output": "請求書を明日までに送ります。", "expect_failures": ["dropped:self_correction", "forbidden:self_correction"], "guard": "not_detectable"}
+      ]
+    },
+    {
+      "id": "ja-long-memo-01",
+      "language": "ja",
+      "categories": ["long_memo", "numbers_units", "technical_terms", "negation"],
+      "correction_mode": "intent_aware",
+      "transcript": "えーと今日の振り返りです。まずリリースは予定通り木曜日に出します。それからSlackの通知が2回重複していた件は、原因がまだわかっていないので調査を続けます。あと、ドキュメントはNotionに移しますが、古いページはまだ消さないでください。最後に、次回のレビューは来週の月曜10時からです。",
+      "reference": "今日の振り返り\n- リリースは予定通り木曜日に出します。\n- Slackの通知が2回重複していた件は、原因がまだわかっていないので調査を続けます。\n- ドキュメントはNotionに移しますが、古いページはまだ消さないでください。\n- 次回のレビューは来週の月曜10時からです。",
+      "allowed_changes": ["Bulleted structure", "Remove fillers and connective words"],
+      "forbidden_changes": ["Drop any item", "Claim the cause is known", "Allow deleting old pages", "Change counts or times"],
+      "rules": {
+        "require": [
+          {"kind": "proposition", "any": ["木曜日"]},
+          {"kind": "name", "any": ["Slack"]},
+          {"kind": "number", "any": ["2回"]},
+          {"kind": "uncertainty", "any": ["わかっていない", "分かっていない", "不明"]},
+          {"kind": "name", "any": ["Notion"]},
+          {"kind": "negation", "any": ["消さないで", "削除しないで"]},
+          {"kind": "number", "any": ["10時"]}
+        ],
+        "forbid": [{"kind": "filler", "any": ["えーと"]}],
+        "max_edit_ratio": 1.0
+      },
+      "fixtures": [
+        {"id": "summary-dropped-items", "output": "今日の振り返り: リリースは木曜日、ドキュメントはNotionに移します。", "expect_failures": ["dropped:name", "dropped:negation", "dropped:number", "dropped:uncertainty"], "guard": "reject"},
+        {"id": "deletion-allowed", "output": "今日の振り返り\n- リリースは予定通り木曜日に出します。\n- Slackの通知が2回重複していた件は、原因がまだわかっていないので調査を続けます。\n- ドキュメントはNotionに移し、古いページは消してください。\n- 次回のレビューは来週の月曜10時からです。", "expect_failures": ["dropped:negation"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "ja-instruction-not-executed-01",
+      "language": "ja",
+      "categories": ["ambiguous_instruction"],
+      "correction_mode": "conservative",
+      "transcript": "このメールに返信して、来週の都合を聞いておいて。",
+      "reference": "このメールに返信して、来週の都合を聞いておいて。",
+      "allowed_changes": ["Punctuation"],
+      "forbidden_changes": ["Write the reply email instead of transcribing the instruction"],
+      "rules": {
+        "require": [{"kind": "proposition", "any": ["返信して"]}],
+        "forbid": [{"kind": "proposition", "any": ["承知しました", "ご都合をお聞かせください", "お世話になっております"]}]
+      },
+      "fixtures": [
+        {"id": "executed-reply", "output": "お世話になっております。来週のご都合をお聞かせください。よろしくお願いいたします。", "expect_failures": ["dropped:proposition", "edit_ratio", "forbidden:proposition"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "ja-instruction-summary-01",
+      "language": "ja",
+      "categories": ["ambiguous_instruction"],
+      "correction_mode": "intent_aware",
+      "transcript": "今の話を三行で要約して、田中さんに送っておいてください。",
+      "reference": "今の話を三行で要約して、田中さんに送っておいてください。",
+      "allowed_changes": ["Punctuation"],
+      "forbidden_changes": ["Produce a summary or a message to Tanaka"],
+      "rules": {
+        "require": [
+          {"kind": "proposition", "any": ["要約して"]},
+          {"kind": "name", "any": ["田中"]},
+          {"kind": "number", "any": ["三行", "3行"]}
+        ],
+        "forbid": [{"kind": "proposition", "any": ["要約:", "要約：", "以下の通り"]}]
+      },
+      "fixtures": [
+        {"id": "executed-summary", "output": "要約：\n1. 進捗は順調です。\n2. 課題は人員です。\n3. 次回は来週です。", "expect_failures": ["added:number", "dropped:name", "dropped:number", "dropped:proposition", "edit_ratio", "forbidden:proposition"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "ja-question-not-answered-01",
+      "language": "ja",
+      "categories": ["ambiguous_instruction", "technical_terms"],
+      "correction_mode": "conservative",
+      "transcript": "この関数ってスレッドセーフですか？",
+      "reference": "この関数はスレッドセーフですか？",
+      "allowed_changes": ["Colloquial particle って to は"],
+      "forbidden_changes": ["Answer the question"],
+      "rules": {
+        "require": [{"kind": "question", "any": ["?", "？"]}],
+        "forbid": [{"kind": "proposition", "any": ["はい", "いいえ"]}]
+      },
+      "fixtures": [
+        {"id": "answered", "output": "はい、この関数はスレッドセーフです。", "expect_failures": ["dropped:question", "forbidden:proposition"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "ja-uncertainty-01",
+      "language": "ja",
+      "categories": ["proposition"],
+      "correction_mode": "intent_aware",
+      "transcript": "たぶん来月から料金が上がると思います。正式な発表はまだです。",
+      "reference": "たぶん来月から料金が上がると思います。正式な発表はまだです。",
+      "allowed_changes": ["Light rewording that keeps the hedge"],
+      "forbidden_changes": ["State the price rise as certain"],
+      "rules": {
+        "require": [
+          {"kind": "uncertainty", "any": ["たぶん", "多分", "おそらく", "と思います", "かもしれません"]},
+          {"kind": "proposition", "any": ["まだ"]}
+        ]
+      },
+      "fixtures": [
+        {"id": "made-certain", "output": "来月から料金が上がります。正式な発表はまだです。", "expect_failures": ["dropped:uncertainty"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "ja-information-added-01",
+      "language": "ja",
+      "categories": ["proposition"],
+      "correction_mode": "intent_aware",
+      "transcript": "資料は来週共有します。",
+      "reference": "資料は来週共有します。",
+      "allowed_changes": ["Punctuation"],
+      "forbidden_changes": ["Add a weekday, time or recipient"],
+      "rules": {
+        "require": [{"kind": "proposition", "any": ["来週"]}],
+        "forbid": [{"kind": "proposition", "any": ["月曜", "火曜", "水曜", "木曜", "金曜"]}]
+      },
+      "fixtures": [
+        {"id": "date-invented", "output": "資料は来週の月曜日10時に共有します。", "expect_failures": ["added:number", "forbidden:proposition"], "guard": "reject"},
+        {"id": "weekday-invented", "output": "資料は来週の月曜日に共有します。", "expect_failures": ["forbidden:proposition"], "guard": "not_detectable"}
+      ]
+    },
+    {
+      "id": "en-filler-negation-01",
+      "language": "en",
+      "categories": ["filler", "negation"],
+      "correction_mode": "conservative",
+      "transcript": "um so please don't merge the branch until uh the tests pass",
+      "reference": "Please don't merge the branch until the tests pass.",
+      "allowed_changes": ["Remove um/uh/so", "Capitalization and punctuation"],
+      "forbidden_changes": ["Drop the negation", "Drop the condition"],
+      "rules": {
+        "require": [
+          {"kind": "negation", "any": ["don't merge", "do not merge"]},
+          {"kind": "proposition", "any": ["until the tests pass"]}
+        ],
+        "forbid": [
+          {"kind": "filler", "any": ["um ", " uh "]},
+          {"kind": "negation", "any": ["please merge"]}
+        ]
+      },
+      "fixtures": [
+        {"id": "negation-dropped", "output": "Please merge the branch until the tests pass.", "expect_failures": ["dropped:negation", "forbidden:negation"], "guard": "reject"},
+        {"id": "expanded-contraction", "output": "Please do not merge the branch until the tests pass.", "expect_failures": [], "guard": "accept"}
+      ]
+    },
+    {
+      "id": "en-self-correction-01",
+      "language": "en",
+      "categories": ["self_correction", "numbers_units"],
+      "correction_mode": "conservative",
+      "transcript": "Book the room for Tuesday at 3 pm, actually make that 4 pm.",
+      "reference": "Book the room for Tuesday at 4 pm.",
+      "allowed_changes": ["Drop 3 pm and the repair cue"],
+      "forbidden_changes": ["Keep 3 pm", "Change the day"],
+      "rules": {
+        "require": [
+          {"kind": "self_correction", "any": ["4 pm", "4pm", "4 p.m."]},
+          {"kind": "proposition", "any": ["Tuesday"]}
+        ],
+        "forbid": [{"kind": "self_correction", "any": ["3 pm", "3pm"]}]
+      },
+      "fixtures": [
+        {"id": "day-changed", "output": "Book the room for Wednesday at 4 pm.", "expect_failures": ["added:name", "dropped:proposition"], "guard": "not_detectable"},
+        {"id": "kept-first-time", "output": "Book the room for Tuesday at 3 pm.", "expect_failures": ["dropped:self_correction", "forbidden:self_correction"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "en-numbers-units-01",
+      "language": "en",
+      "categories": ["numbers_units"],
+      "correction_mode": "intent_aware",
+      "transcript": "The batch size is 32, the learning rate is 0.001, and training runs for 12 epochs on 2 GPUs.",
+      "reference": "The batch size is 32, the learning rate is 0.001, and training runs for 12 epochs on 2 GPUs.",
+      "allowed_changes": ["List formatting"],
+      "forbidden_changes": ["Change any hyperparameter"],
+      "rules": {
+        "require": [
+          {"kind": "number", "any": ["32"]},
+          {"kind": "number", "any": ["0.001"]},
+          {"kind": "number", "any": ["12 epochs"]},
+          {"kind": "number", "any": ["2 GPUs"]}
+        ]
+      },
+      "fixtures": [
+        {"id": "rate-changed", "output": "The batch size is 32, the learning rate is 0.01, and training runs for 12 epochs on 2 GPUs.", "expect_failures": ["added:number", "dropped:number"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "en-url-code-01",
+      "language": "en",
+      "categories": ["url_code"],
+      "correction_mode": "conservative",
+      "transcript": "Run `pnpm test` and then open http://localhost:5173/settings to check the page.",
+      "reference": "Run `pnpm test` and then open http://localhost:5173/settings to check the page.",
+      "allowed_changes": ["Punctuation"],
+      "forbidden_changes": ["Change the command, port or path"],
+      "rules": {
+        "require": [
+          {"kind": "code", "any": ["`pnpm test`"]},
+          {"kind": "url", "any": ["http://localhost:5173/settings"]}
+        ]
+      },
+      "fixtures": [
+        {"id": "port-changed", "output": "Run `pnpm test` and then open http://localhost:3000/settings to check the page.", "expect_failures": ["added:url", "dropped:url"], "guard": "reject"},
+        {"id": "command-changed", "output": "Run `pnpm build` and then open http://localhost:5173/settings to check the page.", "expect_failures": ["added:code", "dropped:code"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "en-question-not-answered-01",
+      "language": "en",
+      "categories": ["ambiguous_instruction"],
+      "correction_mode": "intent_aware",
+      "transcript": "can you tell me what the deadline for the report is",
+      "reference": "Can you tell me what the deadline for the report is?",
+      "allowed_changes": ["Capitalization and a question mark"],
+      "forbidden_changes": ["Answer the question or invent a deadline"],
+      "rules": {
+        "require": [
+          {"kind": "proposition", "any": ["deadline"]},
+          {"kind": "question", "any": ["?", "can you tell me"]}
+        ],
+        "forbid": [{"kind": "proposition", "any": ["The deadline is", "is due"]}]
+      },
+      "fixtures": [
+        {"id": "answered", "output": "The deadline for the report is Friday.", "expect_failures": ["added:name", "dropped:question"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "en-long-memo-01",
+      "language": "en",
+      "categories": ["long_memo", "negation", "proposition"],
+      "correction_mode": "intent_aware",
+      "transcript": "Notes for the vendor call. They can deliver in March but not before. The price is 4,500 dollars per month. I think they mentioned a discount for annual plans but I'm not sure. We should not sign anything until legal reviews it.",
+      "reference": "Notes for the vendor call:\n- They can deliver in March but not before.\n- The price is 4,500 dollars per month.\n- I think they mentioned a discount for annual plans, but I'm not sure.\n- We should not sign anything until legal reviews it.",
+      "allowed_changes": ["Bulleted structure"],
+      "forbidden_changes": ["Present the discount as confirmed", "Drop any constraint"],
+      "rules": {
+        "require": [
+          {"kind": "proposition", "any": ["March"]},
+          {"kind": "negation", "any": ["not before"]},
+          {"kind": "number", "any": ["4,500", "4500"]},
+          {"kind": "uncertainty", "any": ["not sure", "I think"]},
+          {"kind": "negation", "any": ["not sign", "don't sign", "shouldn't sign"]}
+        ],
+        "max_edit_ratio": 1.0
+      },
+      "fixtures": [
+        {"id": "discount-confirmed", "output": "Notes for the vendor call:\n- They can deliver in March but not before.\n- The price is 4,500 dollars per month.\n- They offer a discount for annual plans.\n- We should not sign anything until legal reviews it.", "expect_failures": ["dropped:uncertainty"], "guard": "reject"},
+        {"id": "signing-allowed", "output": "Notes for the vendor call:\n- They can deliver in March but not before.\n- The price is 4,500 dollars per month.\n- I think they mentioned a discount for annual plans, but I'm not sure.\n- We should sign once legal reviews it.", "expect_failures": ["dropped:negation"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "mixed-term-01",
+      "language": "mixed",
+      "categories": ["technical_terms", "filler"],
+      "correction_mode": "conservative",
+      "transcript": "えっと、React のコンポーネントで useEffect の依存配列が空なので、初回レンダリングでしか API を呼んでいません。",
+      "reference": "ReactのコンポーネントでuseEffectの依存配列が空なので、初回レンダリングでしかAPIを呼んでいません。",
+      "allowed_changes": ["Remove the filler", "Remove spaces around Latin terms"],
+      "forbidden_changes": ["Rename useEffect or React", "Drop the negation"],
+      "rules": {
+        "require": [
+          {"kind": "name", "any": ["React"]},
+          {"kind": "term", "any": ["useEffect"]},
+          {"kind": "negation", "any": ["呼んでいません", "呼ばない", "呼んでいない"]}
+        ],
+        "forbid": [{"kind": "filler", "any": ["えっと"]}]
+      },
+      "fixtures": [
+        {"id": "hook-renamed", "output": "ReactのコンポーネントでuseMemoの依存配列が空なので、初回レンダリングでしかAPIを呼んでいません。", "expect_failures": ["added:name", "dropped:term"], "guard": "not_detectable"},
+        {"id": "negation-dropped", "output": "ReactのコンポーネントでuseEffectの依存配列が空なので、毎回のレンダリングでAPIを呼んでいます。", "expect_failures": ["dropped:negation"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "mixed-self-correction-01",
+      "language": "mixed",
+      "categories": ["self_correction", "technical_terms", "numbers_units"],
+      "correction_mode": "intent_aware",
+      "transcript": "Node は18、いや20を使ってください。Python は3.12のままで大丈夫です。",
+      "reference": "Nodeは20を使ってください。Pythonは3.12のままで大丈夫です。",
+      "allowed_changes": ["Drop the superseded version 18"],
+      "forbidden_changes": ["Keep Node 18", "Change the Python version"],
+      "rules": {
+        "require": [
+          {"kind": "self_correction", "any": ["20"]},
+          {"kind": "number", "any": ["3.12"]},
+          {"kind": "name", "any": ["Node"]},
+          {"kind": "name", "any": ["Python"]}
+        ],
+        "forbid": [{"kind": "self_correction", "any": ["18"]}]
+      },
+      "fixtures": [
+        {"id": "python-changed", "output": "Nodeは20を使ってください。Pythonは3.11のままで大丈夫です。", "expect_failures": ["added:number", "dropped:number"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "mixed-negation-01",
+      "language": "mixed",
+      "categories": ["negation", "url_code"],
+      "correction_mode": "conservative",
+      "transcript": "本番環境では `--force` オプションを使わないでください。staging なら問題ありません。",
+      "reference": "本番環境では `--force` オプションを使わないでください。stagingなら問題ありません。",
+      "allowed_changes": ["Spacing around Latin words"],
+      "forbidden_changes": ["Allow --force in production", "Drop the staging exception"],
+      "rules": {
+        "require": [
+          {"kind": "code", "any": ["`--force`"]},
+          {"kind": "negation", "any": ["使わないで", "使用しないで"]},
+          {"kind": "proposition", "any": ["staging"]}
+        ]
+      },
+      "fixtures": [
+        {"id": "polarity-flipped", "output": "本番環境では `--force` オプションを使ってください。stagingなら問題ありません。", "expect_failures": ["dropped:negation"], "guard": "reject"}
+      ]
+    },
+    {
+      "id": "mixed-email-tone-01",
+      "language": "mixed",
+      "categories": ["proposition", "technical_terms"],
+      "correction_mode": "intent_aware",
+      "transcript": "佐藤さん、昨日の PR のレビューありがとうございました。指摘いただいた3点は全部直したので、もう一度見てもらえますか？",
+      "reference": "佐藤さん、昨日のPRのレビューありがとうございました。ご指摘いただいた3点はすべて修正しましたので、もう一度ご確認いただけますか？",
+      "allowed_changes": ["More polite wording", "Spacing around Latin words"],
+      "forbidden_changes": ["Change the count of fixes", "Drop the request"],
+      "rules": {
+        "require": [
+          {"kind": "name", "any": ["佐藤"]},
+          {"kind": "term", "any": ["PR"]},
+          {"kind": "number", "any": ["3点"]},
+          {"kind": "question", "any": ["?", "？"]}
+        ],
+        "max_edit_ratio": 1.0
+      },
+      "fixtures": [
+        {"id": "count-changed", "output": "佐藤さん、昨日のPRのレビューありがとうございました。ご指摘いただいた2点を修正しました。", "expect_failures": ["added:number", "dropped:number", "dropped:question"], "guard": "reject"}
+      ]
+    }
+  ]
+}

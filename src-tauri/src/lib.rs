@@ -1645,6 +1645,13 @@ fn setup_app(
     Ok(())
 }
 
+/// Runs the offline correction evaluation (`examples/correction_eval.rs`,
+/// Issue #85) and returns its exit code. Not part of the app.
+#[doc(hidden)]
+pub fn run_correction_eval_cli(args: Vec<String>) -> i32 {
+    correction::eval::run_cli(args)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let (shortcut_events, shortcut_receiver) = tokio::sync::mpsc::unbounded_channel();
