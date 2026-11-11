@@ -14,11 +14,22 @@ from asr_worker.tests.support import IsolatedWorkerTestCase
 from pathlib import Path
 from unittest.mock import patch
 
-from asr_worker.backends import MockBackend, map_backend_exception, vibevoice_dependency_error
+from asr_worker.backends import MockBackend, BackendError, map_backend_exception, vibevoice_dependency_error
 from asr_worker.worker import Worker, _configure_protocol_stdio, serve
 
 
 class WorkerTests(IsolatedWorkerTestCase):
+    def test_failed_unload_during_reload_or_shutdown_clears_loaded_health(self):
+        for command in ['load', 'shutdown']:
+            with self.subTest(command=command):
+                worker = Worker(MockBackend()); worker.loaded = True
+                with patch.object(worker.backend, 'unload', side_effect=BackendError('speech_cpp_unavailable', 'stuck child')):
+                    response, stop = worker.handle({'id': 1, 'command': command})
+                self.assertFalse(response['ok'])
+                self.assertFalse(worker.loaded)
+                health, _ = worker.handle({'id': 2, 'command': 'health'})
+                self.assertFalse(health['health']['loaded'])
+                self.assertEqual(stop, command == 'shutdown')
     def test_invalid_load_formats_do_not_initialize_native_dependencies(self) -> None:
         calls = []
         output = io.StringIO()

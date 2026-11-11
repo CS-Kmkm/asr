@@ -52,6 +52,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn managed_vulkan_never_uses_cloud_consent_or_cloud_preview() {
+        let settings = Settings {
+            asr_backend: "speech-cpp".into(),
+            cloud_live_preview_enabled: false,
+            ..Settings::default()
+        };
+        assert!(check_asr(&settings).is_ok());
+        assert!(live_preview_enabled(&settings));
+        assert!(settings.cloud_consents.is_empty());
+    }
+
+    #[test]
     fn consent_is_required_for_each_provider_and_asr_endpoint() {
         let mut settings = Settings::default();
         assert!(check_recording(&settings, PipelineMode::Dictate).is_ok());

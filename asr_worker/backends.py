@@ -1036,4 +1036,7 @@ def create_backend(name: str) -> Backend:
         return FasterWhisperBackend()
     if name == "openai-compatible":
         return OpenAICompatibleBackend()
+    if name == "speech-cpp":
+        from .speech_cpp import SpeechCppBackend
+        return SpeechCppBackend()
     raise BackendError("unsupported_backend", f"Unsupported backend: {name}")

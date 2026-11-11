@@ -1,5 +1,8 @@
 # ASR ベンチマークと Phase 0 ゲート判定
 
+Haas／Parakeet JapaneseのWindows/Vulkan導入・Whisperとの固定200音声比較は、
+[日本語モデル比較記録](japanese_model_comparison.md)を参照してください。既定モデルの選定ゲートは未通過です。
+
 人が読み直さずに日本語ASRを評価する手順は、
 [公開音声による評価](eval_set/public_datasets.md)を参照してください。
 固定済みのFLEURS＋JVNV、batch採点、実時間streaming replayを利用できます。

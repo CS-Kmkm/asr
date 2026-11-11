@@ -41,7 +41,7 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
 
 - Rust側がワーカーを **spawn** する。起動コマンドは既定で `python -m asr_worker` であり、
   `--backend` 引数または環境変数 `ASR_WORKER_BACKEND` でバックエンド
-  (`vibevoice` / `faster-whisper` / `openai-compatible` / `mock`、既定 `faster-whisper`)を選択する。
+  (`vibevoice` / `faster-whisper` / `openai-compatible` / `speech-cpp` / `mock`、既定 `faster-whisper`)を選択する。
 - ワーカーはstdinがEOFに達するか `shutdown` を受信するまでメッセージを処理し続ける。
 - ワーカープロセスは **ステートフル**である。`load` 後に内部状態 `loaded = True` を保持し、
   `transcribe` はロード済みを前提とする。
@@ -59,6 +59,19 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
 ---
 
 ## 2. プロトコル v1(現行)
+
+`speech-cpp` は Windows x64/Vulkan 用の管理対象ローカルサーバーを起動します。
+初回 `load` 時に固定revision・SHA256のランタイムとQ8_0重みを取得し、
+`ASR_SPEECH_CPP_HOME`（未指定時 `%LOCALAPPDATA%/LocalVoice/speech.cpp`）に保存します。
+`ASR_MODEL_ID` は `haas-ja-v1.0` または `parakeet-tdt_ctc-0.6b-ja`。
+この経路の量子化はQ8_0固定で、`quantization` は既存設定との互換のため受理します。
+`health` のdeviceは `vulkan`、computeTypeは `Q8_0` です。CPUでTDTをデコードします。
+このbackendではサーバーのdevice・weight_typeを検証し、devices一覧に照合したGPU名を
+追加の `deviceName` フィールドで返します。未知の追加フィールドは既存クライアントで無視できます。
+日本語以外の明示localeはエラーになり、別backendへ自動送信しません。
+現在の自由文promptは渡さず、アプリの認識後辞書置換は維持します。
+
+この経路のエラーコードも§3の共通一覧に含めます。
 
 ### 2.1 共通事項
 
@@ -115,6 +128,7 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
   環境変数 `ASR_FASTER_WHISPER_MODEL` で変更可)
 - mock: `"microsoft/VibeVoice-ASR-HF:mock"`
 - openai-compatible: `openai-compatible:<ASR_MODEL_ID>`（既定は `gpt-4o-mini-transcribe`）。
+- speech-cpp: `speech.cpp:<ASR_MODEL_ID>:Q8_0`（既定は `haas-ja-v1.0`）。量子化引数とは別にQ8_0固定。
 
 ローカルバックエンドでも `ASR_MODEL_ID` が既定モデルより優先される。
 faster-whisper は `ASR_MODEL_ID`、`ASR_FASTER_WHISPER_MODEL`、
@@ -157,9 +171,9 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 | `id` | リクエストと同一 | 必須 | 対象リクエストのエコーバック。 |
 | `event` | `"progress"` | 必須 | 通知行であることの識別子。 |
 | `stage` | `"download"` / `"load"` / `"warmup"` / `"cpu_fallback"` | 必須 | ファイル取得、メモリ読み込み、ダミー音声での初期推論、CUDA失敗後のCPU準備を示す。 |
-| `model` | 文字列 | 任意 | ダウンロード対象のHugging Faceリポジトリ。 |
-| `completed_bytes` | 整数 | 任意 | ダウンロード済みバイト数(全ファイルの合計)。 |
-| `total_bytes` | 整数 / `null` | 任意 | 総バイト数。Hugging Faceがファイルメタデータを返すまでは不明であり `null` になる。 |
+| `model` | 文字列 | 任意 | モデルの識別子。通常はHugging Faceリポジトリ、speech-cppのload通知では `speech.cpp:<ID>:Q8_0`。 |
+| `completed_bytes` | 整数 | 任意 | ダウンロード済みバイト数。faster-whisperは全ファイルの集約、speech-cppは現在の配布物単位。 |
+| `total_bytes` | 整数 / `null` | 任意 | 対応する取得単位の総バイト数。メタデータやContent-Lengthが不明なら `null`。 |
 
 ```json
 → {"id": 1, "command": "load", "quantization": "4bit"}
@@ -180,6 +194,8 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 - VibeVoice: transformers の `from_pretrained` に進捗フックがないため、未キャッシュ時に
   バイト数なしの `download` を1回だけ通知する。
 - openai-compatible / mock: ダウンロードを伴わないため通知しない。
+- speech-cpp: 未取得のランタイムzipとGGUF重みを順に取得し、各配布物ごとにバイト進捗を通知する。
+  次の配布物へ移る際にカウンターはリセットする。取得済みなら検証後に `load` を通知する。
 
 ---
 
@@ -428,6 +444,10 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
 | コード | 発生箇所 | 発生条件 |
 |---|---|---|
 | `invalid_decision_model` | decision.py | 許可された固定モデルまたは量子化ではない。 |
+| `speech_cpp_unavailable` | speech_cpp.py | ランタイム・モデルの取得/起動/稼働失敗。再読込、またはfaster-whisperへ切替。 |
+| `speech_cpp_artifact_invalid` | speech_cpp.py | SHA256不一致。既存ファイルを保持してロードを拒否。 |
+| `speech_cpp_language` | speech_cpp.py | 日本語以外の明示locale。アプリの設定保存も日本語／自動以外との組合せを拒否する。 |
+| `speech_cpp_unsupported_platform` | speech_cpp.py | Windows x64以外。取得前に拒否する。 |
 | `decision_dependencies_missing` | decision.py | 判断モデルの追加依存がない。`uv sync --extra decision` で準備する。 |
 | `decision_cuda_required` | decision.py | 判断モデルに必要な CUDA がない。CPU の自動判定は対象外。 |
 | `decision_release_invalid` | decision.py | 固定リビジョンの実装を読み込めない。 |

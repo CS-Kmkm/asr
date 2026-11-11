@@ -9,6 +9,9 @@ pub(crate) fn model_load_failure_message(error: &AsrError) -> &'static str {
         AsrError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => "The speech worker could not be found. Run worker setup, then try loading again.",
         AsrError::Io(_) | AsrError::Protocol(_) => "The speech worker could not communicate correctly. Restart the app, then try loading again.",
         AsrError::Worker(error) => match error.code.as_str() {
+            "speech_cpp_unsupported_platform" => "Japanese Vulkan models require Windows x64. Select faster-whisper on this system.",
+            "speech_cpp_artifact_invalid" => "Speech model verification failed. Existing files were preserved. Select faster-whisper or check the speech.cpp cache.",
+            "speech_cpp_unavailable" => "The Vulkan speech model could not start. Check network, disk space and GPU drivers, or select faster-whisper.",
             "worker_source_missing" => "Speech worker files are missing. Reinstall the app, or run uv sync from the development checkout.",
             "worker_setup_unavailable" => "Worker setup requires uv. Install uv or set ASR_UV to its executable, then load the model again.",
             "worker_setup_failed" => "Worker setup failed. Check the network, free disk space and write permission, then load the model again.",

@@ -234,6 +234,8 @@ mod tests {
             "ASR_OPENAI_KEY",
             "OPENAI_API_KEY",
             "HF_ENDPOINT",
+            "LOCALAPPDATA",
+            "ASR_SPEECH_CPP_HOME",
             "HF_TOKEN",
             "KMP_DUPLICATE_LIB_OK",
             "CT2_VERBOSE",
@@ -254,6 +256,8 @@ mod tests {
         assert!(!helpers.iter().any(|(key, _)| key == "HF_TOKEN"));
         for name in [
             "HF_ENDPOINT",
+            "LOCALAPPDATA",
+            "ASR_SPEECH_CPP_HOME",
             "HF_TOKEN",
             "KMP_DUPLICATE_LIB_OK",
             "CT2_VERBOSE",

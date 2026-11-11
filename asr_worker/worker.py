@@ -143,6 +143,7 @@ class Worker:
                         "loaded": self.loaded,
                         "device": getattr(self.backend, "device", None) if self.loaded else None,
                         "computeType": getattr(self.backend, "compute_type", None) if self.loaded else None,
+                        **({"deviceName": self.backend.device_name} if self.loaded and getattr(self.backend, "device_name", None) else {}),
                     },
                 }, False
             if operation in {"load_decision", "classify_decision"}:
@@ -172,8 +173,10 @@ class Worker:
                 if not isinstance(quantization, str):
                     return error_response(request_id, "invalid_request", "quantization must be a string"), False
                 if self.loaded:
-                    self.backend.unload()
-                    self.loaded = False
+                    try:
+                        self.backend.unload()
+                    finally:
+                        self.loaded = False
                 self.backend.progress = lambda update: self._emit_progress(request_id, update)
                 try:
                     self.backend.load(quantization)
@@ -260,8 +263,10 @@ class Worker:
 
             if operation == "shutdown":
                 self.decision.unload()
-                self.backend.unload()
-                self.loaded = False
+                try:
+                    self.backend.unload()
+                finally:
+                    self.loaded = False
                 return {"id": request_id, "ok": True}, True
             return error_response(
                 request_id, "unsupported_operation", f"Supported operations: {SUPPORTED_OPERATIONS}"
@@ -437,7 +442,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="VibeVoice JSON Lines worker")
     parser.add_argument(
         "--backend",
-        choices=("vibevoice", "faster-whisper", "openai-compatible", "mock"),
+        choices=("vibevoice", "faster-whisper", "openai-compatible", "speech-cpp", "mock"),
         default=os.environ.get("ASR_WORKER_BACKEND", "faster-whisper"),
     )
     parser.add_argument("--serve", action="store_true", help="Serve an OpenAI-compatible HTTP API")

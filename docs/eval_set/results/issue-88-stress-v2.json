@@ -1,0 +1,505 @@
+{
+  "source_id": "fleurs-ja_jp-test-10112379500600537933",
+  "source_sha256": "f7fedae7b5a3f8355f82b395d93505d1db636511688f22e0373c6182955e3114",
+  "description": "Repeated/truncated public dev audio with 250ms pauses, latency stress only; not natural continuous speech. 10s digital silence is a hallucination check. 5 consecutive direct backend calls per clip, including the first call; same Python process across models, CPU/RSS not isolated. No input injection.",
+  "metadata_revision_note": "v2 corrects the warm5 label in the preserved v1 summary; measured values and original source result are unchanged. Lifecycle rechecked after audit fixes.",
+  "source_result_sha256": "b5f996de89c5036b14b9ee2efd24203ed5cc18be59cd626428c653ce5dd06e75",
+  "records": [
+    {
+      "model": "haas",
+      "audio": "repeated-public-3s.wav",
+      "device": "vulkan",
+      "compute_type": "Q8_0",
+      "wall_ms": {
+        "count": 5,
+        "min": 19.32089999991149,
+        "p50": 19.8288000001412,
+        "p95": 53.77873999987059,
+        "max": 62.25429999994958
+      },
+      "cpu_ms": {
+        "count": 5,
+        "min": 78.125,
+        "p50": 93.75,
+        "p95": 284.375,
+        "max": 312.5
+      },
+      "rss_sum_bytes_max": 176185344,
+      "text_lengths": [
+        10,
+        10,
+        10,
+        10,
+        10
+      ]
+    },
+    {
+      "model": "haas",
+      "audio": "repeated-public-10s.wav",
+      "device": "vulkan",
+      "compute_type": "Q8_0",
+      "wall_ms": {
+        "count": 5,
+        "min": 55.03159999989293,
+        "p50": 56.32340000011027,
+        "p95": 76.63986000006844,
+        "max": 81.08179999999265
+      },
+      "cpu_ms": {
+        "count": 5,
+        "min": 250.0,
+        "p50": 359.375,
+        "p95": 509.375,
+        "max": 546.875
+      },
+      "rss_sum_bytes_max": 176222208,
+      "text_lengths": [
+        65,
+        65,
+        65,
+        65,
+        65
+      ]
+    },
+    {
+      "model": "haas",
+      "audio": "repeated-public-30s.wav",
+      "device": "vulkan",
+      "compute_type": "Q8_0",
+      "wall_ms": {
+        "count": 5,
+        "min": 118.91280000054394,
+        "p50": 122.1133999997619,
+        "p95": 162.00141999997868,
+        "max": 171.36019999998098
+      },
+      "cpu_ms": {
+        "count": 5,
+        "min": 625.0,
+        "p50": 703.125,
+        "p95": 934.375,
+        "max": 984.375
+      },
+      "rss_sum_bytes_max": 177893376,
+      "text_lengths": [
+        162,
+        162,
+        162,
+        162,
+        162
+      ]
+    },
+    {
+      "model": "haas",
+      "audio": "repeated-public-60s.wav",
+      "device": "vulkan",
+      "compute_type": "Q8_0",
+      "wall_ms": {
+        "count": 5,
+        "min": 271.953499999654,
+        "p50": 287.7926999999545,
+        "p95": 2475.074959999801,
+        "max": 3019.808699999885
+      },
+      "cpu_ms": {
+        "count": 5,
+        "min": 1500.0,
+        "p50": 1640.625,
+        "p95": 4175.0,
+        "max": 4796.875
+      },
+      "rss_sum_bytes_max": 219459584,
+      "text_lengths": [
+        337,
+        337,
+        337,
+        337,
+        337
+      ]
+    },
+    {
+      "model": "haas",
+      "audio": "silence-10s.wav",
+      "device": "vulkan",
+      "compute_type": "Q8_0",
+      "wall_ms": {
+        "count": 5,
+        "min": 41.26040000028297,
+        "p50": 43.86419999991631,
+        "p95": 45.919940000203496,
+        "max": 45.93670000031125
+      },
+      "cpu_ms": {
+        "count": 5,
+        "min": 156.25,
+        "p50": 265.625,
+        "p95": 278.125,
+        "max": 281.25
+      },
+      "rss_sum_bytes_max": 218226688,
+      "text_lengths": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "model": "parakeet",
+      "audio": "repeated-public-3s.wav",
+      "device": "vulkan",
+      "compute_type": "Q8_0",
+      "wall_ms": {
+        "count": 5,
+        "min": 21.103400000356487,
+        "p50": 22.639199999503035,
+        "p95": 38.19704000015918,
+        "max": 41.73530000025494
+      },
+      "cpu_ms": {
+        "count": 5,
+        "min": 78.125,
+        "p50": 171.875,
+        "p95": 187.5,
+        "max": 187.5
+      },
+      "rss_sum_bytes_max": 175357952,
+      "text_lengths": [
+        9,
+        9,
+        9,
+        9,
+        9
+      ]
+    },
+    {
+      "model": "parakeet",
+      "audio": "repeated-public-10s.wav",
+      "device": "vulkan",
+      "compute_type": "Q8_0",
+      "wall_ms": {
+        "count": 5,
+        "min": 54.446899999675225,
+        "p50": 56.41800000012154,
+        "p95": 67.58976000000985,
+        "max": 69.98999999996158
+      },
+      "cpu_ms": {
+        "count": 5,
+        "min": 265.625,
+        "p50": 343.75,
+        "p95": 421.875,
+        "max": 437.5
+      },
+      "rss_sum_bytes_max": 178774016,
+      "text_lengths": [
+        74,
+        74,
+        74,
+        74,
+        74
+      ]
+    },
+    {
+      "model": "parakeet",
+      "audio": "repeated-public-30s.wav",
+      "device": "vulkan",
+      "compute_type": "Q8_0",
+      "wall_ms": {
+        "count": 5,
+        "min": 96.4654999997947,
+        "p50": 108.01199999968958,
+        "p95": 129.53819999984262,
+        "max": 134.7065999998449
+      },
+      "cpu_ms": {
+        "count": 5,
+        "min": 500.0,
+        "p50": 593.75,
+        "p95": 759.375,
+        "max": 796.875
+      },
+      "rss_sum_bytes_max": 179978240,
+      "text_lengths": [
+        74,
+        74,
+        74,
+        74,
+        74
+      ]
+    },
+    {
+      "model": "parakeet",
+      "audio": "repeated-public-60s.wav",
+      "device": "vulkan",
+      "compute_type": "Q8_0",
+      "wall_ms": {
+        "count": 5,
+        "min": 188.26809999973193,
+        "p50": 192.44649999927788,
+        "p95": 213.49280000031285,
+        "max": 217.82210000037594
+      },
+      "cpu_ms": {
+        "count": 5,
+        "min": 1015.625,
+        "p50": 1046.875,
+        "p95": 1200.0,
+        "max": 1218.75
+      },
+      "rss_sum_bytes_max": 187809792,
+      "text_lengths": [
+        73,
+        73,
+        73,
+        73,
+        73
+      ]
+    },
+    {
+      "model": "parakeet",
+      "audio": "silence-10s.wav",
+      "device": "vulkan",
+      "compute_type": "Q8_0",
+      "wall_ms": {
+        "count": 5,
+        "min": 43.26560000026802,
+        "p50": 44.66119999960938,
+        "p95": 44.962740000119084,
+        "max": 44.969200000196
+      },
+      "cpu_ms": {
+        "count": 5,
+        "min": 140.625,
+        "p50": 265.625,
+        "p95": 265.625,
+        "max": 265.625
+      },
+      "rss_sum_bytes_max": 187703296,
+      "text_lengths": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "model": "whisper",
+      "audio": "repeated-public-3s.wav",
+      "device": "cuda",
+      "compute_type": "float16",
+      "wall_ms": {
+        "count": 5,
+        "min": 297.8376000000935,
+        "p50": 299.8892000005071,
+        "p95": 302.7046599996538,
+        "max": 303.2501999996384
+      },
+      "cpu_ms": {
+        "count": 5,
+        "min": 281.25,
+        "p50": 296.875,
+        "p95": 321.875,
+        "max": 328.125
+      },
+      "rss_sum_bytes_max": 1115750400,
+      "text_lengths": [
+        8,
+        8,
+        8,
+        8,
+        8
+      ]
+    },
+    {
+      "model": "whisper",
+      "audio": "repeated-public-10s.wav",
+      "device": "cuda",
+      "compute_type": "float16",
+      "wall_ms": {
+        "count": 5,
+        "min": 489.8085999993782,
+        "p50": 498.5330999998041,
+        "p95": 501.4997399999629,
+        "max": 501.84619999981805
+      },
+      "cpu_ms": {
+        "count": 5,
+        "min": 453.125,
+        "p50": 484.375,
+        "p95": 509.375,
+        "max": 515.625
+      },
+      "rss_sum_bytes_max": 1118420992,
+      "text_lengths": [
+        62,
+        62,
+        62,
+        62,
+        62
+      ]
+    },
+    {
+      "model": "whisper",
+      "audio": "repeated-public-30s.wav",
+      "device": "cuda",
+      "compute_type": "float16",
+      "wall_ms": {
+        "count": 5,
+        "min": 3464.4538000002285,
+        "p50": 3482.7016999997795,
+        "p95": 3574.4189600003665,
+        "max": 3590.7898000004934
+      },
+      "cpu_ms": {
+        "count": 5,
+        "min": 4125.0,
+        "p50": 4250.0,
+        "p95": 4471.875,
+        "max": 4484.375
+      },
+      "rss_sum_bytes_max": 1121026048,
+      "text_lengths": [
+        151,
+        151,
+        151,
+        151,
+        151
+      ]
+    },
+    {
+      "model": "whisper",
+      "audio": "repeated-public-60s.wav",
+      "device": "cuda",
+      "compute_type": "float16",
+      "wall_ms": {
+        "count": 5,
+        "min": 6667.446800000107,
+        "p50": 6712.409800000387,
+        "p95": 6756.540280000081,
+        "max": 6762.193300000035
+      },
+      "cpu_ms": {
+        "count": 5,
+        "min": 8031.25,
+        "p50": 8187.5,
+        "p95": 8278.125,
+        "max": 8281.25
+      },
+      "rss_sum_bytes_max": 1121071104,
+      "text_lengths": [
+        322,
+        322,
+        322,
+        322,
+        322
+      ]
+    },
+    {
+      "model": "whisper",
+      "audio": "silence-10s.wav",
+      "device": "cuda",
+      "compute_type": "float16",
+      "wall_ms": {
+        "count": 5,
+        "min": 293.80869999931747,
+        "p50": 297.4400000002788,
+        "p95": 299.17458000018087,
+        "max": 299.42990000017744
+      },
+      "cpu_ms": {
+        "count": 5,
+        "min": 265.625,
+        "p50": 296.875,
+        "p95": 296.875,
+        "max": 296.875
+      },
+      "rss_sum_bytes_max": 1124405248,
+      "text_lengths": [
+        14,
+        14,
+        14,
+        14,
+        14
+      ]
+    }
+  ],
+  "preview": {
+    "haas": {
+      "wall_ms": {
+        "count": 3,
+        "min": 45.842200000151934,
+        "p50": 76.51249999980791,
+        "p95": 88.52300000007745,
+        "max": 89.8575000001074
+      },
+      "live_drain_ms": {
+        "count": 3,
+        "min": 0.0,
+        "p50": 0.0,
+        "p95": 41.59169999966252,
+        "max": 46.212999999625026
+      },
+      "stop_to_final_ms": {
+        "count": 3,
+        "min": 45.842200000151934,
+        "p50": 76.51249999980791,
+        "p95": 130.11469999973997,
+        "max": 136.07049999973242
+      }
+    },
+    "parakeet": {
+      "wall_ms": {
+        "count": 3,
+        "min": 45.26140000052692,
+        "p50": 78.44290000048204,
+        "p95": 83.58774999951493,
+        "max": 84.15939999940747
+      },
+      "live_drain_ms": {
+        "count": 3,
+        "min": 0.0,
+        "p50": 0.0,
+        "p95": 37.633770000047654,
+        "max": 41.81530000005296
+      },
+      "stop_to_final_ms": {
+        "count": 3,
+        "min": 45.26140000052692,
+        "p50": 84.15939999940747,
+        "p95": 116.64832000042225,
+        "max": 120.258200000535
+      }
+    },
+    "whisper": {
+      "wall_ms": {
+        "count": 3,
+        "min": 298.10100000031525,
+        "p50": 300.3998000003776,
+        "p95": 303.766159999941,
+        "max": 304.1401999998925
+      },
+      "live_drain_ms": {
+        "count": 3,
+        "min": 178.89560000003257,
+        "p50": 198.20329999947717,
+        "p95": 210.86045000010927,
+        "max": 212.2668000001795
+      },
+      "stop_to_final_ms": {
+        "count": 3,
+        "min": 483.0357999999251,
+        "p50": 496.3042999997924,
+        "p95": 511.0303700004806,
+        "max": 512.6666000005571
+      }
+    }
+  },
+  "lifecycle": {
+    "crash_error": "speech_cpp_unavailable",
+    "reload_new_server": true,
+    "forced_worker_termination_killed_server_within_5s": true
+  }
+}
