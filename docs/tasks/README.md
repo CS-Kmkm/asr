@@ -5,6 +5,7 @@
 
 | 分類 | 契約 | 扱い |
 |---|---|---|
+| active | [文章品質・意味保存・修正からの学習 — #85](issue-85-text-quality.md) | 補正専用オフライン評価セット・採点・ガード強化・opt-in学習を実装。自動チェック完了、評価はモデルなし（fake）のみ。実プロバイダー評価・人手ブラインド評価・Windows実機UI確認・独立監査は未実施 |
 | active | [モデルカタログ・能力表示 — #87 第1段階](issue-87-model-catalog.md) | 共通カタログ・能力/出所表示・日本語モデルのキャッシュ削除を実装。自動チェック・Codex独立監査完了。PRで公開。Windows実機でのUI確認は未実施、#87本体は継続 |
 | completed | [日本語モデル導入 — #88](issue-88-japanese-models.md) | Windows/Vulkan実装・機能回帰・独立確認完了。[PR #100](https://github.com/CS-Kmkm/asr/pull/100)で公開。追加評価・標準モデル選定は後回し。取り込み状況はPRとIssueを参照。 |
 | completed | [公開音声ベンチマーク — #86](issue-86-public-benchmark.md) | FLEURS＋JVNV固定、batch実認識60件、実時間streaming replay・採点を実装。独立レビュー完了、PR #98 merge・Issueクローズ・実装ブランチ削除済み。実engine結合は #82 |
