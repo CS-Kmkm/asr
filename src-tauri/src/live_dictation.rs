@@ -236,6 +236,10 @@ pub(crate) struct LiveDraft {
     /// Only then does the final paste require an empty selection and an
     /// explicitly inactive IME; without input the recording-start state holds.
     after_input: bool,
+    /// Every paste requires an explicitly empty selection and an inactive
+    /// IME, as after input (Smart Dictate/Edit: the selection was read empty
+    /// at the press, and a selection made since must never be replaced).
+    require_empty_selection: bool,
     attempted: bool,
     defer_insertion: bool,
     pub(crate) pasted: bool,
@@ -293,8 +297,39 @@ impl LiveDraft {
             checkpoint,
             focus_identity,
             after_input: false,
+            require_empty_selection: false,
             attempted: false,
             defer_insertion,
+            pasted: false,
+            preview_decoding: preview_decoding(settings),
+            incremental: incremental::Take::plan(settings),
+            last_hypothesis: String::new(),
+        }
+    }
+
+    /// A Smart Dictate/Edit draft from the field read at the press: its
+    /// input checkpoint and focused-field identity are the press-time ones,
+    /// so a field switch or input during a model load is never accepted.
+    /// Only the final text is pasted, after an explicit empty-selection check.
+    pub(crate) fn from_press(
+        target: TargetWindow,
+        settings: &Settings,
+        mut press: PressSnapshot,
+    ) -> Self {
+        let monitor = press.monitor.take().expect("a snapshot owns its monitor");
+        Self {
+            injector: SystemTextInjector::new(InjectionOptions {
+                restore_clipboard: settings.clipboard_restore,
+            }),
+            monitor,
+            target,
+            session: None,
+            checkpoint: press.checkpoint,
+            focus_identity: press.focus_identity.take(),
+            after_input: false,
+            require_empty_selection: true,
+            attempted: false,
+            defer_insertion: true,
             pasted: false,
             preview_decoding: preview_decoding(settings),
             incremental: incremental::Take::plan(settings),
@@ -464,7 +499,7 @@ impl LiveDraft {
                     &self.monitor,
                     self.checkpoint.expect("checkpoint was verified"),
                     cancel,
-                    self.after_input,
+                    self.after_input || self.require_empty_selection,
                 )?;
                 self.pasted |= result != InsertResult::ClipboardOnly;
                 Ok(result)
@@ -504,7 +539,7 @@ impl LiveDraft {
                 &self.monitor,
                 self.checkpoint,
                 result == InsertResult::PasteUnverified,
-                self.after_input,
+                self.after_input || self.require_empty_selection,
             )
         })
     }
@@ -531,6 +566,37 @@ impl Drop for LiveDraft {
             self.injector.cancel_provisional(session, &self.monitor);
         }
         self.monitor.shutdown();
+    }
+}
+
+/// The input monitor, its checkpoint and the focused-field identity taken
+/// when a Smart Dictate/Edit key was pressed. Dropping an unused snapshot
+/// stops its monitor.
+pub(crate) struct PressSnapshot {
+    monitor: Option<Arc<InputMonitor>>,
+    checkpoint: Option<u64>,
+    focus_identity: Option<Vec<i32>>,
+}
+
+impl PressSnapshot {
+    pub(crate) fn new(
+        monitor: Arc<InputMonitor>,
+        checkpoint: Option<u64>,
+        focus_identity: Option<Vec<i32>>,
+    ) -> Self {
+        Self {
+            monitor: Some(monitor),
+            checkpoint,
+            focus_identity,
+        }
+    }
+}
+
+impl Drop for PressSnapshot {
+    fn drop(&mut self) {
+        if let Some(monitor) = &self.monitor {
+            monitor.shutdown();
+        }
     }
 }
 
@@ -941,6 +1007,7 @@ mod tests {
             checkpoint: Some(0),
             focus_identity: None,
             after_input: false,
+            require_empty_selection: false,
             attempted: false,
             defer_insertion: true,
             pasted: false,
@@ -1402,6 +1469,7 @@ mod tests {
             checkpoint,
             focus_identity: None,
             after_input: false,
+            require_empty_selection: false,
             attempted: false,
             defer_insertion: false,
             pasted: false,
@@ -1414,6 +1482,83 @@ mod tests {
 
     fn content(mock: &SharedMock) -> String {
         mock.lock().unwrap().content()
+    }
+
+    /// A Smart Dictate draft built from the press-time snapshot over the
+    /// mock field, whose focused element has identity `[1]`.
+    fn smart_press_draft(live_insertion: bool) -> (LiveDraft, SharedMock) {
+        let mock = Arc::new(std::sync::Mutex::new(MockBackend::new()));
+        let monitor = available_monitor();
+        let checkpoint = monitor.checkpoint();
+        let settings = Settings {
+            live_target_insertion: live_insertion,
+            ..Settings::default()
+        };
+        let mut draft = LiveDraft::from_press(
+            test_backend::target(),
+            &settings,
+            PressSnapshot::new(monitor, checkpoint, Some(vec![1])),
+        );
+        draft.injector =
+            SystemTextInjector::with_mock(Arc::clone(&mock), InjectionOptions::default());
+        (draft, mock)
+    }
+
+    #[test]
+    fn a_smart_dictate_pastes_into_the_press_field_with_its_selection_still_empty() {
+        let (mut draft, mock) = smart_press_draft(false);
+        let (_cancel, cancelled) = watch::channel(false);
+        assert_eq!(
+            draft.finish("本文", &cancelled),
+            Ok(InsertResult::ClipboardPaste)
+        );
+        assert_eq!(content(&mock), "prefix 本文 suffix");
+    }
+
+    #[test]
+    fn a_smart_dictate_never_accepts_another_field_or_a_new_selection() {
+        type Change = Box<dyn Fn(&MockBackend)>;
+        let changes: Vec<(&str, Change)> = vec![
+            // Another field of the same browser/Electron window was focused
+            // while the model loaded.
+            ("field switched", Box::new(|b| b.set_identity(vec![2]))),
+            ("text selected", Box::new(|b| b.set_selected_text("chosen"))),
+            ("object selected", Box::new(|b| b.set_object_selected(true))),
+            (
+                "selection unreadable",
+                Box::new(|b| {
+                    b.set_text_readable(false);
+                    b.set_selection_readable(false);
+                }),
+            ),
+        ];
+        for (name, change) in changes {
+            let (mut draft, mock) = smart_press_draft(false);
+            change(&mock.lock().unwrap());
+            let before = content(&mock);
+            let (_cancel, cancelled) = watch::channel(false);
+            let result = draft.finish("本文", &cancelled);
+            assert_ne!(result, Ok(InsertResult::ClipboardPaste), "{name}");
+            assert_eq!(mock_calls(&mock, "paste"), 0, "{name}");
+            assert_eq!(content(&mock), before, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_smart_dictate_never_inserts_live_text() {
+        let (mut draft, mock) = smart_press_draft(true);
+        draft.update("途中").unwrap();
+        assert!(!draft.edits_target_live());
+        assert_eq!(mock_calls(&mock, "paste"), 0);
+        assert!(!draft.pasted);
+    }
+
+    #[test]
+    fn an_unused_press_snapshot_stops_its_monitor() {
+        let monitor = available_monitor();
+        let snapshot = PressSnapshot::new(Arc::clone(&monitor), monitor.checkpoint(), None);
+        drop(snapshot);
+        assert!(monitor.checkpoint().is_none());
     }
 
     #[test]

@@ -1385,7 +1385,12 @@ fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
         let generation = hold.begin(shortcut);
         drop(hold);
         if let Some(generation) = generation {
-            tauri::async_runtime::spawn(held_voice_mode(app, mode, route.text, generation));
+            // Key-down: the start request time and Smart snapshot are taken
+            // now, not after the hold delay.
+            let pressed = std::time::Instant::now();
+            tauri::async_runtime::spawn(held_voice_mode(
+                app, mode, route.text, generation, pressed,
+            ));
         }
         return;
     }
@@ -1409,11 +1414,29 @@ fn handle_shortcut(app: AppHandle, shortcut: Shortcut) {
     };
 }
 
-async fn held_voice_mode(app: AppHandle, mode: PipelineMode, chord: String, generation: u64) {
+async fn held_voice_mode(
+    app: AppHandle,
+    mode: PipelineMode,
+    chord: String,
+    generation: u64,
+    pressed: std::time::Instant,
+) {
+    // The Smart Dictate/Edit snapshot of the original field is read at
+    // key-down, in parallel with the hold delay.
+    let smart_press = tauri::async_runtime::spawn(commands::capture_smart_press(
+        app.clone(),
+        mode,
+        chord.clone(),
+    ));
     // A brief accidental press opens no microphone and never captures
     // pre-roll. Starting also rechecks the generation under the hold lock.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    if let Err(error) = commands::start_held_recording(app.clone(), mode, chord, generation).await {
+    // An accidental press drops its snapshot, which stops its monitor.
+    let smart_press = smart_press.await.ok().flatten();
+    if let Err(error) =
+        commands::start_held_recording(app.clone(), mode, chord, generation, pressed, smart_press)
+            .await
+    {
         let held = app
             .state::<Services>()
             .shortcut_hold

@@ -147,14 +147,7 @@ pub(crate) async fn finish(
         let committed = commit_edit_replacement(
             &services.lifecycle,
             operation_id,
-            || {
-                session.injector.replace_selection(
-                    &session.selection,
-                    &edited_for_insertion,
-                    &session.monitor,
-                    session.checkpoint,
-                )
-            },
+            || session.replace(&edited_for_insertion),
             || session.injector.copy_to_clipboard(&edited_for_insertion),
         );
         if let CommittedOutput::Ran((insertion, _)) = &committed {

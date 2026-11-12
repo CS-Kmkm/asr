@@ -809,8 +809,17 @@ pub(super) fn probe_selection<B: Backend>(backend: &B) -> SelectionProbe {
     if backend.ime_composition_active(&target) == Ok(Some(true)) {
         return SelectionProbe::Unknown(UnknownSelection::ImeComposing);
     }
+    // Empty selected text is not an empty selection: a selected embedded
+    // object returns no characters. Only collapsed endpoints count as empty.
+    let empty = |target: TargetWindow| match backend.selection_is_empty(&target) {
+        Ok(true) => SelectionProbe::Empty {
+            focus_identity: backend.focus_identity(&target).ok(),
+            target,
+        },
+        _ => SelectionProbe::Unknown(UnknownSelection::Unreadable),
+    };
     match backend.target_text(&target) {
-        Ok(state) if state.selected.is_empty() => SelectionProbe::Empty(target),
+        Ok(state) if state.selected.is_empty() => empty(target),
         Ok(state) => SelectionProbe::Selected(SelectedText {
             target,
             text: state.selected.clone(),
@@ -824,10 +833,7 @@ pub(super) fn probe_selection<B: Backend>(backend: &B) -> SelectionProbe {
         }
         // The text cannot be read. An explicitly empty selection still
         // makes an additive paste safe; a nonempty or unreadable one does not.
-        Err(_) => match backend.selection_is_empty(&target) {
-            Ok(true) => SelectionProbe::Empty(target),
-            _ => SelectionProbe::Unknown(UnknownSelection::Unreadable),
-        },
+        Err(_) => empty(target),
     }
 }
 
@@ -1687,6 +1693,11 @@ pub(super) mod tests {
         readback_after_paste: RefCell<Option<TargetText>>,
         /// What `capture_target` returns instead of `target()`.
         captured: RefCell<Option<Result<TargetWindow, InjectionError>>>,
+        /// A selected embedded object: no selected characters, yet the
+        /// selection is not collapsed.
+        object_selected: Cell<bool>,
+        /// Runs on every full text read, as input arriving while it is read.
+        on_read: RefCell<Option<Box<dyn Fn() + Send>>>,
     }
 
     impl MockBackend {
@@ -1737,6 +1748,8 @@ pub(super) mod tests {
                 on_snapshot: None,
                 readback_after_paste: RefCell::new(None),
                 captured: RefCell::new(None),
+                object_selected: Cell::new(false),
+                on_read: RefCell::new(None),
             }
         }
         fn apply_pending(&self) {
@@ -1764,6 +1777,16 @@ pub(super) mod tests {
         /// False when the captured field is no longer the focused one.
         pub(crate) fn set_target_valid(&self, valid: bool) {
             self.target_valid.set(valid);
+        }
+        pub(crate) fn set_on_read(&self, on_read: impl Fn() + Send + 'static) {
+            *self.on_read.borrow_mut() = Some(Box::new(on_read));
+        }
+        pub(crate) fn set_object_selected(&self, selected: bool) {
+            self.object_selected.set(selected);
+        }
+        /// Focus moves to another field of the same window.
+        pub(crate) fn set_identity(&self, identity: Vec<i32>) {
+            self.text.borrow_mut().identity = identity;
         }
         pub(crate) fn set_captured(&self, captured: Result<TargetWindow, InjectionError>) {
             *self.captured.borrow_mut() = Some(captured);
@@ -1819,6 +1842,9 @@ pub(super) mod tests {
         }
         fn target_text(&self, _: &TargetWindow) -> Result<TargetText, InjectionError> {
             self.text_reads.set(self.text_reads.get() + 1);
+            if let Some(on_read) = self.on_read.borrow().as_ref() {
+                on_read();
+            }
             if self.text_readable.get() {
                 Ok(self.text.borrow().clone())
             } else {
@@ -1827,7 +1853,7 @@ pub(super) mod tests {
         }
         fn selection_is_empty(&self, _: &TargetWindow) -> Result<bool, InjectionError> {
             if self.selection_readable.get() {
-                Ok(self.text.borrow().selected.is_empty())
+                Ok(self.text.borrow().selected.is_empty() && !self.object_selected.get())
             } else {
                 Err(InjectionError::BackendFailure("unreadable selection"))
             }

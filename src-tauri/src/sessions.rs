@@ -9,11 +9,16 @@ use crate::{
 };
 use std::sync::Arc;
 
+const EDIT_MONITOR_UNSAFE: &str = "Speak to edit could not monitor the original selection safely.";
+
 pub(crate) struct EditSession {
     pub(crate) selection: SelectedText,
     pub(crate) injector: SystemTextInjector,
     pub(crate) monitor: Arc<InputMonitor>,
     pub(crate) checkpoint: u64,
+    /// The replacement also requires the UI Automation identity of the field
+    /// the selection was read from (Smart Dictate/Edit).
+    pub(crate) same_field: bool,
 }
 
 impl EditSession {
@@ -41,42 +46,80 @@ impl EditSession {
         injector: SystemTextInjector,
         monitor: Arc<InputMonitor>,
     ) -> Result<Self, String> {
-        let selection = injector
-            .capture_selection()
-            .map_err(|_| "Select text in a supported foreground edit control.".to_string())?;
-        Self::from_selection(
-            selection,
-            injector,
-            monitor,
+        let checkpoint = Self::start_monitor(
+            &monitor,
             active_hotkey,
             &settings.shortcuts.edit,
             from_shortcut,
-        )
+        )?;
+        let selection = match injector.capture_selection() {
+            Ok(selection) => selection,
+            Err(_) => {
+                monitor.shutdown();
+                return Err("Select text in a supported foreground edit control.".into());
+            }
+        };
+        Self::from_monitored(selection, injector, monitor, checkpoint, false)
     }
 
-    /// An Edit over an already captured selection. `shortcuts` are the
-    /// chords of the key that started the take, whose own presses and
-    /// release are not user activity.
-    pub(crate) fn from_selection(
-        selection: SelectedText,
-        injector: SystemTextInjector,
-        monitor: Arc<InputMonitor>,
+    /// Starts monitoring before the selection is read, so input while it is
+    /// read is observed. `shortcuts` are the chords of the key that started
+    /// the take, whose own presses and release are not user activity.
+    pub(crate) fn start_monitor(
+        monitor: &InputMonitor,
         active_hotkey: &str,
         shortcuts: &[String],
         from_shortcut: bool,
-    ) -> Result<Self, String> {
-        if !monitor.start_for_recording(active_hotkey, shortcuts, from_shortcut) {
-            return Err("Speak to edit could not monitor the original selection safely.".into());
-        }
+    ) -> Result<u64, String> {
         let checkpoint = monitor
-            .checkpoint()
-            .ok_or("Speak to edit could not monitor the original selection safely.")?;
+            .start_for_recording(active_hotkey, shortcuts, from_shortcut)
+            .then(|| monitor.checkpoint())
+            .flatten();
+        checkpoint.ok_or_else(|| {
+            monitor.shutdown();
+            EDIT_MONITOR_UNSAFE.to_owned()
+        })
+    }
+
+    /// An Edit over a selection read after `checkpoint` was taken. Any input
+    /// observed since then, while the selection was read, refuses it: the
+    /// field may have been changed and changed back.
+    pub(crate) fn from_monitored(
+        selection: SelectedText,
+        injector: SystemTextInjector,
+        monitor: Arc<InputMonitor>,
+        checkpoint: u64,
+        same_field: bool,
+    ) -> Result<Self, String> {
+        if monitor.checkpoint() != Some(checkpoint) {
+            monitor.shutdown();
+            return Err(EDIT_MONITOR_UNSAFE.into());
+        }
         Ok(Self {
             selection,
             injector,
             monitor,
             checkpoint,
+            same_field,
         })
+    }
+
+    /// Replaces the original selection under the session's guards.
+    pub(crate) fn replace(
+        &self,
+        text: &str,
+    ) -> Result<injection::InsertResult, injection::InjectionError> {
+        if self.same_field {
+            self.injector.replace_selection_in_same_field(
+                &self.selection,
+                text,
+                &self.monitor,
+                self.checkpoint,
+            )
+        } else {
+            self.injector
+                .replace_selection(&self.selection, text, &self.monitor, self.checkpoint)
+        }
     }
 }
 
@@ -146,6 +189,7 @@ impl AskSession {
             injector: std::mem::take(&mut self.injector),
             monitor: self.monitor.take().expect("checked"),
             checkpoint: self.checkpoint.take().expect("checked"),
+            same_field: false,
         })
     }
 
@@ -281,6 +325,39 @@ mod tests {
             .is_err());
             assert_eq!(calls(&mock.lock().unwrap(), "paste"), 0);
         }
+    }
+
+    #[test]
+    fn edit_monitoring_starts_before_the_selection_is_read() {
+        let settings = Settings::default();
+        // Input while the selection is read refuses the edit and stops the
+        // monitor, even if the field reads the same afterwards.
+        let (injector, mock, monitor) = dependencies("original", true);
+        mock.lock().unwrap().set_on_read({
+            let monitor = Arc::clone(&monitor);
+            move || monitor.test_record_input()
+        });
+        assert!(EditSession::with_injector(
+            &settings,
+            &settings.shortcuts.edit[0],
+            false,
+            injector,
+            Arc::clone(&monitor),
+        )
+        .is_err());
+        assert!(monitor.checkpoint().is_none());
+        assert_eq!(calls(&mock.lock().unwrap(), "paste"), 0);
+        // Failing to read a selection also stops the monitor.
+        let (injector, _mock, monitor) = dependencies("", true);
+        assert!(EditSession::with_injector(
+            &settings,
+            &settings.shortcuts.edit[0],
+            false,
+            injector,
+            Arc::clone(&monitor),
+        )
+        .is_err());
+        assert!(monitor.checkpoint().is_none());
     }
 
     #[test]

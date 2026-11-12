@@ -54,7 +54,7 @@ impl SmartRoute {
 pub(crate) fn decide(probe: &SelectionProbe) -> SmartRoute {
     match probe {
         SelectionProbe::Selected(_) => SmartRoute::Edit,
-        SelectionProbe::Empty(_) => SmartRoute::Dictate,
+        SelectionProbe::Empty { .. } => SmartRoute::Dictate,
         SelectionProbe::Unknown(reason) => SmartRoute::CopyOnly(*reason),
     }
 }
@@ -194,6 +194,19 @@ mod tests {
                 SmartRoute::CopyOnly(ThisApp),
             ),
             (
+                "selected embedded object without characters",
+                Box::new(|b| b.set_object_selected(true)),
+                SmartRoute::CopyOnly(Unreadable),
+            ),
+            (
+                "unreadable text, embedded object selected",
+                Box::new(|b| {
+                    b.set_text_readable(false);
+                    b.set_object_selected(true);
+                }),
+                SmartRoute::CopyOnly(Unreadable),
+            ),
+            (
                 "open IME conversion with a selection",
                 Box::new(|b| {
                     b.set_selected_text("変換");
@@ -293,13 +306,12 @@ mod tests {
         };
         let monitor = Arc::new(InputMonitor::default());
         monitor.test_set_available(true);
-        let settings = Settings::default();
-        let session = EditSession::from_selection(
+        let checkpoint = monitor.checkpoint().unwrap();
+        let session = EditSession::from_monitored(
             selection,
             injector,
             Arc::clone(&monitor),
-            &settings.shortcuts.dictate[0],
-            &settings.shortcuts.dictate,
+            checkpoint,
             true,
         )
         .expect("monitored edit session");
@@ -307,12 +319,7 @@ mod tests {
     }
 
     fn replace(session: &EditSession) -> Result<crate::injection::InsertResult, InjectionError> {
-        session.injector.replace_selection(
-            &session.selection,
-            "edited",
-            &session.monitor,
-            session.checkpoint,
-        )
+        session.replace("edited")
     }
 
     #[test]
@@ -339,6 +346,10 @@ mod tests {
             (
                 "keystrokes observed meanwhile",
                 Box::new(|_, monitor| monitor.test_record_input()),
+            ),
+            (
+                "another field with the same text and selection focused",
+                Box::new(|b, _| b.set_identity(vec![9])),
             ),
             (
                 "target unreadable",
@@ -369,12 +380,23 @@ mod tests {
             panic!("selection expected");
         };
         let monitor = Arc::new(InputMonitor::default());
-        monitor.test_set_available(false);
-        let settings = Settings::default();
-        assert!(EditSession::from_selection(
+        monitor.test_set_available(true);
+        let checkpoint = monitor.checkpoint().unwrap();
+        // Input observed while the selection was read refuses the edit.
+        monitor.test_record_input();
+        assert!(EditSession::from_monitored(
             selection,
             injector,
-            monitor,
+            Arc::clone(&monitor),
+            checkpoint,
+            true
+        )
+        .is_err());
+        assert!(monitor.checkpoint().is_none(), "the monitor was stopped");
+        let settings = Settings::default();
+        let unavailable = InputMonitor::default();
+        assert!(EditSession::start_monitor(
+            &unavailable,
             &settings.shortcuts.dictate[0],
             &settings.shortcuts.dictate,
             true,
