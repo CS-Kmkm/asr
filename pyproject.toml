@@ -25,7 +25,34 @@ vibevoice = [
     "librosa>=0.11.0",
     "torch==2.11.0",
     "torchvision==0.26.0",
-    "transformers>=5.6.2",
+    # Upper bound keeps the release VibeVoice was locked and verified with
+    # (5.10.2) once the lock forks for the transformers-asr extra.
+    "transformers>=5.6.2,<5.11",
+]
+# Windows-native ONNX Runtime ASR (issue #87). On Windows with CPython 3.12 the
+# sherpa-onnx wheel is the maintainer's CUDA 12 / cuDNN 9 build (it also runs on
+# CPU); the NVIDIA runtime wheels supply the CUDA DLLs it links against. Other
+# platforms get the CPU-only PyPI wheel.
+sherpa-onnx = [
+    "numpy>=1.24",
+    "sherpa-onnx==2.0.1",
+    "truststore>=0.10",
+    "nvidia-cuda-runtime-cu12==12.9.79; sys_platform == 'win32'",
+    "nvidia-cublas-cu12==12.9.2.10; sys_platform == 'win32'",
+    "nvidia-cufft-cu12==11.4.1.4; sys_platform == 'win32'",
+    "nvidia-curand-cu12==10.3.10.19; sys_platform == 'win32'",
+    "nvidia-cuda-nvrtc-cu12==12.9.86; sys_platform == 'win32'",
+    "nvidia-cudnn-cu12==9.27.0.42; sys_platform == 'win32'",
+]
+# Native transformers ASR models on torch CUDA (Qwen3-ASR, issue #87). Its
+# transformers release conflicts with the `decision` pin and is kept apart from
+# `vibevoice` so neither existing extra changes; see [tool.uv] conflicts.
+transformers-asr = [
+    "accelerate>=1.13.0",
+    "librosa>=0.11.0",
+    "torch==2.11.0",
+    "transformers==5.15.1",
+    "truststore>=0.10",
 ]
 serve = [
     "fastapi>=0.115,<1",
@@ -33,7 +60,16 @@ serve = [
     "uvicorn>=0.34,<1",
 ]
 
+[tool.uv]
+conflicts = [
+    [{ extra = "transformers-asr" }, { extra = "decision" }],
+    [{ extra = "transformers-asr" }, { extra = "vibevoice" }],
+]
+
 [tool.uv.sources]
+sherpa-onnx = [
+    { url = "https://huggingface.co/csukuangfj2/sherpa-onnx-wheels/resolve/a095349253fe0776ec06c8f8fa7fb3bc572c0589/cuda/2.0.1/sherpa_onnx-2.0.1%2Bcuda12.cudnn9-cp312-cp312-win_amd64.whl", marker = "sys_platform == 'win32' and python_version == '3.12' and platform_machine == 'AMD64'" },
+]
 torch = [
     { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
