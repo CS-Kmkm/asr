@@ -77,11 +77,13 @@ pub(super) fn accept_provider_correction(
     corrected: String,
 ) -> Result<String, CorrectionError> {
     if settings.correction_mode != "intent_aware" {
-        return if conservative_output_is_plausible(transcript, &corrected, dictionary_hints) {
-            Ok(corrected)
-        } else {
-            Err(CorrectionError::ConservativeContentChanged)
-        };
+        if !conservative_output_is_plausible(transcript, &corrected, dictionary_hints) {
+            return Err(CorrectionError::ConservativeContentChanged);
+        }
+        return conservative_rejection(transcript, &corrected, fact_edits(settings))
+            .map_or(Ok(corrected), |kind| {
+                Err(CorrectionError::ProtectedContentChanged(kind))
+            });
     }
     validate_correction_output_with_terms(settings, transcript, &corrected, dictionary_hints)?;
     Ok(corrected)
@@ -105,14 +107,65 @@ pub(super) fn validate_correction_output_with_terms(
     if settings.correction_mode != "intent_aware" {
         return Ok(());
     }
-    let edits = FactEdits {
-        corrections: settings.correction_resolve_self_corrections,
-        merge_duplicates: settings.correction_remove_repetitions,
-    };
+    let edits = fact_edits(settings);
     protected_rejection(transcript, corrected, edits, dictionary_hints).map_or(Ok(()), |kind| {
         Err(CorrectionError::ProtectedContentChanged(kind))
     })?;
     Ok(())
+}
+
+fn fact_edits(settings: &Settings) -> FactEdits {
+    FactEdits {
+        corrections: settings.correction_resolve_self_corrections,
+        merge_duplicates: settings.correction_remove_repetitions,
+    }
+}
+
+/// Facts a conservative edit must keep (Issue #85). Unlike intent-aware
+/// output, number spelling may change (３ -> 3, 3000 -> 3,000, 三人 -> 3人),
+/// so numbers compare by value and counter; URLs and backtick code compare
+/// exactly; negations and questions keep their polarity. Names are not
+/// checked, so spelling fixes such as open ai -> OpenAI stay possible.
+fn conservative_rejection(
+    transcript: &str,
+    corrected: &str,
+    edits: FactEdits,
+) -> Option<ProtectedContentKind> {
+    let corrected = &strip_ordered_list_markers(corrected);
+    // NFKC leaves the minus sign (U+2212) alone; it is the same sign as `-`.
+    let normalize = |text: &str| {
+        text.nfkc()
+            .collect::<String>()
+            .to_lowercase()
+            .replace('\u{2212}', "-")
+    };
+    let (source, output) = (normalize(transcript), normalize(corrected));
+    if !facts_preserved(&source, &output, &output, ProtectedKind::NumberValue, edits) {
+        return Some(ProtectedContentKind::Number);
+    }
+    for (kind, reason) in [
+        (ProtectedKind::Url, ProtectedContentKind::Url),
+        (ProtectedKind::Code, ProtectedContentKind::Code),
+    ] {
+        if !facts_preserved(transcript, corrected, corrected, kind, edits) {
+            return Some(reason);
+        }
+    }
+    polarity_rejection(transcript, corrected, edits)
+}
+
+fn polarity_rejection(
+    transcript: &str,
+    corrected: &str,
+    edits: FactEdits,
+) -> Option<ProtectedContentKind> {
+    if !super::polarity::negation_preserved(transcript, corrected, edits) {
+        return Some(ProtectedContentKind::Negation);
+    }
+    if !super::polarity::question_preserved(transcript, corrected, edits) {
+        return Some(ProtectedContentKind::Question);
+    }
+    None
 }
 
 /// Editing switches that decide which source facts the output may drop.
@@ -176,7 +229,7 @@ fn protected_rejection(
     if !proper_nouns_preserved_with_terms(transcript, corrected, edits, dictionary_hints) {
         return Some(ProtectedContentKind::Name);
     }
-    None
+    polarity_rejection(transcript, corrected, edits)
 }
 
 /// Names must survive intent-aware editing: every kept source name stays,
@@ -540,6 +593,8 @@ pub(super) fn remove_prompted_dictionary_surfaces(
 pub(super) enum ProtectedKind {
     Url,
     Number,
+    /// Numbers by value: digits and kanji numerals as one decimal string.
+    NumberValue,
     Code,
 }
 
@@ -572,6 +627,14 @@ pub(super) fn fact_occurrences(text: &str, kind: ProtectedKind) -> Vec<FactOccur
             .into_iter()
             .map(|(range, value)| {
                 let unit = number_unit(text, &range);
+                (range, FactKey { value, unit })
+            })
+            .collect(),
+        ProtectedKind::NumberValue => number_occurrences(text)
+            .into_iter()
+            .map(|(range, value)| {
+                let unit = number_unit(text, &range);
+                let value = number_value_key(text, &range, &value);
                 (range, FactKey { value, unit })
             })
             .collect(),
@@ -806,8 +869,11 @@ const REPAIR_CUES: [&str; 12] = [
     "I mean",
     "rather",
 ];
-// Empty hesitations that may sit between a repair cue and its replacement.
-const REPAIR_FILLERS: [&str; 11] = [
+// Empty hesitations and English restatement phrases ("actually, make that
+// 4 pm") that may sit between a repair cue and its replacement.
+const REPAIR_FILLERS: [&str; 13] = [
+    "make that",
+    "make it",
     "えーっと",
     "えーと",
     "ええと",
@@ -967,6 +1033,143 @@ pub(super) fn number_occurrences(text: &str) -> Vec<(std::ops::Range<usize>, Str
         }
     }
     spans
+}
+
+/// Latin unit words that may follow a number after one space (`2.5 GB`).
+/// Units written without a space are taken from the token itself.
+const LATIN_UNITS: [&str; 44] = [
+    "b", "kb", "mb", "gb", "tb", "pb", "kib", "mib", "gib", "tib", "bit", "bits", "bps", "kbps",
+    "mbps", "gbps", "ms", "s", "sec", "secs", "min", "mins", "h", "hr", "hrs", "km", "m", "cm",
+    "mm", "kg", "g", "mg", "ml", "px", "fps", "hz", "khz", "mhz", "ghz", "pm", "am", "usd", "jpy",
+    "x",
+];
+
+/// The comparison key of a number in lower-cased NFKC text: the sign, any
+/// letters glued before it (`mp3`), its value (see [`number_value`]) and a
+/// Latin unit (`gb`, `ms`, `%`). Only equivalent spellings share a key:
+/// `-4` and `+4`, `2.5gb` and `2.5tb` differ; `2.5GB` and `2.5 GB` match.
+/// A hyphen glued to a word (`gpt-4`) is not a sign.
+pub(super) fn number_value_key(text: &str, range: &std::ops::Range<usize>, token: &str) -> String {
+    let glued_to_word = text[..range.start]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_ascii_alphanumeric());
+    let sign = if token.starts_with('-') && !glued_to_word {
+        "-"
+    } else {
+        ""
+    };
+    let body = token.trim_start_matches(['-', '+', ' ', '\t']);
+    let prefix: String = body
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
+    let mut suffix: String = body
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if suffix.len() == body.len() {
+        suffix.clear();
+    }
+    let rest = &text[range.end..];
+    if suffix.is_empty() {
+        let after_space = rest.strip_prefix(' ').unwrap_or(rest);
+        if after_space.starts_with('%') {
+            suffix.push('%');
+        } else {
+            let word: String = after_space
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .collect();
+            let ends = after_space[word.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric());
+            if ends && LATIN_UNITS.contains(&word.as_str()) {
+                suffix = word;
+            }
+        }
+    }
+    let value = number_value(token).unwrap_or_else(|| body.to_owned());
+    format!("{sign}{prefix}{value}{suffix}")
+}
+
+/// The decimal value of a number token, ignoring how it was written:
+/// `3,000`, `３０００`, `三千` and `3千` are all `3000`, `mp3` is `3`, and
+/// `2.5gb` is `2.5`. Signs are dropped. Returns `None` for tokens it cannot
+/// read (kanji numerals with a decimal point, overflow), which then compare
+/// by spelling.
+pub(super) fn number_value(token: &str) -> Option<String> {
+    let core = token
+        .trim_start_matches(|c: char| !is_number_character(c))
+        .trim_end_matches(|c: char| !is_number_character(c));
+    if core.is_empty() {
+        return None;
+    }
+    let digit = |c: char| -> Option<u128> {
+        c.to_digit(10).map(u128::from).or_else(|| {
+            let position = "〇一二三四五六七八九"
+                .chars()
+                .position(|numeral| numeral == c)
+                .or(match c {
+                    '零' => Some(0),
+                    '壱' => Some(1),
+                    '弐' => Some(2),
+                    '参' => Some(3),
+                    _ => None,
+                })?;
+            u128::try_from(position).ok()
+        })
+    };
+    let multiplier = |c: char| -> Option<u128> {
+        Some(match c {
+            '十' => 10,
+            '百' => 100,
+            '千' => 1_000,
+            '万' => 10_000,
+            '億' => 100_000_000,
+            '兆' => 1_000_000_000_000,
+            _ => return None,
+        })
+    };
+    let core: String = core.chars().filter(|c| *c != ',').collect();
+    if !core.chars().any(|c| multiplier(c).is_some()) {
+        // Digits written one by one (302, 三〇二, 2.5, 10:00) keep their
+        // separators; only the digit glyphs are normalized.
+        return core
+            .chars()
+            .map(|c| match digit(c) {
+                Some(value) => char::from_digit(u32::try_from(value).ok()?, 10),
+                None => matches!(c, '.' | ':' | '/' | '-').then_some(c),
+            })
+            .collect();
+    }
+    let (mut total, mut section, mut current) = (0u128, 0u128, None::<u128>);
+    for c in core.chars() {
+        if let Some(value) = digit(c) {
+            current = Some(current.unwrap_or(0).checked_mul(10)?.checked_add(value)?);
+        } else {
+            let unit = multiplier(c)?;
+            if unit >= 10_000 {
+                let group = section.checked_add(current.unwrap_or(0))?;
+                total = total.checked_add(group.max(1).checked_mul(unit)?)?;
+                section = 0;
+            } else {
+                section = section.checked_add(current.unwrap_or(1).checked_mul(unit)?)?;
+            }
+            current = None;
+        }
+    }
+    Some(
+        total
+            .checked_add(section)?
+            .checked_add(current.unwrap_or(0))?
+            .to_string(),
+    )
 }
 
 const KANJI_NUMERALS: &str = "〇零一二三四五六七八九十百千万億兆壱弐参";
@@ -1196,5 +1399,160 @@ pub(super) fn is_english_word_character(character: char) -> bool {
 pub(super) fn push_unique_span(spans: &mut Vec<String>, span: &str) {
     if !span.is_empty() && !spans.iter().any(|existing| existing == span) {
         spans.push(span.into());
+    }
+}
+
+#[cfg(test)]
+mod conservative_tests {
+    use super::*;
+
+    fn conservative(transcript: &str, output: &str) -> Result<String, CorrectionError> {
+        accept_provider_correction(&Settings::default(), transcript, &[], output.to_owned())
+    }
+
+    fn rejection(transcript: &str, output: &str) -> Option<&'static str> {
+        match conservative(transcript, output) {
+            Err(CorrectionError::ProtectedContentChanged(kind)) => Some(kind.metric_code()),
+            Err(other) => panic!("unexpected {other:?}"),
+            Ok(_) => None,
+        }
+    }
+
+    #[test]
+    fn number_values_ignore_spelling_but_not_value() {
+        for (token, value) in [
+            ("3,000", "3000"),
+            ("３０００", "3000"),
+            ("三千", "3000"),
+            ("3千", "3000"),
+            ("二十三", "23"),
+            ("千五百", "1500"),
+            ("一万二千", "12000"),
+            ("1万5000", "15000"),
+            ("三〇二", "302"),
+            ("mp3", "3"),
+            ("2.5gb", "2.5"),
+            ("-4", "4"),
+            ("10:00", "10:00"),
+        ] {
+            let normalized = token.nfkc().collect::<String>();
+            assert_eq!(number_value(&normalized).as_deref(), Some(value), "{token}");
+        }
+    }
+
+    #[test]
+    fn conservative_mode_rejects_changed_values_units_urls_code_and_polarity() {
+        for (source, output, code) in [
+            (
+                "会議は10時から第2会議室です。",
+                "会議は11時から第2会議室です。",
+                "protected_number_changed",
+            ),
+            ("最大2.5GBまで", "最大25GBまで", "protected_number_changed"),
+            (
+                "タイムアウトは30秒です",
+                "タイムアウトは30分です",
+                "protected_number_changed",
+            ),
+            (
+                "参加者は三人です",
+                "参加者は4人です",
+                "protected_number_changed",
+            ),
+            (
+                "手順は https://example.com/docs/setup にあります",
+                "手順は https://example.com/doc/setup にあります",
+                "protected_url_changed",
+            ),
+            (
+                "Run `pnpm test` first.",
+                "Run `pnpm build` first.",
+                "protected_code_changed",
+            ),
+            (
+                "まだ送らないでください。",
+                "まだ送ってください。",
+                "protected_negation_changed",
+            ),
+            (
+                "この関数ってスレッドセーフですか？",
+                "この関数はスレッドセーフです。",
+                "protected_question_changed",
+            ),
+        ] {
+            assert_eq!(
+                rejection(source, output),
+                Some(code),
+                "{source} => {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn number_keys_keep_signs_and_latin_units() {
+        for (source, output) in [
+            ("気温は-4度です", "気温は+4度です"),
+            ("offset -4 here", "offset 4 here"),
+            ("最大2.5GBまで", "最大2.5TBまで"),
+            ("timeout 300ms please", "timeout 300s please"),
+            ("CPU 50% used", "CPU 50 used"),
+        ] {
+            assert_eq!(
+                rejection(source, output),
+                Some("protected_number_changed"),
+                "{source} => {output}"
+            );
+        }
+        for (source, output) in [
+            ("最大2.5GBまで", "最大2.5 GBまで"),
+            ("気温は-4度です", "気温は−4度です"),
+            ("offset +4 here", "offset 4 here"),
+            ("use GPT 4 now", "use GPT-4 now"),
+            ("CPU 50 % used", "CPU 50% used"),
+        ] {
+            assert_eq!(rejection(source, output), None, "{source} => {output}");
+        }
+    }
+
+    #[test]
+    fn conservative_mode_keeps_accepting_spelling_only_edits() {
+        for (source, output) in [
+            ("予算は3000円です", "予算は3,000円です"),
+            ("参加者は３人です", "参加者は3人です"),
+            ("三千円です", "3,000円です"),
+            ("もう一度お願いします", "もう1度お願いします"),
+            ("mp3 を GPT 4 で変換", "MP3 を GPT-4 で変換"),
+            ("open ai の api を使う", "OpenAI の API を使う"),
+            (
+                "買うものは牛乳と卵とパンです",
+                "買うもの:\n1. 牛乳\n2. 卵\n3. パン",
+            ),
+            (
+                "申請書は提出しなければなりません",
+                "申請書は提出する必要があります",
+            ),
+            ("打ち合わせは14時、いや15時です", "打ち合わせは15時です"),
+            (
+                "Book it at 3 pm, actually make that 4 pm.",
+                "Book it at 4 pm.",
+            ),
+        ] {
+            assert_eq!(rejection(source, output), None, "{source} => {output}");
+        }
+    }
+
+    #[test]
+    fn superseded_values_need_the_self_correction_switch() {
+        let settings = Settings {
+            correction_resolve_self_corrections: false,
+            ..Settings::default()
+        };
+        assert!(accept_provider_correction(
+            &settings,
+            "打ち合わせは14時、いや15時です",
+            &[],
+            "打ち合わせは15時です".into()
+        )
+        .is_err());
     }
 }

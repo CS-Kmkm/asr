@@ -69,6 +69,7 @@ pub(crate) async fn finish(
         storage,
         &settings,
         app_context.as_ref(),
+        crate::types::DictionaryMode::Edit,
         &instruction_text,
         Some(&source_text),
         correction_cancel.clone(),

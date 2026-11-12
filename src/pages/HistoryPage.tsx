@@ -24,7 +24,9 @@ const modeLabels = {
   selected_translate: "Selected-text translation",
 } as const;
 
-export function HistoryPage({ settings, settingsLoaded, history, filter, query = "", loading = false, failed = false, hasMore = false, onSearch, onLoadMore, onReprocess, reprocessing = false, reprocessedText, onDismissResult, onSave, onFilter, onCopyItem, onRetry, onDelete, onDeleteAll, onLoadAudio, onAudioError, retryActive, onCancelRetry }: {
+const teachableModes = new Set(["faithful", "ai_corrected", "faithful_fallback"]);
+
+export function HistoryPage({ settings, settingsLoaded, history, filter, query = "", loading = false, failed = false, hasMore = false, onSearch, onLoadMore, onReprocess, reprocessing = false, reprocessedText, onDismissResult, onSave, onFilter, onCopyItem, onRetry, onDelete, onDeleteAll, onLoadAudio, onAudioError, retryActive, onCancelRetry, onTeach }: {
   settings: Settings;
   settingsLoaded: boolean;
   history: HistoryItem[];
@@ -49,6 +51,8 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, query =
   onAudioError: () => void;
   retryActive: boolean;
   onCancelRetry: () => void;
+  /** Submits the user's edit of a dictation for an opt-in spelling suggestion. */
+  onTeach?: (id: number, editedText: string) => Promise<boolean>;
 }) {
   const { t } = useI18n();
   const [searchDraft, setSearchDraft] = useState(query);
@@ -144,6 +148,7 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, query =
             <IconButton icon="download" label={t("Download")} context={context} disabled={!item.hasAudio} onClick={() => void audio(item, true)} />
             <IconButton icon="trash" label={t("Delete")} context={context} className="danger-button" onClick={() => onDelete(item.id)} />
           </div>
+          {onTeach && settings.personalizationLearning && settings.historyRetention !== "never" && !item.expiresAt && teachableModes.has(item.mode) && <TeachSpelling item={item} onTeach={onTeach} />}
           {onReprocess && <HistoryReprocessing settings={settings} settingsLoaded={settingsLoaded} item={item} busy={reprocessing} onReprocess={onReprocess} />}
         </article>; })}</div></>}
     {hasMore && onLoadMore && <button className="secondary load-more" disabled={loading} onClick={onLoadMore}>{t("Load more")}</button>}
@@ -181,6 +186,25 @@ function HistoryReprocessing({ settings, settingsLoaded, item, busy, onReprocess
       </select></label>
       <button disabled={disabled} onClick={() => onReprocess(item.id, { kind: "translate", target: effectiveTarget })}>{t("Translate to…")}</button></div>
       <HelpHint label={t("Reprocess text")}>{t("Reprocessing uses the raw transcript and does not insert text.")}</HelpHint>
+    </div>
+  </details>;
+}
+
+/** An explicit, user-submitted edit; nothing is sent until the user presses Suggest. */
+function TeachSpelling({ item, onTeach }: { item: HistoryItem; onTeach: (id: number, editedText: string) => Promise<boolean> }) {
+  const { t } = useI18n();
+  const shown = item.processedText ?? item.transcriptText;
+  const [draft, setDraft] = useState(shown);
+  const [busy, setBusy] = useState(false);
+  return <details className="reprocess-controls">
+    <summary>{t("Teach a spelling")}</summary>
+    <div className="reprocess-actions">
+      <textarea aria-label={t("Edited text")} maxLength={10000} value={draft} onChange={(event) => setDraft(event.target.value)} />
+      <button disabled={busy || draft.trim() === shown.trim() || !draft.trim()} onClick={() => {
+        setBusy(true);
+        void onTeach(item.id, draft).finally(() => setBusy(false));
+      }}>{t("Suggest from my edit")}</button>
+      <HelpHint label={t("Teach a spelling")}>{t("Only the changed word pair is kept; the edited text is not saved.")}</HelpHint>
     </div>
   </details>;
 }

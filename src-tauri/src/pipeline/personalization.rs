@@ -4,7 +4,7 @@ use crate::{
     dictionary::CorrectionTerm,
     personalization,
     storage::Storage,
-    types::{AppContext, Settings},
+    types::{AppContext, DictionaryMode, Settings},
 };
 
 #[derive(Default)]
@@ -31,6 +31,7 @@ pub(crate) async fn resolve(
     storage: &Storage,
     settings: &Settings,
     context: Option<&AppContext>,
+    mode: DictionaryMode,
     spoken: &str,
     source: Option<&str>,
     mut cancel: tokio::sync::watch::Receiver<bool>,
@@ -50,7 +51,7 @@ pub(crate) async fn resolve(
         let guidance = personalization::resolve_profile(&settings, context.as_ref())
             .map(|profile| personalization::action_guidance(&profile));
         let hints = storage
-            .dictionary_correction_terms(&text, context.as_ref())
+            .dictionary_correction_terms(&text, context.as_ref(), mode)
             .unwrap_or_default();
         ResolvedPersonalization { hints, guidance }
     });
@@ -127,6 +128,7 @@ mod tests {
             &storage,
             &settings,
             Some(&context),
+            DictionaryMode::Ask,
             spoken,
             None,
             cancel.clone(),
@@ -148,6 +150,7 @@ mod tests {
             &storage,
             &settings,
             Some(&context),
+            DictionaryMode::Ask,
             spoken,
             Some("source-reading"),
             cancel.clone(),
@@ -164,6 +167,7 @@ mod tests {
                 ..settings
             },
             Some(&context),
+            DictionaryMode::Ask,
             spoken,
             None,
             cancel,
