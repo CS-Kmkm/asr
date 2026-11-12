@@ -5,7 +5,8 @@
 //! 送って, "don't merge" -> "merge", a question turned into an answer) and
 //! leave semantic paraphrase to human review.
 use super::fact_check::{
-    find_repair_cue, is_english_word_character, is_sentence_break_at, FactEdits,
+    find_repair_cue, is_english_word_character, is_sentence_break_at,
+    skip_repair_separators_and_fillers, FactEdits,
 };
 use unicode_normalization::UnicodeNormalization;
 
@@ -135,12 +136,40 @@ fn english_words(text: &str) -> Vec<(usize, usize)> {
     words
 }
 
-/// Whether a repair cue directly follows the negated predicate, so the repair
-/// replaces that predicate (行かない、いや行きます). Only the predicate's own
-/// tail may stand between them: kana auxiliaries or a few English words, with
-/// no clause break. A cue that repairs something later in the sentence
-/// (送らないで、会議は3時、いや4時) leaves the negation in force.
-fn repaired(text: &str, end: usize) -> bool {
+/// The negated predicate a repair must restate: for Japanese the last kanji
+/// of the verb before the negation (送|らない -> 送), for English the word
+/// after it (don't |merge). `None` when there is no such anchor (しない),
+/// so the negation cannot be repaired away.
+fn negated_predicate(text: &str, start: usize, end: usize) -> Option<String> {
+    let marker = &text[start..end];
+    if marker.is_ascii() {
+        let after = text[end..].trim_start();
+        let word: String = after
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect();
+        return (word.len() >= 2).then_some(word);
+    }
+    text[..start]
+        .chars()
+        .rev()
+        .take(3)
+        .take_while(|c| !c.is_whitespace() && !matches!(c, '、' | '。' | ',' | '.'))
+        .find(|c| matches!(c, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}'))
+        .map(String::from)
+}
+
+/// Whether a repair cue directly follows the negated predicate and the
+/// repair restates that predicate, so it replaces it (行かない、いや行きます;
+/// don't merge it, actually merge it). Only the predicate's own tail may
+/// stand between negation and cue: kana auxiliaries or a few English words,
+/// with no clause break. A cue that repairs something else (送らないで、
+/// 会議は3時、いや4時; 送らないであした、いやあさって確認して) leaves the
+/// negation in force.
+fn repaired(text: &str, start: usize, end: usize) -> bool {
+    let Some(predicate) = negated_predicate(text, start, end) else {
+        return false;
+    };
     let tail = &text[end..];
     let Some((cue_at, _)) = find_repair_cue(tail) else {
         return false;
@@ -161,7 +190,24 @@ fn repaired(text: &str, end: usize) -> bool {
         && between
             .chars()
             .all(|c| c.is_ascii_alphabetic() || c == ' ' || c == '\'');
-    kana_tail || word_tail
+    if !(kana_tail || word_tail) {
+        return false;
+    }
+    // The repair clause: from after the cue to the next clause break.
+    let (cue_at, cue_len) = find_repair_cue(tail).unwrap_or_default();
+    let repair = skip_repair_separators_and_fillers(&tail[cue_at + cue_len..]);
+    let clause_end = repair
+        .char_indices()
+        .find(|(index, c)| matches!(c, '、' | ',') || is_sentence_break_at(repair, *index, *c))
+        .map_or(repair.len(), |(index, _)| index);
+    let clause = &repair[..clause_end];
+    if predicate.is_ascii() {
+        english_words(clause)
+            .into_iter()
+            .any(|(word_start, word_end)| clause[word_start..word_end] == predicate)
+    } else {
+        clause.contains(&predicate)
+    }
 }
 
 /// The output must keep every negation of the source and add none.
@@ -179,7 +225,7 @@ pub(super) fn negation_preserved(source: &str, output: &str, edits: FactEdits) -
     }
     let kept = source_spans
         .iter()
-        .filter(|(_, end)| !(edits.corrections && repaired(&source_text, *end)))
+        .filter(|(start, end)| !(edits.corrections && repaired(&source_text, *start, *end)))
         .collect::<Vec<_>>();
     let required = if edits.merge_duplicates {
         let mut phrases = kept
@@ -211,35 +257,105 @@ pub(super) fn negation_preserved(source: &str, output: &str, edits: FactEdits) -
 /// Japanese polite question endings, counted only where a sentence ends.
 const JA_QUESTION_ENDINGS: [&str; 4] = ["でしょうか", "ませんか", "ですか", "ますか"];
 
-/// The number of question sentences: sentences ending in `?`, or in a polite
+/// A sentence and whether it is a question: it ends in `?`, or in a polite
 /// Japanese question ending (ですか) without a mark.
-fn question_count(text: &str) -> usize {
-    let text = text.nfkc().collect::<String>();
-    let mut count = 0;
-    let mut sentence = String::new();
-    for character in text.chars().chain(std::iter::once('\n')) {
-        if matches!(character, '。' | '!' | '?' | '\n') {
-            let trimmed = sentence.trim_end_matches(|c: char| c.is_whitespace() || c == '」');
-            if character == '?'
-                || JA_QUESTION_ENDINGS
-                    .iter()
-                    .any(|ending| trimmed.ends_with(ending))
-            {
-                count += 1;
-            }
-            sentence.clear();
-        } else {
-            sentence.push(character);
-        }
-    }
-    count
+struct Sentence {
+    content: Vec<char>,
+    question: bool,
 }
 
-/// Every spoken question stays a question: an output with fewer question
-/// sentences answered or restated one (確認できますか。送信できますか。 ->
-/// 確認できますか。送信できます。).
-pub(super) fn question_preserved(source: &str, output: &str) -> bool {
-    question_count(output) >= question_count(source)
+/// NFKC sentences split at 。 ! ? line breaks and at a `.` followed by
+/// whitespace or the end (so 3.12 and example.com stay whole).
+fn sentences(text: &str) -> Vec<Sentence> {
+    let text = text.nfkc().collect::<String>();
+    let characters = text.chars().collect::<Vec<_>>();
+    let mut sentences = Vec::new();
+    let mut current = String::new();
+    for (index, character) in characters.iter().copied().enumerate() {
+        let next = characters.get(index + 1).copied();
+        let boundary = matches!(character, '。' | '!' | '?' | '\n')
+            || (character == '.' && next.is_none_or(char::is_whitespace));
+        if !boundary {
+            current.push(character);
+        }
+        if boundary || next.is_none() {
+            let trimmed = current.trim_end_matches(|c: char| c.is_whitespace() || c == '」');
+            let content = trimmed
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<Vec<_>>();
+            if !content.is_empty() {
+                sentences.push(Sentence {
+                    question: character == '?'
+                        || JA_QUESTION_ENDINGS
+                            .iter()
+                            .any(|ending| trimmed.ends_with(ending)),
+                    content,
+                });
+            }
+            current.clear();
+        }
+    }
+    sentences
+}
+
+fn similarity(left: &[char], right: &[char]) -> f64 {
+    let grams = |text: &[char]| {
+        if text.len() < 2 {
+            return vec![text.to_vec()];
+        }
+        text.windows(2).map(<[char]>::to_vec).collect::<Vec<_>>()
+    };
+    let (left, mut right) = (grams(left), grams(right));
+    let total = left.len() + right.len();
+    let mut common = 0;
+    for gram in &left {
+        if let Some(position) = right.iter().position(|other| other == gram) {
+            right.swap_remove(position);
+            common += 1;
+        }
+    }
+    (2 * common) as f64 / total.max(1) as f64
+}
+
+#[cfg(test)]
+fn question_count(text: &str) -> usize {
+    sentences(text)
+        .iter()
+        .filter(|sentence| sentence.question)
+        .count()
+}
+
+/// Every spoken question stays a question. Each source question is matched
+/// to the most similar output sentence, which must be a question
+/// (確認できますか。送信できます。 -> 確認できます。送信できますか。 fails).
+/// The output must also keep as many question sentences; with repetition
+/// removal on, identical repeated questions count once.
+pub(super) fn question_preserved(source: &str, output: &str, edits: FactEdits) -> bool {
+    let source = sentences(source);
+    let output = sentences(output);
+    let mut questions = source
+        .iter()
+        .filter(|sentence| sentence.question)
+        .map(|sentence| &sentence.content)
+        .collect::<Vec<_>>();
+    if questions.is_empty() {
+        return true;
+    }
+    let aligned = questions.iter().all(|question| {
+        output
+            .iter()
+            .map(|sentence| (similarity(question, &sentence.content), sentence.question))
+            .filter(|(score, _)| *score > 0.0)
+            .max_by(|left, right| left.0.total_cmp(&right.0))
+            .is_some_and(|(_, is_question)| is_question)
+    });
+    if edits.merge_duplicates {
+        questions.sort_unstable();
+        questions.dedup();
+    }
+    aligned && output.iter().filter(|sentence| sentence.question).count() >= questions.len()
 }
 
 #[cfg(test)]
@@ -254,6 +370,64 @@ mod tests {
         corrections: false,
         merge_duplicates: false,
     };
+
+    fn q(source: &str, output: &str) -> bool {
+        question_preserved(source, output, NONE)
+    }
+
+    #[test]
+    fn a_repair_must_restate_the_negated_predicate() {
+        // The cue repairs あした, not 送らないで.
+        assert!(!negation_preserved(
+            "本番に送らないであした、いやあさって確認して",
+            "本番に送ってあさって確認して",
+            ALL
+        ));
+        assert!(negation_preserved(
+            "本番に送らないであした、いやあさって確認して",
+            "本番に送らないであさって確認して",
+            ALL
+        ));
+        // Without a kanji anchor (しない) the negation cannot be repaired away.
+        assert!(!negation_preserved("しない、いやする", "する", ALL));
+        assert!(!negation_preserved(
+            "don't merge it, actually deploy it",
+            "Deploy it.",
+            ALL
+        ));
+    }
+
+    #[test]
+    fn each_question_must_map_to_an_interrogative_sentence() {
+        assert!(!q(
+            "確認できますか。送信できます。",
+            "確認できます。送信できますか。"
+        ));
+        assert!(q(
+            "確認できますか。送信できます。",
+            "確認できますか？送信できます。"
+        ));
+        // An ASCII period ends a sentence again.
+        assert_eq!(question_count("確認できますか. 明日です。"), 1);
+        assert!(!q("確認できますか. 明日です。", "確認できます. 明日です。"));
+        assert_eq!(question_count("Python 3.12 です。example.com ですか"), 1);
+    }
+
+    #[test]
+    fn identical_repeated_questions_collapse_only_with_repetition_removal() {
+        let merge = FactEdits {
+            corrections: false,
+            merge_duplicates: true,
+        };
+        let source = "確認できますか。確認できますか。";
+        assert!(question_preserved(source, "確認できますか。", merge));
+        assert!(!question_preserved(source, "確認できますか。", NONE));
+        assert!(!question_preserved(
+            "確認できますか。送信できますか。",
+            "確認できますか。",
+            merge
+        ));
+    }
 
     #[test]
     fn flipped_or_dropped_negations_are_rejected() {
@@ -386,15 +560,15 @@ mod tests {
 
     #[test]
     fn every_question_sentence_must_stay_a_question() {
-        assert!(!question_preserved(
+        assert!(!q(
             "確認できますか。送信できますか。",
             "確認できますか。送信できます。"
         ));
-        assert!(!question_preserved(
+        assert!(!q(
             "Can you check? Can you send it?",
             "Can you check? I can send it."
         ));
-        assert!(question_preserved(
+        assert!(q(
             "確認できますか。送信できますか。",
             "確認できますか？送信できますか？"
         ));
@@ -404,29 +578,20 @@ mod tests {
 
     #[test]
     fn questions_must_stay_questions() {
-        assert!(!question_preserved(
+        assert!(!q(
             "この関数ってスレッドセーフですか？",
             "はい、この関数はスレッドセーフです。"
         ));
-        assert!(!question_preserved(
-            "Is it thread safe?",
-            "Yes, it is thread safe."
-        ));
-        assert!(!question_preserved("明日来ますか", "明日来ます。"));
-        assert!(question_preserved("明日来ますか", "明日来ますか？"));
-        assert!(question_preserved(
+        assert!(!q("Is it thread safe?", "Yes, it is thread safe."));
+        assert!(!q("明日来ますか", "明日来ます。"));
+        assert!(q("明日来ますか", "明日来ますか？"));
+        assert!(q(
             "この関数ってスレッドセーフですか？",
             "この関数はスレッドセーフですか？"
         ));
-        assert!(question_preserved(
-            "can you tell me the deadline",
-            "The deadline is Friday."
-        ));
-        assert!(question_preserved("送ります。", "送ります。"));
+        assert!(q("can you tell me the deadline", "The deadline is Friday."));
+        assert!(q("送ります。", "送ります。"));
         // ですか inside a clause is not a sentence-final question.
-        assert!(question_preserved(
-            "必要ですかどうか確認します。",
-            "必要か確認します。"
-        ));
+        assert!(q("必要ですかどうか確認します。", "必要か確認します。"));
     }
 }

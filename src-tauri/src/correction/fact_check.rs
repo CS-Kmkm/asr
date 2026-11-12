@@ -162,7 +162,7 @@ fn polarity_rejection(
     if !super::polarity::negation_preserved(transcript, corrected, edits) {
         return Some(ProtectedContentKind::Negation);
     }
-    if !super::polarity::question_preserved(transcript, corrected) {
+    if !super::polarity::question_preserved(transcript, corrected, edits) {
         return Some(ProtectedContentKind::Question);
     }
     None
