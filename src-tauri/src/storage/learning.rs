@@ -853,6 +853,38 @@ mod tests {
         }
     }
 
+    /// A database created by the first #85 commit is at version 5 without
+    /// the decision origin column; opening it must add the column.
+    #[test]
+    fn a_version_5_database_without_decision_origin_is_upgraded() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("v5.sqlite3");
+        drop(Storage::open(&path).unwrap());
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "ALTER TABLE dictionary_candidate_decisions DROP COLUMN origin;
+                     PRAGMA user_version = 5;",
+                )
+                .unwrap();
+        }
+        let storage = Storage::open(&path).unwrap();
+        save(&storage, learning_on());
+        let version: i64 = storage
+            .connection()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+        let id = storage
+            .add_dictionary_candidate_from_correction("open ai", "OpenAI", None)
+            .unwrap()
+            .unwrap();
+        assert!(storage.reject_dictionary_candidate(id).unwrap());
+        storage.delete_learned_personalization().unwrap();
+    }
+
     #[test]
     fn modes_are_validated_and_stored_canonically() {
         assert_eq!(stored_modes(&[]).unwrap(), None);
