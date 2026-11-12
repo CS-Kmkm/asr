@@ -147,6 +147,12 @@ pub struct Settings {
     pub clipboard_restore: bool,
     #[serde(default)]
     pub automatic_voice_mode: bool,
+    /// Off by default. On: a Dictation shortcut press edits the selection
+    /// read at the press (Speak to edit), dictates when nothing is selected,
+    /// and only copies the result when the selection cannot be read.
+    /// Automatic voice mode takes precedence.
+    #[serde(default)]
+    pub smart_dictate_edit: bool,
     #[serde(default = "default_decision_model")]
     pub decision_model: String,
     #[serde(default = "default_decision_quantization")]
@@ -460,6 +466,7 @@ impl Default for Settings {
             auto_start: false,
             clipboard_restore: true,
             automatic_voice_mode: false,
+            smart_dictate_edit: false,
             decision_model: default_decision_model(),
             decision_quantization: default_decision_quantization(),
             live_target_insertion: false,
@@ -795,6 +802,8 @@ mod tests {
         );
         assert!(!settings.automatic_voice_mode);
         assert!(!Settings::default().automatic_voice_mode);
+        assert!(!settings.smart_dictate_edit);
+        assert!(!Settings::default().smart_dictate_edit);
         assert_eq!(settings.decision_model, "Cloudflare/clef-flash");
         assert_eq!(settings.decision_quantization, "4bit");
     }

@@ -22,6 +22,7 @@ const fieldLabels = {
   keepFailedTakes: "Keep failed recordings for 24 hours",
   autoStart: "Start with Windows",
   clipboardRestore: "Restore clipboard",
+  smartDictateEdit: "Smart Dictate/Edit",
   liveTargetInsertion: "Live text insertion (experimental)",
   livePreviewFastDecode: "Faster live preview",
   incrementalFinalAsr: "Incremental final transcription (experimental)",

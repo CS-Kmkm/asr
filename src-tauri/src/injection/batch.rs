@@ -783,6 +783,66 @@ pub(super) fn capture_selection<B: Backend>(
     Ok((target, state))
 }
 
+/// The selection state of the focused field at a Smart Dictate/Edit press.
+/// Read-only: it never sends input or touches the clipboard. Anything that
+/// is not positively known is `Unknown`, which never authorizes a replace.
+pub(super) fn probe_selection<B: Backend>(backend: &B) -> SelectionProbe {
+    let target = match backend.capture_target() {
+        Ok(target) => target,
+        Err(InjectionError::SecureTarget | InjectionError::PrivilegeMismatch) => {
+            return SelectionProbe::Unknown(UnknownSelection::Protected)
+        }
+        Err(_) => return SelectionProbe::Unknown(UnknownSelection::NoTarget),
+    };
+    if target.process_id == std::process::id() {
+        return SelectionProbe::Unknown(UnknownSelection::ThisApp);
+    }
+    match backend.validate_target(&target) {
+        Ok(()) => {}
+        Err(InjectionError::SecureTarget | InjectionError::PrivilegeMismatch) => {
+            return SelectionProbe::Unknown(UnknownSelection::Protected)
+        }
+        Err(_) => return SelectionProbe::Unknown(UnknownSelection::NoTarget),
+    }
+    // An open conversion may itself be shown as a selection; neither
+    // editing nor pasting over it is safe.
+    if backend.ime_composition_active(&target) == Ok(Some(true)) {
+        return SelectionProbe::Unknown(UnknownSelection::ImeComposing);
+    }
+    // Empty selected text is not an empty selection: a selected embedded
+    // object returns no characters. Only collapsed endpoints count as empty.
+    // The field must also be identifiable: without its identity, another
+    // empty field of the same window could later pass for it, so the take
+    // fails closed to copy-only.
+    let empty = |target: TargetWindow| match (
+        backend.selection_is_empty(&target),
+        backend.focus_identity(&target),
+    ) {
+        (Ok(true), Ok(focus_identity)) => SelectionProbe::Empty {
+            focus_identity,
+            target,
+        },
+        _ => SelectionProbe::Unknown(UnknownSelection::Unreadable),
+    };
+    match backend.target_text(&target) {
+        Ok(state) if state.selected.is_empty() => empty(target),
+        Ok(state) => SelectionProbe::Selected(SelectedText {
+            target,
+            text: state.selected.clone(),
+            state,
+        }),
+        Err(InjectionError::SecureTarget | InjectionError::PrivilegeMismatch) => {
+            SelectionProbe::Unknown(UnknownSelection::Protected)
+        }
+        Err(InjectionError::TargetChanged | InjectionError::NoForegroundWindow) => {
+            SelectionProbe::Unknown(UnknownSelection::NoTarget)
+        }
+        // The text cannot be read. An explicitly empty selection still
+        // makes an additive paste safe; a nonempty or unreadable one does not.
+        Err(_) => empty(target),
+    }
+}
+
 pub(super) fn replace_selection<B: Backend>(
     backend: &B,
     options: InjectionOptions,
@@ -1637,6 +1697,15 @@ pub(super) mod tests {
         /// What the target exposes after processing a paste, for editors
         /// whose readable text is a proxy or a window of the document.
         readback_after_paste: RefCell<Option<TargetText>>,
+        /// What `capture_target` returns instead of `target()`.
+        captured: RefCell<Option<Result<TargetWindow, InjectionError>>>,
+        /// A selected embedded object: no selected characters, yet the
+        /// selection is not collapsed.
+        object_selected: Cell<bool>,
+        /// UI Automation cannot identify the focused element.
+        identity_fails: Cell<bool>,
+        /// Runs on every full text read, as input arriving while it is read.
+        on_read: RefCell<Option<Box<dyn Fn() + Send>>>,
     }
 
     impl MockBackend {
@@ -1686,6 +1755,10 @@ pub(super) mod tests {
                 on_clipboard_write: None,
                 on_snapshot: None,
                 readback_after_paste: RefCell::new(None),
+                captured: RefCell::new(None),
+                object_selected: Cell::new(false),
+                identity_fails: Cell::new(false),
+                on_read: RefCell::new(None),
             }
         }
         fn apply_pending(&self) {
@@ -1707,6 +1780,33 @@ pub(super) mod tests {
         pub(crate) fn set_text_readable(&self, readable: bool) {
             self.text_readable.set(readable);
         }
+        pub(crate) fn set_selection_readable(&self, readable: bool) {
+            self.selection_readable.set(readable);
+        }
+        /// False when the captured field is no longer the focused one.
+        pub(crate) fn set_target_valid(&self, valid: bool) {
+            self.target_valid.set(valid);
+        }
+        pub(crate) fn set_on_read(&self, on_read: impl Fn() + Send + 'static) {
+            *self.on_read.borrow_mut() = Some(Box::new(on_read));
+        }
+        pub(crate) fn set_identity_fails(&self, fails: bool) {
+            self.identity_fails.set(fails);
+        }
+        pub(crate) fn set_object_selected(&self, selected: bool) {
+            self.object_selected.set(selected);
+        }
+        /// Focus moves to another field of the same window.
+        pub(crate) fn set_identity(&self, identity: Vec<i32>) {
+            self.text.borrow_mut().identity = identity;
+        }
+        pub(crate) fn set_captured(&self, captured: Result<TargetWindow, InjectionError>) {
+            *self.captured.borrow_mut() = Some(captured);
+        }
+        /// Text typed into the field outside this app.
+        pub(crate) fn type_text(&self, typed: &str) {
+            self.text.borrow_mut().before.push_str(typed);
+        }
         /// Consumes the unrestored-clipboard record, as the platform backends do.
         pub(crate) fn take_clipboard_not_restored(&self) -> bool {
             self.not_restored.replace(0) > 0
@@ -1716,7 +1816,10 @@ pub(super) mod tests {
     impl Backend for MockBackend {
         type Clipboard = String;
         fn capture_target(&self) -> Result<TargetWindow, InjectionError> {
-            Ok(target())
+            self.captured
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| Ok(target()))
         }
         fn validate_target(&self, target: &TargetWindow) -> Result<(), InjectionError> {
             if target.is_secure {
@@ -1740,6 +1843,9 @@ pub(super) mod tests {
             Ok(self.ime.get())
         }
         fn focus_identity(&self, _: &TargetWindow) -> Result<Vec<i32>, InjectionError> {
+            if self.identity_fails.get() {
+                return Err(InjectionError::BackendFailure("focus identity unavailable"));
+            }
             Ok(self.text.borrow().identity.clone())
         }
         fn target_text_probe(&self, _: &TargetWindow) -> Result<Option<TextProbe>, InjectionError> {
@@ -1751,6 +1857,9 @@ pub(super) mod tests {
         }
         fn target_text(&self, _: &TargetWindow) -> Result<TargetText, InjectionError> {
             self.text_reads.set(self.text_reads.get() + 1);
+            if let Some(on_read) = self.on_read.borrow().as_ref() {
+                on_read();
+            }
             if self.text_readable.get() {
                 Ok(self.text.borrow().clone())
             } else {
@@ -1759,7 +1868,7 @@ pub(super) mod tests {
         }
         fn selection_is_empty(&self, _: &TargetWindow) -> Result<bool, InjectionError> {
             if self.selection_readable.get() {
-                Ok(self.text.borrow().selected.is_empty())
+                Ok(self.text.borrow().selected.is_empty() && !self.object_selected.get())
             } else {
                 Err(InjectionError::BackendFailure("unreadable selection"))
             }

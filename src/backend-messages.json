@@ -515,6 +515,10 @@
     "code": "the_provisional_text_could_not_be_safely_replaced_the_final_result_remains_on_the_clipboard",
     "ja": "仮テキストを安全に置換できませんでした。最終結果はクリップボードに残っています。"
   },
+  "The selection could not be checked, so the result was copied instead of inserted. Paste it with Ctrl+V.": {
+    "code": "smart_copy_only",
+    "ja": "選択範囲を確認できなかったため、挿入せずに結果をクリップボードへコピーしました。Ctrl+Vで貼り付けてください。"
+  },
   "Automatic insertion failed; the result remains on the clipboard.": {
     "code": "automatic_insertion_failed_the_result_remains_on_the_clipboard",
     "ja": "自動挿入に失敗しました。結果はクリップボードに残っています。"

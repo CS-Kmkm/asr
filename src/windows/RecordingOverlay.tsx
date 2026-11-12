@@ -16,7 +16,20 @@ interface VoiceModeEvent {
   // "selected_translate" is the selected-text translation, which has no recording.
   mode: "dictate" | "translate" | "edit" | "ask" | "selected_translate";
   targetLanguage: string | null;
+  // What the Smart Dictate/Edit key chose at the press; absent otherwise.
+  smartRoute?: SmartRoute | null;
 }
+
+type SmartRoute = "edit" | "dictate" | "copy_only";
+
+const smartRouteLabels: Record<SmartRoute, MessageKey> = {
+  edit: "Smart: editing the selection",
+  dictate: "Smart: dictating",
+  copy_only: "Smart: copy only (selection unknown)",
+};
+
+// How long the recording view names the Smart route before its usual label.
+const SMART_ROUTE_MS = 2_500;
 
 // Fixed outcome and reason codes for a non-confirmed insertion.
 interface InsertionNoticeEvent {
@@ -88,6 +101,8 @@ export function RecordingOverlay() {
   const noticeTimer = useRef<number | undefined>(undefined);
   const [hint, setHint] = useState<string | null>(null);
   const hintTimer = useRef<number | undefined>(undefined);
+  const [smartRoute, setSmartRoute] = useState<SmartRoute | null>(null);
+  const smartRouteTimer = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     // The latest notice replaces any earlier one, like the backend window.
@@ -159,12 +174,19 @@ export function RecordingOverlay() {
           };
         });
       }),
-      listen<VoiceModeEvent>("voice-mode", ({ payload }) => setVoiceMode(payload)),
+      listen<VoiceModeEvent>("voice-mode", ({ payload }) => {
+        setVoiceMode(payload);
+        window.clearTimeout(smartRouteTimer.current);
+        const route = payload.smartRoute && payload.smartRoute in smartRouteLabels ? payload.smartRoute : null;
+        setSmartRoute(route);
+        if (route) smartRouteTimer.current = window.setTimeout(() => setSmartRoute(null), SMART_ROUTE_MS);
+      }),
     ]);
 
     return () => {
       window.clearTimeout(noticeTimer.current);
       window.clearTimeout(hintTimer.current);
+      window.clearTimeout(smartRouteTimer.current);
       void listeners.then((unlisten) => unlisten.forEach((fn) => fn()));
     };
   }, []);
@@ -239,6 +261,8 @@ export function RecordingOverlay() {
         >
           {hint
             ? translateAppMessage(language, hint)
+            : smartRoute
+            ? t(smartRouteLabels[smartRoute])
             : voiceMode.mode === "translate"
             ? t("Translating")
             : voiceMode.mode === "edit"

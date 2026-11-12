@@ -40,7 +40,31 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         apply: migrate_v4_take_spans,
         min_reader_version: 1,
     },
+    Migration {
+        apply: migrate_v5_take_route,
+        min_reader_version: 1,
+    },
 ];
+
+/// Version 5: additive `take_spans` columns for Smart Dictate/Edit and
+/// latency analysis: the stop-to-final-transcript span, the Smart route code
+/// and the shortcut presses of a take. Older rows keep them NULL (missing,
+/// never zero), so `TAKE_SPAN_VERSION` is unchanged; older builds ignore them.
+fn migrate_v5_take_route(connection: &Connection) -> Result<(), StorageError> {
+    for (column, definition) in [
+        ("stop_to_final_ms", "INTEGER"),
+        ("route", "TEXT"),
+        ("key_presses", "INTEGER"),
+    ] {
+        if !column_exists(connection, "take_spans", column)? {
+            connection.execute(
+                &format!("ALTER TABLE take_spans ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
 
 /// Version 4: one content-free row per recording take (spans and a terminal
 /// outcome under a random take id). Kept apart from `metrics` so historical

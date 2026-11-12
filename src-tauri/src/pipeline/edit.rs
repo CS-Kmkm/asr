@@ -18,6 +18,9 @@ use crate::{
 use std::time::Instant;
 use tauri::{Emitter, Manager};
 
+/// Overlay outcome code of a confirmed Smart Dictate/Edit replacement.
+const SMART_EDIT_REPLACED: &str = "smart_edit_replaced";
+
 pub(crate) async fn finish(
     context: PipelineContext<'_>,
     take: RecordedTake,
@@ -39,6 +42,7 @@ pub(crate) async fn finish(
         correction_cancel,
         app_context,
         trace,
+        smart_route,
         ..
     } = take;
     let metrics = storage.metrics_for(
@@ -143,14 +147,7 @@ pub(crate) async fn finish(
         let committed = commit_edit_replacement(
             &services.lifecycle,
             operation_id,
-            || {
-                session.injector.replace_selection(
-                    &session.selection,
-                    &edited_for_insertion,
-                    &session.monitor,
-                    session.checkpoint,
-                )
-            },
+            || session.replace(&edited_for_insertion),
             || session.injector.copy_to_clipboard(&edited_for_insertion),
         );
         if let CommittedOutput::Ran((insertion, _)) = &committed {
@@ -250,6 +247,10 @@ pub(crate) async fn finish(
             injection::notice_outcome(insertion_label, clipboard_lost),
             None,
         );
+    } else if smart_route.is_some() {
+        // The same key either dictates or edits, so say which happened and
+        // how to take it back: the target app's own undo.
+        recording_overlay::show_insertion_notice(app, SMART_EDIT_REPLACED, None);
     }
     let warning = if history_save_status == HistorySaveStatus::AudioUnavailable {
         completion_persistence_warning(history_save_status, metric_failed)

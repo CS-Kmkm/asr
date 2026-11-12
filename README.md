@@ -64,6 +64,19 @@ an empty provider response is rejected and the selection is left unchanged. If
 focus, selection, user input, shortcut release, or IME safety checks fail, the
 original text is left alone and the generated edit remains on the clipboard.
 
+**Smart Dictate/Edit** (Settings > Input, off by default) lets the Dictation
+shortcut do both: when you press it, the app reads the focused field once,
+without AI. A readable selection starts Speak to edit on exactly that
+selection; an empty selection starts Dictate into that field, which pastes
+only the final text and only while the same field is focused with nothing
+selected. When the selection
+cannot be checked (password field, unreadable control, an open IME
+conversion, this app or no field), the take is dictated but only copied to
+the clipboard and History, so text you could not see selected is never
+replaced. The overlay names the chosen route for a moment; a Smart edit
+reports that Ctrl+Z in the app undoes it. The other mode shortcuts and
+hold/toggle behave as before, and automatic voice mode takes precedence.
+
 Audio is deleted after processing by default. Transcript history is optional and
 stored in the application SQLite database. Logs and status events must never
 contain transcript, audio, window-title, or clipboard content.
@@ -660,7 +673,8 @@ Full usage and Phase 0 gate criteria are documented in
   inside `completion_job`), `completion_job` (the Dictate/Translate work
   deferred until after the take completes, in this order: History save with
   its recording copy, dictionary candidate, metrics, persistence warning and
-  temporary-audio cleanup), `stop_to_delivery` (stop
+  temporary-audio cleanup), `stop_to_final` (stop request to the final
+  transcript being ready), `stop_to_delivery` (stop
   request to the output commit returning, delivered takes only) and
   `stop_to_next_take` (stop request to the lifecycle accepting a new take).
   The `ai` stage covers all mode processing before output. Records are
@@ -669,9 +683,17 @@ Full usage and Phase 0 gate criteria are documented in
   An older build can still open the database but does not purge these
   records, so each open removes every take record when no metric remains and
   otherwise those older than the oldest remaining metric.
-  Storage diagnostics (`takes`, included in copied diagnostics) aggregate them
-  per mode, outcome and stage with timed and missing counts and nearest-rank
-  p50/p95 per span.
+  Since schema version 5 each record also keeps its Smart Dictate/Edit
+  `route` (`edit`, `dictate` or `copy_only`; missing for other takes) and
+  `key_presses` (voice-mode shortcut presses attributed to the take before
+  its stop claimed it: the start press, a toggle stop, a cancelling second
+  press or Esc). Storage diagnostics (`takes`, included in copied
+  diagnostics) aggregate them per mode, route, outcome and stage with timed
+  and missing counts and nearest-rank p50/p95 per span; the `key_presses`
+  entry is a count, not milliseconds. `uv run scripts/summarize_takes.py`
+  reads the local database read-only and prints per route and mode the
+  success/clipboard-only/cancel/failure rates and p50/p95 of `record_ready`,
+  `stop_to_final`, `stop_to_delivery` (pasted takes only) and `key_presses`.
 - New SQLite deletions overwrite freed record content using secure-delete.
   History deletions request a WAL checkpoint/truncation; an active external reader or
   database error can defer this until the next policy pass. Previously freed

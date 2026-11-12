@@ -587,6 +587,8 @@ pub(crate) async fn start_recording_with_origin(
             from_shortcut,
             trigger_chord,
             hold_generation: None,
+            requested: None,
+            smart_press: None,
         },
         PipelineMode::Dictate,
     )
@@ -610,6 +612,8 @@ pub(crate) async fn start_voice_translation_with_origin(
             from_shortcut,
             trigger_chord,
             hold_generation: None,
+            requested: None,
+            smart_press: None,
         },
         PipelineMode::Translate,
     )
@@ -633,6 +637,8 @@ pub(crate) async fn start_speak_to_edit_with_origin(
             from_shortcut,
             trigger_chord,
             hold_generation: None,
+            requested: None,
+            smart_press: None,
         },
         PipelineMode::Edit,
     )
@@ -656,6 +662,8 @@ pub(crate) async fn start_ask_with_origin(
             from_shortcut,
             trigger_chord,
             hold_generation: None,
+            requested: None,
+            smart_press: None,
         },
         PipelineMode::Ask,
     )
@@ -739,6 +747,54 @@ struct StartOrigin {
     from_shortcut: bool,
     trigger_chord: Option<String>,
     hold_generation: Option<u64>,
+    /// When the key went down, if earlier than the start (hold-to-talk).
+    requested: Option<Instant>,
+    /// A Smart Dictate/Edit snapshot already taken at the key press.
+    smart_press: Option<SmartPress>,
+}
+
+/// A Smart Dictate/Edit snapshot of the original field, taken when a held
+/// key went down, before the hold delay.
+pub(crate) struct SmartPress(Result<SmartStart, String>);
+
+/// Where a start's Smart Dictate/Edit snapshot comes from.
+enum SmartSource {
+    Off,
+    /// Taken when a held key went down.
+    Pressed(Box<SmartStart>),
+    /// Read now, at this start.
+    ProbeNow,
+}
+
+/// A held key's key-down snapshot is used as is; it is never read again
+/// after the hold delay. A snapshot Smart routing no longer applies to is
+/// dropped, which stops its monitor.
+fn smart_source(applies: bool, press: Option<SmartPress>) -> Result<SmartSource, String> {
+    Ok(match (applies, press) {
+        (false, _) => SmartSource::Off,
+        (true, Some(SmartPress(captured))) => SmartSource::Pressed(Box::new(captured?)),
+        (true, None) => SmartSource::ProbeNow,
+    })
+}
+
+/// Takes the Smart Dictate/Edit snapshot of a hold-to-talk press at key-down,
+/// when Smart routing applies; the microphone still opens only after the
+/// hold delay. `None` when it does not apply.
+pub(crate) async fn capture_smart_press(
+    app: AppHandle,
+    mode: PipelineMode,
+    chord: String,
+) -> Option<SmartPress> {
+    let settings = app.state::<Storage>().get_settings().ok()?;
+    if !crate::smart_dictate::applies(&settings, mode, true, false) {
+        return None;
+    }
+    let shortcuts = voice_mode_shortcuts(&settings, mode)?.clone();
+    let captured =
+        tokio::task::spawn_blocking(move || smart_start(&settings, &chord, &shortcuts, true))
+            .await
+            .unwrap_or_else(|_| Err("recording session task failed".to_owned()));
+    Some(SmartPress(captured))
 }
 
 pub(crate) async fn start_held_recording(
@@ -746,6 +802,8 @@ pub(crate) async fn start_held_recording(
     mode: PipelineMode,
     chord: String,
     generation: u64,
+    requested: Instant,
+    smart_press: Option<SmartPress>,
 ) -> Result<(), String> {
     start_recording_mode(
         app.clone(),
@@ -756,6 +814,8 @@ pub(crate) async fn start_held_recording(
             from_shortcut: true,
             trigger_chord: Some(chord),
             hold_generation: Some(generation),
+            requested: Some(requested),
+            smart_press,
         },
         mode,
     )
@@ -770,13 +830,16 @@ async fn start_recording_mode(
     origin: StartOrigin,
     mode: PipelineMode,
 ) -> Result<(), String> {
-    // The take's start-to-ready span begins at the start request.
-    let requested = Instant::now();
+    // The take's start-to-ready span begins at the start request, or at
+    // key-down for a held key.
     let StartOrigin {
         from_shortcut,
         trigger_chord,
         hold_generation,
+        requested,
+        smart_press,
     } = origin;
+    let requested = requested.unwrap_or_else(Instant::now);
     // Until this take captures its own target, the overlay follows the
     // window the user is working in. Never move a running session's overlay.
     if services.lifecycle.phase() == PipelinePhase::Idle {
@@ -818,6 +881,9 @@ async fn start_recording_mode(
     };
     if !services.lifecycle.is_dictation_test(operation_id) {
         crate::pipeline::take_trace::PENDING.begin(operation_id, &storage, mode, requested);
+        if from_shortcut {
+            crate::pipeline::take_trace::PENDING.key_press(operation_id);
+        }
     }
     start_claimed_recording(
         app,
@@ -828,6 +894,7 @@ async fn start_recording_mode(
         trigger_chord,
         mode,
         operation_id,
+        smart_press,
     )
     .await
 }
@@ -842,6 +909,7 @@ async fn start_claimed_recording(
     trigger_chord: Option<String>,
     mode: PipelineMode,
     operation_id: u64,
+    smart_press: Option<SmartPress>,
 ) -> Result<(), String> {
     let guard = PipelineGuard {
         lifecycle: &services.lifecycle,
@@ -856,6 +924,7 @@ async fn start_claimed_recording(
         trigger_chord,
         mode,
         operation_id,
+        smart_press,
     )
     .await;
     match result {
@@ -915,6 +984,7 @@ async fn start_owned_recording(
     trigger_chord: Option<String>,
     mode: PipelineMode,
     operation_id: u64,
+    smart_press: Option<SmartPress>,
 ) -> Result<(), String> {
     let (cancel_message, cancel_error) = cancellation_copy(mode);
     let dictation_test = services.lifecycle.is_dictation_test(operation_id);
@@ -944,34 +1014,95 @@ async fn start_owned_recording(
         .unwrap_or_else(|| mode_shortcuts[0].as_str());
     let automatic =
         !dictation_test && mode == PipelineMode::Dictate && settings.automatic_voice_mode;
-    let (mut edit_session, mut ask_session) =
-        if automatic || matches!(mode, PipelineMode::Edit | PipelineMode::Ask) {
+    // Smart Dictate/Edit reads the original target and selection once, at
+    // the press, before anything else can change them.
+    let smart = match smart_source(
+        crate::smart_dictate::applies(&settings, mode, from_shortcut, dictation_test),
+        smart_press,
+    )? {
+        SmartSource::Off => None,
+        SmartSource::Pressed(start) => Some(*start),
+        SmartSource::ProbeNow => {
             let settings = settings.clone();
             let active_hotkey = active_hotkey.to_owned();
-            tokio::task::spawn_blocking(move || {
-                let edit = (mode == PipelineMode::Edit)
-                    .then(|| EditSession::new(&settings, &active_hotkey, from_shortcut))
-                    .transpose()?;
-                let ask = if automatic {
-                    Some(AskSession::automatic(
-                        &settings,
-                        &active_hotkey,
-                        from_shortcut,
-                    ))
-                } else {
-                    (mode == PipelineMode::Ask)
-                        .then(|| AskSession::new(&settings, &active_hotkey, from_shortcut))
-                };
-                Ok::<_, String>((edit, ask))
-            })
-            .await
-            .map_err(|_| "recording session task failed".to_owned())??
-        } else {
-            (None, None)
-        };
+            let shortcuts = mode_shortcuts.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    smart_start(&settings, &active_hotkey, &shortcuts, from_shortcut)
+                })
+                .await
+                .map_err(|_| "recording session task failed".to_owned())??,
+            )
+        }
+    };
+    let smart_route = smart.as_ref().map(|start| start.route);
+    // The pipeline mode that processes this take. The lifecycle keeps the
+    // Dictate mode of the pressed key, so the same key stops or cancels it.
+    let take_mode = smart_route.map_or(mode, crate::smart_dictate::SmartRoute::mode);
+    if take_mode != mode {
+        crate::pipeline::take_trace::PENDING.set_mode(operation_id, take_mode);
+        crate::privacy::check_recording(&settings, take_mode).map_err(str::to_owned)?;
+        let preflight_settings = settings.clone();
+        tokio::task::spawn_blocking(move || {
+            correction::preflight_recording(&preflight_settings, take_mode)
+        })
+        .await
+        .map_err(|_| "recording session task failed".to_owned())?
+        .map_err(|error| error.user_message().to_owned())?;
+    }
+    if let Some(route) = smart_route {
+        crate::pipeline::take_trace::PENDING.set_route(operation_id, route.code());
+    }
+    let (smart_edit, mut smart_press, smart_target) = match smart {
+        Some(SmartStart {
+            edit,
+            press,
+            target,
+            ..
+        }) => (edit, press, target),
+        None => (None, None, None),
+    };
+    let (mut edit_session, mut ask_session) = if smart_edit.is_some() {
+        (smart_edit, None)
+    } else if smart_route.is_some() {
+        (None, None)
+    } else if automatic || matches!(mode, PipelineMode::Edit | PipelineMode::Ask) {
+        let settings = settings.clone();
+        let active_hotkey = active_hotkey.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let edit = (mode == PipelineMode::Edit)
+                .then(|| EditSession::new(&settings, &active_hotkey, from_shortcut))
+                .transpose()?;
+            let ask = if automatic {
+                Some(AskSession::automatic(
+                    &settings,
+                    &active_hotkey,
+                    from_shortcut,
+                ))
+            } else {
+                (mode == PipelineMode::Ask)
+                    .then(|| AskSession::new(&settings, &active_hotkey, from_shortcut))
+            };
+            Ok::<_, String>((edit, ask))
+        })
+        .await
+        .map_err(|_| "recording session task failed".to_owned())??
+    } else {
+        (None, None)
+    };
     // Capture the target at the press: a model load may take minutes, and
     // the foreground window by then is not necessarily the one meant.
-    let target = if !dictation_test && mode != PipelineMode::Edit && mode != PipelineMode::Ask {
+    let target = if let Some(route) = smart_route {
+        match (route, smart_target.clone()) {
+            (crate::smart_dictate::SmartRoute::Dictate, Some(target)) => {
+                Some(injection::recording_target(target, from_shortcut))
+            }
+            // An unknown selection is never pasted over: the result is
+            // delivered like a start from this app, on the clipboard.
+            (crate::smart_dictate::SmartRoute::CopyOnly(_), _) => Some(TargetWindow::this_app()),
+            _ => None,
+        }
+    } else if !dictation_test && mode != PipelineMode::Edit && mode != PipelineMode::Ask {
         Some(
             tokio::task::spawn_blocking(move || {
                 SystemTextInjector::default()
@@ -998,8 +1129,18 @@ async fn start_owned_recording(
     // A start from this app has no window handle to anchor to, so it keeps
     // the foreground anchor (the app window) too.
     let context_target = app_context::recording_target(
-        mode,
-        target.as_ref(),
+        take_mode,
+        // A copy-only take still takes its style and overlay position from
+        // the field it was started in.
+        smart_target
+            .as_ref()
+            .filter(|_| {
+                matches!(
+                    smart_route,
+                    Some(crate::smart_dictate::SmartRoute::CopyOnly(_))
+                )
+            })
+            .or(target.as_ref()),
         edit_session
             .as_ref()
             .map(|session| session.selection.target()),
@@ -1013,7 +1154,7 @@ async fn start_owned_recording(
     // just before the microphone opens.
     let prompt_load = {
         let app = app.clone();
-        let context = app_context::asr_prompt_context(mode, app_context.as_ref()).cloned();
+        let context = app_context::asr_prompt_context(take_mode, app_context.as_ref()).cloned();
         let backend = settings.asr_backend.clone();
         tokio::task::spawn_blocking(move || {
             app.state::<Storage>()
@@ -1062,16 +1203,20 @@ async fn start_owned_recording(
         let active_hotkey = active_hotkey.to_owned();
         let mode_shortcuts = mode_shortcuts.clone();
         let report = report_loss();
+        let press = smart_press.take();
         Some(
             tokio::task::spawn_blocking(move || {
-                let mut draft = live_dictation::LiveDraft::new(
-                    target,
-                    &settings,
-                    &active_hotkey,
-                    &mode_shortcuts,
-                    from_shortcut,
-                    live_dictation::defers_target_insertion(mode, &settings),
-                );
+                let mut draft = match press {
+                    Some(press) => live_dictation::LiveDraft::from_press(target, &settings, press),
+                    None => live_dictation::LiveDraft::new(
+                        target,
+                        &settings,
+                        &active_hotkey,
+                        &mode_shortcuts,
+                        from_shortcut,
+                        live_dictation::defers_target_insertion(mode, &settings),
+                    ),
+                };
                 draft.injector.report_clipboard_loss_on_drop(report);
                 draft
             })
@@ -1146,11 +1291,21 @@ async fn start_owned_recording(
         .lock()
         .map_err(|_| "translation target service is unavailable".to_string())? =
         target_language.clone();
+    *services
+        .smart_route
+        .lock()
+        .map_err(|_| "target service is unavailable".to_string())? = smart_route;
     let _ = app.emit(
         "voice-mode",
         serde_json::json!({
-            "mode": voice_mode_event_name(mode),
+            "mode": voice_mode_event_name(take_mode),
             "targetLanguage": target_language,
+            // Shown briefly on the overlay: what the Smart key chose.
+            "smartRoute": smart_route.map(crate::smart_dictate::SmartRoute::code),
+            "smartReason": match smart_route {
+                Some(crate::smart_dictate::SmartRoute::CopyOnly(reason)) => Some(reason.code()),
+                _ => None,
+            },
         }),
     );
     state.clear_result();
@@ -1160,7 +1315,7 @@ async fn start_owned_recording(
         &app,
         &state,
         AppPhase::Recording,
-        recording_message(mode, microphone_fell_back),
+        recording_message(take_mode, microphone_fell_back),
     );
     recording_overlay::set_interactive(&app, mode == PipelineMode::Translate);
     if microphone_fell_back {
@@ -1244,6 +1399,95 @@ fn recording_message(mode: PipelineMode, microphone_fell_back: bool) -> &'static
             "Recording from the selected microphone."
         }
     }
+}
+
+/// What a Smart Dictate/Edit press found and chose.
+struct SmartStart {
+    route: crate::smart_dictate::SmartRoute,
+    /// The Speak to edit session over the probed selection.
+    edit: Option<EditSession>,
+    /// The press-time monitor and field identity of a Dictate route.
+    press: Option<live_dictation::PressSnapshot>,
+    /// The field focused at the press, when one was read.
+    target: Option<TargetWindow>,
+}
+
+/// Probes the original target once and builds the routed session. A
+/// selection that cannot be monitored safely refuses the start, like the
+/// Speak to edit shortcut does, instead of dictating over it.
+fn smart_start(
+    settings: &Settings,
+    active_hotkey: &str,
+    shortcuts: &[String],
+    from_shortcut: bool,
+) -> Result<SmartStart, String> {
+    smart_start_with(
+        SystemTextInjector::new(injection::InjectionOptions {
+            restore_clipboard: settings.clipboard_restore,
+        }),
+        std::sync::Arc::new(crate::input_monitor::InputMonitor::default()),
+        active_hotkey,
+        shortcuts,
+        from_shortcut,
+    )
+}
+
+fn smart_start_with(
+    injector: SystemTextInjector,
+    monitor: std::sync::Arc<crate::input_monitor::InputMonitor>,
+    active_hotkey: &str,
+    shortcuts: &[String],
+    from_shortcut: bool,
+) -> Result<SmartStart, String> {
+    // Monitoring starts before the field is read, so input while it is read
+    // (or while the model loads) is measured from the press.
+    let checkpoint = monitor
+        .start_for_recording(active_hotkey, shortcuts, from_shortcut)
+        .then(|| monitor.checkpoint())
+        .flatten();
+    let probe = injector.probe_selection();
+    let route = crate::smart_dictate::decide(&probe);
+    Ok(match probe {
+        injection::SelectionProbe::Selected(selection) => {
+            let target = selection.target().clone();
+            let Some(checkpoint) = checkpoint else {
+                monitor.shutdown();
+                return Err(
+                    "Speak to edit could not monitor the original selection safely.".into(),
+                );
+            };
+            SmartStart {
+                route,
+                edit: Some(EditSession::from_monitored(
+                    selection, injector, monitor, checkpoint, true,
+                )?),
+                press: None,
+                target: Some(target),
+            }
+        }
+        injection::SelectionProbe::Empty {
+            target,
+            focus_identity,
+        } => SmartStart {
+            route,
+            edit: None,
+            press: Some(live_dictation::PressSnapshot::new(
+                monitor,
+                checkpoint,
+                focus_identity,
+            )),
+            target: Some(target),
+        },
+        injection::SelectionProbe::Unknown(_) => {
+            monitor.shutdown();
+            SmartStart {
+                route,
+                edit: None,
+                press: None,
+                target: injector.capture_target().ok(),
+            }
+        }
+    })
 }
 
 /// Shown on the overlay while a start waits for the speech model.
@@ -3888,5 +4132,7 @@ pub(crate) async fn run_gpu_diagnostics(
 mod ask_outcome_tests;
 #[cfg(test)]
 mod model_status_tests;
+#[cfg(test)]
+mod smart_start_tests;
 #[cfg(test)]
 mod tests;

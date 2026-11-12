@@ -65,6 +65,7 @@ export interface Settings {
   autoStart: boolean;
   clipboardRestore: boolean;
   automaticVoiceMode: boolean;
+  smartDictateEdit: boolean;
   decisionModel: string;
   decisionQuantization: string;
   liveTargetInsertion: boolean;
@@ -242,6 +243,8 @@ export interface StorageDiagnostics {
   /** Per-take spans by outcome cohort; separate from `summaries`. Fixed codes only, no take ids. */
   takes: {
     mode: string | null;
+    /** Smart Dictate/Edit route (`edit`, `dictate`, `copy_only`); null when not Smart-routed. The `key_presses` span entry is a count, not milliseconds. */
+    route: string | null;
     outcome: string;
     stage: string | null;
     count: number;

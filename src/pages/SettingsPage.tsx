@@ -323,6 +323,11 @@ export function SettingsPage({
 
         <SettingRow title={t("Restore clipboard")} detail={t("Restore previous clipboard contents after successful paste.")}
           control={<Toggle label={t("Restore clipboard")} checked={settings.clipboardRestore} onChange={(value) => onSave({ clipboardRestore: value })} />} />
+        <SettingRow title={t("Smart Dictate/Edit")}
+          detail={t("The Dictation shortcut edits selected text and dictates when nothing is selected.")}
+          detailMode="inline"
+          help={t("Off by default. The choice is made from the selection when you press the shortcut, without AI. If the selection cannot be checked (for example in a password field or an app that cannot be read), the result is only copied to the clipboard and never replaces text. Editing uses the configured AI provider. Other mode shortcuts stay unchanged, and automatic voice mode takes precedence.")}
+          control={<Toggle label={t("Smart Dictate/Edit")} checked={settings.smartDictateEdit} disabled={recording || settings.automaticVoiceMode} onChange={(value) => onSave({ smartDictateEdit: value })} />} />
         <SettingRow title={t("Automatic voice mode")}
           detail={t("Voice mode detection runs locally. Model files download on first load and stay cached. Editing, translation and answers still use the configured AI provider.")}
           detailMode="inline"
