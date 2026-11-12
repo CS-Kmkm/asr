@@ -147,7 +147,7 @@ export type HistoryRetention = "never" | "24_hours" | "one_week" | "one_month" |
 export type HistoryTextAction = { kind: "correct"; profile: string | null } | { kind: "translate"; target: string };
 export type HistoryFilter = "all" | "dictate" | "translate" | "edit" | "ask";
 
-export type AsrBackend = "vibevoice" | "faster-whisper" | "openai-compatible" | "speech-cpp";
+export type AsrBackend = "vibevoice" | "faster-whisper" | "openai-compatible" | "speech-cpp" | "sherpa-onnx" | "transformers-asr";
 export type ModelQuantization = "4bit" | "8bit" | "bf16";
 export type NoiseSuppression = "off" | "low" | "medium" | "high";
 export type CorrectionProvider = "openai" | "gemini" | "local";
@@ -264,6 +264,10 @@ export interface WorkerHealth {
   loaded: boolean;
   device: string | null;
   computeType: string | null;
+  /** Physical GPU the loaded model runs on, when the runtime reports it. */
+  deviceName?: string;
+  /** Runtime library and execution provider that actually ran. */
+  runtime?: string;
 }
 
 export type CredentialProvider = "openai" | "gemini" | "speech";

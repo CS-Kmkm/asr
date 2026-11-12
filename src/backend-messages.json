@@ -1,4 +1,10 @@
 {
+  "Automatic voice mode cannot share the speech worker with this ASR runtime. Choose CPU as the speech device for ONNX Runtime models, select another ASR backend, or turn off automatic voice mode.": {"code": "decision_asr_runtime_conflict", "ja": "音声モードの自動判定は、このASR実行環境と同じワーカーでは使えません。ONNX Runtimeモデルでは音声認識デバイスにCPUを選ぶか、別のASRバックエンドを選ぶか、音声モードの自動判定をオフにしてください。"},
+  "Japanese only. ONNX Runtime through sherpa-onnx on CUDA or CPU; the speech device setting chooses. The pinned model downloads on first load.": {"code": "sherpa_onnx_model_detail", "ja": "日本語専用です。sherpa-onnx経由のONNX RuntimeでCUDAまたはCPUを使い、音声認識デバイスの設定で選びます。固定版のモデルを初回読み込み時に取得します。"},
+  "Multilingual, including Japanese. Qwen3-ASR runs with transformers on a CUDA GPU (CPU only when selected). The pinned model downloads on first load.": {"code": "transformers_asr_model_detail", "ja": "日本語を含む多言語に対応します。Qwen3-ASRはtransformersでCUDA GPU上で動作します（CPUは選択した場合のみ）。固定版のモデルを初回読み込み時に取得します。"},
+  "Model file verification failed. Existing files were preserved. Select another model, or check the downloaded model folder.": {"code": "model_artifact_invalid", "ja": "モデルファイルの検証に失敗しました。既存ファイルは保持しています。別のモデルを選ぶか、ダウンロード済みモデルのフォルダーを確認してください。"},
+  "CUDA could not be used for this model. Choose CPU as the speech device, or run worker setup and check the NVIDIA driver.": {"code": "cuda_unavailable", "ja": "このモデルではCUDAを使用できませんでした。音声認識デバイスでCPUを選ぶか、ワーカーのセットアップとNVIDIAドライバーを確認してください。"},
+  "This runtime serves only the models listed in Models. Select one of them.": {"code": "invalid_model", "ja": "この実行環境はモデル画面に表示されたモデルだけを扱います。その中から選んでください。"},
   "Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.": {
     "code": "speech_cpp_locale_incompatible",
     "ja": "日本語モデルには認識言語の日本語または自動設定が必要です。設定で日本語を選ぶか、faster-whisperに切り替えてください。"

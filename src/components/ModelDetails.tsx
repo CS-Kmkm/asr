@@ -91,7 +91,7 @@ export function ModelDetails({ backend, modelId, model }: { backend: AsrBackend;
   const devices = deviceSummary(entry, t);
   const cached = managedId ? cache?.find((item) => item.modelId === managedId) : undefined;
   const loadedRuntime = health?.loaded && health.backend === entry.backend && health.device
-    ? [model?.modelId, health.device === "vulkan" ? "Vulkan" : health.device.toUpperCase(), health.computeType].filter(Boolean).join(" · ")
+    ? [model?.modelId, health.device === "vulkan" ? "Vulkan" : health.device.toUpperCase(), health.deviceName, health.computeType, health.runtime].filter(Boolean).join(" · ")
     : null;
 
   async function remove() {

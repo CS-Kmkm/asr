@@ -190,7 +190,7 @@ fn capture_config(settings: &Settings) -> CaptureConfig {
         // and a second resampling pass for that backend.
         target_sample_rate: if matches!(
             settings.asr_backend.as_str(),
-            "faster-whisper" | "speech-cpp"
+            "faster-whisper" | "speech-cpp" | "sherpa-onnx" | "transformers-asr"
         ) {
             16_000
         } else {
