@@ -23,6 +23,7 @@ mod services;
 mod sessions;
 mod settings;
 mod shortcuts;
+mod smart_dictate;
 mod startup_error;
 mod state;
 mod storage;

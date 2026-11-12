@@ -44,7 +44,28 @@ impl EditSession {
         let selection = injector
             .capture_selection()
             .map_err(|_| "Select text in a supported foreground edit control.".to_string())?;
-        if !monitor.start_for_recording(active_hotkey, &settings.shortcuts.edit, from_shortcut) {
+        Self::from_selection(
+            selection,
+            injector,
+            monitor,
+            active_hotkey,
+            &settings.shortcuts.edit,
+            from_shortcut,
+        )
+    }
+
+    /// An Edit over an already captured selection. `shortcuts` are the
+    /// chords of the key that started the take, whose own presses and
+    /// release are not user activity.
+    pub(crate) fn from_selection(
+        selection: SelectedText,
+        injector: SystemTextInjector,
+        monitor: Arc<InputMonitor>,
+        active_hotkey: &str,
+        shortcuts: &[String],
+        from_shortcut: bool,
+    ) -> Result<Self, String> {
+        if !monitor.start_for_recording(active_hotkey, shortcuts, from_shortcut) {
             return Err("Speak to edit could not monitor the original selection safely.".into());
         }
         let checkpoint = monitor

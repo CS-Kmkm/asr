@@ -94,6 +94,7 @@ export const defaultSettings: Settings = {
   autoStart: false,
   clipboardRestore: true,
   automaticVoiceMode: false,
+  smartDictateEdit: false,
   decisionModel: "Cloudflare/clef-flash",
   decisionQuantization: "4bit",
   liveTargetInsertion: false,

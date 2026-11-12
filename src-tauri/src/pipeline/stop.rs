@@ -28,7 +28,7 @@ use crate::{
     state::PipelineLifecycle,
     types::{AppStage, Settings},
 };
-use crate::{AskSession, EditSession};
+use crate::{smart_dictate::SmartRoute, AskSession, EditSession};
 use tokio::sync::watch;
 
 const NO_VOICE_CAPTURED: &str = "No speech was detected. Your audio may be too quiet. Check your microphone and Input gain in Input settings.";
@@ -80,6 +80,7 @@ struct Captured {
     draft: Option<LiveDraft>,
     edit_session: Option<EditSession>,
     ask_session: Option<AskSession>,
+    smart_route: Option<SmartRoute>,
 }
 
 impl RecordingEvents for Desktop<'_> {
@@ -129,6 +130,14 @@ impl RecordingDriver for Desktop<'_> {
             &services.voice_translation_target,
         )
         .await?;
+        // A Smart Dictate/Edit take keeps the Dictate lifecycle of its key
+        // but is processed in the mode it was routed to at the press.
+        let smart_route = services
+            .smart_route
+            .lock()
+            .map_err(|_| "target service is unavailable".to_string())?
+            .take();
+        let mode = smart_route.map_or(mode, SmartRoute::mode);
         // Stop live recognition first so it starts no window decode while the
         // capture is finalized. It is joined below, after the stop cue.
         if let Some(task) = &live_task {
@@ -213,6 +222,7 @@ impl RecordingDriver for Desktop<'_> {
             draft,
             edit_session,
             ask_session,
+            smart_route,
         })
     }
     fn transcription_message(&self, capture: &Captured, reason: StopReason) -> &'static str {
@@ -250,8 +260,10 @@ impl RecordingDriver for Desktop<'_> {
             mut draft,
             edit_session,
             ask_session,
+            smart_route,
             ..
         } = capture;
+        let mode = smart_route.map_or(mode, SmartRoute::mode);
         let duration_ms = artifact.duration.as_millis() as u64;
         let (cancel_message, cancel_error) = cancellation_copy(mode);
         trace.stage(TakeStage::Model);
@@ -453,13 +465,15 @@ impl RecordingDriver for Desktop<'_> {
             speculation,
             stop_timings,
             trace: trace.clone(),
+            smart_route,
         };
         Ok((take, edit_session, ask_session))
     }
     async fn deliver(
         &self,
         operation_id: u64,
-        mode: PipelineMode,
+        // The recognized take carries the mode it is processed in.
+        _mode: PipelineMode,
         recognized: Self::Recognized,
         trace: &TakeTrace,
     ) -> Result<RecordingResult, String> {
@@ -480,13 +494,13 @@ impl RecordingDriver for Desktop<'_> {
         if services.lifecycle.is_dictation_test(operation_id) {
             return super::setup_tests::finish_dictation_test(context, take).await;
         }
+        // Attributed to the recognized mode, like the `asr` metric of the
+        // same take, even when automatic routing changes the delivered mode.
+        let metric_mode = take.mode;
         let routed =
             super::routing::route(&context, &mut take, &mut edit_session, &mut ask_session).await;
         // Captured before the mode finish consumes the take; written after it.
         let stop_timings = take.stop_timings;
-        // Attributed to the stop mode, like the `asr` metric of the same take,
-        // even when automatic routing changes the delivered mode.
-        let metric_mode = mode;
         let metric_context = take.app_context.clone();
         let asr_backend = take.settings.asr_backend.clone();
         let record_stop_timings = || {

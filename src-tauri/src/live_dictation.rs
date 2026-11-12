@@ -1416,6 +1416,34 @@ mod tests {
         mock.lock().unwrap().content()
     }
 
+    #[test]
+    fn a_smart_copy_only_take_never_pastes_over_a_selection_it_could_not_read() {
+        for deferred in [true, false] {
+            let (mut draft, mock) = live_test_draft();
+            mock.lock().unwrap().set_selected_text("unseen");
+            // The copy-only route records into this app's own target.
+            draft.target = injection::TargetWindow::this_app();
+            draft.defer_insertion = deferred;
+            // Live insertion into this app's own window is refused.
+            let _ = draft.update("途中");
+            let (_cancel, cancelled) = watch::channel(false);
+            let result = draft.finish("最終", &cancelled);
+            assert_eq!(result, Ok(InsertResult::ClipboardOnly));
+            assert_eq!(content(&mock), "prefix unseen suffix");
+            assert_eq!(mock_calls(&mock, "paste"), 0);
+            assert_eq!(mock_calls(&mock, "write"), 1, "copied for recovery");
+            let detail = draft
+                .diagnose(InsertResult::ClipboardOnly)
+                .map(|d| d.code());
+            let route =
+                crate::smart_dictate::SmartRoute::CopyOnly(injection::UnknownSelection::Unreadable);
+            assert_eq!(
+                crate::smart_dictate::copy_only_detail(Some(route), detail),
+                Some("selection_unknown")
+            );
+        }
+    }
+
     fn mock_calls(mock: &SharedMock, name: &str) -> usize {
         test_backend::calls(&mock.lock().unwrap(), name)
     }

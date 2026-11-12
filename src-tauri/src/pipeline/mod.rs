@@ -55,6 +55,8 @@ struct RecordedTake {
     stop_timings: StopTimings,
     /// Spans and outcome of this take; disabled for dictation tests.
     trace: take_trace::TakeTrace,
+    /// The Smart Dictate/Edit route chosen at the press, if any.
+    smart_route: Option<crate::smart_dictate::SmartRoute>,
 }
 
 /// Stop-path stage timings. They are written after delivery (or after a

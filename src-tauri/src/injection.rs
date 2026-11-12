@@ -372,6 +372,43 @@ pub(crate) struct SelectedText {
     text: String,
     state: TargetText,
 }
+/// Why a Smart Dictate/Edit press could not tell whether text is selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnknownSelection {
+    /// No foreground field, or it changed while being read.
+    NoTarget,
+    /// This app's own window is in the foreground.
+    ThisApp,
+    /// A password field or a target at a higher privilege level.
+    Protected,
+    /// An IME conversion is open.
+    ImeComposing,
+    /// The field's text and selection cannot be read.
+    Unreadable,
+}
+
+impl UnknownSelection {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::NoTarget => "no_target",
+            Self::ThisApp => "this_app",
+            Self::Protected => "protected",
+            Self::ImeComposing => "ime_composing",
+            Self::Unreadable => "unreadable",
+        }
+    }
+}
+
+/// The original target and selection state, read once at a Smart
+/// Dictate/Edit press.
+pub(crate) enum SelectionProbe {
+    /// A readable, nonempty selection in an external, unprotected field.
+    Selected(SelectedText),
+    /// An external, unprotected field with nothing selected.
+    Empty(TargetWindow),
+    Unknown(UnknownSelection),
+}
+
 impl SelectedText {
     pub(crate) fn text(&self) -> &str {
         &self.text
@@ -451,6 +488,11 @@ impl SystemTextInjector {
         monitor: &InputMonitor,
     ) {
         batch::cancel(&self.backend, session, monitor)
+    }
+
+    /// Reads the focused field's selection state without sending input.
+    pub(crate) fn probe_selection(&self) -> SelectionProbe {
+        batch::probe_selection(&self.backend)
     }
 
     pub(crate) fn capture_selection(&self) -> Result<SelectedText, InjectionError> {

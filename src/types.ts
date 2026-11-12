@@ -65,6 +65,7 @@ export interface Settings {
   autoStart: boolean;
   clipboardRestore: boolean;
   automaticVoiceMode: boolean;
+  smartDictateEdit: boolean;
   decisionModel: string;
   decisionQuantization: string;
   liveTargetInsertion: boolean;

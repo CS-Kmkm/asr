@@ -255,6 +255,16 @@ impl PendingTakes {
         }
     }
 
+    /// The mode that processes the take, when the start routed it to
+    /// another mode than the pressed key's (Smart Dictate/Edit).
+    pub(crate) fn set_mode(&self, operation_id: u64, mode: PipelineMode) {
+        if let Some((id, trace, _)) = self.slot().as_ref() {
+            if *id == operation_id {
+                trace.with(|state| state.mode = mode);
+            }
+        }
+    }
+
     /// The microphone is capturing: start request to ready.
     pub(crate) fn ready(&self, operation_id: u64) {
         if let Some((id, trace, requested)) = self.slot().as_ref() {

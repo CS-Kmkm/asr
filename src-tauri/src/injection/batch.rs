@@ -783,6 +783,54 @@ pub(super) fn capture_selection<B: Backend>(
     Ok((target, state))
 }
 
+/// The selection state of the focused field at a Smart Dictate/Edit press.
+/// Read-only: it never sends input or touches the clipboard. Anything that
+/// is not positively known is `Unknown`, which never authorizes a replace.
+pub(super) fn probe_selection<B: Backend>(backend: &B) -> SelectionProbe {
+    let target = match backend.capture_target() {
+        Ok(target) => target,
+        Err(InjectionError::SecureTarget | InjectionError::PrivilegeMismatch) => {
+            return SelectionProbe::Unknown(UnknownSelection::Protected)
+        }
+        Err(_) => return SelectionProbe::Unknown(UnknownSelection::NoTarget),
+    };
+    if target.process_id == std::process::id() {
+        return SelectionProbe::Unknown(UnknownSelection::ThisApp);
+    }
+    match backend.validate_target(&target) {
+        Ok(()) => {}
+        Err(InjectionError::SecureTarget | InjectionError::PrivilegeMismatch) => {
+            return SelectionProbe::Unknown(UnknownSelection::Protected)
+        }
+        Err(_) => return SelectionProbe::Unknown(UnknownSelection::NoTarget),
+    }
+    // An open conversion may itself be shown as a selection; neither
+    // editing nor pasting over it is safe.
+    if backend.ime_composition_active(&target) == Ok(Some(true)) {
+        return SelectionProbe::Unknown(UnknownSelection::ImeComposing);
+    }
+    match backend.target_text(&target) {
+        Ok(state) if state.selected.is_empty() => SelectionProbe::Empty(target),
+        Ok(state) => SelectionProbe::Selected(SelectedText {
+            target,
+            text: state.selected.clone(),
+            state,
+        }),
+        Err(InjectionError::SecureTarget | InjectionError::PrivilegeMismatch) => {
+            SelectionProbe::Unknown(UnknownSelection::Protected)
+        }
+        Err(InjectionError::TargetChanged | InjectionError::NoForegroundWindow) => {
+            SelectionProbe::Unknown(UnknownSelection::NoTarget)
+        }
+        // The text cannot be read. An explicitly empty selection still
+        // makes an additive paste safe; a nonempty or unreadable one does not.
+        Err(_) => match backend.selection_is_empty(&target) {
+            Ok(true) => SelectionProbe::Empty(target),
+            _ => SelectionProbe::Unknown(UnknownSelection::Unreadable),
+        },
+    }
+}
+
 pub(super) fn replace_selection<B: Backend>(
     backend: &B,
     options: InjectionOptions,
@@ -1637,6 +1685,8 @@ pub(super) mod tests {
         /// What the target exposes after processing a paste, for editors
         /// whose readable text is a proxy or a window of the document.
         readback_after_paste: RefCell<Option<TargetText>>,
+        /// What `capture_target` returns instead of `target()`.
+        captured: RefCell<Option<Result<TargetWindow, InjectionError>>>,
     }
 
     impl MockBackend {
@@ -1686,6 +1736,7 @@ pub(super) mod tests {
                 on_clipboard_write: None,
                 on_snapshot: None,
                 readback_after_paste: RefCell::new(None),
+                captured: RefCell::new(None),
             }
         }
         fn apply_pending(&self) {
@@ -1707,6 +1758,20 @@ pub(super) mod tests {
         pub(crate) fn set_text_readable(&self, readable: bool) {
             self.text_readable.set(readable);
         }
+        pub(crate) fn set_selection_readable(&self, readable: bool) {
+            self.selection_readable.set(readable);
+        }
+        /// False when the captured field is no longer the focused one.
+        pub(crate) fn set_target_valid(&self, valid: bool) {
+            self.target_valid.set(valid);
+        }
+        pub(crate) fn set_captured(&self, captured: Result<TargetWindow, InjectionError>) {
+            *self.captured.borrow_mut() = Some(captured);
+        }
+        /// Text typed into the field outside this app.
+        pub(crate) fn type_text(&self, typed: &str) {
+            self.text.borrow_mut().before.push_str(typed);
+        }
         /// Consumes the unrestored-clipboard record, as the platform backends do.
         pub(crate) fn take_clipboard_not_restored(&self) -> bool {
             self.not_restored.replace(0) > 0
@@ -1716,7 +1781,10 @@ pub(super) mod tests {
     impl Backend for MockBackend {
         type Clipboard = String;
         fn capture_target(&self) -> Result<TargetWindow, InjectionError> {
-            Ok(target())
+            self.captured
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| Ok(target()))
         }
         fn validate_target(&self, target: &TargetWindow) -> Result<(), InjectionError> {
             if target.is_secure {
