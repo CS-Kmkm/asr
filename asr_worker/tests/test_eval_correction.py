@@ -151,6 +151,11 @@ class ScorerTests(unittest.TestCase):
             ["added:url", "dropped:url"],
             evaluation.score_output(case, "Run `cargo test` and open https://Example.com/docs/Setup now.")["failures"],
         )
+        # allow_new URLs normalize exactly like output URLs.
+        allowed = _case(language="en", transcript="Read the guide.", reference="Read the guide.")
+        allowed["rules"] = {"require": [{"kind": "proposition", "any": ["guide"]}], "allow_new": ["https://Example.com/Docs"]}
+        self.assertEqual([], [code for code in evaluation.score_output(allowed, "Read the guide at https://example.com/Docs.")["failures"] if code.startswith("added")])
+        self.assertIn("added:url", evaluation.score_output(allowed, "Read the guide at https://example.com/docs.")["failures"])
         # Prose stays case-insensitive.
         self.assertTrue(evaluation.contains("Please SEND it", "please send"))
 

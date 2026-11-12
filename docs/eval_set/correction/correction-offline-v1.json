@@ -1328,6 +1328,14 @@
             "dropped:question"
           ],
           "guard": "reject"
+        },
+        {
+          "id": "question-moved",
+          "output": "このファイルを確認できます。今日中に送信できますか。",
+          "expect_failures": [
+            "dropped:question"
+          ],
+          "guard": "reject"
         }
       ]
     },
@@ -1375,6 +1383,57 @@
         {
           "id": "prohibition-dropped",
           "output": "本番には送って、会議は4時です。",
+          "expect_failures": [
+            "dropped:negation"
+          ],
+          "guard": "reject"
+        }
+      ]
+    },
+    {
+      "id": "ja-negation-unrelated-repair-02",
+      "language": "ja",
+      "categories": [
+        "negation",
+        "self_correction"
+      ],
+      "correction_mode": "conservative",
+      "transcript": "本番に送らないであした、いやあさって確認して。",
+      "reference": "本番に送らないであさって確認して。",
+      "allowed_changes": [
+        "Resolve あした to あさって"
+      ],
+      "forbidden_changes": [
+        "Drop the prohibition because of the date repair"
+      ],
+      "rules": {
+        "require": [
+          {
+            "kind": "negation",
+            "any": [
+              "送らないで"
+            ]
+          },
+          {
+            "kind": "self_correction",
+            "any": [
+              "あさって"
+            ]
+          }
+        ],
+        "forbid": [
+          {
+            "kind": "self_correction",
+            "any": [
+              "あした"
+            ]
+          }
+        ]
+      },
+      "fixtures": [
+        {
+          "id": "prohibition-dropped",
+          "output": "本番に送ってあさって確認して。",
           "expect_failures": [
             "dropped:negation"
           ],

@@ -397,12 +397,14 @@ def added_facts(case: dict[str, Any], output: str) -> list[str]:
     source_numbers = set(numbers(transcript))
     if any(value not in source_numbers and normalize(value) not in allowed for value in numbers(output)):
         failures.append("added:number")
-    allowed_exact = {unicodedata.normalize("NFKC", item) for item in rules.get("allow_new", [])}
+    allow_new = rules.get("allow_new", [])
+    allowed_urls = {url_key(item) for item in allow_new}
+    allowed_code = {code_key(item) for item in allow_new}
     source_urls = {url_key(url) for url in urls(transcript)}
-    if any(url_key(url) not in source_urls and url_key(url) not in allowed_exact for url in urls(output)):
+    if any(url_key(url) not in source_urls and url_key(url) not in allowed_urls for url in urls(output)):
         failures.append("added:url")
     source_code = {code_key(span) for span in code_spans(transcript)}
-    if any(code_key(span) not in source_code and code_key(span) not in allowed_exact for span in code_spans(output)):
+    if any(code_key(span) not in source_code and code_key(span) not in allowed_code for span in code_spans(output)):
         failures.append("added:code")
     source_text = _spaceless(normalize(transcript))
     if any(
