@@ -454,3 +454,41 @@ class SharedCatalogRuntimeTests(IsolatedWorkerTestCase):
                 self.assertEqual(entries[model_id]["languageScope"], "japanese_only" if model.japanese_only else "multilingual")
                 self.assertEqual((source["repo"], source["revision"], source["sizeBytes"]), (model.repo, model.revision, model.size))
                 self.assertEqual(source["files"], [{"file": f.name, "sha256": f.sha256, "sizeBytes": f.size} for f in model.files])
+
+
+class FailedLoadReleaseTests(RuntimeAdapterTestCase):
+    """A failed warm-up must not keep tensors alive through its traceback."""
+
+    def probe_adapter(self, error: BaseException):
+        import weakref
+
+        class Tensor:
+            pass
+
+        probes: list[Any] = []
+        alive_at_close: list[bool] = []
+
+        class Failing(FakeAdapter):
+            def _open(self, model: ra.ManagedModel, paths: dict[str, Path]) -> None:
+                self.device = "cuda"
+                activations = Tensor()  # held only by this frame's locals
+                probes.append(weakref.ref(activations))
+                raise error
+
+            def _close(self) -> None:
+                alive_at_close.extend(probe() is not None for probe in probes)
+
+        return Failing(), probes, alive_at_close
+
+    def test_oom_and_cancel_release_frame_references_before_unload(self):
+        self.publish()
+        for error, code in [(RuntimeError("CUDA out of memory. Tried to allocate"), "gpu_oom"),
+                            (BackendError("cancelled", "Transcription was cancelled"), "cancelled")]:
+            with self.subTest(code=code):
+                backend, probes, alive_at_close = self.probe_adapter(error)
+                with self.assertRaises(BackendError) as caught:
+                    backend.load("4bit")
+                self.assertEqual(caught.exception.code, code)
+                self.assertEqual(alive_at_close, [False])
+                self.assertIsNone(probes[0]())
+                self.assertIsNone(backend.device)

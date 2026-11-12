@@ -258,6 +258,27 @@ def split_on_quiet(samples: Any, rate: int, max_seconds: float, search_seconds: 
     return chunks
 
 
+def release_traceback_frames(error: BaseException) -> None:
+    """Drop local variables held by finished frames of an exception chain.
+
+    A failed load or warm-up (GPU OOM, cancel) leaves model tensors referenced
+    from library frames in the traceback. They must be released before the
+    adapter unloads and empties the CUDA cache, or reserved GPU memory stays
+    with an unloaded worker. Same approach as the decision model.
+    """
+    import traceback
+
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback.clear_frames(current.__traceback__)
+        pending.extend(linked for linked in (current.__cause__, current.__context__) if linked is not None)
+
+
 @contextlib.contextmanager
 def captured_native_stderr() -> Iterator[list[str]]:
     """Capture what native libraries write to file descriptor 2.
@@ -352,13 +373,15 @@ class RuntimeAdapter(ProgressReporting):
             self._open(model, paths)
             self.model = model
             self.raise_if_cancelled()
-        except BackendError:
+        except BackendError as exc:
+            release_traceback_frames(exc)
             self._safe_unload()
             raise
         except BaseException as exc:
-            device = self.device
+            mapped = map_backend_exception(exc, "load", self.display_label, device=self.device)
+            release_traceback_frames(exc)
             self._safe_unload()
-            raise map_backend_exception(exc, "load", self.display_label, device=device) from exc
+            raise mapped from exc
 
     def preload_runtime(self) -> None:
         """Import the native runtime before the worker's input thread blocks.
