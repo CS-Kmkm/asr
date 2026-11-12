@@ -17,6 +17,7 @@ import contextlib
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -192,6 +193,15 @@ class SherpaOnnxBackend(RuntimeAdapter):
         version = getattr(self.sherpa, "__version__", "unknown")
         ort = getattr(self.sherpa, "onnxruntime_version", "unknown")
         self.compute_type = "float32"
+        if self.device_policy in ("auto", "cuda") and "torch" in sys.modules:
+            # Reverse of the worker's load_decision guard: torch (the decision
+            # model) is already in this process, and the CUDA 12 / cuDNN 9
+            # DLLs clash with torch's. Only an explicit CPU load is safe.
+            raise BackendError(
+                "decision_runtime_conflict",
+                "sherpa-onnx cannot load CUDA libraries in a worker where torch (the decision model) is loaded; "
+                "select the CPU speech device or restart the worker without the decision model",
+            )
         if self.device_policy in ("auto", "cuda"):
             failure = self._open_cuda(model, paths)
             if failure is None:

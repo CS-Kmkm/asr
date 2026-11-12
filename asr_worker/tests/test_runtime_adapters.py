@@ -290,6 +290,13 @@ class AudioTests(RuntimeAdapterTestCase):
         self.assertIn("Fallback to cpu", "".join(log))
 
 
+def hide_torch(case: IsolatedWorkerTestCase) -> None:
+    """Make this process look torch-free for sherpa CUDA paths; restored after."""
+    saved = sys.modules.pop("torch", None)
+    if saved is not None:
+        case.addCleanup(sys.modules.__setitem__, "torch", saved)
+
+
 class FakeRecognizer:
     """Returns the next scripted text for each decoded stream."""
 
@@ -309,6 +316,7 @@ class FakeRecognizer:
 class SherpaOnnxTests(RuntimeAdapterTestCase):
     def setUp(self) -> None:
         super().setUp()
+        hide_torch(self)
         self.sherpa = types.SimpleNamespace(__version__="2.0.1+test", onnxruntime_version="1.24.4")
 
     def backend(self, policy: str) -> so.SherpaOnnxBackend:
@@ -495,6 +503,10 @@ class FailedLoadReleaseTests(RuntimeAdapterTestCase):
 
 
 class DecisionConflictTests(RuntimeAdapterTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        hide_torch(self)
+
     def test_worker_refuses_decision_model_after_sherpa_cuda_libraries_loaded(self):
         backend = so.SherpaOnnxBackend()
         worker = Worker(backend)
@@ -502,6 +514,42 @@ class DecisionConflictTests(RuntimeAdapterTestCase):
             backend.excludes_torch = True
             response, _ = worker.handle({"id": 1, "command": "load_decision", "model": "Cloudflare/clef-flash"})
         self.assertEqual(response["error"]["code"], "decision_runtime_conflict")
+
+    def test_sherpa_cuda_load_is_refused_after_torch_was_loaded_in_this_worker(self):
+        fake_torch = types.ModuleType("torch")
+        sherpa = types.SimpleNamespace(__version__="t", onnxruntime_version="t")
+        for policy in ["auto", "cuda"]:
+            with self.subTest(policy=policy), patch.dict(sys.modules, {"torch": fake_torch}):
+                os.environ["ASR_DEVICE"] = policy
+                backend = so.SherpaOnnxBackend()
+                backend.sherpa = sherpa
+                with patch.object(so, "preload_cuda_libraries", side_effect=AssertionError("CUDA DLLs loaded")),                      self.assertRaises(BackendError) as caught:
+                    backend._open(so.REAZONSPEECH_K2_V2, {})
+                self.assertEqual(caught.exception.code, "decision_runtime_conflict")
+                self.assertFalse(backend.excludes_torch)
+        # An explicit CPU load stays possible next to torch.
+        os.environ["ASR_DEVICE"] = "cpu"
+        backend = so.SherpaOnnxBackend()
+        backend.sherpa = sherpa
+        with patch.dict(sys.modules, {"torch": fake_torch}),              patch.object(backend, "_build", return_value=(FakeRecognizer(), "")):
+            backend._open(so.REAZONSPEECH_K2_V2, {})
+        self.assertEqual(backend.device, "cpu")
+
+    def test_worker_refuses_cuda_load_after_load_decision_in_the_same_worker(self):
+        self.publish(so.REAZONSPEECH_K2_V2, "sherpa-onnx", {})
+        os.environ["ASR_DEVICE"] = "auto"
+        worker = Worker(so.SherpaOnnxBackend())
+        fake_torch = types.ModuleType("torch")
+
+        def load_decision(model, quantization, progress):
+            sys.modules["torch"] = fake_torch  # what the real decision load imports
+
+        with patch.dict(sys.modules, {}), patch.object(worker.decision, "load", side_effect=load_decision),              patch.object(so.SherpaOnnxBackend, "_import_runtime", lambda self: setattr(self, "sherpa", types.SimpleNamespace(__version__="t", onnxruntime_version="t"))),              patch.object(ra, "fetch_model", return_value={}),              patch.object(so, "preload_cuda_libraries", side_effect=AssertionError("CUDA DLLs loaded")):
+            decision, _ = worker.handle({"id": 1, "command": "load_decision", "model": "Cloudflare/clef-flash"})
+            self.assertTrue(decision["ok"], decision)
+            response, _ = worker.handle({"id": 2, "command": "load"})
+        self.assertEqual(response["error"]["code"], "decision_runtime_conflict")
+        self.assertFalse(worker.loaded)
 
     def test_cuda_attempt_marks_the_process_torch_incompatible_but_cpu_does_not(self):
         os.environ["ASR_DEVICE"] = "cpu"
