@@ -346,6 +346,7 @@ impl RecordingDriver for Desktop<'_> {
             {
                 Ok(value) => {
                     trace.span_since(TakeSpan::Asr, asr_started);
+                    trace.final_ready();
                     Ok(value)
                 }
                 Err(asr::AsrError::Cancelled) => {

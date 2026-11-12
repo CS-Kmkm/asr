@@ -1178,6 +1178,13 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode, trigger
         let lifecycle = &app.state::<Services>().inner().lifecycle;
         shortcuts::press(lifecycle.phase(), lifecycle.mode(), requested_mode)
     };
+    if matches!(
+        press,
+        shortcuts::Press::Stop | shortcuts::Press::CancelStart
+    ) {
+        // A start press is counted by the start itself.
+        pipeline::take_trace::PENDING.key_press_active();
+    }
     let result = match press {
         shortcuts::Press::Stop => commands::stop_recording(
             app.clone(),
@@ -1261,6 +1268,7 @@ async fn toggle_voice_mode(app: AppHandle, requested_mode: PipelineMode, trigger
 
 /// Esc while a session is active: the same cancel as the windows' button.
 async fn cancel_voice_session(app: AppHandle) {
+    pipeline::take_trace::PENDING.key_press_active();
     if let Err(error) = commands::cancel_recording(
         app.clone(),
         app.state::<Services>(),

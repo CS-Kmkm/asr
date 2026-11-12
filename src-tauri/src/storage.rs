@@ -6,6 +6,8 @@ mod schema;
 use history_audio::queue_audio_deletion;
 #[cfg(test)]
 pub(crate) use metrics::TakeRowForTest;
+#[cfg(test)]
+pub(crate) use metrics::KEY_PRESSES_SUMMARY;
 pub use metrics::{MetricContext, MetricRecorder, StorageDiagnostics};
 pub(crate) use metrics::{TakeOutcome, TakeSpan, TakeSpanRecord, TakeStage};
 use schema::{run_migrations, MIGRATIONS};

@@ -818,6 +818,9 @@ async fn start_recording_mode(
     };
     if !services.lifecycle.is_dictation_test(operation_id) {
         crate::pipeline::take_trace::PENDING.begin(operation_id, &storage, mode, requested);
+        if from_shortcut {
+            crate::pipeline::take_trace::PENDING.key_press(operation_id);
+        }
     }
     start_claimed_recording(
         app,
@@ -974,6 +977,9 @@ async fn start_owned_recording(
         .await
         .map_err(|_| "recording session task failed".to_owned())?
         .map_err(|error| error.user_message().to_owned())?;
+    }
+    if let Some(route) = smart_route {
+        crate::pipeline::take_trace::PENDING.set_route(operation_id, route.code());
     }
     let (smart_edit, smart_target) = match smart {
         Some(SmartStart { edit, target, .. }) => (edit, target),

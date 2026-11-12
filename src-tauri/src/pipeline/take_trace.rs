@@ -26,6 +26,10 @@ struct TraceState {
     stage: TakeStage,
     outcome: Option<TakeOutcome>,
     spans: [Option<i64>; TakeSpan::ALL.len()],
+    /// Smart Dictate/Edit route code, when the Smart key routed the take.
+    route: Option<&'static str>,
+    /// Voice-mode shortcut presses attributed to this take.
+    key_presses: i64,
     storage: Storage,
     /// The completion-queue place of this take's row, taken when the take
     /// is concluded, before its lifecycle guard is released.
@@ -41,6 +45,8 @@ impl TraceState {
             // A take released without a conclusion still has one outcome.
             outcome: self.outcome.unwrap_or(TakeOutcome::Failed(self.stage)),
             spans: self.spans,
+            route: self.route,
+            key_presses: Some(self.key_presses),
         }
     }
 }
@@ -82,6 +88,8 @@ impl TakeTrace {
             stage: TakeStage::Start,
             outcome: None,
             spans: [None; TakeSpan::ALL.len()],
+            route: None,
+            key_presses: 0,
             storage: storage.clone(),
             reservation: None,
             released: false,
@@ -123,6 +131,20 @@ impl TakeTrace {
 
     pub(crate) fn stopped(&self, at: Instant) {
         self.with(|state| state.stop = Some(at));
+    }
+
+    /// Marks the final transcript as ready: stop to final recognition.
+    pub(crate) fn final_ready(&self) {
+        self.with(|state| {
+            if let Some(stop) = state.stop {
+                state.spans[TakeSpan::StopToFinal.index()].get_or_insert(duration_ms(stop));
+            }
+        });
+    }
+
+    /// Counts a voice-mode shortcut press that acted on this take.
+    pub(crate) fn key_press(&self) {
+        self.with(|state| state.key_presses = state.key_presses.saturating_add(1));
     }
 
     /// Marks the output commit as returned: stop to delivery complete.
@@ -265,6 +287,32 @@ impl PendingTakes {
         }
     }
 
+    /// The Smart Dictate/Edit route of the take of `operation_id`.
+    pub(crate) fn set_route(&self, operation_id: u64, route: &'static str) {
+        if let Some((id, trace, _)) = self.slot().as_ref() {
+            if *id == operation_id {
+                trace.with(|state| state.route = Some(route));
+            }
+        }
+    }
+
+    /// Counts a shortcut press that started the take of `operation_id`.
+    pub(crate) fn key_press(&self, operation_id: u64) {
+        if let Some((id, trace, _)) = self.slot().as_ref() {
+            if *id == operation_id {
+                trace.key_press();
+            }
+        }
+    }
+
+    /// Counts a shortcut press (a toggle stop, a second press that cancels
+    /// a start, or Esc) on the take that is starting or recording, if any.
+    pub(crate) fn key_press_active(&self) {
+        if let Some((_, trace, _)) = self.slot().as_ref() {
+            trace.key_press();
+        }
+    }
+
     /// The microphone is capturing: start request to ready.
     pub(crate) fn ready(&self, operation_id: u64) {
         if let Some((id, trace, requested)) = self.slot().as_ref() {
@@ -355,16 +403,22 @@ mod tests {
         let storage = Storage::in_memory().unwrap();
         let trace = TakeTrace::new(&storage, PipelineMode::Dictate);
         trace.delivered();
+        trace.final_ready();
         trace.stopped(Instant::now() - Duration::from_millis(40));
+        trace.final_ready();
         trace.delivered();
         trace.conclude(Ok("paste_unverified"), false);
         drop(trace.release_on_drop());
         let rows = drained(&storage);
         let row = &rows[0];
         assert_eq!(row.outcome, "paste_unverified");
+        let final_ready = row.span(TakeSpan::StopToFinal).unwrap();
         let delivered = row.span(TakeSpan::StopToDelivery).unwrap();
         let next = row.span(TakeSpan::StopToNextTake).unwrap();
-        assert!(delivered >= 40 && next >= delivered, "{delivered} {next}");
+        assert!(
+            final_ready >= 40 && delivered >= final_ready && next >= delivered,
+            "{final_ready} {delivered} {next}"
+        );
     }
 
     #[test]
@@ -435,6 +489,47 @@ mod tests {
         trace.release();
         deleting.join().unwrap();
         assert!(drained(&storage).is_empty());
+    }
+
+    #[test]
+    fn smart_takes_record_their_mode_route_and_key_presses() {
+        let storage = Storage::in_memory().unwrap();
+        let pending = PendingTakes::new();
+        // A Smart press routed to Edit, stopped by a second press.
+        pending.begin(1, &storage, PipelineMode::Dictate, Instant::now());
+        pending.key_press(1);
+        pending.set_mode(1, PipelineMode::Edit);
+        pending.set_route(1, "edit");
+        pending.ready(1);
+        pending.key_press(2);
+        pending.set_route(2, "copy_only");
+        pending.key_press_active();
+        let trace = pending.claim(1).unwrap();
+        // Presses after the stop claimed the take are not counted.
+        pending.key_press_active();
+        trace.conclude(Ok("clipboard_paste"), false);
+        trace.release();
+        // A plain take started from the app window: no route, no presses.
+        pending.begin(3, &storage, PipelineMode::Dictate, Instant::now());
+        pending.end(3, true);
+        let rows = drained(&storage);
+        assert_eq!(rows[0].route.as_deref(), Some("edit"));
+        assert_eq!(rows[0].key_presses, Some(2));
+        assert_eq!(rows[1].route, None);
+        assert_eq!(rows[1].key_presses, Some(0));
+        let report = storage.diagnostics().unwrap();
+        let edit = report
+            .takes
+            .iter()
+            .find(|cohort| cohort.route.as_deref() == Some("edit"))
+            .expect("routed cohort");
+        assert_eq!(edit.mode.as_deref(), Some("edit"));
+        let presses = edit
+            .spans
+            .iter()
+            .find(|span| span.span == crate::storage::KEY_PRESSES_SUMMARY)
+            .unwrap();
+        assert_eq!((presses.timed_count, presses.p50_ms), (1, Some(2)));
     }
 
     #[test]
