@@ -67,7 +67,9 @@ original text is left alone and the generated edit remains on the clipboard.
 **Smart Dictate/Edit** (Settings > Input, off by default) lets the Dictation
 shortcut do both: when you press it, the app reads the focused field once,
 without AI. A readable selection starts Speak to edit on exactly that
-selection; an empty selection starts ordinary Dictate. When the selection
+selection; an empty selection starts Dictate into that field, which pastes
+only the final text and only while the same field is focused with nothing
+selected. When the selection
 cannot be checked (password field, unreadable control, an open IME
 conversion, this app or no field), the take is dictated but only copied to
 the clipboard and History, so text you could not see selected is never
