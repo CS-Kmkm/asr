@@ -575,6 +575,7 @@ impl Drop for LiveDraft {
 pub(crate) struct PressSnapshot {
     monitor: Option<Arc<InputMonitor>>,
     checkpoint: Option<u64>,
+    /// Always known: Smart Dictate never relies on the window guard alone.
     focus_identity: Option<Vec<i32>>,
 }
 
@@ -582,12 +583,12 @@ impl PressSnapshot {
     pub(crate) fn new(
         monitor: Arc<InputMonitor>,
         checkpoint: Option<u64>,
-        focus_identity: Option<Vec<i32>>,
+        focus_identity: Vec<i32>,
     ) -> Self {
         Self {
             monitor: Some(monitor),
             checkpoint,
-            focus_identity,
+            focus_identity: Some(focus_identity),
         }
     }
 }
@@ -1497,7 +1498,7 @@ mod tests {
         let mut draft = LiveDraft::from_press(
             test_backend::target(),
             &settings,
-            PressSnapshot::new(monitor, checkpoint, Some(vec![1])),
+            PressSnapshot::new(monitor, checkpoint, vec![1]),
         );
         draft.injector =
             SystemTextInjector::with_mock(Arc::clone(&mock), InjectionOptions::default());
@@ -1545,6 +1546,20 @@ mod tests {
     }
 
     #[test]
+    fn a_smart_dictate_pastes_only_while_its_known_field_identity_reads_back() {
+        // A transient identity failure at paste time never lets the take
+        // through on the window guard alone.
+        let (mut draft, mock) = smart_press_draft(false);
+        mock.lock().unwrap().set_identity_fails(true);
+        let (_cancel, cancelled) = watch::channel(false);
+        assert_ne!(
+            draft.finish("本文", &cancelled),
+            Ok(InsertResult::ClipboardPaste)
+        );
+        assert_eq!(mock_calls(&mock, "paste"), 0);
+    }
+
+    #[test]
     fn a_smart_dictate_never_inserts_live_text() {
         let (mut draft, mock) = smart_press_draft(true);
         draft.update("途中").unwrap();
@@ -1556,7 +1571,7 @@ mod tests {
     #[test]
     fn an_unused_press_snapshot_stops_its_monitor() {
         let monitor = available_monitor();
-        let snapshot = PressSnapshot::new(Arc::clone(&monitor), monitor.checkpoint(), None);
+        let snapshot = PressSnapshot::new(Arc::clone(&monitor), monitor.checkpoint(), vec![1]);
         drop(snapshot);
         assert!(monitor.checkpoint().is_none());
     }

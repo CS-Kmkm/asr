@@ -811,9 +811,15 @@ pub(super) fn probe_selection<B: Backend>(backend: &B) -> SelectionProbe {
     }
     // Empty selected text is not an empty selection: a selected embedded
     // object returns no characters. Only collapsed endpoints count as empty.
-    let empty = |target: TargetWindow| match backend.selection_is_empty(&target) {
-        Ok(true) => SelectionProbe::Empty {
-            focus_identity: backend.focus_identity(&target).ok(),
+    // The field must also be identifiable: without its identity, another
+    // empty field of the same window could later pass for it, so the take
+    // fails closed to copy-only.
+    let empty = |target: TargetWindow| match (
+        backend.selection_is_empty(&target),
+        backend.focus_identity(&target),
+    ) {
+        (Ok(true), Ok(focus_identity)) => SelectionProbe::Empty {
+            focus_identity,
             target,
         },
         _ => SelectionProbe::Unknown(UnknownSelection::Unreadable),
@@ -1696,6 +1702,8 @@ pub(super) mod tests {
         /// A selected embedded object: no selected characters, yet the
         /// selection is not collapsed.
         object_selected: Cell<bool>,
+        /// UI Automation cannot identify the focused element.
+        identity_fails: Cell<bool>,
         /// Runs on every full text read, as input arriving while it is read.
         on_read: RefCell<Option<Box<dyn Fn() + Send>>>,
     }
@@ -1749,6 +1757,7 @@ pub(super) mod tests {
                 readback_after_paste: RefCell::new(None),
                 captured: RefCell::new(None),
                 object_selected: Cell::new(false),
+                identity_fails: Cell::new(false),
                 on_read: RefCell::new(None),
             }
         }
@@ -1780,6 +1789,9 @@ pub(super) mod tests {
         }
         pub(crate) fn set_on_read(&self, on_read: impl Fn() + Send + 'static) {
             *self.on_read.borrow_mut() = Some(Box::new(on_read));
+        }
+        pub(crate) fn set_identity_fails(&self, fails: bool) {
+            self.identity_fails.set(fails);
         }
         pub(crate) fn set_object_selected(&self, selected: bool) {
             self.object_selected.set(selected);
@@ -1831,6 +1843,9 @@ pub(super) mod tests {
             Ok(self.ime.get())
         }
         fn focus_identity(&self, _: &TargetWindow) -> Result<Vec<i32>, InjectionError> {
+            if self.identity_fails.get() {
+                return Err(InjectionError::BackendFailure("focus identity unavailable"));
+            }
             Ok(self.text.borrow().identity.clone())
         }
         fn target_text_probe(&self, _: &TargetWindow) -> Result<Option<TextProbe>, InjectionError> {

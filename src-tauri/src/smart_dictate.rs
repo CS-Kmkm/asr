@@ -194,6 +194,19 @@ mod tests {
                 SmartRoute::CopyOnly(ThisApp),
             ),
             (
+                "empty selection, focused field cannot be identified",
+                Box::new(|b| b.set_identity_fails(true)),
+                SmartRoute::CopyOnly(Unreadable),
+            ),
+            (
+                "unreadable text, empty selection, field cannot be identified",
+                Box::new(|b| {
+                    b.set_text_readable(false);
+                    b.set_identity_fails(true);
+                }),
+                SmartRoute::CopyOnly(Unreadable),
+            ),
+            (
                 "selected embedded object without characters",
                 Box::new(|b| b.set_object_selected(true)),
                 SmartRoute::CopyOnly(Unreadable),

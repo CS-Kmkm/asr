@@ -405,10 +405,11 @@ pub(crate) enum SelectionProbe {
     /// A readable, nonempty selection in an external, unprotected field.
     Selected(SelectedText),
     /// An external, unprotected field whose selection is collapsed, with the
-    /// UI Automation identity of the focused field when it could be read.
+    /// UI Automation identity of the focused field (always known: a field
+    /// that cannot be identified is `Unknown`).
     Empty {
         target: TargetWindow,
-        focus_identity: Option<Vec<i32>>,
+        focus_identity: Vec<i32>,
     },
     Unknown(UnknownSelection),
 }
