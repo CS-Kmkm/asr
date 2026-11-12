@@ -163,7 +163,10 @@ fn changes_several_terms(original: &str, preferred: &str) -> bool {
             j += 1;
         }
     }
-    false
+    // A change left over at the end of either side counts as well
+    // (`Githab and Docke -> Github and Docker`).
+    let tail_changed = i < left.len() || j < right.len();
+    tail_changed && changed && run.iter().any(|c| *c == ' ' || is_hiragana(*c))
 }
 
 fn edit_distance(left: &[char], right: &[char]) -> usize {
@@ -490,6 +493,9 @@ mod tests {
                 "use Kubernetes and Docker now",
             ),
             ("機会学習と深相学習", "機械学習と深層学習"),
+            ("Githab and Docke", "Github and Docker"),
+            ("use Githab and Docke now", "use Github and Docker now"),
+            ("Githab and Docker", "Github and Docke"),
         ] {
             assert_eq!(pair(before, after), None, "{before} -> {after}");
         }
