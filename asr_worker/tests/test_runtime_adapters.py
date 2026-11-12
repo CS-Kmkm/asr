@@ -432,6 +432,25 @@ class TransformersAsrTests(RuntimeAdapterTestCase):
         self.assertEqual(caught.exception.code, "gpu_oom")
         self.assertIsNone(backend.model)
 
+    def test_qwen3_asr_1_7b_is_pinned_and_a_cuda_oom_while_transcribing_is_reported(self):
+        os.environ["ASR_MODEL_ID"] = "qwen3-asr-1.7b"
+        backend = tr.TransformersAsrBackend()
+        self.assertEqual(backend.model_name, "transformers-asr:qwen3-asr-1.7b")
+        self.assertEqual(tr.MODELS["qwen3-asr-1.7b"].repo, "Qwen/Qwen3-ASR-1.7B-hf")
+        backend.model = tr.QWEN3_ASR_1_7B
+        backend.device = "cuda"
+
+        def out_of_memory(*args: Any, **kwargs: Any) -> str:
+            raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+
+        backend._generate = out_of_memory
+        audio = write_wav(self.root / "a.wav", np.zeros(16_000, dtype=np.float32))
+        with self.assertRaises(BackendError) as caught:
+            backend.transcribe(audio, None, "ja-JP")
+        self.assertEqual(caught.exception.code, "gpu_oom")
+        # No silent CPU retry: the loaded model and its device are unchanged.
+        self.assertEqual((backend.model, backend.device), (tr.QWEN3_ASR_1_7B, "cuda"))
+
     def test_dictionary_prompt_and_language_reach_the_processor(self):
         backend = tr.TransformersAsrBackend()
         backend.model = tr.QWEN3_ASR_0_6B

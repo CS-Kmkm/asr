@@ -83,10 +83,23 @@ pub(crate) fn model_identity(settings: &Settings) -> (Option<String>, String) {
             Some(custom_model.unwrap_or("microsoft/VibeVoice-ASR-HF").into()),
             "VibeVoice requires a CUDA GPU; downloads from Hugging Face on first load.".into(),
         ),
-        "speech-cpp" => (
-            Some(format!("speech.cpp:{}:Q8_0", custom_model.unwrap_or("haas-ja-v1.0"))),
-            "Japanese only. speech.cpp uses Vulkan, with Q8_0 weights and CPU decoding. The runtime and model download on first load.".into(),
-        ),
+        "speech-cpp" => {
+            let id = custom_model
+                .or_else(|| model_catalog::default_pinned_model("speech-cpp"))
+                .unwrap_or("haas-ja-v1.0");
+            let pinned = model_catalog::pinned_model("speech-cpp", id);
+            let weights = pinned
+                .and_then(|model| model.weight_format.as_deref())
+                .unwrap_or("Q8_0");
+            let detail = if pinned.and_then(|model| model.language_scope.as_deref())
+                == Some("multilingual")
+            {
+                "Multilingual, including Japanese. Qwen3-ASR runs on speech.cpp with Vulkan (not CUDA) and Q8_0 weights. The runtime and model download on first load."
+            } else {
+                "Japanese only. speech.cpp uses Vulkan, with Q8_0 weights and CPU decoding. The runtime and model download on first load."
+            };
+            (Some(format!("speech.cpp:{id}:{weights}")), detail.into())
+        }
         "sherpa-onnx" => (
             Some(format!(
                 "sherpa-onnx:{}",

@@ -200,6 +200,70 @@
       "issue": null
     },
     {
+      "id": "speech-cpp:qwen3-asr-0.6b",
+      "backend": "speech-cpp",
+      "modelId": "qwen3-asr-0.6b",
+      "aliases": [],
+      "displayName": "Qwen3-ASR 0.6B (speech.cpp)",
+      "availability": "available",
+      "languageScope": "multilingual",
+      "inference": [
+        "batch",
+        "chunked"
+      ],
+      "devices": [
+        "vulkan"
+      ],
+      "decoderOnCpu": false,
+      "vocabulary": "prompt",
+      "wordTimestamps": false,
+      "cancellation": "between_requests",
+      "sampleRateHz": 16000,
+      "license": "Apache-2.0",
+      "source": {
+        "repo": "sakasegawa/Qwen3-ASR-0.6B-GGUF",
+        "revision": "ee78f8709547f39bea3b924a16c72403826cac92",
+        "file": "Qwen3-ASR-0.6B-Q8_0.gguf",
+        "sha256": "416e10c15b4a3d9002bd337d18fc450233fdf68502b6e10d1379d2789838afd0",
+        "sizeBytes": 841502336
+      },
+      "weightFormat": "Q8_0",
+      "memory": null,
+      "issue": null
+    },
+    {
+      "id": "speech-cpp:qwen3-asr-1.7b",
+      "backend": "speech-cpp",
+      "modelId": "qwen3-asr-1.7b",
+      "aliases": [],
+      "displayName": "Qwen3-ASR 1.7B (speech.cpp)",
+      "availability": "available",
+      "languageScope": "multilingual",
+      "inference": [
+        "batch",
+        "chunked"
+      ],
+      "devices": [
+        "vulkan"
+      ],
+      "decoderOnCpu": false,
+      "vocabulary": "prompt",
+      "wordTimestamps": false,
+      "cancellation": "between_requests",
+      "sampleRateHz": 16000,
+      "license": "Apache-2.0",
+      "source": {
+        "repo": "sakasegawa/Qwen3-ASR-1.7B-GGUF",
+        "revision": "81e2423d24073cdeeccb5951df16accc89e075a2",
+        "file": "Qwen3-ASR-1.7B-Q8_0.gguf",
+        "sha256": "5f219b78a1d9c3b9e97da27708b36f8a0bc1bfc1650b541c0a6dbaf87c9a62d0",
+        "sizeBytes": 2176109216
+      },
+      "weightFormat": "Q8_0",
+      "memory": null,
+      "issue": null
+    },
+    {
       "id": "sherpa-onnx:reazonspeech-k2-v2",
       "backend": "sherpa-onnx",
       "modelId": "reazonspeech-k2-v2",
@@ -335,31 +399,74 @@
       "issue": null
     },
     {
-      "id": "planned:qwen3-asr-1.7b",
-      "backend": null,
-      "modelId": null,
+      "id": "transformers-asr:qwen3-asr-1.7b",
+      "backend": "transformers-asr",
+      "modelId": "qwen3-asr-1.7b",
       "aliases": [],
-      "displayName": "Qwen3-ASR 1.7B",
-      "availability": "planned",
+      "displayName": "Qwen3-ASR 1.7B (transformers)",
+      "availability": "available",
       "languageScope": "multilingual",
-      "inference": [],
-      "devices": [],
+      "inference": [
+        "batch",
+        "chunked"
+      ],
+      "devices": [
+        "cuda",
+        "cpu"
+      ],
       "decoderOnCpu": false,
-      "vocabulary": null,
-      "wordTimestamps": null,
-      "cancellation": null,
-      "sampleRateHz": null,
+      "vocabulary": "prompt",
+      "wordTimestamps": false,
+      "cancellation": "between_tokens",
+      "sampleRateHz": 16000,
       "license": "Apache-2.0",
       "source": {
-        "repo": "Qwen/Qwen3-ASR-1.7B",
-        "revision": null,
+        "repo": "Qwen/Qwen3-ASR-1.7B-hf",
+        "revision": "bcd2b5b7f32b480ab5790554cfa8347f246a14f3",
         "file": null,
         "sha256": null,
-        "sizeBytes": null
+        "sizeBytes": 4087628216,
+        "files": [
+          {
+            "file": "config.json",
+            "sha256": "117ac8e63e2af7cae3665e5a632d6eb03f5f384915519ceb6403c15ec6533f63",
+            "sizeBytes": 2399
+          },
+          {
+            "file": "generation_config.json",
+            "sha256": "9939fc9388b79bd70757f938b87381e817173d6a6158f5af6506c0b73e775c3c",
+            "sizeBytes": 165
+          },
+          {
+            "file": "model.safetensors",
+            "sha256": "2db53c7d81bd9b8cbc6a074e89be2c968a0d373fb4ee68bb1b1e14f7042dfee1",
+            "sizeBytes": 4076193080
+          },
+          {
+            "file": "processor_config.json",
+            "sha256": "bc0b230081b44e629dd5b9045b78495615c1831b4b9f4cffe97bd37e82a6156a",
+            "sizeBytes": 487
+          },
+          {
+            "file": "chat_template.jinja",
+            "sha256": "f50e6b694fbf4a683206e37869990d68333fe95d285730f084c838a34b0d98c2",
+            "sizeBytes": 1434
+          },
+          {
+            "file": "tokenizer.json",
+            "sha256": "fe1fad59be22a41ee293363fcf95fdedbc7c93f3b49270b1d2e18bd1399a7a05",
+            "sizeBytes": 11429653
+          },
+          {
+            "file": "tokenizer_config.json",
+            "sha256": "945e980986de2ca7768f3326bfdbb4fbea3406f972b8ae0be233089f2b253c11",
+            "sizeBytes": 998
+          }
+        ]
       },
-      "weightFormat": null,
+      "weightFormat": "bfloat16 (CUDA) / float32 (CPU)",
       "memory": null,
-      "issue": 89
+      "issue": null
     },
     {
       "id": "planned:nemotron-streaming",

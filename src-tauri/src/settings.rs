@@ -110,14 +110,6 @@ pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
     if settings.custom_models.len() > 100 {
         return Err("at most 100 custom models can be saved".into());
     }
-    if settings.asr_backend == "speech-cpp"
-        && settings
-            .model_id
-            .as_deref()
-            .is_some_and(|id| !crate::model_catalog::is_speech_cpp_model(id.trim()))
-    {
-        return Err("speech.cpp model ID must be haas-ja-v1.0 or parakeet-tdt_ctc-0.6b-ja".into());
-    }
     if let Some(message) = pinned_model_error(&settings.asr_backend, settings.model_id.as_deref()) {
         return Err(message);
     }
@@ -126,10 +118,12 @@ pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
         .as_deref()
         .map(str::trim)
         .or_else(|| crate::model_catalog::default_pinned_model(&settings.asr_backend));
-    let japanese_only = settings.asr_backend == "speech-cpp"
-        || selected_model
-            .and_then(|id| crate::model_catalog::pinned_model(&settings.asr_backend, id))
-            .is_some_and(|model| model.language_scope.as_deref() == Some("japanese_only"));
+    // The language scope belongs to the pinned model, not to its runtime:
+    // speech.cpp serves both Japanese-only FastConformer models and the
+    // multilingual Qwen3-ASR.
+    let japanese_only = selected_model
+        .and_then(|id| crate::model_catalog::pinned_model(&settings.asr_backend, id))
+        .is_some_and(|model| model.language_scope.as_deref() == Some("japanese_only"));
     if japanese_only
         && settings
             .speech_locale
@@ -220,13 +214,6 @@ pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
         );
     }
     for model in &settings.custom_models {
-        if model.asr_backend == "speech-cpp"
-            && !crate::model_catalog::is_speech_cpp_model(model.model_id.trim())
-        {
-            return Err(
-                "speech.cpp model ID must be haas-ja-v1.0 or parakeet-tdt_ctc-0.6b-ja".into(),
-            );
-        }
         if !types::ASR_BACKENDS.contains(&model.asr_backend.as_str()) {
             return Err("custom model backend is not supported".into());
         }
@@ -260,18 +247,22 @@ pub(crate) fn decision_conflicts_with_asr(settings: &Settings) -> bool {
     }
 }
 
-/// A pinned backend (other than speech.cpp, which keeps its own message
-/// above) accepts only the model IDs its catalog entries pin.
+/// A pinned backend accepts only the model IDs its catalog entries pin.
 fn pinned_model_error(backend: &str, model_id: Option<&str>) -> Option<String> {
-    if backend == "speech-cpp" || !crate::model_catalog::is_pinned_backend(backend) {
+    if !crate::model_catalog::is_pinned_backend(backend) {
         return None;
     }
     let id = model_id?.trim();
+    let label = if backend == "speech-cpp" {
+        "speech.cpp"
+    } else {
+        backend
+    };
     crate::model_catalog::pinned_model(backend, id)
         .is_none()
         .then(|| {
             format!(
-                "{backend} model ID must be {}",
+                "{label} model ID must be {}",
                 crate::model_catalog::pinned_model_ids(backend).join(" or ")
             )
         })
@@ -336,6 +327,8 @@ mod tests {
         assert!(validate(&settings).is_ok());
         settings.model_id = Some("qwen3-asr-0.6b".into());
         assert!(validate(&settings).is_ok());
+        settings.model_id = Some("qwen3-asr-1.7b".into());
+        assert!(validate(&settings).is_ok());
         settings.model_id = Some("Qwen/Qwen3-ASR-1.7B".into());
         assert!(validate(&settings).is_err());
         settings.model_id = None;
@@ -385,6 +378,14 @@ mod tests {
         assert!(validate(&settings)
             .unwrap_err()
             .contains("Japanese speech models require"));
+        // Qwen3-ASR on speech.cpp is multilingual: the locale is passed on.
+        for model in ["qwen3-asr-0.6b", "qwen3-asr-1.7b"] {
+            settings.model_id = Some(model.into());
+            assert!(validate(&settings).is_ok(), "{model}");
+        }
+        settings.model_id = Some("parakeet-tdt_ctc-0.6b-ja".into());
+        assert!(validate(&settings).is_err());
+        settings.model_id = None;
         settings.asr_backend = "faster-whisper".into();
         assert!(validate(&settings).is_ok());
     }

@@ -54,7 +54,9 @@ test("catalog entries resolve from the configured backend and model ID", () => {
 
 test("planned catalog entries claim no unverified capability", () => {
   const planned = modelCatalog.models.filter((model) => model.availability === "planned");
-  expect(planned.map((model) => model.displayName)).toEqual(expect.arrayContaining(["Qwen3-ASR 1.7B", "Nemotron ASR Streaming (candidate)"]));
+  expect(planned.map((model) => model.displayName)).toEqual(expect.arrayContaining(["Nemotron ASR Streaming (candidate)"]));
+  // Qwen3-ASR 1.7B left the planned list once it was pinned on both runtimes (#89).
+  expect(planned.some((model) => model.displayName.startsWith("Qwen3-ASR"))).toBe(false);
   for (const model of planned) {
     expect(model.backend).toBeNull();
     expect(model.inference).toEqual([]);
@@ -125,10 +127,9 @@ test("a refused removal shows the translated reason and keeps the file", async (
 
 test("the catalog overview labels planned models as unavailable", () => {
   renderPage({ asrBackend: "faster-whisper" });
-  const item = screen.getByText("Qwen3-ASR 1.7B").closest("li")!;
-  expect(within(item).getByText("Planned (not available yet)")).toBeTruthy();
-  expect(within(item).getByText(/#89/)).toBeTruthy();
   const nemotron = screen.getByText("Nemotron ASR Streaming (candidate)").closest("li")!;
+  expect(within(nemotron).getByText("Planned (not available yet)")).toBeTruthy();
+  expect(within(nemotron).getByText(/#82/)).toBeTruthy();
   expect(within(nemotron).getByText(/Speech languages: Not confirmed/)).toBeTruthy();
 });
 
@@ -137,6 +138,27 @@ test("pinned runtime adapters resolve only their catalog models", () => {
   expect(catalogEntryFor("transformers-asr", "qwen3-asr-0.6b")?.entry).toMatchObject({ languageScope: "multilingual", vocabulary: "prompt", cancellation: "between_tokens" });
   expect(catalogEntryFor("sherpa-onnx", "large-v3-turbo")).toBeNull();
   expect(catalogEntryFor("transformers-asr", "Qwen/Qwen3-ASR-1.7B")).toBeNull();
+  expect(catalogEntryFor("transformers-asr", "qwen3-asr-1.7b")?.entry).toMatchObject({ languageScope: "multilingual", devices: ["cuda", "cpu"], source: { repo: "Qwen/Qwen3-ASR-1.7B-hf" } });
+});
+
+test("Qwen3-ASR on speech.cpp is multilingual, Vulkan (never CUDA) and takes the dictionary as a prompt", () => {
+  for (const id of ["qwen3-asr-0.6b", "qwen3-asr-1.7b"]) {
+    expect(catalogEntryFor("speech-cpp", id)?.entry).toMatchObject({ languageScope: "multilingual", devices: ["vulkan"], vocabulary: "prompt", weightFormat: "Q8_0", license: "Apache-2.0" });
+  }
+  renderPage({ asrBackend: "speech-cpp", modelId: "qwen3-asr-1.7b", speechLocale: "en-US" });
+  const facts = details();
+  expect(facts.getByText("Multilingual (including Japanese)")).toBeTruthy();
+  expect(facts.getByText(/Vulkan GPU \(not CUDA\)/)).toBeTruthy();
+  expect(facts.queryByText(/CUDA \(NVIDIA\)/)).toBeNull();
+  expect(facts.getByText("sakasegawa/Qwen3-ASR-1.7B-GGUF")).toBeTruthy();
+  expect(facts.getByText("Dictionary words as a prompt")).toBeTruthy();
+  // Another speech language does not block a multilingual model on the same runtime.
+  expect((screen.getByRole("button", { name: "Load Model" }) as HTMLButtonElement).disabled).toBe(false);
+  expect(screen.queryByText(/Japanese speech models require/)).toBeNull();
+  expect(screen.getByText(/Qwen3-ASR on a Vulkan GPU \(not CUDA\)/)).toBeTruthy();
+  cleanupAndRender({ asrBackend: "speech-cpp", modelId: "haas-ja-v1.0", speechLocale: "en-US" });
+  expect((screen.getByRole("button", { name: "Load Model" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.getByText(/Japanese speech models require/)).toBeTruthy();
 });
 
 test("the ONNX Runtime adapter offers its pinned model, a speech device and Japanese-only details", () => {
