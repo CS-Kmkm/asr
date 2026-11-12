@@ -64,6 +64,17 @@ an empty provider response is rejected and the selection is left unchanged. If
 focus, selection, user input, shortcut release, or IME safety checks fail, the
 original text is left alone and the generated edit remains on the clipboard.
 
+**Smart Dictate/Edit** (Settings > Input, off by default) lets the Dictation
+shortcut do both: when you press it, the app reads the focused field once,
+without AI. A readable selection starts Speak to edit on exactly that
+selection; an empty selection starts ordinary Dictate. When the selection
+cannot be checked (password field, unreadable control, an open IME
+conversion, this app or no field), the take is dictated but only copied to
+the clipboard and History, so text you could not see selected is never
+replaced. The overlay names the chosen route for a moment; a Smart edit
+reports that Ctrl+Z in the app undoes it. The other mode shortcuts and
+hold/toggle behave as before, and automatic voice mode takes precedence.
+
 Audio is deleted after processing by default. Transcript history is optional and
 stored in the application SQLite database. Logs and status events must never
 contain transcript, audio, window-title, or clipboard content.
