@@ -7,6 +7,18 @@
       "archiveSha256": "a8fe0e4b4f463c460e7ace9d38c363bec08b254cac5a7f764b7967af35d4fa1a",
       "source": "https://github.com/nyosegawa/speech.cpp/releases/tag/v0.10.1",
       "platform": "windows-x64"
+    },
+    "sherpa-onnx": {
+      "version": "2.0.1",
+      "package": "sherpa-onnx==2.0.1 (Windows x64 CPython 3.12: maintainer CUDA 12 / cuDNN 9 wheel, ONNX Runtime 1.24.4)",
+      "source": "https://k2-fsa.github.io/sherpa/onnx/cuda.html",
+      "platform": "windows-x64 (CPU wheel elsewhere)"
+    },
+    "transformers-asr": {
+      "version": "5.15.1",
+      "package": "transformers==5.15.1, torch==2.11.0+cu130",
+      "source": "https://pypi.org/project/transformers/5.15.1/",
+      "platform": "CUDA GPU (CPU only when selected)"
     }
   },
   "models": [
@@ -14,12 +26,21 @@
       "id": "faster-whisper:large-v3-turbo",
       "backend": "faster-whisper",
       "modelId": null,
-      "aliases": ["large-v3-turbo", "mobiuslabsgmbh/faster-whisper-large-v3-turbo"],
+      "aliases": [
+        "large-v3-turbo",
+        "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
+      ],
       "displayName": "Whisper large-v3-turbo (faster-whisper)",
       "availability": "available",
       "languageScope": "multilingual",
-      "inference": ["batch", "chunked"],
-      "devices": ["cpu", "cuda"],
+      "inference": [
+        "batch",
+        "chunked"
+      ],
+      "devices": [
+        "cpu",
+        "cuda"
+      ],
       "decoderOnCpu": false,
       "vocabulary": "hotwords",
       "wordTimestamps": false,
@@ -46,12 +67,19 @@
       "id": "vibevoice:microsoft/VibeVoice-ASR-HF",
       "backend": "vibevoice",
       "modelId": null,
-      "aliases": ["microsoft/VibeVoice-ASR-HF"],
+      "aliases": [
+        "microsoft/VibeVoice-ASR-HF"
+      ],
       "displayName": "VibeVoice-ASR",
       "availability": "available",
       "languageScope": "multilingual",
-      "inference": ["batch", "chunked"],
-      "devices": ["cuda"],
+      "inference": [
+        "batch",
+        "chunked"
+      ],
+      "devices": [
+        "cuda"
+      ],
       "decoderOnCpu": false,
       "vocabulary": "prompt",
       "wordTimestamps": false,
@@ -80,8 +108,12 @@
       "displayName": "OpenAI-compatible API",
       "availability": "available",
       "languageScope": "server_defined",
-      "inference": ["batch"],
-      "devices": ["remote"],
+      "inference": [
+        "batch"
+      ],
+      "devices": [
+        "remote"
+      ],
       "decoderOnCpu": false,
       "vocabulary": "prompt",
       "wordTimestamps": false,
@@ -101,8 +133,13 @@
       "displayName": "Haas-ja-v1.0",
       "availability": "available",
       "languageScope": "japanese_only",
-      "inference": ["batch", "chunked"],
-      "devices": ["vulkan"],
+      "inference": [
+        "batch",
+        "chunked"
+      ],
+      "devices": [
+        "vulkan"
+      ],
       "decoderOnCpu": true,
       "vocabulary": "post_dictionary_only",
       "wordTimestamps": false,
@@ -133,8 +170,13 @@
       "displayName": "Parakeet TDT-CTC 0.6B Japanese (TDT)",
       "availability": "available",
       "languageScope": "japanese_only",
-      "inference": ["batch", "chunked"],
-      "devices": ["vulkan"],
+      "inference": [
+        "batch",
+        "chunked"
+      ],
+      "devices": [
+        "vulkan"
+      ],
       "decoderOnCpu": true,
       "vocabulary": "post_dictionary_only",
       "wordTimestamps": false,
@@ -158,25 +200,139 @@
       "issue": null
     },
     {
-      "id": "planned:qwen3-asr-0.6b",
-      "backend": null,
-      "modelId": null,
+      "id": "sherpa-onnx:reazonspeech-k2-v2",
+      "backend": "sherpa-onnx",
+      "modelId": "reazonspeech-k2-v2",
       "aliases": [],
-      "displayName": "Qwen3-ASR 0.6B",
-      "availability": "planned",
-      "languageScope": "multilingual",
-      "inference": [],
-      "devices": [],
+      "displayName": "ReazonSpeech k2 v2 (sherpa-onnx)",
+      "availability": "available",
+      "languageScope": "japanese_only",
+      "inference": [
+        "batch",
+        "chunked"
+      ],
+      "devices": [
+        "cuda",
+        "cpu"
+      ],
       "decoderOnCpu": false,
-      "vocabulary": null,
-      "wordTimestamps": null,
-      "cancellation": null,
-      "sampleRateHz": null,
+      "vocabulary": "post_dictionary_only",
+      "wordTimestamps": false,
+      "cancellation": "between_segments",
+      "sampleRateHz": 16000,
       "license": "Apache-2.0",
-      "source": { "repo": "Qwen/Qwen3-ASR-0.6B", "revision": null, "file": null, "sha256": null, "sizeBytes": null },
-      "weightFormat": null,
-      "memory": null,
-      "issue": 89
+      "source": {
+        "repo": "reazon-research/reazonspeech-k2-v2",
+        "revision": "291488c8151be24d7da4bf7af26e533fad96e407",
+        "file": null,
+        "sha256": null,
+        "sizeBytes": 614881553,
+        "files": [
+          {
+            "file": "encoder-epoch-99-avg-1.onnx",
+            "sha256": "ecdb0b771e16104aaf8e579cb3c1e32fbd589eb641c5946d82b615bd366c5f96",
+            "sizeBytes": 592347848
+          },
+          {
+            "file": "decoder-epoch-99-avg-1.onnx",
+            "sha256": "58b18211ae06265466bfa17172dab574df94f76c8bcb61a3640c28ba860e4124",
+            "sizeBytes": 11767836
+          },
+          {
+            "file": "joiner-epoch-99-avg-1.onnx",
+            "sha256": "d38a81d1191c9ed6de6a1719503692e07e3e973e2364adde0abae5eaaded1174",
+            "sizeBytes": 10720115
+          },
+          {
+            "file": "tokens.txt",
+            "sha256": "2c3ac659818a48a0c04010e0593bbc4d7c8a24a054340b01131499c05fd52def",
+            "sizeBytes": 45754
+          }
+        ]
+      },
+      "weightFormat": "ONNX float32",
+      "memory": {
+        "kind": "observed_device_peak_mib",
+        "value": 2828,
+        "gpu": "RTX 3060 12 GB",
+        "runtime": "CUDA float32 (ONNX Runtime)"
+      },
+      "issue": null
+    },
+    {
+      "id": "transformers-asr:qwen3-asr-0.6b",
+      "backend": "transformers-asr",
+      "modelId": "qwen3-asr-0.6b",
+      "aliases": [],
+      "displayName": "Qwen3-ASR 0.6B (transformers)",
+      "availability": "available",
+      "languageScope": "multilingual",
+      "inference": [
+        "batch",
+        "chunked"
+      ],
+      "devices": [
+        "cuda",
+        "cpu"
+      ],
+      "decoderOnCpu": false,
+      "vocabulary": "prompt",
+      "wordTimestamps": false,
+      "cancellation": "between_tokens",
+      "sampleRateHz": 16000,
+      "license": "Apache-2.0",
+      "source": {
+        "repo": "Qwen/Qwen3-ASR-0.6B-hf",
+        "revision": "7f1569a48a89f3e3f4dc3a5c9d28bddd903bc76c",
+        "file": null,
+        "sha256": null,
+        "sizeBytes": 1576363223,
+        "files": [
+          {
+            "file": "config.json",
+            "sha256": "9eecf6f1b383e343889c2e6010e632590fa57d4bc678e151c7d6a160a0dfb04a",
+            "sizeBytes": 2398
+          },
+          {
+            "file": "generation_config.json",
+            "sha256": "9939fc9388b79bd70757f938b87381e817173d6a6158f5af6506c0b73e775c3c",
+            "sizeBytes": 165
+          },
+          {
+            "file": "model.safetensors",
+            "sha256": "d3f212dd20abecd315d830bc54ae3865e56ebfc3276484e57b771288ba27fd35",
+            "sizeBytes": 1564928088
+          },
+          {
+            "file": "processor_config.json",
+            "sha256": "bc0b230081b44e629dd5b9045b78495615c1831b4b9f4cffe97bd37e82a6156a",
+            "sizeBytes": 487
+          },
+          {
+            "file": "chat_template.jinja",
+            "sha256": "f50e6b694fbf4a683206e37869990d68333fe95d285730f084c838a34b0d98c2",
+            "sizeBytes": 1434
+          },
+          {
+            "file": "tokenizer.json",
+            "sha256": "fe1fad59be22a41ee293363fcf95fdedbc7c93f3b49270b1d2e18bd1399a7a05",
+            "sizeBytes": 11429653
+          },
+          {
+            "file": "tokenizer_config.json",
+            "sha256": "945e980986de2ca7768f3326bfdbb4fbea3406f972b8ae0be233089f2b253c11",
+            "sizeBytes": 998
+          }
+        ]
+      },
+      "weightFormat": "bfloat16 (CUDA) / float32 (CPU)",
+      "memory": {
+        "kind": "observed_device_peak_mib",
+        "value": 4175,
+        "gpu": "RTX 3060 12 GB",
+        "runtime": "CUDA bfloat16 (torch)"
+      },
+      "issue": null
     },
     {
       "id": "planned:qwen3-asr-1.7b",
@@ -194,7 +350,13 @@
       "cancellation": null,
       "sampleRateHz": null,
       "license": "Apache-2.0",
-      "source": { "repo": "Qwen/Qwen3-ASR-1.7B", "revision": null, "file": null, "sha256": null, "sizeBytes": null },
+      "source": {
+        "repo": "Qwen/Qwen3-ASR-1.7B",
+        "revision": null,
+        "file": null,
+        "sha256": null,
+        "sizeBytes": null
+      },
       "weightFormat": null,
       "memory": null,
       "issue": 89

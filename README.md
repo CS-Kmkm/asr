@@ -245,6 +245,20 @@ JSONLワーカーでは `--backend speech-cpp` と、`ASR_MODEL_ID=haas-ja-v1.0`
 `ASR_MODEL_ID=parakeet-tdt_ctc-0.6b-ja` を指定します。
 詳細は[導入方法・既存の比較記録・制限](docs/japanese_model_comparison.md)を参照してください。
 
+### sherpa-onnx / transformers-asr (runtime adapters, Windows native)
+
+モデル画面の「ONNX Runtime モデル（CUDA / CPU）」はReazonSpeech k2 v2（日本語専用、Apache-2.0）を、
+「Qwen3-ASR（transformers・CUDA）」はQwen3-ASR 0.6B（多言語、Apache-2.0）を使います。
+アプリがバックエンドごとの追加依存（`uv sync --extra sherpa-onnx` / `--extra transformers-asr`）を準備し、
+「モデルを読み込む」を押したときだけ、固定revision・SHA256のファイルを
+`%LOCALAPPDATA%/LocalVoice/models` に取得します（約615 MB / 約1.6 GB）。
+WSL・Docker・NeMoは使いません。音声認識デバイスでCPU／CUDAを選べます。
+sherpa-onnxはCUDA実行プロバイダーが実際に動いたと確認できた場合だけCUDAと表示し、
+自動選択では確認できなければCPUで読み込みます。Qwen3-ASRはCUDAが必要で、CPUは明示した場合だけです。
+`transformers-asr` は `decision`・`vibevoice` と同時に入れられません（transformersの版が異なるため）。
+この追加依存を使う間は音声モードの自動判定（判断モデル）を準備できません。
+実機の計測と制限は[タスク契約](docs/tasks/issue-87-runtime-adapters.md)を参照してください。
+
 ### faster-whisper (default, CPU-capable)
 
 The default backend. Runs on CPU (int8) or CUDA (int8/fp16). No NVIDIA GPU

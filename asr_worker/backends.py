@@ -1039,4 +1039,10 @@ def create_backend(name: str) -> Backend:
     if name == "speech-cpp":
         from .speech_cpp import SpeechCppBackend
         return SpeechCppBackend()
+    if name == "sherpa-onnx":
+        from .sherpa_onnx_runtime import SherpaOnnxBackend
+        return SherpaOnnxBackend()
+    if name == "transformers-asr":
+        from .transformers_runtime import TransformersAsrBackend
+        return TransformersAsrBackend()
     raise BackendError("unsupported_backend", f"Unsupported backend: {name}")

@@ -309,11 +309,13 @@ impl Default for VoiceShortcuts {
     }
 }
 
-pub const ASR_BACKENDS: [&str; 5] = [
+pub const ASR_BACKENDS: [&str; 7] = [
     "vibevoice",
     "faster-whisper",
     "openai-compatible",
     "speech-cpp",
+    "sherpa-onnx",
+    "transformers-asr",
     "mock",
 ];
 pub const SPEECH_CPP_SUPPORTED: bool = cfg!(all(target_os = "windows", target_arch = "x86_64"));

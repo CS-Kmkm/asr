@@ -12,7 +12,7 @@ import type {
 import { translateAppMessage, useI18n } from "../i18n";
 import type { MessageKey } from "../i18n";
 import { ModelCatalogOverview, ModelDetails } from "../components/ModelDetails";
-import { modelCatalog } from "../modelCatalog";
+import { availableModels, isPinnedBackend } from "../modelCatalog";
 
 type ModelConfiguration = Pick<
   Settings,
@@ -24,10 +24,16 @@ type ModelConfiguration = Pick<
   | "apiKeyEnvVar"
 >;
 const ADDITIONAL_MODEL_VALUE = "__additional_model__";
-const japaneseModels = modelCatalog.models.filter(
-  (model) => model.availability === "available" && model.backend === "speech-cpp" && model.modelId,
-);
-const defaultJapaneseModelId = japaneseModels[0]?.modelId ?? "haas-ja-v1.0";
+/** The model a pinned backend uses: the configured one when it is pinned, else its first catalog model. */
+function pinnedModelId(backend: AsrBackend, modelId: string) {
+  const models = availableModels(backend);
+  return models.some((entry) => entry.modelId === modelId) ? modelId : models[0]?.modelId ?? "";
+}
+const pinnedModelDetails: Partial<Record<AsrBackend, MessageKey>> = {
+  "speech-cpp": "Haas: Apache-2.0. Parakeet Japanese: CC-BY-4.0. Both use greedy TDT; CTC is unavailable in this runtime.",
+  "sherpa-onnx": "ReazonSpeech k2 v2: Apache-2.0. Recordings longer than about 25 seconds are split at pauses.",
+  "transformers-asr": "Qwen3-ASR 0.6B: Apache-2.0. Dictionary words are passed to the model as context.",
+};
 
 function builtinValue(backend: AsrBackend) {
   return `builtin:${backend}`;
@@ -116,10 +122,10 @@ export function ModelsPage({
   }, [modalOpen]);
 
   const customModels = useMemo(() => {
-    const saved = settings.customModels.filter((model) => model.asrBackend !== "speech-cpp");
+    const saved = settings.customModels.filter((model) => !isPinnedBackend(model.asrBackend));
     if (
       settings.modelId &&
-      settings.asrBackend !== "speech-cpp" &&
+      !isPinnedBackend(settings.asrBackend) &&
       !saved.some(
         (model) =>
           model.asrBackend === settings.asrBackend && model.modelId === settings.modelId,
@@ -139,14 +145,20 @@ export function ModelsPage({
       : !gpu.speechCppSupported ? t("Japanese Vulkan models require Windows x64. Select faster-whisper on this system.")
       : !japaneseLocaleSupported ? t("Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.")
       : t("Japanese only. Vulkan encoder and CPU decoder; Q8_0. Downloads about 690 MB on first load."),
+    "sherpa-onnx": !japaneseLocaleSupported ? t("Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.")
+      : t("Japanese only. ReazonSpeech k2 on ONNX Runtime with CUDA or CPU. Downloads about 615 MB on first load."),
+    "transformers-asr": t("Multilingual, including Japanese. Qwen3-ASR on a CUDA GPU; CPU only when selected. Downloads about 1.6 GB on first load."),
   };
-  const japaneseModelId = japaneseModels.some((entry) => entry.modelId === additionalModelId) ? additionalModelId : defaultJapaneseModelId;
-  const selectedValue = additionalModelId && backend !== "speech-cpp"
+  const pinned = isPinnedBackend(backend);
+  const pinnedId = pinned ? pinnedModelId(backend, additionalModelId) : null;
+  const japaneseOnlyBlocked = pinned && !japaneseLocaleSupported
+    && availableModels(backend).find((entry) => entry.modelId === pinnedId)?.languageScope === "japanese_only";
+  const selectedValue = additionalModelId && !pinned
     ? customModelValue({ asrBackend: backend, modelId: additionalModelId })
     : builtinValue(backend);
 
   function openAdditionalModelModal() {
-    setDraftBackend(backend === "speech-cpp" ? "faster-whisper" : backend);
+    setDraftBackend(isPinnedBackend(backend) ? "faster-whisper" : backend);
     setDraftModelId("");
     setModalOpen(true);
   }
@@ -220,7 +232,9 @@ export function ModelsPage({
               </select>
             }
           />
-          {backend === "faster-whisper" && <SettingRow title={t("Speech device")} help={t("Auto retries caught CUDA failures on CPU. Explicit CUDA reports an error instead. The environment option preserves ASR_DEVICE.")}
+          {(backend === "faster-whisper" || backend === "sherpa-onnx" || backend === "transformers-asr") && <SettingRow title={t("Speech device")} help={t(backend === "transformers-asr"
+            ? "Auto and CUDA require a CUDA GPU and never fall back silently. CPU works but is much slower. The environment option preserves ASR_DEVICE."
+            : "Auto retries caught CUDA failures on CPU. Explicit CUDA reports an error instead. The environment option preserves ASR_DEVICE.")}
             control={<select aria-label={t("Speech device")} value={device ?? ""} onChange={(event) => setDevice((event.target.value || null) as Settings["asrDevice"])}>
               <option value="">{t("Environment (auto by default)")}</option>
               <option value="auto">{t("Auto (CUDA with CPU fallback)")}</option>
@@ -254,10 +268,10 @@ export function ModelsPage({
                 }
               />
             </>
-          ) : backend === "speech-cpp" ? (
-            <SettingRow title={t("Japanese model")} detail={t("Haas: Apache-2.0. Parakeet Japanese: CC-BY-4.0. Both use greedy TDT; CTC is unavailable in this runtime.")}
-              control={<select aria-label={t("Japanese model")} value={japaneseModelId} onChange={(event) => setAdditionalModelId(event.target.value)}>
-                {japaneseModels.map((entry) => <option key={entry.id} value={entry.modelId ?? ""}>{entry.displayName}</option>)}
+          ) : pinned ? (
+            <SettingRow title={t(backend === "speech-cpp" ? "Japanese model" : "Model")} detail={pinnedModelDetails[backend] ? t(pinnedModelDetails[backend]!) : undefined}
+              control={<select aria-label={t(backend === "speech-cpp" ? "Japanese model" : "Model")} value={pinnedId ?? ""} onChange={(event) => setAdditionalModelId(event.target.value)}>
+                {availableModels(backend).map((entry) => <option key={entry.id} value={entry.modelId ?? ""}>{entry.displayName}</option>)}
               </select>} />
           ) : (
             <SettingRow
@@ -284,13 +298,13 @@ export function ModelsPage({
             onConfigureModel({
               asrBackend: backend,
               asrDevice: device,
-              modelId: backend === "speech-cpp" ? japaneseModelId : additionalModelId || null,
+              modelId: pinned ? pinnedId : additionalModelId || null,
               modelQuantization: quantization,
               apiBaseUrl: apiBaseUrl.trim(),
               apiKeyEnvVar: apiKeyEnvVar.trim(),
             })
           }
-          disabled={modelLoading || (backend === "speech-cpp" && (gpu?.speechCppSupported !== true || !japaneseLocaleSupported))}
+          disabled={modelLoading || japaneseOnlyBlocked || (backend === "speech-cpp" && gpu?.speechCppSupported !== true)}
         >
           {modelLoading ? t("Loading...") : model?.state === "error" ? t("Retry") : t("Load Model")}
         </button>
@@ -302,7 +316,7 @@ export function ModelsPage({
         </div>}
         </div>
         {progress && <ModelProgressBar progress={progress} />}
-        <ModelDetails backend={backend} modelId={backend === "speech-cpp" ? japaneseModelId : additionalModelId || null} model={model} />
+        <ModelDetails backend={backend} modelId={pinned ? pinnedId : additionalModelId || null} model={model} />
       </article>
 
       <details className="panel span-2 utility-disclosure"><summary>{t("GPU")}</summary>

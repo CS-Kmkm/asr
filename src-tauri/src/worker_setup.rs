@@ -23,7 +23,9 @@ const SYNC_COMMAND_IDENTITY: &str = "uv sync --frozen --no-dev --inexact --pytho
 pub(crate) struct Provision {
     pub(crate) source: PathBuf,
     pub(crate) environment: PathBuf,
-    pub(crate) vibevoice: bool,
+    /// The backend's optional dependency set (`--extra`), if it has one:
+    /// `vibevoice`, `sherpa-onnx` or `transformers-asr`.
+    pub(crate) extra: Option<&'static str>,
     pub(crate) uv: PathBuf,
 }
 
@@ -57,8 +59,8 @@ impl Provision {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        if self.vibevoice {
-            command.args(["--extra", "vibevoice"]);
+        if let Some(extra) = self.extra {
+            command.args(["--extra", extra]);
         }
         #[cfg(windows)]
         command.creation_flags(0x0800_0000);
@@ -80,7 +82,8 @@ impl Provision {
         let mut digest = Fnv1a::default();
         digest.field(SYNC_COMMAND_IDENTITY.as_bytes());
         digest.field(env!("CARGO_PKG_VERSION").as_bytes());
-        digest.field(if self.vibevoice { b"vibevoice" } else { b"" });
+        // Same bytes as the former vibevoice flag, so existing markers stay valid.
+        digest.field(self.extra.unwrap_or("").as_bytes());
         digest.field(self.python().as_os_str().as_encoded_bytes());
         for name in ["uv.lock", "pyproject.toml"] {
             digest.field(&std::fs::read(self.source.join(name)).ok()?);
@@ -214,7 +217,7 @@ pub(crate) fn install(resource_dir: &Path, local_data: &Path) {
             environment: local_data
                 .join("worker-runtime")
                 .join(env!("CARGO_PKG_VERSION")),
-            vibevoice: false,
+            extra: None,
             uv: environment::value_os("ASR_UV")
                 .unwrap_or_else(|| "uv".into())
                 .into(),
@@ -235,9 +238,18 @@ mod tests {
         let provision = Provision {
             source: PathBuf::from("resources/worker"),
             environment: PathBuf::from("user-data/runtime"),
-            vibevoice: true,
+            extra: Some("vibevoice"),
             uv: "uv".into(),
         };
+        let runtime = Provision {
+            extra: Some("transformers-asr"),
+            ..provision.clone()
+        };
+        let runtime_command = runtime.command();
+        let runtime_args: Vec<_> = runtime_command.as_std().get_args().collect();
+        assert!(runtime_args
+            .windows(2)
+            .any(|pair| pair == ["--extra", "transformers-asr"]));
         let command = provision.command();
         let command = command.as_std();
         assert_eq!(command.get_current_dir(), Some(provision.source.as_path()));
@@ -269,7 +281,7 @@ mod tests {
         let provision = Provision {
             source,
             environment: directory.join("runtime"),
-            vibevoice: false,
+            extra: None,
             uv: directory.join("missing-uv"),
         };
         std::fs::create_dir_all(provision.python().parent().unwrap()).unwrap();
@@ -290,11 +302,13 @@ mod tests {
             .join(format!("{SYNC_MARKER}.partial"))
             .exists());
 
-        let vibevoice = Provision {
-            vibevoice: true,
-            ..provision.clone()
-        };
-        assert!(!vibevoice.is_synced(), "other extras need their own sync");
+        for extra in ["vibevoice", "sherpa-onnx", "transformers-asr"] {
+            let other = Provision {
+                extra: Some(extra),
+                ..provision.clone()
+            };
+            assert!(!other.is_synced(), "{extra} needs its own sync");
+        }
 
         let changes: [(&Path, &str); 4] = [
             (&provision.source.join("uv.lock"), "lock v2"),
@@ -344,7 +358,7 @@ mod tests {
         let provision = Provision {
             source: directory.path().into(),
             environment: directory.path().join("runtime"),
-            vibevoice: false,
+            extra: None,
             uv: directory.path().join("missing-private-program"),
         };
         let error = provision.prepare().await.unwrap_err();

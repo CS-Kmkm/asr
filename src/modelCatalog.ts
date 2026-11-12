@@ -13,6 +13,8 @@ export interface CatalogSource {
   file: string | null;
   sha256: string | null;
   sizeBytes: number | null;
+  /** Every pinned file of a multi-file model; `file`/`sha256` are then null and `sizeBytes` is the total. */
+  files?: Array<{ file: string; sha256: string; sizeBytes: number }>;
 }
 
 export type CatalogMemory =
@@ -47,11 +49,25 @@ export interface CatalogModel {
 
 export interface ModelCatalog {
   schemaVersion: number;
-  runtimes: Record<string, { version: string; archive: string; archiveSha256: string; source: string; platform: string }>;
+  runtimes: Record<string, { version: string; source: string; platform: string; archive?: string; archiveSha256?: string; package?: string }>;
   models: CatalogModel[];
 }
 
 export const modelCatalog = catalogJson as ModelCatalog;
+
+/** Available catalog models of a backend. */
+export function availableModels(backend: AsrBackend): CatalogModel[] {
+  return modelCatalog.models.filter((model) => model.availability === "available" && model.backend === backend);
+}
+
+/**
+ * Whether a backend serves only the catalog's pinned models (speech.cpp,
+ * sherpa-onnx, transformers-asr): no free-form model ID is valid for it.
+ */
+export function isPinnedBackend(backend: AsrBackend): boolean {
+  const models = availableModels(backend);
+  return models.length > 0 && models.every((model) => model.modelId !== null);
+}
 
 /**
  * The catalog entry for a configured backend/model. A custom model ID has no
@@ -67,7 +83,7 @@ export function catalogEntryFor(
   const id = modelId?.trim() || null;
   const exact = available.find((model) => model.modelId === id || (id !== null && model.aliases.includes(id)));
   if (exact) return { entry: exact, custom: false };
-  if (backend === "speech-cpp") return null;
+  if (isPinnedBackend(backend)) return null;
   const backendDefault = available.find((model) => model.modelId === null);
   if (!backendDefault) return null;
   if (backend === "openai-compatible") return { entry: backendDefault, custom: false };

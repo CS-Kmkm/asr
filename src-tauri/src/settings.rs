@@ -81,7 +81,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
     }
     if !types::ASR_BACKENDS.contains(&settings.asr_backend.as_str()) {
         return Err(
-            "asr backend must be vibevoice, faster-whisper, openai-compatible, speech-cpp, or mock"
+            "asr backend must be vibevoice, faster-whisper, openai-compatible, speech-cpp, sherpa-onnx, transformers-asr, or mock"
                 .into(),
         );
     }
@@ -118,7 +118,19 @@ pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
     {
         return Err("speech.cpp model ID must be haas-ja-v1.0 or parakeet-tdt_ctc-0.6b-ja".into());
     }
-    if settings.asr_backend == "speech-cpp"
+    if let Some(message) = pinned_model_error(&settings.asr_backend, settings.model_id.as_deref()) {
+        return Err(message);
+    }
+    let selected_model = settings
+        .model_id
+        .as_deref()
+        .map(str::trim)
+        .or_else(|| crate::model_catalog::default_pinned_model(&settings.asr_backend));
+    let japanese_only = settings.asr_backend == "speech-cpp"
+        || selected_model
+            .and_then(|id| crate::model_catalog::pinned_model(&settings.asr_backend, id))
+            .is_some_and(|model| model.language_scope.as_deref() == Some("japanese_only"));
+    if japanese_only
         && settings
             .speech_locale
             .as_deref()
@@ -215,6 +227,9 @@ pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
         if !types::ASR_BACKENDS.contains(&model.asr_backend.as_str()) {
             return Err("custom model backend is not supported".into());
         }
+        if let Some(message) = pinned_model_error(&model.asr_backend, Some(&model.model_id)) {
+            return Err(message);
+        }
         if model.model_id.trim().is_empty()
             || model.model_id.len() > 512
             || model.model_id.chars().any(char::is_control)
@@ -228,9 +243,60 @@ pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
     Ok(())
 }
 
+/// A pinned backend (other than speech.cpp, which keeps its own message
+/// above) accepts only the model IDs its catalog entries pin.
+fn pinned_model_error(backend: &str, model_id: Option<&str>) -> Option<String> {
+    if backend == "speech-cpp" || !crate::model_catalog::is_pinned_backend(backend) {
+        return None;
+    }
+    let id = model_id?.trim();
+    crate::model_catalog::pinned_model(backend, id)
+        .is_none()
+        .then(|| {
+            format!(
+                "{backend} model ID must be {}",
+                crate::model_catalog::pinned_model_ids(backend).join(" or ")
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_adapter_settings_accept_only_pinned_models_and_their_languages() {
+        let mut settings = Settings {
+            asr_backend: "sherpa-onnx".into(),
+            ..Settings::default()
+        };
+        assert!(validate(&settings).is_ok());
+        settings.model_id = Some("reazonspeech-k2-v2".into());
+        assert!(validate(&settings).is_ok());
+        settings.model_id = Some("large-v3-turbo".into());
+        assert!(validate(&settings)
+            .unwrap_err()
+            .contains("sherpa-onnx model ID must be reazonspeech-k2-v2"));
+        // ReazonSpeech is Japanese-only, including when it is the default.
+        settings.model_id = None;
+        settings.speech_locale = Some("en-US".into());
+        assert!(validate(&settings)
+            .unwrap_err()
+            .contains("Japanese speech models require"));
+        // Qwen3-ASR is multilingual: other locales stay valid.
+        settings.asr_backend = "transformers-asr".into();
+        assert!(validate(&settings).is_ok());
+        settings.model_id = Some("qwen3-asr-0.6b".into());
+        assert!(validate(&settings).is_ok());
+        settings.model_id = Some("Qwen/Qwen3-ASR-1.7B".into());
+        assert!(validate(&settings).is_err());
+        settings.model_id = None;
+        settings.custom_models.push(types::CustomModel {
+            asr_backend: "transformers-asr".into(),
+            model_id: "unpinned/model".into(),
+        });
+        assert!(validate(&settings).is_err());
+    }
 
     #[test]
     fn japanese_model_settings_reject_stale_ids() {
