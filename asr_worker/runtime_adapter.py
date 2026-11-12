@@ -335,6 +335,10 @@ class RuntimeAdapter(ProgressReporting):
     install_extra: ClassVar[str] = ""
     models: ClassVar[Mapping[str, ManagedModel]] = {}
     default_model: ClassVar[str] = ""
+    # True once this process loaded native libraries that cannot coexist with
+    # torch (sherpa-onnx's CUDA 12 / cuDNN 9 DLLs vs torch cu130). The worker
+    # then refuses to load the torch-based decision model in this process.
+    excludes_torch: bool = False
     # Device policies this runtime accepts; ASR_DEVICE outside it is rejected.
     supported_policies: ClassVar[tuple[str, ...]] = DEVICE_POLICIES
 

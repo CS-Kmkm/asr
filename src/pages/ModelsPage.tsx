@@ -12,7 +12,7 @@ import type {
 import { translateAppMessage, useI18n } from "../i18n";
 import type { MessageKey } from "../i18n";
 import { ModelCatalogOverview, ModelDetails } from "../components/ModelDetails";
-import { availableModels, isPinnedBackend } from "../modelCatalog";
+import { availableModels, decisionConflictsWithAsr, isPinnedBackend } from "../modelCatalog";
 
 type ModelConfiguration = Pick<
   Settings,
@@ -153,6 +153,7 @@ export function ModelsPage({
   const pinnedId = pinned ? pinnedModelId(backend, additionalModelId) : null;
   const japaneseOnlyBlocked = pinned && !japaneseLocaleSupported
     && availableModels(backend).find((entry) => entry.modelId === pinnedId)?.languageScope === "japanese_only";
+  const decisionConflict = settings.automaticVoiceMode && decisionConflictsWithAsr(backend, device);
   const selectedValue = additionalModelId && !pinned
     ? customModelValue({ asrBackend: backend, modelId: additionalModelId })
     : builtinValue(backend);
@@ -304,7 +305,7 @@ export function ModelsPage({
               apiKeyEnvVar: apiKeyEnvVar.trim(),
             })
           }
-          disabled={modelLoading || japaneseOnlyBlocked || (backend === "speech-cpp" && gpu?.speechCppSupported !== true)}
+          disabled={modelLoading || japaneseOnlyBlocked || decisionConflict || (backend === "speech-cpp" && gpu?.speechCppSupported !== true)}
         >
           {modelLoading ? t("Loading...") : model?.state === "error" ? t("Retry") : t("Load Model")}
         </button>
@@ -315,6 +316,7 @@ export function ModelsPage({
           {model.state === "error" && onOpenLogs && <button className="secondary" onClick={onOpenLogs}>{t("Open diagnostic logs")}</button>}
         </div>}
         </div>
+        {decisionConflict && <p className="settings-error" role="alert">{translateAppMessage(language, "Automatic voice mode cannot share the speech worker with this ASR runtime. Choose CPU as the speech device for ONNX Runtime models, select another ASR backend, or turn off automatic voice mode.")}</p>}
         {progress && <ModelProgressBar progress={progress} />}
         <ModelDetails backend={backend} modelId={pinned ? pinnedId : additionalModelId || null} model={model} />
       </article>

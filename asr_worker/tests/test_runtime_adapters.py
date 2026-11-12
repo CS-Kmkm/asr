@@ -492,3 +492,29 @@ class FailedLoadReleaseTests(RuntimeAdapterTestCase):
                 self.assertEqual(alive_at_close, [False])
                 self.assertIsNone(probes[0]())
                 self.assertIsNone(backend.device)
+
+
+class DecisionConflictTests(RuntimeAdapterTestCase):
+    def test_worker_refuses_decision_model_after_sherpa_cuda_libraries_loaded(self):
+        backend = so.SherpaOnnxBackend()
+        worker = Worker(backend)
+        with patch.object(worker.decision, "load", side_effect=AssertionError("must not load")):
+            backend.excludes_torch = True
+            response, _ = worker.handle({"id": 1, "command": "load_decision", "model": "Cloudflare/clef-flash"})
+        self.assertEqual(response["error"]["code"], "decision_runtime_conflict")
+
+    def test_cuda_attempt_marks_the_process_torch_incompatible_but_cpu_does_not(self):
+        os.environ["ASR_DEVICE"] = "cpu"
+        cpu = so.SherpaOnnxBackend()
+        cpu.sherpa = types.SimpleNamespace(__version__="t", onnxruntime_version="t")
+        with patch.object(cpu, "_build", return_value=(FakeRecognizer(), "")):
+            cpu._open(so.REAZONSPEECH_K2_V2, {})
+        self.assertFalse(cpu.excludes_torch)
+        os.environ["ASR_DEVICE"] = "auto"
+        auto = so.SherpaOnnxBackend()
+        auto.sherpa = cpu.sherpa
+        with patch.object(auto, "_build", return_value=(FakeRecognizer(), "")), \
+             patch.object(so, "preload_cuda_libraries", return_value=False):
+            auto._open(so.REAZONSPEECH_K2_V2, {})
+        self.assertTrue(auto.excludes_torch)
+        self.assertEqual(auto.device, "cpu")

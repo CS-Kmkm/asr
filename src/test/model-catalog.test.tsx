@@ -172,3 +172,15 @@ test("loaded runtime shows the provider and GPU the worker actually used", async
   renderPage({ asrBackend: "sherpa-onnx" }, "en", { model });
   expect(await details().findByText(/CUDA · NVIDIA GeForce RTX 3060 · float32 · .*CUDAExecutionProvider/)).toBeTruthy();
 });
+
+test("automatic voice mode blocks loading ASR runtimes that cannot share its worker", () => {
+  renderPage({ asrBackend: "sherpa-onnx", asrDevice: "auto", automaticVoiceMode: true }, "ja");
+  expect((screen.getByRole("button", { name: "モデルを読み込む" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.getByRole("alert").textContent).toContain("音声モードの自動判定は、このASR実行環境と同じワーカーでは使えません");
+  cleanup();
+  renderPage({ asrBackend: "sherpa-onnx", asrDevice: "cpu", automaticVoiceMode: true });
+  expect((screen.getByRole("button", { name: "Load Model" }) as HTMLButtonElement).disabled).toBe(false);
+  cleanup();
+  renderPage({ asrBackend: "transformers-asr", asrDevice: "cpu", automaticVoiceMode: true });
+  expect((screen.getByRole("button", { name: "Load Model" }) as HTMLButtonElement).disabled).toBe(true);
+});

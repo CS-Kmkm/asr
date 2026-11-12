@@ -208,6 +208,8 @@ class SherpaOnnxBackend(RuntimeAdapter):
 
     def _open_cuda(self, model: ManagedModel, paths: dict[str, Path]) -> str | None:
         """Build on CUDA; return None when CUDA verifiably ran, else the reason."""
+        # Even a partial preload leaves CUDA 12 / cuDNN 9 DLLs in the process.
+        self.excludes_torch = True
         if not preload_cuda_libraries():
             return "CUDA 12 / cuDNN 9 libraries are missing; run worker setup"
         self.report_progress("warmup")

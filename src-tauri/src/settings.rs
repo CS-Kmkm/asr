@@ -138,6 +138,9 @@ pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
     {
         return Err("Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.".into());
     }
+    if settings.automatic_voice_mode && decision_conflicts_with_asr(settings) {
+        return Err(DECISION_ASR_RUNTIME_CONFLICT.into());
+    }
     let api_url = settings.api_base_url.trim();
     if api_url.len() > 2048
         || !(api_url.starts_with("http://") || api_url.starts_with("https://"))
@@ -243,6 +246,20 @@ pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) const DECISION_ASR_RUNTIME_CONFLICT: &str = "Automatic voice mode cannot share the speech worker with this ASR runtime. Choose CPU as the speech device for ONNX Runtime models, select another ASR backend, or turn off automatic voice mode.";
+
+/// The torch-based decision model shares the speech worker process. It cannot
+/// run next to transformers-asr (conflicting transformers pins) or after
+/// sherpa-onnx loaded its CUDA 12 / cuDNN 9 DLLs (they clash with torch's).
+/// sherpa-onnx is compatible only with an explicit CPU speech device.
+pub(crate) fn decision_conflicts_with_asr(settings: &Settings) -> bool {
+    match settings.asr_backend.as_str() {
+        "transformers-asr" => true,
+        "sherpa-onnx" => settings.asr_device != Some(types::AsrDevice::Cpu),
+        _ => false,
+    }
+}
+
 /// A pinned backend (other than speech.cpp, which keeps its own message
 /// above) accepts only the model IDs its catalog entries pin.
 fn pinned_model_error(backend: &str, model_id: Option<&str>) -> Option<String> {
@@ -263,6 +280,37 @@ fn pinned_model_error(backend: &str, model_id: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automatic_voice_mode_rejects_asr_runtimes_that_cannot_share_its_worker() {
+        let mut settings = Settings {
+            automatic_voice_mode: true,
+            ..Settings::default()
+        };
+        assert!(validate(&settings).is_ok());
+        for (backend, device, ok) in [
+            ("transformers-asr", None, false),
+            ("transformers-asr", Some(types::AsrDevice::Cpu), false),
+            ("sherpa-onnx", None, false),
+            ("sherpa-onnx", Some(types::AsrDevice::Auto), false),
+            ("sherpa-onnx", Some(types::AsrDevice::Cuda), false),
+            ("sherpa-onnx", Some(types::AsrDevice::Cpu), true),
+            ("speech-cpp", None, true),
+            ("vibevoice", None, true),
+        ] {
+            settings.asr_backend = backend.into();
+            settings.asr_device = device;
+            let result = validate(&settings);
+            assert_eq!(result.is_ok(), ok, "{backend} {device:?}");
+            if !ok {
+                assert_eq!(result.unwrap_err(), DECISION_ASR_RUNTIME_CONFLICT);
+                assert!(crate::messages::code(DECISION_ASR_RUNTIME_CONFLICT).is_some());
+            }
+        }
+        settings.automatic_voice_mode = false;
+        settings.asr_backend = "transformers-asr".into();
+        assert!(validate(&settings).is_ok());
+    }
 
     #[test]
     fn runtime_adapter_settings_accept_only_pinned_models_and_their_languages() {

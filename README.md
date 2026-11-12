@@ -256,7 +256,8 @@ WSL・Docker・NeMoは使いません。音声認識デバイスでCPU／CUDAを
 sherpa-onnxはCUDA実行プロバイダーが実際に動いたと確認できた場合だけCUDAと表示し、
 自動選択では確認できなければCPUで読み込みます。Qwen3-ASRはCUDAが必要で、CPUは明示した場合だけです。
 `transformers-asr` は `decision`・`vibevoice` と同時に入れられません（transformersの版が異なるため）。
-この追加依存を使う間は音声モードの自動判定（判断モデル）を準備できません。
+音声モードの自動判定（判断モデル）は、`transformers-asr`、およびCPU以外のデバイスの `sherpa-onnx` とは
+同じワーカーで動かせないため、設定でこの組合せを拒否します（sherpa-onnxは音声認識デバイスにCPUを選べば併用できます）。
 実機の計測と制限は[タスク契約](docs/tasks/issue-87-runtime-adapters.md)を参照してください。
 
 ### faster-whisper (default, CPU-capable)

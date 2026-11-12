@@ -150,6 +150,11 @@ class Worker:
             if operation in {"load_decision", "classify_decision"}:
                 if cancel_requested is not None and cancel_requested():
                     raise cancelled_error()
+                if operation == "load_decision" and getattr(self.backend, "excludes_torch", False):
+                    return error_response(
+                        request_id, "decision_runtime_conflict",
+                        "The decision model cannot load in a worker that loaded sherpa-onnx CUDA libraries; use the CPU speech device or another backend",
+                    ), False
                 if operation == "load_decision":
                     model = request.get("model")
                     quantization = request.get("quantization", "4bit")

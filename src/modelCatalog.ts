@@ -55,6 +55,14 @@ export interface ModelCatalog {
 
 export const modelCatalog = catalogJson as ModelCatalog;
 
+/**
+ * Whether the torch-based decision model (automatic voice mode) cannot share
+ * the speech worker with this ASR runtime. Mirrors Rust `decision_conflicts_with_asr`.
+ */
+export function decisionConflictsWithAsr(backend: AsrBackend, device: "auto" | "cpu" | "cuda" | null): boolean {
+  return backend === "transformers-asr" || (backend === "sherpa-onnx" && device !== "cpu");
+}
+
 /** Available catalog models of a backend. */
 export function availableModels(backend: AsrBackend): CatalogModel[] {
   return modelCatalog.models.filter((model) => model.availability === "available" && model.backend === backend);

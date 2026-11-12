@@ -473,6 +473,7 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
 | `cuda_unavailable` | sherpa_onnx_runtime.py | `ASR_DEVICE=cuda` でCUDA実行プロバイダーの動作を確認できなかった。CPUへは切り替えない。 |
 | `language_unsupported` | runtime_adapter.py | 日本語専用モデルに日本語以外の明示locale。音声を読む前に拒否する。 |
 | `audio_unsupported` | runtime_adapter.py | PCM WAV以外の音声。 |
+| `decision_runtime_conflict` | worker.py | このワーカーがsherpa-onnxのCUDA 12 / cuDNN 9ライブラリを読み込み済みで、torchを使う判断モデルを同じプロセスに読み込めない（DLL衝突）。アプリの設定保存もこの組合せを拒否する。 |
 | `decision_dependencies_missing` | decision.py | 判断モデルの追加依存がない。`uv sync --extra decision` で準備する。 |
 | `decision_cuda_required` | decision.py | 判断モデルに必要な CUDA がない。CPU の自動判定は対象外。 |
 | `decision_release_invalid` | decision.py | 固定リビジョンの実装を読み込めない。 |
