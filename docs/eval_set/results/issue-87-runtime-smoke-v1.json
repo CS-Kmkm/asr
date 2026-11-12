@@ -1,0 +1,806 @@
+{
+ "schema": "issue-87-runtime-smoke/1",
+ "date": "2026-11-11",
+ "environment": {
+  "os": "Windows 11 Pro 10.0.26300",
+  "gpu": "NVIDIA GeForce RTX 3060 12 GB",
+  "driver": "610.88",
+  "python": "3.12.11",
+  "sherpa_onnx": "2.0.1+cuda12.cudnn9 (ONNX Runtime 1.24.4)",
+  "cuda_runtime_wheels": "cudart 12.9.79, cublas 12.9.2.10, cudnn 9.27.0.42",
+  "torch": "2.11.0+cu130",
+  "transformers": "5.15.1"
+ },
+ "method": "JSONL worker (python -m asr_worker) per run: hello, load, health, transcribe first 10 practical-ja-holdout-v1 items (language ja-JP, prompt null), one ~70 s concatenation of the first 6 items, a transcribe cancelled at 30% of the long request's wall time (sherpa-cpu-4: cancelled before start), an en-US request, a dictionary-prompt request, reload in the same worker, shutdown. CER is NFKC/punctuation/whitespace-normalised character error rate (scripts/score_asr.py cer_stats), micro-averaged over the 10 items. GPU memory is nvidia-smi memory.used sampled every 250 ms for the whole device (includes other apps); gpu_baseline_mib is before the worker started. load_ms of the first sherpa run includes the 615 MB download and is not this file's runs. Exploratory single-session measurements on a normal desktop; not a benchmark. No transcript text is stored.",
+ "runs": [
+  {
+   "backend": "sherpa-onnx",
+   "model_id": "reazonspeech-k2-v2",
+   "device_policy": "cuda",
+   "gpu_baseline_mib": 1418,
+   "items": [
+    {
+     "id": "fleurs-ja_jp-test-10020345318418093976",
+     "audio_seconds": 10.44,
+     "wall_ms": 129,
+     "ok": true,
+     "duration_ms": 129,
+     "errors": 2,
+     "cer": 0.044444444444444446,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10214476888438240131",
+     "audio_seconds": 8.88,
+     "wall_ms": 98,
+     "ok": true,
+     "duration_ms": 98,
+     "errors": 2,
+     "cer": 0.06666666666666667,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10256418415643044307",
+     "audio_seconds": 9.48,
+     "wall_ms": 101,
+     "ok": true,
+     "duration_ms": 101,
+     "errors": 1,
+     "cer": 0.02564102564102564,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10281646305484957883",
+     "audio_seconds": 9.66,
+     "wall_ms": 114,
+     "ok": true,
+     "duration_ms": 114,
+     "errors": 4,
+     "cer": 0.10526315789473684,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10300959819649327821",
+     "audio_seconds": 11.94,
+     "wall_ms": 122,
+     "ok": true,
+     "duration_ms": 122,
+     "errors": 4,
+     "cer": 0.08163265306122448,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10440318583992984584",
+     "audio_seconds": 18.6,
+     "wall_ms": 160,
+     "ok": true,
+     "duration_ms": 160,
+     "errors": 3,
+     "cer": 0.03488372093023256,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10447557607007750141",
+     "audio_seconds": 18.3,
+     "wall_ms": 157,
+     "ok": true,
+     "duration_ms": 157,
+     "errors": 0,
+     "cer": 0.0,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10460389341605783008",
+     "audio_seconds": 12.42,
+     "wall_ms": 131,
+     "ok": true,
+     "duration_ms": 131,
+     "errors": 4,
+     "cer": 0.07547169811320754,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10778761596814084242",
+     "audio_seconds": 11.88,
+     "wall_ms": 116,
+     "ok": true,
+     "duration_ms": 116,
+     "errors": 4,
+     "cer": 0.07272727272727272,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-11038445467160388040",
+     "audio_seconds": 15.6,
+     "wall_ms": 141,
+     "ok": true,
+     "duration_ms": 140,
+     "errors": 6,
+     "cer": 0.15384615384615385,
+     "empty": false
+    }
+   ],
+   "hello": true,
+   "load_ms": 3274,
+   "load": {
+    "ok": true,
+    "model": "sherpa-onnx:reazonspeech-k2-v2",
+    "quantization": "4bit"
+   },
+   "progress_stages": [
+    "load",
+    "warmup"
+   ],
+   "download_bytes": 0,
+   "health_after_load": {
+    "backend": "sherpa-onnx",
+    "loaded": true,
+    "device": "cuda",
+    "computeType": "float32",
+    "deviceName": "NVIDIA GeForce RTX 3060",
+    "runtime": "sherpa-onnx 2.0.1+cuda12.cudnn9 / ONNX Runtime 1.24.4 CUDAExecutionProvider"
+   },
+   "long": {
+    "audio_seconds": 70.5,
+    "wall_ms": 643,
+    "ok": true,
+    "errors": 17,
+    "ref_len": 287,
+    "cer": 0.059233449477351915
+   },
+   "cancel": {
+    "response_ok": false,
+    "code": "cancelled",
+    "latency_ms": 155,
+    "cancel_after_ms": 193
+   },
+   "english_request": {
+    "ok": false,
+    "code": "language_unsupported"
+   },
+   "prompt_request_ok": true,
+   "reload_ms": 3203,
+   "reload_ok": true,
+   "gpu_peak_mib_device_wide": 2667,
+   "shutdown_ok": true,
+   "shutdown_ms": 315,
+   "gpu_after_exit_mib": 1602,
+   "cer_normalized_micro": 0.0605,
+   "first_duration_ms": 129,
+   "warm_duration_ms_p50": 122,
+   "warm_duration_ms_max": 160,
+   "run": "sherpa-cuda-5"
+  },
+  {
+   "backend": "sherpa-onnx",
+   "model_id": "reazonspeech-k2-v2",
+   "device_policy": "auto",
+   "gpu_baseline_mib": 1603,
+   "items": [
+    {
+     "id": "fleurs-ja_jp-test-10020345318418093976",
+     "audio_seconds": 10.44,
+     "wall_ms": 147,
+     "ok": true,
+     "duration_ms": 147,
+     "errors": 2,
+     "cer": 0.044444444444444446,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10214476888438240131",
+     "audio_seconds": 8.88,
+     "wall_ms": 181,
+     "ok": true,
+     "duration_ms": 180,
+     "errors": 2,
+     "cer": 0.06666666666666667,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10256418415643044307",
+     "audio_seconds": 9.48,
+     "wall_ms": 156,
+     "ok": true,
+     "duration_ms": 156,
+     "errors": 1,
+     "cer": 0.02564102564102564,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10281646305484957883",
+     "audio_seconds": 9.66,
+     "wall_ms": 173,
+     "ok": true,
+     "duration_ms": 172,
+     "errors": 4,
+     "cer": 0.10526315789473684,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10300959819649327821",
+     "audio_seconds": 11.94,
+     "wall_ms": 194,
+     "ok": true,
+     "duration_ms": 194,
+     "errors": 4,
+     "cer": 0.08163265306122448,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10440318583992984584",
+     "audio_seconds": 18.6,
+     "wall_ms": 190,
+     "ok": true,
+     "duration_ms": 189,
+     "errors": 3,
+     "cer": 0.03488372093023256,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10447557607007750141",
+     "audio_seconds": 18.3,
+     "wall_ms": 156,
+     "ok": true,
+     "duration_ms": 155,
+     "errors": 0,
+     "cer": 0.0,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10460389341605783008",
+     "audio_seconds": 12.42,
+     "wall_ms": 122,
+     "ok": true,
+     "duration_ms": 122,
+     "errors": 4,
+     "cer": 0.07547169811320754,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10778761596814084242",
+     "audio_seconds": 11.88,
+     "wall_ms": 125,
+     "ok": true,
+     "duration_ms": 125,
+     "errors": 4,
+     "cer": 0.07272727272727272,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-11038445467160388040",
+     "audio_seconds": 15.6,
+     "wall_ms": 149,
+     "ok": true,
+     "duration_ms": 148,
+     "errors": 6,
+     "cer": 0.15384615384615385,
+     "empty": false
+    }
+   ],
+   "hello": true,
+   "load_ms": 3449,
+   "load": {
+    "ok": true,
+    "model": "sherpa-onnx:reazonspeech-k2-v2",
+    "quantization": "4bit"
+   },
+   "progress_stages": [
+    "load",
+    "warmup"
+   ],
+   "download_bytes": 0,
+   "health_after_load": {
+    "backend": "sherpa-onnx",
+    "loaded": true,
+    "device": "cuda",
+    "computeType": "float32",
+    "deviceName": "NVIDIA GeForce RTX 3060",
+    "runtime": "sherpa-onnx 2.0.1+cuda12.cudnn9 / ONNX Runtime 1.24.4 CUDAExecutionProvider"
+   },
+   "long": {
+    "audio_seconds": 70.5,
+    "wall_ms": 594,
+    "ok": true,
+    "errors": 17,
+    "ref_len": 287,
+    "cer": 0.059233449477351915
+   },
+   "cancel": {
+    "response_ok": false,
+    "code": "cancelled",
+    "latency_ms": 123,
+    "cancel_after_ms": 178
+   },
+   "english_request": {
+    "ok": false,
+    "code": "language_unsupported"
+   },
+   "prompt_request_ok": true,
+   "reload_ms": 3010,
+   "reload_ok": true,
+   "gpu_peak_mib_device_wide": 2828,
+   "shutdown_ok": true,
+   "shutdown_ms": 263,
+   "gpu_after_exit_mib": 1490,
+   "cer_normalized_micro": 0.0605,
+   "first_duration_ms": 147,
+   "warm_duration_ms_p50": 156,
+   "warm_duration_ms_max": 194,
+   "run": "sherpa-auto-5"
+  },
+  {
+   "backend": "sherpa-onnx",
+   "model_id": "reazonspeech-k2-v2",
+   "device_policy": "cpu",
+   "gpu_baseline_mib": 1623,
+   "items": [
+    {
+     "id": "fleurs-ja_jp-test-10020345318418093976",
+     "audio_seconds": 10.44,
+     "wall_ms": 286,
+     "ok": true,
+     "duration_ms": 285,
+     "errors": 2,
+     "cer": 0.044444444444444446,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10214476888438240131",
+     "audio_seconds": 8.88,
+     "wall_ms": 210,
+     "ok": true,
+     "duration_ms": 209,
+     "errors": 2,
+     "cer": 0.06666666666666667,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10256418415643044307",
+     "audio_seconds": 9.48,
+     "wall_ms": 229,
+     "ok": true,
+     "duration_ms": 228,
+     "errors": 1,
+     "cer": 0.02564102564102564,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10281646305484957883",
+     "audio_seconds": 9.66,
+     "wall_ms": 243,
+     "ok": true,
+     "duration_ms": 242,
+     "errors": 4,
+     "cer": 0.10526315789473684,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10300959819649327821",
+     "audio_seconds": 11.94,
+     "wall_ms": 281,
+     "ok": true,
+     "duration_ms": 281,
+     "errors": 4,
+     "cer": 0.08163265306122448,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10440318583992984584",
+     "audio_seconds": 18.6,
+     "wall_ms": 477,
+     "ok": true,
+     "duration_ms": 477,
+     "errors": 3,
+     "cer": 0.03488372093023256,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10447557607007750141",
+     "audio_seconds": 18.3,
+     "wall_ms": 498,
+     "ok": true,
+     "duration_ms": 497,
+     "errors": 0,
+     "cer": 0.0,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10460389341605783008",
+     "audio_seconds": 12.42,
+     "wall_ms": 327,
+     "ok": true,
+     "duration_ms": 327,
+     "errors": 4,
+     "cer": 0.07547169811320754,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10778761596814084242",
+     "audio_seconds": 11.88,
+     "wall_ms": 317,
+     "ok": true,
+     "duration_ms": 317,
+     "errors": 4,
+     "cer": 0.07272727272727272,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-11038445467160388040",
+     "audio_seconds": 15.6,
+     "wall_ms": 387,
+     "ok": true,
+     "duration_ms": 387,
+     "errors": 6,
+     "cer": 0.15384615384615385,
+     "empty": false
+    }
+   ],
+   "hello": true,
+   "load_ms": 2486,
+   "load": {
+    "ok": true,
+    "model": "sherpa-onnx:reazonspeech-k2-v2",
+    "quantization": "4bit"
+   },
+   "progress_stages": [
+    "load",
+    "warmup"
+   ],
+   "download_bytes": 0,
+   "health_after_load": {
+    "backend": "sherpa-onnx",
+    "loaded": true,
+    "device": "cpu",
+    "computeType": "float32",
+    "deviceName": null,
+    "runtime": "sherpa-onnx 2.0.1+cuda12.cudnn9 / ONNX Runtime 1.24.4 CPUExecutionProvider"
+   },
+   "long": {
+    "audio_seconds": 70.5,
+    "wall_ms": 1902,
+    "ok": true,
+    "errors": 17,
+    "ref_len": 287,
+    "cer": 0.059233449477351915
+   },
+   "cancel": {
+    "response_ok": false,
+    "code": "cancelled",
+    "latency_ms": 0
+   },
+   "english_request": {
+    "ok": false,
+    "code": "language_unsupported"
+   },
+   "prompt_request_ok": true,
+   "reload_ms": 3089,
+   "reload_ok": true,
+   "gpu_peak_mib_device_wide": 1628,
+   "shutdown_ok": true,
+   "shutdown_ms": 113,
+   "gpu_after_exit_mib": 1625,
+   "cer_normalized_micro": 0.0605,
+   "first_duration_ms": 285,
+   "warm_duration_ms_p50": 317,
+   "warm_duration_ms_max": 497,
+   "run": "sherpa-cpu-4"
+  },
+  {
+   "backend": "transformers-asr",
+   "model_id": "qwen3-asr-0.6b",
+   "device_policy": "cuda",
+   "gpu_baseline_mib": 1417,
+   "items": [
+    {
+     "id": "fleurs-ja_jp-test-10020345318418093976",
+     "audio_seconds": 10.44,
+     "wall_ms": 1188,
+     "ok": true,
+     "duration_ms": 1187,
+     "errors": 3,
+     "cer": 0.06666666666666667,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10214476888438240131",
+     "audio_seconds": 8.88,
+     "wall_ms": 798,
+     "ok": true,
+     "duration_ms": 798,
+     "errors": 3,
+     "cer": 0.1,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10256418415643044307",
+     "audio_seconds": 9.48,
+     "wall_ms": 1138,
+     "ok": true,
+     "duration_ms": 1138,
+     "errors": 7,
+     "cer": 0.1794871794871795,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10281646305484957883",
+     "audio_seconds": 9.66,
+     "wall_ms": 1015,
+     "ok": true,
+     "duration_ms": 1015,
+     "errors": 4,
+     "cer": 0.10526315789473684,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10300959819649327821",
+     "audio_seconds": 11.94,
+     "wall_ms": 1294,
+     "ok": true,
+     "duration_ms": 1293,
+     "errors": 0,
+     "cer": 0.0,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10440318583992984584",
+     "audio_seconds": 18.6,
+     "wall_ms": 2281,
+     "ok": true,
+     "duration_ms": 2281,
+     "errors": 4,
+     "cer": 0.046511627906976744,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10447557607007750141",
+     "audio_seconds": 18.3,
+     "wall_ms": 1496,
+     "ok": true,
+     "duration_ms": 1495,
+     "errors": 3,
+     "cer": 0.04838709677419355,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10460389341605783008",
+     "audio_seconds": 12.42,
+     "wall_ms": 1684,
+     "ok": true,
+     "duration_ms": 1684,
+     "errors": 4,
+     "cer": 0.07547169811320754,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10778761596814084242",
+     "audio_seconds": 11.88,
+     "wall_ms": 1565,
+     "ok": true,
+     "duration_ms": 1564,
+     "errors": 4,
+     "cer": 0.07272727272727272,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-11038445467160388040",
+     "audio_seconds": 15.6,
+     "wall_ms": 1285,
+     "ok": true,
+     "duration_ms": 1284,
+     "errors": 6,
+     "cer": 0.15384615384615385,
+     "empty": false
+    }
+   ],
+   "hello": true,
+   "load_ms": 7861,
+   "load": {
+    "ok": true,
+    "model": "transformers-asr:qwen3-asr-0.6b",
+    "quantization": "4bit"
+   },
+   "progress_stages": [
+    "load",
+    "warmup"
+   ],
+   "download_bytes": 0,
+   "health_after_load": {
+    "backend": "transformers-asr",
+    "loaded": true,
+    "device": "cuda",
+    "computeType": "bfloat16",
+    "deviceName": "NVIDIA GeForce RTX 3060",
+    "runtime": "transformers 5.15.1 / torch 2.11.0+cu130"
+   },
+   "long": {
+    "audio_seconds": 70.5,
+    "wall_ms": 7086,
+    "ok": true,
+    "errors": 17,
+    "ref_len": 287,
+    "cer": 0.059233449477351915
+   },
+   "cancel": {
+    "response_ok": false,
+    "code": "cancelled",
+    "latency_ms": 19,
+    "cancel_after_ms": 2126
+   },
+   "english_request": {
+    "ok": true,
+    "code": null
+   },
+   "prompt_request_ok": true,
+   "reload_ms": 3156,
+   "reload_ok": true,
+   "gpu_peak_mib_device_wide": 4175,
+   "shutdown_ok": true,
+   "shutdown_ms": 961,
+   "gpu_after_exit_mib": 1418,
+   "cer_normalized_micro": 0.0766,
+   "first_duration_ms": 1187,
+   "warm_duration_ms_p50": 1293,
+   "warm_duration_ms_max": 2281,
+   "run": "qwen-cuda-3"
+  },
+  {
+   "backend": "transformers-asr",
+   "model_id": "qwen3-asr-0.6b",
+   "device_policy": "cpu",
+   "gpu_baseline_mib": 1490,
+   "items": [
+    {
+     "id": "fleurs-ja_jp-test-10020345318418093976",
+     "audio_seconds": 10.44,
+     "wall_ms": 4079,
+     "ok": true,
+     "duration_ms": 4079,
+     "errors": 3,
+     "cer": 0.06666666666666667,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10214476888438240131",
+     "audio_seconds": 8.88,
+     "wall_ms": 3574,
+     "ok": true,
+     "duration_ms": 3573,
+     "errors": 5,
+     "cer": 0.16666666666666666,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10256418415643044307",
+     "audio_seconds": 9.48,
+     "wall_ms": 6289,
+     "ok": true,
+     "duration_ms": 6289,
+     "errors": 8,
+     "cer": 0.20512820512820512,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10281646305484957883",
+     "audio_seconds": 9.66,
+     "wall_ms": 10760,
+     "ok": true,
+     "duration_ms": 10760,
+     "errors": 4,
+     "cer": 0.10526315789473684,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10300959819649327821",
+     "audio_seconds": 11.94,
+     "wall_ms": 82429,
+     "ok": true,
+     "duration_ms": 82429,
+     "errors": 0,
+     "cer": 0.0,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10440318583992984584",
+     "audio_seconds": 18.6,
+     "wall_ms": 14692,
+     "ok": true,
+     "duration_ms": 14691,
+     "errors": 4,
+     "cer": 0.046511627906976744,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10447557607007750141",
+     "audio_seconds": 18.3,
+     "wall_ms": 8973,
+     "ok": true,
+     "duration_ms": 8972,
+     "errors": 3,
+     "cer": 0.04838709677419355,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10460389341605783008",
+     "audio_seconds": 12.42,
+     "wall_ms": 7800,
+     "ok": true,
+     "duration_ms": 7799,
+     "errors": 4,
+     "cer": 0.07547169811320754,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-10778761596814084242",
+     "audio_seconds": 11.88,
+     "wall_ms": 6697,
+     "ok": true,
+     "duration_ms": 6697,
+     "errors": 4,
+     "cer": 0.07272727272727272,
+     "empty": false
+    },
+    {
+     "id": "fleurs-ja_jp-test-11038445467160388040",
+     "audio_seconds": 15.6,
+     "wall_ms": 6481,
+     "ok": true,
+     "duration_ms": 6480,
+     "errors": 6,
+     "cer": 0.15384615384615385,
+     "empty": false
+    }
+   ],
+   "hello": true,
+   "load_ms": 7923,
+   "load": {
+    "ok": true,
+    "model": "transformers-asr:qwen3-asr-0.6b",
+    "quantization": "4bit"
+   },
+   "progress_stages": [
+    "load",
+    "warmup"
+   ],
+   "download_bytes": 0,
+   "health_after_load": {
+    "backend": "transformers-asr",
+    "loaded": true,
+    "device": "cpu",
+    "computeType": "float32",
+    "deviceName": null,
+    "runtime": "transformers 5.15.1 / torch 2.11.0+cu130"
+   },
+   "long": {
+    "audio_seconds": 70.5,
+    "wall_ms": 42770,
+    "ok": true,
+    "errors": 17,
+    "ref_len": 287,
+    "cer": 0.059233449477351915
+   },
+   "cancel": {
+    "response_ok": false,
+    "code": "cancelled",
+    "latency_ms": 25,
+    "cancel_after_ms": 12831
+   },
+   "english_request": {
+    "ok": true,
+    "code": null
+   },
+   "prompt_request_ok": true,
+   "reload_ms": 4663,
+   "reload_ok": true,
+   "gpu_peak_mib_device_wide": 1801,
+   "shutdown_ok": true,
+   "shutdown_ms": 1620,
+   "gpu_after_exit_mib": 1421,
+   "cer_normalized_micro": 0.0827,
+   "first_duration_ms": 4079,
+   "warm_duration_ms_p50": 7799,
+   "warm_duration_ms_max": 82429,
+   "run": "qwen-cpu-3"
+  }
+ ]
+}
