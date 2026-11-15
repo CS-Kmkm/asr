@@ -29,7 +29,18 @@ RUNTIME_FILES = {
     "speech.dll": "923fb0babff5596202ae92dc5b6423a23579ab461bc7cce8b35258107ee05662",
 }
 # Revision and digest are the converted artifact's identity, not the upstream
-# NeMo checkpoint's identity. Q8_0 uses a GPU encoder and CPU greedy decoder.
+# checkpoint's identity (the GGUF weight layout is speech.cpp-specific).
+# Per-model rules live here and are cross-checked against the shared catalog
+# (src/asr-model-catalog.json) by the worker tests:
+#   weight_type   -> catalog weightFormat; the server must report exactly it.
+#   japanese_only -> catalog languageScope; other languages are refused.
+#   prompt        -> catalog vocabulary "prompt": dictionary terms are sent as
+#                    the server's free-text ``prompt`` option. FastConformer
+#                    (Haas/Parakeet) does not accept one; its dictionary is
+#                    applied after recognition only.
+# FastConformer Q8_0 uses a GPU encoder and a CPU greedy decoder. Qwen3-ASR
+# (an audio encoder plus a Qwen3 LLM decoder) needs speech.cpp >= 0.7.0 for
+# Q8_0; the pinned 0.10.1 runtime serves it.
 MODELS = {
     "haas-ja-v1.0": {
         "repo": "sakasegawa/Haas-ja-v1.0-GGUF",
@@ -37,6 +48,7 @@ MODELS = {
         "file": "Haas-616M-ja-v1.0-Q8_0.gguf",
         "sha256": "cd5f60b2f1c411404b83fca4a65e3ce30a26d9e951b6a346529e65f22758afeb",
         "license": "Apache-2.0", "size": 656381472,
+        "weight_type": "Q8_0", "japanese_only": True, "prompt": False,
     },
     "parakeet-tdt_ctc-0.6b-ja": {
         "repo": "sakasegawa/parakeet-tdt_ctc-0.6b-ja-GGUF",
@@ -44,8 +56,27 @@ MODELS = {
         "file": "parakeet-tdt_ctc-0.6B-ja-Q8_0.gguf",
         "sha256": "6ff90c5240f0778dfb44816916eb3c8e634645e120170d6ae43c0f50a11d79d0",
         "license": "CC-BY-4.0", "size": 661012416,
+        "weight_type": "Q8_0", "japanese_only": True, "prompt": False,
+    },
+    # Converted from Qwen/Qwen3-ASR-0.6B@5eb144179a02acc5e5ba31e748d22b0cf3e303b0.
+    "qwen3-asr-0.6b": {
+        "repo": "sakasegawa/Qwen3-ASR-0.6B-GGUF",
+        "revision": "ee78f8709547f39bea3b924a16c72403826cac92",
+        "file": "Qwen3-ASR-0.6B-Q8_0.gguf",
+        "sha256": "416e10c15b4a3d9002bd337d18fc450233fdf68502b6e10d1379d2789838afd0",
+        "license": "Apache-2.0", "size": 841502336,
+        "weight_type": "Q8_0", "japanese_only": False, "prompt": True,
+    },
+    "qwen3-asr-1.7b": {
+        "repo": "sakasegawa/Qwen3-ASR-1.7B-GGUF",
+        "revision": "81e2423d24073cdeeccb5951df16accc89e075a2",
+        "file": "Qwen3-ASR-1.7B-Q8_0.gguf",
+        "sha256": "5f219b78a1d9c3b9e97da27708b36f8a0bc1bfc1650b541c0a6dbaf87c9a62d0",
+        "license": "Apache-2.0", "size": 2176109216,
+        "weight_type": "Q8_0", "japanese_only": False, "prompt": True,
     },
 }
+DEFAULT_MODEL = "haas-ja-v1.0"
 
 
 def server_environment() -> dict[str, str]:
@@ -175,7 +206,7 @@ def prepare(backend: Any) -> tuple[Path, Path]:
         raise BackendError("speech_cpp_unsupported_platform", "Japanese Vulkan models require Windows x64. Select faster-whisper on this system.")
     model = MODELS.get(backend.catalog_id)
     if model is None:
-        raise BackendError("speech_cpp_unavailable", "Select haas-ja-v1.0 or parakeet-tdt_ctc-0.6b-ja")
+        raise BackendError("speech_cpp_unavailable", f"Select one of: {', '.join(MODELS)}")
     home = cache_home()
     clean_staging(home)
     runtime = home / f"runtime-{VERSION}"
@@ -239,8 +270,13 @@ class SpeechCppBackend(OpenAICompatibleBackend):
 
     def __init__(self) -> None:
         super().__init__()
-        self.catalog_id = os.environ.get("ASR_MODEL_ID", "haas-ja-v1.0")
-        self.model_name = f"speech.cpp:{self.catalog_id}:Q8_0"
+        self.catalog_id = os.environ.get("ASR_MODEL_ID", "").strip() or DEFAULT_MODEL
+        pinned = MODELS.get(self.catalog_id, {})
+        # Unknown IDs keep the label shape; load() refuses them before any download.
+        self.weight_type: str = pinned.get("weight_type", "Q8_0")
+        self.japanese_only: bool = pinned.get("japanese_only", True)
+        self.accepts_prompt: bool = pinned.get("prompt", False)
+        self.model_name = f"speech.cpp:{self.catalog_id}:{self.weight_type}"
         # Never send inherited credentials to the unauthenticated local server.
         self.api_key = None
         self.process: subprocess.Popen | None = None
@@ -307,7 +343,7 @@ class SpeechCppBackend(OpenAICompatibleBackend):
             models.raise_for_status()
             entries = models.json()["data"]
             recognition = [item for item in entries if item.get("speech", {}).get("task") == "recognition"]
-            if len(recognition) != 1 or recognition[0]["speech"].get("device") != "Vulkan0" or recognition[0]["speech"].get("weight_type") != "Q8_0":
+            if len(recognition) != 1 or recognition[0]["speech"].get("device") != "Vulkan0" or recognition[0]["speech"].get("weight_type") != self.weight_type:
                 raise BackendError("speech_cpp_unavailable", "speech.cpp did not report the loaded recognition model")
             self.model_id = recognition[0]["id"]
             self.device = recognition[0]["speech"]["device"].removesuffix("0").lower()
@@ -324,14 +360,15 @@ class SpeechCppBackend(OpenAICompatibleBackend):
 
     def transcribe(self, audio_path: Path, prompt: str | None, language: str | None = None,
                    decoding: str | None = None) -> tuple[str, list[dict[str, Any]]]:
-        if language and language.replace("_", "-").split("-", 1)[0].lower() != "ja":
+        if self.japanese_only and language and language.replace("_", "-").split("-", 1)[0].lower() != "ja":
             raise BackendError("speech_cpp_language", "This model recognizes Japanese only; select faster-whisper for other languages")
         if self.process is None or self.process.poll() is not None:
             raise BackendError("speech_cpp_unavailable", "speech.cpp is not running; reload the model or select faster-whisper")
-        # FastConformer does not accept OpenAI's text prompt. The app still
-        # applies its deterministic dictionary after recognition. Native Haas
-        # keyword boosting needs structured entries, not a lossy prompt parse.
-        return super().transcribe(audio_path, None, language, decoding)
+        # FastConformer does not accept OpenAI's text prompt: the app applies
+        # its deterministic dictionary after recognition (native Haas keyword
+        # boosting needs structured entries, not a lossy prompt parse).
+        # Qwen3-ASR takes the dictionary terms as its context prompt.
+        return super().transcribe(audio_path, prompt if self.accepts_prompt else None, language, decoding)
 
     def unload(self) -> None:
         process, job, reader = self.process, self.job, self.reader

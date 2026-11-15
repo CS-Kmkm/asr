@@ -29,6 +29,7 @@ pub(crate) struct CatalogModel {
     pub availability: String,
     pub language_scope: Option<String>,
     pub inference: Vec<String>,
+    pub vocabulary: Option<String>,
     pub devices: Vec<String>,
     pub source: Option<CatalogSource>,
     pub weight_format: Option<String>,
@@ -44,6 +45,20 @@ pub(crate) struct CatalogSource {
     pub file: Option<String>,
     pub sha256: Option<String>,
     pub size_bytes: Option<u64>,
+    /// Every pinned file of a multi-file model (`file`/`sha256` are then null
+    /// and `size_bytes` is the total).
+    #[serde(default)]
+    pub files: Vec<CatalogFile>,
+}
+
+// Display-only fields are parsed so the catalog tests can check them.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CatalogFile {
+    pub file: String,
+    pub sha256: String,
+    pub size_bytes: u64,
 }
 
 pub(crate) fn catalog() -> &'static Catalog {
@@ -60,6 +75,8 @@ pub(crate) struct ManagedModel<'a> {
     pub revision: &'a str,
     pub file: &'a str,
     pub size_bytes: u64,
+    /// The GGUF weight type the server must report (`Q8_0`).
+    pub weight_format: &'a str,
 }
 
 pub(crate) fn managed_models() -> impl Iterator<Item = ManagedModel<'static>> {
@@ -73,12 +90,47 @@ pub(crate) fn managed_models() -> impl Iterator<Item = ManagedModel<'static>> {
             revision: source.revision.as_deref()?,
             file: source.file.as_deref()?,
             size_bytes: source.size_bytes?,
+            weight_format: model.weight_format.as_deref()?,
         })
     })
 }
 
 pub(crate) fn is_speech_cpp_model(model_id: &str) -> bool {
     managed_models().any(|model| model.model_id == model_id)
+}
+
+fn available_for(backend: &str) -> impl Iterator<Item = &'static CatalogModel> + '_ {
+    catalog().models.iter().filter(move |model| {
+        model.availability == "available" && model.backend.as_deref() == Some(backend)
+    })
+}
+
+/// Whether a backend serves only the catalog's pinned models (speech.cpp,
+/// sherpa-onnx, transformers-asr): every available entry names a model ID,
+/// so a free-form custom model ID is never valid for it.
+pub(crate) fn is_pinned_backend(backend: &str) -> bool {
+    let mut entries = available_for(backend).peekable();
+    entries.peek().is_some() && entries.all(|model| model.model_id.is_some())
+}
+
+/// The pinned catalog entry a pinned backend serves under `model_id`.
+pub(crate) fn pinned_model(backend: &str, model_id: &str) -> Option<&'static CatalogModel> {
+    available_for(backend).find(|model| model.model_id.as_deref() == Some(model_id))
+}
+
+/// The model a pinned backend loads when no model ID is configured.
+pub(crate) fn default_pinned_model(backend: &str) -> Option<&'static str> {
+    if !is_pinned_backend(backend) {
+        return None;
+    }
+    available_for(backend).find_map(|model| model.model_id.as_deref())
+}
+
+/// The pinned model IDs of a backend, for validation messages.
+pub(crate) fn pinned_model_ids(backend: &str) -> Vec<&'static str> {
+    available_for(backend)
+        .filter_map(|model| model.model_id.as_deref())
+        .collect()
 }
 
 /// Mirrors `asr_worker.speech_cpp.cache_home`: an empty override falls back
@@ -235,11 +287,29 @@ mod tests {
                     model.id
                 );
                 // speech.cpp's GPU path is Vulkan; it must never read as CUDA.
+                // The language scope and dictionary handling are per model
+                // (FastConformer: Japanese only, dictionary after recognition;
+                // Qwen3-ASR: multilingual, dictionary as the prompt).
                 if backend == "speech-cpp" {
                     assert_eq!(model.devices, ["vulkan"]);
-                    assert_eq!(model.language_scope.as_deref(), Some("japanese_only"));
-                    assert_eq!(model.weight_format.as_deref(), Some("Q8_0"));
+                    let expected_vocabulary = match model.language_scope.as_deref() {
+                        Some("japanese_only") => "post_dictionary_only",
+                        Some("multilingual") => "prompt",
+                        other => panic!("{}: unexpected language scope {other:?}", model.id),
+                    };
+                    assert_eq!(
+                        model.vocabulary.as_deref(),
+                        Some(expected_vocabulary),
+                        "{}",
+                        model.id
+                    );
+                    let weights = model.weight_format.as_deref().expect("weight format");
+                    assert_eq!(weights, "Q8_0", "{}", model.id);
                     let source = model.source.as_ref().expect("pinned source");
+                    assert!(source
+                        .file
+                        .as_deref()
+                        .is_some_and(|f| f.ends_with(&format!("-{weights}.gguf"))));
                     assert!(!source.repo.is_empty());
                     assert!(source.revision.as_deref().is_some_and(|r| r.len() == 40));
                     assert!(source.sha256.as_deref().is_some_and(hex64));
@@ -249,6 +319,22 @@ mod tests {
                         .is_some_and(|f| f.ends_with(".gguf") && !f.contains(['/', '\\'])));
                     assert!(source.size_bytes.is_some_and(|size| size > 0));
                 }
+                // App-managed multi-file models pin every file and the total.
+                if backend == "sherpa-onnx" || backend == "transformers-asr" {
+                    let source = model.source.as_ref().expect("pinned source");
+                    assert!(source.revision.as_deref().is_some_and(|r| r.len() == 40));
+                    assert!(source.file.is_none() && source.sha256.is_none());
+                    assert!(!source.files.is_empty());
+                    for file in &source.files {
+                        assert!(hex64(&file.sha256), "{}", file.file);
+                        assert!(!file.file.contains(['/', '\\']) && file.size_bytes > 0);
+                    }
+                    assert_eq!(
+                        source.size_bytes,
+                        Some(source.files.iter().map(|file| file.size_bytes).sum())
+                    );
+                    assert!(model.devices.iter().all(|d| d == "cpu" || d == "cuda"));
+                }
             } else {
                 assert!(model.backend.is_none() && model.inference.is_empty());
             }
@@ -256,9 +342,63 @@ mod tests {
     }
 
     #[test]
+    fn pinned_backends_and_defaults_come_from_the_catalog() {
+        for backend in ["speech-cpp", "sherpa-onnx", "transformers-asr"] {
+            assert!(is_pinned_backend(backend), "{backend}");
+        }
+        for backend in ["faster-whisper", "vibevoice", "openai-compatible", "mock"] {
+            assert!(!is_pinned_backend(backend), "{backend}");
+            assert_eq!(default_pinned_model(backend), None);
+        }
+        assert_eq!(default_pinned_model("speech-cpp"), Some("haas-ja-v1.0"));
+        assert_eq!(
+            default_pinned_model("sherpa-onnx"),
+            Some("reazonspeech-k2-v2")
+        );
+        assert_eq!(
+            default_pinned_model("transformers-asr"),
+            Some("qwen3-asr-0.6b")
+        );
+        assert!(pinned_model("sherpa-onnx", "reazonspeech-k2-v2").is_some());
+        assert!(pinned_model("sherpa-onnx", "qwen3-asr-0.6b").is_none());
+        assert!(pinned_model("transformers-asr", "planned:qwen3-asr-1.7b").is_none());
+        for backend in ["speech-cpp", "transformers-asr"] {
+            for id in ["qwen3-asr-0.6b", "qwen3-asr-1.7b"] {
+                assert_eq!(
+                    pinned_model(backend, id).and_then(|model| model.language_scope.as_deref()),
+                    Some("multilingual"),
+                    "{backend} {id}"
+                );
+            }
+        }
+        assert!(catalog()
+            .models
+            .iter()
+            .all(|model| model.id != "planned:qwen3-asr-1.7b"));
+        assert_eq!(
+            pinned_model("sherpa-onnx", "reazonspeech-k2-v2")
+                .and_then(|model| model.language_scope.as_deref()),
+            Some("japanese_only")
+        );
+        assert_eq!(
+            pinned_model("transformers-asr", "qwen3-asr-0.6b")
+                .and_then(|model| model.language_scope.as_deref()),
+            Some("multilingual")
+        );
+    }
+
+    #[test]
     fn speech_cpp_ids_come_from_the_catalog() {
         let ids: Vec<_> = managed_models().map(|model| model.model_id).collect();
-        assert_eq!(ids, ["haas-ja-v1.0", "parakeet-tdt_ctc-0.6b-ja"]);
+        assert_eq!(
+            ids,
+            [
+                "haas-ja-v1.0",
+                "parakeet-tdt_ctc-0.6b-ja",
+                "qwen3-asr-0.6b",
+                "qwen3-asr-1.7b"
+            ]
+        );
         assert!(is_speech_cpp_model("haas-ja-v1.0"));
         assert!(!is_speech_cpp_model("large-v3-turbo"));
         assert!(!is_speech_cpp_model("planned:qwen3-asr-0.6b"));

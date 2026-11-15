@@ -26,8 +26,10 @@ pub(crate) fn deletion_blocked(status: &ModelStatus, model_id: &str) -> Option<&
     if status.state == "loading" {
         return Some(LOAD_IN_PROGRESS);
     }
-    let identity = format!("speech.cpp:{model_id}:Q8_0");
-    (status.state == "ready" && status.model_id.as_deref() == Some(identity.as_str())).then_some(
+    let loaded = model_catalog::managed_models()
+        .find(|model| model.model_id == model_id)
+        .map(|model| format!("speech.cpp:{model_id}:{}", model.weight_format));
+    (status.state == "ready" && loaded.is_some() && status.model_id == loaded).then_some(
         "This model is loaded. Load a different model before removing its downloaded file.",
     )
 }
@@ -102,6 +104,18 @@ mod tests {
         assert!(deletion_blocked(
             &status("not_loaded", Some("speech.cpp:haas-ja-v1.0:Q8_0")),
             haas
+        )
+        .is_none());
+        // The same Qwen3-ASR model ID on another runtime uses other files.
+        let qwen = "qwen3-asr-1.7b";
+        assert!(deletion_blocked(
+            &status("ready", Some("speech.cpp:qwen3-asr-1.7b:Q8_0")),
+            qwen
+        )
+        .is_some());
+        assert!(deletion_blocked(
+            &status("ready", Some("transformers-asr:qwen3-asr-1.7b")),
+            qwen
         )
         .is_none());
     }

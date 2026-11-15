@@ -44,7 +44,7 @@ pub(super) fn correction_hints(
     app_context: Option<&AppContext>,
 ) -> Vec<CorrectionTerm> {
     storage
-        .dictionary_correction_terms(text, app_context)
+        .dictionary_correction_terms(text, app_context, crate::types::DictionaryMode::Dictate)
         .unwrap_or_default()
 }
 

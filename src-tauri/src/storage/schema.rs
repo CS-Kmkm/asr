@@ -41,16 +41,24 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         min_reader_version: 1,
     },
     Migration {
-        apply: migrate_v5_take_route,
+        apply: migrate_v5_dictionary_learning,
+        min_reader_version: 1,
+    },
+    Migration {
+        apply: migrate_v6_decision_origin,
+        min_reader_version: 1,
+    },
+    Migration {
+        apply: migrate_v7_take_route,
         min_reader_version: 1,
     },
 ];
 
-/// Version 5: additive `take_spans` columns for Smart Dictate/Edit and
+/// Version 7: additive `take_spans` columns for Smart Dictate/Edit and
 /// latency analysis: the stop-to-final-transcript span, the Smart route code
 /// and the shortcut presses of a take. Older rows keep them NULL (missing,
 /// never zero), so `TAKE_SPAN_VERSION` is unchanged; older builds ignore them.
-fn migrate_v5_take_route(connection: &Connection) -> Result<(), StorageError> {
+fn migrate_v7_take_route(connection: &Connection) -> Result<(), StorageError> {
     for (column, definition) in [
         ("stop_to_final_ms", "INTEGER"),
         ("route", "TEXT"),
@@ -62,6 +70,37 @@ fn migrate_v5_take_route(connection: &Connection) -> Result<(), StorageError> {
                 [],
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Version 6 (Issue #85): the origin of each confirm/reject decision, so
+/// deleting learned data also forgets decisions on edit suggestions. A
+/// separate step because databases already at version 5 lack the column.
+/// Older builds ignore it.
+fn migrate_v6_decision_origin(connection: &Connection) -> Result<(), StorageError> {
+    if !column_exists(connection, "dictionary_candidate_decisions", "origin")? {
+        connection.execute(
+            "ALTER TABLE dictionary_candidate_decisions ADD COLUMN origin TEXT NOT NULL DEFAULT 'correction'",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Version 5 (Issue #85): optional per-entry text modes (NULL = every mode)
+/// and the origin of a suggestion. Older builds ignore both columns, so an
+/// entry limited to some modes applies to every mode there and a learned
+/// entry reads as auto-added.
+fn migrate_v5_dictionary_learning(connection: &Connection) -> Result<(), StorageError> {
+    if !column_exists(connection, "dictionary_entries", "modes")? {
+        connection.execute("ALTER TABLE dictionary_entries ADD COLUMN modes TEXT", [])?;
+    }
+    if !column_exists(connection, "dictionary_candidates", "origin")? {
+        connection.execute(
+            "ALTER TABLE dictionary_candidates ADD COLUMN origin TEXT NOT NULL DEFAULT 'correction'",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -353,4 +392,39 @@ fn migrate_v2_settings_backups(connection: &Connection) -> Result<(), StorageErr
          );",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_and_text_quality_databases_gain_nullable_smart_spans_without_data_loss() {
+        for prior_version in [4, 6] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            run_migrations(&mut connection, &MIGRATIONS[..prior_version]).unwrap();
+            connection.execute(
+                "INSERT INTO take_spans(take_id, version, created_at, outcome) VALUES ('before', 1, '2026-11-15', 'pasted')",
+                [],
+            ).unwrap();
+            run_migrations(&mut connection, MIGRATIONS).unwrap();
+            run_migrations(&mut connection, MIGRATIONS).unwrap();
+            let row: (String, Option<i64>, Option<String>, Option<i64>) = connection.query_row(
+                "SELECT outcome, stop_to_final_ms, route, key_presses FROM take_spans WHERE take_id = 'before'",
+                [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).unwrap();
+            assert_eq!(row, ("pasted".into(), None, None, None));
+            for (table, column) in [
+                ("dictionary_entries", "modes"),
+                ("dictionary_candidates", "origin"),
+                ("dictionary_candidate_decisions", "origin"),
+            ] {
+                assert!(column_exists(&connection, table, column).unwrap());
+            }
+            let version: i64 = connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 7);
+        }
+    }
 }

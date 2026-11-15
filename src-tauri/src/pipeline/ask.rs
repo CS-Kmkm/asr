@@ -161,6 +161,7 @@ async fn finish_ask(
             storage,
             &settings,
             app_context.as_ref(),
+            crate::types::DictionaryMode::Ask,
             spoken,
             None,
             services
@@ -303,6 +304,7 @@ async fn finish_ask(
         storage,
         &settings,
         app_context.as_ref(),
+        crate::types::DictionaryMode::Ask,
         spoken,
         session.selected_source(),
         services

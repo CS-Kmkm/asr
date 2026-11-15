@@ -144,11 +144,17 @@ class Worker:
                         "device": getattr(self.backend, "device", None) if self.loaded else None,
                         "computeType": getattr(self.backend, "compute_type", None) if self.loaded else None,
                         **({"deviceName": self.backend.device_name} if self.loaded and getattr(self.backend, "device_name", None) else {}),
+                        **({"runtime": self.backend.runtime_label} if self.loaded and getattr(self.backend, "runtime_label", None) else {}),
                     },
                 }, False
             if operation in {"load_decision", "classify_decision"}:
                 if cancel_requested is not None and cancel_requested():
                     raise cancelled_error()
+                if operation == "load_decision" and getattr(self.backend, "excludes_torch", False):
+                    return error_response(
+                        request_id, "decision_runtime_conflict",
+                        "The decision model cannot load in a worker that loaded sherpa-onnx CUDA libraries; use the CPU speech device or another backend",
+                    ), False
                 if operation == "load_decision":
                     model = request.get("model")
                     quantization = request.get("quantization", "4bit")
@@ -442,7 +448,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="VibeVoice JSON Lines worker")
     parser.add_argument(
         "--backend",
-        choices=("vibevoice", "faster-whisper", "openai-compatible", "speech-cpp", "mock"),
+        choices=("vibevoice", "faster-whisper", "openai-compatible", "speech-cpp", "sherpa-onnx", "transformers-asr", "mock"),
         default=os.environ.get("ASR_WORKER_BACKEND", "faster-whisper"),
     )
     parser.add_argument("--serve", action="store_true", help="Serve an OpenAI-compatible HTTP API")
@@ -488,10 +494,13 @@ def main(argv: list[str] | None = None) -> int:
                 notify_progress=os.environ.get("ASR_WORKER_PROGRESS") == "1",
                 # A first native NumPy import can hang on Windows while the
                 # input thread is already blocked waiting for another command.
+                # Runtime adapters import their native runtime (torch, ONNX
+                # Runtime) there too: the same hang was observed for torch.
                 initialize_load_runtime=(
-                    (lambda: importlib.import_module("numpy"))
-                    if os.name == "nt" and args.backend in {"faster-whisper", "vibevoice"}
-                    else None
+                    None if os.name != "nt"
+                    else getattr(backend, "preload_runtime", None)
+                    or ((lambda: importlib.import_module("numpy"))
+                        if args.backend in {"faster-whisper", "vibevoice"} else None)
                 ),
             )
     return 0
