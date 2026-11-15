@@ -42,7 +42,8 @@ QWEN3_ASR_0_6B = ManagedModel(
     kind="qwen3_asr",
 )
 # Same processor/tokenizer files as 0.6B (identical digests) except config.json.
-# bfloat16 weights are about 4.1 GB; measured on an RTX 3060 12 GB (see
+# The pinned bfloat16 weight file is about 4.1 GB on disk. GPU fit, latency and
+# OOM behaviour are not yet measured on hardware (see
 # docs/tasks/issue-89-qwen3-asr.md). A CUDA OOM maps to ``gpu_oom``.
 QWEN3_ASR_1_7B = ManagedModel(
     id="qwen3-asr-1.7b",
