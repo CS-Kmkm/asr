@@ -41,7 +41,29 @@ QWEN3_ASR_0_6B = ManagedModel(
     japanese_only=False,
     kind="qwen3_asr",
 )
-MODELS = {model.id: model for model in (QWEN3_ASR_0_6B,)}
+# Same processor/tokenizer files as 0.6B (identical digests) except config.json.
+# The pinned bfloat16 weight file is about 4.1 GB on disk. GPU fit, latency and
+# OOM behaviour are not yet measured on hardware (see
+# docs/tasks/issue-89-qwen3-asr.md). A CUDA OOM maps to ``gpu_oom``.
+QWEN3_ASR_1_7B = ManagedModel(
+    id="qwen3-asr-1.7b",
+    display_name="Qwen3-ASR 1.7B",
+    repo="Qwen/Qwen3-ASR-1.7B-hf",
+    revision="bcd2b5b7f32b480ab5790554cfa8347f246a14f3",
+    files=(
+        PinnedFile("config.json", "117ac8e63e2af7cae3665e5a632d6eb03f5f384915519ceb6403c15ec6533f63", 2399),
+        PinnedFile("generation_config.json", "9939fc9388b79bd70757f938b87381e817173d6a6158f5af6506c0b73e775c3c", 165),
+        PinnedFile("model.safetensors", "2db53c7d81bd9b8cbc6a074e89be2c968a0d373fb4ee68bb1b1e14f7042dfee1", 4076193080),
+        PinnedFile("processor_config.json", "bc0b230081b44e629dd5b9045b78495615c1831b4b9f4cffe97bd37e82a6156a", 487),
+        PinnedFile("chat_template.jinja", "f50e6b694fbf4a683206e37869990d68333fe95d285730f084c838a34b0d98c2", 1434),
+        PinnedFile("tokenizer.json", "fe1fad59be22a41ee293363fcf95fdedbc7c93f3b49270b1d2e18bd1399a7a05", 11429653),
+        PinnedFile("tokenizer_config.json", "945e980986de2ca7768f3326bfdbb4fbea3406f972b8ae0be233089f2b253c11", 998),
+    ),
+    license="Apache-2.0",
+    japanese_only=False,
+    kind="qwen3_asr",
+)
+MODELS = {model.id: model for model in (QWEN3_ASR_0_6B, QWEN3_ASR_1_7B)}
 SAMPLE_RATE = 16_000
 
 

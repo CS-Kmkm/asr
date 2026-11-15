@@ -63,17 +63,20 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
 `speech-cpp` は Windows x64/Vulkan 用の管理対象ローカルサーバーを起動します。
 初回 `load` 時に固定revision・SHA256のランタイムとQ8_0重みを取得し、
 `ASR_SPEECH_CPP_HOME`（未指定時 `%LOCALAPPDATA%/LocalVoice/speech.cpp`）に保存します。
-`ASR_MODEL_ID` は `haas-ja-v1.0` または `parakeet-tdt_ctc-0.6b-ja`。
+`ASR_MODEL_ID` は `haas-ja-v1.0`、`parakeet-tdt_ctc-0.6b-ja`、`qwen3-asr-0.6b`、`qwen3-asr-1.7b` のいずれか。
 この経路の量子化はQ8_0固定で、`quantization` は既存設定との互換のため受理します。
-`health` のdeviceは `vulkan`、computeTypeは `Q8_0` です。CPUでTDTをデコードします。
+`health` のdeviceは `vulkan`、computeTypeは `Q8_0` です。Haas／ParakeetはCPUでTDTをデコードします。
 このbackendではサーバーのdevice・weight_typeを検証し、devices一覧に照合したGPU名を
 追加の `deviceName` フィールドで返します。未知の追加フィールドは既存クライアントで無視できます。
-日本語以外の明示localeはエラーになり、別backendへ自動送信しません。
-現在の自由文promptは渡さず、アプリの認識後辞書置換は維持します。
+モデルごとの規則（`asr_worker/speech_cpp.py` の `MODELS`、カタログとテストで照合）:
+Haas／Parakeetは日本語専用で、日本語以外の明示localeは `speech_cpp_language` になり、別backendへ自動送信しません。
+自由文promptはサーバーが受け付けないため渡さず、アプリの認識後辞書置換を使います。
+Qwen3-ASRは多言語で、localeの基本言語コードを `language` に、辞書のpromptを `prompt` にそのまま渡します
+（localeなしはモデルの自動判定）。サーバーが報告するweight_typeは固定値（Q8_0）と一致する必要があります。
 
 `sherpa-onnx` と `transformers-asr` はランタイム・アダプター（`asr_worker/runtime_adapter.py`）です。
 `ASR_MODEL_ID` はアダプターが固定したモデルだけを受け付け（`sherpa-onnx`: `reazonspeech-k2-v2`、
-`transformers-asr`: `qwen3-asr-0.6b`。それ以外は `invalid_model`）、初回 `load` 時に固定revision・
+`transformers-asr`: `qwen3-asr-0.6b` / `qwen3-asr-1.7b`。それ以外は `invalid_model`）、初回 `load` 時に固定revision・
 容量・SHA256のファイルをHugging Faceから取得して
 `ASR_MANAGED_MODEL_HOME`（未指定時 `%LOCALAPPDATA%/LocalVoice/models`）`/<backend>/<model>/<revision>/` に保存します。
 読み込みのたびに全ファイルを再検証し、不一致は既存ファイルを残して `model_artifact_invalid` で拒否します。
@@ -145,7 +148,7 @@ ReazonSpeech k2は日本語専用で、日本語以外の明示localeは `langua
   環境変数 `ASR_FASTER_WHISPER_MODEL` で変更可)
 - mock: `"microsoft/VibeVoice-ASR-HF:mock"`
 - openai-compatible: `openai-compatible:<ASR_MODEL_ID>`（既定は `gpt-4o-mini-transcribe`）。
-- speech-cpp: `speech.cpp:<ASR_MODEL_ID>:Q8_0`（既定は `haas-ja-v1.0`）。量子化引数とは別にQ8_0固定。
+- speech-cpp: `speech.cpp:<ASR_MODEL_ID>:<weight_type>`（既定は `haas-ja-v1.0`）。量子化引数とは別に、全モデルQ8_0固定。
 - sherpa-onnx / transformers-asr: `<backend>:<ASR_MODEL_ID>`（既定は `reazonspeech-k2-v2` / `qwen3-asr-0.6b`）。
 
 ローカルバックエンドでも `ASR_MODEL_ID` が既定モデルより優先される。
@@ -466,7 +469,7 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
 | `invalid_decision_model` | decision.py | 許可された固定モデルまたは量子化ではない。 |
 | `speech_cpp_unavailable` | speech_cpp.py | ランタイム・モデルの取得/起動/稼働失敗。再読込、またはfaster-whisperへ切替。 |
 | `speech_cpp_artifact_invalid` | speech_cpp.py | SHA256不一致。既存ファイルを保持してロードを拒否。 |
-| `speech_cpp_language` | speech_cpp.py | 日本語以外の明示locale。アプリの設定保存も日本語／自動以外との組合せを拒否する。 |
+| `speech_cpp_language` | speech_cpp.py | 日本語専用モデル（Haas／Parakeet）での日本語以外の明示locale。アプリの設定保存も日本語／自動以外との組合せを拒否する。Qwen3-ASRでは発生しない。 |
 | `speech_cpp_unsupported_platform` | speech_cpp.py | Windows x64以外。取得前に拒否する。 |
 | `invalid_model` | runtime_adapter.py | アダプターが固定していないモデルID。取得前に拒否する。 |
 | `model_artifact_invalid` | runtime_adapter.py | 固定ファイルの容量・SHA256不一致、または通常ファイルでない。既存ファイルを保持してロードを拒否。 |

@@ -30,9 +30,9 @@ function pinnedModelId(backend: AsrBackend, modelId: string) {
   return models.some((entry) => entry.modelId === modelId) ? modelId : models[0]?.modelId ?? "";
 }
 const pinnedModelDetails: Partial<Record<AsrBackend, MessageKey>> = {
-  "speech-cpp": "Haas: Apache-2.0. Parakeet Japanese: CC-BY-4.0. Both use greedy TDT; CTC is unavailable in this runtime.",
+  "speech-cpp": "Haas: Apache-2.0. Parakeet Japanese: CC-BY-4.0. Both use greedy TDT; CTC is unavailable in this runtime. Qwen3-ASR: Apache-2.0; multilingual, dictionary words are passed to the model as context.",
   "sherpa-onnx": "ReazonSpeech k2 v2: Apache-2.0. Recordings longer than about 25 seconds are split at pauses.",
-  "transformers-asr": "Qwen3-ASR 0.6B: Apache-2.0. Dictionary words are passed to the model as context.",
+  "transformers-asr": "Qwen3-ASR 0.6B / 1.7B: Apache-2.0. Dictionary words are passed to the model as context.",
 };
 
 function builtinValue(backend: AsrBackend) {
@@ -137,22 +137,24 @@ export function ModelsPage({
   }, [settings.asrBackend, settings.customModels, settings.modelId]);
 
   const japaneseLocaleSupported = settings.speechLocale === null || settings.speechLocale === "ja-JP";
+  const pinned = isPinnedBackend(backend);
+  const pinnedId = pinned ? pinnedModelId(backend, additionalModelId) : null;
+  const pinnedEntry = pinned ? availableModels(backend).find((entry) => entry.modelId === pinnedId) : undefined;
+  // The language scope belongs to the model: speech.cpp also serves the multilingual Qwen3-ASR.
+  const japaneseOnlyBlocked = !japaneseLocaleSupported && pinnedEntry?.languageScope === "japanese_only";
   const localizedBackendDetails: Record<AsrBackend, string> = {
     "faster-whisper": t("Fast local transcription on CPU or CUDA."),
     vibevoice: t("Long-form transcription on a CUDA GPU."),
     "openai-compatible": t("OpenAI Audio Transcriptions API or a compatible local server."),
     "speech-cpp": !gpu ? t("Platform support has not been checked. Open GPU and run diagnostics to enable Japanese models.")
       : !gpu.speechCppSupported ? t("Japanese Vulkan models require Windows x64. Select faster-whisper on this system.")
-      : !japaneseLocaleSupported ? t("Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.")
+      : japaneseOnlyBlocked ? t("Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.")
+      : pinnedEntry?.languageScope === "multilingual" ? t("Multilingual, including Japanese. Qwen3-ASR on a Vulkan GPU (not CUDA); Q8_0. Downloads 0.8 GB (0.6B) or 2.2 GB (1.7B) plus the runtime on first load.")
       : t("Japanese only. Vulkan encoder and CPU decoder; Q8_0. Downloads about 690 MB on first load."),
     "sherpa-onnx": !japaneseLocaleSupported ? t("Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.")
       : t("Japanese only. ReazonSpeech k2 on ONNX Runtime with CUDA or CPU. Downloads about 615 MB on first load."),
-    "transformers-asr": t("Multilingual, including Japanese. Qwen3-ASR on a CUDA GPU; CPU only when selected. Downloads about 1.6 GB on first load."),
+    "transformers-asr": t("Multilingual, including Japanese. Qwen3-ASR on a CUDA GPU; CPU only when selected. Downloads 1.6 GB (0.6B) or 4.1 GB (1.7B) on first load."),
   };
-  const pinned = isPinnedBackend(backend);
-  const pinnedId = pinned ? pinnedModelId(backend, additionalModelId) : null;
-  const japaneseOnlyBlocked = pinned && !japaneseLocaleSupported
-    && availableModels(backend).find((entry) => entry.modelId === pinnedId)?.languageScope === "japanese_only";
   const decisionConflict = settings.automaticVoiceMode && decisionConflictsWithAsr(backend, device);
   const selectedValue = additionalModelId && !pinned
     ? customModelValue({ asrBackend: backend, modelId: additionalModelId })

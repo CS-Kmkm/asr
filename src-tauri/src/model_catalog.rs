@@ -29,6 +29,7 @@ pub(crate) struct CatalogModel {
     pub availability: String,
     pub language_scope: Option<String>,
     pub inference: Vec<String>,
+    pub vocabulary: Option<String>,
     pub devices: Vec<String>,
     pub source: Option<CatalogSource>,
     pub weight_format: Option<String>,
@@ -74,6 +75,8 @@ pub(crate) struct ManagedModel<'a> {
     pub revision: &'a str,
     pub file: &'a str,
     pub size_bytes: u64,
+    /// The GGUF weight type the server must report (`Q8_0`).
+    pub weight_format: &'a str,
 }
 
 pub(crate) fn managed_models() -> impl Iterator<Item = ManagedModel<'static>> {
@@ -87,6 +90,7 @@ pub(crate) fn managed_models() -> impl Iterator<Item = ManagedModel<'static>> {
             revision: source.revision.as_deref()?,
             file: source.file.as_deref()?,
             size_bytes: source.size_bytes?,
+            weight_format: model.weight_format.as_deref()?,
         })
     })
 }
@@ -283,11 +287,29 @@ mod tests {
                     model.id
                 );
                 // speech.cpp's GPU path is Vulkan; it must never read as CUDA.
+                // The language scope and dictionary handling are per model
+                // (FastConformer: Japanese only, dictionary after recognition;
+                // Qwen3-ASR: multilingual, dictionary as the prompt).
                 if backend == "speech-cpp" {
                     assert_eq!(model.devices, ["vulkan"]);
-                    assert_eq!(model.language_scope.as_deref(), Some("japanese_only"));
-                    assert_eq!(model.weight_format.as_deref(), Some("Q8_0"));
+                    let expected_vocabulary = match model.language_scope.as_deref() {
+                        Some("japanese_only") => "post_dictionary_only",
+                        Some("multilingual") => "prompt",
+                        other => panic!("{}: unexpected language scope {other:?}", model.id),
+                    };
+                    assert_eq!(
+                        model.vocabulary.as_deref(),
+                        Some(expected_vocabulary),
+                        "{}",
+                        model.id
+                    );
+                    let weights = model.weight_format.as_deref().expect("weight format");
+                    assert_eq!(weights, "Q8_0", "{}", model.id);
                     let source = model.source.as_ref().expect("pinned source");
+                    assert!(source
+                        .file
+                        .as_deref()
+                        .is_some_and(|f| f.ends_with(&format!("-{weights}.gguf"))));
                     assert!(!source.repo.is_empty());
                     assert!(source.revision.as_deref().is_some_and(|r| r.len() == 40));
                     assert!(source.sha256.as_deref().is_some_and(hex64));
@@ -340,6 +362,19 @@ mod tests {
         assert!(pinned_model("sherpa-onnx", "reazonspeech-k2-v2").is_some());
         assert!(pinned_model("sherpa-onnx", "qwen3-asr-0.6b").is_none());
         assert!(pinned_model("transformers-asr", "planned:qwen3-asr-1.7b").is_none());
+        for backend in ["speech-cpp", "transformers-asr"] {
+            for id in ["qwen3-asr-0.6b", "qwen3-asr-1.7b"] {
+                assert_eq!(
+                    pinned_model(backend, id).and_then(|model| model.language_scope.as_deref()),
+                    Some("multilingual"),
+                    "{backend} {id}"
+                );
+            }
+        }
+        assert!(catalog()
+            .models
+            .iter()
+            .all(|model| model.id != "planned:qwen3-asr-1.7b"));
         assert_eq!(
             pinned_model("sherpa-onnx", "reazonspeech-k2-v2")
                 .and_then(|model| model.language_scope.as_deref()),
@@ -355,7 +390,15 @@ mod tests {
     #[test]
     fn speech_cpp_ids_come_from_the_catalog() {
         let ids: Vec<_> = managed_models().map(|model| model.model_id).collect();
-        assert_eq!(ids, ["haas-ja-v1.0", "parakeet-tdt_ctc-0.6b-ja"]);
+        assert_eq!(
+            ids,
+            [
+                "haas-ja-v1.0",
+                "parakeet-tdt_ctc-0.6b-ja",
+                "qwen3-asr-0.6b",
+                "qwen3-asr-1.7b"
+            ]
+        );
         assert!(is_speech_cpp_model("haas-ja-v1.0"));
         assert!(!is_speech_cpp_model("large-v3-turbo"));
         assert!(!is_speech_cpp_model("planned:qwen3-asr-0.6b"));
