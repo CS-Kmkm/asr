@@ -77,6 +77,8 @@ const asrBackendOptions: Array<{ value: AsrBackend; label: MessageKey }> = [
   { value: "vibevoice", label: "VibeVoice (CUDA GPU required)" },
   { value: "openai-compatible", label: "OpenAI-compatible API" },
   { value: "speech-cpp", label: "Japanese models (Vulkan)" },
+  { value: "sherpa-onnx", label: "ONNX Runtime models (CUDA / CPU)" },
+  { value: "transformers-asr", label: "Qwen3-ASR (transformers, CUDA)" },
 ];
 
 type Page =

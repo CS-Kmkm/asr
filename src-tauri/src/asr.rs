@@ -158,6 +158,13 @@ pub struct WorkerHealth {
     pub loaded: bool,
     pub device: Option<String>,
     pub compute_type: Option<String>,
+    /// Physical GPU the loaded model runs on, when the runtime reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+    /// Runtime library and execution provider that actually ran (for
+    /// example ONNX Runtime's CUDA provider), when the backend reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
 }
 
 impl WorkerHealth {
@@ -170,15 +177,22 @@ impl WorkerHealth {
         };
         if !text_ok(&health.python_path, 32_768)
             || !text_ok(&health.python_version, 128)
-            || [&health.faster_whisper_version, &health.ctranslate2_version]
-                .iter()
-                .any(|v| v.as_deref().is_some_and(|v| !text_ok(v, 128)))
+            || [
+                &health.faster_whisper_version,
+                &health.ctranslate2_version,
+                &health.device_name,
+                &health.runtime,
+            ]
+            .iter()
+            .any(|v| v.as_deref().is_some_and(|v| !text_ok(v, 128)))
             || ![
                 "mock",
                 "faster-whisper",
                 "vibevoice",
                 "openai-compatible",
                 "speech-cpp",
+                "sherpa-onnx",
+                "transformers-asr",
                 "unknown",
             ]
             .contains(&health.backend.as_str())
@@ -203,7 +217,11 @@ impl WorkerHealth {
                 ]
                 .contains(&v)
             })
-            || (!health.loaded && (health.device.is_some() || health.compute_type.is_some()))
+            || (!health.loaded
+                && (health.device.is_some()
+                    || health.compute_type.is_some()
+                    || health.device_name.is_some()
+                    || health.runtime.is_some()))
         {
             return Err(AsrError::Protocol("invalid worker health response".into()));
         }
@@ -1499,7 +1517,34 @@ mod tests {
             WorkerHealth::parse(&vulkan).unwrap().device.as_deref(),
             Some("vulkan")
         );
+        let mut onnx = response.clone();
+        onnx["health"]["backend"] = json!("sherpa-onnx");
+        onnx["health"]["device"] = json!("cuda");
+        onnx["health"]["computeType"] = json!("float32");
+        onnx["health"]["deviceName"] = json!("NVIDIA GeForce RTX 3060");
+        onnx["health"]["runtime"] =
+            json!("sherpa-onnx 2.0.1 / ONNX Runtime 1.24.4 CUDAExecutionProvider");
+        let parsed = WorkerHealth::parse(&onnx).unwrap();
+        assert_eq!(
+            parsed.device_name.as_deref(),
+            Some("NVIDIA GeForce RTX 3060")
+        );
+        assert!(parsed.runtime.unwrap().contains("CUDAExecutionProvider"));
+        let mut idle_runtime = response.clone();
+        idle_runtime["health"]["loaded"] = json!(false);
+        idle_runtime["health"]["device"] = json!(null);
+        idle_runtime["health"]["computeType"] = json!(null);
+        idle_runtime["health"]["runtime"] = json!("stale runtime");
+        assert!(WorkerHealth::parse(&idle_runtime).is_err());
         for (field, value) in [
+            (
+                "runtime",
+                json!(
+                    "bad
+runtime"
+                ),
+            ),
+            ("deviceName", json!("x".repeat(129))),
             ("loaded", json!(false)),
             ("device", json!("unexpected")),
             ("backend", json!("C:/private/model")),
@@ -1522,6 +1567,8 @@ mod tests {
             "vibevoice",
             "openai-compatible",
             "speech-cpp",
+            "sherpa-onnx",
+            "transformers-asr",
         ] {
             let mut spec = WorkerCommand::python("python").with_backend(backend);
             for name in ["OPENAI_API_KEY", "GEMINI_API_KEY", "ASR_API_KEY"] {
@@ -2776,7 +2823,7 @@ sys.stdin.read()
                 let provision = crate::worker_setup::Provision {
                     source,
                     environment: directory.path().join("runtime"),
-                    vibevoice: false,
+                    extra: None,
                     uv: python.clone().into(),
                 };
                 // What uv would have created: the environment's interpreter

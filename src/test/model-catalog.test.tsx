@@ -1,9 +1,9 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { I18nProvider } from "../i18n";
 import { ModelsPage } from "../pages/ModelsPage";
 import { catalogEntryFor, modelCatalog } from "../modelCatalog";
-import type { GpuDiagnostics, ManagedModelCache, Settings } from "../types";
+import type { GpuDiagnostics, ManagedModelCache, ModelStatus, Settings } from "../types";
 import * as api from "../api";
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
@@ -15,13 +15,19 @@ vi.mock("../api", async (importOriginal) => ({
 }));
 
 const gpu: GpuDiagnostics = { status: "unavailable", adapterName: null, driverVersion: null, memoryTotalMb: null, recommendation: "", speechCppSupported: true };
-const options = [{ value: "faster-whisper", label: "Whisper model" }, { value: "speech-cpp", label: "Japanese models (Vulkan)" }] as const;
+const options = [{ value: "faster-whisper", label: "Whisper model" }, { value: "speech-cpp", label: "Japanese models (Vulkan)" },
+  { value: "sherpa-onnx", label: "ONNX Runtime models (CUDA / CPU)" }, { value: "transformers-asr", label: "Qwen3-ASR (transformers, CUDA)" }] as const;
 const haasPresent: ManagedModelCache = { modelId: "haas-ja-v1.0", state: "present", sizeBytes: 656381472, expectedBytes: 656381472 };
 const parakeetMissing: ManagedModelCache = { modelId: "parakeet-tdt_ctc-0.6b-ja", state: "missing", sizeBytes: null, expectedBytes: 661012416 };
 
-function renderPage(settings: Partial<Settings>, language: "en" | "ja" = "en") {
+function renderPage(settings: Partial<Settings>, language: "en" | "ja" = "en", extra: { onConfigureModel?: (configuration: unknown) => void; model?: ModelStatus } = {}) {
   return render(<I18nProvider language={language}><ModelsPage settings={{ ...api.defaultSettings, ...settings }} gpu={gpu} asrBackendOptions={[...options]}
-    modelLoading={false} onConfigureModel={vi.fn()} onSaveCustomModel={async () => true} onDiagnoseGpu={vi.fn()} /></I18nProvider>);
+    modelLoading={false} onConfigureModel={extra.onConfigureModel ?? vi.fn()} onSaveCustomModel={async () => true} onDiagnoseGpu={vi.fn()} model={extra.model} /></I18nProvider>);
+}
+
+function cleanupAndRender(settings: Partial<Settings>) {
+  cleanup();
+  return renderPage(settings);
 }
 
 function details() {
@@ -48,7 +54,7 @@ test("catalog entries resolve from the configured backend and model ID", () => {
 
 test("planned catalog entries claim no unverified capability", () => {
   const planned = modelCatalog.models.filter((model) => model.availability === "planned");
-  expect(planned.map((model) => model.displayName)).toEqual(expect.arrayContaining(["Qwen3-ASR 0.6B", "Qwen3-ASR 1.7B"]));
+  expect(planned.map((model) => model.displayName)).toEqual(expect.arrayContaining(["Qwen3-ASR 1.7B", "Nemotron ASR Streaming (candidate)"]));
   for (const model of planned) {
     expect(model.backend).toBeNull();
     expect(model.inference).toEqual([]);
@@ -124,4 +130,57 @@ test("the catalog overview labels planned models as unavailable", () => {
   expect(within(item).getByText(/#89/)).toBeTruthy();
   const nemotron = screen.getByText("Nemotron ASR Streaming (candidate)").closest("li")!;
   expect(within(nemotron).getByText(/Speech languages: Not confirmed/)).toBeTruthy();
+});
+
+test("pinned runtime adapters resolve only their catalog models", () => {
+  expect(catalogEntryFor("sherpa-onnx", "reazonspeech-k2-v2")?.entry).toMatchObject({ languageScope: "japanese_only", devices: ["cuda", "cpu"], license: "Apache-2.0" });
+  expect(catalogEntryFor("transformers-asr", "qwen3-asr-0.6b")?.entry).toMatchObject({ languageScope: "multilingual", vocabulary: "prompt", cancellation: "between_tokens" });
+  expect(catalogEntryFor("sherpa-onnx", "large-v3-turbo")).toBeNull();
+  expect(catalogEntryFor("transformers-asr", "Qwen/Qwen3-ASR-1.7B")).toBeNull();
+});
+
+test("the ONNX Runtime adapter offers its pinned model, a speech device and Japanese-only details", () => {
+  const onConfigureModel = vi.fn();
+  renderPage({ asrBackend: "sherpa-onnx", modelId: null }, "en", { onConfigureModel });
+  expect((screen.getByRole("combobox", { name: "Model" }) as HTMLSelectElement).value).toBe("reazonspeech-k2-v2");
+  expect(screen.getByRole("combobox", { name: "Speech device" })).toBeTruthy();
+  const facts = details();
+  expect(facts.getByText("Japanese only")).toBeTruthy();
+  expect(facts.getByText(/CUDA \(NVIDIA\) \/ CPU/)).toBeTruthy();
+  expect(facts.getByText("reazon-research/reazonspeech-k2-v2")).toBeTruthy();
+  expect(facts.getByText(/2,828 MiB/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Load Model" }));
+  expect(onConfigureModel).toHaveBeenCalledWith(expect.objectContaining({ asrBackend: "sherpa-onnx", modelId: "reazonspeech-k2-v2" }));
+  expect(api.getAsrModelCacheStatus).not.toHaveBeenCalled();
+});
+
+test("a Japanese-only adapter cannot be loaded with another speech language", () => {
+  renderPage({ asrBackend: "sherpa-onnx", speechLocale: "en-US" });
+  expect((screen.getByRole("button", { name: "Load Model" }) as HTMLButtonElement).disabled).toBe(true);
+  cleanupAndRender({ asrBackend: "transformers-asr", speechLocale: "en-US" });
+  expect((screen.getByRole("button", { name: "Load Model" }) as HTMLButtonElement).disabled).toBe(false);
+  expect(details().getByText("Multilingual (including Japanese)")).toBeTruthy();
+});
+
+test("loaded runtime shows the provider and GPU the worker actually used", async () => {
+  vi.mocked(api.getWorkerHealth).mockResolvedValueOnce({
+    pythonPath: "python", pythonVersion: "3.12", fasterWhisperVersion: null, ctranslate2Version: null,
+    backend: "sherpa-onnx", loaded: true, device: "cuda", computeType: "float32", deviceName: "NVIDIA GeForce RTX 3060",
+    runtime: "sherpa-onnx 2.0.1 / ONNX Runtime 1.24.4 CUDAExecutionProvider",
+  });
+  const model: ModelStatus = { modelId: "sherpa-onnx:reazonspeech-k2-v2", quantization: "4bit", installed: true, state: "ready", detail: "" };
+  renderPage({ asrBackend: "sherpa-onnx" }, "en", { model });
+  expect(await details().findByText(/CUDA · NVIDIA GeForce RTX 3060 · float32 · .*CUDAExecutionProvider/)).toBeTruthy();
+});
+
+test("automatic voice mode blocks loading ASR runtimes that cannot share its worker", () => {
+  renderPage({ asrBackend: "sherpa-onnx", asrDevice: "auto", automaticVoiceMode: true }, "ja");
+  expect((screen.getByRole("button", { name: "モデルを読み込む" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(screen.getByRole("alert").textContent).toContain("音声モードの自動判定は、このASR実行環境と同じワーカーでは使えません");
+  cleanup();
+  renderPage({ asrBackend: "sherpa-onnx", asrDevice: "cpu", automaticVoiceMode: true });
+  expect((screen.getByRole("button", { name: "Load Model" }) as HTMLButtonElement).disabled).toBe(false);
+  cleanup();
+  renderPage({ asrBackend: "transformers-asr", asrDevice: "cpu", automaticVoiceMode: true });
+  expect((screen.getByRole("button", { name: "Load Model" }) as HTMLButtonElement).disabled).toBe(true);
 });

@@ -41,7 +41,7 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
 
 - Rust側がワーカーを **spawn** する。起動コマンドは既定で `python -m asr_worker` であり、
   `--backend` 引数または環境変数 `ASR_WORKER_BACKEND` でバックエンド
-  (`vibevoice` / `faster-whisper` / `openai-compatible` / `speech-cpp` / `mock`、既定 `faster-whisper`)を選択する。
+  (`vibevoice` / `faster-whisper` / `openai-compatible` / `speech-cpp` / `sherpa-onnx` / `transformers-asr` / `mock`、既定 `faster-whisper`)を選択する。
 - ワーカーはstdinがEOFに達するか `shutdown` を受信するまでメッセージを処理し続ける。
 - ワーカープロセスは **ステートフル**である。`load` 後に内部状態 `loaded = True` を保持し、
   `transcribe` はロード済みを前提とする。
@@ -70,6 +70,23 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
 追加の `deviceName` フィールドで返します。未知の追加フィールドは既存クライアントで無視できます。
 日本語以外の明示localeはエラーになり、別backendへ自動送信しません。
 現在の自由文promptは渡さず、アプリの認識後辞書置換は維持します。
+
+`sherpa-onnx` と `transformers-asr` はランタイム・アダプター（`asr_worker/runtime_adapter.py`）です。
+`ASR_MODEL_ID` はアダプターが固定したモデルだけを受け付け（`sherpa-onnx`: `reazonspeech-k2-v2`、
+`transformers-asr`: `qwen3-asr-0.6b`。それ以外は `invalid_model`）、初回 `load` 時に固定revision・
+容量・SHA256のファイルをHugging Faceから取得して
+`ASR_MANAGED_MODEL_HOME`（未指定時 `%LOCALAPPDATA%/LocalVoice/models`）`/<backend>/<model>/<revision>/` に保存します。
+読み込みのたびに全ファイルを再検証し、不一致は既存ファイルを残して `model_artifact_invalid` で拒否します。
+`ASR_DEVICE`（`auto` / `cpu` / `cuda`）でデバイスを選びます。`sherpa-onnx` の `auto` はCUDA実行プロバイダーが
+実際に動いたと確認できなければCPUで読み込み直して `cpu_fallback` を通知し、`cuda` はエラー（`cuda_unavailable`）にします。
+`transformers-asr` の `auto` / `cuda` はCUDA必須（なければ `gpu_unsupported`）で、CPUは `cpu` 指定時だけです。
+`quantization` は互換のため受理しますが使いません（ONNX float32、CUDA時bfloat16 / CPU時float32）。
+`health` は読み込み中のモデルについて、実際に動いたdevice・computeTypeに加え、
+CUDA時のGPU名を `deviceName`、ランタイムと実行プロバイダー（例
+`sherpa-onnx 2.0.1+cuda12.cudnn9 / ONNX Runtime 1.24.4 CUDAExecutionProvider`）を追加の `runtime` フィールドで返します。
+ReazonSpeech k2は日本語専用で、日本語以外の明示localeは `language_unsupported` になります。約25秒を超える音声は
+無音に近い位置で分割して認識し、キャンセルは分割の間で反映します。Qwen3-ASRは多言語で、promptを文脈として渡し、
+キャンセルはトークン生成の間で反映します。入力はPCM WAVのみです（それ以外は `audio_unsupported`）。
 
 この経路のエラーコードも§3の共通一覧に含めます。
 
@@ -129,6 +146,7 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
 - mock: `"microsoft/VibeVoice-ASR-HF:mock"`
 - openai-compatible: `openai-compatible:<ASR_MODEL_ID>`（既定は `gpt-4o-mini-transcribe`）。
 - speech-cpp: `speech.cpp:<ASR_MODEL_ID>:Q8_0`（既定は `haas-ja-v1.0`）。量子化引数とは別にQ8_0固定。
+- sherpa-onnx / transformers-asr: `<backend>:<ASR_MODEL_ID>`（既定は `reazonspeech-k2-v2` / `qwen3-asr-0.6b`）。
 
 ローカルバックエンドでも `ASR_MODEL_ID` が既定モデルより優先される。
 faster-whisper は `ASR_MODEL_ID`、`ASR_FASTER_WHISPER_MODEL`、
@@ -196,6 +214,8 @@ v1 と完全に同一の「1リクエスト1レスポンス」で応答する。
 - openai-compatible / mock: ダウンロードを伴わないため通知しない。
 - speech-cpp: 未取得のランタイムzipとGGUF重みを順に取得し、各配布物ごとにバイト進捗を通知する。
   次の配布物へ移る際にカウンターはリセットする。取得済みなら検証後に `load` を通知する。
+- sherpa-onnx / transformers-asr: 未取得ファイルの合計を `total_bytes` とし、ファイルをまたいで累積した
+  `completed_bytes` を通知する。検証後に `load`、ダミー音声での初期推論前に `warmup` を通知する。
 
 ---
 
@@ -448,6 +468,12 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
 | `speech_cpp_artifact_invalid` | speech_cpp.py | SHA256不一致。既存ファイルを保持してロードを拒否。 |
 | `speech_cpp_language` | speech_cpp.py | 日本語以外の明示locale。アプリの設定保存も日本語／自動以外との組合せを拒否する。 |
 | `speech_cpp_unsupported_platform` | speech_cpp.py | Windows x64以外。取得前に拒否する。 |
+| `invalid_model` | runtime_adapter.py | アダプターが固定していないモデルID。取得前に拒否する。 |
+| `model_artifact_invalid` | runtime_adapter.py | 固定ファイルの容量・SHA256不一致、または通常ファイルでない。既存ファイルを保持してロードを拒否。 |
+| `cuda_unavailable` | sherpa_onnx_runtime.py | `ASR_DEVICE=cuda` でCUDA実行プロバイダーの動作を確認できなかった。CPUへは切り替えない。 |
+| `language_unsupported` | runtime_adapter.py | 日本語専用モデルに日本語以外の明示locale。音声を読む前に拒否する。 |
+| `audio_unsupported` | runtime_adapter.py | PCM WAV以外の音声。 |
+| `decision_runtime_conflict` | worker.py / sherpa_onnx_runtime.py | torch（判断モデル）とsherpa-onnxのCUDA 12 / cuDNN 9ライブラリは同じプロセスに共存できない（DLL衝突）。sherpa-onnxがCUDAライブラリを読み込んだ後の `load_decision`、およびtorchが読み込み済みのワーカーでの `ASR_DEVICE` が `auto` / `cuda` のsherpa-onnx `load` を拒否する（`cpu` なら読み込める）。アプリの設定保存もこの組合せを拒否する。 |
 | `decision_dependencies_missing` | decision.py | 判断モデルの追加依存がない。`uv sync --extra decision` で準備する。 |
 | `decision_cuda_required` | decision.py | 判断モデルに必要な CUDA がない。CPU の自動判定は対象外。 |
 | `decision_release_invalid` | decision.py | 固定リビジョンの実装を読み込めない。 |

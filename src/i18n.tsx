@@ -23,6 +23,14 @@ const backendTemplates = Object.entries(backendCatalogue).filter(([, entry]) => 
 });
 
 const en = {
+  "ONNX Runtime models (CUDA / CPU)": "ONNX Runtime models (CUDA / CPU)",
+  "Qwen3-ASR (transformers, CUDA)": "Qwen3-ASR (transformers, CUDA)",
+  "Model": "Model",
+  "Japanese only. ReazonSpeech k2 on ONNX Runtime with CUDA or CPU. Downloads about 615 MB on first load.": "Japanese only. ReazonSpeech k2 on ONNX Runtime with CUDA or CPU. Downloads about 615 MB on first load.",
+  "Multilingual, including Japanese. Qwen3-ASR on a CUDA GPU; CPU only when selected. Downloads about 1.6 GB on first load.": "Multilingual, including Japanese. Qwen3-ASR on a CUDA GPU; CPU only when selected. Downloads about 1.6 GB on first load.",
+  "ReazonSpeech k2 v2: Apache-2.0. Recordings longer than about 25 seconds are split at pauses.": "ReazonSpeech k2 v2: Apache-2.0. Recordings longer than about 25 seconds are split at pauses.",
+  "Qwen3-ASR 0.6B: Apache-2.0. Dictionary words are passed to the model as context.": "Qwen3-ASR 0.6B: Apache-2.0. Dictionary words are passed to the model as context.",
+  "Auto and CUDA require a CUDA GPU and never fall back silently. CPU works but is much slower. The environment option preserves ASR_DEVICE.": "Auto and CUDA require a CUDA GPU and never fall back silently. CPU works but is much slower. The environment option preserves ASR_DEVICE.",
   "Platform support has not been checked. Open GPU and run diagnostics to enable Japanese models.": "Platform support has not been checked. Open GPU and run diagnostics to enable Japanese models.",
   "Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.": "Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.",
   "Japanese Vulkan models require Windows x64. Select faster-whisper on this system.": "Japanese Vulkan models require Windows x64. Select faster-whisper on this system.",
@@ -487,6 +495,14 @@ const en = {
 } as const;
 export type MessageKey = keyof typeof en | keyof typeof backendMessages;
 const ja: Record<keyof typeof en, string> = {
+  "ONNX Runtime models (CUDA / CPU)": "ONNX Runtime モデル（CUDA / CPU）",
+  "Qwen3-ASR (transformers, CUDA)": "Qwen3-ASR（transformers・CUDA）",
+  "Model": "モデル",
+  "Japanese only. ReazonSpeech k2 on ONNX Runtime with CUDA or CPU. Downloads about 615 MB on first load.": "日本語専用。ReazonSpeech k2をONNX RuntimeのCUDAまたはCPUで動かします。初回読み込み時に約615 MBを取得します。",
+  "Multilingual, including Japanese. Qwen3-ASR on a CUDA GPU; CPU only when selected. Downloads about 1.6 GB on first load.": "日本語を含む多言語に対応。Qwen3-ASRをCUDA GPUで動かします（CPUは選択した場合のみ）。初回読み込み時に約1.6 GBを取得します。",
+  "ReazonSpeech k2 v2: Apache-2.0. Recordings longer than about 25 seconds are split at pauses.": "ReazonSpeech k2 v2：Apache-2.0。約25秒を超える録音は無音部分で分割して認識します。",
+  "Qwen3-ASR 0.6B: Apache-2.0. Dictionary words are passed to the model as context.": "Qwen3-ASR 0.6B：Apache-2.0。辞書の語句を文脈としてモデルに渡します。",
+  "Auto and CUDA require a CUDA GPU and never fall back silently. CPU works but is much slower. The environment option preserves ASR_DEVICE.": "自動選択とCUDAではCUDA GPUが必要で、暗黙にCPUへ切り替えることはありません。CPUでも動作しますが大幅に遅くなります。環境設定を選ぶとASR_DEVICEを引き継ぎます。",
   "Platform support has not been checked. Open GPU and run diagnostics to enable Japanese models.": "対応環境をまだ確認していません。下のGPUを開いて診断を実行すると、日本語モデルの対応状況を確認できます。",
   "Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.": "日本語モデルには認識言語の日本語または自動設定が必要です。設定で日本語を選ぶか、faster-whisperに切り替えてください。",
   "Japanese Vulkan models require Windows x64. Select faster-whisper on this system.": "日本語VulkanモデルにはWindows x64が必要です。この環境ではfaster-whisperを選択してください。",

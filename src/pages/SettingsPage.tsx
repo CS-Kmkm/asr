@@ -11,6 +11,7 @@ import type { AudioDevice, AudioLevel, ScopedStyleProfile, Settings, ShortcutMod
 import { speechLocaleRegistry, translationLanguageRegistry, uiLocaleRegistry } from "../types";
 import { getShortcutWarning, startMicrophoneTest, stopMicrophoneTest } from "../api";
 import { translateAppMessage, useI18n } from "../i18n";
+import { decisionConflictsWithAsr } from "../modelCatalog";
 
 const translationLanguages = translationLanguageRegistry.map(({ code, label }) => [code, label] as const);
 
@@ -327,7 +328,8 @@ export function SettingsPage({
           detail={t("Voice mode detection runs locally. Model files download on first load and stay cached. Editing, translation and answers still use the configured AI provider.")}
           detailMode="inline"
           help={t("The Dictation shortcut chooses Dictate, Translate, Edit or Ask from your speech. Select text before asking to edit or translate it. Insertion waits until the decision is complete. Other mode shortcuts stay fixed.")}
-          control={<Toggle label={t("Automatic voice mode")} checked={settings.automaticVoiceMode} disabled={recording} onChange={(value) => onSave({ automaticVoiceMode: value })} />} />
+          control={<Toggle label={t("Automatic voice mode")} checked={settings.automaticVoiceMode} disabled={recording || (!settings.automaticVoiceMode && decisionConflictsWithAsr(settings.asrBackend, settings.asrDevice))} onChange={(value) => onSave({ automaticVoiceMode: value })} />} />
+        {!settings.automaticVoiceMode && decisionConflictsWithAsr(settings.asrBackend, settings.asrDevice) && <p className="settings-note">{translateAppMessage(language, "Automatic voice mode cannot share the speech worker with this ASR runtime. Choose CPU as the speech device for ONNX Runtime models, select another ASR backend, or turn off automatic voice mode.")}</p>}
         {settings.automaticVoiceMode && <>
           <p className="settings-note">{t("Enable automatic voice mode, then use Load model on the Models page to prepare the local decision model. Recording never downloads or loads decision weights. Install the decision extra for a source checkout. Unavailable or uncertain decisions keep selected text unchanged.")}</p>
           <SettingRow title={t("Decision model")} control={<select aria-label={t("Decision model")} disabled={recording} value={settings.decisionModel} onChange={(event) => onSave({ decisionModel: event.target.value })}>
