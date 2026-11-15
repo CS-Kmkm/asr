@@ -228,7 +228,12 @@
         "sizeBytes": 841502336
       },
       "weightFormat": "Q8_0",
-      "memory": null,
+      "memory": {
+        "kind": "observed_device_peak_mib",
+        "value": 3035,
+        "gpu": "RTX 3060 12 GB",
+        "runtime": "Vulkan Q8_0"
+      },
       "issue": null
     },
     {
@@ -260,7 +265,12 @@
         "sizeBytes": 2176109216
       },
       "weightFormat": "Q8_0",
-      "memory": null,
+      "memory": {
+        "kind": "observed_device_peak_mib",
+        "value": 4662,
+        "gpu": "RTX 3060 12 GB",
+        "runtime": "Vulkan Q8_0"
+      },
       "issue": null
     },
     {
