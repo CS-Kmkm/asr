@@ -809,6 +809,13 @@ pub(super) fn probe_selection<B: Backend>(backend: &B) -> SelectionProbe {
     if backend.ime_composition_active(&target) == Ok(Some(true)) {
         return SelectionProbe::Unknown(UnknownSelection::ImeComposing);
     }
+    // Anchor the field before the separate UIA reads. Focus can move within
+    // the same window without a keystroke, so input monitoring alone cannot
+    // establish that all reads describe the press-time field.
+    let identity_at_start = match backend.focus_identity(&target) {
+        Ok(identity) => identity,
+        Err(_) => return SelectionProbe::Unknown(UnknownSelection::Unreadable),
+    };
     // Empty selected text is not an empty selection: a selected embedded
     // object returns no characters. Only collapsed endpoints count as empty.
     // The field must also be identifiable: without its identity, another
@@ -818,19 +825,30 @@ pub(super) fn probe_selection<B: Backend>(backend: &B) -> SelectionProbe {
         backend.selection_is_empty(&target),
         backend.focus_identity(&target),
     ) {
-        (Ok(true), Ok(focus_identity)) => SelectionProbe::Empty {
-            focus_identity,
-            target,
-        },
+        (Ok(true), Ok(focus_identity)) if focus_identity == identity_at_start => {
+            SelectionProbe::Empty {
+                focus_identity,
+                target,
+            }
+        }
         _ => SelectionProbe::Unknown(UnknownSelection::Unreadable),
     };
     match backend.target_text(&target) {
+        Ok(state) if state.identity != identity_at_start => {
+            SelectionProbe::Unknown(UnknownSelection::Unreadable)
+        }
         Ok(state) if state.selected.is_empty() => empty(target),
-        Ok(state) => SelectionProbe::Selected(SelectedText {
-            target,
-            text: state.selected.clone(),
-            state,
-        }),
+        Ok(state)
+            if state.identity == identity_at_start
+                && backend.focus_identity(&target).as_ref() == Ok(&identity_at_start) =>
+        {
+            SelectionProbe::Selected(SelectedText {
+                target,
+                text: state.selected.clone(),
+                state,
+            })
+        }
+        Ok(_) => SelectionProbe::Unknown(UnknownSelection::Unreadable),
         Err(InjectionError::SecureTarget | InjectionError::PrivilegeMismatch) => {
             SelectionProbe::Unknown(UnknownSelection::Protected)
         }
@@ -1705,7 +1723,7 @@ pub(super) mod tests {
         /// UI Automation cannot identify the focused element.
         identity_fails: Cell<bool>,
         /// Runs on every full text read, as input arriving while it is read.
-        on_read: RefCell<Option<Box<dyn Fn() + Send>>>,
+        on_read: RefCell<Option<MockHook>>,
     }
 
     impl MockBackend {
@@ -1788,6 +1806,9 @@ pub(super) mod tests {
             self.target_valid.set(valid);
         }
         pub(crate) fn set_on_read(&self, on_read: impl Fn() + Send + 'static) {
+            *self.on_read.borrow_mut() = Some(Box::new(move |_| on_read()));
+        }
+        pub(crate) fn set_on_read_action(&self, on_read: impl Fn(&MockBackend) + Send + 'static) {
             *self.on_read.borrow_mut() = Some(Box::new(on_read));
         }
         pub(crate) fn set_identity_fails(&self, fails: bool) {
@@ -1858,7 +1879,7 @@ pub(super) mod tests {
         fn target_text(&self, _: &TargetWindow) -> Result<TargetText, InjectionError> {
             self.text_reads.set(self.text_reads.get() + 1);
             if let Some(on_read) = self.on_read.borrow().as_ref() {
-                on_read();
+                on_read(self);
             }
             if self.text_readable.get() {
                 Ok(self.text.borrow().clone())

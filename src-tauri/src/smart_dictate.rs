@@ -137,6 +137,19 @@ mod tests {
     }
 
     #[test]
+    fn focus_moving_during_the_probe_without_input_never_routes_to_a_paste() {
+        for selected in ["", "original"] {
+            assert_eq!(
+                route_of(|backend| {
+                    backend.set_selected_text(selected);
+                    backend.set_on_read_action(|backend| backend.set_identity(vec![2]));
+                }),
+                SmartRoute::CopyOnly(UnknownSelection::Unreadable),
+            );
+        }
+    }
+
+    #[test]
     fn routing_table_covers_selected_empty_and_every_unknown_state() {
         use UnknownSelection::*;
         type Setup = Box<dyn Fn(&MockBackend)>;

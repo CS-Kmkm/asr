@@ -5,7 +5,7 @@
 
 | 分類 | 契約 | 扱い |
 |---|---|---|
-| active | [スマート入力/編集 — #84](issue-84-smart-dictate-edit.md) | Dictationキーで選択あり→編集・なし→入力・不明→コピーのみ（opt-in、推論なし）。take_spansの計測と集計スクリプトを実装。自動テスト・独立監査実施、最終差分の監査とWindows実機確認は継続中 |
+| active | [スマート入力/編集 — #84](issue-84-smart-dictate-edit.md) | Dictationキーで選択あり→編集・なし→入力・不明→コピーのみ（opt-in、推論なし）。take_spansの計測と集計スクリプトを実装。最終差分の独立監査・統合回帰完了。Windows実機確認は継続中 |
 | active | [文章品質・意味保存・修正からの学習 — #85](issue-85-text-quality.md) | 補正専用オフライン評価セット・採点・ガード強化・opt-in学習を実装。自動チェック・独立監査完了。実プロバイダー評価・人手ブラインド評価・Windows実機UI確認は未実施 |
 | active | [Qwen3-ASR 0.6B/1.7B — #89](issue-89-qwen3-asr.md) | speech.cpp（Vulkan、Q8_0）で0.6B/1.7B、transformers（CUDA）で1.7Bを追加。RTX 3060で日本語holdout・長尺を比較し、手動プリセットの推奨条件を記録。transformers 1.7Bの実機計測・日英混在音声・アプリ実機確認は未実施 |
 | active | [ランタイム・アダプター — #87 第2段階](issue-87-runtime-adapters.md) | sherpa-onnx（CPU/CUDA、ReazonSpeech k2）とtransformers（CUDA、Qwen3-ASR 0.6B）をWindowsネイティブで追加。自動テスト・RTX 3060実機smoke完了。Windows実機でのUI・録音確認は未実施 |
