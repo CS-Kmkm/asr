@@ -55,6 +55,24 @@ uv run scripts/score_asr.py --bench bench_data/batch-new.json --manifest bench_d
 `runtime`はfaster-whisperで `ctranslate2`、他のラッパーでは `--runtime nemo` / `--runtime speech.cpp`などで明示します。
 runtimeラベルは申告値であり、実deviceの代わりではありません。CUDAとVulkanをまとめません。
 batch時間の表は `bench_asr.py` のMarkdown出力、採点表は `score_asr.py` で生成できます。
+
+LLMにスコアを渡す際は、詳細JSON全体の代わりに次の集計要約を使えます。
+
+```powershell
+uv run scripts/summarize_bench.py bench_data/score-new.json --output bench_data/score-context-new.json
+```
+
+`score_asr.py`の採点JSON、`bench_asr.py`の時間JSON、`asr-japanese-comparison/1`のモデル比較JSONに対応します。
+発話別の行・サンプル本文・音声パス・worker起動コマンドを省き、集計値、評価条件、ドメイン別結果、警告、欠測を残します。
+欠落・参照不一致・反復結果の不一致は件数で残し、対象のID一覧は詳細JSONで確認します。
+未対応のモデル比較フィールドがある場合は、条件や本文を誤って取り込まないようエラーで停止します。
+モデル比較は列名を共有する配列形式で、CERは百分率の小数第3位まで、時間は元の値です。
+要約は元ファイル名とSHA256を含む派生表示で、再採点やbaseline入力には詳細JSONを使ってください。
+入力と既存の出力は上書きしません。
+
+Qwen比較の要約は[issue-89-qwen3-context-v1.json](results/issue-89-qwen3-context-v1.json)です。
+詳細な時間分布、モデル別ハッシュ、誤り数は[元の結果](results/issue-89-qwen3-holdout-v1.json)を参照してください。
+
 `--baseline`は以前の採点JSONとの差と条件差を表示します。warm反復を増やしても独立な音声件数は増えません。
 少数件のp95からモデルの優劣を断定しないでください。補正LLMを通さないRaw ASRが対象です。
 補正後を評価する場合は、同じmanifestに対する別結果として採点し、Rawと分けて表示します。
