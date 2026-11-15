@@ -59,6 +59,8 @@ pub(crate) struct Services {
     pub(crate) initialization: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     pub(crate) shutdown_started: AtomicBool,
     pub(crate) voice_translation_target: Mutex<Option<String>>,
+    /// The Smart Dictate/Edit route of the running take; `None` otherwise.
+    pub(crate) smart_route: Mutex<Option<crate::smart_dictate::SmartRoute>>,
     pub(crate) shortcut_routes: Mutex<shortcuts::Routes>,
     pub(crate) shortcut_capture: Mutex<shortcuts::CaptureLease>,
     pub(crate) shortcut_hold: Mutex<shortcuts::HoldLease>,
@@ -101,6 +103,7 @@ impl Services {
             initialization: Mutex::new(None),
             shutdown_started: AtomicBool::new(false),
             voice_translation_target: Mutex::new(None),
+            smart_route: Mutex::new(None),
             shortcut_routes: Mutex::new(
                 shortcuts::Routes::parse_saved(settings).expect("validated settings"),
             ),

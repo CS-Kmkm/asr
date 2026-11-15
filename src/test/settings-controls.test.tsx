@@ -27,6 +27,22 @@ test("automatic routing requires opt-in and its controls cannot change during re
   expect((screen.getByRole("combobox", { name: "Decision model quantization" }) as HTMLSelectElement).disabled).toBe(true);
 });
 
+test("Smart Dictate/Edit is opt-in, fixed while recording and yields to automatic voice mode", () => {
+  const save = vi.fn();
+  const view = (settings: typeof defaultSettings, recording = false) => <I18nProvider language="en"><SettingsPage section="input" settings={settings} onSave={save} devices={[]} recording={recording} /></I18nProvider>;
+  const app = render(view(defaultSettings));
+  const toggle = screen.getByRole("switch", { name: "Smart Dictate/Edit" });
+  expect(toggle.getAttribute("aria-checked")).toBe("false");
+  fireEvent.click(toggle);
+  expect(save).toHaveBeenCalledWith({ smartDictateEdit: true });
+  app.rerender(view({ ...defaultSettings, smartDictateEdit: true }, true));
+  expect((screen.getByRole("switch", { name: "Smart Dictate/Edit" }) as HTMLButtonElement).disabled).toBe(true);
+  app.rerender(view({ ...defaultSettings, smartDictateEdit: true, automaticVoiceMode: true }));
+  expect((screen.getByRole("switch", { name: "Smart Dictate/Edit" }) as HTMLButtonElement).disabled).toBe(true);
+  app.rerender(<I18nProvider language="ja"><SettingsPage section="input" settings={defaultSettings} onSave={save} devices={[]} recording={false} /></I18nProvider>);
+  expect(screen.getByRole("switch", { name: "スマート入力/編集" })).toBeTruthy();
+});
+
 test("incremental final transcription is an opt-in for local speech backends only", () => {
   const save = vi.fn();
   const name = "Incremental final transcription (experimental)";

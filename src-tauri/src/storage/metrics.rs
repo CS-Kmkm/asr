@@ -97,6 +97,9 @@ pub(crate) enum TakeSpan {
     /// The Dictate/Translate deferred completion job (History, dictionary
     /// candidate, metrics and temporary-audio cleanup).
     CompletionJob,
+    /// Stop request to the final transcript being ready (before routing,
+    /// AI and delivery).
+    StopToFinal,
     /// Stop request to the output commit returning.
     StopToDelivery,
     /// Stop request to the lifecycle accepting a new take.
@@ -104,7 +107,7 @@ pub(crate) enum TakeSpan {
 }
 
 impl TakeSpan {
-    pub(crate) const ALL: [Self; 17] = [
+    pub(crate) const ALL: [Self; 18] = [
         Self::RecordReady,
         Self::ModelEnsure,
         Self::AudioStop,
@@ -120,6 +123,7 @@ impl TakeSpan {
         Self::HelperExit,
         Self::HistorySave,
         Self::CompletionJob,
+        Self::StopToFinal,
         Self::StopToDelivery,
         Self::StopToNextTake,
     ];
@@ -141,6 +145,7 @@ impl TakeSpan {
             Self::HelperExit => "helper_exit",
             Self::HistorySave => "history_save",
             Self::CompletionJob => "completion_job",
+            Self::StopToFinal => "stop_to_final",
             Self::StopToDelivery => "stop_to_delivery",
             Self::StopToNextTake => "stop_to_next_take",
         }
@@ -255,7 +260,19 @@ pub(crate) struct TakeSpanRecord {
     pub mode: crate::state::PipelineMode,
     pub outcome: TakeOutcome,
     pub spans: [Option<i64>; TakeSpan::ALL.len()],
+    /// The Smart Dictate/Edit route code, for a take the Smart key routed.
+    pub route: Option<&'static str>,
+    /// Voice-mode shortcut presses attributed to the take until its stop
+    /// claimed it (start press, toggle stop, Esc); `None` when not counted.
+    pub key_presses: Option<i64>,
 }
+
+/// Smart Dictate/Edit route codes that diagnostics export.
+pub(crate) const TAKE_ROUTE_CODES: [&str; 3] = ["edit", "dictate", "copy_only"];
+
+/// The pseudo-span of a take cohort that summarizes `key_presses`, a count
+/// rather than milliseconds.
+pub(crate) const KEY_PRESSES_SUMMARY: &str = "key_presses";
 
 /// Spans of one take cohort. `missing_count` counts takes of the cohort
 /// without this span (or with an invalid one), so it is never read as zero.
@@ -275,6 +292,8 @@ pub struct TakeSpanSummary {
 #[serde(rename_all = "camelCase")]
 pub struct TakeCohortSummary {
     pub mode: Option<String>,
+    /// Smart Dictate/Edit route; `None` for takes the Smart key did not route.
+    pub route: Option<String>,
     pub outcome: String,
     pub stage: Option<String>,
     pub count: i64,
@@ -458,7 +477,7 @@ impl Storage {
             .iter()
             .map(|span| format!(", {}_ms", span.code()))
             .collect();
-        let placeholders: String = (0..TakeSpan::ALL.len())
+        let placeholders: String = (0..TakeSpan::ALL.len() + 2)
             .map(|index| format!(", ?{}", index + 7))
             .collect();
         let mode = MetricContext {
@@ -480,10 +499,12 @@ impl Storage {
                 .into(),
         ];
         values.extend(record.spans.iter().map(|value| (*value).into()));
+        values.push(record.route.map(str::to_owned).into());
+        values.push(record.key_presses.into());
         let transaction = connection.transaction()?;
         transaction.execute(
             &format!(
-                "INSERT INTO take_spans(take_id, version, created_at, mode, outcome, stage{columns})
+                "INSERT INTO take_spans(take_id, version, created_at, mode, outcome, stage{columns}, route, key_presses)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6{placeholders})"
             ),
             rusqlite::params_from_iter(values),
@@ -512,14 +533,14 @@ impl Storage {
             .collect();
         let mut statement = connection
             .prepare(&format!(
-                "SELECT take_id, outcome, stage{columns} FROM take_spans ORDER BY id"
+                "SELECT take_id, outcome, stage, route, key_presses{columns} FROM take_spans ORDER BY id"
             ))
             .unwrap();
         let rows = statement
             .query_map([], |row| {
                 let mut spans = Vec::new();
                 for (index, span) in TakeSpan::ALL.iter().enumerate() {
-                    if let Some(value) = row.get::<_, Option<i64>>(index + 3)? {
+                    if let Some(value) = row.get::<_, Option<i64>>(index + 5)? {
                         spans.push((span.code(), value));
                     }
                 }
@@ -527,6 +548,8 @@ impl Storage {
                     take_id: row.get(0)?,
                     outcome: row.get(1)?,
                     stage: row.get(2)?,
+                    route: row.get(3)?,
+                    key_presses: row.get(4)?,
                     spans,
                 })
             })
@@ -543,6 +566,8 @@ pub(crate) struct TakeRowForTest {
     pub take_id: String,
     pub outcome: String,
     pub stage: Option<String>,
+    pub route: Option<String>,
+    pub key_presses: Option<i64>,
     pub spans: Vec<(&'static str, i64)>,
 }
 
@@ -588,6 +613,7 @@ fn take_cohorts(connection: &rusqlite::Connection) -> Result<Vec<TakeCohortSumma
     };
     let outcomes = quoted(TakeOutcome::CODES.to_vec());
     let stages = quoted(TakeStage::ALL.iter().map(|stage| stage.code()).collect());
+    let routes = quoted(TAKE_ROUTE_CODES.to_vec());
     let span_columns: String = TakeSpan::ALL
         .iter()
         .map(|span| format!(", {}_ms", span.code()))
@@ -596,70 +622,86 @@ fn take_cohorts(connection: &rusqlite::Connection) -> Result<Vec<TakeCohortSumma
         .iter()
         .map(|span| {
             let code = span.code();
-            format!("SELECT mode, outcome, stage, '{code}' AS span, {code}_ms AS ms FROM takes")
+            format!(
+                "SELECT mode, route, outcome, stage, '{code}' AS span, {code}_ms AS ms FROM takes"
+            )
         })
+        .chain(std::iter::once(format!(
+            "SELECT mode, route, outcome, stage, '{KEY_PRESSES_SUMMARY}' AS span, key_presses AS ms FROM takes"
+        )))
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
     let span_list = TakeSpan::ALL
         .iter()
+        .map(|span| span.code())
+        .chain(std::iter::once(KEY_PRESSES_SUMMARY))
         .enumerate()
-        .map(|(order, span)| format!("SELECT '{}' AS span, {order} AS ord", span.code()))
+        .map(|(order, code)| format!("SELECT '{code}' AS span, {order} AS ord"))
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
     let mut query = connection.prepare(&format!(
         "WITH takes AS (
            SELECT
              CASE WHEN mode IN ('dictate', 'translate', 'edit', 'ask', 'selected_text') THEN mode ELSE NULL END AS mode,
+             CASE WHEN route IS NULL THEN NULL WHEN route IN ({routes}) THEN route ELSE 'other' END AS route,
              CASE WHEN outcome IN ({outcomes}) THEN outcome ELSE 'other' END AS outcome,
-             CASE WHEN stage IS NULL THEN NULL WHEN stage IN ({stages}) THEN stage ELSE 'other' END AS stage
+             CASE WHEN stage IS NULL THEN NULL WHEN stage IN ({stages}) THEN stage ELSE 'other' END AS stage,
+             key_presses
              {span_columns}
            FROM take_spans WHERE version = {TAKE_SPAN_VERSION}
          ), cohorts AS (
-           SELECT mode, outcome, stage, COUNT(*) AS n FROM takes GROUP BY mode, outcome, stage
+           SELECT mode, route, outcome, stage, COUNT(*) AS n FROM takes GROUP BY mode, route, outcome, stage
          ), spans AS ({unpivot}
          ), ranked AS (
-           SELECT mode, outcome, stage, span, ms,
-             ROW_NUMBER() OVER (PARTITION BY mode, outcome, stage, span ORDER BY ms) AS rank,
-             COUNT(*) OVER (PARTITION BY mode, outcome, stage, span) AS n
+           SELECT mode, route, outcome, stage, span, ms,
+             ROW_NUMBER() OVER (PARTITION BY mode, route, outcome, stage, span ORDER BY ms) AS rank,
+             COUNT(*) OVER (PARTITION BY mode, route, outcome, stage, span) AS n
            FROM spans WHERE ms >= 0
          ), timings AS (
-           SELECT mode, outcome, stage, span, COUNT(*) AS timed,
+           SELECT mode, route, outcome, stage, span, COUNT(*) AS timed,
              MAX(CASE WHEN rank = (n + 1) / 2 THEN ms END) AS p50,
              MAX(CASE WHEN rank = (n * 95 + 99) / 100 THEN ms END) AS p95
-           FROM ranked GROUP BY mode, outcome, stage, span
+           FROM ranked GROUP BY mode, route, outcome, stage, span
          ), span_list AS ({span_list})
-         SELECT c.mode, c.outcome, c.stage, c.n, s.span, COALESCE(t.timed, 0), t.p50, t.p95
+         SELECT c.mode, c.route, c.outcome, c.stage, c.n, s.span, COALESCE(t.timed, 0), t.p50, t.p95
          FROM cohorts c CROSS JOIN span_list s
-         LEFT JOIN timings t ON t.mode IS c.mode AND t.outcome = c.outcome
+         LEFT JOIN timings t ON t.mode IS c.mode AND t.route IS c.route AND t.outcome = c.outcome
            AND t.stage IS c.stage AND t.span = s.span
-         ORDER BY c.mode, c.outcome, c.stage, s.ord",
+         ORDER BY c.mode, c.route, c.outcome, c.stage, s.ord",
     ))?;
     let rows = query.query_map([], |row| {
-        let count: i64 = row.get(3)?;
-        let timed_count: i64 = row.get(5)?;
+        let count: i64 = row.get(4)?;
+        let timed_count: i64 = row.get(6)?;
         Ok((
             row.get::<_, Option<String>>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
             count,
             TakeSpanSummary {
-                span: row.get(4)?,
+                span: row.get(5)?,
                 timed_count,
                 missing_count: count - timed_count,
-                p50_ms: row.get(6)?,
-                p95_ms: row.get(7)?,
+                p50_ms: row.get(7)?,
+                p95_ms: row.get(8)?,
             },
         ))
     })?;
     let mut cohorts: Vec<TakeCohortSummary> = Vec::new();
     for row in rows {
-        let (mode, outcome, stage, count, span) = row?;
+        let (mode, route, outcome, stage, count, span) = row?;
         match cohorts.last_mut() {
-            Some(last) if last.mode == mode && last.outcome == outcome && last.stage == stage => {
+            Some(last)
+                if last.mode == mode
+                    && last.route == route
+                    && last.outcome == outcome
+                    && last.stage == stage =>
+            {
                 last.spans.push(span);
             }
             _ => cohorts.push(TakeCohortSummary {
                 mode,
+                route,
                 outcome,
                 stage,
                 count,
@@ -880,6 +922,8 @@ mod tests {
             mode: crate::state::PipelineMode::Dictate,
             outcome,
             spans: [None; TakeSpan::ALL.len()],
+            route: None,
+            key_presses: None,
         };
         for (span, ms) in spans {
             record.spans[span.index()] = Some(*ms);
@@ -950,7 +994,8 @@ mod tests {
         assert_eq!(cancelled.mode.as_deref(), Some("dictate"));
         let pasted = &report.takes[1];
         assert_eq!((pasted.outcome.as_str(), pasted.count), ("pasted", 4));
-        assert_eq!(pasted.spans.len(), TakeSpan::ALL.len());
+        // Every span plus the key-press count.
+        assert_eq!(pasted.spans.len(), TakeSpan::ALL.len() + 1);
         let span = |code: &str| pasted.spans.iter().find(|row| row.span == code).unwrap();
         let asr = span("asr");
         assert_eq!(

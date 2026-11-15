@@ -882,7 +882,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, super::super::MIGRATIONS.len() as i64);
         let id = storage
             .add_dictionary_candidate_from_correction("open ai", "OpenAI", None)
             .unwrap()

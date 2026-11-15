@@ -23,6 +23,9 @@ use crate::{
 use std::time::Instant;
 use tauri::{Emitter, Manager};
 
+/// A Smart Dictate/Edit take whose selection could not be read at the press.
+const SMART_COPY_ONLY: &str = "The selection could not be checked, so the result was copied instead of inserted. Paste it with Ctrl+V.";
+
 /// Shown when the final paste is held back because the original field lost
 /// focus or its IME is still composing. Fixed copy: no transcript or title.
 const TARGET_WAIT_HINT: &str =
@@ -84,6 +87,7 @@ async fn finish_owned(
         // Recorded by the shared stop pipeline after delivery.
         stop_timings: _,
         trace,
+        smart_route,
     } = take;
     let metrics = storage.metrics_for(mode, app_context::history_category(app_context.as_ref()));
     let duration_ms = artifact.duration.as_millis() as u64;
@@ -421,6 +425,11 @@ async fn finish_owned(
         })
         .await
         .map_err(|_| "dictation insertion task failed".to_owned())?;
+    let insertion_detail = crate::smart_dictate::copy_only_detail(smart_route, insertion_detail);
+    let copy_only = matches!(
+        smart_route,
+        Some(crate::smart_dictate::SmartRoute::CopyOnly(_))
+    );
     let insertion_result = match committed {
         CommittedOutput::Ran(inserted) => inserted,
         // Nothing was pasted or copied; ends below as a cancelled insertion,
@@ -532,6 +541,8 @@ async fn finish_owned(
         "The live draft could not be confirmed, so it was not replaced; the final result is available in this app."
     } else if insertion == InsertResult::PasteUnverified {
         "Pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard)."
+    } else if insertion == InsertResult::ClipboardOnly && copy_only {
+        SMART_COPY_ONLY
     } else if insertion == InsertResult::ClipboardOnly && streamed_into_target {
         "The provisional text could not be safely replaced; the final result remains on the clipboard."
     } else if insertion == InsertResult::ClipboardOnly {

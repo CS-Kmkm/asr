@@ -372,6 +372,48 @@ pub(crate) struct SelectedText {
     text: String,
     state: TargetText,
 }
+/// Why a Smart Dictate/Edit press could not tell whether text is selected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum UnknownSelection {
+    /// No foreground field, or it changed while being read.
+    NoTarget,
+    /// This app's own window is in the foreground.
+    ThisApp,
+    /// A password field or a target at a higher privilege level.
+    Protected,
+    /// An IME conversion is open.
+    ImeComposing,
+    /// The field's text and selection cannot be read.
+    Unreadable,
+}
+
+impl UnknownSelection {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::NoTarget => "no_target",
+            Self::ThisApp => "this_app",
+            Self::Protected => "protected",
+            Self::ImeComposing => "ime_composing",
+            Self::Unreadable => "unreadable",
+        }
+    }
+}
+
+/// The original target and selection state, read once at a Smart
+/// Dictate/Edit press.
+pub(crate) enum SelectionProbe {
+    /// A readable, nonempty selection in an external, unprotected field.
+    Selected(SelectedText),
+    /// An external, unprotected field whose selection is collapsed, with the
+    /// UI Automation identity of the focused field (always known: a field
+    /// that cannot be identified is `Unknown`).
+    Empty {
+        target: TargetWindow,
+        focus_identity: Vec<i32>,
+    },
+    Unknown(UnknownSelection),
+}
+
 impl SelectedText {
     pub(crate) fn text(&self) -> &str {
         &self.text
@@ -453,6 +495,11 @@ impl SystemTextInjector {
         batch::cancel(&self.backend, session, monitor)
     }
 
+    /// Reads the focused field's selection state without sending input.
+    pub(crate) fn probe_selection(&self) -> SelectionProbe {
+        batch::probe_selection(&self.backend)
+    }
+
     pub(crate) fn capture_selection(&self) -> Result<SelectedText, InjectionError> {
         let (target, state) = batch::capture_selection(&self.backend)?;
         Ok(SelectedText {
@@ -471,6 +518,33 @@ impl SystemTextInjector {
     ) -> Result<InsertResult, InjectionError> {
         batch::replace_selection(
             &self.backend,
+            self.options,
+            &selection.target,
+            &selection.state,
+            text,
+            monitor,
+            checkpoint,
+        )
+    }
+
+    /// `replace_selection` that also requires the field focused when the
+    /// selection was read: another field with the same text and selection
+    /// is refused. The pin holds until the paste is sent; verification after
+    /// it keeps its usual rules, since some editors renew the id on paste.
+    pub(crate) fn replace_selection_in_same_field(
+        &self,
+        selection: &SelectedText,
+        text: &str,
+        monitor: &InputMonitor,
+        checkpoint: u64,
+    ) -> Result<InsertResult, InjectionError> {
+        let pinned = PinnedField {
+            inner: &self.backend,
+            identity: &selection.state.identity,
+            pasted: std::cell::Cell::new(false),
+        };
+        batch::replace_selection(
+            &pinned,
             self.options,
             &selection.target,
             &selection.state,
@@ -683,6 +757,111 @@ fn final_guard(after_input: bool) -> batch::FinalGuard {
         batch::FinalGuard::AfterInput
     } else {
         batch::FinalGuard::Untouched
+    }
+}
+
+/// A backend that, until a paste is sent, accepts the target only while the
+/// field with `identity` is focused in it.
+struct PinnedField<'a, B> {
+    inner: &'a B,
+    identity: &'a [i32],
+    pasted: std::cell::Cell<bool>,
+}
+
+impl<B: Backend> PinnedField<'_, B> {
+    fn same_field(&self, target: &TargetWindow) -> Result<(), InjectionError> {
+        if self.pasted.get() {
+            return Ok(());
+        }
+        match self.inner.focus_identity(target) {
+            Ok(identity) if identity == self.identity => Ok(()),
+            Ok(_) => Err(InjectionError::TargetChanged),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl<B: Backend> Backend for PinnedField<'_, B> {
+    type Clipboard = B::Clipboard;
+    fn capture_target(&self) -> Result<TargetWindow, InjectionError> {
+        self.inner.capture_target()
+    }
+    fn validate_target(&self, target: &TargetWindow) -> Result<(), InjectionError> {
+        self.inner.validate_target(target)?;
+        self.same_field(target)
+    }
+    fn ime_composition_active(
+        &self,
+        target: &TargetWindow,
+    ) -> Result<Option<bool>, InjectionError> {
+        self.inner.ime_composition_active(target)
+    }
+    fn target_text(&self, target: &TargetWindow) -> Result<TargetText, InjectionError> {
+        self.same_field(target)?;
+        self.inner.target_text(target)
+    }
+    fn target_text_probe(
+        &self,
+        target: &TargetWindow,
+    ) -> Result<Option<TextProbe>, InjectionError> {
+        self.inner.target_text_probe(target)
+    }
+    fn selection_is_empty(&self, target: &TargetWindow) -> Result<bool, InjectionError> {
+        self.inner.selection_is_empty(target)
+    }
+    fn focus_identity(&self, target: &TargetWindow) -> Result<Vec<i32>, InjectionError> {
+        self.inner.focus_identity(target)
+    }
+    fn select_recent(
+        &self,
+        target: &TargetWindow,
+        expected: &TargetText,
+        text: &str,
+    ) -> Result<bool, InjectionError> {
+        self.inner.select_recent(target, expected, text)
+    }
+    fn clipboard_snapshot(&self) -> Result<Self::Clipboard, InjectionError> {
+        self.inner.clipboard_snapshot()
+    }
+    fn clipboard_write(
+        &self,
+        text: &str,
+        exclusion: ClipboardExclusion,
+    ) -> Result<u32, WriteError> {
+        self.inner.clipboard_write(text, exclusion)
+    }
+    fn clipboard_restore(
+        &self,
+        snapshot: Self::Clipboard,
+        expected_sequence: u32,
+    ) -> Result<bool, InjectionError> {
+        self.inner.clipboard_restore(snapshot, expected_sequence)
+    }
+    fn paste(&self, target: &TargetWindow, policy: SafetyPolicy) -> Result<bool, InjectionError> {
+        // The last check before the paste is sent; afterwards the pin ends.
+        if self.same_field(target).is_err() {
+            return Ok(false);
+        }
+        self.pasted.set(true);
+        self.inner.paste(target, policy)
+    }
+    fn delete_selection(&self, target: &TargetWindow) -> Result<bool, InjectionError> {
+        self.same_field(target)?;
+        self.inner.delete_selection(target)
+    }
+    fn collapse_selection(
+        &self,
+        target: &TargetWindow,
+        expected: &TargetText,
+    ) -> Result<bool, InjectionError> {
+        self.same_field(target)?;
+        self.inner.collapse_selection(target, expected)
+    }
+    fn wait_for_target(&self) {
+        self.inner.wait_for_target()
+    }
+    fn clipboard_not_restored(&self) {
+        self.inner.clipboard_not_restored()
     }
 }
 

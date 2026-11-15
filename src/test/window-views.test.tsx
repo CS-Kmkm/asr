@@ -212,3 +212,33 @@ test("overlay releases all event subscriptions when its window unmounts", async 
   await waitFor(() => expect(transport.stopped).toHaveBeenCalledTimes(8));
   expect(transport.handlers.size).toBe(0);
 });
+
+test("the Smart key names its routed mode briefly, then the usual label returns", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  try {
+    render(<I18nProvider language="ja"><RecordingOverlay /></I18nProvider>);
+    await emit("app-state", recording);
+    await emit("voice-mode", { mode: "edit", targetLanguage: null, smartRoute: "edit" });
+    expect(screen.getByText("スマート：選択範囲を編集")).toBeTruthy();
+    await act(async () => { vi.advanceTimersByTime(3_000); });
+    expect(screen.queryByText("スマート：選択範囲を編集")).toBeNull();
+    expect(screen.getByText("編集中")).toBeTruthy();
+    await emit("voice-mode", { mode: "dictate", targetLanguage: null, smartRoute: "copy_only" });
+    expect(screen.getByText("スマート：コピーのみ（選択状態が不明）")).toBeTruthy();
+    // A plain Dictate start shows no route.
+    await emit("voice-mode", { mode: "dictate", targetLanguage: null });
+    expect(screen.queryByText(/スマート/)).toBeNull();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("a Smart edit and a copy-only take report their outcome and recovery in Japanese", async () => {
+  render(<I18nProvider language="ja"><RecordingOverlay /></I18nProvider>);
+  await emit("app-state", { ...processing, phase: "completed", stage: "completed" });
+  await emit("insertion-notice", { outcome: "smart_edit_replaced", detail: null });
+  expect(screen.getByText("選択範囲を編集しました。元に戻すにはアプリでCtrl+Zを押してください。")).toBeTruthy();
+  await emit("insertion-notice", { outcome: "clipboard_only", detail: "selection_unknown" });
+  expect(screen.getByText("挿入できませんでした。クリップボードにコピーしました（Ctrl+V で貼り付け）。")).toBeTruthy();
+  expect(screen.getByText("入力欄の選択範囲を確認できませんでした。")).toBeTruthy();
+});

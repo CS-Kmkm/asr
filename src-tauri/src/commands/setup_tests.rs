@@ -28,6 +28,7 @@ pub(crate) async fn start_dictation_test(app: AppHandle) -> Result<u64, String> 
             None,
             PipelineMode::Dictate,
             id,
+            None,
         )
         .await;
     });

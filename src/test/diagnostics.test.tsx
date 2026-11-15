@@ -10,7 +10,7 @@ const report: StorageDiagnostics = {
   databaseOk: true, schemaVersion: 3,
   summaries: [{ eventType: "asr", provider: "faster-whisper", mode: "dictate", appCategory: "email", count: 22, successes: 20, timedCount: 20, p50Ms: 10, p95Ms: 19 }],
   outcomes: [{ eventType: "asr", provider: "faster-whisper", mode: "dictate", appCategory: "email", success: false, code: "asr_failed", count: 2 }],
-  takes: [{ mode: "dictate", outcome: "cancelled", stage: "asr", count: 3, spans: [{ span: "asr", timedCount: 2, missingCount: 1, p50Ms: 40, p95Ms: 90 }] }],
+  takes: [{ mode: "dictate", route: null, outcome: "cancelled", stage: "asr", count: 3, spans: [{ span: "asr", timedCount: 2, missingCount: 1, p50Ms: 40, p95Ms: 90 }] }],
 };
 const state: AppState = { phase: "idle", stage: "idle", operation: null, operationId: null, message: null, messageCode: null, lastResult: "private transcript sentinel", updatedAt: new Date().toISOString() };
 function show() {
