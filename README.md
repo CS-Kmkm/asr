@@ -221,14 +221,14 @@ Windows x64用のランタイムと固定Q8_0重みを初回ロード時に取�
   他アプリの使用量を含みます。測定していないモデルは「未計測」です。
 - 追加したモデルIDには既定モデルの対応言語・ライセンス・出所を流用せず（対応言語は「未確認」）、バックエンドの実行環境などの能力だけを表示します。
 - 状態保持型ストリーミング（#82）はどのモデルにもまだ実装していないため、能力として表示しません。
-- 「モデルカタログ」にはQwen3-ASR（#89）とNemotron Streaming候補（#82）を「計画中（未対応）」として載せています。
+- 「モデルカタログ」にはNemotron Streaming候補（#82）を「計画中（未対応）」として載せています。
   未検証の値は「未確認」と表示します。
 - 日本語モデル（speech.cpp）のダウンロード済みファイルは、確認ダイアログの後に削除できます。
   読み込み中・読み込み済みのモデル、固定パス外のファイル、通常のファイルではない項目、共有ランタイムは削除しません。
   次回の読み込みで再取得します。Whisper／VibeVoiceのHugging Faceキャッシュは管理対象外です。
 
 カタログの固定情報は `asr_worker/speech_cpp.py` の固定値とテストで照合しています。
-speech.cppのモデルIDの検証（Rust）もカタログから導出します。
+speech.cppのモデルIDと、日本語専用かどうか（認識言語の制限）の検証（Rust・UI）もカタログから導出します。
 
 ### speech-cpp (Japanese, Windows x64/Vulkan)
 
@@ -241,9 +241,29 @@ Q8_0重みをSHA256で検証します（初回取得は約690 MB）。Windows x6
 非対応環境では選択できません。日本語専用で、エンコーダーはVulkan、TDTデコーダーはCPUを使います。
 CTCは未対応です。Whisperの既定モデルと読み込み形式は変更しません。
 
-JSONLワーカーでは `--backend speech-cpp` と、`ASR_MODEL_ID=haas-ja-v1.0` または
-`ASR_MODEL_ID=parakeet-tdt_ctc-0.6b-ja` を指定します。
+同じ「日本語モデル（Vulkan）」でQwen3-ASR 0.6B／1.7B（Q8_0 GGUF、Apache-2.0、#89）も選べます。
+Qwen3-ASRは日本語を含む多言語モデルで、認識言語を指定するとその言語を、自動設定ではモデルの言語判定を使い、
+辞書の語句はpromptとしてモデルに渡します（初回取得は約0.84 GB／2.18 GB）。
+GPU経路はVulkanで、CUDAではありません。推奨条件と実測は[Qwen3-ASRの契約](docs/tasks/issue-89-qwen3-asr.md)を参照してください。
+
+JSONLワーカーでは `--backend speech-cpp` と、`ASR_MODEL_ID=haas-ja-v1.0`、
+`parakeet-tdt_ctc-0.6b-ja`、`qwen3-asr-0.6b` または `qwen3-asr-1.7b` を指定します。
 詳細は[導入方法・既存の比較記録・制限](docs/japanese_model_comparison.md)を参照してください。
+
+### sherpa-onnx / transformers-asr (runtime adapters, Windows native)
+
+モデル画面の「ONNX Runtime モデル（CUDA / CPU）」はReazonSpeech k2 v2（日本語専用、Apache-2.0）を、
+「Qwen3-ASR（transformers・CUDA）」はQwen3-ASR 0.6B／1.7B（多言語、Apache-2.0）を使います。
+アプリがバックエンドごとの追加依存（`uv sync --extra sherpa-onnx` / `--extra transformers-asr`）を準備し、
+「モデルを読み込む」を押したときだけ、固定revision・SHA256のファイルを
+`%LOCALAPPDATA%/LocalVoice/models` に取得します（約615 MB / 約1.6 GB（0.6B）・約4.1 GB（1.7B））。
+WSL・Docker・NeMoは使いません。音声認識デバイスでCPU／CUDAを選べます。
+sherpa-onnxはCUDA実行プロバイダーが実際に動いたと確認できた場合だけCUDAと表示し、
+自動選択では確認できなければCPUで読み込みます。Qwen3-ASRはCUDAが必要で、CPUは明示した場合だけです。
+`transformers-asr` は `decision`・`vibevoice` と同時に入れられません（transformersの版が異なるため）。
+音声モードの自動判定（判断モデル）は、`transformers-asr`、およびCPU以外のデバイスの `sherpa-onnx` とは
+同じワーカーで動かせないため、設定でこの組合せを拒否します（sherpa-onnxは音声認識デバイスにCPUを選べば併用できます）。
+実機の計測と制限は[タスク契約](docs/tasks/issue-87-runtime-adapters.md)を参照してください。
 
 ### faster-whisper (default, CPU-capable)
 

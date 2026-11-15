@@ -83,9 +83,36 @@ pub(crate) fn model_identity(settings: &Settings) -> (Option<String>, String) {
             Some(custom_model.unwrap_or("microsoft/VibeVoice-ASR-HF").into()),
             "VibeVoice requires a CUDA GPU; downloads from Hugging Face on first load.".into(),
         ),
-        "speech-cpp" => (
-            Some(format!("speech.cpp:{}:Q8_0", custom_model.unwrap_or("haas-ja-v1.0"))),
-            "Japanese only. speech.cpp uses Vulkan, with Q8_0 weights and CPU decoding. The runtime and model download on first load.".into(),
+        "speech-cpp" => {
+            let id = custom_model
+                .or_else(|| model_catalog::default_pinned_model("speech-cpp"))
+                .unwrap_or("haas-ja-v1.0");
+            let pinned = model_catalog::pinned_model("speech-cpp", id);
+            let weights = pinned
+                .and_then(|model| model.weight_format.as_deref())
+                .unwrap_or("Q8_0");
+            let detail = if pinned.and_then(|model| model.language_scope.as_deref())
+                == Some("multilingual")
+            {
+                "Multilingual, including Japanese. Qwen3-ASR runs on speech.cpp with Vulkan (not CUDA) and Q8_0 weights. The runtime and model download on first load."
+            } else {
+                "Japanese only. speech.cpp uses Vulkan, with Q8_0 weights and CPU decoding. The runtime and model download on first load."
+            };
+            (Some(format!("speech.cpp:{id}:{weights}")), detail.into())
+        }
+        "sherpa-onnx" => (
+            Some(format!(
+                "sherpa-onnx:{}",
+                custom_model.unwrap_or("reazonspeech-k2-v2")
+            )),
+            "Japanese only. ONNX Runtime through sherpa-onnx on CUDA or CPU; the speech device setting chooses. The pinned model downloads on first load.".into(),
+        ),
+        "transformers-asr" => (
+            Some(format!(
+                "transformers-asr:{}",
+                custom_model.unwrap_or("qwen3-asr-0.6b")
+            )),
+            "Multilingual, including Japanese. Qwen3-ASR runs with transformers on a CUDA GPU (CPU only when selected). The pinned model downloads on first load.".into(),
         ),
         "openai-compatible" => (
             Some(format!(
@@ -161,11 +188,24 @@ pub(crate) fn worker_command_for_settings(settings: &Settings) -> WorkerCommand 
     worker_command_with_speech_key(settings, key)
 }
 
+/// The optional dependency set (`uv sync --extra`) a backend needs.
+pub(crate) fn worker_extra(backend: &str) -> Option<&'static str> {
+    match backend {
+        "vibevoice" => Some("vibevoice"),
+        "sherpa-onnx" => Some("sherpa-onnx"),
+        "transformers-asr" => Some("transformers-asr"),
+        _ => None,
+    }
+}
+
 pub(crate) fn worker_device_policy(settings: &Settings) -> Option<&'static str> {
-    (settings.asr_backend == "faster-whisper")
-        .then_some(settings.asr_device)
-        .flatten()
-        .map(types::AsrDevice::as_str)
+    matches!(
+        settings.asr_backend.as_str(),
+        "faster-whisper" | "sherpa-onnx" | "transformers-asr"
+    )
+    .then_some(settings.asr_device)
+    .flatten()
+    .map(types::AsrDevice::as_str)
 }
 
 pub(crate) fn worker_command_with_speech_key(
@@ -180,7 +220,7 @@ pub(crate) fn worker_command_with_speech_key(
             worker_setup::bundled().filter(|bundled| project_root.as_ref() == Some(&bundled.source))
         {
             let mut provision = bundled.clone();
-            provision.vibevoice = settings.asr_backend == "vibevoice";
+            provision.extra = worker_extra(&settings.asr_backend);
             command.program = provision.python();
             command.provision = Some(provision);
         }
@@ -198,7 +238,7 @@ pub(crate) fn worker_command_with_speech_key(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .or_else(|| (settings.asr_backend == "speech-cpp").then_some("haas-ja-v1.0"))
+        .or_else(|| model_catalog::default_pinned_model(&settings.asr_backend))
     {
         command.env.push(("ASR_MODEL_ID".into(), model_id.into()));
     }

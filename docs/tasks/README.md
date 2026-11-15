@@ -5,7 +5,9 @@
 
 | 分類 | 契約 | 扱い |
 |---|---|---|
-| active | [文章品質・意味保存・修正からの学習 — #85](issue-85-text-quality.md) | 補正専用オフライン評価セット・採点・ガード強化・opt-in学習を実装。自動チェック完了、評価はモデルなし（fake）のみ。実プロバイダー評価・人手ブラインド評価・Windows実機UI確認・独立監査は未実施 |
+| active | [文章品質・意味保存・修正からの学習 — #85](issue-85-text-quality.md) | 補正専用オフライン評価セット・採点・ガード強化・opt-in学習を実装。自動チェック・独立監査完了。実プロバイダー評価・人手ブラインド評価・Windows実機UI確認は未実施 |
+| active | [Qwen3-ASR 0.6B/1.7B — #89](issue-89-qwen3-asr.md) | speech.cpp（Vulkan、Q8_0）で0.6B/1.7B、transformers（CUDA）で1.7Bを追加。RTX 3060で日本語holdout・長尺を比較し、手動プリセットの推奨条件を記録。transformers 1.7Bの実機計測・日英混在音声・アプリ実機確認は未実施 |
+| active | [ランタイム・アダプター — #87 第2段階](issue-87-runtime-adapters.md) | sherpa-onnx（CPU/CUDA、ReazonSpeech k2）とtransformers（CUDA、Qwen3-ASR 0.6B）をWindowsネイティブで追加。自動テスト・RTX 3060実機smoke完了。Windows実機でのUI・録音確認は未実施 |
 | active | [モデルカタログ・能力表示 — #87 第1段階](issue-87-model-catalog.md) | 共通カタログ・能力/出所表示・日本語モデルのキャッシュ削除を実装。自動チェック・Codex独立監査完了。PRで公開。Windows実機でのUI確認は未実施、#87本体は継続 |
 | completed | [日本語モデル導入 — #88](issue-88-japanese-models.md) | Windows/Vulkan実装・機能回帰・独立確認完了。[PR #100](https://github.com/CS-Kmkm/asr/pull/100)で公開。追加評価・標準モデル選定は後回し。取り込み状況はPRとIssueを参照。 |
 | completed | [公開音声ベンチマーク — #86](issue-86-public-benchmark.md) | FLEURS＋JVNV固定、batch実認識60件、実時間streaming replay・採点を実装。独立レビュー完了、PR #98 merge・Issueクローズ・実装ブランチ削除済み。実engine結合は #82 |

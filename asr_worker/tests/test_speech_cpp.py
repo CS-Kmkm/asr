@@ -139,7 +139,7 @@ class SpeechCppTests(IsolatedWorkerTestCase):
                 acquire('https://example.invalid', Path(folder) / 'bad.gguf', '0' * 64, backend)
             self.assertEqual([p.name for p in Path(folder).iterdir()], ['model.gguf'])
 
-    def _start(self, *, ready=True, models=None, job_error=False):
+    def _start(self, *, ready=True, models=None, job_error=False, expect_failure=False):
         backend = SpeechCppBackend()
         process = MagicMock()
         process.poll.return_value = None
@@ -153,7 +153,7 @@ class SpeechCppTests(IsolatedWorkerTestCase):
              patch('asr_worker.speech_cpp.subprocess.Popen', return_value=process) as start, \
              patch('asr_worker.speech_cpp.attach_job', side_effect=OSError('job denied') if job_error else None, return_value=None), \
              patch('httpx.Client', return_value=client) as transport:
-            if ready and models != [] and not job_error:
+            if ready and models != [] and not job_error and not expect_failure:
                 backend.load('4bit')
             else:
                 with self.assertRaises(BackendError) as caught:
@@ -214,6 +214,64 @@ class SpeechCppTests(IsolatedWorkerTestCase):
             backend.transcribe(Path('absent.wav'), None, 'ja')
         self.assertEqual(caught.exception.code, 'speech_cpp_unavailable')
 
+    def _running(self, model_id):
+        with patch.dict(os.environ, {'ASR_MODEL_ID': model_id}):
+            backend = SpeechCppBackend()
+        backend.process = MagicMock()
+        backend.process.poll.return_value = None
+        captured = []
+
+        def handle(request):
+            captured.append(request.read())
+            return httpx.Response(200, json={'text': 'Tauri を使います'})
+        backend.client = httpx.Client(base_url='http://127.0.0.1/v1/', transport=httpx.MockTransport(handle))
+        self.addCleanup(backend.client.close)
+        return backend, captured
+
+    def test_qwen3_asr_is_multilingual_and_receives_the_dictionary_prompt(self):
+        for model_id in ['qwen3-asr-0.6b', 'qwen3-asr-1.7b']:
+            with self.subTest(model=model_id), tempfile.TemporaryDirectory() as folder:
+                backend, captured = self._running(model_id)
+                self.assertEqual(backend.model_name, f'speech.cpp:{model_id}:Q8_0')
+                path = Path(folder) / 'audio.wav'
+                path.write_bytes(b'RIFF')
+                text, _ = backend.transcribe(path, 'Tauri, faster-whisper', 'en-US')
+                self.assertEqual(text, 'Tauri を使います')
+                self.assertIn(b'name="prompt"\r\n\r\nTauri, faster-whisper\r\n', captured[0])
+                self.assertIn(b'name="language"\r\n\r\nen\r\n', captured[0])
+                # Automatic language: no language field, the model detects it.
+                backend.transcribe(path, None, None)
+                self.assertNotIn(b'name="language"', captured[1])
+                self.assertNotIn(b'name="prompt"', captured[1])
+
+    def test_fastconformer_models_stay_japanese_only(self):
+        for model_id in ['haas-ja-v1.0', 'parakeet-tdt_ctc-0.6b-ja']:
+            with self.subTest(model=model_id):
+                backend, captured = self._running(model_id)
+                with self.assertRaises(BackendError) as caught:
+                    backend.transcribe(Path('absent.wav'), 'term', 'en-US')
+                self.assertEqual(caught.exception.code, 'speech_cpp_language')
+                self.assertEqual(captured, [])
+
+    def test_server_must_report_the_pinned_weight_type_of_the_selected_model(self):
+        with patch.dict(os.environ, {'ASR_MODEL_ID': 'qwen3-asr-1.7b'}):
+            reported = [{'id': 'Qwen3-ASR-1.7B', 'speech': {'task': 'recognition', 'device': 'Vulkan0', 'weight_type': 'Q8_0'}}]
+            backend, *_ = self._start(models=reported)
+            self.assertEqual((backend.device, backend.compute_type), ('vulkan', 'Q8_0'))
+            backend.unload()
+            reported[0]['speech']['weight_type'] = 'Q4_K'
+            _, proc, *_ = self._start(models=reported, expect_failure=True)
+            proc.terminate.assert_called_once()
+
+    def test_unknown_model_id_is_refused_before_any_download(self):
+        with patch.dict(os.environ, {'ASR_MODEL_ID': 'Qwen/Qwen3-ASR-1.7B'}):
+            backend = SpeechCppBackend()
+        with patch('asr_worker.speech_cpp.IS_WINDOWS', True),              patch('asr_worker.speech_cpp.platform.machine', return_value='AMD64'),              patch('asr_worker.speech_cpp.acquire') as network:
+            with self.assertRaises(BackendError) as caught:
+                prepare(backend)
+        self.assertEqual(caught.exception.code, 'speech_cpp_unavailable')
+        network.assert_not_called()
+
 
 class SharedCatalogTests(IsolatedWorkerTestCase):
     """The UI/Rust catalog must describe exactly the artifacts the worker pins."""
@@ -241,4 +299,8 @@ class SharedCatalogTests(IsolatedWorkerTestCase):
             })
             self.assertEqual(entry['license'], pinned['license'])
             self.assertEqual(entry['devices'], ['vulkan'])
-            self.assertEqual(entry['languageScope'], 'japanese_only')
+            # Per-model rules the backend enforces come from the same facts.
+            self.assertEqual(entry['languageScope'], 'japanese_only' if pinned['japanese_only'] else 'multilingual')
+            self.assertEqual(entry['vocabulary'], 'prompt' if pinned['prompt'] else 'post_dictionary_only')
+            self.assertEqual(entry['weightFormat'], pinned['weight_type'])
+            self.assertTrue(pinned['file'].endswith(f"-{pinned['weight_type']}.gguf"))
