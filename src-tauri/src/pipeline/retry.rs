@@ -187,6 +187,7 @@ pub(crate) async fn run(
                 storage,
                 &settings,
                 retry_context.as_ref(),
+                crate::types::DictionaryMode::Edit,
                 &transcript.text,
                 Some(selected),
                 cancel.clone(),
@@ -217,6 +218,7 @@ pub(crate) async fn run(
                     storage,
                     &settings,
                     retry_context.as_ref(),
+                    crate::types::DictionaryMode::Ask,
                     &transcript.text,
                     None,
                     cancel.clone(),
@@ -245,6 +247,7 @@ pub(crate) async fn run(
                     storage,
                     &settings,
                     retry_context.as_ref(),
+                    crate::types::DictionaryMode::Ask,
                     &transcript.text,
                     source.source_text.as_deref(),
                     cancel.clone(),
@@ -269,7 +272,11 @@ pub(crate) async fn run(
                 "Correcting the transcript with the configured AI provider.",
             );
             let hints = storage
-                .dictionary_correction_terms(&transcript.text, retry_context.as_ref())
+                .dictionary_correction_terms(
+                    &transcript.text,
+                    retry_context.as_ref(),
+                    types::DictionaryMode::Dictate,
+                )
                 .unwrap_or_default();
             let correction_started = Instant::now();
             let result = correction::correct_transcript(

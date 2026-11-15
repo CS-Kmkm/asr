@@ -3154,7 +3154,7 @@ pub(crate) async fn update_dictionary_entry(
         personalization::validate_dictionary_scope(entry.app_scope.as_deref())
             .map_err(str::to_owned)?;
         if !storage
-            .update_dictionary_entry(
+            .update_dictionary_entry_with_modes(
                 id,
                 &NewDictionaryEntry {
                     reading: &entry.reading,
@@ -3164,6 +3164,7 @@ pub(crate) async fn update_dictionary_entry(
                     priority: entry.priority,
                     app_scope: entry.app_scope.as_deref(),
                 },
+                &entry.modes,
             )
             .map_err(command_error)?
         {
@@ -3189,14 +3190,17 @@ pub(crate) async fn add_dictionary_entry(
         personalization::validate_dictionary_scope(entry.app_scope.as_deref())
             .map_err(str::to_owned)?;
         let id = storage
-            .add_dictionary_entry(&NewDictionaryEntry {
-                reading: &entry.reading,
-                surface: &entry.surface,
-                category: entry.category.as_deref(),
-                aliases: &entry.aliases,
-                priority: entry.priority,
-                app_scope: entry.app_scope.as_deref(),
-            })
+            .add_dictionary_entry_with_modes(
+                &NewDictionaryEntry {
+                    reading: &entry.reading,
+                    surface: &entry.surface,
+                    category: entry.category.as_deref(),
+                    aliases: &entry.aliases,
+                    priority: entry.priority,
+                    app_scope: entry.app_scope.as_deref(),
+                },
+                &entry.modes,
+            )
             .map_err(command_error)?;
         storage
             .list_dictionary()
@@ -3257,14 +3261,47 @@ pub(crate) async fn list_dictionary_candidates(
 #[tauri::command]
 pub(crate) async fn confirm_dictionary_candidate(
     id: i64,
+    scope: Option<types::CandidateScopeInput>,
     storage: State<'_, Storage>,
 ) -> Result<DictionaryEntry, String> {
     let storage = storage.inner().clone();
     storage_task(move || {
         storage
-            .confirm_dictionary_candidate(id)
+            .confirm_dictionary_candidate_in(id, &scope.unwrap_or_default())
             .map_err(command_error)?
             .ok_or_else(|| "dictionary candidate not found".into())
+    })
+    .await
+}
+
+/// Proposes a preferred-spelling suggestion from the user's edit of a
+/// History dictation (opt-in learning). Only the changed pair is stored.
+#[tauri::command]
+pub(crate) async fn propose_dictionary_candidate_from_edit(
+    history_id: i64,
+    edited_text: String,
+    storage: State<'_, Storage>,
+) -> Result<crate::storage::EditProposal, String> {
+    let storage = storage.inner().clone();
+    storage_task(move || {
+        storage
+            .propose_dictionary_candidate_from_edit(history_id, &edited_text)
+            .map_err(command_error)
+    })
+    .await
+}
+
+/// Deletes pending suggestions from edits, learned entries and their
+/// decisions; manual and auto-added entries stay.
+#[tauri::command]
+pub(crate) async fn delete_learned_personalization(
+    storage: State<'_, Storage>,
+) -> Result<usize, String> {
+    let storage = storage.inner().clone();
+    storage_task(move || {
+        storage
+            .delete_learned_personalization()
+            .map_err(command_error)
     })
     .await
 }

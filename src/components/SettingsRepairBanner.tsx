@@ -49,6 +49,7 @@ const fieldLabels = {
   correctionAutoFormat: "Automatic formatting",
   correctionImproveClarity: "Improve clarity",
   personalizationEnabled: "Personalization",
+  personalizationLearning: "Learn from my edits",
   globalStyleProfile: "Global profile",
   setupComplete: "Setup completed",
   "shortcuts.dictate": "Dictation shortcuts",

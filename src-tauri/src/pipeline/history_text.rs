@@ -82,7 +82,11 @@ fn prepare(storage: &Storage, id: i64, action: Action) -> Result<Prepared, Strin
         }
     };
     let hints = storage
-        .dictionary_correction_terms(&source.transcript_text, context.as_ref())
+        .dictionary_correction_terms(
+            &source.transcript_text,
+            context.as_ref(),
+            types::DictionaryMode::Dictate,
+        )
         .map_err(crate::command_error)?;
     Ok(Prepared {
         settings,
