@@ -220,6 +220,7 @@ Haas-ja-v1.0／Parakeet Japaneseはモデル画面の「日本語モデル（Vul
 Windows x64用のランタイムと固定Q8_0重みを初回ロード時に取得し、アプリがサーバーの起動・終了を管理します。
 日本語専用で、既定のWhisperは変更していません。
 導入要件・比較結果・制限は[日本語モデル比較](docs/japanese_model_comparison.md)を参照してください。
+用途別の手動選択と推奨値は[音声認識モデルの手動選択](docs/model_selection.md)にまとめています。
 
 ### モデルカタログと能力表示
 
