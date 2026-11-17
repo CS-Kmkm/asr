@@ -1408,6 +1408,30 @@ mod tests {
     }
 
     #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires explicitly selected virtual input and native audio permission"]
+    fn native_virtual_input_reopens_after_enumeration_thread_exits() {
+        let id = std::env::var("LVI_NATIVE_TEST_INPUT")
+            .expect("set LVI_NATIVE_TEST_INPUT to the virtual cable's name-based ID");
+        assert_eq!(id, "name:CABLE Output (VB-Audio Virtual Cable)");
+        eprintln!("native audio probe: enumerate on a short-lived thread");
+        let devices = thread::spawn(list_cpal_devices).join().unwrap().unwrap();
+        assert!(devices.iter().any(|device| device.id == id));
+        for attempt in 1..=2 {
+            eprintln!("native audio probe: open {attempt}");
+            let config = CaptureConfig {
+                device_id: Some(id.clone()),
+                fallback_to_default: false,
+                ..CaptureConfig::default()
+            };
+            let mut active = start_cpal_capture(config).unwrap();
+            drop_active_stream(&mut active);
+            eprintln!("native audio probe: closed {attempt}");
+        }
+        // No recording is promoted and no WAV is written by this probe.
+    }
+
+    #[cfg(target_os = "windows")]
     #[tokio::test(flavor = "current_thread")]
     async fn stopping_a_stream_does_not_block_the_async_runtime() {
         let directory = tempfile::tempdir().unwrap();
