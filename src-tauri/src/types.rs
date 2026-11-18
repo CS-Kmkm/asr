@@ -117,6 +117,12 @@ pub struct Settings {
     #[serde(default)]
     pub incremental_final_asr: bool,
     #[serde(default)]
+    pub stateful_streaming: bool,
+    #[serde(default)]
+    pub qwen_demo_streaming: bool,
+    #[serde(default)]
+    pub offline_only: bool,
+    #[serde(default)]
     pub shortcuts: VoiceShortcuts,
     #[serde(default)]
     pub hold_to_talk: HoldToTalk,
@@ -457,6 +463,9 @@ impl Default for Settings {
             cloud_live_preview_enabled: false,
             live_preview_fast_decode: false,
             incremental_final_asr: false,
+            stateful_streaming: false,
+            qwen_demo_streaming: false,
+            offline_only: false,
             shortcuts: VoiceShortcuts::default(),
             hold_to_talk: HoldToTalk::default(),
             translation_hotkey: default_translation_hotkey(),

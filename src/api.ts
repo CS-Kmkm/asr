@@ -76,6 +76,9 @@ export const defaultSettings: Settings = {
   livePreviewEnabled: null,
   livePreviewFastDecode: false,
   incrementalFinalAsr: false,
+  statefulStreaming: false,
+  qwenDemoStreaming: false,
+  offlineOnly: false,
   cloudLivePreviewEnabled: false,
   shortcuts: {
     dictate: ["Ctrl+Shift+Space"],

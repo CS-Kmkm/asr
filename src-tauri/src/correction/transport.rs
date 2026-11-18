@@ -139,7 +139,13 @@ pub(super) async fn request_text_with_access(
     if *cancel.borrow() {
         return Err(CorrectionError::Cancelled);
     }
-    crate::privacy::check_text(settings).map_err(|_| CorrectionError::ConsentRequired)?;
+    crate::privacy::check_text(settings).map_err(|_| {
+        if settings.offline_only {
+            CorrectionError::Offline
+        } else {
+            CorrectionError::ConsentRequired
+        }
+    })?;
     let TextRequest {
         input,
         instruction,

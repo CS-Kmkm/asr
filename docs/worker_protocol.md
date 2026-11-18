@@ -60,6 +60,62 @@ v1(現行)仕様は実装と1対1で対応し、v2拡張提案は未実装であ
 
 ## 2. プロトコル v1(現行)
 
+### 状態保持型Streaming（#82、v1への追加）
+
+`sherpa-onnx` の `nemotron-3.5-streaming-560ms` は、固定revision・SHA256の
+Nemotron 3.5多言語モデルを使います。録音ごとに推論状態を保持し、通常の
+`transcribe` では約25秒を超える音声を無音部分で分割し、区間ごとに独立したstreamで処理します。
+
+- `stream_start`: `session_id`（1〜128文字）、`sample_rate: 16000`、任意の `language`。
+  BCP-47 localeの基本言語（ja-JP→jaなど）をstreamのlanguage optionへ設定し、nullは自動判定。
+  同時に1セッションだけ。
+- `stream_push`: 同じ `session_id`、先頭からの `offset`（サンプル数）、
+  `samples`（1〜32000個の有限なfloat、範囲[-1,1]、16kHz mono）。順序違反・重複は拒否。
+- `stream_flush`: 同じ `session_id`、送信済み全サンプル数の `offset`。
+  末尾paddingと `input_finished()` 後に残りをdecodeし、セッションを解放。
+- `stream_cancel` / `stream_close`: 同じIDのセッションを解放。旧IDは新セッションを解放しない。
+- 応答は通常の `id`, `ok` に加え `session_id`, `offset`, `model`, `text`, `final`。
+  `text` は毎回の全文置換で、追記用deltaではありません。flushだけ `final: true`。
+  close/cancel応答は `session_id`, `closed: true`。
+- load、batch transcribe、shutdown、streamの変更処理失敗・キャンセルで状態を破棄。
+  worker再起動後は復元せず、デスクトップ側が録音全体のbatch認識へ戻ります。
+- デスクトップのStreaming設定は既定OFF。Dictate/Translate/Edit/Askの録音中に使用し、
+  Edit/Askの選択範囲・入力監視は各モードが保持します。Retryはbatch経路です。途中結果は表示のみです。
+- `ASR_QWEN_DEMO_STREAMING=1` と `ASR_BACKEND=openai-compatible` の組合せは、通常のAudio Transcriptions APIの代わりに
+  公式Qwenデモの `/api/start`, `/api/chunk`, `/api/finish` に接続します。`ASR_API_BASE_URL` は数値loopback HTTP originのみで、APIキーは送りません。
+  モデル名は `qwen-demo:unverified`、言語は自動のみです。`stream_final_reusable=False` のためデスクトップは確定結果を再利用せず、録音全体の再認識を行います。
+  サービスは別途用意したvLLM環境で稼働させます。状態保持型encoderではなく、蓄積音声を再投入するバッファ型です。
+- Streamingは固定手動ゲインのraw音声を連続リサンプルします。全録音に基づく
+  自動ゲイン・ノイズ抑制はbatch fallbackのみに適用するため、精度は比較評価が必要です。
+- `ASR_OFFLINE_ONLY=1` は管理対象モデル・speech.cppの新規取得を拒否します。
+  desktopは `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1` も設定します。
+
+出典: [sherpa-onnx Nemotron](https://k2-fsa.github.io/sherpa/onnx/nemo/nemotron-streaming.html)、
+[固定ONNXモデル](https://huggingface.co/csukuangfj2/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11/tree/ab43d895f5985b1bbab8b6eac8607fcdc05343f3)、
+[元モデル・ライセンス](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b)。
+元モデルのrevision `ea30d66debe3740a08b573244286791d423d6b3e` のモデルカードで
+OpenMDW-1.1を確認しています（[ライセンス本文](https://openmdw.ai/license/1-1/)）。
+既存キャッシュの削除はモデルをアンロードしてアプリを終了し、管理対象の
+`%LOCALAPPDATA%/LocalVoice/models/sherpa-onnx/nemotron-3.5-streaming-560ms/ab43d895f5985b1bbab8b6eac8607fcdc05343f3`
+を利用者が明示的に削除します。更新はpin変更と検証を伴う別変更で行います。
+
+#### 固定音声replayとの接続
+
+`asr_worker.streaming_replay` は #86 の `scripts/bench_streaming.py` のadapter protocolを
+実モデルのworker sessionへ接続します。実測は実装後の別工程で、次のコマンド自体は未実行です。
+必要な依存・モデルを明示的に準備した後、既存の固定manifestを指定します。
+
+```powershell
+uv run scripts/bench_streaming.py --manifest bench_data/manifests/practical-ja-smoke-local-v1.json --output bench_data/results/nemotron-stream-new.json --adapter-cmd uv run --offline --extra sherpa-onnx -m asr_worker.streaming_replay --device cpu
+```
+
+CUDAは `--device cuda` に変更します。adapterは既定でモデルの新規取得を禁止します。
+明示的なモデル取得を許す場合だけ `--allow-download` を指定します（既存の
+`ASR_OFFLINE_ONLY=1` は解除しません）。入力PCM16を連続的に16kHzへ変換し、
+partialは全文置換、flush後だけfinalを返します。stable保証は提供しないため
+first stableは未計測です。原音に対する固定gain=1で、デスクトップの手動ゲインが1以外の場合と
+同一条件とは見なしません。これはASRエンジン計測であり、Windowsの貼り付け成功やIMEは測りません。
+
 `speech-cpp` は Windows x64/Vulkan 用の管理対象ローカルサーバーを起動します。
 初回 `load` 時に固定revision・SHA256のランタイムとQ8_0重みを取得し、
 `ASR_SPEECH_CPP_HOME`（未指定時 `%LOCALAPPDATA%/LocalVoice/speech.cpp`）に保存します。
@@ -75,7 +131,7 @@ Qwen3-ASRは多言語で、localeの基本言語コードを `language` に、�
 （localeなしはモデルの自動判定）。サーバーが報告するweight_typeは固定値（Q8_0）と一致する必要があります。
 
 `sherpa-onnx` と `transformers-asr` はランタイム・アダプター（`asr_worker/runtime_adapter.py`）です。
-`ASR_MODEL_ID` はアダプターが固定したモデルだけを受け付け（`sherpa-onnx`: `reazonspeech-k2-v2`、
+`ASR_MODEL_ID` はアダプターが固定したモデルだけを受け付け（`sherpa-onnx`: `reazonspeech-k2-v2` / `nemotron-3.5-streaming-560ms`、
 `transformers-asr`: `qwen3-asr-0.6b` / `qwen3-asr-1.7b`。それ以外は `invalid_model`）、初回 `load` 時に固定revision・
 容量・SHA256のファイルをHugging Faceから取得して
 `ASR_MANAGED_MODEL_HOME`（未指定時 `%LOCALAPPDATA%/LocalVoice/models`）`/<backend>/<model>/<revision>/` に保存します。
@@ -485,9 +541,14 @@ model-progress を発行する。これは Python の JSONL 通知ではない�
 | `invalid_request` | worker.py | リクエストがJSONオブジェクトでない / `id` が欠落 / `quantization` が文字列でない / 判断モデルの `model` が文字列でない / `prompt` の型が不正(非文字列要素を含むリスト、文字列・リスト・null以外) / `language` が文字列・null 以外、または32文字超 / `decoding` が `"greedy"`・null 以外。 |
 | `invalid_json` | worker.py (`serve`) | 受信行がJSONとして解釈できない(`JSONDecodeError`)。`id` は `null`。 |
 | `model_not_loaded` | worker.py | `load` 成功前に `transcribe` を要求した。 |
+| `model_not_cached` | runtime_adapter.py / speech_cpp.py / backends.py | オフライン専用設定で必要なモデル・ランタイムが未取得。既存ファイルは変更しない。 |
+| `stream_unsupported` | streaming.py | 選択モデルは状態保持型Streamingを提供しない。 |
+| `stream_busy` | streaming.py | 前のStreamingセッションが開いている。 |
+| `stream_missing` | streaming.py | 未開始・終了済み・旧workerのセッションID。 |
+| `stream_sequence` | streaming.py | サンプルoffsetが不連続、重複、またはflush時の被覆不足。 |
 | `invalid_audio_path` | worker.py | `audio_path` が非空文字列でない。 |
 | `audio_not_found` | worker.py | `audio_path` が示すパスが存在しない、またはファイルでない。 |
-| `unsupported_operation` | worker.py | `command`/`op` が `hello`/`health`/`load`/`transcribe`/`load_decision`/`unload_decision`/`classify_decision`/`cancel`/`shutdown` のいずれでもない。 |
+| `unsupported_operation` | worker.py | `command`/`op` が `hello`/`health`/`load`/`transcribe`/`stream_start`/`stream_push`/`stream_flush`/`stream_close`/`stream_cancel`/`load_decision`/`unload_decision`/`classify_decision`/`cancel`/`shutdown` のいずれでもない。 |
 | `cancelled` | worker.py / backends.py | `cancel`(§2.5)で中断された `transcribe` / `load_decision` / `classify_decision`。中断できずに完了した場合も結果を破棄してこのコードを返す。判断モデルの読み込み直後にキャンセルされた場合も、その判断モデルを解放する。 |
 | `unsupported_quantization` | backends.py(各バックエンドの `load` / `faster_whisper_compute_type`) | `quantization` が許容集合 `{4bit, 8bit, bf16}` 外。 |
 | `unsupported_backend` | backends.py (`create_backend`) | 未知のバックエンド名。プロセス起動時 (`main`) に発生し、終了コード2でワーカーが起動失敗する(この場合プロトコル応答ではなくstderr出力)。 |

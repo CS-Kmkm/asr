@@ -714,6 +714,8 @@ class FasterWhisperBackend(ProgressReporting):
         )
         if cached is not None:
             return cached
+        if os.environ.get("ASR_OFFLINE_ONLY") == "1":
+            raise BackendError("model_not_cached", "Offline mode requires the speech model already cached")
         self.report_progress("download", model=repo_id)
         return download_snapshot(
             repo_id,
@@ -1035,6 +1037,9 @@ def create_backend(name: str) -> Backend:
     if name == "faster-whisper":
         return FasterWhisperBackend()
     if name == "openai-compatible":
+        if os.environ.get("ASR_QWEN_DEMO_STREAMING") == "1":
+            from .qwen_streaming_api import QwenStreamingApiBackend
+            return QwenStreamingApiBackend()
         return OpenAICompatibleBackend()
     if name == "speech-cpp":
         from .speech_cpp import SpeechCppBackend

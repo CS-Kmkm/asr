@@ -7,9 +7,9 @@ library loaded in this process, and this process holding a CUDA context
 (``nvidia-smi`` compute-apps). Otherwise it reports CPU (``auto``) or fails
 (``cuda``).
 
-This stage implements offline (batch) recognition. Online recognizers for
-stateful streaming (#82) are a new ``ManagedModel.kind`` with its own builder
-and session object; the download/verify/device lifecycle stays as is.
+Offline ReazonSpeech and online Nemotron use separate ``ManagedModel.kind``
+builders and per-take sessions; the pinned download/verify/device lifecycle
+is shared. Online models also expose independent-stream batch recognition.
 """
 from __future__ import annotations
 
@@ -57,7 +57,22 @@ REAZONSPEECH_K2_V2 = ManagedModel(
     japanese_only=True,
     kind="offline_transducer",
 )
-MODELS = {model.id: model for model in (REAZONSPEECH_K2_V2,)}
+NEMOTRON_STREAMING = ManagedModel(
+    id="nemotron-3.5-streaming-560ms",
+    display_name="Nemotron 3.5 ASR Streaming 0.6B (560 ms, INT8)",
+    repo="csukuangfj2/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11",
+    revision="ab43d895f5985b1bbab8b6eac8607fcdc05343f3",
+    files=(
+        PinnedFile("encoder.int8.onnx", "012e9321373af99021415e0b0eb3ec827b4be3153be6f30d9b448fe65e896e68", 657601403),
+        PinnedFile("decoder.int8.onnx", "19f9c98fc6d0a2c33a65a43b36fdb2e914c26c0aa9764be3aebc502a1e982fb0", 14978075),
+        PinnedFile("joiner.int8.onnx", "4101c7c679a0bc30483794b27a059e34e79232aa2068d78d51231a22c8b0d7ce", 9504438),
+        PinnedFile("tokens.txt", "729cc103155bafa785f9cd45746cd41cabe97eab7182fc04d594129587958f8a", 131440),
+    ),
+    license="OpenMDW-1.1",
+    japanese_only=False,
+    kind="online_transducer",
+)
+MODELS = {model.id: model for model in (REAZONSPEECH_K2_V2, NEMOTRON_STREAMING)}
 
 
 def cuda_library_folders() -> list[Path]:
@@ -161,11 +176,12 @@ class SherpaOnnxBackend(RuntimeAdapter):
         return max(1, min(4, (os.cpu_count() or 2) // 2))
 
     def _build(self, model: ManagedModel, paths: dict[str, Path], provider: str) -> tuple[Any, str]:
-        if model.kind != "offline_transducer":
+        if model.kind not in {"offline_transducer", "online_transducer"}:
             raise BackendError("invalid_model", f"Unsupported sherpa-onnx model kind: {model.kind}")
         files = [file.name for file in model.files]
         with captured_native_stderr() as log:
-            recognizer = self.sherpa.OfflineRecognizer.from_transducer(
+            factory = self.sherpa.OnlineRecognizer if model.kind == "online_transducer" else self.sherpa.OfflineRecognizer
+            recognizer = factory.from_transducer(
                 encoder=str(paths[files[0]]), decoder=str(paths[files[1]]), joiner=str(paths[files[2]]),
                 tokens=str(paths[files[3]]), num_threads=self._threads(), sample_rate=model.sample_rate,
                 feature_dim=80, decoding_method="greedy_search", provider=provider,
@@ -179,15 +195,51 @@ class SherpaOnnxBackend(RuntimeAdapter):
 
         return np.zeros(int(model.sample_rate * WARMUP_SECONDS), dtype=np.float32)
 
-    def _decode(self, recognizer: Any, chunks: list[Any], rate: int) -> list[str]:
+    def _decode(self, recognizer: Any, chunks: list[Any], rate: int, language: str | None = None) -> list[str]:
         texts = []
         for chunk in chunks:
             self.raise_if_cancelled()
-            stream = recognizer.create_stream()
+            stream = self._online_stream(recognizer, language) if self.supports_streaming else recognizer.create_stream()
             stream.accept_waveform(rate, chunk)
-            recognizer.decode_stream(stream)
-            texts.append(str(stream.result.text))
+            if self.supports_streaming:
+                texts.append(self.decode_online(stream, [], final=True, recognizer=recognizer))
+            else:
+                recognizer.decode_stream(stream)
+                texts.append(str(stream.result.text))
         return texts
+
+    @property
+    def supports_streaming(self) -> bool:
+        return self.models[self.catalog_id].kind == "online_transducer"
+
+    @staticmethod
+    def _online_stream(recognizer: Any, language: str | None) -> Any:
+        base = language.replace("_", "-").split("-", 1)[0].lower() if language else None
+        if base not in (None, "auto", "en", "es", "de", "fr", "it", "ar", "ja", "ko", "pt", "ru", "hi", "zh", "vi", "he", "nl", "cs", "da", "pl", "no", "sv", "th", "tr", "bg", "el", "et", "fi", "hr", "hu", "lt", "lv", "ro", "sk", "uk", "mt", "sl"):
+            raise BackendError("language_unsupported", "Nemotron does not support the selected speech language")
+        stream = recognizer.create_stream()
+        if base not in (None, "auto"):
+            stream.set_option("language", base)
+        return stream
+
+    def create_online_stream(self, language: str | None = None) -> Any:
+        if self.recognizer is None or not self.supports_streaming:
+            raise BackendError("stream_unsupported", "Load a stateful streaming model first")
+        return self._online_stream(self.recognizer, language)
+
+    def decode_online(self, stream: Any, samples: Any, final: bool, recognizer: Any = None) -> str:
+        import numpy as np
+
+        recognizer = self.recognizer if recognizer is None else recognizer
+        if len(samples):
+            stream.accept_waveform(16000, np.asarray(samples, dtype=np.float32))
+        if final:
+            stream.accept_waveform(16000, np.zeros(16000, dtype=np.float32))
+            stream.input_finished()
+        while recognizer.is_ready(stream):
+            self.raise_if_cancelled()
+            recognizer.decode_stream(stream)
+        return str(recognizer.get_result(stream))
 
     def _open(self, model: ManagedModel, paths: dict[str, Path]) -> None:
         version = getattr(self.sherpa, "__version__", "unknown")
@@ -253,7 +305,7 @@ class SherpaOnnxBackend(RuntimeAdapter):
         # The dictionary is applied by the app after recognition; this
         # transducer is decoded greedily without hotwords.
         chunks = split_on_quiet(samples, rate, MAX_CHUNK_SECONDS)
-        texts = self._decode(self.recognizer, chunks, rate)
+        texts = self._decode(self.recognizer, chunks, rate, language)
         segments: list[dict[str, Any]] = []
         start = 0.0
         for chunk, text in zip(chunks, texts):

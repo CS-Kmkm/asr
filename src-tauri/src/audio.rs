@@ -199,6 +199,23 @@ pub(crate) fn raw_position(index: usize, sample_rate: u32) -> Duration {
 }
 
 impl AudioSnapshot {
+    /// Raw mono samples with fixed manual gain. Streaming must not recompute
+    /// whole-window gain/noise statistics for already submitted samples.
+    pub(crate) fn into_stream_pcm(self) -> (Vec<f32>, u32, CaptureConfig) {
+        let gain = self.config.enhancement.gain;
+        let samples = self
+            .samples
+            .into_iter()
+            .map(|v| {
+                if v.is_finite() {
+                    (v * gain).clamp(-1.0, 1.0)
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        (samples, self.input_sample_rate, self.config)
+    }
     /// Length of the raw audio, before resampling and enhancement.
     pub(crate) fn duration(&self) -> Duration {
         samples_to_duration(self.samples.len(), self.input_sample_rate)

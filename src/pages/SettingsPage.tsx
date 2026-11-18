@@ -12,6 +12,7 @@ import { speechLocaleRegistry, translationLanguageRegistry, uiLocaleRegistry } f
 import { getShortcutWarning, startMicrophoneTest, stopMicrophoneTest } from "../api";
 import { translateAppMessage, useI18n } from "../i18n";
 import { decisionConflictsWithAsr } from "../modelCatalog";
+import { ExecutionSettings } from "../components/ExecutionSettings";
 
 const translationLanguages = translationLanguageRegistry.map(({ code, label }) => [code, label] as const);
 
@@ -294,6 +295,7 @@ export function SettingsPage({
       <SettingsRepairBanner settings={settings} />
       <section className="panel" hidden={section !== "all" && section !== "input"}>
         {section === "all" && <h2>{t("Input settings")}</h2>}
+        <ExecutionSettings settings={settings} onSave={onSave} recording={recording} />
         <SettingRow title={t("Speech language")} detail={t("Only the base language is used. VibeVoice ignores this setting.")}
           detailMode={settings.asrBackend === "vibevoice" ? "inline" : "hint"}
           control={<select value={settings.speechLocale ?? "auto"} onChange={(event) => onSave({ speechLocale: event.target.value === "auto" ? null : event.target.value as Settings["speechLocale"] })}>

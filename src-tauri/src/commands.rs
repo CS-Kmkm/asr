@@ -1223,6 +1223,11 @@ async fn start_owned_recording(
             .await
             .map_err(|_| "recording session task failed".to_owned())?,
         )
+    } else if !dictation_test
+        && crate::live_dictation::streaming::enabled(&settings)
+        && matches!(take_mode, PipelineMode::Edit | PipelineMode::Ask)
+    {
+        Some(live_dictation::LiveDraft::recognition_only(&settings))
     } else {
         None
     };
@@ -2815,6 +2820,7 @@ fn apply_settings_patch(
     let mut settings: Settings = serde_json::from_value(serde_json::Value::Object(merged))
         .map_err(|error| format!("invalid settings value: {error}"))?;
     if settings.asr_backend != stored.asr_backend
+        || settings.qwen_demo_streaming != stored.qwen_demo_streaming
         || crate::privacy::asr_consent_key(&settings) != crate::privacy::asr_consent_key(stored)
     {
         let current = crate::privacy::asr_consent_key(&settings);
@@ -2981,6 +2987,8 @@ fn worker_configuration_changed(previous: &Settings, next: &Settings) -> bool {
     worker_command_inputs(previous) != worker_command_inputs(next)
         || crate::worker_device_policy(previous) != crate::worker_device_policy(next)
         || previous.model_quantization != next.model_quantization
+        || previous.offline_only != next.offline_only
+        || previous.qwen_demo_streaming != next.qwen_demo_streaming
 }
 
 /// The settings `worker_command_for_settings` derives the worker command

@@ -23,6 +23,7 @@ use tokio::sync::watch;
 mod benchmark;
 pub(crate) mod incremental;
 mod segmentation;
+pub(crate) mod streaming;
 use segmentation::{append_utterance, trailing_quiet, Decision, Segmentation};
 
 const LIVE_INTERVAL: Duration = Duration::from_millis(150);
@@ -249,6 +250,7 @@ pub(crate) struct LiveDraft {
     /// Incremental final recognition when its setting was on at start; the
     /// stop path takes it for the final recognition.
     pub(crate) incremental: Option<incremental::Take>,
+    pub(crate) streaming: Option<streaming::Session>,
     /// The live text shown last while recording (a revision, or the committed
     /// text a retraction returned to). Held in memory only; the stop path
     /// compares it with the final transcript.
@@ -256,6 +258,30 @@ pub(crate) struct LiveDraft {
 }
 
 impl LiveDraft {
+    /// Recognition-only owner for Edit/Ask. Their own session keeps the
+    /// selected field and input guards; this owner never captures or pastes.
+    pub(crate) fn recognition_only(settings: &Settings) -> Self {
+        Self {
+            injector: SystemTextInjector::new(InjectionOptions {
+                restore_clipboard: settings.clipboard_restore,
+            }),
+            monitor: Arc::new(InputMonitor::default()),
+            target: TargetWindow::this_app(),
+            session: None,
+            checkpoint: None,
+            focus_identity: None,
+            after_input: false,
+            require_empty_selection: true,
+            attempted: false,
+            defer_insertion: true,
+            pasted: false,
+            preview_decoding: preview_decoding(settings),
+            incremental: None,
+            streaming: streaming::Session::plan(settings),
+            last_hypothesis: String::new(),
+        }
+    }
+
     fn can_insert_final(&self, text: &str) -> bool {
         !text.is_empty()
             && self
@@ -299,10 +325,11 @@ impl LiveDraft {
             after_input: false,
             require_empty_selection: false,
             attempted: false,
-            defer_insertion,
+            defer_insertion: defer_insertion || streaming::enabled(settings),
             pasted: false,
             preview_decoding: preview_decoding(settings),
             incremental: incremental::Take::plan(settings),
+            streaming: streaming::Session::plan(settings),
             last_hypothesis: String::new(),
         }
     }
@@ -333,6 +360,7 @@ impl LiveDraft {
             pasted: false,
             preview_decoding: preview_decoding(settings),
             incremental: incremental::Take::plan(settings),
+            streaming: streaming::Session::plan(settings),
             last_hypothesis: String::new(),
         }
     }
@@ -619,6 +647,30 @@ pub(crate) fn start(
     let (stop, stopped) = watch::channel(false);
     let decoding = draft.preview_decoding;
     let task = spawn_recording_owner(async move {
+        if let Some(mut stream) = draft.streaming.take() {
+            let services = app.state::<Services>();
+            stream
+                .run(
+                    &services.audio,
+                    services.transcriber.as_ref(),
+                    cancel,
+                    stopped,
+                    |text| {
+                        if preview_enabled
+                            && services.lifecycle.phase() == PipelinePhase::Recording
+                            && !services.lifecycle.is_cancelled(operation_id)
+                        {
+                            let state = app.state::<AppState>();
+                            let _ = app.emit("app-state", state.publish_result(text.to_owned()));
+                            recording_overlay::show_live_subtitle(&app, text);
+                            draft.note_hypothesis(text);
+                        }
+                    },
+                )
+                .await;
+            draft.streaming = Some(stream);
+            return draft;
+        }
         let mut incremental = draft
             .incremental
             .take()
@@ -978,6 +1030,23 @@ fn window_text(result: Result<asr::Transcript, asr::AsrError>) -> Result<Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognition_only_stream_never_owns_insertion_or_selection() {
+        let settings = Settings {
+            stateful_streaming: true,
+            asr_backend: "sherpa-onnx".into(),
+            model_id: Some("nemotron-3.5-streaming-560ms".into()),
+            ..Settings::default()
+        };
+        let draft = LiveDraft::recognition_only(&settings);
+        assert!(draft.streaming.is_some());
+        assert!(draft.defer_insertion);
+        assert!(draft.checkpoint.is_none());
+        assert!(draft.session.is_none());
+        assert!(draft.incremental.is_none());
+        assert!(!draft.can_insert_final("recognized instruction"));
+    }
     use crate::asr::WorkerCommand;
     use audio::{
         AudioArtifact, AudioDevice, AudioFuture, AudioSnapshot, CaptureConfig, CaptureState,
@@ -1014,6 +1083,7 @@ mod tests {
             pasted: false,
             preview_decoding: asr::PreviewDecoding::Standard,
             incremental: None,
+            streaming: None,
             last_hypothesis: String::new(),
         }
     }
@@ -1476,6 +1546,7 @@ mod tests {
             pasted: false,
             preview_decoding: asr::PreviewDecoding::Standard,
             incremental: None,
+            streaming: None,
             last_hypothesis: String::new(),
         };
         (draft, mock)

@@ -107,6 +107,9 @@ export interface Settings {
   livePreviewFastDecode: boolean;
   /** Dictate/Translate: recognize finished ranges while recording (local speech backends only). */
   incrementalFinalAsr: boolean;
+  statefulStreaming: boolean;
+  qwenDemoStreaming: boolean;
+  offlineOnly: boolean;
 }
 /**
  * Stored settings with the backend revision of the write that stored them.

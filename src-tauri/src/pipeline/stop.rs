@@ -327,23 +327,53 @@ impl RecordingDriver for Desktop<'_> {
         }
         let asr_started = Instant::now();
         let model_was_ready = model_ready.is_ok();
+        let stream_transcript = if model_was_ready {
+            if let Some(stream) = draft.as_mut().and_then(|draft| draft.streaming.take()) {
+                let result = stream
+                    .finish(services.transcriber.as_ref(), &settings, cancel.clone())
+                    .await;
+                if !services.lifecycle.is_dictation_test(operation_id)
+                    && !matches!(result, Err(asr::AsrError::Cancelled))
+                {
+                    let _ = metrics.add_metric(
+                        "asr_streaming",
+                        Some(&settings.asr_backend),
+                        Some(asr_started.elapsed().as_millis() as i64),
+                        result.is_ok(),
+                        result.is_err().then_some("stream_fallback"),
+                    );
+                }
+                match result {
+                    Ok(value) => Some(Ok(value)),
+                    Err(asr::AsrError::Cancelled) => Some(Err(asr::AsrError::Cancelled)),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let transcript_result = match model_ready {
             Err(error) => Err((error, TranscriptionFailure::Retryable)),
-            Ok(_) => match crate::live_dictation::incremental::transcribe_final(
-                services.transcriber.as_ref(),
-                draft.as_mut().and_then(|draft| draft.incremental.take()),
-                &settings,
-                &artifact.path,
-                prompt.as_deref(),
-                cancel,
-                |outcome| {
-                    if !services.lifecycle.is_dictation_test(operation_id) {
-                        outcome.record(metrics, &settings.asr_backend);
-                    }
-                },
-            )
-            .await
-            {
+            Ok(_) => match if let Some(result) = stream_transcript {
+                result
+            } else {
+                crate::live_dictation::incremental::transcribe_final(
+                    services.transcriber.as_ref(),
+                    draft.as_mut().and_then(|draft| draft.incremental.take()),
+                    &settings,
+                    &artifact.path,
+                    prompt.as_deref(),
+                    cancel,
+                    |outcome| {
+                        if !services.lifecycle.is_dictation_test(operation_id) {
+                            outcome.record(metrics, &settings.asr_backend);
+                        }
+                    },
+                )
+                .await
+            } {
                 Ok(value) => {
                     trace.span_since(TakeSpan::Asr, asr_started);
                     trace.final_ready();

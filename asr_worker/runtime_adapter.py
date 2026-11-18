@@ -50,8 +50,8 @@ class ManagedModel:
     """One catalog model served by a runtime adapter.
 
     ``kind`` selects how the adapter builds the recognizer (for example
-    ``offline_transducer``). A streaming model added by #82 gets its own kind
-    and recognizer builder without changing the download/verify lifecycle.
+    ``offline_transducer`` or ``online_transducer``). Streaming has its own
+    recognizer/session without changing the download/verify lifecycle.
     """
 
     id: str
@@ -181,6 +181,8 @@ def fetch_model(runtime: str, model: ManagedModel, backend: ProgressReporting) -
     clean_stale_staging(folder)
     paths = {file.name: folder / file.name for file in model.files}
     missing = [file for file in model.files if not paths[file.name].exists()]
+    if missing and os.environ.get("ASR_OFFLINE_ONLY") == "1":
+        raise BackendError("model_not_cached", "Offline mode requires model files already cached; turn it off and explicitly load the model first")
     if missing:
         progress = {"completed": 0, "total": sum(file.size for file in missing)}
         backend.report_progress("download", model=f"{model.repo}@{model.revision[:12]}",

@@ -26,6 +26,8 @@ const fieldLabels = {
   liveTargetInsertion: "Live text insertion (experimental)",
   livePreviewFastDecode: "Faster live preview",
   incrementalFinalAsr: "Incremental final transcription (experimental)",
+  statefulStreaming: "Stateful streaming (experimental)",
+  offlineOnly: "Offline only",
   speculativeCorrection: "Speculative correction (experimental)",
   noiseSuppression: "Noise suppression",
   inputGainPercent: "Input gain",

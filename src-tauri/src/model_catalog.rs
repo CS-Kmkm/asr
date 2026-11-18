@@ -260,10 +260,8 @@ mod tests {
                 ["japanese_only", "multilingual", "server_defined"].contains(&scope)
             }));
             for mode in &model.inference {
-                // Stateful streaming is a separate capability (#82) that no
-                // implemented engine provides yet; never advertise it here.
                 assert!(
-                    ["batch", "chunked"].contains(&mode.as_str()),
+                    ["batch", "chunked", "stateful_streaming"].contains(&mode.as_str()),
                     "{}",
                     model.id
                 );

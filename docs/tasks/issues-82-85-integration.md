@@ -1,0 +1,35 @@
+Goal: Implement the remaining application behavior of issues #82-#85 before the final #81 product benchmark.
+
+Scope: Add opt-in stateful Nemotron streaming through the existing sherpa-onnx runtime and JSONL worker; add Hybrid presets and explicit offline execution policy. Preserve the already merged Smart Dictate/Edit (#84) and correction quality/confirmed learning (#85).
+
+Constraints: No commits, pushes, Issue changes, model downloads or cloud calls without the corresponding authorization. Preserve pre-existing edits in docs/windows_verification.md, scripts/bench_asr.py, scripts/bench_e2e_passive.py and its test. Streaming is opt-in and never the default; failed/unverified sessions use full-recording recognition. No provisional streaming text is pasted. Reuse existing consent, cancellation, correction and insertion paths. Use pnpm, uv and cargo as established by this repository.
+
+Reuse / creation plan: Extend sherpa_onnx_runtime.py, worker.py, asr.rs and live_dictation; add a bounded streaming session module, Hybrid settings controls and behavior tests. Reuse the pinned model catalog and FinalTail coverage mechanism. streaming_replay.py connects the existing #86 start/audio/flush replay protocol to the real engine without changing the evaluation harness. #84/#85 need regression verification, not duplicate implementations.
+
+Acceptance criteria:
+1. Streaming has a pinned model and explicit capability, start/push/flush/cancel/close with session and sequence validation. Verify Python fake-runtime/protocol tests; batch-only backends retain their contract.
+2. A recording streams serial PCM, replaces the preview hypothesis and reuses only a successful complete final flush with unchanged model/settings; otherwise recognizes the full artifact. Verify Rust session tests and pipeline regression checks.
+3. Hybrid presets allow independent subsequent ASR/LLM edits, disclose audio/text destinations separately and never grant consent or switch to an unapproved cloud fallback. Offline policy blocks cloud ASR/text before requests. Verify settings/privacy and frontend tests.
+4. Existing Smart routing, insertion guards and confirmed learning continue to pass their automated checks.
+5. Build, format, targeted tests and independent read-only audit pass; resolve supported findings. Final product benchmarks, real-provider/blind quality comparison and foreground manual Windows checks remain subsequent verification and are not represented as measured.
+
+Open questions: May decide myself: use one serial sherpa recognizer with a separate stream per take, final-only insertion, raw fixed-gain PCM for stable streaming preprocessing; retain the enhanced whole-recording fallback. No blocking user questions.
+
+Context: GitHub #80-#85; docs/tasks/issue-84-smart-dictate-edit.md and issue-85-text-quality.md; existing #87 runtime/catalog and #86 replay protocol.
+
+Status: Implementation complete; final verification results are recorded below. No commit, push, Issue mutation, model-weight download, cloud inference request or product benchmark was performed. Public metadata/model-card/token-definition sources were retrieved to verify pins, API and license. Pre-existing working-tree changes were preserved.
+
+Completion report (2026-11-17):
+- AC1 done: pinned Nemotron 3.5 560ms INT8 artifacts (revision ab43d895f5985b1bbab8b6eac8607fcdc05343f3), offline/online recognizer builders, optional stream operations with strict session/offset/PCM validation, late-start cancellation cleanup and explicit language selection. Catalog mirrors runtime file hashes/sizes. The original model card at ea30d66debe3740a08b573244286791d423d6b3e identifies OpenMDW-1.1; no Apache/NVIDIA-license assumption is used for Nemotron.
+- AC2 done: serial recording owner with continuous rational 16kHz resampling, sealed FinalTail coverage, settings/config/model-generation checks, preview-only hypotheses, final flush reuse and unchanged full-recording fallback. Edit/Ask/Retry use independent-stream batch recognition. Existing correction, cancellation and insertion paths remain authoritative. The asr_streaming metric records final reuse/fallback; #86 replay records first partial and flush timing with exact runtime identity. No stable prefix is promised or fabricated.
+- AC3 done: six one-shot preset patches, separate editable ASR/LLM configuration and audio/text destination display, independent existing Privacy consent, offline restrictions on cloud requests, managed downloads and bundled worker provisioning. Presets do not grant consent, change API keys/endpoints, change History retention or enable learning. Offline errors have their own localized AI failure code.
+- AC4 done: full Rust/frontend/Python regression suites include existing Smart selection/field guards and confirmed learning. #84/#85 were already integrated in #104/#102 and were not reimplemented.
+- AC5 done: independent native read-only audit (requested gpt-6-sol/xhigh) completed, with scoped follow-up for replay/cancellation. Fixed and rechecked: explicit speech locale was not passed to Nemotron; protocol wording incorrectly described long batch audio as one stream. Also fixed a non-pasteable PowerShell example found in follow-up. No open confirmed code defect was reported. External Claude source transmission was not used, consistent with the existing repository task policy. Clippy all-targets with -D warnings, cargo fmt --check, frontend production build, Node checks and git diff --check pass.
+
+Verification evidence:
+- Rust full library suite: 947 passed / 8 ignored (.ai/issues-82-85-rust-v2.log). After final locale/start-cleanup changes, targeted streaming suite: 8 passed (.ai/issues-82-85-streaming-final.log); Clippy all targets passes (.ai/issues-82-85-clippy-final.log).
+- Frontend full suite: 216 passed (.ai/issues-82-85-vitest-v3.log); production TypeScript/Vite build passes (.ai/issues-82-85-build-final.log). Scoped final model/preset UI suite: 17 passed (.ai/issues-82-85-ui-final.log).
+- Python final integrated suite: 442 passed / 1 skipped / 233 subtests (.ai/issues-82-85-pytest-final.log). Added locale/cancellation/replay and protocol checks separately: 24 passed (.ai/issues-82-85-streaming-python-final.log).
+- Node scripts: 41 passed (.ai/issues-82-85-node-final.log).
+
+Limits / next work: Real Nemotron CPU/CUDA initialization, Japanese recognition quality and runtime/device observations have not been exercised with actual weights. Streaming uses fixed manual gain rather than whole-recording enhancement. Independent-stream batch fallback is therefore a different preprocessing/inference condition and must be compared honestly. #81 product benchmarking, real-provider/blind correction quality and foreground Windows/IME/clipboard checks remain subsequent verification. Defaults remain batch/streaming OFF; model adoption is not decided. Usage and reproducible replay commands are in README.md and docs/worker_protocol.md. #84/#85 native checks remain in their existing contracts; their Issues are not represented as fully verified or closed.

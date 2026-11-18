@@ -291,6 +291,16 @@ pub enum PreviewDecoding {
     reason = "async_trait generates must_use on boxed futures; required on its generated methods on newer Clippy."
 )]
 pub trait Transcriber: Send + Sync {
+    /// Stateful operations are optional; batch-only implementations keep their contract.
+    async fn stream_request(
+        &self,
+        _request: Value,
+        _cancel: watch::Receiver<bool>,
+    ) -> Result<Value, AsrError> {
+        Err(AsrError::Protocol(
+            "stateful streaming is unavailable".into(),
+        ))
+    }
     async fn health(&self) -> Result<WorkerHealth, AsrError> {
         Err(AsrError::Protocol("worker health is unavailable".into()))
     }
@@ -1283,6 +1293,31 @@ impl JsonlTranscriber {
 
 #[async_trait]
 impl Transcriber for JsonlTranscriber {
+    async fn stream_request(
+        &self,
+        mut request: Value,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<Value, AsrError> {
+        request["id"] = json!(self.next_id());
+        let close = matches!(
+            request["command"].as_str(),
+            Some("stream_close" | "stream_cancel")
+        );
+        if close && self.state.lock().await.running.is_none() {
+            return Ok(json!({"closed":true}));
+        }
+        self.protocol_request(
+            request,
+            cancel,
+            if close {
+                Duration::from_secs(2)
+            } else {
+                self.request_timeout
+            },
+            !close,
+        )
+        .await
+    }
     async fn load_decision(
         &self,
         model: &str,

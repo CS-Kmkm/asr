@@ -31,7 +31,7 @@ function pinnedModelId(backend: AsrBackend, modelId: string) {
 }
 const pinnedModelDetails: Partial<Record<AsrBackend, MessageKey>> = {
   "speech-cpp": "Haas: Apache-2.0. Parakeet Japanese: CC-BY-4.0. Both use greedy TDT; CTC is unavailable in this runtime. Qwen3-ASR: Apache-2.0; multilingual, dictionary words are passed to the model as context.",
-  "sherpa-onnx": "ReazonSpeech k2 v2: Apache-2.0. Recordings longer than about 25 seconds are split at pauses.",
+  "sherpa-onnx": "ReazonSpeech: Apache-2.0, Japanese batch. Nemotron: OpenMDW-1.1, multilingual streaming (experimental). Streaming is enabled separately in Input settings.",
   "transformers-asr": "Qwen3-ASR 0.6B / 1.7B: Apache-2.0. Dictionary words are passed to the model as context.",
 };
 
@@ -152,7 +152,7 @@ export function ModelsPage({
       : pinnedEntry?.languageScope === "multilingual" ? t("Multilingual, including Japanese. Qwen3-ASR on a Vulkan GPU (not CUDA); Q8_0. Downloads 0.8 GB (0.6B) or 2.2 GB (1.7B) plus the runtime on first load.")
       : t("Japanese only. Vulkan encoder and CPU decoder; Q8_0. Downloads about 690 MB on first load."),
     "sherpa-onnx": !japaneseLocaleSupported ? t("Japanese speech models require Japanese or automatic speech language. Select Japanese in Settings or switch to faster-whisper.")
-      : t("Japanese only. ReazonSpeech k2 on ONNX Runtime with CUDA or CPU. Downloads about 615 MB on first load."),
+      : t("ONNX Runtime on CUDA or CPU. ReazonSpeech: Japanese batch, about 615 MB. Nemotron: multilingual streaming, about 682 MB. Downloads on first load."),
     "transformers-asr": t("Multilingual, including Japanese. Qwen3-ASR on a CUDA GPU; CPU only when selected. Downloads 1.6 GB (0.6B) or 4.1 GB (1.7B) on first load."),
   };
   const decisionConflict = settings.automaticVoiceMode && decisionConflictsWithAsr(backend, device);

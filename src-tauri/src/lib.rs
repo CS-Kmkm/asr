@@ -107,7 +107,7 @@ pub(crate) fn model_identity(settings: &Settings) -> (Option<String>, String) {
                 "sherpa-onnx:{}",
                 custom_model.unwrap_or("reazonspeech-k2-v2")
             )),
-            "Japanese only. ONNX Runtime through sherpa-onnx on CUDA or CPU; the speech device setting chooses. The pinned model downloads on first load.".into(),
+            "ReazonSpeech Japanese batch or Nemotron multilingual streaming on ONNX Runtime (CUDA / CPU). Pinned models download on first load unless offline mode is enabled.".into(),
         ),
         "transformers-asr" => (
             Some(format!(
@@ -117,14 +117,16 @@ pub(crate) fn model_identity(settings: &Settings) -> (Option<String>, String) {
             "Multilingual, including Japanese. Qwen3-ASR runs with transformers on a CUDA GPU (CPU only when selected). The pinned model downloads on first load.".into(),
         ),
         "openai-compatible" => (
-            Some(format!(
+            Some(if settings.qwen_demo_streaming { "qwen-demo:unverified".into() } else { format!(
                 "openai-compatible:{}",
                 custom_model.unwrap_or("gpt-4o-mini-transcribe")
-            )),
-            format!(
+            ) }),
+            if settings.qwen_demo_streaming {
+                format!("Uses the official Qwen streaming demo API at {} (/api/start, /api/chunk, /api/finish), without an API key. Requires a separately operated vLLM service. Hypotheses are buffered; complete audio is processed again at stop because the service does not attest model identity or final coverage.", settings.api_base_url)
+            } else { format!(
                 "Uses an OpenAI-compatible Audio Transcriptions API at {}. The API key is read from the {} environment variable.",
                 settings.api_base_url, settings.api_key_env_var
-            ),
+            ) },
         ),
         "mock" => (
             Some("mock".into()),
@@ -228,6 +230,27 @@ pub(crate) fn worker_command_with_speech_key(
         }
     }
     command.quantization = Some(settings.model_quantization.clone());
+    command.env.push((
+        "ASR_QWEN_DEMO_STREAMING".into(),
+        if settings.qwen_demo_streaming {
+            "1"
+        } else {
+            "0"
+        }
+        .into(),
+    ));
+    command.env.push((
+        "ASR_OFFLINE_ONLY".into(),
+        if settings.offline_only { "1" } else { "0" }.into(),
+    ));
+    if settings.offline_only {
+        for key in ["HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"] {
+            command.env.push((key.into(), "1".into()));
+        }
+    }
+    if settings.offline_only {
+        command.provision = None;
+    }
     if let Some(device) = worker_device_policy(settings) {
         command.env.push(("ASR_DEVICE".into(), device.into()));
     }
@@ -900,6 +923,25 @@ mod model_configuration_tests {
             .env
             .iter()
             .any(|(key, value)| key == "ASR_MODEL_ID" && value == "openai/whisper-custom"));
+    }
+
+    #[test]
+    fn qwen_demo_status_and_worker_use_the_explicit_protocol() {
+        let settings = Settings {
+            asr_backend: "openai-compatible".into(),
+            qwen_demo_streaming: true,
+            ..Settings::default()
+        };
+        let (identity, detail) = model_identity(&settings);
+        assert_eq!(identity.as_deref(), Some("qwen-demo:unverified"));
+        assert!(detail.contains("/api/start"));
+        assert!(detail.contains("without an API key"));
+        assert!(!detail.contains("Audio Transcriptions API"));
+        let command = worker_command_for_settings(&settings);
+        assert!(command
+            .env
+            .iter()
+            .any(|(key, value)| key == "ASR_QWEN_DEMO_STREAMING" && value == "1"));
     }
 
     #[test]

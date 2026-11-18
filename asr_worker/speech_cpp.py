@@ -173,6 +173,8 @@ def acquire(url: str, target: Path, expected: str, backend: Any) -> None:
     if target.exists():
         verify(target, expected)
         return
+    if os.environ.get("ASR_OFFLINE_ONLY") == "1":
+        raise BackendError("model_not_cached", "Offline mode requires the model and runtime already cached")
     import httpx
     target.parent.mkdir(parents=True, exist_ok=True)
     staging: Path | None = None

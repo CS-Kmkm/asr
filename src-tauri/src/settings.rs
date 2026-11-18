@@ -30,6 +30,27 @@ pub(crate) fn validate_translation_targets(settings: &Settings) -> Result<(), St
 
 /// The checks of a settings save that depend only on the saved values.
 pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
+    if settings.qwen_demo_streaming && settings.asr_backend == "openai-compatible" {
+        let url = reqwest::Url::parse(&settings.api_base_url).map_err(|_| {
+            "Qwen Streaming needs a loopback HTTP origin and automatic speech language."
+        })?;
+        let host = url.host_str().unwrap_or("").trim_matches(['[', ']']);
+        if url.scheme() != "http"
+            || !host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !["", "/"].contains(&url.path())
+            || settings.speech_locale.is_some()
+        {
+            return Err(
+                "Qwen Streaming needs a loopback HTTP origin and automatic speech language.".into(),
+            );
+        }
+    }
     if settings.translation_instruction.chars().count() > 500
         || settings
             .translation_instruction

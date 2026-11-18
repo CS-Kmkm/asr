@@ -15,10 +15,11 @@ from typing import Any, Callable, Iterable, Iterator, TextIO
 from .backends import DECODINGS, Backend, BackendError, CancelCheck, QUANTIZATIONS, cancelled_error, create_backend
 from .diagnostics import log_exception
 from .decision import DecisionModel
+from .streaming import StreamingSession
 
 PROTOCOL_VERSION = 1
 WORKER_VERSION = "0.1.0"
-SUPPORTED_OPERATIONS = "hello, health, load, transcribe, load_decision, unload_decision, classify_decision, cancel, shutdown"
+SUPPORTED_OPERATIONS = "hello, health, load, transcribe, stream_start, stream_push, stream_flush, stream_cancel, stream_close, load_decision, unload_decision, classify_decision, cancel, shutdown"
 
 
 def _configure_protocol_stdio() -> None:
@@ -95,6 +96,7 @@ class Worker:
         self.backend = backend
         self.loaded = False
         self.decision = DecisionModel()
+        self.streaming = StreamingSession(backend)
         # Assigned by serve() so a load can report progress before its response.
         self.notify = notify
 
@@ -175,6 +177,7 @@ class Worker:
                 return {"id": request_id, "ok": True}, False
 
             if operation == "load":
+                self.streaming.close()
                 quantization = request.get("quantization", "4bit")
                 if not isinstance(quantization, str):
                     return error_response(request_id, "invalid_request", "quantization must be a string"), False
@@ -196,7 +199,14 @@ class Worker:
                     "quantization": quantization,
                 }, False
 
+            if operation in {"stream_start", "stream_push", "stream_flush", "stream_cancel", "stream_close"}:
+                if not self.loaded:
+                    return error_response(request_id, "model_not_loaded", "Load the model before streaming"), False
+                result = self.streaming.handle(request, cancel_requested)
+                return {**result, "id": request_id, "ok": True}, False
+
             if operation == "transcribe":
+                self.streaming.close()
                 if not self.loaded:
                     return error_response(request_id, "model_not_loaded", "Load the model before transcription"), False
                 raw_path = request.get("audio_path")
@@ -268,6 +278,7 @@ class Worker:
                 return {"id": request_id, "ok": True, "cancelled": False}, False
 
             if operation == "shutdown":
+                self.streaming.close()
                 self.decision.unload()
                 try:
                     self.backend.unload()

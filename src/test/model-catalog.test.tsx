@@ -54,7 +54,6 @@ test("catalog entries resolve from the configured backend and model ID", () => {
 
 test("planned catalog entries claim no unverified capability", () => {
   const planned = modelCatalog.models.filter((model) => model.availability === "planned");
-  expect(planned.map((model) => model.displayName)).toEqual(expect.arrayContaining(["Nemotron ASR Streaming (candidate)"]));
   // Qwen3-ASR 1.7B left the planned list once it was pinned on both runtimes (#89).
   expect(planned.some((model) => model.displayName.startsWith("Qwen3-ASR"))).toBe(false);
   for (const model of planned) {
@@ -62,7 +61,7 @@ test("planned catalog entries claim no unverified capability", () => {
     expect(model.inference).toEqual([]);
     expect(model.devices).toEqual([]);
   }
-  expect(modelCatalog.models.some((model) => model.inference.includes("stateful_streaming"))).toBe(false);
+  expect(catalogEntryFor("sherpa-onnx", "nemotron-3.5-streaming-560ms")?.entry.inference).toContain("stateful_streaming");
 });
 
 test("Japanese model details show Japanese-only Vulkan runtime and pinned provenance", async () => {
@@ -125,12 +124,12 @@ test("a refused removal shows the translated reason and keeps the file", async (
   expect(facts.getByText("ダウンロード済み（容量一致。SHA256は読み込み時に検証）")).toBeTruthy();
 });
 
-test("the catalog overview labels planned models as unavailable", () => {
+test("the catalog overview labels the experimental streaming implementation as available", () => {
   renderPage({ asrBackend: "faster-whisper" });
-  const nemotron = screen.getByText("Nemotron ASR Streaming (candidate)").closest("li")!;
-  expect(within(nemotron).getByText("Planned (not available yet)")).toBeTruthy();
+  const nemotron = screen.getByText("Nemotron 3.5 ASR Streaming 0.6B (560 ms, INT8, experimental)").closest("li")!;
+  expect(within(nemotron).getByText("Available")).toBeTruthy();
   expect(within(nemotron).getByText(/#82/)).toBeTruthy();
-  expect(within(nemotron).getByText(/Speech languages: Not confirmed/)).toBeTruthy();
+  expect(within(nemotron).getByText(/Multilingual \(including Japanese\)/)).toBeTruthy();
 });
 
 test("pinned runtime adapters resolve only their catalog models", () => {

@@ -10,6 +10,9 @@ pub(crate) fn asr_consent_key(settings: &Settings) -> String {
 }
 
 pub(crate) fn check_asr(settings: &Settings) -> Result<(), &'static str> {
+    if settings.offline_only && settings.asr_backend == "openai-compatible" {
+        return Err("Offline mode blocks cloud speech. Select a local speech model.");
+    }
     if settings.asr_backend == "openai-compatible"
         && !settings.cloud_consents.contains(&asr_consent_key(settings))
     {
@@ -19,6 +22,9 @@ pub(crate) fn check_asr(settings: &Settings) -> Result<(), &'static str> {
 }
 
 pub(crate) fn check_text(settings: &Settings) -> Result<(), &'static str> {
+    if settings.offline_only && settings.correction_provider != "local" {
+        return Err("Offline mode blocks cloud AI. Select a local AI provider.");
+    }
     if matches!(settings.correction_provider.as_str(), "openai" | "gemini")
         && !settings
             .cloud_consents
@@ -50,6 +56,28 @@ pub(crate) fn live_preview_enabled(settings: &Settings) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_policy_overrides_stored_cloud_consents_for_audio_and_text_independently() {
+        let mut settings = Settings {
+            offline_only: true,
+            ..Settings::default()
+        };
+        settings.cloud_consents =
+            vec!["openai".into(), "gemini".into(), asr_consent_key(&settings)];
+        assert!(check_asr(&settings).is_ok());
+        assert!(check_text(&settings).is_err());
+        assert!(check_recording(&settings, PipelineMode::Dictate).is_ok());
+        assert!(check_recording(&settings, PipelineMode::Edit).is_err());
+        settings.correction_provider = "local".into();
+        assert!(check_recording(&settings, PipelineMode::Edit).is_ok());
+        settings.asr_backend = "openai-compatible".into();
+        assert!(check_recording(&settings, PipelineMode::Dictate).is_err());
+        settings.offline_only = false;
+        assert!(check_recording(&settings, PipelineMode::Dictate).is_ok());
+        settings.api_base_url = "https://changed.example/v1".into();
+        assert_eq!(check_asr(&settings), Err(AUDIO_CONSENT_REQUIRED));
+    }
 
     #[test]
     fn managed_vulkan_never_uses_cloud_consent_or_cloud_preview() {
