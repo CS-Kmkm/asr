@@ -1,4 +1,5 @@
 {
+  "The local AI server could not start. Check its executable, model, port and available memory.": {"code": "ai_local_server", "ja": "ローカルAIサーバーを起動できませんでした。実行ファイル・モデル・ポート・空きメモリーを確認してください。"},
   "Offline mode blocks cloud speech. Select a local speech model.": {"code": "offline_cloud_speech", "ja": "オフライン設定のためクラウド音声認識を利用できません。ローカルの音声モデルを選んでください。"},
   "Offline mode blocks cloud AI. Select a local AI provider.": {"code": "ai_offline", "ja": "オフライン設定のためクラウドAIを利用できません。ローカルAIを選んでください。"},
   "Offline mode requires model files already cached. Turn it off and explicitly load the model first.": {"code": "model_not_cached", "ja": "オフライン専用では取得済みのモデルだけを利用できます。一度オフにして、先にモデルを明示的に読み込んでください。"},

@@ -111,7 +111,10 @@ export interface Settings {
   qwenDemoStreaming: boolean;
   offlineOnly: boolean;
   learnedStyleRules: LearnedStyleRule[];
+  localServer: LocalServerConfig;
 }
+export interface LocalServerConfig { executablePath: string; modelPath: string; autoStart: boolean; contextSize: number; gpuLayers: number; }
+export interface LocalServerStatus { state: "stopped" | "starting" | "ready"; pid: number | null; readyMs: number | null; }
 export type StylePreference = "formal" | "casual" | "bullets" | "paragraphs";
 export interface LearnedStyleRule { preference: StylePreference; scope: string; modes: DictionaryMode[]; }
 /**

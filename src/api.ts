@@ -80,6 +80,7 @@ export const defaultSettings: Settings = {
   qwenDemoStreaming: false,
   offlineOnly: false,
   learnedStyleRules: [],
+  localServer: { executablePath: "", modelPath: "", autoStart: false, contextSize: 4096, gpuLayers: 0 },
   cloudLivePreviewEnabled: false,
   shortcuts: {
     dictate: ["Ctrl+Shift+Space"],
@@ -438,6 +439,9 @@ export async function proposeStyleFromEdit(historyId: number, editedText: string
 export async function setLearnedStyleRule(rule: import("./types").LearnedStyleRule, enabled: boolean): Promise<SettingsSnapshot> {
   return invoke("set_learned_style_rule", { rule, enabled });
 }
+export async function getLocalServerStatus(): Promise<import("./types").LocalServerStatus> { return invoke("get_local_server_status"); }
+export async function startLocalServer(): Promise<import("./types").LocalServerStatus> { return invoke("start_local_server"); }
+export async function stopLocalServer(): Promise<void> { return invoke("stop_local_server"); }
 
 /** Deletes suggestions from edits and learned entries; returns the number of deleted rows. */
 export async function deleteLearnedPersonalization(): Promise<number> {

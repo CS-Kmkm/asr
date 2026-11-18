@@ -153,6 +153,20 @@ pub(super) async fn request_text_with_access(
         budget,
     } = task;
     let provider = settings.correction_provider.as_str();
+    if provider == "local" && settings.local_server.auto_start {
+        crate::local_llm::start(settings, cancel.clone())
+            .await
+            .map_err(|error| {
+                if *cancel.borrow() {
+                    CorrectionError::Cancelled
+                } else {
+                    CorrectionError::LocalServer(error)
+                }
+            })?;
+        if *cancel.borrow() {
+            return Err(CorrectionError::Cancelled);
+        }
+    }
     let client = access.client(provider == "local")?;
     let (request, sent_key) = match provider {
         "openai" => {

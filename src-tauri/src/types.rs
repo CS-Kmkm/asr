@@ -240,6 +240,8 @@ pub struct Settings {
     pub scoped_style_profiles: Vec<ScopedStyleProfile>,
     #[serde(default)]
     pub learned_style_rules: Vec<LearnedStyleRule>,
+    #[serde(default)]
+    pub local_server: LocalServerConfig,
 }
 
 impl Settings {
@@ -289,6 +291,28 @@ pub struct LearnedStyleRule {
     pub scope: String,
     pub modes: Vec<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LocalServerConfig {
+    pub executable_path: String,
+    pub model_path: String,
+    pub auto_start: bool,
+    pub context_size: u32,
+    pub gpu_layers: u32,
+}
+impl Default for LocalServerConfig {
+    fn default() -> Self {
+        Self {
+            executable_path: String::new(),
+            model_path: String::new(),
+            auto_start: false,
+            context_size: 4096,
+            gpu_layers: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomModel {
@@ -529,6 +553,7 @@ impl Default for Settings {
             global_style_profile: None,
             scoped_style_profiles: Vec::new(),
             learned_style_rules: Vec::new(),
+            local_server: LocalServerConfig::default(),
         }
     }
 }

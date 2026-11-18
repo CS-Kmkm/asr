@@ -53,6 +53,8 @@ pub enum CorrectionError {
     ConsentRequired,
     #[error("Offline mode blocks cloud AI. Select a local AI provider.")]
     Offline,
+    #[error("local AI server failed to start: {0}")]
+    LocalServer(String),
     #[error("text correction API returned an invalid response: {0}")]
     InvalidResponse(String),
     #[error("the local model reached its output token limit")]
@@ -96,6 +98,7 @@ impl CorrectionError {
             Self::ConservativeContentChanged => "ai_conservative_content_changed",
             Self::ConsentRequired => "ai_consent_required",
             Self::Offline => "ai_offline",
+            Self::LocalServer(_) => "ai_local_server",
             Self::InvalidEndpoint(_) => "ai_invalid_endpoint",
             Self::InvalidModelConfiguration => "ai_invalid_model_configuration",
             Self::UnsupportedProvider(_) => "ai_unsupported_provider",
@@ -2018,6 +2021,7 @@ mod tests {
                 CorrectionError::InvalidApiKey { .. } => "InvalidApiKey",
                 CorrectionError::ConsentRequired => "ConsentRequired",
                 CorrectionError::Offline => "Offline",
+                CorrectionError::LocalServer(_) => "LocalServer",
                 CorrectionError::InvalidResponse(_) => "InvalidResponse",
                 CorrectionError::OutputLimit => "OutputLimit",
                 CorrectionError::ProviderOutputLimit => "ProviderOutputLimit",

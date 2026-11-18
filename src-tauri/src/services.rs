@@ -162,5 +162,6 @@ impl Services {
             language.take();
         }
         let _ = self.transcriber.shutdown().await;
+        crate::local_llm::stop().await;
     }
 }

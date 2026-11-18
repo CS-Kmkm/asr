@@ -14,6 +14,7 @@ mod evaluation;
 mod injection;
 mod input_monitor;
 mod live_dictation;
+mod local_llm;
 mod messages;
 mod model_catalog;
 mod personalization;
@@ -1870,6 +1871,9 @@ pub fn run() {
             commands::propose_dictionary_candidate_from_edit,
             commands::propose_style_from_edit,
             commands::set_learned_style_rule,
+            commands::get_local_server_status,
+            commands::start_local_server,
+            commands::stop_local_server,
             commands::delete_learned_personalization,
             commands::copy_history_item,
             commands::copy_to_clipboard,

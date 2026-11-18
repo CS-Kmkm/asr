@@ -14,6 +14,7 @@ import { translateAppMessage, useI18n } from "../i18n";
 import { decisionConflictsWithAsr } from "../modelCatalog";
 import { ExecutionSettings } from "../components/ExecutionSettings";
 import { LearnedStyleList } from "../components/StyleLearning";
+import { LocalServerSettings } from "../components/LocalServerSettings";
 
 const translationLanguages = translationLanguageRegistry.map(({ code, label }) => [code, label] as const);
 
@@ -295,6 +296,7 @@ export function SettingsPage({
     <div className="settings-stack" hidden={section === "none"}>
       <SettingsRepairBanner settings={settings} />
       {(section === "all" || section === "writing") && <LearnedStyleList settings={settings} />}
+      {(section === "all" || section === "writing") && settings.correctionProvider === "local" && <LocalServerSettings settings={settings} onSave={onSave} recording={recording} />}
       <section className="panel" hidden={section !== "all" && section !== "input"}>
         {section === "all" && <h2>{t("Input settings")}</h2>}
         <ExecutionSettings settings={settings} onSave={onSave} recording={recording} />

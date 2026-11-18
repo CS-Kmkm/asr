@@ -468,6 +468,12 @@ only dictionary aliases actually found in the transcript, caps optional style
 guidance at 500 characters, requests minimal/no reasoning on supported models,
 and sets an output-token limit based on the transcript length.
 
+文章設定の「ローカルAIサーバー」では、既存の `llama-server.exe` とGGUFモデルの絶対パスを保存して、起動・停止できます。
+ローカルAIのURLは数値loopbackのHTTP（例 `http://127.0.0.1:8080/v1`）にし、モデル名は起動時のaliasとして使います。
+GPU layersの初期値0はCPU実行です。GPU利用時は音声認識とVRAMを共有するため、空き容量に合わせて指定してください。
+自動起動は既定OFFで、サーバーや重みの自動取得は行いません。このアプリが起動したプロセスだけを停止し、アプリ終了時にも解放します。
+別途稼働しているvLLM等は従来のOpenAI互換URLで利用できます。vLLMのWindowsネイティブ起動は管理対象外です。
+
 Correction responses are consumed as server-sent events from the OpenAI
 Responses API, Gemini Interactions API, and compatible local Chat Completions
 servers; non-streaming local responses are also accepted. Correction deltas

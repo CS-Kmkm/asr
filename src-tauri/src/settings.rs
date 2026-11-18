@@ -30,6 +30,7 @@ pub(crate) fn validate_translation_targets(settings: &Settings) -> Result<(), St
 
 /// The checks of a settings save that depend only on the saved values.
 pub(crate) fn validate(settings: &Settings) -> Result<(), String> {
+    crate::local_llm::validate(settings)?;
     if settings.qwen_demo_streaming && settings.asr_backend == "openai-compatible" {
         let url = reqwest::Url::parse(&settings.api_base_url).map_err(|_| {
             "Qwen Streaming needs a loopback HTTP origin and automatic speech language."

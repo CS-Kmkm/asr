@@ -3539,6 +3539,33 @@ pub(crate) async fn confirm_dictionary_candidate(
 /// Proposes a preferred-spelling suggestion from the user's edit of a
 /// History dictation (opt-in learning). Only the changed pair is stored.
 #[tauri::command]
+pub(crate) async fn get_local_server_status() -> Result<crate::local_llm::ServerStatus, String> {
+    Ok(crate::local_llm::status().await)
+}
+
+#[tauri::command]
+pub(crate) async fn start_local_server(
+    services: State<'_, Services>,
+    storage: State<'_, Storage>,
+) -> Result<crate::local_llm::ServerStatus, String> {
+    if services.lifecycle.phase() != PipelinePhase::Idle {
+        return Err("Finish the current operation before managing the local server.".into());
+    }
+    let settings = storage.get_settings().map_err(command_error)?;
+    let (_signal, cancel) = tokio::sync::watch::channel(false);
+    crate::local_llm::start(&settings, cancel).await
+}
+
+#[tauri::command]
+pub(crate) async fn stop_local_server(services: State<'_, Services>) -> Result<(), String> {
+    if services.lifecycle.phase() != PipelinePhase::Idle {
+        return Err("Finish the current operation before managing the local server.".into());
+    }
+    crate::local_llm::stop().await;
+    Ok(())
+}
+
+#[tauri::command]
 pub(crate) async fn propose_dictionary_candidate_from_edit(
     history_id: i64,
     edited_text: String,
