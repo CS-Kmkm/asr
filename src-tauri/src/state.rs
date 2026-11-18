@@ -72,6 +72,11 @@ impl PipelineLifecycle {
         let phase = operation
             .as_ref()
             .map_or(PipelinePhase::Idle, |operation| operation.phase);
+        crate::evaluation::lifecycle(
+            phase,
+            operation.as_ref().map(|operation| operation.id),
+            operation.as_ref().map(|operation| operation.mode),
+        );
         self.phase_changes.send_if_modified(|current| {
             let changed = *current != phase;
             *current = phase;

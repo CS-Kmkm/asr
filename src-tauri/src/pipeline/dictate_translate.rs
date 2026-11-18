@@ -426,6 +426,7 @@ async fn finish_owned(
         .await
         .map_err(|_| "dictation insertion task failed".to_owned())?;
     let insertion_detail = crate::smart_dictate::copy_only_detail(smart_route, insertion_detail);
+    crate::evaluation::insertion_detail(operation_id, insertion_detail);
     let copy_only = matches!(
         smart_route,
         Some(crate::smart_dictate::SmartRoute::CopyOnly(_))

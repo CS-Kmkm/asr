@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from concurrent.futures import Future
 import ctypes
 from ctypes import wintypes as wt
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ import importlib.util
 import json
 import math
 import os
+import queue
 from pathlib import Path
 import sys
 import threading
@@ -490,8 +492,12 @@ class ConsoleKeyGuard:
 
 
 class TargetWindow:
-    def __init__(self, api: WinAPI) -> None:
+    def __init__(self, api: WinAPI, *, foreground_mode: str = 'legacy') -> None:
+        if foreground_mode not in ('legacy', 'plain', 'operator'):
+            raise ValueError('unknown foreground mode')
         self.api = api
+        self.foreground_mode = foreground_mode
+        self.ui_jobs = queue.Queue()
         self.hwnd = None
         self.edit = None
         self.events: list[Change] = []
@@ -548,6 +554,17 @@ class TargetWindow:
         self.ensure_alive()
         return result.value
 
+    def call_on_ui(self, callback: Any, *, timeout_ms: int = 250) -> Any:
+        """Run a local helper on the owned EDIT thread; cancel queued late work."""
+        future: Future = Future()
+        self.ui_jobs.put((future, callback))
+        try:
+            self.message(0x8003, timeout_ms=timeout_ms)
+            return future.result(timeout=.01)
+        except BaseException:
+            future.cancel()
+            raise
+
     def snapshot(self, clock: Any = time) -> tuple[float, list[Change]]:
         self.message(0x8001)  # Poll on the EDIT's thread, before taking the lock.
         with self.lock:
@@ -584,9 +601,11 @@ class TargetWindow:
         # Runs on the window thread. The caller uses SendMessageTimeoutW so a
         # foreground app with a hung input queue cannot block emergency cleanup.
         user = self.api.user
+        if self.foreground_mode == 'operator':
+            return
         user.ShowWindow(self.hwnd, 9)  # SW_RESTORE
         user.SetForegroundWindow(self.hwnd)
-        if self.focus_process() is not None:
+        if self.foreground_mode == 'legacy' and self.focus_process() is not None:
             # Attach the caller to the current foreground input queue, as
             # documented for SetForegroundWindow foreground-lock restrictions.
             foreground = user.GetForegroundWindow()
@@ -641,6 +660,15 @@ class TargetWindow:
                     return 0
                 if message == 0x8002:
                     self._bring_foreground()
+                    return 0
+                if message == 0x8003:
+                    while not self.ui_jobs.empty():
+                        future, callback = self.ui_jobs.get_nowait()
+                        if future.set_running_or_notify_cancel():
+                            try:
+                                future.set_result(callback())
+                            except BaseException as exc:
+                                future.set_exception(exc)
                     return 0
                 if message == 0x10:
                     user.DestroyWindow(hwnd)

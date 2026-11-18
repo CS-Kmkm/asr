@@ -10,6 +10,7 @@ mod credentials;
 mod decision;
 mod dictionary;
 mod environment;
+mod evaluation;
 mod injection;
 mod input_monitor;
 mod live_dictation;
@@ -1587,6 +1588,7 @@ fn setup_app(
     log_dir: Option<&Path>,
     startup_diagnostics: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    evaluation::initialize();
     if !cfg!(debug_assertions) {
         worker_setup::install(
             &app.path().resource_dir()?,

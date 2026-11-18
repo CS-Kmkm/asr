@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 struct TraceState {
+    evaluation_operation_id: Option<u64>,
     take_id: String,
     mode: PipelineMode,
     /// When the stop was requested; `None` for a take that never stopped.
@@ -82,6 +83,7 @@ impl TakeTrace {
 
     pub(crate) fn new(storage: &Storage, mode: PipelineMode) -> Self {
         Self(Some(Arc::new(Mutex::new(TraceState {
+            evaluation_operation_id: None,
             take_id: random_take_id(),
             mode,
             stop: None,
@@ -206,7 +208,10 @@ impl TakeTrace {
         // Read at run time, so a completion job queued earlier by this take
         // has already added its own span.
         reservation.defer(move || {
-            let record = Self::lock(&shared).record();
+            let state = Self::lock(&shared);
+            let record = state.record();
+            crate::evaluation::take(state.evaluation_operation_id, &record);
+            drop(state);
             let _ = job_storage.add_take_spans(&record);
         });
     }
@@ -268,9 +273,9 @@ impl PendingTakes {
         mode: PipelineMode,
         requested: Instant,
     ) {
-        let stale = self
-            .slot()
-            .replace((operation_id, TakeTrace::new(storage, mode), requested));
+        let trace = TakeTrace::new(storage, mode);
+        trace.with(|state| state.evaluation_operation_id = Some(operation_id));
+        let stale = self.slot().replace((operation_id, trace, requested));
         // Unreachable while one recording runs at a time; never lose a take.
         if let Some((_, trace, _)) = stale {
             trace.release();
@@ -353,6 +358,24 @@ impl PendingTakes {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn recording_cancel_preserves_evaluation_operation_identity() {
+        let storage = Storage::in_memory().unwrap();
+        let pending = PendingTakes::new();
+        pending.begin(17, &storage, PipelineMode::Dictate, Instant::now());
+        let trace = pending.slot().as_ref().unwrap().1.clone();
+        pending.ready(17);
+        pending.end(17, true);
+        let state = TakeTrace::lock(trace.0.as_ref().unwrap());
+        assert_eq!(state.evaluation_operation_id, Some(17));
+        assert!(matches!(
+            state.outcome,
+            Some(TakeOutcome::Cancelled(TakeStage::Recording))
+        ));
+        drop(state);
+        assert_eq!(drained(&storage)[0].outcome, "cancelled");
+    }
 
     fn drained(storage: &Storage) -> Vec<crate::storage::TakeRowForTest> {
         assert!(storage.drain_deferred_completions(Duration::from_secs(10)));
