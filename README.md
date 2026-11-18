@@ -109,6 +109,10 @@ DictateではAI文章補正もオンにする必要があります。Ask・Edit�
 
 ## Windows prerequisites
 
+Windows固有の入力・選択・フォーカス移動の受け入れ確認には、
+[Computer Useに依存しないローカル評価ツール](docs/windows_evaluation.md)を用意しています。
+対応するシナリオはユーザーの対話端末から実行し、未対応の実機条件は手動確認として記録します。
+
 - Windows 11 and WebView2
 - Rust stable with the MSVC target and Visual Studio 2022 Build Tools
 - Node.js 22 (CI uses 22)
@@ -246,7 +250,7 @@ Windows x64用のランタイムと固定Q8_0重みを初回ロード時に取�
   Dictate/Translate/Edit/Askは録音中に推論状態を保持し、途中結果を表示します。検証できた停止時の確定結果だけを使い、
   通信断・worker再起動・被覆不足では録音全体を再認識します。Edit/Askは録音開始時の選択範囲・入力監視を保持し、停止後にだけ処理します。Retryはbatch経路です。
   Streamingは手動ゲインを固定適用し、全録音に基づくノイズ抑制・自動ゲインはbatch fallbackで適用します。
-  実モデルの日本語精度・CPU/CUDA動作・速度は追加検証が必要で、標準モデルには切り替えません。
+  固定音声1件でCPU・CUDAの実モデル動作を確認済みです。日本語全体の精度・速度比較と標準モデルの選定は今後の評価で扱います。
 - Qwen3-ASRの[公式Streamingデモ](https://github.com/QwenLM/Qwen3-ASR/blob/main/qwen_asr/cli/demo_streaming.py)にも接続できます。
   別途稼働させたvLLMサービスを、音声認識APIの数値loopback HTTP origin（例 `http://127.0.0.1:8000`、パスなし）に設定し、入力設定でQwen接続とStreamingを有効にします。PrivacyのAPI向けライブプレビューも別途有効にしてください。音声の言語は自動です。
   リモートサービスにはSSHトンネル等を別途用意してください。APIキーは送信しませんが、音声の送信同意は必要です。
@@ -585,6 +589,11 @@ smoke test (no GPU or audio files required):
 ```bash
 python scripts/bench_asr.py --backend mock --smoke
 ```
+
+`bench_asr.py` と `bench_streaming.py` は `--record-resources` を付けると、対象プロセスと観測できた子プロセスの
+CPU使用率・RSS最大値・NVIDIAプロセス別GPUメモリをJSONに追記します。`psutil` は任意依存で、例えば `uv run --with psutil scripts/bench_asr.py ... --record-resources` として利用します。
+取得できない値はnullです。CPUは1コア使用で100%、RSSは共有メモリの重複を含みます。短命の子プロセスや瞬間的ピーク、
+別途起動したサーバーは含まれないため、実機全体のメモリ使用量とは異なります。Streaming replayの計測にはアダプター起動待ちを含み、batchの認識処理だけの値とは直接比較できません。
 
 Full usage and Phase 0 gate criteria are documented in
 [docs/benchmarks.md](docs/benchmarks.md).

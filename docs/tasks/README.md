@@ -5,6 +5,13 @@
 
 | 分類 | 契約 | 扱い |
 |---|---|---|
+| completed | [November roadmap split](november-roadmap-split.md) | Verified local branch split and owner acceptance scope. Comparative benchmarks and deferred research remain open. |
+| completed | [Nemotron application streaming integration](nemotron-app-integration.md) | Real CPU/CUDA worker trials through the Rust streaming session passed, including sealed tail and session reuse checks. Native capture and insertion remain pending. |
+| completed | [Nemotron runtime verification](nemotron-runtime-preparation.md) | Production managed files acquired and hash-verified; CPU and explicit-CUDA single-clip streaming replays and independent evidence review complete. Desktop integration and product comparisons remain open. |
+| active | [Native acceptance continuation](native-acceptance-continuation.md) | Real-model Dictate, focus-away, selection-change, minimize, recording cancel, combined IME, processing cancel and Hold Dictate passed sampled native trials. Added scenarios, regression tests and independent code audit complete; external-app and broader product acceptance remain open. |
+| implemented | [Windows evaluation tools](windows-evaluation-runner.md) | Hook/clipboard-free passive observation and local Windows acceptance runner implemented; initial automated checks and independent audit complete. Current native evidence and limits are tracked in the continuation above. Uncommitted. |
+| implemented | [Remaining application features](remaining-feature-implementation.md) | Confirmed style learning, optional resource metrics, Edit/Ask streaming, official Qwen demo connector and owned llama.cpp lifecycle implemented. Automated checks and independent audit complete; actual inference/hardware and product benchmarks remain separate. Uncommitted. |
+| implemented | [Streaming / Hybrid integration — #82–#85](issues-82-85-integration.md) | #82 stateful Nemotron and #83 execution presets/offline policy implemented; existing #84/#85 regression verified. Independent audit complete. Real-model, native Windows and product benchmark verification remain separate. Uncommitted; Issues unchanged. |
 | completed | [モデル管理・ランタイムの完了確認 — #87](issue-87-completion.md) | ランタイム実装・推奨モデルの案内・完了記録を確認。残る検証は2026-11-17のユーザー指示で完了扱い。未実測を実測済みとは記載しない。公開状態はIssue/PRを参照 |
 | active | [スマート入力/編集 — #84](issue-84-smart-dictate-edit.md) | Dictationキーで選択あり→編集・なし→入力・不明→コピーのみ（opt-in、推論なし）。take_spansの計測と集計スクリプトを実装。最終差分の独立監査・統合回帰完了。Windows実機確認は継続中 |
 | active | [文章品質・意味保存・修正からの学習 — #85](issue-85-text-quality.md) | 補正専用オフライン評価セット・採点・ガード強化・opt-in学習を実装。自動チェック・独立監査完了。実プロバイダー評価・人手ブラインド評価・Windows実機UI確認は未実施 |
