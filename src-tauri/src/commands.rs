@@ -3536,8 +3536,6 @@ pub(crate) async fn confirm_dictionary_candidate(
     .await
 }
 
-/// Proposes a preferred-spelling suggestion from the user's edit of a
-/// History dictation (opt-in learning). Only the changed pair is stored.
 #[tauri::command]
 pub(crate) async fn get_local_server_status() -> Result<crate::local_llm::ServerStatus, String> {
     Ok(crate::local_llm::status().await)
@@ -3565,6 +3563,8 @@ pub(crate) async fn stop_local_server(services: State<'_, Services>) -> Result<(
     Ok(())
 }
 
+/// Proposes a preferred-spelling suggestion from the user's edit of a
+/// History dictation (opt-in learning). Only the changed pair is stored.
 #[tauri::command]
 pub(crate) async fn propose_dictionary_candidate_from_edit(
     history_id: i64,
@@ -3580,8 +3580,6 @@ pub(crate) async fn propose_dictionary_candidate_from_edit(
     .await
 }
 
-/// Deletes pending suggestions from edits, learned entries and their
-/// decisions; manual and auto-added entries stay.
 #[tauri::command]
 pub(crate) async fn propose_style_from_edit(
     history_id: i64,
@@ -3617,6 +3615,8 @@ pub(crate) async fn set_learned_style_rule(
     Ok(snapshot)
 }
 
+/// Deletes pending suggestions from edits, learned entries and their
+/// decisions; manual and auto-added entries stay.
 #[tauri::command]
 pub(crate) async fn delete_learned_personalization(
     app: AppHandle,
