@@ -81,6 +81,17 @@ class BenchError(RuntimeError):
     """Raised for any unrecoverable benchmark failure (clean exit, no hang)."""
 
 
+def resource_monitor(pid, enabled=False):
+    name = "_bench_resource_metrics"
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name("resource_metrics.py"))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return module.ResourceMonitor(pid, enabled=enabled)
+
+
 def load_manifest(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     """Share the scorer's loader, including when this script is loaded by file path."""
     module_name = "_bench_score_manifest"
@@ -660,6 +671,7 @@ def run_transcribe_loop(
     repeat: int,
     conditions: RequestConditions,
     record_device: bool = False,
+    record_resources: bool = False,
 ) -> list[dict[str, Any]]:
     """Run `repeat` transcriptions per audio file, return per-call records.
 
@@ -676,7 +688,8 @@ def run_transcribe_loop(
             if conditions.idle_gap_s > 0:
                 _sleep(conditions.idle_gap_s)
             live = simulate_live_preview(session, audio, item_conditions) if conditions.live else None
-            response, wall_ms = session.request(transcribe_payload(audio, item_conditions))
+            with resource_monitor(getattr(getattr(session, "proc", None), "pid", None), enabled=record_resources) as resources:
+                response, wall_ms = session.request(transcribe_payload(audio, item_conditions))
             record: dict[str, Any] = {
                 "audio": str(audio),
                 "wall_ms": wall_ms,
@@ -685,6 +698,8 @@ def run_transcribe_loop(
             }
             if conditions.item_languages is not None:
                 record["language"] = item_conditions.language
+            if record_resources:
+                record["resources"] = resources.report()
             if live is not None:
                 record["live_drain_ms"] = live["live_drain_ms"]
                 record["stop_to_final_ms"] = live["live_drain_ms"] + wall_ms
@@ -817,6 +832,7 @@ def run_benchmark(args: argparse.Namespace, audio_paths: list[Path]) -> dict[str
     # idle gap and live-preview load apply to warm requests.
     cold_conditions = replace(conditions, idle_gap_s=0.0, live=None)
     record_device = getattr(args, "record_device", False)
+    record_resources = getattr(args, "record_resources", False)
 
     cold_load_ms: list[float] = []
     warm_records: list[dict[str, Any]] = []
@@ -831,7 +847,7 @@ def run_benchmark(args: argparse.Namespace, audio_paths: list[Path]) -> dict[str
             cold_load_ms.append(load_wall_ms)
             # One transcription per audio file counts as the "cold path"
             # (process start + load + first transcription).
-            cold_records.extend(run_transcribe_loop(session, audio_paths, 1, cold_conditions, record_device))
+            cold_records.extend(run_transcribe_loop(session, audio_paths, 1, cold_conditions, record_device, record_resources))
             if cold_i == 0:
                 model_name = load_resp.get("model", "?")
 
@@ -843,7 +859,7 @@ def run_benchmark(args: argparse.Namespace, audio_paths: list[Path]) -> dict[str
         model_name = warm_load_resp.get("model", "?")
         # Health after load is outside every timer.
         worker_health = query_health(session)
-        warm_records = run_transcribe_loop(session, audio_paths, args.repeat, conditions, record_device)
+        warm_records = run_transcribe_loop(session, audio_paths, args.repeat, conditions, record_device, record_resources)
 
     observed = sorted(
         {
@@ -1069,6 +1085,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a markdown summary")
     parser.add_argument("--output", metavar="PATH", help="write UTF-8 results to a new file; existing files are never overwritten")
     parser.add_argument("--record-device", action="store_true", help="query worker health after every transcription and record actual device/compute type (requires health support)")
+    parser.add_argument("--record-resources", action="store_true", help="sample worker-tree CPU/RSS/GPU memory; use uv run --with psutil; unavailable values remain null")
     parser.add_argument("--model-revision", help="verified model commit or content digest; null means unverified, never infer from a model name")
     parser.add_argument("--runtime", help="execution runtime label, e.g. nemo or speech.cpp; device is recorded separately by --record-device")
     parser.add_argument(

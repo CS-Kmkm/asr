@@ -13,7 +13,7 @@ import time
 import wave
 from pathlib import Path
 
-from bench_asr import BenchError, WorkerSession, load_manifest, summarize
+from bench_asr import BenchError, WorkerSession, load_manifest, summarize, resource_monitor
 from bench_data import write_json_new
 
 
@@ -84,7 +84,15 @@ class StreamSession(WorkerSession):
         super().close()
 
 
-def replay(session, audio: Path, language: str, stream_id: str, chunk_ms: int):
+def replay(session, audio: Path, language: str, stream_id: str, chunk_ms: int, record_resources=False):
+    with resource_monitor(getattr(getattr(session, "proc", None), "pid", None), enabled=record_resources) as monitor:
+        result = _replay(session, audio, language, stream_id, chunk_ms)
+    if record_resources:
+        result["resources"] = {**monitor.report(), "phase": "replay_including_adapter_readiness"}
+    return result
+
+
+def _replay(session, audio: Path, language: str, stream_id: str, chunk_ms: int):
     with wave.open(str(audio), "rb") as wav:
         if wav.getnchannels() != 1 or wav.getsampwidth() != 2 or wav.getcomptype() != "NONE":
             raise BenchError("replay requires mono PCM16 WAV")
@@ -184,6 +192,7 @@ def main(argv=None):
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--chunk-ms", type=int, default=100)
     parser.add_argument("--timeout", type=float, default=60)
+    parser.add_argument("--record-resources", action="store_true", help="sample adapter-process-tree CPU/RAM/GPU memory (psutil optional)")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--adapter-cmd", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -201,7 +210,7 @@ def main(argv=None):
         samples = []
         with StreamSession(args.adapter_cmd, timeout_s=args.timeout) as session:
             for item in manifest["items"]:
-                samples.append(replay(session, Path(item["audio_path"]), item["language"], item["id"], args.chunk_ms))
+                samples.append(replay(session, Path(item["audio_path"]), item["language"], item["id"], args.chunk_ms, args.record_resources))
         result = {"config": {"mode": "streaming-realtime", "manifest": conditions, "chunk_ms": args.chunk_ms,
                              "adapter_cmd": args.adapter_cmd, "identities": [s["identity"] for s in samples],
                              "timing": "source chunk end to local event receipt; startup excluded; no accelerated replay"},
