@@ -60,6 +60,23 @@ pub(crate) fn validate_dictionary_scope(scope: Option<&str>) -> Result<(), &'sta
 }
 
 pub(crate) fn validate_settings_profiles(settings: &Settings) -> Result<(), &'static str> {
+    if settings.learned_style_rules.len() > 100 {
+        return Err("at most 100 learned style rules can be saved");
+    }
+    for rule in &settings.learned_style_rules {
+        if !["formal", "casual", "bullets", "paragraphs"].contains(&rule.preference.as_str())
+            || rule.modes.is_empty()
+            || rule
+                .modes
+                .iter()
+                .any(|mode| !crate::types::DICTIONARY_MODES.contains(&mode.as_str()))
+        {
+            return Err("learned style rule is invalid");
+        }
+        if rule.scope != "global" {
+            validate_scope(&rule.scope)?;
+        }
+    }
     if settings.scoped_style_profiles.len() > 100 {
         return Err("at most 100 scoped style profiles can be saved");
     }
@@ -91,6 +108,14 @@ pub(crate) fn resolve_profile(
     settings: &Settings,
     context: Option<&AppContext>,
 ) -> Option<StyleProfile> {
+    resolve_profile_for(settings, context, crate::types::DictionaryMode::Dictate)
+}
+
+pub(crate) fn resolve_profile_for(
+    settings: &Settings,
+    context: Option<&AppContext>,
+    mode: crate::types::DictionaryMode,
+) -> Option<StyleProfile> {
     if !settings.personalization_enabled {
         return None;
     }
@@ -108,21 +133,81 @@ pub(crate) fn resolve_profile(
                     .find(|item| item.scope == category_scope)
             })
     });
-    scoped
+    let base = scoped
         .map(|item| item.profile.clone())
-        .or_else(|| settings.global_style_profile.clone())
+        .or_else(|| settings.global_style_profile.clone());
+    let base_rank = scoped.map_or(0, |item| if item.scope.starts_with("app:") { 2 } else { 1 });
+    let mode = match mode {
+        crate::types::DictionaryMode::Dictate => "dictate",
+        crate::types::DictionaryMode::Edit => "edit",
+        crate::types::DictionaryMode::Ask => "ask",
+    };
+    let mut rules: Vec<_> = settings
+        .learned_style_rules
+        .iter()
+        .filter_map(|rule| {
+            if !rule.modes.iter().any(|m| m == mode) {
+                return None;
+            }
+            let rank = if rule.scope == "global" {
+                0
+            } else if context.is_some_and(|c| rule.scope == format!("category:{}", c.category)) {
+                1
+            } else if context
+                .and_then(|c| c.app_key.as_ref())
+                .is_some_and(|app| rule.scope == format!("app:{app}"))
+            {
+                2
+            } else {
+                return None;
+            };
+            // A broad learned preference must not override a more specific
+            // manually configured profile. Confirmed rules at the same scope
+            // may refine that profile.
+            (rank >= base_rank).then_some((rank, rule))
+        })
+        .collect();
+    if rules.is_empty() {
+        return base;
+    }
+    rules.sort_by_key(|(rank, _)| *rank);
+    let mut profile = base.unwrap_or(StyleProfile {
+        formality: String::new(),
+        detail: String::new(),
+        guidance: None,
+    });
+    let mut layout = None;
+    for (_, rule) in rules {
+        match rule.preference.as_str() {
+            "formal" | "casual" => profile.formality.clone_from(&rule.preference),
+            "bullets" => layout = Some("Prefer bullet lists for enumerations; preserve every fact and do not turn ordinary prose into a list."),
+            "paragraphs" => layout = Some("Prefer connected prose and paragraphs over bullet lists; preserve every fact."),
+            _ => {},
+        }
+    }
+    if let Some(layout) = layout {
+        let guidance = profile.guidance.get_or_insert_with(String::new);
+        if !guidance.is_empty() {
+            guidance.push(' ');
+        }
+        guidance.push_str(layout);
+    }
+    Some(profile)
 }
 
 pub(crate) fn guidance(profile: &StyleProfile) -> String {
     let detail = match profile.detail.as_str() {
         "detailed" => "Prefer detailed phrasing of existing facts; never add new details.",
+        "" => "Preserve the original level of detail.",
         _ => "Prefer concise phrasing.",
     };
     guidance_with_detail(profile, detail)
 }
 
 pub(crate) fn action_guidance(profile: &StyleProfile) -> String {
-    let detail = if profile.detail == "detailed" {
+    let detail = if profile.detail.is_empty() {
+        "Preserve the original level of detail."
+    } else if profile.detail == "detailed" {
         "Prefer detailed responses when appropriate for the requested action."
     } else {
         "Prefer concise phrasing."
@@ -133,6 +218,7 @@ pub(crate) fn action_guidance(profile: &StyleProfile) -> String {
 fn guidance_with_detail(profile: &StyleProfile, detail: &str) -> String {
     let formality = match profile.formality.as_str() {
         "formal" => "Use formal, professional wording.",
+        "" => "Preserve the original register.",
         _ => "Use casual, conversational wording.",
     };
     let mut result = format!("{formality} {detail}");
@@ -236,6 +322,43 @@ mod tests {
             ..settings
         };
         assert_eq!(resolve_profile(&no_global, None), None);
+    }
+
+    #[test]
+    fn learned_preferences_respect_manual_scope_precedence() {
+        let mut settings = Settings {
+            personalization_enabled: true,
+            scoped_style_profiles: vec![ScopedStyleProfile {
+                scope: "app:code".into(),
+                profile: profile("formal", "concise"),
+            }],
+            learned_style_rules: vec![crate::types::LearnedStyleRule {
+                preference: "casual".into(),
+                scope: "global".into(),
+                modes: vec!["dictate".into()],
+            }],
+            ..Settings::default()
+        };
+        let ctx = context("code", "development");
+        assert_eq!(
+            resolve_profile(&settings, Some(&ctx)).unwrap().formality,
+            "formal"
+        );
+        settings.learned_style_rules[0].scope = "category:development".into();
+        assert_eq!(
+            resolve_profile(&settings, Some(&ctx)).unwrap().formality,
+            "formal"
+        );
+        settings.learned_style_rules[0].scope = "app:code".into();
+        assert_eq!(
+            resolve_profile(&settings, Some(&ctx)).unwrap().formality,
+            "casual"
+        );
+        settings.scoped_style_profiles[0].scope = "category:development".into();
+        assert_eq!(
+            resolve_profile(&settings, Some(&ctx)).unwrap().formality,
+            "casual"
+        );
     }
 
     #[test]

@@ -153,6 +153,7 @@ test("Dashboard distinguishes local, cloud speech and cloud AI settings", () => 
 
 function historyPage(settings, history) {
   const { HistoryPage } = load("../src/pages/HistoryPage.tsx", {
+    "../components/StyleLearning": { TeachStyle: "teach-style" },
     react: hooks,
     "../components/ui": { Empty: "empty", HelpHint: "help", IconButton: "icon-button" },
     "../components/HistoryRetentionSelect": { HistoryRetentionSelect: "retention-select" },

@@ -96,6 +96,7 @@ function historyPage(onLoadAudio) {
     react: { useState: (initial) => [initial, (value) => effects.states.push(value)], useEffect() {} },
     "../components/ui": { Empty: "empty", HelpHint: "help", IconButton: "icon-button" },
     "../components/HistoryRetentionSelect": { HistoryRetentionSelect: "retention-select" },
+    "../components/StyleLearning": { TeachStyle: "teach-style" },
     "../types": load("../src/types.ts"),
     "../i18n": { useI18n: () => ({ language: "en", t: (key) => key }), insertionDetailLabels: {}, insertionOutcomeLabels: {} },
   }, globals);

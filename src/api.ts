@@ -79,6 +79,7 @@ export const defaultSettings: Settings = {
   statefulStreaming: false,
   qwenDemoStreaming: false,
   offlineOnly: false,
+  learnedStyleRules: [],
   cloudLivePreviewEnabled: false,
   shortcuts: {
     dictate: ["Ctrl+Shift+Space"],
@@ -429,6 +430,13 @@ export async function confirmDictionaryCandidate(id: number, scope?: CandidateSc
 export async function proposeDictionaryCandidateFromEdit(historyId: number, editedText: string): Promise<EditProposal> {
   if (!inTauri) throw new Error("Learning from edits requires the desktop application.");
   return invoke("propose_dictionary_candidate_from_edit", { historyId, editedText });
+}
+
+export async function proposeStyleFromEdit(historyId: number, editedText: string): Promise<import("./types").StylePreference[]> {
+  return invoke("propose_style_from_edit", { historyId, editedText });
+}
+export async function setLearnedStyleRule(rule: import("./types").LearnedStyleRule, enabled: boolean): Promise<SettingsSnapshot> {
+  return invoke("set_learned_style_rule", { rule, enabled });
 }
 
 /** Deletes suggestions from edits and learned entries; returns the number of deleted rows. */

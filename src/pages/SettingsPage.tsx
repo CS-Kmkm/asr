@@ -13,6 +13,7 @@ import { getShortcutWarning, startMicrophoneTest, stopMicrophoneTest } from "../
 import { translateAppMessage, useI18n } from "../i18n";
 import { decisionConflictsWithAsr } from "../modelCatalog";
 import { ExecutionSettings } from "../components/ExecutionSettings";
+import { LearnedStyleList } from "../components/StyleLearning";
 
 const translationLanguages = translationLanguageRegistry.map(({ code, label }) => [code, label] as const);
 
@@ -293,6 +294,7 @@ export function SettingsPage({
   return (
     <div className="settings-stack" hidden={section === "none"}>
       <SettingsRepairBanner settings={settings} />
+      {(section === "all" || section === "writing") && <LearnedStyleList settings={settings} />}
       <section className="panel" hidden={section !== "all" && section !== "input"}>
         {section === "all" && <h2>{t("Input settings")}</h2>}
         <ExecutionSettings settings={settings} onSave={onSave} recording={recording} />

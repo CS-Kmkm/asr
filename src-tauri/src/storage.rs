@@ -1,5 +1,6 @@
 mod completion_queue;
 mod learning;
+mod style_learning;
 pub use learning::EditProposal;
 mod history;
 mod history_audio;

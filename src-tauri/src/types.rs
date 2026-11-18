@@ -238,6 +238,8 @@ pub struct Settings {
     pub global_style_profile: Option<StyleProfile>,
     #[serde(default)]
     pub scoped_style_profiles: Vec<ScopedStyleProfile>,
+    #[serde(default)]
+    pub learned_style_rules: Vec<LearnedStyleRule>,
 }
 
 impl Settings {
@@ -279,6 +281,14 @@ pub struct ScopedStyleProfile {
     pub profile: StyleProfile,
 }
 
+/// Fixed preferences confirmed by the user; no example text is retained.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LearnedStyleRule {
+    pub preference: String,
+    pub scope: String,
+    pub modes: Vec<String>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomModel {
@@ -518,6 +528,7 @@ impl Default for Settings {
             personalization_learning: false,
             global_style_profile: None,
             scoped_style_profiles: Vec::new(),
+            learned_style_rules: Vec::new(),
         }
     }
 }

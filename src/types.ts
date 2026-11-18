@@ -110,7 +110,10 @@ export interface Settings {
   statefulStreaming: boolean;
   qwenDemoStreaming: boolean;
   offlineOnly: boolean;
+  learnedStyleRules: LearnedStyleRule[];
 }
+export type StylePreference = "formal" | "casual" | "bullets" | "paragraphs";
+export interface LearnedStyleRule { preference: StylePreference; scope: string; modes: DictionaryMode[]; }
 /**
  * Stored settings with the backend revision of the write that stored them.
  * Revisions only grow, so a newer snapshot is one with a higher revision.

@@ -407,13 +407,20 @@ impl Storage {
             [LEARNED_SOURCE],
         )?;
         let candidates = delete_pending_edit_candidates(&transaction)?;
+        let mut settings = super::stored_settings(&transaction)?;
+        let styles = settings.learned_style_rules.len();
+        settings.learned_style_rules.clear();
+        super::save_settings_row(&transaction, &settings)?;
         transaction.commit()?;
+        if styles > 0 {
+            self.advance_settings_revision(&connection);
+        }
         self.checkpoint_after_deletion(&connection);
-        Ok(decisions + entries + candidates)
+        Ok(decisions + entries + candidates + styles)
     }
 }
 
-fn learning_allowed(settings: &crate::types::Settings) -> Result<(), StorageError> {
+pub(super) fn learning_allowed(settings: &crate::types::Settings) -> Result<(), StorageError> {
     if !settings.personalization_learning {
         return Err(StorageError::Validation(
             "learning from edits is off".into(),

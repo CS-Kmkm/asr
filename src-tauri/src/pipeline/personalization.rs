@@ -48,7 +48,7 @@ pub(crate) async fn resolve(
         text.push_str(source);
     }
     let mut work = tokio::task::spawn_blocking(move || {
-        let guidance = personalization::resolve_profile(&settings, context.as_ref())
+        let guidance = personalization::resolve_profile_for(&settings, context.as_ref(), mode)
             .map(|profile| personalization::action_guidance(&profile));
         let hints = storage
             .dictionary_correction_terms(&text, context.as_ref(), mode)

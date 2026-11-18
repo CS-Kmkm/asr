@@ -2819,6 +2819,16 @@ fn apply_settings_patch(
     }
     let mut settings: Settings = serde_json::from_value(serde_json::Value::Object(merged))
         .map_err(|error| format!("invalid settings value: {error}"))?;
+    let new_style_rule = settings
+        .learned_style_rules
+        .iter()
+        .any(|rule| !stored.learned_style_rules.contains(rule));
+    if new_style_rule
+        && (!settings.personalization_learning
+            || settings.history_retention == types::HistoryRetention::Never)
+    {
+        return Err("Enable learning and History before saving a learned style preference.".into());
+    }
     if settings.asr_backend != stored.asr_backend
         || settings.qwen_demo_streaming != stored.qwen_demo_streaming
         || crate::privacy::asr_consent_key(&settings) != crate::privacy::asr_consent_key(stored)
@@ -3546,16 +3556,58 @@ pub(crate) async fn propose_dictionary_candidate_from_edit(
 /// Deletes pending suggestions from edits, learned entries and their
 /// decisions; manual and auto-added entries stay.
 #[tauri::command]
-pub(crate) async fn delete_learned_personalization(
+pub(crate) async fn propose_style_from_edit(
+    history_id: i64,
+    edited_text: String,
     storage: State<'_, Storage>,
-) -> Result<usize, String> {
+) -> Result<Vec<String>, String> {
     let storage = storage.inner().clone();
     storage_task(move || {
         storage
-            .delete_learned_personalization()
+            .propose_style_from_edit(history_id, &edited_text)
             .map_err(command_error)
     })
     .await
+}
+
+#[tauri::command]
+pub(crate) async fn set_learned_style_rule(
+    app: AppHandle,
+    services: State<'_, Services>,
+    storage: State<'_, Storage>,
+    rule: types::LearnedStyleRule,
+    enabled: bool,
+) -> Result<types::SettingsSnapshot, String> {
+    let _update = services.settings_update.lock().await;
+    let storage = storage.inner().clone();
+    let snapshot = storage_task(move || {
+        storage
+            .set_learned_style_rule(&rule, enabled)
+            .map_err(command_error)
+    })
+    .await?;
+    let _ = app.emit("settings-changed", &snapshot);
+    Ok(snapshot)
+}
+
+#[tauri::command]
+pub(crate) async fn delete_learned_personalization(
+    app: AppHandle,
+    services: State<'_, Services>,
+    storage: State<'_, Storage>,
+) -> Result<usize, String> {
+    let _update = services.settings_update.lock().await;
+    let storage = storage.inner().clone();
+    let result = storage_task(move || {
+        let count = storage
+            .delete_learned_personalization()
+            .map_err(command_error)?;
+        let snapshot = storage.get_settings_snapshot().map_err(command_error)?;
+        Ok((count, snapshot))
+    })
+    .await?;
+    let _ = app.emit("settings-changed", &result.1);
+    Ok(result.0)
 }
 
 #[tauri::command]

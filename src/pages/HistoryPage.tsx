@@ -3,6 +3,7 @@ import { Empty, HelpHint, IconButton } from "../components/ui";
 import { HistoryRetentionSelect } from "../components/HistoryRetentionSelect";
 import { translationLanguageRegistry, type HistoryAudioPayload, type HistoryFilter, type HistoryItem, type HistoryTextAction, type Settings } from "../types";
 import { insertionDetailLabels, insertionOutcomeLabels, useI18n } from "../i18n";
+import { TeachStyle } from "../components/StyleLearning";
 
 const filters = [
   { value: "all", label: "All", icon: "all" }, { value: "dictate", label: "Dictate", icon: "microphone" },
@@ -149,6 +150,7 @@ export function HistoryPage({ settings, settingsLoaded, history, filter, query =
             <IconButton icon="trash" label={t("Delete")} context={context} className="danger-button" onClick={() => onDelete(item.id)} />
           </div>
           {onTeach && settings.personalizationLearning && settings.historyRetention !== "never" && !item.expiresAt && teachableModes.has(item.mode) && <TeachSpelling item={item} onTeach={onTeach} />}
+          {settings.personalizationLearning && settings.historyRetention !== "never" && !item.expiresAt && teachableModes.has(item.mode) && <TeachStyle item={item} />}
           {onReprocess && <HistoryReprocessing settings={settings} settingsLoaded={settingsLoaded} item={item} busy={reprocessing} onReprocess={onReprocess} />}
         </article>; })}</div></>}
     {hasMore && onLoadMore && <button className="secondary load-more" disabled={loading} onClick={onLoadMore}>{t("Load more")}</button>}

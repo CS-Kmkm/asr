@@ -50,6 +50,8 @@ pub const APP_COMMANDS: &[&str] = &[
     "confirm_dictionary_candidate",
     "reject_dictionary_candidate",
     "propose_dictionary_candidate_from_edit",
+    "propose_style_from_edit",
+    "set_learned_style_rule",
     "delete_learned_personalization",
     "copy_history_item",
     "copy_to_clipboard",
