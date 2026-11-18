@@ -5,7 +5,8 @@
 
 | 分類 | 契約 | 扱い |
 |---|---|---|
-| completed | [November roadmap split](november-roadmap-split.md) | Verified local branch split and owner acceptance scope. Comparative benchmarks and deferred research remain open. |
+| completed | [November roadmap automated evaluation](november-roadmap-automated-evaluation.md) | Recorded offline comparisons, regression coverage and owner-approved closure of #80–#85. Research #108 remains deferred. |
+| completed | [November roadmap split](november-roadmap-split.md) | Historical record of the local branch split and initial owner acceptance scope. |
 | completed | [Nemotron application streaming integration](nemotron-app-integration.md) | Real CPU/CUDA worker trials through the Rust streaming session passed, including sealed tail and session reuse checks. Native capture and insertion remain pending. |
 | completed | [Nemotron runtime verification](nemotron-runtime-preparation.md) | Production managed files acquired and hash-verified; CPU and explicit-CUDA single-clip streaming replays and independent evidence review complete. Desktop integration and product comparisons remain open. |
 | active | [Native acceptance continuation](native-acceptance-continuation.md) | Real-model Dictate, focus-away, selection-change, minimize, recording cancel, combined IME, processing cancel and Hold Dictate passed sampled native trials. Added scenarios, regression tests and independent code audit complete; external-app and broader product acceptance remain open. |

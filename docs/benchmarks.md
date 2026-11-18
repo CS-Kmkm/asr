@@ -10,6 +10,9 @@ Haas／Parakeet JapaneseのWindows/Vulkan導入・Whisperとの固定200音声�
 OpenWhisprとの日本語エンジン比較の条件・再現手順・結果は
 [競合比較](competitor_comparison.md)を参照。
 
+NemotronのCPU／CUDA、同じ音声でのバッチ比較、ローカル補正の追加結果は
+[11月ロードマップの自動評価](tasks/november-roadmap-automated-evaluation.md)を参照。
+
 本ドキュメントは、計画書 (`docs/local_ai_voice_input_implementation_plan.md`) の
 **Phase 0(技術検証, §15)** が定める
 

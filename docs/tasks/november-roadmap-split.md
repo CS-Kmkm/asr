@@ -1,3 +1,5 @@
+This record describes the initial branch split. The later measurements and owner-approved closure are recorded in [November roadmap automated evaluation](november-roadmap-automated-evaluation.md).
+
 Goal: Organize the completed local roadmap implementation into reviewable branches and reconcile GitHub issue status with actual evidence and the owner's acceptance decision.
 
 Scope: Native acceptance tooling, application streaming/policy and its coupled features, benchmark resource sampling, and related evidence. Keep pre-existing benchmark/device and documentation edits outside the split when separable. The owner accepted practical-operation testing as complete. Preserve original run statuses and distinguish comparative performance/quality work, which was not waived. No publication or merge assumed from local commit authorization.
