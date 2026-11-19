@@ -3,6 +3,7 @@ import { beforeEach, expect, test, vi } from "vitest";
 import { AskAnswerPanel } from "../windows/AskAnswerPanel";
 import { RecordingOverlay } from "../windows/RecordingOverlay";
 import { I18nProvider, translateAppMessage } from "../i18n";
+import { listen } from "@tauri-apps/api/event";
 import { copyToClipboard, dismissAskAnswer, getAskAnswer } from "../api";
 import type { AppState } from "../types";
 
@@ -61,6 +62,18 @@ test("Ask ignores an older snapshot after a newer event and unsubscribes on unmo
   view.unmount();
   await waitFor(() => expect(transport.stopped).toHaveBeenCalledWith("ask-answer"));
   expect(transport.stopped).toHaveBeenCalledWith("ask-answer-preview");
+});
+
+test("Ask keeps the final answer subscription when preview registration fails", async () => {
+  vi.mocked(listen).mockImplementationOnce(vi.mocked(listen).getMockImplementation()!);
+  vi.mocked(listen).mockRejectedValueOnce(new Error("preview subscription failed"));
+  vi.mocked(getAskAnswer).mockReturnValueOnce(new Promise(() => {}));
+  const view = render(<I18nProvider language="en"><AskAnswerPanel /></I18nProvider>);
+  await waitFor(() => expect(getAskAnswer).toHaveBeenCalledOnce());
+  await emit("ask-answer", { operationId: 1, payload: "Final answer", kind: "generated" });
+  expect(screen.getByText("Final answer")).toBeTruthy();
+  view.unmount();
+  await waitFor(() => expect(transport.stopped).toHaveBeenCalledWith("ask-answer"));
 });
 
 test("Ask streams a marked, silent preview that the validated answer replaces", async () => {

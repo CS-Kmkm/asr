@@ -27,12 +27,12 @@ export function AskAnswerPanel() {
       setAnswer(value.payload);
       setAnswerKind(value.kind);
     };
-    const setup = async () => {
-      const unlistenAnswer = await listen<AskAnswer>("ask-answer", ({ payload }) => {
+    const listeners = [
+      listen<AskAnswer>("ask-answer", ({ payload }) => {
         if (!active || payload.operationId < operationRef.current) return;
         showAnswer(payload);
-      });
-      const unlistenPreview = await listen<AskAnswerPreview>("ask-answer-preview", ({ payload }) => {
+      }),
+      listen<AskAnswerPreview>("ask-answer-preview", ({ payload }) => {
         if (!active) return;
         if (!payload.active) {
           previewEndedRef.current = Math.max(previewEndedRef.current, payload.operationId);
@@ -42,19 +42,20 @@ export function AskAnswerPanel() {
         if (payload.operationId <= previewEndedRef.current || payload.operationId < previewRef.current) return;
         previewRef.current = payload.operationId;
         setPreview({ operationId: payload.operationId, text: payload.text });
-      });
-      const unlisten = () => { unlistenAnswer(); unlistenPreview(); };
-      if (!active) {
-        unlisten();
-        return;
-      }
+      }),
+    ];
+    const subscriptions = Promise.allSettled(listeners);
+    void subscriptions.then(async () => {
+      if (!active) return;
       const current = await getAskAnswer();
       if (active && current && current.operationId >= operationRef.current) showAnswer(current);
-      return unlisten;
+    }).catch(() => {});
+    return () => {
+      active = false;
+      void subscriptions.then((results) => results.forEach((result) => {
+        if (result.status === "fulfilled") result.value();
+      }));
     };
-    let unlisten: (() => void) | undefined;
-    void setup().then((cleanup) => { unlisten = cleanup; if (!active) cleanup?.(); });
-    return () => { active = false; unlisten?.(); };
   }, []);
   const dismiss = async () => {
     await dismissAskAnswer(operationId);

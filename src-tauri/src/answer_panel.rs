@@ -305,8 +305,10 @@ fn show_kind(app: &AppHandle, operation_id: u64, payload: &str, kind: AnswerKind
     let Some(window) = app.get_webview_window(WINDOW_LABEL) else {
         return false;
     };
+    // Use the same event target as the answer preview.
     if app
-        .emit(
+        .emit_to(
+            WINDOW_LABEL,
             "ask-answer",
             serde_json::json!({"operationId": operation_id, "payload": payload, "kind": kind }),
         )
