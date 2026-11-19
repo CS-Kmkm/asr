@@ -713,6 +713,8 @@ def run_transcribe_loop(
                 health = response.get("health", {})
                 records[-1]["device"] = health.get("device")
                 records[-1]["compute_type"] = health.get("computeType")
+                if health.get("deviceName"):
+                    records[-1]["device_name"] = health["deviceName"]
     return records
 
 
@@ -729,6 +731,7 @@ def query_health(session: WorkerSession) -> dict[str, Any] | None:
         "backend": health.get("backend"),
         "device": health.get("device"),
         "compute_type": health.get("computeType"),
+        **({"device_name": health["deviceName"]} if health.get("deviceName") else {}),
     }
 
 
@@ -883,7 +886,7 @@ def run_benchmark(args: argparse.Namespace, audio_paths: list[Path]) -> dict[str
         "config": {
             "backend": args.backend,
             "whisper_decode_profile": env.get("ASR_WHISPER_DECODE_PROFILE") if args.backend == "faster-whisper" else None,
-            "device_policy": env.get("ASR_DEVICE", "auto"),
+            "device_policy": "Vulkan0" if args.backend == "speech-cpp" else env.get("ASR_DEVICE", "auto"),
             "record_device": record_device,
             "worker_health": worker_health,
             "observed_devices": [{"device": d, "compute_type": c} for d, c in observed] if record_device else None,
