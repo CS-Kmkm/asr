@@ -213,7 +213,7 @@ pub(super) async fn request_text_with_access(
         }
         let response = match await_reqwest_or_cancel(client.execute(request), &mut cancel).await {
             Ok(response) => response,
-            Err(CorrectionError::Request(_)) if cloud && attempt == 0 => {
+            Err(CorrectionError::Request(error)) if cloud && attempt == 0 && retryable(&error) => {
                 retry_wait(None, &mut cancel).await?;
                 continue;
             }
@@ -246,7 +246,9 @@ pub(super) async fn request_text_with_access(
         })
         .await;
         let result = match result {
-            Err(CorrectionError::Request(_)) if cloud && attempt == 0 && !emitted => {
+            Err(CorrectionError::Request(error))
+                if cloud && attempt == 0 && !emitted && retryable(&error) =>
+            {
                 retry_wait(None, &mut cancel).await?;
                 continue;
             }
@@ -261,6 +263,13 @@ pub(super) async fn request_text_with_access(
         return Ok(result.to_owned());
     }
     unreachable!("each final attempt returns its result")
+}
+
+/// Connection failures and resets are retried. A read or total timeout is
+/// not: the provider may still be generating (a long silent reasoning phase),
+/// so a second request would be billed again for the same work.
+fn retryable(error: &reqwest::Error) -> bool {
+    error.is_connect() || !error.is_timeout()
 }
 
 fn short_retry_after(value: Option<&str>) -> Option<Duration> {

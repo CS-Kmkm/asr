@@ -11,6 +11,7 @@ mod wav;
 pub use dsp::enhance_audio;
 pub use dsp::meter;
 use dsp::resample_linear_owned;
+pub(crate) use dsp::AntiAlias;
 #[cfg(test)]
 pub use dsp::{interleaved_to_mono, resample_linear};
 #[cfg(test)]
@@ -870,7 +871,7 @@ impl AudioCapture for CpalAudioCapture {
                 return Ok(());
             }
             validate_config(&config)?;
-            self.active = Some(start_cpal_capture(config)?);
+            self.active = Some(start_cpal_capture_off_runtime(config).await?);
             self.recording = false;
             Ok(())
         })
@@ -883,7 +884,8 @@ impl AudioCapture for CpalAudioCapture {
                 return Ok(());
             }
             if let Some(mut active) = self.active.take() {
-                drop_active_stream(&mut active);
+                // Shutdown joins the stream thread; keep it off the runtime.
+                let _ = tokio::task::spawn_blocking(move || drop_active_stream(&mut active)).await;
             }
             Ok(())
         })
@@ -904,7 +906,7 @@ impl AudioCapture for CpalAudioCapture {
                     active.config.enhancement = config.enhancement;
                     active
                 }
-                None => start_cpal_capture(config)?,
+                None => start_cpal_capture_off_runtime(config).await?,
             };
             {
                 let mut shared = active.shared.lock().map_err(|_| {
@@ -1390,6 +1392,16 @@ where
             None,
         )
         .map_err(|error| AudioError::StreamBuild(error.to_string()))
+}
+
+/// Opening the device blocks until WASAPI reports the stream started, so the
+/// wait runs on the blocking pool rather than a tokio worker.
+async fn start_cpal_capture_off_runtime(
+    config: CaptureConfig,
+) -> Result<ActiveCapture, AudioError> {
+    tokio::task::spawn_blocking(move || start_cpal_capture(config))
+        .await
+        .map_err(|_| AudioError::StreamFailure("audio stream start task failed".into()))?
 }
 
 fn drop_active_stream(active: &mut ActiveCapture) {

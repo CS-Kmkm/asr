@@ -950,7 +950,9 @@ async fn run_loop(
                     )
                     .await;
                 let inference_cost = inference_started.elapsed();
-                cleanup.cleanup().map_err(command_error)?;
+                // A delete failure (e.g. an AV sharing violation) must not end
+                // the live preview; the artifact's Drop retries the removal.
+                let _ = cleanup.cleanup();
                 if *cancel.borrow() || *stopped.borrow() {
                     return Ok(());
                 }

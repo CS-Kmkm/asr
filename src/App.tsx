@@ -327,6 +327,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
 
   useEffect(() => {
     let active = true;
+    let appStateRevision = 0;
     void getStartupHotkeyWarning().then(setStartupHotkeyWarnings).catch(() => {});
     const applyAppState = (next: AppState) => {
       const id = next.operationId;
@@ -342,31 +343,38 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
         showQuietInputNotice(next.message, id);
       }
     };
-    Promise.all([
-      getAppState(),
-      listHistory(),
-      getGpuDiagnostics(),
-      listDictionary(),
-    ])
-      .then(
-        ([nextState, nextHistory, nextGpu, nextDictionary]) => {
-          applyAppState(nextState);
-          if (historyRequestRef.current === 0 && historyFilterRef.current === "all") {
-            setHistory(nextHistory);
-            const last = nextHistory.at(-1);
-            historyCursorRef.current = last ? { createdAt: last.createdAt, id: last.id } : null;
-            setHistoryHasMore(nextHistory.length === 100);
-          }
-          setGpu(nextGpu);
-          setDictionary(nextDictionary);
-        },
-      )
-      .catch((error: unknown) => showNotice(String(error), "error"));
+    // Each snapshot applies on its own: one failed read must not drop the
+    // others (for example the app state of a recording already running).
+    const reportFailure = (error: unknown) => { if (active) showNotice(String(error), "error"); };
+    const appStateListener = listen<AppState>("app-state", (event) => {
+      if (!active) return;
+      appStateRevision += 1;
+      applyAppState(event.payload);
+    });
+    void appStateListener.catch(() => {}).then(async () => {
+      if (!active) return;
+      const revision = appStateRevision;
+      const snapshot = await getAppState();
+      if (active && appStateRevision === revision) applyAppState(snapshot);
+    }).catch(reportFailure);
+    listHistory().then((nextHistory) => {
+      if (active && historyRequestRef.current === 0 && historyFilterRef.current === "all") {
+        setHistory(nextHistory);
+        const last = nextHistory.at(-1);
+        historyCursorRef.current = last ? { createdAt: last.createdAt, id: last.id } : null;
+        setHistoryHasMore(nextHistory.length === 100);
+      }
+    }).catch(reportFailure);
+    getGpuDiagnostics().then((nextGpu) => { if (active) setGpu(nextGpu); }).catch(reportFailure);
+    const dictionaryRequest = dictionaryRequestRef.current;
+    listDictionary().then((nextDictionary) => {
+      if (active && dictionaryRequestRef.current === dictionaryRequest) setDictionary(nextDictionary);
+    }).catch(reportFailure);
     const modelListener = listen<ModelStatus>("model-status", (event) => {
       applyModelStatus(event.payload);
     });
     const listeners = [
-      listen<AppState>("app-state", (event) => applyAppState(event.payload)),
+      appStateListener,
       modelListener,
       listen<ModelProgress>("model-progress", (event) => {
         if (modelPreparationActiveRef.current) setModelProgress(event.payload);
@@ -494,9 +502,7 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
   }
 
   useEffect(() => {
-    // Shortcut-driven recordings finish through app-state events, without the
-    // Dashboard stop handler. Read the retained data when either page opens
-    // and after lifecycle or retention changes while it is visible.
+    // Read the retained data when either page opens or retention changes.
     let active = true;
     if (page === "history") {
       void refreshHistory().catch((error) => { if (active) showNotice(String(error), "error"); });
@@ -510,7 +516,29 @@ function MainAppContent({ onLanguageChange }: { onLanguageChange: (language: Set
       historyRequestRef.current += 1;
       dictionaryRequestRef.current += 1;
     };
-  }, [page, state.phase, settings.historyRetention]);
+  }, [page, settings.historyRetention]);
+
+  // Shortcut-driven operations (Ask, Edit, retries) finish through app-state
+  // events without the Dashboard stop handler, and not all of them announce
+  // their History row. Re-read once an operation settles, not on every
+  // intermediate phase, which re-read the page several times per take.
+  const operationSettled = state.phase === "idle" || state.phase === "completed" || state.phase === "error";
+  const settledPhase = operationSettled ? state.phase : null;
+  const settledOperation = operationSettled ? state.operationId : null;
+  const firstSettledRef = useRef(true);
+  useEffect(() => {
+    if (firstSettledRef.current) {
+      // The page-open read above already covers the first render.
+      firstSettledRef.current = false;
+      return;
+    }
+    if (!settledPhase) return;
+    let active = true;
+    const reading = page === "history" ? refreshHistory() : page === "dictionary" ? refreshDictionary() : null;
+    void reading?.catch((error) => { if (active) showNotice(String(error), "error"); });
+    return () => { active = false; };
+    // Keyed on the terminal state of a take; page changes are read above.
+  }, [settledPhase, settledOperation]);
 
   useEffect(() => {
     // Dictate and Translate save their History row and dictionary candidate

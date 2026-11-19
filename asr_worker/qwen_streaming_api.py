@@ -89,7 +89,6 @@ class QwenStreamingApiBackend(ProgressReporting):
 
     def transcribe(self, audio_path, prompt, language=None, decoding=None):
         from .streaming_replay import PcmResampler
-        stream = self.create_online_stream(language)
         try:
             with wave.open(str(audio_path), "rb") as handle:
                 if handle.getnchannels() != 1 or handle.getsampwidth() != 2 or handle.getcomptype() != "NONE":
@@ -98,17 +97,23 @@ class QwenStreamingApiBackend(ProgressReporting):
                 if not 8000 <= rate <= 192000:
                     raise BackendError("audio_unsupported", "Qwen streaming connector requires an 8..192 kHz sample rate")
                 resampler = PcmResampler(rate)
-                while data := handle.readframes(rate):
-                    self.raise_if_cancelled()
-                    samples = [value[0] / 32768 for value in struct.iter_unpack("<h", data)]
-                    chunk = resampler.push(samples)
-                    if chunk:
-                        self.decode_online(stream, chunk, False)
-                tail = resampler.push([], final=True)
-                text = self.decode_online(stream, tail, True)
-            return text, [{"start": 0.0, "end": 0.0, "speaker": None, "text": text}]
-        finally:
-            self.close_online_stream(stream)
+                stream = self.create_online_stream(language)
+                try:
+                    while data := handle.readframes(rate):
+                        self.raise_if_cancelled()
+                        if len(data) % 2:
+                            raise BackendError("audio_unsupported", "Qwen streaming connector received an incomplete PCM16 sample")
+                        samples = [value[0] / 32768 for value in struct.iter_unpack("<h", data)]
+                        chunk = resampler.push(samples)
+                        if chunk:
+                            self.decode_online(stream, chunk, False)
+                    tail = resampler.push([], final=True)
+                    text = self.decode_online(stream, tail, True)
+                finally:
+                    self.close_online_stream(stream)
+        except (wave.Error, EOFError) as exc:
+            raise BackendError("audio_unsupported", "Qwen streaming connector requires a readable WAV file") from exc
+        return text, [{"start": 0.0, "end": 0.0, "speaker": None, "text": text}]
 
     def unload(self):
         if self.client is not None:

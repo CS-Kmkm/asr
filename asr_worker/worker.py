@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+import math
 import os
 import platform
 import queue
@@ -44,14 +45,23 @@ def _isolate_protocol_stdout() -> TextIO:
     return protocol
 
 
-def _sanitize_unicode(value: Any) -> Any:
-    """Replace lone UTF-16 surrogates before serializing a protocol response.
+def _sanitize_json(value: Any) -> Any:
+    """Replace non-finite numbers and repair UTF-16 surrogates for JSON.
 
     Model output can occasionally contain a lone surrogate. Python strings can
     represent those code points, but Unicode and JSON cannot; serde_json rejects
     an escaped lone surrogate as an invalid Unicode code point.
     """
+    if isinstance(value, float):
+        # JSON has no NaN/Infinity; serde_json rejects the bare tokens and the
+        # response would be lost.
+        return value if math.isfinite(value) else None
     if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+            return value
+        except UnicodeEncodeError:
+            pass
         sanitized: list[str] = []
         index = 0
         while index < len(value):
@@ -73,13 +83,13 @@ def _sanitize_unicode(value: Any) -> Any:
         return "".join(sanitized)
     if isinstance(value, dict):
         return {
-            _sanitize_unicode(key): _sanitize_unicode(item)
+            _sanitize_json(key): _sanitize_json(item)
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_sanitize_unicode(item) for item in value]
+        return [_sanitize_json(item) for item in value]
     if isinstance(value, tuple):
-        return tuple(_sanitize_unicode(item) for item in value)
+        return tuple(_sanitize_json(item) for item in value)
     return value
 
 
@@ -261,6 +271,12 @@ class Worker:
                 # discarded because the client no longer waits for it.
                 if cancel_requested is not None and cancel_requested():
                     raise cancelled_error()
+                # Keep the transcript even when the backend cannot supply a
+                # segment's timing. The client requires numeric timestamps.
+                segments = [
+                    segment for segment in segments
+                    if math.isfinite(segment["start"]) and math.isfinite(segment["end"])
+                ]
                 return {
                     "id": request_id,
                     "ok": True,
@@ -296,7 +312,7 @@ class Worker:
 
 
 def _write_message(output_stream: TextIO, message: dict[str, Any]) -> None:
-    safe_message = _sanitize_unicode(message)
+    safe_message = _sanitize_json(message)
     output_stream.write(json.dumps(safe_message, ensure_ascii=False, separators=(",", ":")) + "\n")
     output_stream.flush()
 

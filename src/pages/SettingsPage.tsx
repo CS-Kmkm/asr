@@ -139,8 +139,12 @@ export function SettingsPage({
     mountedRef.current = true;
     let unlisten: Array<() => void> | undefined;
     let active = true;
-    void Promise.all([
-      listen<AudioLevel>("audio-level", ({ payload }) => setLevel(payload)),
+    void Promise.allSettled([
+      // Levels arrive every 80 ms during any recording; only the microphone
+      // test draws them, so ignore the rest instead of re-rendering the page.
+      listen<AudioLevel>("audio-level", ({ payload }) => {
+        if (testRunningRef.current) setLevel(payload);
+      }),
       // Hiding the main window to the tray keeps this page mounted while the
       // backend releases the test, so reset the controls it left running.
       listen("microphone-test-stopped", () => {
@@ -155,7 +159,8 @@ export function SettingsPage({
         setLevel({ rms: 0, peak: 0 });
         setTestError(payload.message);
       }),
-    ]).then((stops) => {
+    ]).then((results) => {
+      const stops = results.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
       if (active) unlisten = stops;
       else stops.forEach((stop) => stop());
     });

@@ -216,9 +216,17 @@ async fn finish_ask(
                 .answer_panel
                 .publish_notice(operation_id, clarification.into());
             if !published || !answer_panel::show_notice(app, operation_id, clarification) {
-                commit_ask_copy(&services.lifecycle, operation_id, || {
-                    session.injector.copy_to_clipboard(clarification)
-                })?;
+                // Clipboard access blocks; keep it off the async workers.
+                let app_for_copy = app.clone();
+                let session_for_copy = Arc::clone(&session);
+                tokio::task::spawn_blocking(move || {
+                    let services = app_for_copy.state::<crate::Services>();
+                    commit_ask_copy(&services.lifecycle, operation_id, || {
+                        session_for_copy.injector.copy_to_clipboard(clarification)
+                    })
+                })
+                .await
+                .map_err(|_| "Ask clipboard task failed".to_owned())??;
                 trace.delivered();
                 let snapshot = state.complete(
                     clarification.into(),
@@ -258,10 +266,18 @@ async fn finish_ask(
         // owned by this operation until the outer PipelineGuard finishes it.
         trace.stage(TakeStage::Delivery);
         let launch_started = std::time::Instant::now();
-        services
-            .lifecycle
-            .commit_side_effect(operation_id, || open_fixed_search(&url))
-            .map_err(|_| "ask was cancelled".to_string())??;
+        // ShellExecuteW blocks; run it, with the lifecycle lock that commits
+        // it, off the async workers.
+        let app_for_search = app.clone();
+        tokio::task::spawn_blocking(move || {
+            app_for_search
+                .state::<crate::Services>()
+                .lifecycle
+                .commit_side_effect(operation_id, || open_fixed_search(&url))
+        })
+        .await
+        .map_err(|_| "Ask search task failed".to_owned())?
+        .map_err(|_| "ask was cancelled".to_string())??;
         trace.span_since(TakeSpan::Paste, launch_started);
         trace.delivered();
         let latency_ms = started.elapsed().as_millis() as u64;

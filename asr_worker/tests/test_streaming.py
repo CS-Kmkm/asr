@@ -99,6 +99,19 @@ def test_online_runtime_keeps_one_stream_and_finishes_after_padding():
     assert calls == [(16000, 10), "decode", (16000, 16000), "finished", "decode"]
 
 
+def test_batch_decode_pads_the_final_tail_at_the_input_rate():
+    # sherpa-onnx aborts the process when one stream receives two different
+    # input rates, so the final silence must match the WAV's rate.
+    backend = so.SherpaOnnxBackend()
+    backend.catalog_id = so.NEMOTRON_STREAMING.id
+    calls = []
+    stream = SimpleNamespace(accept_waveform=lambda rate, values: calls.append((rate, len(values))),
+                             input_finished=lambda: calls.append("finished"))
+    recognizer = SimpleNamespace(create_stream=lambda: stream, is_ready=lambda s: False, get_result=lambda s: "日本語")
+    assert backend._decode(recognizer, [[0.1] * 480], 48000) == ["日本語"]
+    assert calls == [(48000, 480), (48000, 48000), "finished"]
+
+
 @pytest.mark.parametrize("language,expected", [("ja-JP", "ja"), ("en-GB", "en"), ("zh-TW", "zh"), ("es-MX", "es"), (None, None)])
 def test_explicit_language_is_applied_before_live_and_batch_samples(language, expected):
     backend = so.SherpaOnnxBackend()

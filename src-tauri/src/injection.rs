@@ -1298,7 +1298,12 @@ mod windows_backend {
             if size == 0 {
                 return Err(());
             }
-            let mut buffer = vec![0u8; size as usize];
+            // usize-backed so the buffer meets TOKEN_MANDATORY_LABEL's
+            // pointer alignment; a byte Vec does not guarantee it.
+            let mut buffer = vec![0usize; (size as usize).div_ceil(size_of::<usize>())];
+            if buffer.len() * size_of::<usize>() < size_of::<TOKEN_MANDATORY_LABEL>() {
+                return Err(());
+            }
             unsafe {
                 GetTokenInformation(
                     token,
@@ -1480,6 +1485,12 @@ mod windows_backend {
                 keyboard_input(modifier, true),
             ];
             self.validate_target(target)?;
+            // The selection check above is a UIA round trip; a modifier
+            // pressed meanwhile would turn Ctrl+V into another chord
+            // (e.g. Ctrl+Alt+V), so re-check right before sending.
+            if !modifiers_released() {
+                return Ok(false);
+            }
             let sent = keys::chord_sent(unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) });
             if let Some(release_from) = sent.release_from {
                 // Release only our chord's keys, never replay the paste.

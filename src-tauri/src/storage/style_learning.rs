@@ -88,7 +88,12 @@ impl Storage {
         if enabled {
             settings.learned_style_rules.push(rule.clone());
         }
-        settings.validate().map_err(StorageError::Validation)?;
+        // Removing a rule cannot make settings invalid, and a stale unrelated
+        // field must not block the removal (as in
+        // `delete_learned_personalization`). Only adding one is validated.
+        if enabled {
+            settings.validate().map_err(StorageError::Validation)?;
+        }
         super::save_settings_row(&transaction, &settings)?;
         transaction.commit()?;
         let revision = self.advance_settings_revision(&connection);
@@ -237,6 +242,34 @@ mod tests {
         storage.update_settings(&off).unwrap();
         storage.set_learned_style_rule(&rule, true).unwrap();
         assert_eq!(storage.delete_learned_personalization().unwrap(), 1);
+        assert!(storage
+            .get_settings()
+            .unwrap()
+            .learned_style_rules
+            .is_empty());
+    }
+
+    #[test]
+    fn removing_a_learned_style_is_not_blocked_by_an_unrelated_invalid_field() {
+        use crate::types::{LearnedStyleRule, Settings};
+        let storage = Storage::in_memory().unwrap();
+        let rule = LearnedStyleRule {
+            preference: "casual".into(),
+            scope: "category:development".into(),
+            modes: vec!["edit".into()],
+        };
+        let settings = Settings {
+            personalization_learning: true,
+            personalization_enabled: true,
+            learned_style_rules: vec![rule.clone()],
+            translation_instruction: "x".repeat(501),
+            ..Settings::default()
+        };
+        assert!(settings.validate().is_err());
+        storage.store_raw_settings_for_test(&serde_json::to_string(&settings).unwrap());
+        assert!(storage.set_learned_style_rule(&rule, true).is_err());
+        let removed = storage.set_learned_style_rule(&rule, false).unwrap();
+        assert!(removed.settings.learned_style_rules.is_empty());
         assert!(storage
             .get_settings()
             .unwrap()

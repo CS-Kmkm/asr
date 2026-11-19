@@ -158,6 +158,9 @@ impl Provision {
         if *cancel.borrow() {
             return Err(AsrError::Cancelled);
         }
+        // A cancelled or failed sync may leave the environment half
+        // modified, so it must not keep an earlier sync's marker.
+        self.forget_sync();
         let mut command = self.command();
         command.args(["--extra", "decision"]);
         let status = tokio::select! {
@@ -167,6 +170,9 @@ impl Provision {
         if !status.success() {
             return Err(setup_error("decision_dependencies_missing"));
         }
+        // The same base sync plus an extra: the base requirements match again.
+        let provision = self.clone();
+        let _ = tokio::task::spawn_blocking(move || provision.record_sync()).await;
         Ok(())
     }
 }

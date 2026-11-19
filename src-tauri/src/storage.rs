@@ -1563,28 +1563,9 @@ impl Storage {
         Ok(self.history_audio_dir.join(filename))
     }
 
-    fn remove_or_queue_audio(&self, filename: &str) -> Result<(), StorageError> {
-        let path = self.audio_path(filename)?;
-        match fs::remove_file(path) {
-            Ok(()) => {
-                self.connection()?.execute(
-                    "DELETE FROM pending_audio_deletions WHERE filename = ?1",
-                    [filename],
-                )?;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.connection()?.execute(
-                    "DELETE FROM pending_audio_deletions WHERE filename = ?1",
-                    [filename],
-                )?;
-            }
-            Err(_) => {
-                queue_audio_deletion(&*self.connection()?, filename, &Utc::now().to_rfc3339())?;
-            }
-        }
-        Ok(())
-    }
-
+    /// Retries every queued audio deletion. The file operations run first;
+    /// their bookkeeping is then written in one transaction (a file that is
+    /// gone leaves the queue, one that still fails stays queued).
     pub fn retry_pending_audio_deletions(&self) -> Result<(), StorageError> {
         let filenames = {
             let connection = self.connection()?;
@@ -1595,10 +1576,34 @@ impl Storage {
                 .collect::<Result<Vec<_>, _>>()?;
             values
         };
-        for filename in filenames {
-            self.remove_or_queue_audio(&filename)?;
+        let mut removed = Vec::new();
+        let mut failed = Vec::new();
+        // An invalid queued name stops the retry as before, after recording
+        // the outcomes of the names processed ahead of it.
+        let outcome = filenames.iter().try_for_each(|filename| {
+            match fs::remove_file(self.audio_path(filename)?) {
+                Ok(()) => removed.push(filename),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => removed.push(filename),
+                Err(_) => failed.push(filename),
+            }
+            Ok::<(), StorageError>(())
+        });
+        if !removed.is_empty() || !failed.is_empty() {
+            let mut connection = self.connection()?;
+            let transaction = connection.transaction()?;
+            for filename in removed {
+                transaction.execute(
+                    "DELETE FROM pending_audio_deletions WHERE filename = ?1",
+                    [filename],
+                )?;
+            }
+            let now = Utc::now().to_rfc3339();
+            for filename in failed {
+                queue_audio_deletion(&transaction, filename, &now)?;
+            }
+            transaction.commit()?;
         }
-        Ok(())
+        outcome
     }
 
     pub fn reconcile_history_audio(&self) -> Result<(), StorageError> {
@@ -1633,7 +1638,7 @@ impl Storage {
             let values = statement
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?;
-            values
+            values.into_iter().collect::<HashSet<_>>()
         };
         for entry in fs::read_dir(&self.history_audio_dir)? {
             let Ok(entry) = entry else { continue };
@@ -1641,7 +1646,7 @@ impl Storage {
                 continue;
             }
             let filename = entry.file_name().to_string_lossy().into_owned();
-            if !live_filenames.iter().any(|value| value == &filename) {
+            if !live_filenames.contains(&filename) {
                 // `read_dir` produced this contained path. Delete that path directly
                 // so a malformed orphan cannot turn startup into a path-validation
                 // failure or escape the owned directory.
@@ -1862,7 +1867,7 @@ impl Storage {
         }
         let transaction = connection.unchecked_transaction()?;
         for value in &values {
-            insert_dictionary_entry(&transaction, &value.as_new(), "manual", None, &[])?;
+            insert_validated_dictionary_entry(&transaction, &value.as_new(), "manual", &[])?;
         }
         transaction.commit()?;
         Ok(values.len())
@@ -2375,14 +2380,17 @@ fn purge_metrics_before(
     connection: &Connection,
     cutoff: Option<&str>,
 ) -> Result<usize, StorageError> {
-    let metrics = connection.execute(
-        "DELETE FROM metrics WHERE ?1 IS NULL OR created_at < ?1",
-        params![cutoff],
-    )?;
-    let takes = connection.execute(
-        "DELETE FROM take_spans WHERE ?1 IS NULL OR created_at < ?1",
-        params![cutoff],
-    )?;
+    let (metrics, takes) = if let Some(cutoff) = cutoff {
+        (
+            connection.execute("DELETE FROM metrics WHERE created_at < ?1", [cutoff])?,
+            connection.execute("DELETE FROM take_spans WHERE created_at < ?1", [cutoff])?,
+        )
+    } else {
+        (
+            connection.execute("DELETE FROM metrics", [])?,
+            connection.execute("DELETE FROM take_spans", [])?,
+        )
+    };
     Ok(metrics + takes)
 }
 
@@ -2445,6 +2453,18 @@ fn insert_dictionary_entry<C: std::ops::Deref<Target = Connection>>(
 ) -> Result<i64, StorageError> {
     validate_dictionary_entry(entry)?;
     validate_dictionary_collisions(&read_dictionary_entries(connection)?, entry, excluded_id)?;
+    insert_validated_dictionary_entry(connection, entry, source, modes)
+}
+
+/// Inserts an entry the caller has already validated against the stored
+/// entries under the same connection lock (the CSV import plans every row
+/// before writing, so re-reading the dictionary per row adds nothing).
+fn insert_validated_dictionary_entry<C: std::ops::Deref<Target = Connection>>(
+    connection: &C,
+    entry: &NewDictionaryEntry<'_>,
+    source: &str,
+    modes: &[String],
+) -> Result<i64, StorageError> {
     let modes = learning::stored_modes(modes)?;
     let now = Utc::now().to_rfc3339();
     connection.execute(
@@ -3059,11 +3079,14 @@ mod tests {
         assert!(column_names(connection, "dictionary_candidate_decisions")
             .iter()
             .any(|name| name == "created_at"));
-        assert!(object_exists(
-            connection,
-            "index",
-            "idx_history_audio_filename"
-        ));
+        for index in [
+            "idx_history_audio_filename",
+            "idx_history_retry_of_id",
+            "idx_dictionary_candidates_history_id",
+            "idx_metrics_created_at",
+        ] {
+            assert!(object_exists(connection, "index", index), "{index}");
+        }
     }
 
     #[test]
