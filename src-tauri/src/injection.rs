@@ -1485,6 +1485,12 @@ mod windows_backend {
                 keyboard_input(modifier, true),
             ];
             self.validate_target(target)?;
+            // The selection check above is a UIA round trip; a modifier
+            // pressed meanwhile would turn Ctrl+V into another chord
+            // (e.g. Ctrl+Alt+V), so re-check right before sending.
+            if !modifiers_released() {
+                return Ok(false);
+            }
             let sent = keys::chord_sent(unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) });
             if let Some(release_from) = sent.release_from {
                 // Release only our chord's keys, never replay the paste.
