@@ -1298,7 +1298,12 @@ mod windows_backend {
             if size == 0 {
                 return Err(());
             }
-            let mut buffer = vec![0u8; size as usize];
+            // usize-backed so the buffer meets TOKEN_MANDATORY_LABEL's
+            // pointer alignment; a byte Vec does not guarantee it.
+            let mut buffer = vec![0usize; (size as usize).div_ceil(size_of::<usize>())];
+            if buffer.len() * size_of::<usize>() < size_of::<TOKEN_MANDATORY_LABEL>() {
+                return Err(());
+            }
             unsafe {
                 GetTokenInformation(
                     token,
