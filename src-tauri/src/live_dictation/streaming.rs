@@ -29,6 +29,8 @@ fn generation(asr: &dyn Transcriber) -> Option<u64> {
 
 /// Continuous linear resampling uses absolute rational positions, so neither
 /// chunk boundaries nor different microphone rates duplicate/drop samples.
+/// Downsampling first runs the batch path's anti-alias filter, whose state
+/// carries across chunks.
 #[derive(Default)]
 struct Resampler {
     pending: Vec<f32>,
@@ -36,6 +38,7 @@ struct Resampler {
     total: usize,
     next: usize,
     rate: u32,
+    filter: Option<audio::AntiAlias>,
 }
 
 impl Resampler {
@@ -49,6 +52,12 @@ impl Resampler {
             return Err(AsrError::Protocol("stream capture rate changed".into()));
         }
         self.rate = rate;
+        let mut samples = samples;
+        if rate > 16000 {
+            self.filter
+                .get_or_insert_with(|| audio::AntiAlias::new(rate, 16000))
+                .process(&mut samples);
+        }
         self.total += samples.len();
         self.pending.extend(samples);
         let mut output = Vec::new();
@@ -523,6 +532,30 @@ mod tests {
             assert_eq!(expected, actual);
             assert!(resampler.pending.len() <= 1);
         }
+    }
+    #[test]
+    fn downsampling_rejects_tones_above_the_output_nyquist() {
+        let rms = |frequency: f64| {
+            let input: Vec<f32> = (0..48_000)
+                .map(|i| {
+                    (2.0 * std::f64::consts::PI * frequency * i as f64 / 48_000.0).sin() as f32
+                        * 0.5
+                })
+                .collect();
+            let mut resampler = Resampler::default();
+            let mut output = vec![];
+            for chunk in input.chunks(960) {
+                output.extend(resampler.push(chunk.to_vec(), 48_000, false).unwrap());
+            }
+            output.extend(resampler.push(vec![], 48_000, true).unwrap());
+            assert_eq!(output.len(), 16_000);
+            audio::meter(&output[1_000..]).rms
+        };
+        let passband = rms(1_000.0);
+        assert!(passband > 0.3, "1 kHz rms {passband}");
+        // 14 kHz would alias to 2 kHz without the anti-alias filter.
+        let alias = rms(14_000.0);
+        assert!(alias < passband * 0.01, "14 kHz rms {alias}");
     }
     #[test]
     fn streaming_is_explicit_and_model_specific() {

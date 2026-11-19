@@ -11,6 +11,7 @@ mod wav;
 pub use dsp::enhance_audio;
 pub use dsp::meter;
 use dsp::resample_linear_owned;
+pub(crate) use dsp::AntiAlias;
 #[cfg(test)]
 pub use dsp::{interleaved_to_mono, resample_linear};
 #[cfg(test)]

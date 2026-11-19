@@ -229,27 +229,64 @@ pub(super) fn resample_linear_owned(
 /// a transition band before the output Nyquist frequency. Processing in place
 /// keeps memory bounded for long recordings; state is reset for each take.
 fn anti_alias(samples: &mut [f32], source_rate: u32, target_rate: u32) {
-    let omega = std::f64::consts::PI * 0.8 * target_rate as f64 / source_rate as f64;
-    let cosine = omega.cos();
-    for stage in 0..4 {
-        let q = 1.0 / (2.0 * (((2 * stage + 1) as f64 * std::f64::consts::PI) / 16.0).cos());
-        let alpha = omega.sin() / (2.0 * q);
-        let a0 = 1.0 + alpha;
-        let b0 = (1.0 - cosine) / (2.0 * a0);
-        let b1 = 2.0 * b0;
-        let a1 = -2.0 * cosine / a0;
-        let a2 = (1.0 - alpha) / a0;
-        let (mut z1, mut z2) = (0.0, 0.0);
-        for sample in samples.iter_mut() {
-            let input = if sample.is_finite() {
-                f64::from(*sample)
-            } else {
-                0.0
-            };
-            let output = b0 * input + z1;
-            z1 = b1 * input - a1 * output + z2;
-            z2 = b0 * input - a2 * output;
-            *sample = output as f32;
+    AntiAlias::new(source_rate, target_rate).process(samples);
+}
+
+/// The anti-alias cascade with persistent state, so a stream filtered chunk
+/// by chunk matches filtering the concatenated samples at once.
+#[derive(Clone, Debug)]
+pub(crate) struct AntiAlias {
+    stages: [Biquad; 4],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Biquad {
+    b0: f64,
+    b1: f64,
+    a1: f64,
+    a2: f64,
+    z1: f64,
+    z2: f64,
+}
+
+impl AntiAlias {
+    pub(crate) fn new(source_rate: u32, target_rate: u32) -> Self {
+        let omega = std::f64::consts::PI * 0.8 * target_rate as f64 / source_rate as f64;
+        let cosine = omega.cos();
+        let stages = std::array::from_fn(|stage| {
+            let q = 1.0 / (2.0 * (((2 * stage + 1) as f64 * std::f64::consts::PI) / 16.0).cos());
+            let alpha = omega.sin() / (2.0 * q);
+            let a0 = 1.0 + alpha;
+            let b0 = (1.0 - cosine) / (2.0 * a0);
+            Biquad {
+                b0,
+                b1: 2.0 * b0,
+                a1: -2.0 * cosine / a0,
+                a2: (1.0 - alpha) / a0,
+                z1: 0.0,
+                z2: 0.0,
+            }
+        });
+        Self { stages }
+    }
+
+    pub(crate) fn process(&mut self, samples: &mut [f32]) {
+        for stage in &mut self.stages {
+            let Biquad { b0, b1, a1, a2, .. } = *stage;
+            let (mut z1, mut z2) = (stage.z1, stage.z2);
+            for sample in samples.iter_mut() {
+                let input = if sample.is_finite() {
+                    f64::from(*sample)
+                } else {
+                    0.0
+                };
+                let output = b0 * input + z1;
+                z1 = b1 * input - a1 * output + z2;
+                z2 = b0 * input - a2 * output;
+                *sample = output as f32;
+            }
+            stage.z1 = z1;
+            stage.z2 = z2;
         }
     }
 }
@@ -278,6 +315,23 @@ pub fn meter(samples: &[f32]) -> LevelMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunked_anti_alias_matches_one_pass() {
+        let signal: Vec<f32> = (0..4_800)
+            .map(|i| ((i as f32) * 0.37).sin() * 0.5 + ((i as f32) * 2.1).cos() * 0.25)
+            .collect();
+        let mut whole = signal.clone();
+        anti_alias(&mut whole, 48_000, 16_000);
+        let mut filter = AntiAlias::new(48_000, 16_000);
+        let mut chunked = Vec::new();
+        for chunk in signal.chunks(333) {
+            let mut chunk = chunk.to_vec();
+            filter.process(&mut chunk);
+            chunked.extend(chunk);
+        }
+        assert_eq!(whole, chunked);
+    }
 
     #[test]
     fn resampler_preserves_speech_band_and_rejects_aliases() {
