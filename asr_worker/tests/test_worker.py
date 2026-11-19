@@ -276,6 +276,30 @@ with _isolate_protocol_stdout() as output:
         self.assertEqual(response["segments"][0]["speaker"], "voice\ufffd")
         self.assertEqual(response["segments"][0]["text"], "emoji:\U0001f600 before\ufffdafter")
 
+    def test_response_keeps_text_and_drops_only_segments_with_non_finite_timing(self) -> None:
+        class InvalidTimingBackend(MockBackend):
+            def transcribe(self, audio_path, prompt, language=None):
+                return "full transcript", [
+                    {"start": float("nan"), "end": 1.0, "text": "bad start"},
+                    {"start": 1.0, "end": float("inf"), "text": "bad end"},
+                    {"start": 2.0, "end": 3.0, "speaker": float("-inf"), "text": "valid timing"},
+                ]
+
+        with tempfile.NamedTemporaryFile(suffix=".wav") as audio:
+            requests = [
+                {"id": 1, "command": "load"},
+                {"id": 2, "command": "transcribe", "audio_path": audio.name},
+            ]
+            output = io.StringIO()
+            serve(Worker(InvalidTimingBackend()), io.StringIO("".join(json.dumps(req) + "\n" for req in requests)), output)
+
+        response = json.loads(output.getvalue().splitlines()[1])
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["text"], "full transcript")
+        self.assertEqual(response["segments"], [
+            {"start": 2.0, "end": 3.0, "speaker": None, "text": "valid timing"},
+        ])
+
     def test_load_required_before_transcribe(self) -> None:
         response, _ = Worker(MockBackend()).handle(
             {"id": "request", "op": "transcribe", "audio_path": "unused.wav"}
