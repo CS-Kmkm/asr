@@ -80,10 +80,15 @@ pub(super) fn accept_provider_correction(
         if !conservative_output_is_plausible(transcript, &corrected, dictionary_hints) {
             return Err(CorrectionError::ConservativeContentChanged);
         }
-        return conservative_rejection(transcript, &corrected, fact_edits(settings))
-            .map_or(Ok(corrected), |kind| {
-                Err(CorrectionError::ProtectedContentChanged(kind))
-            });
+        return conservative_rejection(
+            transcript,
+            &corrected,
+            fact_edits(settings),
+            dictionary_hints,
+        )
+        .map_or(Ok(corrected), |kind| {
+            Err(CorrectionError::ProtectedContentChanged(kind))
+        });
     }
     validate_correction_output_with_terms(settings, transcript, &corrected, dictionary_hints)?;
     Ok(corrected)
@@ -126,10 +131,13 @@ fn fact_edits(settings: &Settings) -> FactEdits {
 /// so numbers compare by value and counter; URLs and backtick code compare
 /// exactly; negations and questions keep their polarity. Names are not
 /// checked, so spelling fixes such as open ai -> OpenAI stay possible.
+/// Prompted dictionary surfaces (GPT-4 for a spoken "gpt four") do not count
+/// as new numbers, mirroring the intent-aware check.
 fn conservative_rejection(
     transcript: &str,
     corrected: &str,
     edits: FactEdits,
+    dictionary_hints: &[CorrectionTerm],
 ) -> Option<ProtectedContentKind> {
     let corrected = &strip_ordered_list_markers(corrected);
     // NFKC leaves the minus sign (U+2212) alone; it is the same sign as `-`.
@@ -140,7 +148,28 @@ fn conservative_rejection(
             .replace('\u{2212}', "-")
     };
     let (source, output) = (normalize(transcript), normalize(corrected));
-    if !facts_preserved(&source, &output, &output, ProtectedKind::NumberValue, edits) {
+    // Match whole surfaces in the same normalized text used to count numbers.
+    // A surface used more often than its readings allow still counts in full.
+    let normalized_hints: Vec<_> = dictionary_hints
+        .iter()
+        .map(|term| CorrectionTerm {
+            surface: normalize(&term.surface),
+            readings: term
+                .readings
+                .iter()
+                .map(|reading| normalize(reading))
+                .collect(),
+        })
+        .collect();
+    let output_for_new_values =
+        remove_prompted_dictionary_surfaces(&source, &output, &normalized_hints);
+    if !facts_preserved(
+        &source,
+        &output,
+        output_for_new_values.as_deref().unwrap_or(&output),
+        ProtectedKind::NumberValue,
+        edits,
+    ) {
         return Some(ProtectedContentKind::Number);
     }
     for (kind, reason) in [
@@ -554,11 +583,13 @@ pub(super) fn remove_prompted_dictionary_surfaces(
             .readings
             .iter()
             .flat_map(|reading| source.matches(&fold(reading)).collect::<Vec<_>>())
+            .filter(|range| name_boundaries(transcript, range))
             .collect::<Vec<_>>();
-        if occurrences.is_empty() {
-            return None;
-        }
-        occurrences.extend(source.matches(&surface));
+        occurrences.extend(
+            source
+                .matches(&surface)
+                .filter(|range| name_boundaries(transcript, range)),
+        );
         // A reading and its aliases may cover the same spoken occurrence.
         // Prefer the longest match at each start, then count only disjoint
         // source spans, including already-correct spellings.
@@ -575,18 +606,29 @@ pub(super) fn remove_prompted_dictionary_surfaces(
                 }
             })
             .count();
-        let corrected_folded = Folded::new(corrected);
-        if corrected_folded.matches(&surface).count() > allowed {
+        if dictionary_surface_ranges(corrected, &surface).len() > allowed {
             return None;
         }
-        let ranges = Folded::new(&without_dictionary_surfaces)
-            .matches(&surface)
-            .collect::<Vec<_>>();
+        let ranges = dictionary_surface_ranges(&without_dictionary_surfaces, &surface);
         for range in ranges.into_iter().rev() {
-            without_dictionary_surfaces.replace_range(range, "");
+            without_dictionary_surfaces.replace_range(range, " ");
         }
     }
     Some(without_dictionary_surfaces)
+}
+
+fn dictionary_surface_ranges(text: &str, surface: &str) -> Vec<std::ops::Range<usize>> {
+    let numbers = number_occurrences(text);
+    Folded::new(text)
+        .matches(surface)
+        .filter(|range| {
+            name_boundaries(text, range)
+                && numbers.iter().all(|(number, _)| {
+                    !ranges_overlap(range, number)
+                        || (range.start <= number.start && range.end >= number.end)
+                })
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -1539,6 +1581,64 @@ mod conservative_tests {
         ] {
             assert_eq!(rejection(source, output), None, "{source} => {output}");
         }
+    }
+
+    #[test]
+    fn unrelated_substring_hints_do_not_reject_unchanged_text() {
+        let terms = [CorrectionTerm {
+            surface: ".NET Framework".into(),
+            readings: vec!["net".into()],
+        }];
+        assert!(protected_rejection(
+            "a network issue",
+            "a network issue",
+            fact_edits(&Settings::default()),
+            &terms,
+        )
+        .is_none());
+        assert!(remove_prompted_dictionary_surfaces(
+            "a network issue",
+            "a .NET Framework issue",
+            &terms,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn prompted_dictionary_surfaces_are_not_new_numbers() {
+        let terms = [CorrectionTerm {
+            surface: "GPT-4".into(),
+            readings: vec!["gpt four".into()],
+        }];
+        let accept = |output: &str| {
+            accept_provider_correction(
+                &Settings::default(),
+                "gpt four を使う",
+                &terms,
+                output.to_owned(),
+            )
+        };
+        assert_eq!(accept("GPT-4 を使う").ok().as_deref(), Some("GPT-4 を使う"));
+        for different_model in ["GPT-4o を使う", "GPT-4.5 を使う", "GPT-4ｏ を使う"] {
+            assert!(accept(different_model).is_err(), "{different_model}");
+        }
+        assert!(matches!(
+            accept("GPT-4 を4回使う"),
+            Err(CorrectionError::ProtectedContentChanged(
+                ProtectedContentKind::Number
+            ))
+        ));
+        assert!(matches!(
+            accept_provider_correction(
+                &Settings::default(),
+                "gpt four を使う",
+                &[],
+                "GPT-4 を使う".into()
+            ),
+            Err(CorrectionError::ProtectedContentChanged(
+                ProtectedContentKind::Number
+            ))
+        ));
     }
 
     #[test]
