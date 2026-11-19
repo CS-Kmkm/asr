@@ -202,7 +202,7 @@ class SherpaOnnxBackend(RuntimeAdapter):
             stream = self._online_stream(recognizer, language) if self.supports_streaming else recognizer.create_stream()
             stream.accept_waveform(rate, chunk)
             if self.supports_streaming:
-                texts.append(self.decode_online(stream, [], final=True, recognizer=recognizer))
+                texts.append(self.decode_online(stream, [], final=True, recognizer=recognizer, rate=rate))
             else:
                 recognizer.decode_stream(stream)
                 texts.append(str(stream.result.text))
@@ -227,14 +227,18 @@ class SherpaOnnxBackend(RuntimeAdapter):
             raise BackendError("stream_unsupported", "Load a stateful streaming model first")
         return self._online_stream(self.recognizer, language)
 
-    def decode_online(self, stream: Any, samples: Any, final: bool, recognizer: Any = None) -> str:
+    def decode_online(
+        self, stream: Any, samples: Any, final: bool, recognizer: Any = None, rate: int = 16000
+    ) -> str:
         import numpy as np
 
         recognizer = self.recognizer if recognizer is None else recognizer
         if len(samples):
-            stream.accept_waveform(16000, np.asarray(samples, dtype=np.float32))
+            stream.accept_waveform(rate, np.asarray(samples, dtype=np.float32))
         if final:
-            stream.accept_waveform(16000, np.zeros(16000, dtype=np.float32))
+            # The tail must use the stream's rate: sherpa-onnx aborts the
+            # process when one stream receives two different input rates.
+            stream.accept_waveform(rate, np.zeros(rate, dtype=np.float32))
             stream.input_finished()
         while recognizer.is_ready(stream):
             self.raise_if_cancelled()
