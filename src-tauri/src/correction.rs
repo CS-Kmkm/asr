@@ -1318,12 +1318,17 @@ fn parse_openai_response(value: &Value) -> Result<String, CorrectionError> {
 }
 
 fn parse_gemini_response(value: &Value) -> Result<String, CorrectionError> {
+    if value.get("status").and_then(Value::as_str) == Some("incomplete") {
+        return Err(CorrectionError::InvalidResponse(
+            "the response was incomplete".into(),
+        ));
+    }
+    // Steps are in generation order; several model outputs join in order.
     let text = value
         .get("steps")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .rev()
         .filter(|step| step.get("type").and_then(Value::as_str) == Some("model_output"))
         .filter_map(|step| step.get("content").and_then(Value::as_array))
         .flatten()
@@ -2274,6 +2279,22 @@ mod tests {
             }]
         });
         assert_eq!(parse_gemini_response(&value).unwrap(), "corrected");
+        let value = json!({
+            "steps": [
+                {"type": "model_output", "content": [{"type": "text", "text": "first "}]},
+                {"type": "thought", "content": [{"type": "text", "text": "hidden"}]},
+                {"type": "model_output", "content": [{"type": "text", "text": "second"}]}
+            ]
+        });
+        assert_eq!(parse_gemini_response(&value).unwrap(), "first second");
+        let value = json!({
+            "status": "incomplete",
+            "steps": [{"type": "model_output", "content": [{"type": "text", "text": "cut"}]}]
+        });
+        assert!(matches!(
+            parse_gemini_response(&value),
+            Err(CorrectionError::InvalidResponse(_))
+        ));
     }
 
     #[test]
