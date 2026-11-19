@@ -56,6 +56,19 @@ def test_qwen_full_audio_fallback_resamples_and_closes_its_session(tmp_path):
     service.unload()
 
 
+def test_invalid_wav_header_is_rejected_before_opening_a_session(tmp_path):
+    def handle(request):
+        pytest.fail(f"Unexpected request: {request.url.path}")
+
+    service = backend(handle)
+    path = tmp_path / "invalid.wav"
+    path.write_bytes(b"RIFF")
+    with pytest.raises(BackendError) as caught:
+        service.transcribe(path, None)
+    assert caught.value.code == "audio_unsupported"
+    service.unload()
+
+
 @pytest.mark.parametrize("url", ["https://api.example", "http://localhost:8000", "http://192.168.1.3:8000", "http://127.0.0.1:8000/v1", "http://user:pass@127.0.0.1:8000"])
 def test_connector_rejects_unapproved_remote_or_ambiguous_endpoints(url):
     with patch.dict(os.environ, {"ASR_API_BASE_URL": url}): service = QwenStreamingApiBackend()
