@@ -2380,14 +2380,17 @@ fn purge_metrics_before(
     connection: &Connection,
     cutoff: Option<&str>,
 ) -> Result<usize, StorageError> {
-    let metrics = connection.execute(
-        "DELETE FROM metrics WHERE ?1 IS NULL OR created_at < ?1",
-        params![cutoff],
-    )?;
-    let takes = connection.execute(
-        "DELETE FROM take_spans WHERE ?1 IS NULL OR created_at < ?1",
-        params![cutoff],
-    )?;
+    let (metrics, takes) = if let Some(cutoff) = cutoff {
+        (
+            connection.execute("DELETE FROM metrics WHERE created_at < ?1", [cutoff])?,
+            connection.execute("DELETE FROM take_spans WHERE created_at < ?1", [cutoff])?,
+        )
+    } else {
+        (
+            connection.execute("DELETE FROM metrics", [])?,
+            connection.execute("DELETE FROM take_spans", [])?,
+        )
+    };
     Ok(metrics + takes)
 }
 
@@ -3076,11 +3079,14 @@ mod tests {
         assert!(column_names(connection, "dictionary_candidate_decisions")
             .iter()
             .any(|name| name == "created_at"));
-        assert!(object_exists(
-            connection,
-            "index",
-            "idx_history_audio_filename"
-        ));
+        for index in [
+            "idx_history_audio_filename",
+            "idx_history_retry_of_id",
+            "idx_dictionary_candidates_history_id",
+            "idx_metrics_created_at",
+        ] {
+            assert!(object_exists(connection, "index", index), "{index}");
+        }
     }
 
     #[test]

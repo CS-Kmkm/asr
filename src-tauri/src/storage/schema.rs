@@ -52,7 +52,25 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         apply: migrate_v7_take_route,
         min_reader_version: 1,
     },
+    Migration {
+        apply: migrate_v8_lookup_indexes,
+        min_reader_version: 1,
+    },
 ];
+
+/// Version 8: indexes for foreign-key child lookups and the metrics
+/// retention purge. With `foreign_keys` on, deleting a history row looks up
+/// `retry_of_id` and `dictionary_candidates.history_id` children; without
+/// these indexes each deleted row scans both tables. Indexes are invisible
+/// to older builds.
+fn migrate_v8_lookup_indexes(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_history_retry_of_id ON dictation_history(retry_of_id);
+         CREATE INDEX IF NOT EXISTS idx_dictionary_candidates_history_id ON dictionary_candidates(history_id);
+         CREATE INDEX IF NOT EXISTS idx_metrics_created_at ON metrics(created_at);",
+    )?;
+    Ok(())
+}
 
 /// Version 7: additive `take_spans` columns for Smart Dictate/Edit and
 /// latency analysis: the stop-to-final-transcript span, the Smart route code
@@ -424,7 +442,7 @@ mod integration_tests {
             let version: i64 = connection
                 .pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 7);
+            assert_eq!(version, MIGRATIONS.len() as i64);
         }
     }
 }
