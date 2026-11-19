@@ -2,7 +2,7 @@
 import { beforeEach, expect, test, vi } from "vitest";
 import App from "../App";
 import { listen } from "@tauri-apps/api/event";
-import { defaultSettings, getSettings, getShortcutWarning, updateSettings, listDictionaryCandidates,
+import { defaultSettings, getAppState, getSettings, getShortcutWarning, updateSettings, listDictionaryCandidates,
   listHistory, listHistoryPage, deleteAllHistory, reprocessHistoryText, copyToClipboard, getGpuDiagnostics, getModelStatus, getStartupHotkeyWarning, stopRecording, loadModel, previewHistoryRetentionPurge, getProviderCredentials } from "../api";
 import type { DictionaryCandidate, HistoryItem, Settings, SettingsSnapshot } from "../types";
 
@@ -28,7 +28,7 @@ vi.mock("../api", async (original) => {
     updateSettings: vi.fn(),
     getStartupHotkeyWarning: vi.fn(async () => []),
     getShortcutWarning: vi.fn(async () => []),
-    getAppState: async () => ({ phase: "idle", stage: "idle", operation: null, operationId: null, message: null, messageCode: null, lastResult: null }),
+    getAppState: vi.fn(async () => ({ phase: "idle", stage: "idle", operation: null, operationId: null, message: null, messageCode: null, lastResult: null })),
     getModelStatus: vi.fn(async () => ({ modelId: null, quantization: "4bit", installed: false, state: "not_configured", detail: "" })),
     getGpuDiagnostics: vi.fn(async () => null),
     getProviderCredentials: vi.fn(async () => []),
@@ -878,6 +878,16 @@ test("a ready event wins over a delayed loading snapshot", async () => {
   expect(screen.getByText("Ready")).toBeTruthy();
   expect(screen.queryByRole("progressbar")).toBeNull();
   expect(document.querySelector(".notice-message")).toBeNull();
+});
+
+test("a completion event wins over a late recording snapshot for the same take", async () => {
+  const snapshot = deferred<Awaited<ReturnType<typeof getAppState>>>();
+  vi.mocked(getAppState).mockReturnValueOnce(snapshot.promise);
+  render(<App />);
+  await waitFor(() => expect(getAppState).toHaveBeenCalledOnce());
+  await emit("app-state", { phase: "completed", stage: "completed", operation: "recording", operationId: 1, lastResult: "Finished transcript" });
+  await act(async () => snapshot.resolve({ phase: "recording", stage: "recording", operation: "recording", operationId: 1, message: null, messageCode: null, lastResult: null, updatedAt: "now" }));
+  expect(screen.getByText("Finished transcript")).toBeTruthy();
 });
 
 test("the initial model snapshot is requested only after the status listener exists", async () => {
