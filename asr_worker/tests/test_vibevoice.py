@@ -117,6 +117,19 @@ class VibeVoiceLoadTests(IsolatedWorkerTestCase):
         self.assertEqual(failure.exception.code, "gpu_unsupported")
         transformers.AutoProcessor.from_pretrained.assert_not_called()
 
+    def test_missing_dependency_after_loading_the_processor_cleans_up(self) -> None:
+        modules, transformers, _, _ = self.fake_modules()
+        transformers.VibeVoiceAsrForConditionalGeneration.from_pretrained.side_effect = ModuleNotFoundError(name="bitsandbytes")
+        modules["torch"].cuda.empty_cache = Mock()
+        backend = VibeVoiceBackend()
+        with patch.dict(sys.modules, modules), patch("asr_worker.backends.cached_snapshot_path", return_value="/fake/cached"):
+            with self.assertRaises(BackendError) as failure:
+                backend.load("4bit")
+        self.assertEqual(failure.exception.code, "backend_unavailable")
+        self.assertIsNone(backend.processor)
+        self.assertIsNone(backend.model)
+        modules["torch"].cuda.empty_cache.assert_called_once()
+
     def test_unexpected_cpu_placement_does_not_publish_a_ready_model(self) -> None:
         modules, _, _, _ = self.fake_modules(device="cpu")
         backend = VibeVoiceBackend()

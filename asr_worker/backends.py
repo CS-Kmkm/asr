@@ -491,12 +491,24 @@ class VibeVoiceBackend(ProgressReporting):
                 )
             self.device = "cuda"
             self.compute_type = quantization
-        except ModuleNotFoundError as exc:
-            raise vibevoice_dependency_error(exc) from exc
-        except BackendError:
-            raise
         except BaseException as exc:
-            raise map_backend_exception(exc, "load") from exc
+            # A partial load (e.g. OOM inside from_pretrained) leaves tensors
+            # referenced from the traceback; drop them and release the cache.
+            from .runtime_adapter import release_traceback_frames  # circular at import time
+
+            if isinstance(exc, ModuleNotFoundError):
+                mapped = vibevoice_dependency_error(exc)
+            elif isinstance(exc, BackendError):
+                mapped = exc
+            else:
+                mapped = map_backend_exception(exc, "load")
+            release_traceback_frames(exc)
+            # Cleanup must never replace the load error the caller reports.
+            with contextlib.suppress(BaseException):
+                self.unload()
+            if mapped is exc:
+                raise
+            raise mapped from exc
 
     def _report_pending_download(self) -> None:
         """Report that model files are still missing before transformers loads.
