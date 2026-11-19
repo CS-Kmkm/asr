@@ -1867,7 +1867,7 @@ impl Storage {
         }
         let transaction = connection.unchecked_transaction()?;
         for value in &values {
-            insert_dictionary_entry(&transaction, &value.as_new(), "manual", None, &[])?;
+            insert_validated_dictionary_entry(&transaction, &value.as_new(), "manual", &[])?;
         }
         transaction.commit()?;
         Ok(values.len())
@@ -2450,6 +2450,18 @@ fn insert_dictionary_entry<C: std::ops::Deref<Target = Connection>>(
 ) -> Result<i64, StorageError> {
     validate_dictionary_entry(entry)?;
     validate_dictionary_collisions(&read_dictionary_entries(connection)?, entry, excluded_id)?;
+    insert_validated_dictionary_entry(connection, entry, source, modes)
+}
+
+/// Inserts an entry the caller has already validated against the stored
+/// entries under the same connection lock (the CSV import plans every row
+/// before writing, so re-reading the dictionary per row adds nothing).
+fn insert_validated_dictionary_entry<C: std::ops::Deref<Target = Connection>>(
+    connection: &C,
+    entry: &NewDictionaryEntry<'_>,
+    source: &str,
+    modes: &[String],
+) -> Result<i64, StorageError> {
     let modes = learning::stored_modes(modes)?;
     let now = Utc::now().to_rfc3339();
     connection.execute(
