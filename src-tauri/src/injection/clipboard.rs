@@ -375,13 +375,37 @@ fn set_marker(format: u32, value: Option<u32>) -> bool {
     }
 }
 
+/// Registered marker formats that keep clipboard content out of Win+V
+/// history, the cloud clipboard, and clipboard monitors, with their values.
+const HISTORY_MARKERS: [(&str, Option<u32>); 3] = [
+    ("ExcludeClipboardContentFromMonitorProcessing", None),
+    ("CanIncludeInClipboardHistory", Some(0)),
+    ("CanUploadToCloudClipboard", Some(0)),
+];
+
 fn apply_history_exclusion() -> bool {
+    apply_history_exclusion_except(&[])
+}
+
+/// Sets every history marker whose format is not in `present`. A marker
+/// whose format cannot be registered or set makes the result false.
+fn apply_history_exclusion_except(present: &[u32]) -> bool {
     let mut ok = true;
-    ok &= marker("ExcludeClipboardContentFromMonitorProcessing")
-        .is_some_and(|format| set_marker(format, None));
-    ok &= marker("CanIncludeInClipboardHistory").is_some_and(|format| set_marker(format, Some(0)));
-    ok &= marker("CanUploadToCloudClipboard").is_some_and(|format| set_marker(format, Some(0)));
+    for (name, value) in HISTORY_MARKERS {
+        ok &= marker(name)
+            .is_some_and(|format| !needs_marker(format, present) || set_marker(format, value));
+    }
     ok
+}
+
+/// A marker already on the clipboard (restored from a snapshot) keeps the
+/// owner's value; setting the same format twice would replace it.
+fn needs_marker(format: u32, present: &[u32]) -> bool {
+    !present.contains(&format)
+}
+
+fn can_add_restore_markers(format_count: usize) -> bool {
+    (1..=MAX_FORMATS - HISTORY_MARKERS.len()).contains(&format_count)
 }
 
 /// A clipboard that stays locked is `ClipboardUnavailable`; one that opens
@@ -469,6 +493,12 @@ pub(super) fn restore(
     for entry in &mut snapshot.entries {
         set_entry(entry)?;
     }
+    // Avoid recording or uploading restored content. Preserve an empty
+    // clipboard and leave room for every added format under the snapshot cap.
+    if can_add_restore_markers(snapshot.entries.len()) {
+        let present: Vec<u32> = snapshot.entries.iter().map(|entry| entry.format).collect();
+        let _ = apply_history_exclusion_except(&present);
+    }
     Ok(true)
 }
 
@@ -481,6 +511,18 @@ mod tests {
         let total: u64 = OPEN_BACKOFF_MS.iter().sum();
         assert!((100..=200).contains(&total), "{total} ms");
         assert!(OPEN_BACKOFF_MS.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
+    fn restore_adds_only_history_markers_the_snapshot_lacks() {
+        let present = [CF_UNICODETEXT, 0xC123];
+        assert!(!needs_marker(0xC123, &present));
+        assert!(needs_marker(0xC124, &present));
+        assert!(needs_marker(0xC124, &[]));
+        assert_eq!(HISTORY_MARKERS.len(), 3);
+        assert!(!can_add_restore_markers(0));
+        assert!(can_add_restore_markers(MAX_FORMATS - 3));
+        assert!(!can_add_restore_markers(MAX_FORMATS - 2));
     }
 
     #[test]
