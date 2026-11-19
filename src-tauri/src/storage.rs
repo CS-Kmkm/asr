@@ -1563,28 +1563,9 @@ impl Storage {
         Ok(self.history_audio_dir.join(filename))
     }
 
-    fn remove_or_queue_audio(&self, filename: &str) -> Result<(), StorageError> {
-        let path = self.audio_path(filename)?;
-        match fs::remove_file(path) {
-            Ok(()) => {
-                self.connection()?.execute(
-                    "DELETE FROM pending_audio_deletions WHERE filename = ?1",
-                    [filename],
-                )?;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                self.connection()?.execute(
-                    "DELETE FROM pending_audio_deletions WHERE filename = ?1",
-                    [filename],
-                )?;
-            }
-            Err(_) => {
-                queue_audio_deletion(&*self.connection()?, filename, &Utc::now().to_rfc3339())?;
-            }
-        }
-        Ok(())
-    }
-
+    /// Retries every queued audio deletion. The file operations run first;
+    /// their bookkeeping is then written in one transaction (a file that is
+    /// gone leaves the queue, one that still fails stays queued).
     pub fn retry_pending_audio_deletions(&self) -> Result<(), StorageError> {
         let filenames = {
             let connection = self.connection()?;
@@ -1595,10 +1576,34 @@ impl Storage {
                 .collect::<Result<Vec<_>, _>>()?;
             values
         };
-        for filename in filenames {
-            self.remove_or_queue_audio(&filename)?;
+        let mut removed = Vec::new();
+        let mut failed = Vec::new();
+        // An invalid queued name stops the retry as before, after recording
+        // the outcomes of the names processed ahead of it.
+        let outcome = filenames.iter().try_for_each(|filename| {
+            match fs::remove_file(self.audio_path(filename)?) {
+                Ok(()) => removed.push(filename),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => removed.push(filename),
+                Err(_) => failed.push(filename),
+            }
+            Ok::<(), StorageError>(())
+        });
+        if !removed.is_empty() || !failed.is_empty() {
+            let mut connection = self.connection()?;
+            let transaction = connection.transaction()?;
+            for filename in removed {
+                transaction.execute(
+                    "DELETE FROM pending_audio_deletions WHERE filename = ?1",
+                    [filename],
+                )?;
+            }
+            let now = Utc::now().to_rfc3339();
+            for filename in failed {
+                queue_audio_deletion(&transaction, filename, &now)?;
+            }
+            transaction.commit()?;
         }
-        Ok(())
+        outcome
     }
 
     pub fn reconcile_history_audio(&self) -> Result<(), StorageError> {
@@ -1633,7 +1638,7 @@ impl Storage {
             let values = statement
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?;
-            values
+            values.into_iter().collect::<HashSet<_>>()
         };
         for entry in fs::read_dir(&self.history_audio_dir)? {
             let Ok(entry) = entry else { continue };
@@ -1641,7 +1646,7 @@ impl Storage {
                 continue;
             }
             let filename = entry.file_name().to_string_lossy().into_owned();
-            if !live_filenames.iter().any(|value| value == &filename) {
+            if !live_filenames.contains(&filename) {
                 // `read_dir` produced this contained path. Delete that path directly
                 // so a malformed orphan cannot turn startup into a path-validation
                 // failure or escape the owned directory.
