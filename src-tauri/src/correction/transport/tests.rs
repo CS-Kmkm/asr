@@ -339,6 +339,83 @@ async fn a_failed_cloud_stream_is_not_retried_after_a_visible_delta() {
 }
 
 #[tokio::test]
+async fn a_silent_cloud_stream_timeout_is_not_retried() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!(
+        "http://127.0.0.1:{}/provider",
+        listener.local_addr().unwrap().port()
+    );
+    let (release, released) = mpsc::channel::<()>();
+    let handler = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut socket = loop {
+            match listener.accept() {
+                Ok((socket, _)) => break socket,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        };
+        read_request(&mut socket);
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK
+Content-Type: text/event-stream
+Content-Length: 10000
+Connection: close
+
+",
+            )
+            .unwrap();
+        // Stay silent, as during a long reasoning phase, until the client
+        // has timed out; then watch for a replayed request.
+        let _ = released.recv_timeout(Duration::from_secs(5));
+        let deadline = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < deadline {
+            if listener.accept().is_ok() {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(socket);
+        true
+    });
+    let (_sender, cancel) = watch::channel(false);
+    let error = request_text_with_access(
+        &settings("openai"),
+        TextRequest {
+            input: "text",
+            instruction: "instruction",
+            trim_output: true,
+            budget: OutputBudget::AskText,
+        },
+        cancel,
+        |_| {},
+        ProviderAccess::Stub {
+            endpoint,
+            api_key: STUB_KEY.into(),
+            client: Some(cloud_client_with(Duration::from_millis(200), true).unwrap()),
+        },
+    )
+    .await
+    .unwrap_err();
+    release.send(()).unwrap();
+    assert!(
+        matches!(&error, CorrectionError::Request(error) if error.is_timeout()),
+        "{error:?}"
+    );
+    assert!(
+        handler.join().unwrap(),
+        "a timed-out request must not be sent again"
+    );
+}
+
+#[tokio::test]
 async fn both_cloud_transports_send_auth_and_task_fields_and_parse_success() {
     for provider in ["openai", "gemini"] {
         let stub = Stub::new("200 OK", success(provider), false);
