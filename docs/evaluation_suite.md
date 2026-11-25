@@ -58,18 +58,18 @@ uv run --offline --no-sync scripts/evaluate.py --suite full --profile all --vm-f
 
 CUDA の raw / normalized CER は各発話の最初の warm 出力を採点し、編集距離の総和を正解文字数の総和で割ります。ワーカー往復時間の p50 / p95 は2回分の warm リクエストを集計します。VM はゲスト CPU の試行 CER の中央値と、停止操作から独立した受信確認までの時間を記録し、メモ帳 warm の観測件数と予定件数を併記します。この遅延には、ワーカー側の証跡生成と受信側のポーリング待ちが含まれます。変更前後の比較ではデータ、測定区間、実行条件をそろえ、CER や遅延の増加は再計測して確認します。7ステージの `PASS` は計測とガードの成立を示します。数値の回帰や #111 の製品目標は、計測の処理負荷と観測間隔を別途評価できる測定で判定します。
 
-### 2026-11-22 の基準値
+### 2026-11-25 の基準値
 
-フル評価は7/7ステージが合格しました。基準時の Git HEAD は `e176a1ba4f51fef1d99b555817c3a040479de973` で、評価ソースには作業ツリーの変更を含みます。ホストの GPU は RTX 3060 12 GiB、NVIDIA ドライバーは 610.88 でした。ゲストは Windows 11 Pro 26300.9974、4 vCPU、起動時8 GiB（動的メモリ有効）、VB-CABLE 3.5.2.0 です。ゲストの Python は3.12.11、uv は0.8.8、faster-whisper は1.2.1、CTranslate2 は4.8.0でした。
+フル評価は7/7ステージが合格しました。評価ソースはコミット `c3ecc0dc1088363f175907dc1f5e11b97cdcc785` と照合済みです。再開時は最初に合格した5ステージの証跡を検証して再利用し、VM の2ステージを実行しました。ホストの GPU は RTX 3060 12 GiB、NVIDIA ドライバーは 621.40 でした。ゲストは Windows 11 Pro 26300.9974、4 vCPU、起動時8 GiB（動的メモリ有効）、VB-CABLE 3.5.2.0 です。ゲストの Python は3.12.11、uv は0.8.8、faster-whisper は1.2.1、CTranslate2 は4.8.0でした。
 
 | 測定 | 件数 | 結果 |
 | --- | --- | --- |
-| CUDA smoke | 60発話・120要求 | raw CER 11.50%、normalized CER 5.72%、ワーカー往復 p50 / p95 415 / 564 ms |
-| CUDA holdout | 200発話・400要求 | raw CER 10.61%、normalized CER 4.85%、ワーカー往復 p50 / p95 411 / 544 ms |
+| CUDA smoke | 60発話・120要求 | raw CER 11.50%、normalized CER 5.72%、ワーカー往復 p50 / p95 427 / 554 ms |
+| CUDA holdout | 200発話・400要求 | raw CER 10.61%、normalized CER 4.85%、ワーカー往復 p50 / p95 422 / 575 ms |
 | VM 固定文・ガード | 通常挿入6件・ガード4件・障害回復1件 | 11件すべて合格 |
-| VM 実モデル | メモ帳10件・VS Code 2件・Chrome 2件 | 確認済み挿入14/14。試行 CER 中央値は raw 16.67%、normalized 0.00%。メモ帳 warm の停止から挿入までの p50 / p95 は 9.90 / 10.20 秒（9/9件、ゲスト CPU） |
+| VM 実モデル | メモ帳10件・VS Code 2件・Chrome 2件 | 確認済み挿入14/14。試行 CER 中央値は raw 16.67%、normalized 0.00%。メモ帳 warm の停止から挿入までの p50 / p95 は 10.70 / 11.58 秒（9/9件、ゲスト CPU） |
 
-基準レポートはローカルの `.ai/evaluation/phase1-final-1ef813606e214ab4ba2dd33ce0ece845/report-d0be1ac5a84d4b3c9741ee3729791a10` にあります。同じ実行ルートに、分母・モデル実測・証跡ハッシュを照合した `verification.json` と、評価入力をハッシュ付きで保存した `reproduction-inputs.zip` があります。再利用時は同じ Git HEAD の別チェックアウトに ZIP の `source/` を展開し、`product/local-voice-input.exe` を設定の `app_binary` に指定します。ZIP 内の `index.json` でハッシュを照合できます。
+基準レポートはローカルの `.ai/evaluation/phase1-merge-028fd8765cc945a3b9d590959b90183c/report-71efcc53393644e8a98c162557f50703` にあります。同じ実行ルートに、分母・モデル実測・証跡ハッシュを照合した `verification.json` と、評価入力をハッシュ付きで保存した `reproduction-inputs.zip` があります。再利用時は計測コミットの別チェックアウトに ZIP の `source/` を展開し、`product/local-voice-input.exe` を設定の `app_binary` に指定します。ZIP 内の `index.json` でハッシュを照合できます。
 
 固定音声は元アーカイブから別のデータルートへ261件を復元し、通常の事前確認で照合しました。ゲスト用の Python と依存ライブラリもホストの別ディレクトリに展開し、復元した短音声を製品ワーカーと同じ認識経路でオフライン認識できることを確認しました。CPU の設定は `int8`、CTranslate2 の実測値は `int8_float32` でした。使用したアーカイブと復元の証跡は[基準計測記録](tasks/issue-110-final-baseline.md)にあります。Phase 1 のフル評価と完了判定は、準備済みの隔離 VM を対象とします。
 
