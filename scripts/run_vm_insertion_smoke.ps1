@@ -140,7 +140,7 @@ try {
     Assert-NotCancelled
     $externalRepeats = 2
     $externalTakes = if ($RealApps) { 2 * $externalRepeats } else { 0 }
-    $limit = if ($RealModelNotepad) { 70 + 160 * ($RealRepeats + $externalTakes) } elseif ($ExpandedMatrix) { 925 } elseif ($IncludeNotepad) { 380 } else { 290 }
+    $limit = if ($RealModelNotepad) { 155 + 160 * ($RealRepeats + $externalTakes) } elseif ($ExpandedMatrix) { 1100 } elseif ($IncludeNotepad) { 380 } else { 290 }
     $previousRun = Invoke-Command -Session $session -ArgumentList $guestRoot,$taskName,$digest,$AppRevision,$runId,($IncludeNotepad.IsPresent),($RealModelNotepad.IsPresent),$expectedUser,$RealRepeats,$limit,($MockOnRealProfile.IsPresent),($ExpandedMatrix.IsPresent),($RealApps.IsPresent) -ScriptBlock {
         param($root, $task, $expectedDigest, $revision, $owner, $notepad, $real, $userName, $repeats, $limit, $sharedMock, $expanded, $realApps)
         $ErrorActionPreference = 'Stop'
@@ -334,7 +334,13 @@ exit $LASTEXITCODE
         } catch {
             $report.status = 'BLOCKED'
             $report.cleanup_error = $_.Exception.Message
-        } finally { Remove-PSSession -Session $session }
+        } finally {
+            try { Remove-PSSession -Session $session }
+            catch {
+                $report.status = 'BLOCKED'
+                if (-not $report.cleanup_error) { $report.cleanup_error = $_.Exception.Message }
+            }
+        }
     }
     try { $report | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $output 'host.json') -Encoding UTF8 }
     finally {

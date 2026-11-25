@@ -31,6 +31,10 @@ REAL_MODEL = Path(r'C:\ASR-Evaluation\models\faster-whisper-0a363e9161cbc7ed1431
 REAL_DEPENDENCIES = Path(r'C:\ASR-Evaluation\runtime\real-deps\site-packages')
 
 
+class AcceptanceTimeout(EvidenceError):
+    """The acceptance process stopped without confirming desktop cleanup."""
+
+
 def contain_guest_processes():
     """Kill the app and acceptance children if their controller exits abnormally."""
     class BasicLimits(ctypes.Structure):
@@ -316,7 +320,8 @@ def trial_directory(case_dir, index, repeats):
     return case_dir / f'trial-{index:02}' if repeats > 1 else case_dir
 
 
-def run_acceptance(root, scenario, profile, manifest, item, exe_hash, events, directory, index, *, mock_on_real_profile=False):
+def run_acceptance(root, scenario, profile, manifest, item, exe_hash, events, directory, index, *,
+                   mock_on_real_profile=False, mock_text=None):
     real = scenario in REAL_RECEIVERS
     recovery = scenario == WORKER_RECOVERY
     command = [
@@ -327,7 +332,7 @@ def run_acceptance(root, scenario, profile, manifest, item, exe_hash, events, di
     if real:
         command.extend(('--real-case', scenario, '--worker-proof', str(directory / 'capture-proof.json')))
     else:
-        command.append('--mock-insertion')
+        command.extend(('--mock-insertion', '--mock-text', mock_text))
         if mock_on_real_profile:
             command.append('--mock-on-real-profile')
         if recovery:
@@ -410,10 +415,13 @@ def run_case(root, scenario, profile, manifest, item, exe_hash, *, repeats=1, mo
     request_log.touch(exist_ok=False)
     case = {'scenario': scenario, 'status': 'BLOCKED'}
     app = root / 'local-voice-input.exe'
+    mock_text = None if real else MOCK_TEXT + uuid.uuid4().hex[:16]
     env = {key: value for key, value in os.environ.items() if not key.upper().startswith('ASR_')}
     env.update(ASR_EVAL_EVENTS=str(events), ASR_PYTHON=sys.executable,
-               ASR_WORKER_MOCK_TEXT=MOCK_TEXT, ASR_EVAL_CAPTURE_PROOF=str(capture),
+               ASR_EVAL_CAPTURE_PROOF=str(capture),
                ASR_EVAL_REQUEST_LOG=str(request_log))
+    if mock_text is not None:
+        env['ASR_WORKER_MOCK_TEXT'] = mock_text
     if mock_on_real_profile:
         env['ASR_EVAL_MOCK_WORKER'] = '1'
     recovery = scenario == WORKER_RECOVERY
@@ -442,14 +450,15 @@ def run_case(root, scenario, profile, manifest, item, exe_hash, *, repeats=1, mo
                 for index in range(1, repeats + 1):
                     trial_directory(case_dir, index, repeats).mkdir()
                 recovery_trials = run_acceptance(root, scenario, profile, manifest, item, exe_hash, events,
-                                                 case_dir, 1, mock_on_real_profile=mock_on_real_profile)
+                                                 case_dir, 1, mock_on_real_profile=mock_on_real_profile,
+                                                 mock_text=mock_text)
             for index in range(1, (len(recovery_trials) if recovery else repeats) + 1):
                 directory = trial_directory(case_dir, index, repeats)
                 if repeats > 1 and not recovery:
                     directory.mkdir()
                 trial = recovery_trials[index - 1] if recovery else run_acceptance(
                     root, scenario, profile, manifest, item, exe_hash, events, directory, index,
-                    mock_on_real_profile=mock_on_real_profile)[0]
+                    mock_on_real_profile=mock_on_real_profile, mock_text=mock_text)[0]
                 trials.append(trial)
                 all_requests = request_log.read_text(encoding='ascii').splitlines()
                 if any(request != 'transcribe' for request in all_requests):
@@ -486,6 +495,8 @@ def run_case(root, scenario, profile, manifest, item, exe_hash, *, repeats=1, mo
                         case['reason'] = trial['reason']
                 if trial['status'] != 'PASS':
                     break
+        except subprocess.TimeoutExpired as exc:
+            raise AcceptanceTimeout(f'{scenario} timed out; sign the evaluation user out and back in') from exc
         except (EvidenceError, OSError, sqlite3.Error, ValueError, subprocess.SubprocessError) as exc:
             case.update(status='BLOCKED', reason=str(exc))
         finally:
@@ -546,6 +557,8 @@ def main():
                                             repeats=repeats, mock_on_real_profile=args.mock_on_real_profile))
     except (EvidenceError, OSError, sqlite3.Error, ValueError, subprocess.SubprocessError) as exc:
         result['reason'] = str(exc)
+        if isinstance(exc, (AcceptanceTimeout, subprocess.TimeoutExpired)):
+            result['requires_session_reset'] = True
         for scenario in scenarios[len(result['cases']):]:
             result['cases'].append({'scenario': scenario, 'status': 'BLOCKED', 'reason': 'suite_interrupted'})
     statuses = {case['status'] for case in result['cases']}

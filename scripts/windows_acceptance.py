@@ -473,9 +473,9 @@ def prepare(api, target, previous, text):
     raise UnsupportedTarget('scratch control did not accept deterministic setup')
 
 
-def judge(scenario, primary, secondary, take, reference, max_cer):
+def judge(scenario, primary, secondary, take, reference, max_cer, *, mock_text=MOCK_TEXT):
     if scenario in MOCK_RECEIVERS:
-        expected = MOCK_PREFIX + MOCK_TEXT + MOCK_SUFFIX if scenario == MOCK_INSERTION else MOCK_TEXT
+        expected = MOCK_PREFIX + mock_text + MOCK_SUFFIX if scenario == MOCK_INSERTION else mock_text
         exact = primary == expected and not secondary
         result = {'status': 'PASS' if exact else 'FAIL', 'exact_receiver_match': exact}
         if exact and take['outcome'] not in DELIVERY_OUTCOMES:
@@ -545,11 +545,11 @@ def observed_playback(player, path, reader, target, check=lambda: None, *, abort
 
 def run_scenario(scenario, *, api, primary, secondary, reader, player, item, hotkey,
                  max_cer=.5, timeout=60, guard_seconds=2, clock=time, ime=None,
-                 recording_mode='toggle', unattended=False, real_proof=None):
+                 recording_mode='toggle', unattended=False, real_proof=None, mock_text=MOCK_TEXT):
     arguments = dict(api=api, primary=primary, secondary=secondary, reader=reader,
                      player=player, item=item, hotkey=hotkey, max_cer=max_cer,
                      timeout=timeout, guard_seconds=guard_seconds, clock=clock, ime=ime,
-                     unattended=unattended, real_proof=real_proof)
+                     unattended=unattended, real_proof=real_proof, mock_text=mock_text)
     if recording_mode == 'toggle':
         return _run_scenario(scenario, **arguments)
     if recording_mode != 'hold' or scenario not in HOLD_SCENARIOS or ime:
@@ -603,7 +603,7 @@ def run_scenario(scenario, *, api, primary, secondary, reader, player, item, hot
 def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, hotkey,
                   max_cer=.5, timeout=60, guard_seconds=2, clock=time, ime=None,
                   start=None, stop=None, recording_timeout=None, hold_check=lambda: None,
-                  still_held=lambda: None, unattended=False, real_proof=None):
+                  still_held=lambda: None, unattended=False, real_proof=None, mock_text=MOCK_TEXT):
     reader.ready()
     if reader.phase != 'idle':
         raise EvidenceError('app not idle; never retry its toggle blindly')
@@ -679,7 +679,7 @@ def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, ho
                 else:
                     receiver_violation = True
         elif scenario in MOCK_RECEIVERS:
-            expected = MOCK_PREFIX + MOCK_TEXT + MOCK_SUFFIX if mock_insertion else MOCK_TEXT
+            expected = MOCK_PREFIX + mock_text + MOCK_SUFFIX if mock_insertion else mock_text
             receiver_violation |= primary.read() not in (original, expected)
         if secondary_violation or (not confirms_insertion and not ime and primary.read() != original):
             receiver_violation = True
@@ -760,7 +760,7 @@ def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, ho
         raise ScenarioEvidenceError('target_changed_after_stop',
                                     'receiver or focus could not be verified after the stop action') from exc
     if real_proof is None:
-        result = judge(scenario, first, second, take, item['reference'], max_cer)
+        result = judge(scenario, first, second, take, item['reference'], max_cer, mock_text=mock_text)
     else:
         proof = proof or read_real_proof(real_proof)
         exact = bool(proof and first and delivery_digest(first) == proof['delivery_sha256'] and not second)
@@ -842,6 +842,7 @@ def main(argv=None):
     parser.add_argument('--recording-mode', choices=('toggle', 'hold'), default='toggle')
     parser.add_argument('--max-cer', type=float, default=.5)
     parser.add_argument('--mock-insertion', action='store_true', help='run one unattended native mock case in ASR-Eval')
+    parser.add_argument('--mock-text', help=argparse.SUPPRESS)
     parser.add_argument('--worker-recovery', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--mock-on-real-profile', action='store_true', help=argparse.SUPPRESS)
     real_mode = parser.add_mutually_exclusive_group()
@@ -849,6 +850,9 @@ def main(argv=None):
     real_mode.add_argument('--real-case', choices=tuple(REAL_RECEIVERS))
     parser.add_argument('--worker-proof', type=Path)
     args = parser.parse_args(argv)
+    if args.mock_text is not None and (not args.mock_insertion or not re.fullmatch(
+            re.escape(MOCK_TEXT) + r'[0-9a-f]{16}', args.mock_text)):
+        parser.error('--mock-text requires a nonce-tagged VM mock payload')
     if args.mock_on_real_profile and not args.mock_insertion:
         parser.error('--mock-on-real-profile requires --mock-insertion')
     if args.worker_recovery and (not args.mock_insertion or args.scenario):
@@ -983,7 +987,8 @@ def main(argv=None):
                         scenario, api=api, primary=primary, secondary=secondary, reader=reader,
                         player=player, item=item, hotkey=hotkey, max_cer=args.max_cer, ime=ime,
                         recording_mode=args.recording_mode, unattended=unattended,
-                        real_proof=args.worker_proof, timeout=90 if args.real_case else (
+                        real_proof=args.worker_proof, mock_text=args.mock_text or MOCK_TEXT,
+                        timeout=90 if args.real_case else (
                             15 if args.mock_insertion else 60))
                 if read_profile() != profile:
                     raise EvidenceError('profile changed during trial')

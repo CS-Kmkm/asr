@@ -450,7 +450,7 @@ def run_vm(args, stage, directory, inputs):
         "-AppBinary", args.app_binary, "-AppRevision", args.app_revision,
         "-ManagementCredentialPath", args.credential, "-OutputDirectory", vm,
         "-ManifestDirectory", args.manifest_dir, *flags,
-    ], timeout=190 + 160 * total_takes if real else (1065 if args.suite == "full" else 500))
+    ], timeout=275 + 160 * total_takes if real else (1240 if args.suite == "full" else 500))
     try:
         host = read_json(vm / "host.json")
     except (OSError, ValueError) as exc:
@@ -463,6 +463,10 @@ def run_vm(args, stage, directory, inputs):
     if host.get("vm_id", "").lower() != inputs["vm_id"]:
         raise Blocked("VM host report identity does not match preflight")
     guest = read_json(vm / "result.json") if (vm / "result.json").is_file() else {}
+    if guest.get("requires_session_reset"):
+        raise CleanupUnconfirmed(guest.get("reason") or "the VM desktop session must be reset")
+    if guest.get("exe_sha256") != inputs["app_sha256"] and (status == "PASS" or guest.get("exe_sha256")):
+        raise Blocked("VM tested an application binary that differs from preflight")
     if guest and not real and guest.get("mock_on_real_profile") != inputs["mock_on_real_profile"]:
         raise Blocked("VM result does not match the selected mock worker mode")
     metrics = vm_metrics(guest, repeats, real=real, external=external)
@@ -509,7 +513,7 @@ def execute(args, root, stage, inputs):
     except CleanupUnconfirmed as exc:
         status, metrics, reason = "BLOCKED", {}, str(exc)
         unsafe_vm = True
-    except (Blocked, OSError, ValueError, KeyError, TypeError, IndexError, DataError, subprocess.SubprocessError) as exc:
+    except (Blocked, OSError, ValueError, KeyError, TypeError, IndexError, AttributeError, DataError, subprocess.SubprocessError) as exc:
         status, metrics, reason = "BLOCKED", {}, str(exc)
     result = {"status": status, "metrics": metrics, "reason": reason, "inputs": inputs, "evidence_sha256": evidence,
               "directory": directory.relative_to(root).as_posix()}
@@ -567,6 +571,7 @@ def run_plan(args, root):
     results = {}
     interrupted = False
     unsafe_vm = False
+    vm_app_sha256 = None
     for stage in STAGES:
         if not planned(args, stage):
             results[stage] = {"status": "NOT_SELECTED"}
@@ -577,11 +582,16 @@ def run_plan(args, root):
         else:
             try:
                 inputs = inputs_for(args, stage)
+                if STAGES[stage] == "vm":
+                    candidate = inputs.get("app_sha256")
+                    if vm_app_sha256 is not None and candidate != vm_app_sha256:
+                        raise Blocked("application binary changed between VM stages")
+                    vm_app_sha256 = candidate
                 saved = matching_pass(root, stage, inputs, args.suite) if args.resume else None
                 results[stage] = {**saved, "reused": True} if saved else execute(args, root, stage, inputs)
             except KeyboardInterrupt:
                 results[stage] = {"status": "INTERRUPTED", "reason": "operator interrupted preflight"}
-            except (Blocked, OSError, ValueError, KeyError, TypeError, DataError, subprocess.SubprocessError) as exc:
+            except (Blocked, OSError, ValueError, KeyError, TypeError, IndexError, AttributeError, DataError, subprocess.SubprocessError) as exc:
                 results[stage] = {"status": "BLOCKED", "reason": str(exc)}
             interrupted = results[stage]["status"] == "INTERRUPTED"
             unsafe_vm |= results[stage].get("vm_cleanup_unconfirmed", False)

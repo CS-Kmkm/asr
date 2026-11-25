@@ -131,6 +131,15 @@ class AcceptanceTests(unittest.TestCase):
             module.main(cli)
         self.assertIn('requires --mock-insertion', stderr.getvalue())
 
+    def test_vm_mock_rejects_text_from_a_previous_case(self):
+        older = module.MOCK_TEXT + "0" * 16
+        current = module.MOCK_TEXT + "1" * 16
+        take = {"outcome": "pasted"}
+        self.assertEqual(module.judge(module.MOCK_NOTEPAD, older, "", take, "", 0.5,
+                                      mock_text=current)["status"], "FAIL")
+        self.assertEqual(module.judge(module.MOCK_NOTEPAD, current, "", take, "", 0.5,
+                                      mock_text=current)["status"], "PASS")
+
     def test_vm_guard_cases_detect_transient_edits_and_cancel_processing(self):
         for scenario, defect in (('focus-away', None), ('focus-away', 'transient'),
                                  ('cancel', None), ('cancel', 'processing')):

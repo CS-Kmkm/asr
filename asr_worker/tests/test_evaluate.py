@@ -82,6 +82,33 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(execute.call_count, 1)
         self.assertEqual(stages["vm-real"]["status"], "NOT_RUN")
 
+    def test_vm_stages_cannot_use_different_application_binaries(self):
+        args = SimpleNamespace(profile="vm", suite="smoke", vm_mode="both", resume=False)
+        with patch.object(evaluate, "inputs_for", side_effect=[
+            {"app_sha256": "mock-binary"}, {"app_sha256": "different-binary"},
+        ]), patch.object(evaluate, "execute", return_value={"status": "PASS"}) as execute:
+            stages, status = evaluate.run_plan(args, Path("unused"))
+        self.assertEqual(status, "BLOCKED")
+        self.assertEqual(execute.call_count, 1)
+        self.assertEqual(stages["vm-real"]["reason"], "application binary changed between VM stages")
+
+    def test_vm_evidence_must_bind_the_binary_and_desktop_session(self):
+        args = SimpleNamespace(suite="smoke", vm_fixture="original", app_binary="app.exe",
+                               app_revision="revision", credential="credential.xml", manifest_dir="manifests")
+        inputs = {"vm_id": "vm", "app_sha256": "expected", "mock_on_real_profile": False}
+        with tempfile.TemporaryDirectory() as scratch, patch.object(evaluate, "invoke_vm", return_value=0):
+            directory = Path(scratch)
+            vm = directory / "vm"
+            vm.mkdir()
+            evaluate.new_json(vm / "host.json", {"status": "PASS", "vm_id": "vm"})
+            evidence = vm / "result.json"
+            evaluate.new_json(evidence, {"exe_sha256": "different", "status": "PASS"})
+            with self.assertRaisesRegex(evaluate.Blocked, "binary that differs from preflight"):
+                evaluate.run_vm(args, "vm-mock", directory, inputs)
+            evidence.write_text('{"requires_session_reset":true,"reason":"acceptance timed out"}', encoding="utf-8")
+            with self.assertRaisesRegex(evaluate.CleanupUnconfirmed, "acceptance timed out"):
+                evaluate.run_vm(args, "vm-mock", directory, inputs)
+
     def test_vm_interrupt_at_controller_exit_still_stops_suite(self):
         with tempfile.TemporaryDirectory() as scratch:
             directory = Path(scratch)
@@ -97,6 +124,7 @@ class EvaluationTests(unittest.TestCase):
                 subprocess, "Popen", return_value=SimpleNamespace(pid=42, wait=wait)
             ), self.assertRaises(KeyboardInterrupt):
                 evaluate.invoke_vm(directory, ["unused"], timeout=10)
+
     def test_mock_recognition_rejects_wrong_text_from_successful_process(self):
         with tempfile.TemporaryDirectory() as scratch:
             directory = Path(scratch)
