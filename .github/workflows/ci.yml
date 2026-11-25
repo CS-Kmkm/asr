@@ -70,6 +70,14 @@ jobs:
           version: latest
       - run: uv sync --extra serve
       - run: uv run --with pytest pytest asr_worker/tests -q
+      - name: Run headless evaluation smoke
+        run: uv run --no-sync scripts/evaluate.py --suite smoke --profile headless --verbose --output "${{ runner.temp }}/asr-evaluation-smoke"
+      - name: Show failed headless evaluation report
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-ChildItem (Join-Path $env:RUNNER_TEMP 'asr-evaluation-smoke') -Recurse -Filter summary.md -ErrorAction SilentlyContinue |
+            Get-Content
 
   release:
     runs-on: windows-latest

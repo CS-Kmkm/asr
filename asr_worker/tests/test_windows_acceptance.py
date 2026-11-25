@@ -1,6 +1,7 @@
 """Exercise acceptance orchestration without sending Windows input."""
 from pathlib import Path
 import contextlib
+import io
 import json
 import sqlite3
 import sys
@@ -13,6 +14,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'scripts'))
 try:
+    import vm_insertion_smoke as vm_smoke
     import windows_acceptance as module
 finally:
     sys.path.pop(0)
@@ -27,9 +29,12 @@ class Clock:
 class Target:
     def __init__(self, content=''):
         self.content, self.focused, self.minimized = content, False, False
+        self.changes = []
     def focus(self): self.focused = True
     def focus_process(self): return None if self.focused else 'other'
     def read(self): return self.content
+    def change_count(self): return len(self.changes)
+    def changed_since(self, start, expected): return any(value != expected for value in self.changes[start:])
     def minimize(self): self.minimized = True
 
 
@@ -48,6 +53,210 @@ class Reader:
 
 
 class AcceptanceTests(unittest.TestCase):
+    def test_real_notepad_matches_worker_output_independently_of_reference(self):
+        expected_text = '認識した文章'
+        for output, status in ((expected_text, 'PASS'), (expected_text * 2, 'FAIL'), ('', 'FAIL')):
+            with self.subTest(status=status, output=output), tempfile.TemporaryDirectory() as directory:
+                proof = Path(directory) / 'proof.json'
+                clock = Clock()
+                primary, secondary = Target(), Target()
+                reader = Reader('pasted')
+
+                def tap(api, target, chord):
+                    if reader.phase == 'idle':
+                        reader.phase, reader.operation_id = 'recording', 7
+                        return clock.perf_counter()
+                    dispatched = clock.perf_counter()
+                    clock.sleep(.125)
+                    proof.write_text(json.dumps({
+                        'backend': 'faster-whisper', 'device': 'cpu', 'compute_type': 'int8',
+                        'captured_frames': 16000, 'sample_rate': 16000,
+                        'delivery_sha256': module.delivery_digest(expected_text),
+                    }), encoding='utf-8')
+                    primary.content, reader.phase = output, 'idle'
+                    return dispatched
+
+                with patch.object(module, 'tap', side_effect=tap), \
+                     patch.object(module, 'observed_playback', return_value=(1, 3, 2000)):
+                    row, _, _ = module.run_scenario(
+                        module.REAL_NOTEPAD, api=None, primary=primary, secondary=secondary, reader=reader,
+                        player=None, item={'audio_path': 'unused', 'reference': 'unrelated reference'},
+                        hotkey=(17, 32), clock=clock, guard_seconds=.1, unattended=True, real_proof=proof)
+                self.assertEqual(row['status'], status)
+                self.assertEqual(row['stop_to_observed_insertion_ms'], 125 if status == 'PASS' else None)
+
+    def test_owned_notepad_requires_exactly_one_fixture_phrase(self):
+        text = module.MOCK_TEXT
+        for primary, secondary, expected in ((text, '', 'PASS'), (text + text, '', 'FAIL'),
+                                              (text + '\n', '', 'FAIL'), (text, text, 'FAIL')):
+            with self.subTest(primary=primary, secondary=secondary):
+                row = module.judge(module.MOCK_NOTEPAD, primary, secondary, {'outcome': 'pasted'}, 'unrelated', .5)
+                self.assertEqual(row['status'], expected)
+
+    def test_exact_receiver_proof_requires_the_app_to_attempt_delivery(self):
+        for outcome, expected in (('pasted', 'PASS'), ('paste_unverified', 'PASS'),
+                                  ('clipboard_only', 'FAIL'), ('cancelled', 'FAIL')):
+            with self.subTest(outcome=outcome):
+                row = module.judge('mock-terminal', module.MOCK_TEXT, '',
+                                   {'outcome': outcome}, 'unrelated', .5)
+                self.assertEqual(row['status'], expected)
+                if expected == 'FAIL':
+                    self.assertEqual(row['reason'], 'app_outcome_mismatch')
+
+    def test_focus_loss_after_stop_has_a_distinct_reason(self):
+        primary, secondary = Target(), Target()
+        reader = Reader('pasted')
+
+        def tap(api, target, chord):
+            if reader.phase == 'idle':
+                reader.phase, reader.operation_id = 'recording', 7
+            else:
+                reader.phase = 'idle'
+                primary.focused = False
+
+        with patch.object(module, 'tap', side_effect=tap), \
+             patch.object(module, 'observed_playback', return_value=(1, 3, 2000)), \
+             self.assertRaises(module.ScenarioEvidenceError) as error:
+            module.run_scenario(
+                'mock-edge', api=None, primary=primary, secondary=secondary, reader=reader,
+                player=None, item={'audio_path': 'unused', 'reference': 'public'},
+                hotkey=(17, 32), clock=Clock(), unattended=True)
+        self.assertEqual(error.exception.code, 'target_changed_after_stop')
+
+    def test_owned_notepad_is_not_available_in_the_legacy_runner(self):
+        cli = ['--manifest', 'unused.json', '--item-id', 'unused', '--events', 'unused.jsonl',
+               '--profile-db', 'unused.db', '--output-dir', 'unused', '--scenario', module.MOCK_NOTEPAD]
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+            module.main(cli)
+        self.assertIn('requires --mock-insertion', stderr.getvalue())
+
+    def test_vm_mock_rejects_text_from_a_previous_case(self):
+        older = module.MOCK_TEXT + "0" * 16
+        current = module.MOCK_TEXT + "1" * 16
+        take = {"outcome": "pasted"}
+        self.assertEqual(module.judge(module.MOCK_NOTEPAD, older, "", take, "", 0.5,
+                                      mock_text=current)["status"], "FAIL")
+        self.assertEqual(module.judge(module.MOCK_NOTEPAD, current, "", take, "", 0.5,
+                                      mock_text=current)["status"], "PASS")
+
+    def test_vm_guard_cases_detect_transient_edits_and_cancel_processing(self):
+        for scenario, defect in (('focus-away', None), ('focus-away', 'transient'),
+                                 ('cancel', None), ('cancel', 'processing')):
+            with self.subTest(scenario=scenario, defect=defect):
+                primary, secondary = Target(module.SEED), Target()
+                reader = Reader('cancelled' if scenario == 'cancel' else 'clipboard_only')
+                calls = []
+
+                def tap(api, target, chord):
+                    calls.append((target, chord))
+                    if len(calls) == 1:
+                        reader.phase, reader.operation_id = 'recording', 7
+                    else:
+                        reader.phase = 'idle'
+                        if defect == 'transient':
+                            secondary.changes.extend(('unexpected insertion', ''))
+                        if defect == 'processing':
+                            reader.events.append({'operation_id': 7, 'phase': 'processing'})
+
+                with patch.object(module, 'tap', side_effect=tap), \
+                     patch.object(module, 'observed_playback', return_value=(1, 3, 2000)):
+                    row, _, _ = module.run_scenario(
+                        scenario, api=None, primary=primary, secondary=secondary, reader=reader,
+                        player=None, item={'audio_path': 'unused', 'reference': 'public'},
+                        hotkey=(17, 32), clock=Clock(), guard_seconds=.1, unattended=True)
+                self.assertEqual(row['status'], 'FAIL' if defect else 'PASS')
+                self.assertEqual(calls[-1], (primary, (27,)) if scenario == 'cancel' else (secondary, (17, 32)))
+
+    def test_vm_capture_proof_is_required_for_focus_away_and_forbidden_for_cancel(self):
+        for scenario, initial, proof, requests, expected in (
+            ('focus-away', 'PASS', None, 1, 'BLOCKED'),
+            ('focus-away', 'PASS', {'passed': True}, 1, 'PASS'),
+            ('cancel', 'PASS', None, 1, 'FAIL'),
+            ('cancel', 'PASS', {'passed': False}, 0, 'FAIL'),
+            ('cancel', 'PASS', None, 0, 'PASS'),
+            ('cancel', 'BLOCKED', {'passed': True}, 1, 'BLOCKED'),
+        ):
+            with self.subTest(scenario=scenario, initial=initial, proof=proof, requests=requests):
+                case = {'scenario': scenario, 'status': initial}
+                vm_smoke.apply_capture_proof(case, proof, requests)
+                self.assertEqual(case['status'], expected)
+
+    def test_vm_request_trace_observes_protocol_input_before_validation(self):
+        lines = ['{"command":"load"}', '{bad json', '{"command":"transcribe"}',
+                 '{"op":"transcribe","audio_path":"private"}']
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = Path(tmp) / 'trace.log'
+            self.assertEqual(list(vm_smoke.trace_transcriptions(lines, trace)), lines)
+            self.assertEqual(trace.read_text(encoding='ascii').splitlines(), ['transcribe', 'transcribe'])
+
+    def test_vm_capture_evidence_distinguishes_the_fixture_from_silence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, item = vm_smoke.fixture(root)
+            self.assertTrue(vm_smoke.capture_evidence(root / f'{item}.wav')['passed'])
+            silence = root / 'silence.wav'
+            with wave.open(str(silence), 'wb') as output:
+                output.setparams((1, 2, 16000, 0, 'NONE', 'not compressed'))
+                output.writeframes(bytes(32000))
+            self.assertFalse(vm_smoke.capture_evidence(silence)['passed'])
+
+    def test_mock_insertion_requires_exact_text_at_the_caret(self):
+        prefix, text, suffix = module.MOCK_PREFIX, module.MOCK_TEXT, module.MOCK_SUFFIX
+        cases = (
+            (prefix + text + suffix, '', 'PASS'),
+            (prefix + text + text + suffix, '', 'FAIL'),
+            (prefix + suffix + text, '', 'FAIL'),
+            (text + suffix, '', 'FAIL'),
+            (prefix + text + suffix, text, 'FAIL'),
+        )
+        for primary, secondary, expected in cases:
+            with self.subTest(primary=primary, secondary=secondary):
+                result = module.judge(module.MOCK_INSERTION, primary, secondary, {'outcome': 'pasted'},
+                                      'different reference', .5)
+                self.assertEqual(result['status'], expected)
+                self.assertNotIn('normalized_cer', result)
+
+    def test_mock_profile_requires_explicit_offline_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'profile.sqlite3'
+            settings = {'asrBackend': 'mock', 'microphoneId': 'virtual-test',
+                        'textCorrectionEnabled': False, 'automaticVoiceMode': False, 'liveTargetInsertion': False,
+                        'holdToTalk': {'dictate': False}, 'shortcuts': {'dictate': ['Ctrl+Shift+Space']}}
+            with contextlib.closing(sqlite3.connect(path)) as db, db:
+                db.execute('CREATE TABLE settings (key TEXT, value TEXT)')
+                db.execute('INSERT INTO settings VALUES (?, ?)', ('app_settings', json.dumps(settings)))
+            with self.assertRaises(module.EvidenceError):
+                module.profile_settings(path, 'virtual-test', mock_insertion=True)
+            settings['offlineOnly'] = True
+            with contextlib.closing(sqlite3.connect(path)) as db, db:
+                db.execute('UPDATE settings SET value=?', (json.dumps(settings),))
+            self.assertEqual(module.profile_settings(path, 'virtual-test', mock_insertion=True)['asrBackend'], 'mock')
+            with self.assertRaises(module.EvidenceError):
+                module.profile_settings(path, 'virtual-test')
+
+    def test_shared_mock_requires_a_pinned_evaluation_profile(self):
+        settings = {
+            'asrBackend': 'faster-whisper', 'asrDevice': 'cpu', 'offlineOnly': True,
+            'microphoneId': 'virtual-test', 'textCorrectionEnabled': False,
+            'automaticVoiceMode': False, 'liveTargetInsertion': False, 'livePreviewEnabled': False,
+            'incrementalFinalAsr': False, 'statefulStreaming': False, 'smartDictateEdit': False,
+            'holdToTalk': {'dictate': False}, 'shortcuts': {'dictate': ['Ctrl+Shift+Space']},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / 'profile.sqlite3'
+            with contextlib.closing(sqlite3.connect(database)) as db, db:
+                db.execute('CREATE TABLE settings (key TEXT, value TEXT)')
+                db.execute('INSERT INTO settings VALUES (?, ?)', ('app_settings', json.dumps(settings)))
+            with self.assertRaises(module.EvidenceError):
+                module.profile_settings(database, 'virtual-test', mock_insertion=True, mock_on_real_profile=True)
+            settings['asrEvaluationProfile'] = 'vm-real-notepad/1'
+            with contextlib.closing(sqlite3.connect(database)) as db, db:
+                db.execute('UPDATE settings SET value=?', (json.dumps(settings),))
+            observed = module.profile_settings(database, 'virtual-test',
+                                               mock_insertion=True, mock_on_real_profile=True)
+            self.assertEqual(observed['asrBackend'], 'faster-whisper')
+
     def test_hold_playback_abort_does_not_wait_for_audio_worker(self):
         release, entered, finished = threading.Event(), threading.Event(), threading.Event()
         def play(path):
@@ -84,6 +293,55 @@ class AcceptanceTests(unittest.TestCase):
         for first, second in [(module.SEED+'public', ''), (module.SEED, 'public'), ('', '')]:
             self.assertEqual(module.judge('focus-away', first, second, {'outcome': 'clipboard_only'}, 'public', .5)['status'], 'FAIL')
         self.assertEqual(module.judge('cancel', module.SEED, '', {'outcome': 'pasted'}, 'public', .5)['status'], 'FAIL')
+
+    def test_worker_crash_oracle_requires_refusal_and_both_receivers_unchanged(self):
+        for primary, secondary, outcome, expected in (
+            (module.SEED, '', 'failed', 'PASS'),
+            (module.SEED + module.MOCK_TEXT, '', 'failed', 'FAIL'),
+            (module.SEED, module.MOCK_TEXT, 'failed', 'FAIL'),
+            (module.SEED, '', 'clipboard_only', 'FAIL'),
+        ):
+            with self.subTest(primary=primary, secondary=secondary, outcome=outcome):
+                row = module.judge(module.WORKER_CRASH, primary, secondary, {'outcome': outcome}, '', .5)
+                self.assertEqual(row['status'], expected)
+
+    def test_worker_recovery_checks_liveness_and_allows_pid_reuse(self):
+        def take(operation, created):
+            return {'status': 'PASS', 'acceptance': {'results': [{
+                        'operation_id': operation, 'worker_exit_before_recovery': True}]},
+                    'capture_proof': {'worker_pid': 42, 'worker_start_time': created}}
+
+        reader = SimpleNamespace(pid=123, phase='idle', takes={1: None}, poll=lambda: None)
+        process = SimpleNamespace(pid=123, poll=lambda: None)
+        first = take(1, 100)
+        first['acceptance']['results'][0]['worker_exit_before_recovery'] = False
+        vm_smoke.check_worker_recovery_trial(first, [first], reader, process, ['transcribe'])
+        self.assertEqual(first['status'], 'FAIL')
+
+        first, second = take(1, 100), take(2, 200)
+        vm_smoke.check_worker_recovery_trial(first, [first], reader, process, ['transcribe'])
+        self.assertEqual(first['status'], 'PASS')
+        reader.takes[2] = None
+        with patch.object(vm_smoke, 'live_process_start', return_value=200):
+            vm_smoke.check_worker_recovery_trial(second, [first, second], reader, process, ['transcribe'])
+        self.assertTrue(second['recovered_worker_live'])
+        self.assertEqual(first['application_pid'], second['application_pid'])
+
+    def test_worker_exit_evidence_requires_one_request_marker_consumption_and_worker_exit(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / 'trial-01').mkdir()
+            (root / 'trial-01' / 'capture-proof.json').write_text(
+                '{"worker_pid": 42, "worker_start_time": 100}', encoding='utf-8')
+            requests, marker = root / 'transcription-requests.log', root / 'crash-once'
+            requests.write_text('transcribe\n', encoding='ascii')
+            with patch.object(module, 'live_process_start', return_value=100):
+                self.assertFalse(module.worker_exited_before_recovery(root))
+            with patch.object(module, 'live_process_start', return_value=None) as exited:
+                self.assertTrue(module.worker_exited_before_recovery(root))
+                exited.assert_called_once_with(42, exit_wait_ms=2000)
+                marker.touch()
+                self.assertFalse(module.worker_exited_before_recovery(root))
 
     def test_failed_start_never_plays_audio_or_sends_stop_toggle(self):
         reader, primary, secondary = Reader('pasted'), Target(), Target()

@@ -6,19 +6,23 @@ No Computer Use, global key hooks, clipboard observer, or permission bypass.
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import ctypes
 from ctypes import wintypes as wt
 import hashlib
 import json
+import os
 from pathlib import Path
 import queue
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import uuid
 import wave
 
 from bench_e2e import (WinAPI, TargetWindow, WavePlayer, Keyboard, ConsoleKeyGuard,
@@ -30,6 +34,27 @@ SCENARIOS = ('dictate', 'focus-away', 'selection-change', 'minimize', 'cancel')
 OPTIONAL_SCENARIOS = ('ime-composition', 'cancel-processing')
 HOLD_SCENARIOS = ('dictate', 'focus-away', 'selection-change', 'cancel')
 SEED = 'ASR acceptance sentinel'
+MOCK_INSERTION = 'mock-insertion'
+MOCK_NOTEPAD = 'mock-notepad'
+REAL_NOTEPAD = 'real-notepad'
+REAL_EXTERNAL = {'real-vscode': 'code', 'real-chrome': 'chrome'}
+REAL_EXTERNAL_REPEATS = 2
+REAL_RECEIVERS = {REAL_NOTEPAD: 'notepad', **REAL_EXTERNAL}
+MOCK_GUARDS = ('focus-away', 'cancel')
+VM_SMOKE_SCENARIOS = (MOCK_INSERTION, *MOCK_GUARDS)
+VM_EXTRA_GUARDS = ('selection-change', 'minimize')
+WORKER_CRASH = 'worker-crash'
+WORKER_RECOVERY = 'worker-crash-recovery'
+MOCK_EXTERNAL = {'mock-notepad': 'notepad', 'mock-edge': 'edge', 'mock-vscode': 'code', 'mock-chrome': 'chrome',
+                 'mock-terminal': 'terminal'}
+MOCK_RECEIVERS = (MOCK_INSERTION, *MOCK_EXTERNAL)
+VM_FULL_SCENARIOS = (*VM_SMOKE_SCENARIOS, *VM_EXTRA_GUARDS, *MOCK_EXTERNAL, WORKER_RECOVERY)
+VM_MOCK_CASES = (*MOCK_GUARDS, *VM_EXTRA_GUARDS, *MOCK_EXTERNAL)
+WORKER_RECOVERY_TRIALS = (WORKER_CRASH, MOCK_INSERTION)
+DELIVERY_OUTCOMES = ('pasted', 'paste_unverified')
+MOCK_PREFIX = '前の文。'
+MOCK_SUFFIX = '後ろの文。'
+MOCK_TEXT = '挿入試験です。'
 
 
 class UnsupportedTarget(EvidenceError):
@@ -44,7 +69,8 @@ class ScenarioEvidenceError(EvidenceError):
         self.code = code
 
 
-def profile_settings(path, device, recording_mode='toggle'):
+def profile_settings(path, device, recording_mode='toggle', *, mock_insertion=False, real_notepad=False,
+                     mock_on_real_profile=False):
     if recording_mode not in ('toggle', 'hold'):
         raise EvidenceError('unknown recording mode')
     with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=1)) as db:
@@ -55,7 +81,15 @@ def profile_settings(path, device, recording_mode='toggle'):
         raise EvidenceError('invalid profile JSON') from exc
     if not isinstance(settings, dict) or not isinstance(settings.get('holdToTalk'), dict) or not isinstance(settings.get('shortcuts'), dict):
         raise EvidenceError('invalid profile shape')
-    if (settings.get('asrBackend') not in ('speech-cpp', 'faster-whisper', 'sherpa-onnx', 'transformers-asr')
+    backends = ('mock',) if mock_insertion and not mock_on_real_profile else (
+        'speech-cpp', 'faster-whisper', 'sherpa-onnx', 'transformers-asr')
+    if (settings.get('asrBackend') not in backends
+            or ((mock_insertion or real_notepad) and settings.get('offlineOnly') is not True)
+            or ((real_notepad or mock_on_real_profile) and (settings.get('asrBackend') != 'faster-whisper'
+                                  or settings.get('asrDevice') != 'cpu'
+                                  or any(settings.get(key) is not False for key in (
+                                      'livePreviewEnabled', 'incrementalFinalAsr', 'statefulStreaming', 'smartDictateEdit'))))
+            or (mock_on_real_profile and settings.get('asrEvaluationProfile') != 'vm-real-notepad/1')
             or any(settings.get(key) is not False for key in (
                 'textCorrectionEnabled', 'automaticVoiceMode', 'liveTargetInsertion'))
             or settings.get('holdToTalk', {}).get('dictate') is not (recording_mode == 'hold')
@@ -69,6 +103,52 @@ def profile_settings(path, device, recording_mode='toggle'):
         'asrBackend', 'modelId', 'modelQuantization', 'asrDevice', 'speechLocale',
         'statefulStreaming', 'qwenDemoStreaming', 'incrementalFinalAsr',
         'livePreviewEnabled', 'smartDictateEdit', 'clipboardRestore')}}
+
+
+def live_process_start(pid, *, exit_wait_ms=0):
+    """Return the Windows creation time of the current live process at pid."""
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    kernel.OpenProcess.restype = wt.HANDLE
+    kernel.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+    kernel.WaitForSingleObject.restype = wt.DWORD
+    kernel.GetProcessTimes.argtypes = [wt.HANDLE] + [ctypes.POINTER(wt.FILETIME)] * 4
+    kernel.CloseHandle.argtypes = [wt.HANDLE]
+    handle = kernel.OpenProcess(0x101000, False, pid)  # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == 87:  # No process with this PID.
+            return None
+        raise ctypes.WinError(error)
+    try:
+        state = kernel.WaitForSingleObject(handle, exit_wait_ms)
+        if state == 0:  # The process has exited.
+            return None
+        if state != 0x102:  # WAIT_TIMEOUT means the process is still live.
+            raise ctypes.WinError(ctypes.get_last_error())
+        created, exited, system, user = (wt.FILETIME() for _ in range(4))
+        if not kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                      ctypes.byref(system), ctypes.byref(user)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return (created.dwHighDateTime << 32) | created.dwLowDateTime
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def worker_identity(proof):
+    pid, start = proof.get('worker_pid'), proof.get('worker_start_time')
+    if type(pid) is not int or pid <= 0 or type(start) is not int or start <= 0:
+        raise EvidenceError('worker process identity was not recorded')
+    return pid, start
+
+
+def worker_exited_before_recovery(directory):
+    proof_path = directory / 'trial-01' / 'capture-proof.json'
+    proof = json.loads(proof_path.read_text(encoding='utf-8'))
+    pid, start = worker_identity(proof)
+    requests = (directory / 'transcription-requests.log').read_text(encoding='ascii').splitlines()
+    return (requests == ['transcribe'] and not (directory / 'crash-once').exists()
+            and live_process_start(pid, exit_wait_ms=2000) != start)
 
 
 def runtime_metadata(api, app_pid):
@@ -103,19 +183,31 @@ def runtime_metadata(api, app_pid):
             'runner_script_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             'runner_files_sha256': {name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
                                     for name in ('windows_acceptance.py', 'bench_e2e.py', 'evaluation_events.py',
-                                                 'score_asr.py', 'windows_uia_bridge.ps1')},
+                                                 'score_asr.py', 'windows_uia_bridge.ps1', 'windows_acceptance_target.html',
+                                                 'windows_acceptance_terminal.py')},
             'os_build': sys.getwindowsversion().build,
             'application_binary_sha256': digest,
             'application_identity_scope': 'loaded executable file; debug frontend is separate'}
 
 
 class UIABridge:
-    def __init__(self):
+    def __init__(self, *, owned_notepad=False):
+        bridge = Path(__file__).with_name('windows_uia_bridge.ps1')
+        env = None
+        if owned_notepad:
+            # The provisioned guest has Windows PowerShell and does not require PowerShell 7.
+            powershell = Path(os.environ['SystemRoot']) / 'System32' / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe'
+            env = {**os.environ, 'ASR_EVAL_UIA_SOURCE': str(bridge.resolve())}
+            bootstrap = '& ([scriptblock]::Create([IO.File]::ReadAllText($env:ASR_EVAL_UIA_SOURCE)))'
+            code = base64.b64encode(bootstrap.encode('utf-16-le')).decode('ascii')
+            command = [str(powershell), '-NoProfile', '-NonInteractive', '-EncodedCommand', code]
+        else:
+            command = ['pwsh.exe', '-NoProfile', '-NonInteractive', '-File', str(bridge)]
+        self.owned_notepad = owned_notepad
         self.process = subprocess.Popen(
-            ['pwsh.exe', '-NoProfile', '-NonInteractive', '-File',
-             str(Path(__file__).with_name('windows_uia_bridge.ps1'))],
+            command,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, encoding='utf-8', creationflags=subprocess.CREATE_NO_WINDOW)
+            text=True, encoding='utf-8', creationflags=subprocess.CREATE_NO_WINDOW, env=env)
         self.responses = queue.Queue()
         def read():
             for line in self.process.stdout:
@@ -123,13 +215,18 @@ class UIABridge:
             self.responses.put(None)
         threading.Thread(target=read, daemon=True).start()
 
-    def call(self, action, target):
+    def call(self, action, target, **fields):
         try:
-            self.process.stdin.write(json.dumps({'action': action, 'target': target}) + '\n')
+            self.process.stdin.write(json.dumps({'action': action, 'target': target, **fields}) + '\n')
             self.process.stdin.flush()
-            line = self.responses.get(timeout=.75 if action == 'focused' else 8)
+            timeout = {'focused': .75, 'open_notepad': 18, 'open_fixture': 35}.get(action, 8)
+            line = self.responses.get(timeout=timeout)
             result = json.loads(line) if line else {}
             if result.get('ok') is not True:
+                if action in ('open_notepad', 'close_notepad', 'open_fixture', 'close_fixture'):
+                    error = result.get('error', 'owned_target_unavailable')
+                    if re.fullmatch(r'owned_[a-z_]+', error):
+                        raise ScenarioEvidenceError(error, 'owned target could not be prepared or cleaned up')
                 raise UnsupportedTarget('UI Automation target unsupported, blocked, or changed')
             return result
         except (OSError, ValueError, queue.Empty) as exc:
@@ -137,6 +234,12 @@ class UIABridge:
             raise UnsupportedTarget('UI Automation unavailable; no fallback input was sent') from exc
 
     def close(self):
+        if self.owned_notepad and self.process.poll() is None:
+            self.process.stdin.close()
+            try:
+                self.process.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                pass
         if self.process.poll() is None:
             self.process.kill()
         self.process.wait(timeout=3)
@@ -202,10 +305,33 @@ class NativeTarget:
         _, changes = self.window.snapshot()
         return changes[-1].text if changes else ''
 
+    def change_count(self):
+        return len(self.window.snapshot()[1])
+
+    def changed_since(self, start, expected):
+        return any(change.text != expected for change in self.window.snapshot()[1][start:])
+
     def select_all(self):
         result = ctypes.c_size_t()
         if not self.api.user.SendMessageTimeoutW(self.window.edit, 0xB1, 0, -1, 0x23, 250, ctypes.byref(result)):
             raise UnsupportedTarget('native selection timed out')
+
+    def select_caret(self, offset):
+        require_focus(self)
+        result = ctypes.c_size_t()
+        if not self.api.user.SendMessageTimeoutW(self.window.edit, 0xB1, offset, offset, 0x23, 250, ctypes.byref(result)):
+            raise UnsupportedTarget('native caret placement timed out')
+        self.require_caret(offset)
+
+    def require_caret(self, offset):
+        self.require_selection(offset, offset)
+
+    def require_selection(self, start, end):
+        require_focus(self)
+        result = ctypes.c_size_t()
+        if (not self.api.user.SendMessageTimeoutW(self.window.edit, 0xB0, 0, 0, 0x23, 250, ctypes.byref(result))
+                or result.value != (end << 16 | start)):
+            raise UnsupportedTarget('native selection does not match the expected positions')
 
     def change_held_selection(self):
         # Window messages avoid sending an arrow with the Dictate modifiers down.
@@ -225,6 +351,9 @@ class NativeTarget:
 
     def minimize(self):
         self.api.user.ShowWindow(self.window.hwnd, 7)
+        self.api.bind(self.api.user, 'IsIconic', wt.BOOL, wt.HWND)
+        if not self.api.user.IsIconic(self.window.hwnd):
+            raise UnsupportedTarget('native fixture was not minimized')
 
 
 class NativeIME:
@@ -344,14 +473,41 @@ def prepare(api, target, previous, text):
     raise UnsupportedTarget('scratch control did not accept deterministic setup')
 
 
-def judge(scenario, primary, secondary, take, reference, max_cer):
+def judge(scenario, primary, secondary, take, reference, max_cer, *, mock_text=MOCK_TEXT):
+    if scenario in MOCK_RECEIVERS:
+        expected = MOCK_PREFIX + mock_text + MOCK_SUFFIX if scenario == MOCK_INSERTION else mock_text
+        exact = primary == expected and not secondary
+        result = {'status': 'PASS' if exact else 'FAIL', 'exact_receiver_match': exact}
+        if exact and take['outcome'] not in DELIVERY_OUTCOMES:
+            result.update(status='FAIL', reason='app_outcome_mismatch')
+        return result
     if scenario == 'dictate':
         cer = cer_stats(reference, primary)['cer']
         passed = bool(primary.strip()) and not secondary and take['outcome'] == 'pasted' and cer <= max_cer
         return {'status': 'PASS' if passed else 'FAIL', 'normalized_cer': cer}
-    expected = 'cancelled' if scenario in ('cancel', 'cancel-processing') else 'clipboard_only'
+    expected = ('failed' if scenario == WORKER_CRASH else
+                'cancelled' if scenario in ('cancel', 'cancel-processing') else 'clipboard_only')
     passed = primary == SEED and not secondary and take['outcome'] == expected
     return {'status': 'PASS' if passed else 'FAIL', 'normalized_cer': None}
+
+
+def delivery_digest(text):
+    return hashlib.sha256(text.replace('\r\n', '\n').replace('\r', '\n').encode('utf-8')).hexdigest()
+
+
+def read_real_proof(path):
+    try:
+        proof = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return None
+    if (not isinstance(proof, dict) or proof.get('backend') != 'faster-whisper'
+            or proof.get('device') != 'cpu' or proof.get('compute_type') != 'int8'
+            or type(proof.get('captured_frames')) is not int or proof['captured_frames'] <= 0
+            or type(proof.get('sample_rate')) is not int or proof['sample_rate'] <= 0
+            or not isinstance(proof.get('delivery_sha256'), str)
+            or not re.fullmatch('[0-9a-f]{64}', proof['delivery_sha256'])):
+        raise EvidenceError('invalid real worker evidence')
+    return proof
 
 
 def observed_playback(player, path, reader, target, check=lambda: None, *, abort_on_failure=False):
@@ -389,10 +545,11 @@ def observed_playback(player, path, reader, target, check=lambda: None, *, abort
 
 def run_scenario(scenario, *, api, primary, secondary, reader, player, item, hotkey,
                  max_cer=.5, timeout=60, guard_seconds=2, clock=time, ime=None,
-                 recording_mode='toggle'):
+                 recording_mode='toggle', unattended=False, real_proof=None, mock_text=MOCK_TEXT):
     arguments = dict(api=api, primary=primary, secondary=secondary, reader=reader,
                      player=player, item=item, hotkey=hotkey, max_cer=max_cer,
-                     timeout=timeout, guard_seconds=guard_seconds, clock=clock, ime=ime)
+                     timeout=timeout, guard_seconds=guard_seconds, clock=clock, ime=ime,
+                     unattended=unattended, real_proof=real_proof, mock_text=mock_text)
     if recording_mode == 'toggle':
         return _run_scenario(scenario, **arguments)
     if recording_mode != 'hold' or scenario not in HOLD_SCENARIOS or ime:
@@ -446,15 +603,28 @@ def run_scenario(scenario, *, api, primary, secondary, reader, player, item, hot
 def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, hotkey,
                   max_cer=.5, timeout=60, guard_seconds=2, clock=time, ime=None,
                   start=None, stop=None, recording_timeout=None, hold_check=lambda: None,
-                  still_held=lambda: None):
+                  still_held=lambda: None, unattended=False, real_proof=None, mock_text=MOCK_TEXT):
     reader.ready()
     if reader.phase != 'idle':
         raise EvidenceError('app not idle; never retry its toggle blindly')
     baseline = reader.sequence
     primary.focus()
     original = primary.read()
-    if original != ('' if scenario == 'dictate' else SEED) or secondary.read():
+    mock_insertion = scenario == MOCK_INSERTION
+    empty_receiver = scenario in ('dictate', *REAL_RECEIVERS, *MOCK_EXTERNAL)
+    confirms_insertion = empty_receiver or mock_insertion
+    expected_initial = MOCK_PREFIX + MOCK_SUFFIX if mock_insertion else ('' if empty_receiver else SEED)
+    if original != expected_initial or secondary.read():
         raise EvidenceError('unexpected scratch state before recording')
+    if mock_insertion:
+        primary.select_caret(len(MOCK_PREFIX))
+    guard_counts = (primary.change_count(), secondary.change_count()) if (
+        unattended and scenario in (*MOCK_GUARDS, *VM_EXTRA_GUARDS, WORKER_CRASH)) else None
+
+    def guarded_receivers_changed():
+        return guard_counts is not None and (primary.changed_since(guard_counts[0], original)
+                                             or secondary.changed_since(guard_counts[1], ''))
+
     if ime:
         ime.compose()
         ime.cancel_composition()
@@ -473,7 +643,7 @@ def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, ho
     # This is the real recording path, not a WAV-import shortcut.
     def before_stop_check():
         hold_check()
-        if primary.read() != original or secondary.read():
+        if primary.read() != original or secondary.read() or guarded_receivers_changed():
             raise ScenarioEvidenceError('receiver_changed_during_playback',
                                         'scratch text changed before stop; no further input sent')
     playback_options = {'abort_on_failure': True} if start is not None else {}
@@ -486,19 +656,43 @@ def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, ho
                                         'recording ended before the intended stop or cancel')
     require_recording()
     require_focus(primary)
+    if mock_insertion:
+        primary.require_caret(len(MOCK_PREFIX))
     hold_check()
     receiver_violation = False
     secondary_violation = False
+    proof = None
+    first_confirmed_at = None
+
     def monitor_receiver():
-        nonlocal receiver_violation, secondary_violation
+        nonlocal receiver_violation, secondary_violation, proof, first_confirmed_at
         secondary_violation |= bool(secondary.read())
-        if secondary_violation or (scenario != 'dictate' and not ime and primary.read() != original):
+        if real_proof is not None:
+            text = primary.read()
+            observed_at = clock.perf_counter()
+            if proof is None:
+                proof = read_real_proof(real_proof)
+            if text:
+                if proof and delivery_digest(text) == proof['delivery_sha256']:
+                    if first_confirmed_at is None:
+                        first_confirmed_at = observed_at
+                else:
+                    receiver_violation = True
+        elif scenario in MOCK_RECEIVERS:
+            expected = MOCK_PREFIX + mock_text + MOCK_SUFFIX if mock_insertion else mock_text
+            receiver_violation |= primary.read() not in (original, expected)
+        if secondary_violation or (not confirms_insertion and not ime and primary.read() != original):
             receiver_violation = True
+        receiver_violation |= guarded_receivers_changed()
     if ime:
         ime.compose()
     if scenario == 'selection-change':
         if stop is None:
+            if unattended:
+                primary.require_caret(len(SEED))
             tap(api, primary, (0x10, 0x25))  # Shift+Left, observed by product input monitor.
+            if unattended:
+                primary.require_selection(len(SEED) - 1, len(SEED))
         else:
             primary.change_held_selection()
     target = primary
@@ -523,7 +717,7 @@ def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, ho
             stop(primary)
     else:
         if stop is None:
-            tap(api, target, hotkey)
+            stop_at = tap(api, target, hotkey)
         else:
             hold_check()
             still_held()
@@ -537,9 +731,13 @@ def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, ho
                 tap(api, primary, (0x1B,))
                 processing_cancel_attempted = True
     def check_delivery():
-        monitor_receiver()
-        if stop is not None and scenario != 'dictate':
-            require_focus(target)
+        try:
+            monitor_receiver()
+            if unattended or mock_insertion or (stop is not None and scenario != 'dictate'):
+                require_focus(target)
+        except UnsupportedTarget as exc:
+            raise ScenarioEvidenceError('target_changed_after_stop',
+                                        'receiver or focus could not be verified after the stop action') from exc
     reader.wait(lambda r: r.completed(operation), timeout, check=check_delivery)
     # Look for delayed insertion after completion, including cancellation.
     deadline = clock.perf_counter() + guard_seconds
@@ -554,13 +752,33 @@ def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, ho
         if not ime.active():
             raise EvidenceError('IME composition disappeared during the guard')
         ime.close()
-    first, second = primary.read(), secondary.read()
-    if stop is not None and scenario != 'dictate':
-        require_focus(target)
-    result = judge(scenario, first, second, take, item['reference'], max_cer)
-    if receiver_violation:
+    try:
+        first, second = primary.read(), secondary.read()
+        if stop is not None and scenario != 'dictate':
+            require_focus(target)
+    except UnsupportedTarget as exc:
+        raise ScenarioEvidenceError('target_changed_after_stop',
+                                    'receiver or focus could not be verified after the stop action') from exc
+    if real_proof is None:
+        result = judge(scenario, first, second, take, item['reference'], max_cer, mock_text=mock_text)
+    else:
+        proof = proof or read_real_proof(real_proof)
+        exact = bool(proof and first and delivery_digest(first) == proof['delivery_sha256'] and not second)
+        result = {'status': 'PASS' if exact else 'FAIL', 'exact_receiver_match': exact,
+                  'stop_to_observed_insertion_ms': (first_confirmed_at - stop_at) * 1000
+                  if exact and first_confirmed_at is not None else None}
+        if exact and take['outcome'] not in DELIVERY_OUTCOMES:
+            result.update(status='FAIL', reason='app_outcome_mismatch')
+        elif exact and first_confirmed_at is None:
+            result.update(status='BLOCKED', reason='missing_insertion_observation_time')
+        if proof is None and not receiver_violation and not first and not second:
+            result.update(status='BLOCKED', reason='real_worker_evidence_missing')
+    if receiver_violation or guarded_receivers_changed():
+        receiver_violation = True
         result['status'] = 'FAIL'
-    if scenario != 'dictate':
+        if unattended:
+            result['reason'] = 'unexpected_receiver_mutation'
+    if not confirms_insertion:
         result['receiver_unchanged'] = first == original and not second and not receiver_violation
     if scenario == 'cancel' and stop is not None:
         result['requested_cancel_method'] = 'operator_overlay'
@@ -569,6 +787,12 @@ def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, ho
                 event['operation_id'] == operation and event['phase'] == 'processing'
                 for event in reader.events)):
             result.update(status='BLOCKED', reason='processing_observed_before_cancel_completion')
+    if scenario == 'cancel' and unattended:
+        saw_processing = any(event['operation_id'] == operation and event['phase'] == 'processing'
+                             for event in reader.events)
+        result.update(cancel_method='escape', processing_observed=saw_processing)
+        if saw_processing:
+            result.update(status='FAIL', reason='processing_observed_after_recording_cancel')
     if scenario == 'cancel-processing':
         result['processing_cancel_attempted'] = processing_cancel_attempted
         if secondary_violation or second:
@@ -594,6 +818,15 @@ def require_focus(target):
         raise UnsupportedTarget('focus left the enrolled control')
 
 
+def require_evaluation_guest():
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'HARDWARE\DESCRIPTION\System\BIOS') as bios:
+        product, _ = winreg.QueryValueEx(bios, 'SystemProductName')
+    if product != 'Virtual Machine' or socket.gethostname().casefold() != 'asr-eval':
+        raise UnsupportedTarget('unattended insertion requires the ASR-Eval guest')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--manifest', type=Path, required=True)
@@ -604,13 +837,47 @@ def main(argv=None):
     parser.add_argument('--target', choices=('native', 'external'), default='native')
     parser.add_argument('--playback-device', default='CABLE Input')
     parser.add_argument('--microphone-id', default='name:CABLE Output (VB-Audio Virtual Cable)')
-    parser.add_argument('--scenario', action='append', choices=SCENARIOS + OPTIONAL_SCENARIOS)
+    parser.add_argument('--scenario', action='append',
+                        choices=SCENARIOS + OPTIONAL_SCENARIOS + tuple(MOCK_EXTERNAL))
     parser.add_argument('--recording-mode', choices=('toggle', 'hold'), default='toggle')
     parser.add_argument('--max-cer', type=float, default=.5)
+    parser.add_argument('--mock-insertion', action='store_true', help='run one unattended native mock case in ASR-Eval')
+    parser.add_argument('--mock-text', help=argparse.SUPPRESS)
+    parser.add_argument('--worker-recovery', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--mock-on-real-profile', action='store_true', help=argparse.SUPPRESS)
+    real_mode = parser.add_mutually_exclusive_group()
+    real_mode.add_argument('--real-notepad', dest='real_case', action='store_const', const=REAL_NOTEPAD)
+    real_mode.add_argument('--real-case', choices=tuple(REAL_RECEIVERS))
+    parser.add_argument('--worker-proof', type=Path)
     args = parser.parse_args(argv)
+    if args.mock_text is not None and (not args.mock_insertion or not re.fullmatch(
+            re.escape(MOCK_TEXT) + r'[0-9a-f]{16}', args.mock_text)):
+        parser.error('--mock-text requires a nonce-tagged VM mock payload')
+    if args.mock_on_real_profile and not args.mock_insertion:
+        parser.error('--mock-on-real-profile requires --mock-insertion')
+    if args.worker_recovery and (not args.mock_insertion or args.scenario):
+        parser.error('--worker-recovery requires --mock-insertion and selects its own scenarios')
+    unattended = args.mock_insertion or bool(args.real_case)
+    if args.real_case and (args.mock_insertion or args.scenario or args.target != 'native'
+                              or args.recording_mode != 'toggle' or args.worker_proof is None):
+        parser.error('a real case requires toggle mode, an owned target and --worker-proof')
+    if not args.real_case and args.worker_proof is not None:
+        parser.error('--worker-proof requires a real case')
     if not 0 <= args.max_cer <= 1:
         parser.error('--max-cer must be between 0 and 1')
-    scenarios = args.scenario or (('dictate',) if args.recording_mode == 'hold' else SCENARIOS)
+    if args.mock_insertion and (args.target != 'native' or args.recording_mode != 'toggle'
+                                or (args.scenario and (len(args.scenario) != 1
+                                                       or args.scenario[0] not in VM_MOCK_CASES))):
+        parser.error('--mock-insertion requires toggle mode and one supported VM case')
+    if not args.mock_insertion and any(case in MOCK_EXTERNAL for case in (args.scenario or ())):
+        parser.error('each VM mock case requires --mock-insertion in ASR-Eval')
+    scenarios = (args.scenario or (MOCK_INSERTION,)) if args.mock_insertion else (
+        args.scenario or (('dictate',) if args.recording_mode == 'hold' else SCENARIOS))
+    if args.real_case:
+        scenarios = (args.real_case,)
+    if args.worker_recovery:
+        scenarios = WORKER_RECOVERY_TRIALS
+    owned_target = REAL_RECEIVERS.get(args.real_case) or MOCK_EXTERNAL.get(scenarios[0])
     if args.recording_mode == 'hold' and any(scenario not in HOLD_SCENARIOS for scenario in scenarios):
         parser.error('--recording-mode hold supports dictate, focus-away, selection-change and cancel')
     if args.recording_mode == 'hold' and args.target != 'native' and 'selection-change' in scenarios:
@@ -621,12 +888,17 @@ def main(argv=None):
         parser.error('choose a nonempty-reference item from the manifest')
     if hashlib.sha256(Path(item['audio_path']).read_bytes()).hexdigest() != item['audio_sha256']:
         parser.error('audio hash mismatch')
-    profile = profile_settings(args.profile_db, args.microphone_id, args.recording_mode)
+    def read_profile():
+        return profile_settings(args.profile_db, args.microphone_id, args.recording_mode,
+                                mock_insertion=args.mock_insertion, real_notepad=bool(args.real_case),
+                                mock_on_real_profile=args.mock_on_real_profile)
+
+    profile = read_profile()
     hotkey = parse_hotkey(profile['hotkey'])
     args.output_dir.mkdir(parents=True, exist_ok=False)
-    report = {'schema': 'asr-windows-acceptance/1', 'target': args.target,
+    report = {'schema': 'asr-windows-acceptance/1', 'target': f'owned_{owned_target}' if owned_target else args.target,
               'item_id': item['id'], 'audio_sha256': item['audio_sha256'],
-              'max_cer': args.max_cer, 'recording_mode': args.recording_mode,
+              'max_cer': None if unattended else args.max_cer, 'recording_mode': args.recording_mode,
               'requested_scenarios': list(scenarios),
               'profile_projection_schema': 'asr-acceptance-profile/2',
               'profile_sha256': hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest(),
@@ -639,17 +911,38 @@ def main(argv=None):
     player = WavePlayer(api, args.playback_device)
     reader.ready()
     report['runtime'] = runtime_metadata(api, reader.pid)
-    print('評価中は専用の空欄だけを使います。アプリのモデル・録音権限を確認し、停止してから開始してください。')
-    input('準備できたら Enter（終了は Ctrl+C）: ')
+    if not unattended:
+        print('評価中は専用の空欄だけを使います。アプリのモデル・録音権限を確認し、停止してから開始してください。')
+        input('準備できたら Enter（終了は Ctrl+C）: ')
     active_scenario = 'setup'
     try:
+        if unattended:
+            require_evaluation_guest()
         with contextlib.ExitStack() as stack:
-            if args.target == 'native':
+            if owned_target:
+                secondary = NativeTarget(api, stack.enter_context(TargetWindow(api, foreground_mode='legacy')))
+                secondary.focus()
+                bridge = UIABridge(owned_notepad=True)
+                stack.callback(bridge.close)
+                if owned_target == 'notepad':
+                    fixture = args.output_dir / f'asr-fixture-{uuid.uuid4().hex}.txt'
+                    fixture.touch(exist_ok=False)
+                    target = bridge.call('open_notepad', 'primary', path=str(fixture.resolve()))
+                    stack.callback(bridge.call, 'close_notepad', 'primary')
+                else:
+                    target = bridge.call('open_fixture', 'primary', kind=owned_target)
+                    stack.callback(bridge.call, 'close_fixture', 'primary')
+                primary = ExternalTarget(bridge, 'primary', target['window'])
+                report['applications'] = [{'process': target['process'], 'version': target['version']},
+                                          {'process': 'owned_native_edit', 'version': None}]
+            elif args.target == 'native':
                 report['applications'] = [{'process': 'owned_native_edit', 'version': None}]
-                windows = [stack.enter_context(TargetWindow(api, foreground_mode='plain')) for _ in range(2)]
+                foreground_mode = 'legacy' if args.mock_insertion else 'plain'
+                windows = [stack.enter_context(TargetWindow(api, foreground_mode=foreground_mode)) for _ in range(2)]
                 primary, secondary = [NativeTarget(api, window) for window in windows]
-                print('5秒以内に最初に開いた評価用ウィンドウをクリックしてください。')
-                time.sleep(5)
+                if not args.mock_insertion:
+                    print('5秒以内に最初に開いた評価用ウィンドウをクリックしてください。')
+                    time.sleep(5)
             else:
                 bridge = UIABridge()
                 stack.callback(bridge.close)
@@ -668,15 +961,23 @@ def main(argv=None):
                 active_scenario = scenario
                 if scenario == 'minimize' and primary.root == secondary.root:
                     raise UnsupportedTarget('minimize requires two separate scratch windows')
-                if profile_settings(args.profile_db, args.microphone_id, args.recording_mode) != profile:
+                if read_profile() != profile:
                     raise EvidenceError('profile changed')
                 reader.ready()
                 if reader.phase != 'idle':
                     raise EvidenceError('app not idle before scratch preparation')
                 Keyboard(api.send, primary, hotkey, key_down=api.key_down,
                          idle_seconds=api.idle_seconds).before_trial()
-                prepare(api, secondary, previous[1], '')
-                prepare(api, primary, previous[0], '' if scenario == 'dictate' else SEED)
+                if owned_target:
+                    require_focus(primary)
+                    if primary.read() or secondary.read():
+                        raise EvidenceError('owned receiver and decoy must be empty before recording')
+                elif args.mock_insertion:
+                    initial = MOCK_PREFIX + MOCK_SUFFIX if scenario == MOCK_INSERTION else SEED
+                    prepare(api, primary, previous[0], initial)
+                else:
+                    prepare(api, secondary, previous[1], '')
+                    prepare(api, primary, previous[0], '' if scenario == 'dictate' else SEED)
                 print(f'{scenario}: 開始', flush=True)
                 with contextlib.ExitStack() as scenario_cleanup:
                     ime = NativeIME(api, primary) if scenario == 'ime-composition' else None
@@ -685,9 +986,17 @@ def main(argv=None):
                     result, previous[0], previous[1] = run_scenario(
                         scenario, api=api, primary=primary, secondary=secondary, reader=reader,
                         player=player, item=item, hotkey=hotkey, max_cer=args.max_cer, ime=ime,
-                        recording_mode=args.recording_mode)
-                if profile_settings(args.profile_db, args.microphone_id, args.recording_mode) != profile:
+                        recording_mode=args.recording_mode, unattended=unattended,
+                        real_proof=args.worker_proof, mock_text=args.mock_text or MOCK_TEXT,
+                        timeout=90 if args.real_case else (
+                            15 if args.mock_insertion else 60))
+                if read_profile() != profile:
                     raise EvidenceError('profile changed during trial')
+                if scenario == WORKER_CRASH and result['status'] == 'PASS':
+                    exited = worker_exited_before_recovery(args.output_dir.parent)
+                    result['worker_exit_before_recovery'] = exited
+                    if not exited:
+                        result.update(status='FAIL', reason='worker_exit_not_verified_before_recovery')
                 report['results'].append(result)
                 if result['status'] == 'PASS' and scenario == 'cancel-processing' and 'cancel during processing' in report['manual_remaining']:
                     report['manual_remaining'][report['manual_remaining'].index('cancel during processing')] = 'processing cancel with correction/Translate/Edit/Ask'
@@ -700,7 +1009,11 @@ def main(argv=None):
                   'os_input_audio_or_process_unavailable' if isinstance(exc, (BenchError, OSError)) else
                   'profile_database_unavailable' if isinstance(exc, sqlite3.Error) else
                   'invalid_evidence_or_profile')
-        report['results'].append({'scenario': active_scenario, 'status': 'BLOCKED', 'reason': reason})
+        status = 'FAIL' if unattended and getattr(exc, 'code', None) == 'receiver_changed_during_playback' else 'BLOCKED'
+        report['results'].append({'scenario': active_scenario, 'status': status,
+                                  'reason': getattr(exc, 'code', reason) if unattended else reason})
+        if unattended:
+            print(f'VM insertion {status}: {exc}', file=sys.stderr)
         if hasattr(exc, 'hold_abort'):
             report['results'][-1].update(exc.hold_abort)
             if 'hold_abort_cause' in exc.hold_abort:
