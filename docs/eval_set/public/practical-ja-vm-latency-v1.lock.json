@@ -1,0 +1,43 @@
+{
+  "schema": "asr-bench-lock/1",
+  "name": "practical-ja-vm-latency-v1",
+  "created_by": "scripts/bench_data.py",
+  "selection": {
+    "profile": "smoke",
+    "seed": 0,
+    "count_per_source": 1,
+    "pool": "dev",
+    "holdout_percent": 50,
+    "strata": "duration-tertile"
+  },
+  "sources": [
+    {
+      "source": "jvnv",
+      "dataset_id": "jvnv",
+      "config": "ver1",
+      "split": "all",
+      "revision": "ver1-20231021",
+      "license": "CC-BY-SA-4.0",
+      "url": "https://ss-takashi.sakura.ne.jp/corpus/jvnv/jvnv_ver1.zip",
+      "archive_sha256": "6d7f5334c2288dcb92730858d8c4a8dd6e62781f02755e56e611d9844ed9bd99"
+    }
+  ],
+  "items": [
+    {
+      "id": "jvnv-ver1-all-M2_anger_regular_36",
+      "source": "jvnv",
+      "split": "all",
+      "pool": "dev",
+      "dataset_id": "jvnv",
+      "revision": "ver1-20231021",
+      "locale": "ja_jp",
+      "item_id": "M2_anger_regular_36",
+      "group": "M2",
+      "speaker": "M2",
+      "audio_sha256": "ad50799ac8f6cda1b1ccc0995603ec8bef26856a51497825e563af38278b646b",
+      "source_audio_sha256": "290072e188ebc4eeb1e9fb15e15b9c0440cda4e6acf4b3eb9423c7c2a74954a8",
+      "license": "CC-BY-SA-4.0",
+      "reference_sha256": "02896c9824ed7bab0c2cedb49c1962067d80ed2277185d088c98a7517e0a9c2f"
+    }
+  ]
+}

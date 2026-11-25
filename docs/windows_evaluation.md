@@ -1,7 +1,48 @@
 # Computer Useに依存しないWindows評価
 
+[評価スイート](evaluation_suite.md)から、隔離 VM の試験、ヘッドレス試験、ホスト上の CUDA 測定を実行できます。
+
 評価は、ユーザーが対話端末から起動するローカルツールで行います。権限ダイアログの操作は
 ユーザーが先に済ませます。以下は実行手順であり、実機での合格記録ではありません。
+
+## #110 の VM 内挿入スモーク
+
+ホストの PowerShell 7 から、`ASR-Eval` に評価対象のビルドを転送して3ケースを実行できます。
+初回準備としてゲストの `ASREval` 標準ユーザーをサインインさせ、初回設定画面を完了してください。
+ゲストには VB-CABLE と `C:\ASR-Evaluation\runtime` の `uv.exe`、`python\python.exe` が必要です。
+ホストでは、PowerShell Direct 用のゲスト管理資格情報を同じ Windows ユーザーで
+`Export-Clixml` したファイルを使います。ゲストの画面や入力を試験中に操作する必要はありません。
+
+```powershell
+$out = Join-Path $PWD ('.ai/issue-110-insertion-' + [guid]::NewGuid().ToString('N'))
+.\scripts\run_vm_insertion_smoke.ps1 `
+  -AppBinary src-tauri/target/release/local-voice-input.exe `
+  -AppRevision (git rev-parse HEAD) `
+  -ManagementCredentialPath .ai/ASR-Eval-local-admin.credential.xml `
+  -OutputDirectory $out
+```
+
+`-AppRevision` には評価対象の実行ファイルをビルドしたコミットを指定します。ゲストでは
+各ケースで、オフラインの専用プロファイルで asr を新しく起動し、実ホットキーと VB-CABLE で録音します。
+
+- **通常挿入**では、mock ASR の固定文が専用 native EDIT の指定位置に一度だけ入り、前後の文が保持されたことを確認します。
+- **フォーカス移動**では、録音中に別欄へ移って停止し、どちらの入力欄も変化せず、アプリがクリップボードへのフォールバックを報告したことを確認します。
+- **録音キャンセル**では、録音中に Esc を送り、両欄の保持、キャンセル完了、処理状態への遷移とワーカーへの認識要求がともに観測されなかったことを確認します。
+
+`-IncludeNotepad` を指定すると、4ケース目としてゲストのメモ帳を追加します。ランナーが新しい空テキストファイルを開き、そのウィンドウと入力欄を特定してから録音を始めます。メモ帳の `TextPattern` で固定文との完全一致を確認し、試験終了後は今回開いたメモ帳を閉じます。ゲストに既存のメモ帳が開いている場合は、このケースを `BLOCKED` として報告します。
+
+通常挿入、フォーカス移動、メモ帳では、ASR ワーカーへ渡った録音に合成音が含まれることも検証します。録音データは結果に含めません。
+フォーカス移動とキャンセルでは、操作が完了してからさらに2秒間、両方の入力欄を監視します。
+ケースごとの合否と実行ファイルの SHA-256 は `result.json` に、起動・終了処理を含む試験全体の結果は `host.json` に記録します。
+終了コードは `0` が `PASS`、`1` が `FAIL`、`2` が `BLOCKED` です。
+
+### 実モデルでのメモ帳挿入
+
+上のコマンドに `-RealModelNotepad` を付けると、日本語 FLEURS の固定音声1件を VB-CABLE に再生します。実行前に、ゲストの標準ユーザー `ASREvalReal` でサインインし、初回設定を済ませます。このモードには、ゲストの `C:\ASR-Evaluation\runtime\real-deps\site-packages` に faster-whisper の依存ライブラリ、`C:\ASR-Evaluation\models` に固定リビジョンのモデル一式が必要です。ホストには `practical-ja-smoke-v1` のマニフェストと対象 WAV を用意します。ランナーはモデル5ファイルと元音声、正解文の SHA-256 を照合します。
+
+専用プロファイルでオフラインの faster-whisper を CPU（int8）で動かします。録音が固定音声と一致することは音量変化の相関で確認します。正解文に対する CER を認識指標として記録し、挿入はワーカーの出力とメモ帳の全文が一致するかで判定します。停止ショートカット送信開始から、最初に全文一致を観測するまでの時間を記録します。結果の `real_worker_proof` に CER と録音照合、`acceptance.results` に挿入判定と時間が入ります。
+
+`-RealModelNotepad -RealRepeats 6` では、同じアプリと読み込んだモデルで固定音声を6回測定します。各回で新しい空のメモ帳を使います。`result.json` の `cases[0].trials` に各回の結果が入り、`app_spans_ms.record_ready` で録音開始要求から録音準備完了まで、`stop_to_observed_insertion_ms` で停止からメモ帳への挿入確認までを比較できます。
 
 ## 1. 用意するもの
 

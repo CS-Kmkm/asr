@@ -70,6 +70,7 @@ jobs:
           version: latest
       - run: uv sync --extra serve
       - run: uv run --with pytest pytest asr_worker/tests -q
+      - run: uv run --no-sync scripts/evaluate.py --suite smoke --profile headless --output "${{ runner.temp }}/asr-evaluation-smoke"
 
   release:
     runs-on: windows-latest
