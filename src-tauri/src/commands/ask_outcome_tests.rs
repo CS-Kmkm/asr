@@ -3,6 +3,19 @@
 use super::*;
 
 #[test]
+fn a_newer_clipboard_copy_suppresses_ask_fallback() {
+    assert_eq!(
+        ask_insertion(
+            Some(Err(injection::InjectionError::ClipboardChanged)),
+            "caret",
+            || { panic!("a clipboard conflict must not copy again") }
+        )
+        .ok(),
+        Some("insertion_failed")
+    );
+}
+
+#[test]
 fn a_failed_copy_never_claims_the_result_is_on_the_clipboard() {
     use injection::InjectionError;
     assert_eq!(ask_fallback_insertion(Ok(())), "clipboard_only");

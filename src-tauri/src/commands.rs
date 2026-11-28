@@ -233,12 +233,13 @@ pub(crate) const INSERTION_FAILED: &str = "Insertion failed; the result is avail
 /// A replacement error happens before any paste, so the original selection is
 /// unchanged and the clipboard is the fallback. `None` means the edit reached
 /// neither the target nor the clipboard.
-fn edit_insertion_outcome<E, F>(
-    replaced: Result<InsertResult, E>,
+fn edit_insertion_outcome<F>(
+    replaced: Result<InsertResult, injection::InjectionError>,
     copy_to_clipboard: impl FnOnce() -> Result<(), F>,
 ) -> Option<InsertResult> {
     match replaced {
         Ok(result) => Some(result),
+        Err(injection::InjectionError::ClipboardChanged) => None,
         Err(_) => copy_to_clipboard()
             .ok()
             .map(|()| InsertResult::ClipboardOnly),
@@ -287,32 +288,44 @@ pub(crate) fn edit_persistence_warning(
     history_failed: bool,
     metric_failed: bool,
 ) -> Option<(&'static str, &'static str)> {
-    let replaced = insertion == InsertResult::ClipboardPaste;
-    let warning = match (history_failed, metric_failed, replaced) {
+    use InsertResult::{ClipboardOnly, ClipboardPaste, DirectInsert, PasteUnverified};
+    let warning = match (history_failed, metric_failed, insertion) {
         (false, false, _) => return None,
-        (true, true, true) => (
+        (true, true, ClipboardPaste | DirectInsert) => (
             "history_metric_save_failed",
             "The edit was completed, but history and usage metrics could not be saved.",
         ),
-        (true, false, true) => (
+        (true, false, ClipboardPaste | DirectInsert) => (
             "history_save_failed",
             "The edit was completed, but history could not be saved.",
         ),
-        (false, true, true) => (
+        (false, true, ClipboardPaste | DirectInsert) => (
             "metric_save_failed",
             "The edit was completed, but usage metrics could not be saved.",
         ),
-        (true, true, false) => (
+        (true, true, ClipboardOnly) => (
             "history_metric_save_failed",
             "The edit remains on the clipboard, but history and usage metrics could not be saved.",
         ),
-        (true, false, false) => (
+        (true, false, ClipboardOnly) => (
             "history_save_failed",
             "The edit remains on the clipboard, but history could not be saved.",
         ),
-        (false, true, false) => (
+        (false, true, ClipboardOnly) => (
             "metric_save_failed",
             "The edit remains on the clipboard, but usage metrics could not be saved.",
+        ),
+        (true, true, PasteUnverified) => (
+            "history_metric_save_failed",
+            "Edit insertion could not be confirmed, and history and usage metrics could not be saved.",
+        ),
+        (true, false, PasteUnverified) => (
+            "history_save_failed",
+            "Edit insertion could not be confirmed, and history could not be saved.",
+        ),
+        (false, true, PasteUnverified) => (
+            "metric_save_failed",
+            "Edit insertion could not be confirmed, and usage metrics could not be saved.",
         ),
     };
     Some(warning)
@@ -1794,10 +1807,11 @@ pub(crate) fn ask_insertion(
     copy_to_clipboard: impl FnOnce() -> Result<(), injection::InjectionError>,
 ) -> Result<&'static str, OutputCancelled> {
     match inserted {
-        Some(Ok(InsertResult::ClipboardPaste)) => Ok(pasted),
+        Some(Ok(InsertResult::ClipboardPaste | InsertResult::DirectInsert)) => Ok(pasted),
         Some(Ok(InsertResult::ClipboardOnly)) => Ok("clipboard_only"),
         Some(Ok(InsertResult::PasteUnverified)) => Ok("paste_unverified"),
         Some(Err(injection::InjectionError::Cancelled)) => Err(OutputCancelled),
+        Some(Err(injection::InjectionError::ClipboardChanged)) => Ok("insertion_failed"),
         Some(Err(_)) | None => Ok(ask_fallback_insertion(copy_to_clipboard())),
     }
 }
@@ -1903,6 +1917,7 @@ fn selected_text_terminal(end: SelectedTextEnd) -> (AppPhase, &'static str) {
 fn selected_text_insertion_label(insertion: Option<InsertResult>) -> &'static str {
     match insertion {
         Some(InsertResult::ClipboardPaste) => "clipboard_paste",
+        Some(InsertResult::DirectInsert) => "caret",
         Some(InsertResult::ClipboardOnly) => "clipboard_only",
         Some(InsertResult::PasteUnverified) => "paste_unverified",
         None => "insertion_failed",
@@ -1915,7 +1930,9 @@ fn selected_text_insertion_label(insertion: Option<InsertResult>) -> &'static st
 /// records no metric, as in the other modes.
 fn selected_text_metric(end: SelectedTextEnd) -> Option<(bool, Option<&'static str>)> {
     match end {
-        SelectedTextEnd::Delivered(Some(InsertResult::ClipboardPaste)) => Some((true, None)),
+        SelectedTextEnd::Delivered(Some(
+            InsertResult::ClipboardPaste | InsertResult::DirectInsert,
+        )) => Some((true, None)),
         SelectedTextEnd::Delivered(insertion) => {
             Some((false, Some(selected_text_insertion_label(insertion))))
         }
@@ -1960,7 +1977,8 @@ fn selected_text_history_item<'a>(
 
 /// A translation paste that was sent but could not be confirmed, for voice
 /// and selected-text translation alike.
-pub(crate) const TRANSLATION_PASTE_UNVERIFIED: &str = "Translation pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard).";
+pub(crate) const TRANSLATION_PASTE_UNVERIFIED: &str =
+    "Translation insertion could not be confirmed. Check the target field.";
 
 /// A translation left on the clipboard because its target changed, for voice
 /// and selected-text translation alike.
@@ -1972,7 +1990,9 @@ pub(crate) const TRANSLATION_TARGET_CHANGED: &str =
 /// so it must not read as a target change that invites a second paste.
 fn selection_translation_status(result: InsertResult) -> (&'static str, &'static str) {
     match result {
-        InsertResult::ClipboardPaste => ("success", "Translation inserted."),
+        InsertResult::ClipboardPaste | InsertResult::DirectInsert => {
+            ("success", "Translation inserted.")
+        }
         InsertResult::PasteUnverified => ("paste_unverified", TRANSLATION_PASTE_UNVERIFIED),
         InsertResult::ClipboardOnly => ("error", TRANSLATION_TARGET_CHANGED),
     }
@@ -2256,15 +2276,15 @@ async fn run_selected_text_translation(
     let (phase, message) = selected_text_terminal(end);
     match insertion {
         Some(result) => {
+            let (kind, message) = selection_translation_status(result);
             let snapshot = state.complete(translated, message.into());
             let _ = app.emit("app-state", snapshot);
-            let (kind, message) = selection_translation_status(result);
             emit_status(app, kind, message);
-            if result != InsertResult::ClipboardPaste || clipboard_lost {
+            if !result.confirmed() || clipboard_lost {
                 recording_overlay::show_insertion_notice(
                     app,
                     injection::notice_outcome(insertion_label, clipboard_lost),
-                    None,
+                    insertion_detail,
                 );
             }
         }
@@ -2303,7 +2323,7 @@ pub(crate) fn ask_fallback_insertion(
 pub(crate) fn ask_completion_message(insertion: &str) -> &'static str {
     match insertion {
         "paste_unverified" => {
-            "Ask insertion could not be confirmed; the result remains on the clipboard."
+            "Ask insertion could not be confirmed. Check the target field."
         }
         "clipboard_only" => "Ask result is on the clipboard.",
         "insertion_failed" => {

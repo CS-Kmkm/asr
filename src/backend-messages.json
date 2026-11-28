@@ -277,9 +277,9 @@
     "code": "opening_the_requested_fixed_search",
     "ja": "指定された検索を開いています。"
   },
-  "Ask insertion could not be confirmed; the result remains on the clipboard.": {
+  "Ask insertion could not be confirmed. Check the target field.": {
     "code": "ask_insertion_could_not_be_confirmed_the_result_remains_on_the_clipboard",
-    "ja": "入力を確認できませんでした。結果はクリップボードにあります。"
+    "ja": "入力を確認できませんでした。対象の入力欄を確認してください。"
   },
   "Ask result is on the clipboard.": {
     "code": "ask_result_is_on_the_clipboard",
@@ -533,9 +533,9 @@
     "code": "inserting_into_the_captured_target",
     "ja": "取得した入力先へ挿入しています。"
   },
-  "Pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard).": {
+  "Dictation insertion could not be confirmed. Check the target field.": {
     "code": "pasted_this_field_cannot_confirm_the_result_press_ctrl_v_only_if_the_text_did_not_appear_it_is_on_th",
-    "ja": "貼り付けました。この入力欄では結果を自動確認できません。文字が入っていない場合だけ Ctrl+V で貼り付けてください（クリップボードにあります）。"
+    "ja": "音声入力の挿入を確認できませんでした。対象の入力欄を確認してください。"
   },
   "The provisional text could not be safely replaced; the final result remains on the clipboard.": {
     "code": "the_provisional_text_could_not_be_safely_replaced_the_final_result_remains_on_the_clipboard",
@@ -625,9 +625,9 @@
     "code": "the_translation_target_language_was_unavailable_and_the_clipboard_could_not_be_updated_the_raw_trans",
     "ja": "翻訳先の言語を取得できず、クリップボードも更新できませんでした。元の文字起こしはこのアプリで確認できます。"
   },
-  "Translation pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard).": {
+  "Translation insertion could not be confirmed. Check the target field.": {
     "code": "translation_pasted_this_field_cannot_confirm_the_result_press_ctrl_v_only_if_the_text_did_not_appear",
-    "ja": "翻訳結果を貼り付けました。この入力欄では結果を自動確認できません。文字が入っていない場合だけ Ctrl+V で貼り付けてください（クリップボードにあります）。"
+    "ja": "翻訳結果の挿入を確認できませんでした。対象の入力欄を確認してください。"
   },
   "Voice translation inserted.": {
     "code": "voice_translation_inserted",
@@ -725,9 +725,21 @@
     "code": "automatic_replacement_was_skipped_the_edit_remains_on_the_clipboard",
     "ja": "自動置換を見送りました。編集結果はクリップボードに残っています。"
   },
-  "The edit paste could not be confirmed; the result remains on the clipboard.": {
+  "Edit insertion could not be confirmed. Check the target field.": {
     "code": "the_edit_paste_could_not_be_confirmed_the_result_remains_on_the_clipboard",
-    "ja": "編集結果の貼り付けを確認できませんでした。結果はクリップボードに残っています。"
+    "ja": "編集結果の挿入を確認できませんでした。対象の入力欄を確認してください。"
+  },
+  "Edit insertion could not be confirmed, and history and usage metrics could not be saved.": {
+    "code": "edit_unconfirmed_history_metrics_save_failed",
+    "ja": "編集結果の挿入を確認できず、履歴と利用状況の記録も保存できませんでした。"
+  },
+  "Edit insertion could not be confirmed, and history could not be saved.": {
+    "code": "edit_unconfirmed_history_save_failed",
+    "ja": "編集結果の挿入を確認できず、履歴も保存できませんでした。"
+  },
+  "Edit insertion could not be confirmed, and usage metrics could not be saved.": {
+    "code": "edit_unconfirmed_metrics_save_failed",
+    "ja": "編集結果の挿入を確認できず、利用状況の記録も保存できませんでした。"
   },
   "Speak to edit could not monitor the original selection safely.": {
     "code": "speak_to_edit_could_not_monitor_the_original_selection_safely",

@@ -84,10 +84,17 @@ pub(crate) fn recording_target(captured: TargetWindow, from_shortcut: bool) -> T
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InsertResult {
     ClipboardPaste,
+    DirectInsert,
     ClipboardOnly,
     /// Input was queued, but the target edit was not confirmed. Do not retry,
     /// restore the old clipboard, or overwrite a possibly pending payload.
     PasteUnverified,
+}
+
+impl InsertResult {
+    pub(crate) fn confirmed(self) -> bool {
+        matches!(self, Self::ClipboardPaste | Self::DirectInsert)
+    }
 }
 
 /// Fixed reason for an insertion that was not confirmed. The code is stored
@@ -157,7 +164,9 @@ impl InsertionDetail {
             InjectionError::SecureTarget | InjectionError::PrivilegeMismatch => {
                 Some(Self::TargetProtected)
             }
-            InjectionError::ClipboardUnavailable => Some(Self::ClipboardUnavailable),
+            InjectionError::ClipboardUnavailable | InjectionError::ClipboardChanged => {
+                Some(Self::ClipboardUnavailable)
+            }
             InjectionError::ClipboardUnpreservable | InjectionError::ClipboardProtected => {
                 Some(Self::ClipboardProtected)
             }
@@ -303,6 +312,8 @@ pub enum InjectionError {
     PrivilegeMismatch,
     /// The clipboard is locked by another process.
     ClipboardUnavailable,
+    /// Ownership of the clipboard payload changed or could not be established.
+    ClipboardChanged,
     /// The clipboard could be opened, but holds data that cannot be copied
     /// (too many or too large formats, private or owner-drawn formats, or a
     /// delay-rendering owner that fails to render).
@@ -325,6 +336,7 @@ impl fmt::Display for InjectionError {
             Self::SecureTarget => "text insertion into secure controls is disabled",
             Self::PrivilegeMismatch => "the target cannot be accessed at this privilege level",
             Self::ClipboardUnavailable => "the clipboard is unavailable",
+            Self::ClipboardChanged => "clipboard ownership could not be verified before insertion",
             Self::ClipboardUnpreservable => "the clipboard holds data that cannot be preserved",
             Self::ClipboardProtected => {
                 "the clipboard was left unchanged because it could not be saved for restoring"
@@ -424,6 +436,10 @@ impl SelectedText {
     }
 }
 impl SystemTextInjector {
+    pub(crate) fn is_terminal_target(&self, target: &TargetWindow) -> bool {
+        self.backend.is_terminal(target)
+    }
+
     pub fn new(options: InjectionOptions) -> Self {
         Self {
             backend: InjectorBackend::new(),
@@ -786,6 +802,9 @@ impl<B: Backend> Backend for PinnedField<'_, B> {
     fn capture_target(&self) -> Result<TargetWindow, InjectionError> {
         self.inner.capture_target()
     }
+    fn is_terminal(&self, target: &TargetWindow) -> bool {
+        self.inner.is_terminal(target)
+    }
     fn validate_target(&self, target: &TargetWindow) -> Result<(), InjectionError> {
         self.inner.validate_target(target)?;
         self.same_field(target)
@@ -820,30 +839,57 @@ impl<B: Backend> Backend for PinnedField<'_, B> {
     ) -> Result<bool, InjectionError> {
         self.inner.select_recent(target, expected, text)
     }
-    fn clipboard_snapshot(&self) -> Result<Self::Clipboard, InjectionError> {
-        self.inner.clipboard_snapshot()
-    }
     fn clipboard_write(
         &self,
         text: &str,
         exclusion: ClipboardExclusion,
-    ) -> Result<u32, WriteError> {
-        self.inner.clipboard_write(text, exclusion)
+        preserve: bool,
+    ) -> Result<ClipboardWrite<Self::Clipboard>, WriteError<Self::Clipboard>> {
+        self.inner.clipboard_write(text, exclusion, preserve)
+    }
+    fn clipboard_write_terminal(
+        &self,
+        text: &str,
+        target: &TargetWindow,
+    ) -> Result<ClipboardWrite<Self::Clipboard>, WriteError<Self::Clipboard>> {
+        self.inner.clipboard_write_terminal(text, target)
+    }
+    fn clipboard_sequence(&self) -> u32 {
+        self.inner.clipboard_sequence()
     }
     fn clipboard_restore(
         &self,
         snapshot: Self::Clipboard,
-        expected_sequence: u32,
+        expected: ClipboardStamp,
     ) -> Result<bool, InjectionError> {
-        self.inner.clipboard_restore(snapshot, expected_sequence)
+        self.inner.clipboard_restore(snapshot, expected)
     }
-    fn paste(&self, target: &TargetWindow, policy: SafetyPolicy) -> Result<bool, InjectionError> {
+    fn paste(
+        &self,
+        target: &TargetWindow,
+        policy: SafetyPolicy,
+        sequence: u32,
+    ) -> Result<bool, InjectionError> {
         // The last check before the paste is sent; afterwards the pin ends.
         if self.same_field(target).is_err() {
             return Ok(false);
         }
         self.pasted.set(true);
-        self.inner.paste(target, policy)
+        self.inner.paste(target, policy, sequence)
+    }
+    fn paste_with_receipt(
+        &self,
+        target: &TargetWindow,
+        policy: SafetyPolicy,
+        sequence: u32,
+        receipt: Option<&dyn TerminalReceipt>,
+    ) -> Result<bool, InjectionError> {
+        if self.same_field(target).is_err() {
+            return Ok(false);
+        }
+        self.pasted.set(true);
+        self.inner
+            .paste_with_receipt(target, policy, sequence, receipt)
     }
     fn delete_selection(&self, target: &TargetWindow) -> Result<bool, InjectionError> {
         self.same_field(target)?;
@@ -883,9 +929,47 @@ impl SafetyPolicy {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectDispatch {
+    Declined,
+    Confirmed,
+    Ambiguous,
+}
+
+#[cfg(any(windows, test))]
+impl DirectDispatch {
+    fn from_queued_inputs(sent: usize, expected: usize) -> Self {
+        match sent {
+            0 => Self::Declined,
+            sent if sent == expected => Self::Confirmed,
+            _ => Self::Ambiguous,
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn direct_dispatch_distinguishes_zero_full_and_partial_queueing() {
+    assert_eq!(
+        DirectDispatch::from_queued_inputs(0, 4),
+        DirectDispatch::Declined
+    );
+    assert_eq!(
+        DirectDispatch::from_queued_inputs(4, 4),
+        DirectDispatch::Confirmed
+    );
+    assert_eq!(
+        DirectDispatch::from_queued_inputs(1, 4),
+        DirectDispatch::Ambiguous
+    );
+}
+
 trait Backend {
     type Clipboard;
     fn capture_target(&self) -> Result<TargetWindow, InjectionError>;
+    fn is_terminal(&self, _target: &TargetWindow) -> bool {
+        false
+    }
     fn validate_target(&self, target: &TargetWindow) -> Result<(), InjectionError>;
     fn ime_composition_active(&self, target: &TargetWindow)
         -> Result<Option<bool>, InjectionError>;
@@ -912,17 +996,54 @@ trait Backend {
         expected: &TargetText,
         text: &str,
     ) -> Result<bool, InjectionError>;
-    fn clipboard_snapshot(&self) -> Result<Self::Clipboard, InjectionError>;
-    fn clipboard_write(&self, text: &str, exclusion: ClipboardExclusion)
-        -> Result<u32, WriteError>;
+    fn clipboard_write(
+        &self,
+        text: &str,
+        exclusion: ClipboardExclusion,
+        preserve: bool,
+    ) -> Result<ClipboardWrite<Self::Clipboard>, WriteError<Self::Clipboard>>;
+    fn clipboard_write_terminal(
+        &self,
+        text: &str,
+        _target: &TargetWindow,
+    ) -> Result<ClipboardWrite<Self::Clipboard>, WriteError<Self::Clipboard>> {
+        self.clipboard_write(text, ClipboardExclusion::ExcludeFromHistory, true)
+    }
+    fn clipboard_sequence(&self) -> u32;
     fn clipboard_restore(
         &self,
         snapshot: Self::Clipboard,
-        expected_sequence: u32,
+        expected: ClipboardStamp,
     ) -> Result<bool, InjectionError>;
+    /// Reports whether the transport dispatched the entire edit. The caller
+    /// verifies the actual field contents before claiming delivery.
+    fn try_direct_insert(
+        &self,
+        _target: &TargetWindow,
+        _before: &TargetText,
+        _text: &str,
+        _still_allowed: &dyn Fn() -> bool,
+    ) -> DirectDispatch {
+        DirectDispatch::Declined
+    }
     /// Returns true if the paste key's key-down was queued, including by a
     /// partial SendInput; a modifier alone does not paste.
-    fn paste(&self, target: &TargetWindow, policy: SafetyPolicy) -> Result<bool, InjectionError>;
+    /// Errors must occur before any input is queued.
+    fn paste(
+        &self,
+        target: &TargetWindow,
+        policy: SafetyPolicy,
+        sequence: u32,
+    ) -> Result<bool, InjectionError>;
+    fn paste_with_receipt(
+        &self,
+        target: &TargetWindow,
+        policy: SafetyPolicy,
+        sequence: u32,
+        _receipt: Option<&dyn TerminalReceipt>,
+    ) -> Result<bool, InjectionError> {
+        self.paste(target, policy, sequence)
+    }
     /// Returns true if any input was queued, including a partial SendInput.
     fn delete_selection(&self, target: &TargetWindow) -> Result<bool, InjectionError>;
     /// Collapses the selection to a caret at its end when the field still
@@ -938,17 +1059,46 @@ trait Backend {
     fn clipboard_not_restored(&self);
 }
 
-/// A failed clipboard write.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum WriteError {
-    /// The clipboard was never opened or emptied, so nothing changed. A
-    /// sequence change meanwhile belongs to another process.
-    Untouched(InjectionError),
-    /// The write emptied the clipboard, then failed. `sequence` is the
-    /// clipboard sequence right after it closed, identifying the change as ours.
+#[derive(Debug)]
+struct ClipboardWrite<C> {
+    sequence: u32,
+    previous: Option<C>,
+    receipt: Option<Box<dyn TerminalReceipt>>,
+}
+
+impl<C> ClipboardWrite<C> {
+    fn eager(sequence: u32, previous: Option<C>) -> Self {
+        Self {
+            sequence,
+            previous,
+            receipt: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ClipboardStamp {
+    sequence: u32,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    owner: Option<isize>,
+}
+
+trait TerminalReceipt: std::fmt::Debug {
+    fn stamp(&self) -> Option<ClipboardStamp>;
+    fn arm(&self) {}
+    fn wait_for_read(&self, cancelled: &dyn Fn() -> bool) -> Option<ClipboardStamp>;
+}
+
+#[derive(Debug)]
+enum WriteError<C> {
+    /// The current contents cannot be attributed to this write.
+    Unowned(InjectionError),
+    /// Publication changed the clipboard, but could not close it and obtain a sequence.
+    CloseFailed,
+    /// The write failed after replacing the clipboard and still owns it.
     AfterEmpty {
         error: InjectionError,
-        sequence: u32,
+        write: ClipboardWrite<C>,
     },
 }
 
@@ -1019,6 +1169,9 @@ pub(crate) mod test_backend {
         fn capture_target(&self) -> Result<TargetWindow, InjectionError> {
             delegate!(self, |b| b.capture_target())
         }
+        fn is_terminal(&self, target: &TargetWindow) -> bool {
+            delegate!(self, |b| b.is_terminal(target))
+        }
         fn validate_target(&self, target: &TargetWindow) -> Result<(), InjectionError> {
             delegate!(self, |b| b.validate_target(target))
         }
@@ -1051,45 +1204,84 @@ pub(crate) mod test_backend {
         ) -> Result<bool, InjectionError> {
             delegate!(self, |b| b.select_recent(target, expected, text))
         }
-        fn clipboard_snapshot(&self) -> Result<Self::Clipboard, InjectionError> {
-            match &self.mock {
-                Some(mock) => mock
-                    .lock()
-                    .expect("mock backend lock")
-                    .clipboard_snapshot()
-                    .map(Clipboard::Mock),
-                None => self.platform.clipboard_snapshot().map(Clipboard::Platform),
-            }
-        }
         fn clipboard_write(
             &self,
             text: &str,
             exclusion: ClipboardExclusion,
-        ) -> Result<u32, WriteError> {
-            delegate!(self, |b| b.clipboard_write(text, exclusion))
+            preserve: bool,
+        ) -> Result<ClipboardWrite<Self::Clipboard>, WriteError<Self::Clipboard>> {
+            fn map_write<C>(
+                result: Result<ClipboardWrite<C>, WriteError<C>>,
+                wrap: impl FnOnce(C) -> Clipboard,
+            ) -> Result<ClipboardWrite<Clipboard>, WriteError<Clipboard>> {
+                let convert = |write: ClipboardWrite<C>| ClipboardWrite {
+                    sequence: write.sequence,
+                    previous: write.previous.map(wrap),
+                    receipt: write.receipt,
+                };
+                match result {
+                    Ok(write) => Ok(convert(write)),
+                    Err(WriteError::Unowned(error)) => Err(WriteError::Unowned(error)),
+                    Err(WriteError::CloseFailed) => Err(WriteError::CloseFailed),
+                    Err(WriteError::AfterEmpty { error, write }) => Err(WriteError::AfterEmpty {
+                        error,
+                        write: convert(write),
+                    }),
+                }
+            }
+            match &self.mock {
+                Some(mock) => map_write(
+                    mock.lock()
+                        .expect("mock backend lock")
+                        .clipboard_write(text, exclusion, preserve),
+                    Clipboard::Mock,
+                ),
+                None => map_write(
+                    self.platform.clipboard_write(text, exclusion, preserve),
+                    Clipboard::Platform,
+                ),
+            }
+        }
+        fn clipboard_sequence(&self) -> u32 {
+            delegate!(self, |b| b.clipboard_sequence())
         }
         fn clipboard_restore(
             &self,
             snapshot: Self::Clipboard,
-            expected_sequence: u32,
+            expected: ClipboardStamp,
         ) -> Result<bool, InjectionError> {
             match (&self.mock, snapshot) {
                 (Some(mock), Clipboard::Mock(snapshot)) => mock
                     .lock()
                     .expect("mock backend lock")
-                    .clipboard_restore(snapshot, expected_sequence),
+                    .clipboard_restore(snapshot, expected),
                 (None, Clipboard::Platform(snapshot)) => {
-                    self.platform.clipboard_restore(snapshot, expected_sequence)
+                    self.platform.clipboard_restore(snapshot, expected)
                 }
                 _ => unreachable!("a snapshot is restored by the backend that took it"),
             }
+        }
+        fn try_direct_insert(
+            &self,
+            target: &TargetWindow,
+            before: &TargetText,
+            text: &str,
+            still_allowed: &dyn Fn() -> bool,
+        ) -> DirectDispatch {
+            delegate!(self, |b| b.try_direct_insert(
+                target,
+                before,
+                text,
+                still_allowed
+            ))
         }
         fn paste(
             &self,
             target: &TargetWindow,
             policy: SafetyPolicy,
+            sequence: u32,
         ) -> Result<bool, InjectionError> {
-            delegate!(self, |b| b.paste(target, policy))
+            delegate!(self, |b| b.paste(target, policy, sequence))
         }
         fn delete_selection(&self, target: &TargetWindow) -> Result<bool, InjectionError> {
             delegate!(self, |b| b.delete_selection(target))
@@ -1151,16 +1343,25 @@ impl Backend for PlatformBackend {
     ) -> Result<bool, InjectionError> {
         Err(InjectionError::UnsupportedPlatform)
     }
-    fn clipboard_snapshot(&self) -> Result<Self::Clipboard, InjectionError> {
+    fn clipboard_write(
+        &self,
+        _: &str,
+        _: ClipboardExclusion,
+        _: bool,
+    ) -> Result<ClipboardWrite<Self::Clipboard>, WriteError<Self::Clipboard>> {
+        Err(WriteError::Unowned(InjectionError::UnsupportedPlatform))
+    }
+    fn clipboard_sequence(&self) -> u32 {
+        0
+    }
+    fn clipboard_restore(
+        &self,
+        _: Self::Clipboard,
+        _: ClipboardStamp,
+    ) -> Result<bool, InjectionError> {
         Err(InjectionError::UnsupportedPlatform)
     }
-    fn clipboard_write(&self, _: &str, _: ClipboardExclusion) -> Result<u32, WriteError> {
-        Err(WriteError::Untouched(InjectionError::UnsupportedPlatform))
-    }
-    fn clipboard_restore(&self, _: Self::Clipboard, _: u32) -> Result<bool, InjectionError> {
-        Err(InjectionError::UnsupportedPlatform)
-    }
-    fn paste(&self, _: &TargetWindow, _: SafetyPolicy) -> Result<bool, InjectionError> {
+    fn paste(&self, _: &TargetWindow, _: SafetyPolicy, _: u32) -> Result<bool, InjectionError> {
         Err(InjectionError::UnsupportedPlatform)
     }
     fn delete_selection(&self, _: &TargetWindow) -> Result<bool, InjectionError> {
@@ -1181,15 +1382,15 @@ use windows_backend::PlatformBackend;
 #[cfg(target_os = "windows")]
 mod windows_backend {
     use super::{
-        accessibility, clipboard, keys, target, Backend, ClipboardExclusion, InjectionError,
-        SafetyPolicy, TargetText, TargetWindow, TextProbe, UnrestoredClipboard, WriteError,
-        INJECTION_MARKER,
+        accessibility, clipboard, keys, target, Backend, ClipboardExclusion, ClipboardStamp,
+        ClipboardWrite, DirectDispatch, InjectionError, SafetyPolicy, TargetText, TargetWindow,
+        TerminalReceipt, TextProbe, UnrestoredClipboard, WriteError, INJECTION_MARKER,
     };
     use std::mem::{size_of, zeroed};
     use std::thread;
     use std::time::Duration;
     use windows::core::{w, PCWSTR};
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WPARAM};
     use windows::Win32::Security::{
         GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
         TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
@@ -1199,12 +1400,13 @@ mod windows_backend {
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-        KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, VIRTUAL_KEY,
-        VK_BACK, VK_CONTROL, VK_MENU, VK_SHIFT,
+        KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+        MAPVK_VK_TO_VSC, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_MENU, VK_SHIFT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         FindWindowExW, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongPtrW,
-        GetWindowThreadProcessId, GUITHREADINFO, GWL_STYLE,
+        GetWindowThreadProcessId, IsWindowUnicode, SendMessageTimeoutW, GUITHREADINFO, GWL_STYLE,
+        SMTO_ABORTIFHUNG, SMTO_BLOCK, SMTO_ERRORONEXIT,
     };
     const ES_PASSWORD: isize = 0x20;
     pub(super) struct PlatformBackend {
@@ -1349,6 +1551,26 @@ mod windows_backend {
 
     impl Backend for PlatformBackend {
         type Clipboard = clipboard::Snapshot;
+        fn is_terminal(&self, target: &TargetWindow) -> bool {
+            let window = HWND(target.window_handle as *mut _);
+            control_class(window).is_some_and(|class| {
+                [
+                    "CASCADIA_HOSTING_WINDOW_CLASS",
+                    "ConsoleWindowClass",
+                    "VirtualConsoleClass",
+                ]
+                .iter()
+                .any(|known| class.eq_ignore_ascii_case(known))
+            }) || crate::app_context::from_target(target).is_some_and(|context| {
+                context.category == "terminal"
+                    || matches!(
+                        context.app_key.as_deref(),
+                        Some(
+                            "conhost" | "openconsole" | "mintty" | "conemu" | "conemu64" | "kitty"
+                        )
+                    )
+            })
+        }
         fn capture_target(&self) -> Result<TargetWindow, InjectionError> {
             let window = unsafe { GetForegroundWindow() };
             if window.0.is_null() {
@@ -1444,27 +1666,135 @@ mod windows_backend {
             }
             accessibility::select_recent(target, expected, text)
         }
-        fn clipboard_snapshot(&self) -> Result<Self::Clipboard, InjectionError> {
-            clipboard::snapshot()
-        }
         fn clipboard_write(
             &self,
             text: &str,
             exclusion: ClipboardExclusion,
-        ) -> Result<u32, WriteError> {
-            clipboard::write(text, exclusion)
+            preserve: bool,
+        ) -> Result<ClipboardWrite<Self::Clipboard>, WriteError<Self::Clipboard>> {
+            clipboard::write(text, exclusion, preserve)
+        }
+        fn clipboard_sequence(&self) -> u32 {
+            clipboard::sequence()
+        }
+        fn clipboard_write_terminal(
+            &self,
+            text: &str,
+            target: &TargetWindow,
+        ) -> Result<ClipboardWrite<Self::Clipboard>, WriteError<Self::Clipboard>> {
+            clipboard::write_terminal(text, target)
         }
         fn clipboard_restore(
             &self,
             snapshot: Self::Clipboard,
-            expected_sequence: u32,
+            expected: ClipboardStamp,
         ) -> Result<bool, InjectionError> {
-            clipboard::restore(snapshot, expected_sequence)
+            clipboard::restore_owned(snapshot, expected)
+        }
+        fn try_direct_insert(
+            &self,
+            target: &TargetWindow,
+            before: &TargetText,
+            text: &str,
+            still_allowed: &dyn Fn() -> bool,
+        ) -> DirectDispatch {
+            if crate::environment::value("ASR_UNICODE_EDIT_INSERT").as_deref() == Some("1") {
+                let result = self.try_unicode_edit(target, before, text, still_allowed);
+                if result != DirectDispatch::Declined {
+                    return result;
+                }
+            }
+            // Restrict this opt-in transport to classic Unicode EDIT fields
+            // and a single-line, additive caret insertion. Rich editors,
+            // selection replacements and multiline conversion use paste.
+            if crate::environment::value("ASR_NATIVE_EDIT_INSERT").as_deref() != Some("1")
+                || target.process_id == std::process::id()
+                || target.control_handle == target.window_handle
+                || !before.selected.is_empty()
+                || text.is_empty()
+                || text.contains(['\0', '\r', '\n'])
+                || before.before.contains('\n')
+                || before.after.contains('\n')
+            {
+                return DirectDispatch::Declined;
+            }
+            let control = HWND(target.control_handle as *mut _);
+            const ES_READONLY: isize = 0x800;
+            if !control_class(control).is_some_and(|class| class.eq_ignore_ascii_case("Edit"))
+                || !unsafe { IsWindowUnicode(control) }.as_bool()
+                || unsafe { GetWindowLongPtrW(control, GWL_STYLE) } & (ES_PASSWORD | ES_READONLY)
+                    != 0
+                || self.ime_composition_active(target).ok().flatten() != Some(false)
+                || self.validate_target(target).is_err()
+            {
+                return DirectDispatch::Declined;
+            }
+
+            const EM_GETSEL: u32 = 0x00b0;
+            const EM_REPLACESEL: u32 = 0x00c2;
+            const MESSAGE_TIMEOUT_MS: u32 = 150;
+            let flags = SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT;
+            let Some(expected_caret) = u32::try_from(before.before.encode_utf16().count()).ok()
+            else {
+                return DirectDispatch::Declined;
+            };
+            let payload: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            let (mut start, mut end) = (u32::MAX, u32::MAX);
+            // Both messages are below WM_USER. Windows marshals their
+            // buffers for the target process. Keep pointers valid during send.
+            let read = unsafe {
+                SendMessageTimeoutW(
+                    control,
+                    EM_GETSEL,
+                    WPARAM((&mut start as *mut u32) as usize),
+                    LPARAM((&mut end as *mut u32) as isize),
+                    flags,
+                    MESSAGE_TIMEOUT_MS,
+                    None,
+                )
+            };
+            let foreground = unsafe { GetForegroundWindow() };
+            if read.0 == 0
+                || start != expected_caret
+                || end != expected_caret
+                || foreground.0 as isize != target.window_handle
+                || focused_control(foreground, target.thread_id) != control
+                || !modifiers_released()
+                || !still_allowed()
+            {
+                return DirectDispatch::Declined;
+            }
+            let sent = unsafe {
+                SendMessageTimeoutW(
+                    control,
+                    EM_REPLACESEL,
+                    WPARAM(1), // Preserve the ordinary edit control's Undo.
+                    LPARAM(payload.as_ptr() as isize),
+                    flags,
+                    MESSAGE_TIMEOUT_MS,
+                    None,
+                )
+            };
+            if sent.0 == 0 {
+                DirectDispatch::Ambiguous
+            } else {
+                DirectDispatch::Confirmed
+            }
         }
         fn paste(
             &self,
             target: &TargetWindow,
             policy: SafetyPolicy,
+            sequence: u32,
+        ) -> Result<bool, InjectionError> {
+            self.paste_with_receipt(target, policy, sequence, None)
+        }
+        fn paste_with_receipt(
+            &self,
+            target: &TargetWindow,
+            policy: SafetyPolicy,
+            sequence: u32,
+            receipt: Option<&dyn TerminalReceipt>,
         ) -> Result<bool, InjectionError> {
             self.validate_target(target)?;
             if !policy.permits_ime(self.ime_composition_active(target)?) || !modifiers_released() {
@@ -1488,8 +1818,17 @@ mod windows_backend {
             // The selection check above is a UIA round trip; a modifier
             // pressed meanwhile would turn Ctrl+V into another chord
             // (e.g. Ctrl+Alt+V), so re-check right before sending.
-            if !modifiers_released() {
+            // Another reader can materialize the payload and advance its
+            // sequence without replacing the delayed clipboard owner.
+            let current = match receipt {
+                Some(receipt) => receipt.stamp().is_some(),
+                None => clipboard::sequence() == sequence,
+            };
+            if !modifiers_released() || !current {
                 return Ok(false);
+            }
+            if let Some(receipt) = receipt {
+                receipt.arm();
             }
             let sent = keys::chord_sent(unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) });
             if let Some(release_from) = sent.release_from {
@@ -1555,6 +1894,85 @@ mod windows_backend {
                     // A scan code fits in the low byte; MAPVK_VK_TO_VSC
                     // returns 0 for a key without one.
                     wScan: (scan & 0xFF) as u16,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: INJECTION_MARKER,
+                },
+            },
+        }
+    }
+
+    impl PlatformBackend {
+        fn try_unicode_edit(
+            &self,
+            target: &TargetWindow,
+            before: &TargetText,
+            text: &str,
+            still_allowed: &dyn Fn() -> bool,
+        ) -> DirectDispatch {
+            const MAX_UTF16_UNITS: usize = 256;
+            if !before.selected.is_empty()
+                || text.is_empty()
+                || text.chars().any(char::is_control)
+                || text.encode_utf16().take(MAX_UTF16_UNITS + 1).count() > MAX_UTF16_UNITS
+            {
+                return DirectDispatch::Declined;
+            }
+            let recognized_app = crate::app_context::from_target(target).is_some_and(|context| {
+                matches!(
+                    context.app_key.as_deref(),
+                    Some(
+                        "chrome"
+                            | "msedge"
+                            | "brave"
+                            | "firefox"
+                            | "opera"
+                            | "code"
+                            | "slack"
+                            | "discord"
+                    )
+                )
+            });
+            if !recognized_app
+                || self.validate_target(target).is_err()
+                || self.ime_composition_active(target).ok().flatten() != Some(false)
+                || !accessibility::writable_edit_is_current(target, before)
+            {
+                return DirectDispatch::Declined;
+            }
+            let inputs: Vec<INPUT> = text
+                .encode_utf16()
+                .flat_map(|unit| [unicode_input(unit, false), unicode_input(unit, true)])
+                .collect();
+            let foreground = unsafe { GetForegroundWindow() };
+            if foreground.0 as isize != target.window_handle
+                || focused_control(foreground, target.thread_id).0 as isize != target.control_handle
+                || !modifiers_released()
+                || !still_allowed()
+            {
+                return DirectDispatch::Declined;
+            }
+            let sent = unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) } as usize;
+            // SendInput may enqueue a prefix. Release only its last key and
+            // leave readback to the caller. Never send the omitted text again.
+            if !sent.is_multiple_of(2) && sent < inputs.len() {
+                let _ = unsafe { SendInput(&inputs[sent..sent + 1], size_of::<INPUT>() as i32) };
+            }
+            DirectDispatch::from_queued_inputs(sent, inputs.len())
+        }
+    }
+
+    fn unicode_input(unit: u16, key_up: bool) -> INPUT {
+        let mut flags = KEYEVENTF_UNICODE;
+        if key_up {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0),
+                    wScan: unit,
                     dwFlags: flags,
                     time: 0,
                     dwExtraInfo: INJECTION_MARKER,
