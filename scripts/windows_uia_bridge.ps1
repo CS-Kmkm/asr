@@ -197,7 +197,7 @@ function Find-TerminalFixture($token, $session) {
     }
 }
 
-function Start-OwnedFixture($kind, $ownership) {
+function Start-OwnedFixture($kind, $ownership, [bool]$bracketed) {
     Assert-EvaluationGuest
     $run = Split-Path $bridgeRoot -Parent
     $evaluation = Join-Path $env:LOCALAPPDATA 'ASR-Evaluation'
@@ -238,6 +238,7 @@ function Start-OwnedFixture($kind, $ownership) {
             $python = 'C:\ASR-Evaluation\runtime\python\python.exe'
             $entry = Join-Path $bridgeRoot 'windows_acceptance_terminal.py'
             $arguments = "-w new new-tab --title $token --suppressApplicationTitle `"$python`" `"$entry`" `"$reader`""
+            if ($bracketed) { $arguments += ' --bracketed' }
         }
         'mintty' {
             $exe = 'C:\ASR-Evaluation\tools\GitPortable\usr\bin\mintty.exe'
@@ -438,7 +439,7 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             } elseif ($request.action -eq 'open_fixture') {
                 $stage = 'owned_fixture_launch_failed'
                 if ($request.target -ne 'primary' -or $fixtureOwnership.Launched) { throw 'invalid fixture slot' }
-                $owned = Start-OwnedFixture $request.kind $fixtureOwnership
+                $owned = Start-OwnedFixture $request.kind $fixtureOwnership ($request.bracketed -eq $true)
                 $fixtureToken = $owned.Token
                 $fixtureKind = $owned.Kind
                 $readerPath = $owned.Reader
@@ -558,6 +559,19 @@ while ($null -ne ($line = [Console]::ReadLine())) {
                     $pattern.DocumentRange.Select()
                     if (-not (Test-Focused $target)) { throw 'focus changed' }
                     $result = @{ ok = $true }
+                }
+                'matrix_caret' {
+                    if (-not (Test-Focused $target) -or $target.FixtureKind -eq 'terminal') { throw 'focus mismatch' }
+                    $pattern = $target.Element.GetCurrentPattern([Windows.Automation.TextPattern]::Pattern)
+                    $selection = @($pattern.GetSelection())
+                    $atEnd = $false
+                    if ($selection.Count -eq 1 -and $selection[0].CompareEndpoints('Start', $selection[0], 'End') -eq 0) {
+                        $before = $pattern.DocumentRange.Clone()
+                        $before.MoveEndpointByRange('End', $selection[0], 'Start')
+                        $atEnd = $before.GetText(-1) -ceq $request.prefix
+                    }
+                    if (-not (Test-Focused $target)) { throw 'focus changed' }
+                    $result = @{ ok = $true; at_end = $atEnd }
                 }
                 'minimize' {
                     [void][AcceptanceWindows]::ShowWindow($target.Hwnd, 7)

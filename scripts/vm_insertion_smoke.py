@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import sqlite3
+import statistics
 import subprocess
 import sys
 import time
@@ -21,8 +22,9 @@ import wave
 from evaluation_events import EventReader, EvidenceError, SourceUnavailable
 from score_asr import Options, _manifest_metrics, load_manifest, parse_args as score_args
 from windows_acceptance import (
-    MOCK_EXTERNAL, MOCK_INSERTION, MOCK_NOTEPAD, MOCK_TEXT, REAL_EXTERNAL, REAL_EXTERNAL_REPEATS,
-    REAL_NOTEPAD, REAL_RECEIVERS, VM_CLASSIC_TERMINALS, VM_FULL_SCENARIOS, VM_SMOKE_SCENARIOS,
+    HELD_WORKER_GUARDS, MOCK_EXTERNAL, MOCK_INSERTION, MOCK_NOTEPAD, MOCK_TEXT, REAL_EXTERNAL, REAL_EXTERNAL_REPEATS,
+    NATIVE_MODEL, NATIVE_MODELS, NATIVE_NOTEPAD, NORMAL_MATRIX_CONDITIONS, NORMAL_MATRIX_TARGETS, matrix_text,
+    REAL_NOTEPAD, REAL_RECEIVERS, VM_CLASSIC_TERMINALS, VM_FULL_SCENARIOS, VM_INFLIGHT_GUARDS, VM_SMOKE_SCENARIOS,
     WORKER_RECOVERY, WORKER_RECOVERY_TRIALS,
     delivery_digest, live_process_start, read_real_proof, require_evaluation_guest, worker_identity,
 )
@@ -211,19 +213,60 @@ def probed_worker():
 
     def transcribe(self, audio_path, *args, **kwargs):
         marker = os.environ.get('ASR_WORKER_MOCK_CRASH_FILE')
+        matrix_arm = os.environ.get('ASR_EVAL_MATRIX_ARM')
+        hold = os.environ.get('ASR_EVAL_HOLD_TRANSCRIBE')
         destination = proof_path
         identity = {}
-        if marker:
+        if matrix_arm:
+            arm = Path(matrix_arm)
+            trial = json.loads(arm.read_text(encoding='utf-8'))
+            arm.unlink()
+            index, condition, nonce = (trial['index'], trial['condition'], trial['nonce'])
+            if type(index) is not int or not 1 <= index <= 201:
+                raise EvidenceError('invalid matrix proof index')
+            text = matrix_text(condition, nonce)
+            destination = trial_directory(proof_path.parent, index, 2) / proof_path.name
+            identity = {'matrix_nonce': nonce, 'worker_pid': os.getpid()}
+        elif marker:
             index = 1 if Path(marker).is_file() else 2
             destination = trial_directory(proof_path.parent, index, 2) / proof_path.name
             identity = {'worker_pid': os.getpid(), 'worker_start_time': live_process_start(os.getpid())}
-        with destination.open('x', encoding='utf-8') as report:
+        if hold:
+            Path(hold).touch(exist_ok=False)
+            os.environ['ASR_WORKER_MOCK_HOLD_FILE'] = hold
+        try:
+            with destination.open('x', encoding='utf-8') as report:
+                try:
+                    json.dump({'effective_backend': 'mock', **identity, **capture_evidence(audio_path)}, report)
+                except (EvidenceError, OSError, wave.Error):
+                    json.dump({'passed': False, 'reason': 'captured_audio_unreadable'}, report)
+                    raise
+            if matrix_arm:
+                os.environ['ASR_WORKER_MOCK_TEXT'] = text
+            if not hold:
+                return original(self, audio_path, *args, **kwargs)
+
+            # MockBackend only polls this callback from inside its held
+            # transcription loop. Publish the witness from that first poll.
+            original_check = self.is_cancel_requested
+            acknowledged = False
+
+            def observed_cancel():
+                nonlocal acknowledged
+                if not acknowledged:
+                    destination.with_name('worker-hold-ready').touch(exist_ok=False)
+                    acknowledged = True
+                return original_check()
+
+            self.is_cancel_requested = observed_cancel
             try:
-                json.dump({'effective_backend': 'mock', **identity, **capture_evidence(audio_path)}, report)
-            except (EvidenceError, OSError, wave.Error):
-                json.dump({'passed': False, 'reason': 'captured_audio_unreadable'}, report)
-                raise
-        return original(self, audio_path, *args, **kwargs)
+                return original(self, audio_path, *args, **kwargs)
+            finally:
+                del self.is_cancel_requested
+        finally:
+            if hold:
+                os.environ.pop('ASR_WORKER_MOCK_HOLD_FILE', None)
+                Path(hold).unlink(missing_ok=True)
 
     backend.transcribe = real_transcribe if real_manifest else transcribe
     request_log = Path(os.environ['ASR_EVAL_REQUEST_LOG'])
@@ -248,10 +291,11 @@ def stage_capture_probe(root):
     )
 
 
-def prepare_profile(*, real=False):
+def prepare_profile(*, real=False, native_model=None):
     if os.environ.get('USERNAME', '').casefold() != ('asrevalreal' if real else 'asreval'):
         raise EvidenceError('expected the dedicated evaluation user')
-    profile = Path(os.environ['APPDATA']) / 'org.localvoice.input' / 'local-voice-input.sqlite3'
+    profile_name = NATIVE_MODELS[native_model][0] if native_model else 'org.localvoice.input'
+    profile = Path(os.environ['APPDATA']) / profile_name / 'local-voice-input.sqlite3'
     config = {
         'asrEvaluationProfile': 'vm-insertion-smoke/1', 'setupComplete': True,
         'asrBackend': 'mock', 'offlineOnly': True, 'modelId': None,
@@ -264,7 +308,10 @@ def prepare_profile(*, real=False):
         'deleteAudioAfterProcessing': True, 'autoStart': False, 'clipboardRestore': True,
         'noiseSuppression': 'off', 'automaticGain': False, 'inputGainPercent': 100,
     }
-    if real:
+    if native_model:
+        config.update(asrEvaluationProfile='vm-native-notepad/1', asrBackend='speech-cpp',
+                      asrDevice='cpu', speechLocale='ja-JP', modelQuantization='8bit', modelId=native_model)
+    elif real:
         config.update(asrEvaluationProfile='vm-real-notepad/1', asrBackend='faster-whisper',
                       asrDevice='cpu', speechLocale='ja-JP', modelQuantization='4bit',
                       modelId=str(REAL_MODEL))
@@ -322,8 +369,9 @@ def trial_directory(case_dir, index, repeats):
 
 
 def run_acceptance(root, scenario, profile, manifest, item, exe_hash, events, directory, index, *,
-                   mock_on_real_profile=False, mock_text=None):
+                   mock_on_real_profile=False, mock_text=None, matrix_trial=None, native_model=None):
     real = scenario in REAL_RECEIVERS
+    native = scenario == NATIVE_NOTEPAD
     recovery = scenario == WORKER_RECOVERY
     command = [
         sys.executable, '-X', 'utf8', str(root / 'scripts' / 'windows_acceptance.py'),
@@ -332,17 +380,26 @@ def run_acceptance(root, scenario, profile, manifest, item, exe_hash, events, di
     ]
     if real:
         command.extend(('--real-case', scenario, '--worker-proof', str(directory / 'capture-proof.json')))
+    elif native:
+        command.extend(('--native-notepad', '--native-model', native_model))
     else:
-        command.extend(('--mock-insertion', '--mock-text', mock_text))
+        command.append('--mock-insertion')
+        if matrix_trial:
+            command.extend(('--matrix-condition', matrix_trial['condition'],
+                            '--matrix-nonce', matrix_trial['nonce']))
+        else:
+            command.extend(('--mock-text', mock_text))
         if mock_on_real_profile:
             command.append('--mock-on-real-profile')
         if recovery:
             command.append('--worker-recovery')
         elif scenario != MOCK_INSERTION:
             command.extend(('--scenario', scenario))
+        if scenario in HELD_WORKER_GUARDS:
+            command.extend(('--inflight-proof', str(directory / 'worker-hold-ready')))
     with (directory / 'acceptance.log').open('xb') as log:
         external = scenario in MOCK_EXTERNAL or scenario in VM_CLASSIC_TERMINALS
-        timeout = 160 if real else 100 if recovery else 65 if external else 50
+        timeout = 160 if real or native else 100 if recovery else 65 if external else 50
         code = subprocess.run(command, timeout=timeout, check=False,
                               stdout=log, stderr=subprocess.STDOUT).returncode
     report_path = directory / 'acceptance' / 'acceptance.json'
@@ -407,8 +464,44 @@ def check_worker_recovery_trial(trial, trials, reader, process, requests):
         trial['application_pid'] = process.pid
 
 
-def run_case(root, scenario, profile, manifest, item, exe_hash, *, repeats=1, mock_on_real_profile=False):
+def observe_native_worker(app_pid, executable, model):
+    # Outside the measured interval. Observe a child of the staged application
+    # with the exact runtime, model argument and CPU selection.
+    shell = Path(os.environ['SystemRoot']) / 'System32' / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe'
+    command = r'''
+$ErrorActionPreference = 'Stop'
+$appPid = [int]$env:ASR_EVAL_PARENT_PID
+$workers = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$appPid" | Where-Object {
+    $_.ExecutablePath -eq $env:ASR_EVAL_SPEECH_EXE -and
+    $_.CommandLine -and $_.CommandLine.Contains($env:ASR_EVAL_SPEECH_MODEL) -and
+    $_.CommandLine -match '(?i)\s--device\s+CPU(\s|$)'
+})
+if ($workers.Count -ne 1) { exit 1 }
+$worker = Get-Process -Id $workers[0].ProcessId
+[Console]::WriteLine(([ordered]@{ pid = $worker.Id; working_set_bytes = $worker.WorkingSet64;
+    peak_working_set_bytes = $worker.PeakWorkingSet64; private_bytes = $worker.PrivateMemorySize64;
+    handles = $worker.HandleCount; cpu_seconds = $worker.CPU } | ConvertTo-Json -Compress))
+'''
+    detected = subprocess.run([str(shell), '-NoProfile', '-NonInteractive', '-Command', command],
+                              env={**os.environ, 'ASR_EVAL_PARENT_PID': str(app_pid),
+                                   'ASR_EVAL_SPEECH_EXE': str(executable), 'ASR_EVAL_SPEECH_MODEL': str(model)},
+                              capture_output=True, check=False, timeout=8)
+    if detected.returncode:
+        raise EvidenceError('the pinned native CPU worker was not observed below the application')
+    resources = json.loads(detected.stdout)
+    pid = resources['pid']
+    if type(pid) is not int or pid <= 0:
+        raise EvidenceError('invalid observed native worker identity')
+    started = live_process_start(pid)
+    if started is None:
+        raise EvidenceError('the observed native worker exited before identity could be bound')
+    return (pid, started), resources
+
+
+def run_case(root, scenario, profile, manifest, item, exe_hash, *, repeats=1, mock_on_real_profile=False,
+             native_model=None):
     real = scenario in REAL_RECEIVERS
+    native = scenario == NATIVE_NOTEPAD
     case_dir = root / 'cases' / scenario
     case_dir.mkdir(parents=True)
     events = case_dir / 'events.jsonl'
@@ -417,7 +510,7 @@ def run_case(root, scenario, profile, manifest, item, exe_hash, *, repeats=1, mo
     request_log.touch(exist_ok=False)
     case = {'scenario': scenario, 'status': 'BLOCKED'}
     app = root / 'local-voice-input.exe'
-    mock_text = None if real else MOCK_TEXT + uuid.uuid4().hex[:16]
+    mock_text = None if real or native else MOCK_TEXT + uuid.uuid4().hex[:16]
     env = {key: value for key, value in os.environ.items() if not key.upper().startswith('ASR_')}
     env.update(ASR_EVAL_EVENTS=str(events), ASR_PYTHON=sys.executable,
                ASR_EVAL_CAPTURE_PROOF=str(capture),
@@ -426,6 +519,8 @@ def run_case(root, scenario, profile, manifest, item, exe_hash, *, repeats=1, mo
         env['ASR_WORKER_MOCK_TEXT'] = mock_text
     if mock_on_real_profile:
         env['ASR_EVAL_MOCK_WORKER'] = '1'
+    if scenario in HELD_WORKER_GUARDS:
+        env['ASR_EVAL_HOLD_TRANSCRIBE'] = str(case_dir / 'hold-transcribe')
     recovery = scenario == WORKER_RECOVERY
     if recovery:
         repeats = len(WORKER_RECOVERY_TRIALS)
@@ -438,6 +533,17 @@ def run_case(root, scenario, profile, manifest, item, exe_hash, *, repeats=1, mo
         env.update(PYTHONPATH=str(REAL_DEPENDENCIES),
                    ASR_EVAL_REAL_REFERENCE=str(manifest), HF_HUB_OFFLINE='1',
                    ASR_EVAL_REAL_REPEATS=str(repeats))
+    if native:
+        case['native_model'] = native_model
+        cache = root / 'native-cache'
+        native_exe = cache / 'runtime-0.10.1' / 'speech.exe'
+        model_file = NATIVE_MODELS[native_model][1]
+        native_models = list(cache.glob(f'*/{model_file}'))
+        if not native_exe.is_file() or len(native_models) != 1:
+            raise EvidenceError('staged native runtime or model missing')
+        # A fallback Python ASR path must not run for this lane.
+        env.update(ASR_NATIVE_SPEECH_CPP='cpu', ASR_SPEECH_CPP_HOME=str(cache),
+                   ASR_PYTHON=str(root / 'disabled-python.exe'))
     trials = []
     operations = []
     worker_identity = None
@@ -460,14 +566,30 @@ def run_case(root, scenario, profile, manifest, item, exe_hash, *, repeats=1, mo
                     directory.mkdir()
                 trial = recovery_trials[index - 1] if recovery else run_acceptance(
                     root, scenario, profile, manifest, item, exe_hash, events, directory, index,
-                    mock_on_real_profile=mock_on_real_profile, mock_text=mock_text)[0]
+                    mock_on_real_profile=mock_on_real_profile, mock_text=mock_text, native_model=native_model)[0]
                 trials.append(trial)
                 all_requests = request_log.read_text(encoding='ascii').splitlines()
                 if any(request != 'transcribe' for request in all_requests):
                     raise EvidenceError('unexpected worker request trace')
                 requests = all_requests[request_offset:index] if recovery else all_requests[request_offset:]
                 request_offset = index if recovery else len(all_requests)
-                if real:
+                if native:
+                    reader.poll()
+                    operation = trial['acceptance']['results'][0].get('operation_id')
+                    expected_operations = [*operations, operation] if operation is not None else operations
+                    if (process.poll() is not None or reader.pid != process.pid or reader.phase != 'idle'
+                            or list(reader.takes) != expected_operations or requests):
+                        raise EvidenceError('native trial lost app continuity or invoked Python ASR')
+                    if operation is not None:
+                        operations.append(operation)
+                    if trial['status'] == 'PASS':
+                        identity, resources = observe_native_worker(process.pid, native_exe, native_models[0])
+                        if worker_identity not in (None, identity):
+                            trial.update(status='FAIL', reason='native_worker_changed')
+                        worker_identity = identity
+                        trial.update(native_worker_pid=identity[0], native_worker_started=identity[1],
+                                     native_worker_resources=resources, application_pid=process.pid)
+                elif real:
                     reader.poll()
                     proof = read_real_proof(directory / capture.name)
                     check_real_trial(trial, reader, process, proof, requests, index, operations)
@@ -495,8 +617,18 @@ def run_case(root, scenario, profile, manifest, item, exe_hash, *, repeats=1, mo
                     case['status'] = trial['status']
                     if 'reason' in trial:
                         case['reason'] = trial['reason']
-                if trial['status'] != 'PASS':
+                if trial['status'] != 'PASS' and not native:
                     break
+            if native:
+                statuses = {row['status'] for row in trials}
+                case['status'] = ('FAIL' if 'FAIL' in statuses else 'BLOCKED' if 'BLOCKED' in statuses else 'PASS')
+                warm = [row['acceptance']['results'][0]['stop_to_observed_insertion_ms']
+                        for row in trials[1:] if row['status'] == 'PASS']
+                case['native_latency'] = {
+                    'warm_planned': repeats - 1, 'warm_observed': len(warm),
+                    'p50_ms': statistics.median(warm) if warm else None,
+                    'p95_ms': statistics.quantiles(warm, n=20, method='inclusive')[-1] if len(warm) > 1 else None,
+                }
         except subprocess.TimeoutExpired as exc:
             raise AcceptanceTimeout(f'{scenario} timed out; sign the evaluation user out and back in') from exc
         except (EvidenceError, OSError, sqlite3.Error, ValueError, subprocess.SubprocessError) as exc:
@@ -505,7 +637,118 @@ def run_case(root, scenario, profile, manifest, item, exe_hash, *, repeats=1, mo
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=10)
+    if native and worker_identity is not None:
+        pid, started = worker_identity
+        case['native_worker_reaped'] = live_process_start(pid, exit_wait_ms=5000) != started
+        if not case['native_worker_reaped']:
+            case.update(status='FAIL', reason='native_worker_survived_app_exit')
     return case
+
+
+def matrix_schedule(samples):
+    # The first short trial is the single uncounted warm-up for this target.
+    conditions = ['short', *(NORMAL_MATRIX_CONDITIONS * samples)]
+    return [{'index': index, 'condition': condition, 'nonce': uuid.uuid4().hex[:16]}
+            for index, condition in enumerate(conditions, 1)]
+
+
+def run_matrix_case(root, scenario, profile, manifest, item, exe_hash, samples, *, mock_on_real_profile):
+    case_dir = root / 'cases' / scenario
+    case_dir.mkdir(parents=True)
+    events = case_dir / 'events.jsonl'
+    capture = case_dir / 'capture-proof.json'
+    requests = case_dir / 'transcription-requests.log'
+    requests.touch(exist_ok=False)
+    arm = case_dir / 'matrix-trial.json'
+    schedule = matrix_schedule(samples)
+    trials = []
+    case = {'scenario': scenario, 'requested_trials': len(schedule) - 1,
+            'status': 'BLOCKED', 'trials': trials}
+    env = {key: value for key, value in os.environ.items() if not key.upper().startswith('ASR_')}
+    env.update(ASR_EVAL_EVENTS=str(events), ASR_PYTHON=sys.executable,
+               ASR_EVAL_CAPTURE_PROOF=str(capture), ASR_EVAL_REQUEST_LOG=str(requests),
+               ASR_EVAL_MATRIX_ARM=str(arm))
+    if mock_on_real_profile:
+        env['ASR_EVAL_MOCK_WORKER'] = '1'
+    with (case_dir / 'app.log').open('xb') as log:
+        process = subprocess.Popen([str(root / 'local-voice-input.exe')], cwd=root, env=env,
+                                   stdout=log, stderr=subprocess.STDOUT)
+        try:
+            reader = wait_for_app(process, events)
+            for planned in schedule:
+                index = planned['index']
+                directory = trial_directory(case_dir, index, len(schedule))
+                directory.mkdir()
+                previous_takes = len(reader.takes)
+                with arm.open('x', encoding='utf-8') as handle:
+                    json.dump(planned, handle)
+                offset = requests.stat().st_size
+                trial, = run_acceptance(root, scenario, profile, manifest, item, exe_hash, events,
+                                        directory, index, mock_on_real_profile=mock_on_real_profile,
+                                        matrix_trial=planned)
+                with requests.open('rb') as handle:
+                    handle.seek(offset)
+                    trace = handle.read()
+                proof_path = directory / capture.name
+                proof = json.loads(proof_path.read_text(encoding='utf-8')) if proof_path.is_file() else None
+                apply_capture_proof(trial, proof, len(trace.splitlines()))
+                reader.poll()
+                if trial['status'] == 'PASS' and (
+                        trace not in (b'transcribe\r\n', b'transcribe\n')
+                        or proof.get('matrix_nonce') != planned['nonce']
+                        or proof.get('effective_backend') != 'mock'):
+                    trial.update(status='FAIL', reason='unexpected_matrix_capture_evidence')
+                if trial['status'] == 'PASS' and (
+                        list(reader.takes)[previous_takes:] != [trial['acceptance']['results'][0]['operation_id']]):
+                    trial.update(status='FAIL', reason='unexpected_matrix_application_operations')
+                trial.update(planned)
+                with (directory / 'matrix-result.json').open('x', encoding='utf-8') as handle:
+                    json.dump(trial, handle, ensure_ascii=False)
+                if index == 1:
+                    case['warmup'] = trial
+                else:
+                    trials.append(trial)
+                if reader.pid != process.pid or reader.phase != 'idle' or process.poll() is not None:
+                    raise AcceptanceTimeout('matrix app did not return to idle')
+                if arm.exists():
+                    arm.unlink()  # Setup failure or another route produced no transcription.
+                print(f'{scenario}: {index}/{len(schedule)} {trial["status"]}', flush=True)
+            case['status'] = 'PASS' if all(t['status'] == 'PASS' for t in trials) else 'FAIL'
+        except (AcceptanceTimeout, subprocess.TimeoutExpired) as exc:
+            case.update(reason=str(exc), requires_session_reset=True)
+        except (EvidenceError, OSError, sqlite3.Error, ValueError, subprocess.SubprocessError) as exc:
+            case.update(reason=str(exc))
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=10)
+    return case
+
+
+def matrix_summary(cases, samples):
+    def count(trials, planned):
+        confirmed = sum(trial['status'] == 'PASS' for trial in trials)
+        blocked = sum(trial['status'] == 'BLOCKED' for trial in trials)
+        proportion = confirmed / planned
+        z = 1.959963984540054
+        scale = 1 + z**2 / planned
+        center = (proportion + z**2 / (2 * planned)) / scale
+        spread = z * math.sqrt(proportion * (1 - proportion) / planned + z**2 / (4 * planned**2)) / scale
+        return {'planned': planned, 'reported': len(trials), 'confirmed': confirmed, 'blocked': blocked,
+                'rate': proportion, 'wilson_95': [max(0, center - spread), min(1, center + spread)]}
+
+    trials = [trial for case in cases for trial in case.get('trials', [])]
+    target_total = samples * len(NORMAL_MATRIX_CONDITIONS)
+    return {
+        **count(trials, target_total * len(NORMAL_MATRIX_TARGETS)),
+        'by_target': {case['scenario']: count(case.get('trials', []), target_total) for case in cases},
+        'by_condition': {condition: count([t for t in trials if t['condition'] == condition],
+                                         samples * len(NORMAL_MATRIX_TARGETS))
+                         for condition in NORMAL_MATRIX_CONDITIONS},
+        'cells': {case['scenario']: {condition: count([t for t in case.get('trials', [])
+                                                      if t['condition'] == condition], samples)
+                                     for condition in NORMAL_MATRIX_CONDITIONS} for case in cases},
+    }
 
 
 def main():
@@ -515,12 +758,21 @@ def main():
     modes.add_argument('--include-notepad', action='store_true')
     modes.add_argument('--expanded-matrix', action='store_true')
     modes.add_argument('--classic-terminals', action='store_true')
+    modes.add_argument('--normal-matrix', action='store_true')
+    modes.add_argument('--normal-matrix-pilot', action='store_true')
+    modes.add_argument('--inflight-guards', action='store_true')
     modes.add_argument('--real-notepad', action='store_true')
     modes.add_argument('--real-apps', action='store_true')
+    modes.add_argument('--native-notepad', action='store_true')
+    parser.add_argument('--native-model', choices=NATIVE_MODELS)
     parser.add_argument('--real-repeats', type=int, default=1)
     parser.add_argument('--mock-on-real-profile', action='store_true')
     args = parser.parse_args()
-    real = args.real_notepad or args.real_apps
+    if args.native_model and not args.native_notepad:
+        parser.error('--native-model requires --native-notepad')
+    native_model = (args.native_model or NATIVE_MODEL) if args.native_notepad else None
+    real = args.real_notepad or args.real_apps or args.native_notepad
+    matrix_samples = 50 if args.normal_matrix else 1 if args.normal_matrix_pilot else 0
     if not 1 <= args.real_repeats <= 80 or (args.real_repeats != 1 and not real):
         parser.error('--real-repeats accepts 1–80 and requires a real mode for multiple takes')
     if args.mock_on_real_profile and real:
@@ -530,10 +782,16 @@ def main():
         scenarios = VM_FULL_SCENARIOS
     elif args.classic_terminals:
         scenarios = tuple(VM_CLASSIC_TERMINALS)
+    elif matrix_samples:
+        scenarios = NORMAL_MATRIX_TARGETS
+    elif args.inflight_guards:
+        scenarios = VM_INFLIGHT_GUARDS
     elif args.real_notepad:
         scenarios = (REAL_NOTEPAD,)
     elif args.real_apps:
         scenarios = tuple(REAL_RECEIVERS)
+    elif args.native_notepad:
+        scenarios = (NATIVE_NOTEPAD,)
     root = Path(__file__).resolve().parents[1]
     output = root / 'result.json'
     if output.exists():
@@ -544,8 +802,12 @@ def main():
     try:
         require_evaluation_guest()
         contain_guest_processes()
-        result['exe_sha256'] = hashlib.sha256(app.read_bytes()).hexdigest()
-        profile = prepare_profile(real=real or args.mock_on_real_profile)
+        app_image = app.read_bytes()
+        result['exe_sha256'] = hashlib.sha256(app_image).hexdigest()
+        if native_model and NATIVE_MODELS[native_model][0].encode('ascii') not in app_image:
+            raise EvidenceError('native evaluation identifier is missing from the staged executable')
+        del app_image
+        profile = prepare_profile(real=real or args.mock_on_real_profile, native_model=native_model)
         if real:
             manifest = root / 'real-fixture' / 'manifest.json'
             staged_item, = load_manifest(manifest)['items']
@@ -557,9 +819,17 @@ def main():
         result['worker_sha256'] = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
                                    for path in sorted((root / 'asr_worker').glob('*.py'))}
         for scenario in scenarios:
+            if matrix_samples:
+                case = run_matrix_case(root, scenario, profile, manifest, item, result['exe_sha256'],
+                                       matrix_samples, mock_on_real_profile=args.mock_on_real_profile)
+                result['cases'].append(case)
+                if case.get('requires_session_reset'):
+                    raise AcceptanceTimeout(case['reason'])
+                continue
             repeats = REAL_EXTERNAL_REPEATS if scenario in REAL_EXTERNAL else args.real_repeats
             result['cases'].append(run_case(root, scenario, profile, manifest, item, result['exe_sha256'],
-                                            repeats=repeats, mock_on_real_profile=args.mock_on_real_profile))
+                                            repeats=repeats, mock_on_real_profile=args.mock_on_real_profile,
+                                            native_model=native_model))
     except (EvidenceError, OSError, sqlite3.Error, ValueError, subprocess.SubprocessError) as exc:
         result['reason'] = str(exc)
         if isinstance(exc, (AcceptanceTimeout, subprocess.TimeoutExpired)):
@@ -568,6 +838,17 @@ def main():
             result['cases'].append({'scenario': scenario, 'status': 'BLOCKED', 'reason': 'suite_interrupted'})
     statuses = {case['status'] for case in result['cases']}
     result['status'] = 'FAIL' if 'FAIL' in statuses else 'BLOCKED' if 'BLOCKED' in statuses else 'PASS'
+    if matrix_samples:
+        summary = matrix_summary(result['cases'], matrix_samples)
+        result['normal_matrix'] = summary
+        if (summary['reported'] != summary['planned'] or summary['blocked'] == summary['planned']
+                or result.get('requires_session_reset')):
+            result['status'] = 'BLOCKED'
+            result.setdefault('reason', 'normal_matrix_coverage_unavailable')
+        elif 200 * summary['confirmed'] >= 199 * summary['planned']:
+            result['status'] = 'PASS'
+        else:
+            result.update(status='FAIL', reason='normal_matrix_below_target')
     with output.open('x', encoding='utf-8') as report:
         json.dump(result, report, ensure_ascii=False, indent=2)
     return {'PASS': 0, 'FAIL': 1}.get(result['status'], 2)

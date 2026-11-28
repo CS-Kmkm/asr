@@ -18,6 +18,7 @@ import queue
 import re
 import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import threading
@@ -37,6 +38,13 @@ SEED = 'ASR acceptance sentinel'
 MOCK_INSERTION = 'mock-insertion'
 MOCK_NOTEPAD = 'mock-notepad'
 REAL_NOTEPAD = 'real-notepad'
+NATIVE_NOTEPAD = 'native-notepad'
+NATIVE_PROFILE = 'org.localvoice.input.eval-native'
+NATIVE_MODEL = 'qwen3-asr-0.6b'
+NATIVE_MODELS = {
+    NATIVE_MODEL: (NATIVE_PROFILE, 'Qwen3-ASR-0.6B-Q8_0.gguf'),
+    'haas-ja-v1.0': ('org.localvoice.input.eval-haas', 'Haas-616M-ja-v1.0-Q8_0.gguf'),
+}
 REAL_EXTERNAL = {'real-vscode': 'code', 'real-chrome': 'chrome'}
 REAL_EXTERNAL_REPEATS = 2
 REAL_RECEIVERS = {REAL_NOTEPAD: 'notepad', **REAL_EXTERNAL}
@@ -49,8 +57,15 @@ MOCK_EXTERNAL = {'mock-notepad': 'notepad', 'mock-edge': 'edge', 'mock-vscode': 
                  'mock-terminal': 'terminal'}
 VM_CLASSIC_TERMINALS = {'mock-mintty': 'mintty', 'mock-putty': 'putty'}
 MOCK_RECEIVERS = (MOCK_INSERTION, *MOCK_EXTERNAL)
+NORMAL_MATRIX_TARGETS = (MOCK_INSERTION, MOCK_NOTEPAD, 'mock-chrome', 'mock-vscode', 'mock-terminal')
+NORMAL_MATRIX_CONDITIONS = ('short', 'mixed', 'multiline', 'long')
+NORMAL_MATRIX_PREFIX = '既存文。'
 VM_FULL_SCENARIOS = (*VM_SMOKE_SCENARIOS, *VM_EXTRA_GUARDS, *MOCK_EXTERNAL, WORKER_RECOVERY)
-VM_MOCK_CASES = (*MOCK_GUARDS, *VM_EXTRA_GUARDS, *MOCK_EXTERNAL, *VM_CLASSIC_TERMINALS)
+CLIPBOARD_GUARDS = ('clipboard-rich', 'clipboard-newer-during-asr')
+VM_INFLIGHT_GUARDS = ('ime-composition', 'cancel-processing', *CLIPBOARD_GUARDS)
+HELD_WORKER_GUARDS = ('cancel-processing', 'clipboard-newer-during-asr')
+VM_MOCK_CASES = (*MOCK_GUARDS, *VM_EXTRA_GUARDS, *MOCK_EXTERNAL, *VM_CLASSIC_TERMINALS,
+                 *VM_INFLIGHT_GUARDS)
 WORKER_RECOVERY_TRIALS = (WORKER_CRASH, MOCK_INSERTION)
 DELIVERY_OUTCOMES = ('pasted', 'paste_unverified')
 MOCK_PREFIX = '前の文。'
@@ -71,7 +86,7 @@ class ScenarioEvidenceError(EvidenceError):
 
 
 def profile_settings(path, device, recording_mode='toggle', *, mock_insertion=False, real_notepad=False,
-                     mock_on_real_profile=False):
+                     mock_on_real_profile=False, native_model=None):
     if recording_mode not in ('toggle', 'hold'):
         raise EvidenceError('unknown recording mode')
     with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=1)) as db:
@@ -85,12 +100,18 @@ def profile_settings(path, device, recording_mode='toggle', *, mock_insertion=Fa
     backends = ('mock',) if mock_insertion and not mock_on_real_profile else (
         'speech-cpp', 'faster-whisper', 'sherpa-onnx', 'transformers-asr')
     if (settings.get('asrBackend') not in backends
-            or ((mock_insertion or real_notepad) and settings.get('offlineOnly') is not True)
+            or ((mock_insertion or real_notepad or native_model) and settings.get('offlineOnly') is not True)
             or ((real_notepad or mock_on_real_profile) and (settings.get('asrBackend') != 'faster-whisper'
                                   or settings.get('asrDevice') != 'cpu'
                                   or any(settings.get(key) is not False for key in (
                                       'livePreviewEnabled', 'incrementalFinalAsr', 'statefulStreaming', 'smartDictateEdit'))))
             or (mock_on_real_profile and settings.get('asrEvaluationProfile') != 'vm-real-notepad/1')
+            or (native_model and (
+                settings.get('asrEvaluationProfile') != 'vm-native-notepad/1'
+                or settings.get('asrBackend') != 'speech-cpp' or settings.get('modelId') != native_model
+                or settings.get('modelQuantization') != '8bit' or settings.get('asrDevice') != 'cpu'
+                or any(settings.get(key) is not False for key in (
+                    'livePreviewEnabled', 'incrementalFinalAsr', 'statefulStreaming', 'smartDictateEdit'))))
             or any(settings.get(key) is not False for key in (
                 'textCorrectionEnabled', 'automaticVoiceMode', 'liveTargetInsertion'))
             or settings.get('holdToTalk', {}).get('dictate') is not (recording_mode == 'hold')
@@ -274,6 +295,11 @@ class ExternalTarget:
     def select_all(self):
         self.bridge.call('select_all', self.name)
 
+    def require_matrix_caret(self):
+        result = self.bridge.call('matrix_caret', self.name, prefix=NORMAL_MATRIX_PREFIX)
+        if not result['at_end']:
+            raise UnsupportedTarget('external caret could not be verified after the matrix sentinel')
+
     def minimize(self):
         self.bridge.call('minimize', self.name)
 
@@ -310,8 +336,8 @@ class NativeTarget:
     def change_count(self):
         return len(self.window.snapshot()[1])
 
-    def changed_since(self, start, expected):
-        return any(change.text != expected for change in self.window.snapshot()[1][start:])
+    def changed_since(self, start, *permitted):
+        return any(change.text not in permitted for change in self.window.snapshot()[1][start:])
 
     def select_all(self):
         result = ctypes.c_size_t()
@@ -475,9 +501,83 @@ def prepare(api, target, previous, text):
     raise UnsupportedTarget('scratch control did not accept deterministic setup')
 
 
-def judge(scenario, primary, secondary, take, reference, max_cer, *, mock_text=MOCK_TEXT):
-    if scenario in MOCK_RECEIVERS or scenario in VM_CLASSIC_TERMINALS:
-        expected = MOCK_PREFIX + mock_text + MOCK_SUFFIX if scenario == MOCK_INSERTION else mock_text
+def matrix_text(condition, nonce):
+    if not re.fullmatch(r'[0-9a-f]{16}', nonce):
+        raise EvidenceError('invalid matrix trial nonce')
+    endings = {
+        'short': '確認しました。',
+        'mixed': '会議 ABC-123 🗾 確認済み。',
+        'multiline': '一行目を確認。\n二行目も確認。\n三行目です。',
+        'long': '長文の挿入試験。' * 128,
+    }
+    if condition not in endings:
+        raise EvidenceError('invalid matrix text condition')
+    text = endings[condition]
+    return (text[:1024 - len(nonce)] if condition == 'long' else text) + nonce
+
+
+def receiver_text(text):
+    return text.replace('\r\n', '\n').replace('\r', '\n')
+
+
+class ClipboardFixture(Clipboard):
+    """Known-format sentinels for the dedicated guest, with independent readback."""
+
+    # BITMAPINFOHEADER and one padded, 24-bit BGR pixel (CF_DIB).
+    dib = struct.pack('<IiiHHIIiiII', 40, 1, 1, 1, 24, 0, 4, 0, 0, 0, 0) + b'\x26\x67\xab\x00'
+
+    def __init__(self, api, hwnd, scenario):
+        super().__init__(api, hwnd)
+        self.scenario = scenario
+        self.original = f'ASR fixture original {uuid.uuid4().hex}'
+        self.newer = f'ASR fixture newer {uuid.uuid4().hex}'
+
+    def seed(self):
+        if self.scenario != 'clipboard-rich':
+            self.write(self.original, exclude_from_history=True)
+            return
+        with self.opened():
+            if not self.api.user.EmptyClipboard():
+                raise BenchError('could not clear the evaluation clipboard')
+            self._set_data(self.exclude_format, b'\0' * 4)
+            self._set_data(13, (self.original + '\0').encode('utf-16-le'))
+            self._set_data(8, self.dib)
+        if not self.preserved():
+            raise EvidenceError('could not seed the rich clipboard fixture')
+
+    def copy_newer(self):
+        self.write(self.newer, exclude_from_history=True)
+        if self.read() != self.newer:
+            raise EvidenceError('newer clipboard fixture was not published')
+
+    def preserved(self):
+        if self.scenario != 'clipboard-rich':
+            return self.read() == self.newer
+        with self.opened():
+            if self._read_opened() != self.original or not self.api.user.IsClipboardFormatAvailable(8):
+                return False
+            handle = self.api.user.GetClipboardData(8)
+            size = self.api.bind(self.api.kernel, 'GlobalSize', ctypes.c_size_t, wt.HANDLE)
+            if not handle or size(handle) < len(self.dib):
+                return False
+            pointer = self.api.kernel.GlobalLock(handle)
+            if not pointer:
+                return False
+            try:
+                return ctypes.string_at(pointer, len(self.dib)) == self.dib
+            finally:
+                self.api.kernel.GlobalUnlock(handle)
+
+
+def judge(scenario, primary, secondary, take, reference, max_cer, *, mock_text=MOCK_TEXT,
+          normal_matrix=False):
+    if scenario in (*MOCK_RECEIVERS, *VM_CLASSIC_TERMINALS, *CLIPBOARD_GUARDS):
+        if normal_matrix:
+            primary = receiver_text(primary)
+            expected = NORMAL_MATRIX_PREFIX + mock_text
+        else:
+            expected = (MOCK_PREFIX + mock_text + MOCK_SUFFIX
+                        if scenario in (MOCK_INSERTION, *CLIPBOARD_GUARDS) else mock_text)
         exact = primary == expected and not secondary
         result = {'status': 'PASS' if exact else 'FAIL', 'exact_receiver_match': exact}
         if exact and take['outcome'] not in DELIVERY_OUTCOMES:
@@ -547,11 +647,14 @@ def observed_playback(player, path, reader, target, check=lambda: None, *, abort
 
 def run_scenario(scenario, *, api, primary, secondary, reader, player, item, hotkey,
                  max_cer=.5, timeout=60, guard_seconds=2, clock=time, ime=None,
-                 recording_mode='toggle', unattended=False, real_proof=None, mock_text=MOCK_TEXT):
+                 recording_mode='toggle', unattended=False, real_proof=None, mock_text=MOCK_TEXT,
+                 normal_matrix=False, inflight_proof=None, clipboard_fixture=None):
     arguments = dict(api=api, primary=primary, secondary=secondary, reader=reader,
                      player=player, item=item, hotkey=hotkey, max_cer=max_cer,
                      timeout=timeout, guard_seconds=guard_seconds, clock=clock, ime=ime,
-                     unattended=unattended, real_proof=real_proof, mock_text=mock_text)
+                     unattended=unattended, real_proof=real_proof, mock_text=mock_text,
+                     normal_matrix=normal_matrix, inflight_proof=inflight_proof,
+                     clipboard_fixture=clipboard_fixture)
     if recording_mode == 'toggle':
         return _run_scenario(scenario, **arguments)
     if recording_mode != 'hold' or scenario not in HOLD_SCENARIOS or ime:
@@ -605,26 +708,33 @@ def run_scenario(scenario, *, api, primary, secondary, reader, player, item, hot
 def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, hotkey,
                   max_cer=.5, timeout=60, guard_seconds=2, clock=time, ime=None,
                   start=None, stop=None, recording_timeout=None, hold_check=lambda: None,
-                  still_held=lambda: None, unattended=False, real_proof=None, mock_text=MOCK_TEXT):
+                  still_held=lambda: None, unattended=False, real_proof=None, mock_text=MOCK_TEXT,
+                  normal_matrix=False, inflight_proof=None, clipboard_fixture=None):
     reader.ready()
     if reader.phase != 'idle':
         raise EvidenceError('app not idle; never retry its toggle blindly')
     baseline = reader.sequence
     primary.focus()
     original = primary.read()
-    mock_insertion = scenario == MOCK_INSERTION
-    empty_receiver = scenario in ('dictate', *REAL_RECEIVERS, *MOCK_EXTERNAL, *VM_CLASSIC_TERMINALS)
+    mock_insertion = scenario in (MOCK_INSERTION, *CLIPBOARD_GUARDS)
+    native_notepad = scenario == NATIVE_NOTEPAD
+    empty_receiver = scenario in ('dictate', NATIVE_NOTEPAD, *REAL_RECEIVERS, *MOCK_EXTERNAL, *VM_CLASSIC_TERMINALS)
     confirms_insertion = empty_receiver or mock_insertion
-    expected_initial = MOCK_PREFIX + MOCK_SUFFIX if mock_insertion else ('' if empty_receiver else SEED)
+    expected_initial = (NORMAL_MATRIX_PREFIX if normal_matrix else
+                        MOCK_PREFIX + MOCK_SUFFIX if mock_insertion else ('' if empty_receiver else SEED))
     if original != expected_initial or secondary.read():
         raise EvidenceError('unexpected scratch state before recording')
+    caret_offset = len(NORMAL_MATRIX_PREFIX if normal_matrix else MOCK_PREFIX)
     if mock_insertion:
-        primary.select_caret(len(MOCK_PREFIX))
+        primary.select_caret(caret_offset)
+    elif normal_matrix and scenario != 'mock-terminal':
+        primary.require_matrix_caret()
     guard_counts = (primary.change_count(), secondary.change_count()) if (
-        unattended and scenario in (*MOCK_GUARDS, *VM_EXTRA_GUARDS, WORKER_CRASH)) else None
+        unattended and scenario in (*MOCK_GUARDS, *VM_EXTRA_GUARDS, *CLIPBOARD_GUARDS,
+                                    'cancel-processing', WORKER_CRASH)) else None
 
-    def guarded_receivers_changed():
-        return guard_counts is not None and (primary.changed_since(guard_counts[0], original)
+    def guarded_receivers_changed(*permitted):
+        return guard_counts is not None and (primary.changed_since(guard_counts[0], original, *permitted)
                                              or secondary.changed_since(guard_counts[1], ''))
 
     if ime:
@@ -659,17 +769,27 @@ def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, ho
     require_recording()
     require_focus(primary)
     if mock_insertion:
-        primary.require_caret(len(MOCK_PREFIX))
+        primary.require_caret(caret_offset)
+    elif normal_matrix and scenario != 'mock-terminal':
+        primary.require_matrix_caret()
     hold_check()
     receiver_violation = False
     secondary_violation = False
     proof = None
     first_confirmed_at = None
+    seen_native_text = {}
+    permitted_changes = (MOCK_PREFIX + mock_text + MOCK_SUFFIX,) if scenario in CLIPBOARD_GUARDS else ()
 
     def monitor_receiver():
         nonlocal receiver_violation, secondary_violation, proof, first_confirmed_at
         secondary_violation |= bool(secondary.read())
-        if real_proof is not None:
+        if native_notepad:
+            text = primary.read()
+            if len(text) > 4096 or len(seen_native_text) >= 64 and text not in seen_native_text:
+                receiver_violation = True
+            elif text:
+                seen_native_text.setdefault(text, clock.perf_counter())
+        elif real_proof is not None:
             text = primary.read()
             observed_at = clock.perf_counter()
             if proof is None:
@@ -680,12 +800,19 @@ def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, ho
                         first_confirmed_at = observed_at
                 else:
                     receiver_violation = True
-        elif scenario in MOCK_RECEIVERS or scenario in VM_CLASSIC_TERMINALS:
-            expected = MOCK_PREFIX + mock_text + MOCK_SUFFIX if mock_insertion else mock_text
-            receiver_violation |= primary.read() not in (original, expected)
+        elif scenario in (*MOCK_RECEIVERS, *VM_CLASSIC_TERMINALS, *CLIPBOARD_GUARDS):
+            if normal_matrix:
+                # Some terminals expose a paste in chunks on their readback pipe.
+                # Any transient prefix is permitted; the final read must match exactly.
+                observed = receiver_text(primary.read())
+                receiver_violation |= not (observed.startswith(original)
+                                           and (original + mock_text).startswith(observed))
+            else:
+                expected = MOCK_PREFIX + mock_text + MOCK_SUFFIX if mock_insertion else mock_text
+                receiver_violation |= primary.read() not in (original, expected)
         if secondary_violation or (not confirms_insertion and not ime and primary.read() != original):
             receiver_violation = True
-        receiver_violation |= guarded_receivers_changed()
+        receiver_violation |= guarded_receivers_changed(*permitted_changes)
     if ime:
         ime.compose()
     if scenario == 'selection-change':
@@ -704,6 +831,7 @@ def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, ho
     if scenario == 'minimize':
         primary.minimize()
     processing_cancel_attempted = False
+    worker_hold_observed = False
     if scenario == 'cancel':
         if stop is None:
             tap(api, target, (0x1B,))
@@ -725,13 +853,29 @@ def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, ho
             still_held()
             require_recording()
             stop(target)
-        if scenario == 'cancel-processing':
-            reader.wait(lambda r: (r.phase == 'processing' and r.operation_id == operation)
+        if scenario in HELD_WORKER_GUARDS:
+            def check_held_target():
+                require_focus(primary)
+                if inflight_proof is not None:
+                    before_stop_check()
+                    if unattended:
+                        primary.require_caret(caret_offset if mock_insertion else len(SEED))
+
+            reader.wait(lambda r: (r.phase == 'processing' and r.operation_id == operation
+                                   and (inflight_proof is None or inflight_proof.is_file()))
                         or r.completed(operation), timeout,
-                        check=lambda: require_focus(primary))
+                        check=check_held_target)
             if reader.phase == 'processing' and reader.operation_id == operation:
-                tap(api, primary, (0x1B,))
-                processing_cancel_attempted = True
+                check_held_target()
+                worker_hold_observed = inflight_proof is not None and inflight_proof.is_file()
+                if scenario == 'cancel-processing':
+                    tap(api, primary, (0x1B,))
+                    processing_cancel_attempted = True
+                else:
+                    clipboard_fixture.copy_newer()
+                    check_held_target()
+                    # The private hold marker was created by the staged worker.
+                    inflight_proof.with_name('hold-transcribe').unlink()
     def check_delivery():
         try:
             monitor_receiver()
@@ -761,8 +905,18 @@ def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, ho
     except UnsupportedTarget as exc:
         raise ScenarioEvidenceError('target_changed_after_stop',
                                     'receiver or focus could not be verified after the stop action') from exc
-    if real_proof is None:
-        result = judge(scenario, first, second, take, item['reference'], max_cer, mock_text=mock_text)
+    if native_notepad:
+        first_seen = seen_native_text.get(first)
+        cer = cer_stats(item['reference'], first)['cer']
+        delivered = bool(first.strip()) and take['outcome'] == 'pasted' and not second
+        receiver_violation |= any(not first.startswith(text) for text in seen_native_text)
+        result = {'status': 'PASS' if delivered and first_seen is not None and cer <= max_cer else 'FAIL',
+                  'reference_normalized_cer': cer,
+                  'stop_to_observed_insertion_ms': ((first_seen - stop_at) * 1000
+                                                    if delivered and first_seen is not None else None)}
+    elif real_proof is None:
+        result = judge(scenario, first, second, take, item['reference'], max_cer,
+                       mock_text=mock_text, normal_matrix=normal_matrix)
     else:
         proof = proof or read_real_proof(real_proof)
         exact = bool(proof and first and delivery_digest(first) == proof['delivery_sha256'] and not second)
@@ -775,11 +929,19 @@ def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, ho
             result.update(status='BLOCKED', reason='missing_insertion_observation_time')
         if proof is None and not receiver_violation and not first and not second:
             result.update(status='BLOCKED', reason='real_worker_evidence_missing')
-    if receiver_violation or guarded_receivers_changed():
+    if receiver_violation or guarded_receivers_changed(*permitted_changes):
         receiver_violation = True
         result['status'] = 'FAIL'
         if unattended:
             result['reason'] = 'unexpected_receiver_mutation'
+    if clipboard_fixture is not None:
+        result['clipboard_preserved'] = clipboard_fixture.preserved()
+        if not result['clipboard_preserved']:
+            result.update(status='FAIL', reason='clipboard_fixture_not_preserved')
+        if scenario == 'clipboard-newer-during-asr':
+            result['worker_hold_observed'] = worker_hold_observed
+            if not worker_hold_observed and result['status'] == 'PASS':
+                result.update(status='BLOCKED', reason='clipboard_worker_hold_not_observed')
     if not confirms_insertion:
         result['receiver_unchanged'] = first == original and not second and not receiver_violation
     if scenario == 'cancel' and stop is not None:
@@ -797,6 +959,7 @@ def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, ho
             result.update(status='FAIL', reason='processing_observed_after_recording_cancel')
     if scenario == 'cancel-processing':
         result['processing_cancel_attempted'] = processing_cancel_attempted
+        result['worker_hold_observed'] = worker_hold_observed
         if secondary_violation or second:
             result.update(status='FAIL', reason='secondary_receiver_changed')
         elif not processing_cancel_attempted and (not receiver_violation or (
@@ -820,6 +983,28 @@ def require_focus(target):
         raise UnsupportedTarget('focus left the enrolled control')
 
 
+def require_inactive_ime(api, target):
+    require_focus(target)
+    get_thread = api.user.GetWindowThreadProcessId
+    get_layout = api.bind(api.user, 'GetKeyboardLayout', wt.HANDLE, wt.DWORD)
+    imm = ctypes.WinDLL('imm32', use_last_error=True)
+    is_ime = api.bind(imm, 'ImmIsIME', wt.BOOL, wt.HANDLE)
+    thread = get_thread(target.root, None)
+    layout = get_layout(thread) if thread else None
+    if not layout:
+        raise UnsupportedTarget('normal matrix could not identify the keyboard layout')
+    if not is_ime(layout):
+        return
+    ime_window = api.bind(imm, 'ImmGetDefaultIMEWnd', wt.HWND, wt.HWND)(target.root)
+    is_open = ctypes.c_size_t()
+    if not ime_window or not api.user.SendMessageTimeoutW(ime_window, 0x0283, 5, 0, 0x23,
+                                                          250, ctypes.byref(is_open)):
+        raise UnsupportedTarget('normal matrix could not read the IME open status')
+    if is_open.value:
+        raise UnsupportedTarget('normal matrix requires an inactive IME')
+    require_focus(target)
+
+
 def require_evaluation_guest():
     import winreg
 
@@ -840,18 +1025,44 @@ def main(argv=None):
     parser.add_argument('--playback-device', default='CABLE Input')
     parser.add_argument('--microphone-id', default='name:CABLE Output (VB-Audio Virtual Cable)')
     parser.add_argument('--scenario', action='append',
-                        choices=SCENARIOS + OPTIONAL_SCENARIOS + tuple(MOCK_EXTERNAL) + tuple(VM_CLASSIC_TERMINALS))
+                        choices=SCENARIOS + OPTIONAL_SCENARIOS + tuple(MOCK_EXTERNAL) + tuple(VM_CLASSIC_TERMINALS)
+                        + CLIPBOARD_GUARDS)
     parser.add_argument('--recording-mode', choices=('toggle', 'hold'), default='toggle')
     parser.add_argument('--max-cer', type=float, default=.5)
     parser.add_argument('--mock-insertion', action='store_true', help='run one unattended native mock case in ASR-Eval')
     parser.add_argument('--mock-text', help=argparse.SUPPRESS)
+    parser.add_argument('--matrix-condition', choices=NORMAL_MATRIX_CONDITIONS, help=argparse.SUPPRESS)
+    parser.add_argument('--matrix-nonce', help=argparse.SUPPRESS)
+    parser.add_argument('--inflight-proof', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--worker-recovery', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--mock-on-real-profile', action='store_true', help=argparse.SUPPRESS)
     real_mode = parser.add_mutually_exclusive_group()
     real_mode.add_argument('--real-notepad', dest='real_case', action='store_const', const=REAL_NOTEPAD)
     real_mode.add_argument('--real-case', choices=tuple(REAL_RECEIVERS))
+    real_mode.add_argument('--native-notepad', action='store_true')
+    parser.add_argument('--native-model', choices=NATIVE_MODELS, help=argparse.SUPPRESS)
     parser.add_argument('--worker-proof', type=Path)
     args = parser.parse_args(argv)
+    if args.native_model and not args.native_notepad:
+        parser.error('--native-model requires --native-notepad')
+    if args.native_notepad:
+        args.native_model = args.native_model or NATIVE_MODEL
+    expects_hold = (args.mock_insertion and args.scenario is not None and len(args.scenario) == 1
+                    and args.scenario[0] in HELD_WORKER_GUARDS)
+    if bool(args.inflight_proof) != expects_hold:
+        parser.error('VM held-worker checks require a staged proof of active transcription')
+    if expects_hold:
+        case_dir = Path(__file__).resolve().parents[1] / 'cases' / args.scenario[0]
+        if (args.output_dir.resolve() != case_dir / 'acceptance'
+                or args.inflight_proof.resolve() != case_dir / 'worker-hold-ready'):
+            parser.error('held-worker evidence must belong to its staged case')
+    matrix = args.matrix_condition is not None or args.matrix_nonce is not None
+    if matrix and (not args.mock_insertion or args.mock_text is not None or args.worker_recovery
+                   or args.matrix_condition is None or args.matrix_nonce is None
+                   or not re.fullmatch(r'[0-9a-f]{16}', args.matrix_nonce)
+                   or (args.scenario or [MOCK_INSERTION])[0] not in NORMAL_MATRIX_TARGETS):
+        parser.error('matrix payload requires a normal mock receiver, condition and nonce')
+    mock_text = matrix_text(args.matrix_condition, args.matrix_nonce) if matrix else args.mock_text or MOCK_TEXT
     if args.mock_text is not None and (not args.mock_insertion or not re.fullmatch(
             re.escape(MOCK_TEXT) + r'[0-9a-f]{16}', args.mock_text)):
         parser.error('--mock-text requires a nonce-tagged VM mock payload')
@@ -859,28 +1070,36 @@ def main(argv=None):
         parser.error('--mock-on-real-profile requires --mock-insertion')
     if args.worker_recovery and (not args.mock_insertion or args.scenario):
         parser.error('--worker-recovery requires --mock-insertion and selects its own scenarios')
-    unattended = args.mock_insertion or bool(args.real_case)
+    unattended = args.mock_insertion or bool(args.real_case) or args.native_notepad
     if args.real_case and (args.mock_insertion or args.scenario or args.target != 'native'
                               or args.recording_mode != 'toggle' or args.worker_proof is None):
         parser.error('a real case requires toggle mode, an owned target and --worker-proof')
     if not args.real_case and args.worker_proof is not None:
         parser.error('--worker-proof requires a real case')
+    if args.native_notepad:
+        profile_name, _ = NATIVE_MODELS[args.native_model]
+        expected_profile = Path(os.environ.get('APPDATA', '')) / profile_name / 'local-voice-input.sqlite3'
+        if (args.mock_insertion or args.scenario or args.target != 'native' or args.recording_mode != 'toggle'
+                or args.profile_db.resolve() != expected_profile.resolve()):
+            parser.error('native Notepad requires its dedicated evaluation profile and toggle mode')
     if not 0 <= args.max_cer <= 1:
         parser.error('--max-cer must be between 0 and 1')
     if args.mock_insertion and (args.target != 'native' or args.recording_mode != 'toggle'
                                 or (args.scenario and (len(args.scenario) != 1
                                                        or args.scenario[0] not in VM_MOCK_CASES))):
         parser.error('--mock-insertion requires toggle mode and one supported VM case')
-    if not args.mock_insertion and any(case in MOCK_EXTERNAL or case in VM_CLASSIC_TERMINALS
+    if not args.mock_insertion and any(case in (*MOCK_EXTERNAL, *VM_CLASSIC_TERMINALS, *CLIPBOARD_GUARDS)
                                        for case in (args.scenario or ())):
         parser.error('each VM mock case requires --mock-insertion in ASR-Eval')
     scenarios = (args.scenario or (MOCK_INSERTION,)) if args.mock_insertion else (
         args.scenario or (('dictate',) if args.recording_mode == 'hold' else SCENARIOS))
     if args.real_case:
         scenarios = (args.real_case,)
+    elif args.native_notepad:
+        scenarios = (NATIVE_NOTEPAD,)
     if args.worker_recovery:
         scenarios = WORKER_RECOVERY_TRIALS
-    owned_target = (REAL_RECEIVERS.get(args.real_case) or MOCK_EXTERNAL.get(scenarios[0])
+    owned_target = ('notepad' if args.native_notepad else REAL_RECEIVERS.get(args.real_case) or MOCK_EXTERNAL.get(scenarios[0])
                     or VM_CLASSIC_TERMINALS.get(scenarios[0]))
     if args.recording_mode == 'hold' and any(scenario not in HOLD_SCENARIOS for scenario in scenarios):
         parser.error('--recording-mode hold supports dictate, focus-away, selection-change and cancel')
@@ -895,7 +1114,7 @@ def main(argv=None):
     def read_profile():
         return profile_settings(args.profile_db, args.microphone_id, args.recording_mode,
                                 mock_insertion=args.mock_insertion, real_notepad=bool(args.real_case),
-                                mock_on_real_profile=args.mock_on_real_profile)
+                                mock_on_real_profile=args.mock_on_real_profile, native_model=args.native_model)
 
     profile = read_profile()
     hotkey = parse_hotkey(profile['hotkey'])
@@ -934,7 +1153,8 @@ def main(argv=None):
                     target = bridge.call('open_notepad', 'primary', path=str(fixture.resolve()))
                     stack.callback(bridge.call, 'close_notepad', 'primary')
                 else:
-                    target = bridge.call('open_fixture', 'primary', kind=owned_target)
+                    target = bridge.call('open_fixture', 'primary', kind=owned_target,
+                                         bracketed=matrix and owned_target == 'terminal')
                     stack.callback(bridge.call, 'close_fixture', 'primary')
                 primary = ExternalTarget(bridge, 'primary', target['window'])
                 report['applications'] = [{'process': target['process'], 'version': target['version']},
@@ -972,12 +1192,23 @@ def main(argv=None):
                     raise EvidenceError('app not idle before scratch preparation')
                 Keyboard(api.send, primary, hotkey, key_down=api.key_down,
                          idle_seconds=api.idle_seconds).before_trial()
+                if matrix:
+                    primary.focus()
+                    require_inactive_ime(api, primary)
                 if owned_target:
                     require_focus(primary)
                     if primary.read() or secondary.read():
                         raise EvidenceError('owned receiver and decoy must be empty before recording')
+                    if matrix:
+                        unicode_text(api, primary, NORMAL_MATRIX_PREFIX)
+                        if scenario != 'mock-terminal':
+                            tap(api, primary, (0x11, 0x23))  # Ctrl+End in the owned editor.
+                        deadline = time.perf_counter() + 3
+                        while primary.read() != NORMAL_MATRIX_PREFIX and time.perf_counter() < deadline:
+                            time.sleep(.05)
                 elif args.mock_insertion:
-                    initial = MOCK_PREFIX + MOCK_SUFFIX if scenario == MOCK_INSERTION else SEED
+                    initial = (NORMAL_MATRIX_PREFIX if matrix else
+                               MOCK_PREFIX + MOCK_SUFFIX if scenario in (MOCK_INSERTION, *CLIPBOARD_GUARDS) else SEED)
                     prepare(api, primary, previous[0], initial)
                 else:
                     prepare(api, secondary, previous[1], '')
@@ -987,6 +1218,10 @@ def main(argv=None):
                     ime = NativeIME(api, primary) if scenario == 'ime-composition' else None
                     if ime:
                         scenario_cleanup.callback(ime.close)
+                    clipboard_fixture = None
+                    if scenario in CLIPBOARD_GUARDS:
+                        clipboard_fixture = ClipboardFixture(api, int(secondary.root), scenario)
+                        clipboard_fixture.seed()
                     terminal_clipboard = None
                     if unattended and scenario in ('mock-terminal', *VM_CLASSIC_TERMINALS):
                         terminal_clipboard = Clipboard(api, int(secondary.root))
@@ -996,14 +1231,16 @@ def main(argv=None):
                         scenario, api=api, primary=primary, secondary=secondary, reader=reader,
                         player=player, item=item, hotkey=hotkey, max_cer=args.max_cer, ime=ime,
                         recording_mode=args.recording_mode, unattended=unattended,
-                        real_proof=args.worker_proof, mock_text=args.mock_text or MOCK_TEXT,
-                        timeout=90 if args.real_case else (
+                        real_proof=args.worker_proof, mock_text=mock_text, normal_matrix=matrix,
+                        inflight_proof=args.inflight_proof,
+                        clipboard_fixture=clipboard_fixture,
+                        timeout=90 if args.real_case or args.native_notepad else (
                             15 if args.mock_insertion else 60))
                     if terminal_clipboard and result['status'] == 'PASS':
                         contents = terminal_clipboard.read()
                         if contents == sentinel:
                             result['terminal_clipboard'] = 'restored'
-                        elif contents == (args.mock_text or MOCK_TEXT):
+                        elif contents == mock_text:
                             result['terminal_clipboard'] = 'transcript_retained'
                         else:
                             result.update(status='FAIL', reason='unexpected_terminal_clipboard_contents')

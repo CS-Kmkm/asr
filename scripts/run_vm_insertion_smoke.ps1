@@ -6,8 +6,14 @@ param(
     [switch]$IncludeNotepad,
     [switch]$ExpandedMatrix,
     [switch]$ClassicTerminals,
+    [ValidateSet('full', 'pilot')][string]$NormalMatrix,
+    [switch]$InflightGuards,
     [switch]$RealModelNotepad,
     [switch]$RealApps,
+    [switch]$NativeNotepad,
+    [ValidateSet('qwen3-asr-0.6b', 'haas-ja-v1.0')][string]$NativeModel = 'qwen3-asr-0.6b',
+    [string]$NativeCacheDirectory,
+    [string]$NativeCandidatePath,
     [switch]$MockOnRealProfile,
     [ValidateRange(1, 80)][int]$RealRepeats = 1,
     [ValidateSet('original', 'short')][string]$RealFixture = 'original',
@@ -16,15 +22,26 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$referenceRun = $RealModelNotepad -or $NativeNotepad
+if ($NativeNotepad -and ($RealModelNotepad -or $RealApps -or $IncludeNotepad -or $ExpandedMatrix -or
+        $NormalMatrix -or $ClassicTerminals -or $InflightGuards -or $MockOnRealProfile -or $RealFixture -ne 'short')) {
+    throw 'Native Notepad requires the short fixture and its own evaluation suite.'
+}
+if ([bool]$NativeCacheDirectory -ne $NativeNotepad.IsPresent -or [bool]$NativeCandidatePath -ne $NativeNotepad.IsPresent) {
+    throw 'Native Notepad requires the isolated build manifest and an explicit pinned cache directory.'
+}
+if ($PSBoundParameters.ContainsKey('NativeModel') -and -not $NativeNotepad) { throw 'NativeModel requires NativeNotepad.' }
 if ($RealApps -and -not $RealModelNotepad) { throw 'RealApps requires RealModelNotepad.' }
 if ($IncludeNotepad -and $RealModelNotepad) { throw 'Choose one Notepad mode.' }
 if ($ExpandedMatrix -and ($IncludeNotepad -or $RealModelNotepad)) { throw 'Choose one fixture suite.' }
 if ($ClassicTerminals -and ($ExpandedMatrix -or $IncludeNotepad -or $RealModelNotepad)) { throw 'Choose one fixture suite.' }
+if ($NormalMatrix -and ($ClassicTerminals -or $ExpandedMatrix -or $IncludeNotepad -or $RealModelNotepad)) { throw 'Choose one fixture suite.' }
+if ($InflightGuards -and ($NormalMatrix -or $ClassicTerminals -or $ExpandedMatrix -or $IncludeNotepad -or $RealModelNotepad)) { throw 'Choose one fixture suite.' }
 if ($MockOnRealProfile -and $RealModelNotepad) { throw 'MockOnRealProfile is a mock-only mode.' }
-if (($RealRepeats -ne 1 -or $RealFixture -ne 'original') -and -not $RealModelNotepad) {
-    throw 'RealRepeats and RealFixture require RealModelNotepad.'
+if (($RealRepeats -ne 1 -or $RealFixture -ne 'original') -and -not $referenceRun) {
+    throw 'RealRepeats and RealFixture require a real model suite.'
 }
-$expectedUser = if ($RealModelNotepad -or $MockOnRealProfile) { 'ASREvalReal' } else { 'ASREval' }
+$expectedUser = if ($referenceRun -or $MockOnRealProfile) { 'ASREvalReal' } else { 'ASREval' }
 $repo = Split-Path $PSScriptRoot -Parent
 if (-not $ManifestDirectory) { $ManifestDirectory = Join-Path $repo 'bench_data\manifests' }
 $output = (New-Item -ItemType Directory -Path $OutputDirectory).FullName
@@ -52,6 +69,22 @@ try {
     $credential = Import-Clixml -LiteralPath $ManagementCredentialPath
     $app = Get-Item -LiteralPath $AppBinary
     $digest = (Get-FileHash -LiteralPath $app.FullName).Hash
+    if ($NativeNotepad) {
+        $candidate = Get-Content -Raw -Encoding UTF8 -LiteralPath $NativeCandidatePath | ConvertFrom-Json
+        $variant = @{
+            'qwen3-asr-0.6b' = @{ config = 'tauri.native-evaluation.conf.json'; identifier = 'org.localvoice.input.eval-native'; file = 'Qwen3-ASR-0.6B-Q8_0.gguf' }
+            'haas-ja-v1.0' = @{ config = 'tauri.haas-evaluation.conf.json'; identifier = 'org.localvoice.input.eval-haas'; file = 'Haas-616M-ja-v1.0-Q8_0.gguf' }
+        }[$NativeModel]
+        $config = Join-Path $PSScriptRoot $variant.config
+        $identifier = (Get-Content -Raw -LiteralPath $config | ConvertFrom-Json).identifier
+        if ($identifier -ne $variant.identifier -or
+                $candidate.identifier -ne $identifier -or $candidate.revision -ne $AppRevision -or
+                $candidate.app_sha256 -ne $digest -or $candidate.config_sha256 -ne (Get-FileHash -LiteralPath $config).Hash -or
+                -not [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($app.FullName)).Contains($identifier, [StringComparison]::Ordinal)) {
+            throw 'Candidate does not match the isolated native evaluation build.'
+        }
+        $report.native_evaluation_identifier = $identifier
+    }
     $session = New-PSSession -VMName $vm.Name -Credential $credential
     if ($ClassicTerminals) {
         $report.classic_tools = @(Invoke-Command -Session $session -ScriptBlock {
@@ -92,7 +125,7 @@ try {
     foreach ($file in Get-ChildItem -LiteralPath (Join-Path $repo 'asr_worker') -File -Filter '*.py') {
         Copy-Item -LiteralPath $file.FullName -Destination "$guestRoot\asr_worker" -ToSession $session
     }
-    if ($RealModelNotepad) {
+    if ($referenceRun) {
         $report.requested_trials = $RealRepeats
         $manifestName = 'practical-ja-smoke-v1'
         $itemId = 'fleurs-ja_jp-test-1100824364670689611'
@@ -132,8 +165,41 @@ try {
         $report.input_reference_sha256 = $referenceHash
         $report.input_item_id = $itemId
         $report.fixture = $RealFixture
-        $report.model_revision = '0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf'
-        $report.model_files_sha256 = Invoke-Command -Session $session -ArgumentList $report.model_revision -ScriptBlock {
+        if ($NativeNotepad) {
+            $catalog = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $repo 'src\asr-model-catalog.json') | ConvertFrom-Json
+            $model = @($catalog.models | Where-Object id -EQ "speech-cpp:${NativeModel}")
+            if ($model.Count -ne 1 -or $model[0].modelId -ne $NativeModel -or $model[0].weightFormat -ne 'Q8_0' -or
+                    $model[0].source.revision -notmatch '^[a-f0-9]{40}$' -or
+                    $model[0].source.file -ne $variant.file -or
+                    $model[0].source.sha256 -notmatch '^[a-f0-9]{64}$') { throw 'Invalid native model catalog pin.' }
+            $source = $model[0].source
+            $report.model_revision = $source.revision
+            $report.native_model = $model[0].modelId
+            $report.native_device = 'cpu'
+            $expected = [ordered]@{
+                'runtime-0.10.1\speech.exe' = '46f264e26fcaa60f433455c6c6092137c123af67fad956d67f250daf5ebaa893'
+                'runtime-0.10.1\speech.dll' = '923fb0babff5596202ae92dc5b6423a23579ab461bc7cce8b35258107ee05662'
+            }
+            $expected[(Join-Path $source.revision $source.file)] = $source.sha256
+            $report.model_files_sha256 = @(foreach ($file in $expected.Keys) {
+                $localAsset = Join-Path $NativeCacheDirectory $file
+                if ((Get-FileHash -LiteralPath $localAsset).Hash -ne $expected[$file]) { throw "Native asset hash mismatch: $file" }
+                $guestAsset = Join-Path "$guestRoot\native-cache" $file
+                Invoke-Command -Session $session -ArgumentList $guestAsset -ScriptBlock {
+                    param($path)
+                    New-Item -ItemType Directory -Path (Split-Path $path -Parent) -Force | Out-Null
+                }
+                Copy-Item -LiteralPath $localAsset -Destination $guestAsset -ToSession $session
+                $actual = Invoke-Command -Session $session -ArgumentList $guestAsset -ScriptBlock {
+                    param($path)
+                    (Get-FileHash -LiteralPath $path).Hash
+                }
+                if ($actual -ne $expected[$file]) { throw "Staged native asset hash mismatch: $file" }
+                [pscustomobject]@{ file = $file; sha256 = $actual }
+            })
+        } else {
+            $report.model_revision = '0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf'
+            $report.model_files_sha256 = Invoke-Command -Session $session -ArgumentList $report.model_revision -ScriptBlock {
             param($revision)
             $modelDir = "C:\ASR-Evaluation\models\faster-whisper-$revision"
             $expected = [ordered]@{
@@ -149,14 +215,15 @@ try {
                 }
                 [pscustomobject]@{ file = $file; sha256 = $expected[$file] }
             }
-        } | Select-Object file,sha256
+            } | Select-Object file,sha256
+        }
     }
     Assert-NotCancelled
     $externalRepeats = 2
     $externalTakes = if ($RealApps) { 2 * $externalRepeats } else { 0 }
-    $limit = if ($RealModelNotepad) { 155 + 160 * ($RealRepeats + $externalTakes) } elseif ($ExpandedMatrix) { 1100 } elseif ($IncludeNotepad) { 380 } else { 290 }
-    $previousRun = Invoke-Command -Session $session -ArgumentList $guestRoot,$taskName,$digest,$AppRevision,$runId,($IncludeNotepad.IsPresent),($RealModelNotepad.IsPresent),$expectedUser,$RealRepeats,$limit,($MockOnRealProfile.IsPresent),($ExpandedMatrix.IsPresent),($RealApps.IsPresent),($ClassicTerminals.IsPresent) -ScriptBlock {
-        param($root, $task, $expectedDigest, $revision, $owner, $notepad, $real, $userName, $repeats, $limit, $sharedMock, $expanded, $realApps, $classicTerminals)
+    $limit = if ($NormalMatrix -eq 'full') { 68400 } elseif ($NormalMatrix -eq 'pilot') { 1800 } elseif ($referenceRun) { 155 + 160 * ($RealRepeats + $externalTakes) } elseif ($ExpandedMatrix) { 1100 } elseif ($InflightGuards) { 480 } elseif ($IncludeNotepad) { 380 } else { 290 }
+    $previousRun = Invoke-Command -Session $session -ArgumentList $guestRoot,$taskName,$digest,$AppRevision,$runId,($IncludeNotepad.IsPresent),($RealModelNotepad.IsPresent),$expectedUser,$RealRepeats,$limit,($MockOnRealProfile.IsPresent),($ExpandedMatrix.IsPresent),($RealApps.IsPresent),($ClassicTerminals.IsPresent),$NormalMatrix,($InflightGuards.IsPresent),($NativeNotepad.IsPresent),$NativeModel -ScriptBlock {
+        param($root, $task, $expectedDigest, $revision, $owner, $notepad, $real, $userName, $repeats, $limit, $sharedMock, $expanded, $realApps, $classicTerminals, $normalMatrix, $inflightGuards, $nativeNotepad, $nativeModel)
         $ErrorActionPreference = 'Stop'
         if ((Get-FileHash -LiteralPath (Join-Path $root 'local-voice-input.exe')).Hash -ne $expectedDigest) {
             throw 'The staged guest executable has an unexpected hash.'
@@ -173,9 +240,9 @@ $entry = Join-Path $PWD 'scripts\vm_insertion_smoke.py'
 & 'C:\ASR-Evaluation\runtime\uv.exe' run --offline --no-project --python 'C:\ASR-Evaluation\runtime\python\python.exe' $entry --revision __REVISION__ __EXTERNAL_CASE__ *> $resultPath
 exit $LASTEXITCODE
 '@
-        $externalCase = if ($realApps) { "--real-apps --real-repeats $repeats" } elseif ($real) { "--real-notepad --real-repeats $repeats" } elseif ($expanded) {
+        $externalCase = if ($nativeNotepad) { "--native-notepad --native-model $nativeModel --real-repeats $repeats" } elseif ($realApps) { "--real-apps --real-repeats $repeats" } elseif ($real) { "--real-notepad --real-repeats $repeats" } elseif ($expanded) {
             '--expanded-matrix'
-        } elseif ($classicTerminals) { '--classic-terminals' } elseif ($notepad) { '--include-notepad' } else { '' }
+        } elseif ($classicTerminals) { '--classic-terminals' } elseif ($normalMatrix -eq 'full') { '--normal-matrix' } elseif ($normalMatrix -eq 'pilot') { '--normal-matrix-pilot' } elseif ($inflightGuards) { '--inflight-guards' } elseif ($notepad) { '--include-notepad' } else { '' }
         if ($sharedMock) { $externalCase += ' --mock-on-real-profile' }
         $command = $command.Replace('__REVISION__', $revision).Replace('__EXTERNAL_CASE__', $externalCase)
         $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
@@ -189,9 +256,10 @@ exit $LASTEXITCODE
         $previousRun
     }
     $deadline = (Get-Date).AddSeconds($limit)
+    $pollMilliseconds = if ($NormalMatrix -eq 'full') { 5000 } else { 750 }
     do {
         Assert-NotCancelled
-        Start-Sleep -Milliseconds 750
+        Start-Sleep -Milliseconds $pollMilliseconds
         $completed = Invoke-Command -Session $session -ArgumentList $taskName,$runId,$previousRun -ScriptBlock {
             param($task, $owner, $previous)
             $registered = Get-ScheduledTask -TaskName $task
@@ -222,20 +290,37 @@ exit $LASTEXITCODE
     if ($IncludeNotepad) { $expectedCases += ',mock-notepad' }
     if ($ExpandedMatrix) { $expectedCases += ',selection-change,minimize,mock-notepad,mock-edge,mock-vscode,mock-chrome,mock-terminal,worker-crash-recovery' }
     if ($RealModelNotepad) { $expectedCases = 'real-notepad' }
+    if ($NativeNotepad) { $expectedCases = 'native-notepad' }
     if ($RealApps) { $expectedCases += ',real-vscode,real-chrome' }
     if ($ClassicTerminals) { $expectedCases = 'mock-mintty,mock-putty' }
+    if ($NormalMatrix) { $expectedCases = 'mock-insertion,mock-notepad,mock-chrome,mock-vscode,mock-terminal' }
+    if ($InflightGuards) { $expectedCases = 'ime-composition,cancel-processing,clipboard-rich,clipboard-newer-during-asr' }
     if ($caseNames -ne $expectedCases -or @($guestResult.cases | Where-Object status -NotIn @('PASS','FAIL','BLOCKED')).Count) {
         throw 'Guest case coverage could not be verified.'
     }
-    if ($RealModelNotepad) {
+    if ($referenceRun) {
         foreach ($realCase in $guestResult.cases | Where-Object status -EQ 'PASS') {
-            $count = if ($realCase.scenario -eq 'real-notepad') { $RealRepeats } else { $externalRepeats }
+            $count = if ($realCase.scenario -in @('real-notepad', 'native-notepad')) { $RealRepeats } else { $externalRepeats }
             if ($count -gt 1 -and (
                 $realCase.requested_trials -ne $count -or @($realCase.trials).Count -ne $count -or
                 ($realCase.trials.index -join ',') -ne ((1..$count) -join ',') -or
                 @($realCase.trials | Where-Object status -NE 'PASS').Count)) {
                 throw 'Guest real trial coverage could not be verified.'
             }
+        }
+    }
+    if ($NativeNotepad -and $guestResult.status -eq 'PASS') {
+        $nativeCase = $guestResult.cases[0]
+        $nativeTrials = if ($RealRepeats -gt 1) { $nativeCase.trials } else { @($nativeCase) }
+        $first = $nativeTrials[0]
+        if ($nativeCase.native_model -ne $NativeModel -or $nativeCase.native_worker_reaped -ne $true -or
+                -not $first.native_worker_pid -or -not $first.native_worker_started -or
+                -not $first.application_pid -or @($nativeTrials | Where-Object {
+                    $_.native_worker_pid -ne $first.native_worker_pid -or $_.native_worker_started -ne $first.native_worker_started -or
+                    $_.application_pid -ne $first.application_pid -or -not $_.acceptance.results[0].stop_to_observed_insertion_ms -or
+                    $_.acceptance.results[0].reference_normalized_cer -gt 0.5
+                }).Count) {
+            throw 'Guest native CPU trial identity or independent receiver evidence could not be verified.'
         }
     }
     if ($ExpandedMatrix) {
@@ -254,8 +339,68 @@ exit $LASTEXITCODE
             }
         }
     }
+    if ($InflightGuards) {
+        foreach ($case in $guestResult.cases | Where-Object status -EQ 'PASS') {
+            $row = $case.acceptance.results[0]
+            if ($case.capture_proof.passed -ne $true -or $case.transcription_requests -ne 1 -or
+                    ($case.scenario -in @('ime-composition','cancel-processing') -and $row.receiver_unchanged -ne $true) -or
+                    ($case.scenario -eq 'cancel-processing' -and ($row.processing_cancel_attempted -ne $true -or
+                        $row.worker_hold_observed -ne $true -or $row.app_outcome -ne 'cancelled')) -or
+                    ($case.scenario -eq 'ime-composition' -and -not $row.verification_scope) -or
+                    ($case.scenario -like 'clipboard-*' -and ($row.clipboard_preserved -ne $true -or $row.exact_receiver_match -ne $true)) -or
+                    ($case.scenario -eq 'clipboard-newer-during-asr' -and $row.worker_hold_observed -ne $true)) {
+                throw 'Guest in-flight guard evidence could not be verified.'
+            }
+        }
+    }
     $caseStatuses = @($guestResult.cases.status)
-    $expectedStatus = if ($caseStatuses -contains 'FAIL') { 'FAIL' } elseif ($caseStatuses -contains 'BLOCKED') { 'BLOCKED' } else { 'PASS' }
+    if ($NormalMatrix) {
+        $samples = if ($NormalMatrix -eq 'full') { 50 } else { 1 }
+        $conditions = 'short', 'mixed', 'multiline', 'long'
+        $planned = 20 * $samples
+        $reported = 0
+        $confirmed = 0
+        $blocked = 0
+        $nonces = [Collections.Generic.HashSet[string]]::new()
+        foreach ($case in $guestResult.cases) {
+            $nextIndex = 2
+            if ($case.warmup -and ($case.warmup.index -ne 1 -or $case.warmup.condition -ne 'short' -or
+                    $case.warmup.nonce -cnotmatch '^[a-f0-9]{16}$' -or -not $nonces.Add($case.warmup.nonce))) {
+                throw 'Guest matrix warm-up identity could not be verified.'
+            }
+            foreach ($trial in @($case.trials | Where-Object { $_ })) {
+                if ($trial.index -ne $nextIndex -or $trial.condition -ne $conditions[($nextIndex - 2) % 4] -or
+                        $trial.scenario -ne $case.scenario -or $trial.nonce -cnotmatch '^[a-f0-9]{16}$' -or
+                        -not $nonces.Add($trial.nonce) -or $trial.status -notin @('PASS', 'FAIL', 'BLOCKED')) {
+                    throw 'Guest matrix trial identity could not be verified.'
+                }
+                if ($trial.status -eq 'PASS') {
+                    $row = $trial.acceptance.results[0]
+                    if ($row.exact_receiver_match -ne $true -or $trial.capture_proof.matrix_nonce -ne $trial.nonce -or
+                            $trial.capture_proof.effective_backend -ne 'mock' -or $trial.capture_proof.passed -ne $true -or
+                            $trial.transcription_requests -ne 1) {
+                        throw 'Guest matrix receiver and capture evidence could not be verified.'
+                    }
+                    $confirmed++
+                }
+                if ($trial.status -eq 'BLOCKED') { $blocked++ }
+                $reported++
+                $nextIndex++
+            }
+            if ($nextIndex -gt (4 * $samples + 2) -or ($nextIndex -gt 2 -and -not $case.warmup)) {
+                throw 'Guest matrix target coverage could not be verified.'
+            }
+        }
+        $matrix = $guestResult.normal_matrix
+        if (-not $matrix -or $matrix.planned -ne $planned -or $matrix.reported -ne $reported -or
+                $matrix.confirmed -ne $confirmed -or $matrix.blocked -ne $blocked) {
+            throw 'Guest matrix totals could not be verified.'
+        }
+        $report.normal_matrix = $matrix
+        $expectedStatus = if ($reported -ne $planned -or $blocked -eq $planned -or $guestResult.requires_session_reset) { 'BLOCKED' } elseif (200 * $confirmed -ge 199 * $planned) { 'PASS' } else { 'FAIL' }
+    } else {
+        $expectedStatus = if ($caseStatuses -contains 'FAIL') { 'FAIL' } elseif ($caseStatuses -contains 'BLOCKED') { 'BLOCKED' } else { 'PASS' }
+    }
     if ($guestResult.status -ne $expectedStatus) { throw 'Guest suite and case statuses disagree.' }
     $report.status = $expectedStatus
     $report.cases = @($guestResult.cases | Select-Object scenario,status,reason)
@@ -282,10 +427,13 @@ exit $LASTEXITCODE
                     $fixtureProfiles = Join-Path $root 'target-profiles'
                     $terminalEntry = Join-Path $root 'scripts\windows_acceptance_terminal.py'
                     $puttyEntry = Join-Path $root 'scripts\windows_acceptance_putty.py'
+                    $nativeWorker = Join-Path $root 'native-cache\runtime-0.10.1\speech.exe'
                     $findRunProcesses = {
-                        Get-CimInstance Win32_Process -Filter "Name='local-voice-input.exe' OR Name='python.exe' OR Name='uv.exe'" |
+                        Get-CimInstance Win32_Process -Filter "Name='local-voice-input.exe' OR Name='python.exe' OR Name='uv.exe' OR Name='speech.exe'" |
                             Where-Object {
                                 $_.ExecutablePath -eq $appPath -or (
+                                    $_.ExecutablePath -eq $nativeWorker -and
+                                    (Invoke-CimMethod -InputObject $_ -MethodName GetOwnerSid -ErrorAction SilentlyContinue).Sid -eq $userSid) -or (
                                     $_.CommandLine -and (
                                         $_.CommandLine.IndexOf($entry, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
                                         $_.CommandLine.IndexOf($terminalEntry, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
@@ -371,7 +519,7 @@ exit $LASTEXITCODE
             }
         }
     }
-    try { $report | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $output 'host.json') -Encoding UTF8 }
+    try { $report | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $output 'host.json') -Encoding UTF8 }
     finally {
         if ($locked) { $controllerMutex.ReleaseMutex() }
         $controllerMutex.Dispose()
