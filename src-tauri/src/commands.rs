@@ -13,7 +13,7 @@ use crate::{
     asr::{self, Transcriber},
     audio::{
         self, AudioCapture, AudioDevice, AudioEnhancementConfig, CaptureConfig,
-        NoiseSuppressionLevel,
+        NoiseSuppressionLevel, MAX_RECORDING_DURATION,
     },
     command_error,
     correction::{self, FailureOutcome},
@@ -80,7 +80,11 @@ pub(crate) enum TranscriptionFailure {
 impl TranscriptionFailure {
     pub(crate) fn of(error: &asr::AsrError) -> Self {
         match error {
-            asr::AsrError::Worker(worker) if worker.code == "cpu_oom" => Self::CpuMemory,
+            asr::AsrError::Worker(worker)
+                if matches!(worker.code.as_str(), "cpu_oom" | "native_cpu_oom") =>
+            {
+                Self::CpuMemory
+            }
             asr::AsrError::Worker(worker) if worker.code == TRANSCRIPT_TRUNCATED_CODE => {
                 Self::TooLongForModel
             }
@@ -229,12 +233,13 @@ pub(crate) const INSERTION_FAILED: &str = "Insertion failed; the result is avail
 /// A replacement error happens before any paste, so the original selection is
 /// unchanged and the clipboard is the fallback. `None` means the edit reached
 /// neither the target nor the clipboard.
-fn edit_insertion_outcome<E, F>(
-    replaced: Result<InsertResult, E>,
+fn edit_insertion_outcome<F>(
+    replaced: Result<InsertResult, injection::InjectionError>,
     copy_to_clipboard: impl FnOnce() -> Result<(), F>,
 ) -> Option<InsertResult> {
     match replaced {
         Ok(result) => Some(result),
+        Err(injection::InjectionError::ClipboardChanged) => None,
         Err(_) => copy_to_clipboard()
             .ok()
             .map(|()| InsertResult::ClipboardOnly),
@@ -283,32 +288,44 @@ pub(crate) fn edit_persistence_warning(
     history_failed: bool,
     metric_failed: bool,
 ) -> Option<(&'static str, &'static str)> {
-    let replaced = insertion == InsertResult::ClipboardPaste;
-    let warning = match (history_failed, metric_failed, replaced) {
+    use InsertResult::{ClipboardOnly, ClipboardPaste, DirectInsert, PasteUnverified};
+    let warning = match (history_failed, metric_failed, insertion) {
         (false, false, _) => return None,
-        (true, true, true) => (
+        (true, true, ClipboardPaste | DirectInsert) => (
             "history_metric_save_failed",
             "The edit was completed, but history and usage metrics could not be saved.",
         ),
-        (true, false, true) => (
+        (true, false, ClipboardPaste | DirectInsert) => (
             "history_save_failed",
             "The edit was completed, but history could not be saved.",
         ),
-        (false, true, true) => (
+        (false, true, ClipboardPaste | DirectInsert) => (
             "metric_save_failed",
             "The edit was completed, but usage metrics could not be saved.",
         ),
-        (true, true, false) => (
+        (true, true, ClipboardOnly) => (
             "history_metric_save_failed",
             "The edit remains on the clipboard, but history and usage metrics could not be saved.",
         ),
-        (true, false, false) => (
+        (true, false, ClipboardOnly) => (
             "history_save_failed",
             "The edit remains on the clipboard, but history could not be saved.",
         ),
-        (false, true, false) => (
+        (false, true, ClipboardOnly) => (
             "metric_save_failed",
             "The edit remains on the clipboard, but usage metrics could not be saved.",
+        ),
+        (true, true, PasteUnverified) => (
+            "history_metric_save_failed",
+            "Edit insertion could not be confirmed, and history and usage metrics could not be saved.",
+        ),
+        (true, false, PasteUnverified) => (
+            "history_save_failed",
+            "Edit insertion could not be confirmed, and history could not be saved.",
+        ),
+        (false, true, PasteUnverified) => (
+            "metric_save_failed",
+            "Edit insertion could not be confirmed, and usage metrics could not be saved.",
         ),
     };
     Some(warning)
@@ -1258,7 +1275,31 @@ async fn start_owned_recording(
         }
     }
     let prompt = join_blocking(prompt_load).await.flatten();
-    let capture_config = capture_config(&settings);
+    let target_language =
+        (mode == PipelineMode::Translate).then(|| settings.translation_target_language.clone());
+    let capture_config = CaptureConfig {
+        retain_interrupted_audio: !dictation_test
+            && matches!(
+                take_mode,
+                PipelineMode::Dictate | PipelineMode::Translate | PipelineMode::Edit
+            )
+            && storage::FailedTakeRetention::for_settings(&settings).is_some(),
+        crash_spool: (!dictation_test
+            && storage::FailedTakeRetention::for_settings(&settings)
+                == Some(storage::FailedTakeRetention::Normal))
+        .then(|| {
+            crate::audio::spool::Policy::new(
+                storage.inner().clone(),
+                take_mode,
+                target_language.as_deref(),
+                edit_session
+                    .as_ref()
+                    .map(|session| session.selection.text()),
+            )
+        })
+        .flatten(),
+        ..capture_config(&settings)
+    };
     let mut test = services.microphone_test.lock().await;
     let mut audio = services.audio.lock().await;
     release_microphone_test(&mut test, audio.as_mut())
@@ -1289,8 +1330,6 @@ async fn start_owned_recording(
         .app_context
         .lock()
         .map_err(|_| "target service is unavailable".to_string())? = app_context;
-    let target_language =
-        (mode == PipelineMode::Translate).then(|| settings.translation_target_language.clone());
     *services
         .voice_translation_target
         .lock()
@@ -1359,10 +1398,17 @@ async fn start_owned_recording(
                 break;
             }
             let (level, stream_failed) = {
-                let audio = services.audio.lock().await;
-                (audio.level(), audio.stream_error().is_some())
+                let mut audio = services.audio.lock().await;
+                if services.lifecycle.phase() != PipelinePhase::Recording
+                    || services.lifecycle.is_cancelled(operation_id)
+                {
+                    break;
+                }
+                let failed = audio.stream_error().is_some() && !audio.recover_stream();
+                (audio.level(), failed)
             };
             if let Some(reason) = automatic_stop_reason(
+                operation_id,
                 stream_failed,
                 recording_started.elapsed(),
                 MAX_RECORDING_DURATION,
@@ -1541,30 +1587,28 @@ async fn load_unless_cancelled(
     }
 }
 
-/// Recordings stop automatically at this length and are transcribed as usual.
-const MAX_RECORDING_DURATION: Duration = Duration::from_secs(15 * 60);
-
 /// Why a recording stopped. Only `User` comes from an explicit request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StopReason {
     User,
     HoldRelease(u64),
     DictationTest(u64),
-    MicrophoneDisconnected,
-    MaximumDuration,
+    MicrophoneDisconnected(u64),
+    MaximumDuration(u64),
 }
 
 /// Decides, on each level tick, whether a recording must stop by itself. A
 /// failed input stream delivers no more audio, so it wins over the time limit.
 fn automatic_stop_reason(
+    operation_id: u64,
     stream_failed: bool,
     elapsed: Duration,
     limit: Duration,
 ) -> Option<StopReason> {
     if stream_failed {
-        Some(StopReason::MicrophoneDisconnected)
+        Some(StopReason::MicrophoneDisconnected(operation_id))
     } else if elapsed >= limit {
-        Some(StopReason::MaximumDuration)
+        Some(StopReason::MaximumDuration(operation_id))
     } else {
         None
     }
@@ -1576,19 +1620,20 @@ pub(crate) fn microphone_disconnected(
     reason: StopReason,
     artifact: &Result<audio::AudioArtifact, audio::AudioError>,
 ) -> bool {
-    reason == StopReason::MicrophoneDisconnected
+    matches!(reason, StopReason::MicrophoneDisconnected(_))
         || match artifact {
             Ok(artifact) => artifact.warning.is_some(),
             Err(error) => matches!(error, audio::AudioError::StreamFailure(_)),
         }
 }
 
-pub(crate) const MICROPHONE_DISCONNECTED: &str = "The microphone was disconnected, so recording stopped. The audio captured before the disconnection is being transcribed.";
-pub(crate) const MICROPHONE_DISCONNECTED_WITHOUT_SPEECH: &str = "The microphone was disconnected before usable speech was captured. Check the microphone and start a new recording.";
+pub(crate) const MICROPHONE_DISCONNECTED: &str =
+    "Microphone input stopped. Transcribing the audio captured so far.";
+pub(crate) const MICROPHONE_DISCONNECTED_WITHOUT_SPEECH: &str = "Microphone input stopped before usable speech was captured. Check the microphone and start a new recording.";
 pub(crate) const RECORDING_LIMIT_REACHED: &str =
     "Recording reached the 15-minute limit and stopped. The audio is being transcribed.";
 const MICROPHONE_DISCONNECTED_PROCESSING: &str =
-    "Microphone disconnected. Transcribing what was captured.";
+    "Microphone input stopped. Transcribing what was captured.";
 const RECORDING_LIMIT_PROCESSING: &str = "Recording limit reached. Transcribing.";
 
 /// The Processing message the overlay shows. An automatic stop keeps its
@@ -1599,9 +1644,9 @@ pub(crate) fn processing_message(
     disconnected: bool,
     default: &'static str,
 ) -> &'static str {
-    if disconnected || reason == StopReason::MicrophoneDisconnected {
+    if disconnected || matches!(reason, StopReason::MicrophoneDisconnected(_)) {
         MICROPHONE_DISCONNECTED_PROCESSING
-    } else if reason == StopReason::MaximumDuration {
+    } else if matches!(reason, StopReason::MaximumDuration(_)) {
         RECORDING_LIMIT_PROCESSING
     } else {
         default
@@ -1762,10 +1807,11 @@ pub(crate) fn ask_insertion(
     copy_to_clipboard: impl FnOnce() -> Result<(), injection::InjectionError>,
 ) -> Result<&'static str, OutputCancelled> {
     match inserted {
-        Some(Ok(InsertResult::ClipboardPaste)) => Ok(pasted),
+        Some(Ok(InsertResult::ClipboardPaste | InsertResult::DirectInsert)) => Ok(pasted),
         Some(Ok(InsertResult::ClipboardOnly)) => Ok("clipboard_only"),
         Some(Ok(InsertResult::PasteUnverified)) => Ok("paste_unverified"),
         Some(Err(injection::InjectionError::Cancelled)) => Err(OutputCancelled),
+        Some(Err(injection::InjectionError::ClipboardChanged)) => Ok("insertion_failed"),
         Some(Err(_)) | None => Ok(ask_fallback_insertion(copy_to_clipboard())),
     }
 }
@@ -1871,6 +1917,7 @@ fn selected_text_terminal(end: SelectedTextEnd) -> (AppPhase, &'static str) {
 fn selected_text_insertion_label(insertion: Option<InsertResult>) -> &'static str {
     match insertion {
         Some(InsertResult::ClipboardPaste) => "clipboard_paste",
+        Some(InsertResult::DirectInsert) => "caret",
         Some(InsertResult::ClipboardOnly) => "clipboard_only",
         Some(InsertResult::PasteUnverified) => "paste_unverified",
         None => "insertion_failed",
@@ -1883,7 +1930,9 @@ fn selected_text_insertion_label(insertion: Option<InsertResult>) -> &'static st
 /// records no metric, as in the other modes.
 fn selected_text_metric(end: SelectedTextEnd) -> Option<(bool, Option<&'static str>)> {
     match end {
-        SelectedTextEnd::Delivered(Some(InsertResult::ClipboardPaste)) => Some((true, None)),
+        SelectedTextEnd::Delivered(Some(
+            InsertResult::ClipboardPaste | InsertResult::DirectInsert,
+        )) => Some((true, None)),
         SelectedTextEnd::Delivered(insertion) => {
             Some((false, Some(selected_text_insertion_label(insertion))))
         }
@@ -1928,7 +1977,8 @@ fn selected_text_history_item<'a>(
 
 /// A translation paste that was sent but could not be confirmed, for voice
 /// and selected-text translation alike.
-pub(crate) const TRANSLATION_PASTE_UNVERIFIED: &str = "Translation pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard).";
+pub(crate) const TRANSLATION_PASTE_UNVERIFIED: &str =
+    "Translation insertion could not be confirmed. Check the target field.";
 
 /// A translation left on the clipboard because its target changed, for voice
 /// and selected-text translation alike.
@@ -1940,7 +1990,9 @@ pub(crate) const TRANSLATION_TARGET_CHANGED: &str =
 /// so it must not read as a target change that invites a second paste.
 fn selection_translation_status(result: InsertResult) -> (&'static str, &'static str) {
     match result {
-        InsertResult::ClipboardPaste => ("success", "Translation inserted."),
+        InsertResult::ClipboardPaste | InsertResult::DirectInsert => {
+            ("success", "Translation inserted.")
+        }
         InsertResult::PasteUnverified => ("paste_unverified", TRANSLATION_PASTE_UNVERIFIED),
         InsertResult::ClipboardOnly => ("error", TRANSLATION_TARGET_CHANGED),
     }
@@ -2224,15 +2276,15 @@ async fn run_selected_text_translation(
     let (phase, message) = selected_text_terminal(end);
     match insertion {
         Some(result) => {
+            let (kind, message) = selection_translation_status(result);
             let snapshot = state.complete(translated, message.into());
             let _ = app.emit("app-state", snapshot);
-            let (kind, message) = selection_translation_status(result);
             emit_status(app, kind, message);
-            if result != InsertResult::ClipboardPaste || clipboard_lost {
+            if !result.confirmed() || clipboard_lost {
                 recording_overlay::show_insertion_notice(
                     app,
                     injection::notice_outcome(insertion_label, clipboard_lost),
-                    None,
+                    insertion_detail,
                 );
             }
         }
@@ -2271,7 +2323,7 @@ pub(crate) fn ask_fallback_insertion(
 pub(crate) fn ask_completion_message(insertion: &str) -> &'static str {
     match insertion {
         "paste_unverified" => {
-            "Ask insertion could not be confirmed; the result remains on the clipboard."
+            "Ask insertion could not be confirmed. Check the target field."
         }
         "clipboard_only" => "Ask result is on the clipboard.",
         "insertion_failed" => {
@@ -2519,7 +2571,7 @@ pub(crate) async fn cancel_recording(
 ) -> Result<(), String> {
     let mode = services.lifecycle.mode().unwrap_or(PipelineMode::Dictate);
     let (cancel_message, _) = cancellation_copy(mode);
-    let cancelled = cancel_pipeline_operation(
+    let cancelled = cancel_pipeline_operation_with_storage(
         &services.lifecycle,
         &services.audio,
         &services.target,
@@ -2527,6 +2579,8 @@ pub(crate) async fn cancel_recording(
         &services.live,
         &services.edit,
         &services.ask,
+        None,
+        Some(&storage),
         || emit_state(&app, &state, AppPhase::Idle, cancel_message),
     )
     .await?;
@@ -2562,6 +2616,7 @@ impl<F: FnOnce()> Drop for OnDrop<F> {
 /// nor overwrite a newer recording. Starting and Processing keep their owner,
 /// which publishes their terminal phase.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn cancel_pipeline_operation(
     lifecycle: &PipelineLifecycle,
     audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
@@ -2598,12 +2653,62 @@ async fn cancel_pipeline_operation_for(
     expected: Option<u64>,
     publish_cancelled: impl FnOnce(),
 ) -> Result<Option<PipelinePhase>, String> {
+    cancel_pipeline_operation_with_storage(
+        lifecycle,
+        audio,
+        target,
+        translation_target,
+        live,
+        edit,
+        ask,
+        expected,
+        None,
+        publish_cancelled,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cancel_pipeline_operation_with_storage(
+    lifecycle: &PipelineLifecycle,
+    audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
+    target: &Mutex<Option<TargetWindow>>,
+    translation_target: &Mutex<Option<String>>,
+    live: &tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
+    edit: &tokio::sync::Mutex<Option<EditSession>>,
+    ask: &tokio::sync::Mutex<Option<AskSession>>,
+    expected: Option<u64>,
+    storage: Option<&Storage>,
+    publish_cancelled: impl FnOnce(),
+) -> Result<Option<PipelinePhase>, String> {
     let Some((operation_id, phase)) = lifecycle.cancel_for(expected)? else {
         return Ok(None);
     };
     // Starting and Processing already have an owner. Releasing their lifecycle
     // here would allow a new recording to race their remaining writes/cleanup.
     if phase != PipelinePhase::Recording {
+        if phase == PipelinePhase::Processing {
+            if let Some(storage) = storage {
+                if let Some(checkpoint) = storage.stopping_checkpoint(operation_id) {
+                    storage
+                        .discard_capture_spool(&checkpoint)
+                        .map_err(command_error)?;
+                } else {
+                    // Stop may have claimed the operation just before registering its
+                    // checkpoint. The recorder lock serializes that handoff.
+                    let audio = audio.lock().await;
+                    let checkpoint = storage.stopping_checkpoint(operation_id).or_else(|| {
+                        lifecycle.cancellation(operation_id).ok()?;
+                        audio.checkpoint()
+                    });
+                    if let Some(checkpoint) = checkpoint {
+                        storage
+                            .discard_capture_spool(&checkpoint)
+                            .map_err(command_error)?;
+                    }
+                }
+            }
+        }
         return Ok(Some(phase));
     }
     // A recording cancelled before any stop ends its take here.
@@ -2618,6 +2723,15 @@ async fn cancel_pipeline_operation_for(
     if let Ok(mut target) = target.lock() {
         target.take();
     }
+    // Pause preview before shutdown where available, then invalidate the take
+    // at the recorder before waiting for the device.
+    if let Some(task) = live.lock().await.as_ref() {
+        task.signal_stop();
+    }
+    let audio_result = {
+        let mut audio = audio.lock().await;
+        audio.cancel().await
+    };
     let live_task = live.lock().await.take();
     edit.lock().await.take();
     ask.lock().await.take();
@@ -2627,10 +2741,6 @@ async fn cancel_pipeline_operation_for(
     if let Ok(mut language) = translation_target.lock() {
         language.take();
     }
-    let audio_result = {
-        let mut audio = audio.lock().await;
-        audio.cancel().await
-    };
     if let Some(task) = live_task {
         drop(task.finish().await?);
     }

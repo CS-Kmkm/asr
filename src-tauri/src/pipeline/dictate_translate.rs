@@ -376,10 +376,7 @@ async fn finish_owned(
             let paste_started = Instant::now();
             let committed = commit_dictation_output(&services.lifecycle, operation_id, || {
                 if translation_failed {
-                    draft
-                        .injector
-                        .copy_to_clipboard(&text_for_insertion)
-                        .map(|()| InsertResult::ClipboardOnly)
+                    draft.copy_final(&text_for_insertion)
                 } else {
                     draft.finish(&text_for_insertion, &cancel)
                 }
@@ -452,10 +449,13 @@ async fn finish_owned(
         Err(_) => "insertion_failed",
         Ok(InsertResult::ClipboardPaste) if streamed_into_target => "provisional_replace",
         Ok(InsertResult::ClipboardPaste) => "clipboard_paste",
+        Ok(InsertResult::DirectInsert) => "caret",
         Ok(InsertResult::ClipboardOnly) => "clipboard_only",
         Ok(InsertResult::PasteUnverified) => "paste_unverified",
     };
-    let inserted = insertion_result == Ok(InsertResult::ClipboardPaste);
+    let inserted = insertion_result
+        .as_ref()
+        .is_ok_and(|result| result.confirmed());
     // Reserved before the take is shown as complete, so a Delete all or a
     // retention change that starts from here on waits for this take's
     // deferred History row, dictionary candidate and metrics.
@@ -541,7 +541,7 @@ async fn finish_owned(
         // The clipboard may still hold the first live fragment, not the result.
         "The live draft could not be confirmed, so it was not replaced; the final result is available in this app."
     } else if insertion == InsertResult::PasteUnverified {
-        "Pasted. This field cannot confirm the result; press Ctrl+V only if the text did not appear (it is on the clipboard)."
+        "Dictation insertion could not be confirmed. Check the target field."
     } else if insertion == InsertResult::ClipboardOnly && copy_only {
         SMART_COPY_ONLY
     } else if insertion == InsertResult::ClipboardOnly && streamed_into_target {

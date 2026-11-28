@@ -242,6 +242,7 @@ pub(crate) struct LiveDraft {
     /// at the press, and a selection made since must never be replaced).
     require_empty_selection: bool,
     attempted: bool,
+    clipboard_changed: bool,
     defer_insertion: bool,
     pub(crate) pasted: bool,
     /// How this recording's live-preview requests decode, fixed from the
@@ -273,6 +274,7 @@ impl LiveDraft {
             after_input: false,
             require_empty_selection: true,
             attempted: false,
+            clipboard_changed: false,
             defer_insertion: true,
             pasted: false,
             preview_decoding: preview_decoding(settings),
@@ -315,6 +317,8 @@ impl LiveDraft {
             restore_clipboard: settings.clipboard_restore,
         });
         let focus_identity = injector.focus_identity(&target);
+        let defer_insertion =
+            defer_insertion || streaming::enabled(settings) || injector.is_terminal_target(&target);
         Self {
             injector,
             monitor,
@@ -325,7 +329,8 @@ impl LiveDraft {
             after_input: false,
             require_empty_selection: false,
             attempted: false,
-            defer_insertion: defer_insertion || streaming::enabled(settings),
+            clipboard_changed: false,
+            defer_insertion,
             pasted: false,
             preview_decoding: preview_decoding(settings),
             incremental: incremental::Take::plan(settings),
@@ -356,6 +361,7 @@ impl LiveDraft {
             after_input: false,
             require_empty_selection: true,
             attempted: false,
+            clipboard_changed: false,
             defer_insertion: true,
             pasted: false,
             preview_decoding: preview_decoding(settings),
@@ -386,7 +392,17 @@ impl LiveDraft {
     /// Shows a new live hypothesis. An empty one is ignored; withdrawing text
     /// already shown is `retract`'s job.
     pub(crate) fn update(&mut self, text: &str) -> Result<(), injection::InjectionError> {
-        if text.is_empty() || self.monitor.shortcut_pending() || self.defer_insertion {
+        let result = self.update_insertion(text);
+        self.clipboard_changed |= result == Err(injection::InjectionError::ClipboardChanged);
+        result
+    }
+
+    fn update_insertion(&mut self, text: &str) -> Result<(), injection::InjectionError> {
+        if text.is_empty()
+            || self.monitor.shortcut_pending()
+            || self.defer_insertion
+            || self.clipboard_changed
+        {
             return Ok(());
         }
         if let Some(session) = self.session.as_mut() {
@@ -400,6 +416,7 @@ impl LiveDraft {
             if self
                 .checkpoint
                 .is_some_and(|c| self.monitor.unchanged_since(c))
+                && self.focus_unchanged()
             {
                 self.session = self.injector.begin_live_provisional(
                     text,
@@ -429,19 +446,20 @@ impl LiveDraft {
     /// edits the draft this session inserted, under the same guards as a
     /// revision, and never starts an insertion of its own.
     pub(crate) fn retract(&mut self, committed: &str) -> Result<(), injection::InjectionError> {
-        if self.monitor.shortcut_pending() || self.defer_insertion {
+        if self.monitor.shortcut_pending() || self.defer_insertion || self.clipboard_changed {
             return Ok(());
         }
         let Some(session) = self.session.as_mut() else {
             return Ok(());
         };
         let result = if committed.is_empty() {
-            self.injector.retract_provisional(session, &self.monitor)?
+            self.injector.retract_provisional(session, &self.monitor)
         } else {
             self.injector
-                .update_provisional(session, committed, &self.monitor)?
+                .update_provisional(session, committed, &self.monitor)
         };
-        confirmed(result)
+        self.clipboard_changed |= result == Err(injection::InjectionError::ClipboardChanged);
+        confirmed(result?)
     }
 
     /// Input during recording and recognition does not block a deferred final
@@ -518,6 +536,12 @@ impl LiveDraft {
         text: &str,
         cancel: &watch::Receiver<bool>,
     ) -> Result<InsertResult, injection::InjectionError> {
+        if *cancel.borrow() {
+            return Err(injection::InjectionError::Cancelled);
+        }
+        if self.clipboard_changed {
+            return Err(injection::InjectionError::ClipboardChanged);
+        }
         match self.finalization(text) {
             Finalization::InsertOnce => {
                 self.attempted = true;
@@ -533,10 +557,6 @@ impl LiveDraft {
                 Ok(result)
             }
             Finalization::FinishSession => {
-                // On cancel, dropping the draft removes its unedited range.
-                if *cancel.borrow() {
-                    return Err(injection::InjectionError::Cancelled);
-                }
                 let session = self.session.as_mut().expect("session was checked");
                 self.injector
                     .finish_provisional(session, text, &self.monitor)
@@ -547,11 +567,18 @@ impl LiveDraft {
                 if *cancel.borrow() {
                     return Err(injection::InjectionError::Cancelled);
                 }
-                self.injector
-                    .copy_to_clipboard(text)
-                    .map(|()| InsertResult::ClipboardOnly)
+                self.copy_final(text)
             }
         }
+    }
+
+    pub(crate) fn copy_final(&self, text: &str) -> Result<InsertResult, injection::InjectionError> {
+        if self.clipboard_changed {
+            return Err(injection::InjectionError::ClipboardChanged);
+        }
+        self.injector
+            .copy_to_clipboard(text)
+            .map(|()| InsertResult::ClipboardOnly)
     }
 
     /// Reason for a non-confirmed outcome. Call before dropping the draft,
@@ -561,7 +588,7 @@ impl LiveDraft {
         if result == InsertResult::ClipboardOnly && !self.focus_unchanged() {
             return Some(InsertionDetail::TargetChanged);
         }
-        (result != InsertResult::ClipboardPaste).then(|| {
+        (!result.confirmed()).then(|| {
             self.injector.diagnose_insertion(
                 &self.target,
                 &self.monitor,
@@ -576,7 +603,7 @@ impl LiveDraft {
 /// A live edit of an existing draft must be confirmed; otherwise live
 /// insertion pauses and the final text is only copied.
 fn confirmed(result: InsertResult) -> Result<(), injection::InjectionError> {
-    if result == InsertResult::ClipboardPaste {
+    if result.confirmed() {
         Ok(())
     } else {
         Err(injection::InjectionError::BackendFailure(
@@ -871,7 +898,16 @@ async fn run_loop(
                 incremental::Turn::Idle => {}
                 incremental::Turn::Used => continue,
                 incremental::Turn::Stop => return Ok(()),
-                incremental::Turn::CaptureFailed => return Err(LiveFailure::Capture),
+                incremental::Turn::CaptureFailed => {
+                    // A replacement can be adopted between the failed read and
+                    // this check. Continue on either side of that handoff.
+                    let capture = audio.lock().await;
+                    match capture.probe(Duration::ZERO, Duration::MAX) {
+                        Ok(Some(_)) | Err(AudioError::Recovering) => continue,
+                        Err(AudioError::NotCapturing) => return Ok(()),
+                        _ => return Err(LiveFailure::Capture),
+                    }
+                }
             }
         }
         if !work.preview {
@@ -887,12 +923,14 @@ async fn run_loop(
                     Ok(Some(probe)) if !gate.should_prepare(&probe, &segmentation) => continue,
                     Ok(_) => {}
                     Err(AudioError::NotCapturing) => return Ok(()),
+                    Err(AudioError::Recovering) => continue,
                     Err(_) => return Err(LiveFailure::Capture),
                 }
             }
             match audio.snapshot(cursor) {
                 Ok(snapshot) => snapshot,
                 Err(AudioError::NotCapturing) => return Ok(()),
+                Err(AudioError::Recovering) => continue,
                 Err(_) => return Err(LiveFailure::Capture),
             }
         };
@@ -1081,6 +1119,7 @@ mod tests {
             after_input: false,
             require_empty_selection: false,
             attempted: false,
+            clipboard_changed: false,
             defer_insertion: true,
             pasted: false,
             preview_decoding: asr::PreviewDecoding::Standard,
@@ -1528,6 +1567,54 @@ mod tests {
 
     type SharedMock = Arc<std::sync::Mutex<MockBackend>>;
 
+    #[test]
+    fn a_clipboard_conflict_during_preview_stops_delivery_for_the_take() {
+        use injection::InjectionError;
+
+        let (mut draft, mock) = live_test_draft();
+        mock.lock().unwrap().copy_after_write();
+        let (_sender, cancel) = watch::channel(false);
+
+        assert_eq!(
+            draft.update("preview"),
+            Err(InjectionError::ClipboardChanged)
+        );
+        assert_eq!(
+            draft.finish("final", &cancel),
+            Err(InjectionError::ClipboardChanged)
+        );
+        assert_eq!(
+            draft.copy_final("final"),
+            Err(InjectionError::ClipboardChanged)
+        );
+        let mock = mock.lock().unwrap();
+        assert_eq!(mock.content(), "prefix  suffix");
+        assert_eq!(mock.clipboard_text(), "new user copy");
+    }
+
+    #[test]
+    fn a_clipboard_conflict_while_revising_leaves_the_last_confirmed_preview() {
+        use injection::InjectionError;
+
+        let (mut draft, mock) = live_test_draft();
+        draft.update("preview").unwrap();
+        mock.lock().unwrap().copy_after_write();
+        let (_sender, cancel) = watch::channel(false);
+
+        assert_eq!(
+            draft.update("revised"),
+            Err(InjectionError::ClipboardChanged)
+        );
+        assert_eq!(
+            draft.finish("final", &cancel),
+            Err(InjectionError::ClipboardChanged)
+        );
+        drop(draft);
+        let mock = mock.lock().unwrap();
+        assert_eq!(mock.content(), "prefix preview suffix");
+        assert_eq!(mock.clipboard_text(), "new user copy");
+    }
+
     /// A live-insertion draft whose injector drives the batch mock target,
     /// which reads "prefix | suffix" with the caret at `|`.
     fn live_test_draft() -> (LiveDraft, SharedMock) {
@@ -1544,6 +1631,7 @@ mod tests {
             after_input: false,
             require_empty_selection: false,
             attempted: false,
+            clipboard_changed: false,
             defer_insertion: false,
             pasted: false,
             preview_decoding: asr::PreviewDecoding::Standard,

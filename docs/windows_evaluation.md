@@ -2,6 +2,26 @@
 
 [評価スイート](evaluation_suite.md)から、隔離 VM の試験、ヘッドレス試験、ホスト上の CUDA 測定を実行できます。
 
+## Issue #111 の追加確認
+
+専用 VM `ASR-Eval` を起動し、`ASREvalReal` でデスクトップにサインインします。統合版のリリースビルドと `dist/index.html` を用意したら、ホストの PowerShell 7 で実行します。
+
+```powershell
+pwsh -NoProfile -File scripts/run_vm_wave_a_checks.ps1
+```
+
+- 端末試験は VM の mintty と PuTTY を開き、固定文が受信側に一度だけ届いたことを確認します。PuTTY の接続先はゲスト内のループバック受信機です。`-Check Terminals` で端末だけを再実行できます。
+- Clippy は現在のソースを VM の新規ディレクトリに転送し、`cargo clippy --all-targets --locked --offline -- -D warnings` をゲストで実行します。初回は固定依存をゲストに取得します。取得済みなら `-Check Clippy -Offline` で再実行できます。
+- `-AppBinary` で別の対象 exe を指定できます。成否、対象 exe の SHA-256、Clippy が使うソースの SHA-256 は `.ai/evaluation/wave-a-checks-*/` に保存します。終了コード `0` は指定した自動試験の合格、`1` は試験失敗、`2` は準備不足です。
+
+### 物理 USB マイク
+
+ホストから USB マイクの**デバイス自体**を VM に共有します。拡張セッションで「ローカル リソース」から対象 USB デバイスを選びます。音声の「このコンピューターから録音」はリモートオーディオ入力を作るため、抜き差し試験に使うにはゲストから元の USB 録音エンドポイントが見える接続が必要です。共有一覧に機器が出ない場合は、機器単位の USB リダイレクトを確認してください。 [Hyper-V 拡張セッション](https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/enhanced-session-mode) · [USB デバイスが共有一覧に出ない場合](https://learn.microsoft.com/en-us/troubleshoot/windows-client/remote/usb-devices-unavailable-remotefx-usb-redirection)
+
+Clippy が通ると、ランナーがゲストで実行する `check_vm_microphone_hotplug.ps1 -List` のコマンドを表示します。USB 録音入力が1つ表示されたら `-List` を外して実行します。複数ある場合は表示された ID を `-DeviceInstanceId` に指定します。画面の指示に従って話し、抜いたまま待ち、同じ USB ポートに再接続してもう一度話します。試験は切断前の録音が残り、同じデバイスで録音を再開できたことを確認します。ログはゲストの `%LOCALAPPDATA%\ASR-Evaluation` に保存します。
+
+専用 VM の準備に使う場所は `C:\ASR-Evaluation\tools` です。Git for Windows Portable 2.56.1 を `GitPortable`、PuTTY 0.85 を `PuTTY`、Visual Studio 2022 Build Tools の C++ ワークロードを `VSBuildTools` に置きます。Rust 1.97.1 と Clippy には `Rust\cargo` と `Rust\rustup` を使います。 [Git for Windows リリース](https://github.com/git-for-windows/git/releases/tag/v2.56.1.windows.1) · [PuTTY 配布元](https://www.chiark.greenend.org.uk/~sgtatham/putty/latest.html) · [Windows の Rust セットアップ](https://learn.microsoft.com/en-us/windows/dev-environment/rust/setup)
+
 評価は、ユーザーが対話端末から起動するローカルツールで行います。権限ダイアログの操作は
 ユーザーが先に済ませます。以下は実行手順であり、実機での合格記録ではありません。
 

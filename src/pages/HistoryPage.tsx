@@ -215,7 +215,7 @@ function InsertionBadge({ result, detail }: { result: string; detail: string | n
   const { t } = useI18n();
   const resultKey = insertionOutcomeLabels[result];
   const detailKey = detail ? insertionDetailLabels[detail] : undefined;
-  const inserted = result === "clipboard_paste" || result === "provisional_replace";
+  const inserted = result === "caret" || result === "clipboard_paste" || result === "provisional_replace";
   const state = inserted ? "inserted" : result === "paste_unverified" ? "sent" : "not-inserted";
   const detailText = detail ? (detailKey ? t(detailKey) : detail) : undefined;
   return <small className={`history-insertion ${state}`} title={detailText}>

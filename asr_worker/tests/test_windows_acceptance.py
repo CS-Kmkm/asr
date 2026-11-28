@@ -34,7 +34,7 @@ class Target:
     def focus_process(self): return None if self.focused else 'other'
     def read(self): return self.content
     def change_count(self): return len(self.changes)
-    def changed_since(self, start, expected): return any(value != expected for value in self.changes[start:])
+    def changed_since(self, start, *permitted): return any(value not in permitted for value in self.changes[start:])
     def minimize(self): self.minimized = True
 
 
@@ -53,6 +53,102 @@ class Reader:
 
 
 class AcceptanceTests(unittest.TestCase):
+    def test_native_product_timing_requires_independent_receiver_and_reference_quality(self):
+        reference = '入力の確認です。'
+        for written, outcome, expected in ((reference, 'pasted', 'PASS'),
+                                           ('全然違う内容', 'pasted', 'FAIL'),
+                                           (reference, 'clipboard_only', 'FAIL'),
+                                           ('', 'pasted', 'FAIL')):
+            with self.subTest(written=written, outcome=outcome):
+                clock = Clock()
+                primary, secondary, reader = Target(), Target(), Reader(outcome)
+
+                def tap(api, target, chord):
+                    if reader.phase == 'idle':
+                        reader.phase, reader.operation_id = 'recording', 7
+                        return clock.perf_counter()
+                    stopped = clock.perf_counter()
+                    clock.sleep(.125)
+                    primary.content, reader.phase = written, 'idle'
+                    return stopped
+
+                with patch.object(module, 'tap', side_effect=tap), \
+                     patch.object(module, 'observed_playback', return_value=(1, 3, 2000)):
+                    result, _, _ = module.run_scenario(
+                        module.NATIVE_NOTEPAD, api=None, primary=primary, secondary=secondary,
+                        reader=reader, player=None, item={'audio_path': 'unused', 'reference': reference},
+                        hotkey=(17, 32), clock=clock, guard_seconds=.1, unattended=True)
+                self.assertEqual(result['status'], expected)
+                if expected == 'PASS':
+                    self.assertEqual(result['stop_to_observed_insertion_ms'], 125)
+                    self.assertEqual(result['reference_normalized_cer'], 0)
+
+    def test_native_notepad_profile_is_isolated_from_the_real_model_baseline(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+                'os.environ', {'APPDATA': directory, 'USERNAME': 'ASREvalReal'}):
+            old_profile = vm_smoke.prepare_profile(real=True)
+            old_bytes = old_profile.read_bytes()
+            native_profile = vm_smoke.prepare_profile(real=True, native_model=module.NATIVE_MODEL)
+            native_bytes = native_profile.read_bytes()
+            haas = 'haas-ja-v1.0'
+            haas_profile = vm_smoke.prepare_profile(real=True, native_model=haas)
+
+            self.assertEqual(native_profile.parent.name, module.NATIVE_PROFILE)
+            self.assertEqual(haas_profile.parent.name, 'org.localvoice.input.eval-haas')
+            self.assertEqual(len({old_profile, native_profile, haas_profile}), 3)
+            self.assertEqual(old_profile.read_bytes(), old_bytes)
+            self.assertEqual(native_profile.read_bytes(), native_bytes)
+            mic = 'name:CABLE Output (VB-Audio Virtual Cable)'
+            self.assertEqual(module.profile_settings(native_profile, mic, native_model=module.NATIVE_MODEL)['modelId'],
+                             module.NATIVE_MODEL)
+            self.assertEqual(module.profile_settings(haas_profile, mic, native_model=haas)['modelId'], haas)
+            for profile in (old_profile, native_profile):
+                with self.subTest(profile=profile.parent.name), self.assertRaises(module.EvidenceError):
+                    module.profile_settings(profile, mic, native_model=haas)
+
+    def test_fixed_matrix_schedule_covers_each_condition_and_excludes_warmup(self):
+        cases = []
+        nonces = set()
+        for target in module.NORMAL_MATRIX_TARGETS:
+            warmup, *trials = vm_smoke.matrix_schedule(50)
+            self.assertEqual(warmup['index'], 1)
+            self.assertEqual(len(trials), 200)
+            for row in (warmup, *trials):
+                self.assertNotIn(row['nonce'], nonces)
+                nonces.add(row['nonce'])
+            for row in trials:
+                row['status'] = 'PASS'
+            cases.append({'scenario': target, 'warmup': warmup, 'trials': trials})
+        cases[0]['trials'][-1]['status'] = 'FAIL'
+        cases[-1]['trials'].pop()
+
+        result = vm_smoke.matrix_summary(cases, 50)
+
+        self.assertEqual((result['confirmed'], result['reported'], result['planned']), (998, 999, 1000))
+        self.assertEqual(result['rate'], .998)
+        self.assertLess(result['wilson_95'][0], result['rate'])
+        self.assertGreater(result['wilson_95'][1], result['rate'])
+        self.assertEqual(result['by_condition']['long']['confirmed'], 248)
+        self.assertEqual(result['cells'][module.NORMAL_MATRIX_TARGETS[-1]]['long']['planned'], 50)
+
+    def test_matrix_receiver_rejects_lost_prefix_stale_nonce_and_duplicate(self):
+        text = module.matrix_text('multiline', 'a' * 16)
+        expected = module.NORMAL_MATRIX_PREFIX + text
+        self.assertEqual(len(module.matrix_text('long', 'b' * 16).encode('utf-16-le')) // 2, 1024)
+        self.assertGreater(len(module.matrix_text('mixed', 'b' * 16).encode('utf-16-le')) // 2,
+                           len(module.matrix_text('mixed', 'b' * 16)))
+        for observed, decoy, status in (
+                (expected.replace('\n', '\r\n'), '', 'PASS'),
+                (expected.replace('\n', '\r'), '', 'PASS'),
+                (text, '', 'FAIL'),
+                (expected[:-16] + 'b' * 16, '', 'FAIL'),
+                (expected + text, '', 'FAIL'),
+                (expected, text, 'FAIL')):
+            with self.subTest(observed=observed, decoy=decoy):
+                result = module.judge('mock-terminal', observed, decoy, {'outcome': 'paste_unverified'},
+                                      '', .5, mock_text=text, normal_matrix=True)
+                self.assertEqual(result['status'], status)
+
     def test_real_notepad_matches_worker_output_independently_of_reference(self):
         expected_text = '認識した文章'
         for output, status in ((expected_text, 'PASS'), (expected_text * 2, 'FAIL'), ('', 'FAIL')):
@@ -614,21 +710,36 @@ class AcceptanceTests(unittest.TestCase):
     def test_processing_cancel_waits_for_processing_before_escape(self):
         primary, secondary, reader = Target(module.SEED), Target(), Reader('cancelled')
         calls = []
+        proof_exists = False
+        wait = reader.wait
+
+        def delayed_proof(predicate, timeout, check=lambda: None):
+            nonlocal proof_exists
+            if reader.phase == 'processing' and not proof_exists:
+                self.assertFalse(predicate(reader))
+                self.assertEqual(calls, [(17, 32), (17, 32)])
+                proof_exists = True
+            return wait(predicate, timeout, check)
+
+        reader.wait = delayed_proof
         def tap(api, target, chord):
             calls.append(chord)
             if len(calls) == 1: reader.phase, reader.operation_id = 'recording', 7
             elif chord == (17, 32): reader.phase = 'processing'
             else:
                 self.assertEqual(reader.phase, 'processing')
+                self.assertTrue(proof_exists)
                 reader.phase = 'idle'
         with patch.object(module, 'tap', side_effect=tap), \
              patch.object(module, 'observed_playback', return_value=(1, 3, 2000)):
             result, _, _ = module.run_scenario('cancel-processing', api=None, primary=primary,
                 secondary=secondary, reader=reader, player=None,
                 item={'audio_path': 'unused', 'reference': 'public'}, hotkey=(17, 32),
-                clock=Clock(), guard_seconds=.1)
+                clock=Clock(), guard_seconds=.1,
+                inflight_proof=SimpleNamespace(is_file=lambda: proof_exists))
         self.assertEqual(result['status'], 'PASS')
         self.assertTrue(result['processing_cancel_attempted'])
+        self.assertTrue(result['worker_hold_observed'])
         self.assertEqual(calls, [(17, 32), (17, 32), (27,)])
 
     def test_missed_processing_window_is_blocked_without_late_escape(self):
@@ -648,6 +759,79 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(result['reason'], 'processing_window_missed')
         self.assertFalse(result['processing_cancel_attempted'])
         self.assertEqual(calls, [(17, 32), (17, 32)])
+
+    def test_held_processing_cancel_sends_no_escape_if_receiver_changes(self):
+        primary, secondary, reader = Target(module.SEED), Target(), Reader('cancelled')
+        calls = []
+
+        def tap(api, target, chord):
+            calls.append(chord)
+            if len(calls) == 1:
+                reader.phase, reader.operation_id = 'recording', 7
+            else:
+                reader.phase = 'processing'
+                primary.content += 'intervening edit'
+
+        with patch.object(module, 'tap', side_effect=tap), \
+             patch.object(module, 'observed_playback', return_value=(1, 3, 2000)), \
+             self.assertRaises(module.ScenarioEvidenceError):
+            module.run_scenario('cancel-processing', api=None, primary=primary,
+                secondary=secondary, reader=reader, player=None,
+                item={'audio_path': 'unused', 'reference': 'public'}, hotkey=(17, 32),
+                clock=Clock(), inflight_proof=SimpleNamespace(is_file=lambda: True))
+        self.assertEqual(calls, [(17, 32), (17, 32)])
+
+    def test_clipboard_guard_requires_exact_receiver_and_independent_clipboard_readback(self):
+        initial = module.MOCK_PREFIX + module.MOCK_SUFFIX
+        final = module.MOCK_PREFIX + module.MOCK_TEXT + module.MOCK_SUFFIX
+        for scenario, preserved in (('clipboard-rich', False), ('clipboard-newer-during-asr', True)):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                hold, proof = root / 'hold-transcribe', root / 'worker-hold-ready'
+                primary, secondary, reader = Target(initial), Target(), Reader('pasted')
+                primary.select_caret = primary.require_caret = lambda offset: self.assertEqual(offset, len(module.MOCK_PREFIX))
+                calls = []
+
+                def tap(api, target, chord):
+                    calls.append(chord)
+                    if len(calls) == 1:
+                        reader.phase, reader.operation_id = 'recording', 7
+                    elif scenario == 'clipboard-rich':
+                        primary.content, reader.phase = final, 'idle'
+                        primary.changes.append(final)
+                    else:
+                        hold.touch()
+                        proof.touch()
+                        reader.phase = 'processing'
+
+                def copy_newer():
+                    self.assertTrue(hold.is_file())
+                    self.assertEqual(reader.phase, 'processing')
+                    self.assertEqual(primary.content, initial)
+                    calls.append('copy')
+
+                wait = reader.wait
+
+                def deliver_after_release(predicate, timeout, check=lambda: None):
+                    if reader.phase == 'processing' and not hold.is_file():
+                        primary.content, reader.phase = final, 'idle'
+                        primary.changes.append(final)
+                    return wait(predicate, timeout, check)
+
+                reader.wait = deliver_after_release
+                with patch.object(module, 'tap', side_effect=tap), \
+                     patch.object(module, 'observed_playback', return_value=(1, 3, 2000)):
+                    result, _, _ = module.run_scenario(scenario, api=None, primary=primary,
+                        secondary=secondary, reader=reader, player=None,
+                        item={'audio_path': 'unused', 'reference': 'public'}, hotkey=(17, 32),
+                        clock=Clock(), guard_seconds=.1, unattended=True,
+                        inflight_proof=proof if scenario in module.HELD_WORKER_GUARDS else None,
+                        clipboard_fixture=SimpleNamespace(copy_newer=copy_newer, preserved=lambda: preserved))
+                self.assertTrue(result['exact_receiver_match'])
+                self.assertEqual(result['clipboard_preserved'], preserved)
+                self.assertEqual(result['status'], 'PASS' if preserved else 'FAIL')
+                self.assertEqual('copy' in calls, scenario in module.HELD_WORKER_GUARDS)
+                self.assertFalse(hold.exists())
 
     def test_external_bridge_stops_on_error_without_fallback_input(self):
         bridge = SimpleNamespace(call=lambda *args: {'focused': False})

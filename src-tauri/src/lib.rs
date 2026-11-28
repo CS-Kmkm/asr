@@ -217,6 +217,13 @@ pub(crate) fn worker_command_with_speech_key(
     settings: &Settings,
     speech_key: Option<String>,
 ) -> WorkerCommand {
+    if let Some(command) = asr::native::command(settings) {
+        return command;
+    }
+    python_worker_command(settings, speech_key)
+}
+
+fn python_worker_command(settings: &Settings, speech_key: Option<String>) -> WorkerCommand {
     let (python, project_root) = worker_runtime();
     let mut command = WorkerCommand::python(python).with_backend(&settings.asr_backend);
     command.source_required = environment::value_os("ASR_PYTHON").is_none();
@@ -1633,6 +1640,7 @@ fn setup_app(
 ) -> Result<(), Box<dyn std::error::Error>> {
     evaluation::initialize();
     if !cfg!(debug_assertions) {
+        asr::native::register_bundled_runtime(&app.path().resource_dir()?);
         worker_setup::install(
             &app.path().resource_dir()?,
             &app.path().app_local_data_dir()?,
@@ -1661,6 +1669,12 @@ fn setup_app(
     let _ = storage.back_up_unreadable_settings();
     storage.enforce_current_history_policy()?;
     let (settings, repairs) = storage.get_settings_with_repairs()?;
+    let recovery_storage = storage.clone();
+    let recovery_policy_readable =
+        !repairs.contains("historyRetention") && !repairs.contains("deleteAudioAfterProcessing");
+    storage.reserve_completion().defer(move || {
+        audio::spool::recover(&recovery_storage, recovery_policy_readable);
+    });
     if !repairs.is_empty() {
         // Once per start: later reads use the same in-memory fallbacks.
         emit_status(

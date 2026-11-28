@@ -1,11 +1,14 @@
 //! Shared stop/capture/recognition lifecycle and mode dispatch.
-use super::{PipelineContext, RecordedTake, StopTimings};
+use super::{
+    finish::{report_history_save_warning, save_history_reporting_row, HISTORY_CHANGED_EVENT},
+    PipelineContext, RecordedTake, StopTimings,
+};
 use crate::commands::{
     cancellation_copy, ensure_model_loaded_cancellable, failed_take_history_item,
     failed_take_message, microphone_disconnected, play_stop_cue, preserve_failed_take,
     processing_message, report_temp_cleanup, take_published_sessions, StopReason,
-    TranscriptionFailure, MICROPHONE_DISCONNECTED, MICROPHONE_DISCONNECTED_WITHOUT_SPEECH,
-    RECORDING_LIMIT_REACHED,
+    TranscriptionFailure, INSERTION_FAILED, MICROPHONE_DISCONNECTED,
+    MICROPHONE_DISCONNECTED_WITHOUT_SPEECH, RECORDING_LIMIT_REACHED,
 };
 use crate::{
     app_context, asr, command_error, emit_stage, emit_state, emit_status, model_identity,
@@ -15,14 +18,14 @@ use crate::{
     types::{AppPhase, NewHistoryItem, RecordingResult},
     Services, TempArtifact,
 };
-use std::time::Instant;
-use tauri::AppHandle;
+use std::{sync::OnceLock, time::Instant};
+use tauri::{AppHandle, Emitter};
 
 use super::orchestration::{RecordingDriver, RecordingEvents};
 use super::speculative::{CorrectionInputs, Speculation};
 use super::take_trace::{TakeTrace, PENDING};
 use crate::live_dictation::LiveDraft;
-use crate::storage::{TakeSpan, TakeStage};
+use crate::storage::{TakeOutcome, TakeSpan, TakeStage};
 use crate::{
     audio::AudioArtifact,
     state::PipelineLifecycle,
@@ -32,6 +35,8 @@ use crate::{smart_dictate::SmartRoute, AskSession, EditSession};
 use tokio::sync::watch;
 
 const NO_VOICE_CAPTURED: &str = "No speech was detected. Your audio may be too quiet. Check your microphone and Input gain in Input settings.";
+const INTERRUPTED_CAPTURE_REJECTED: &str =
+    "Microphone input stopped before enough speech was captured for automatic transcription.";
 
 /// Energy detection cannot distinguish silence from speech below its floor.
 /// Use the same actionable copy for the overlay and the IPC caller so a
@@ -61,15 +66,16 @@ fn capture_failure_message(no_voice: bool, disconnected: bool) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy)]
 struct Desktop<'a> {
     app: &'a AppHandle,
     services: &'a Services,
     state: &'a AppState,
     storage: &'a Storage,
+    operation_id: OnceLock<u64>,
 }
 
 struct Captured {
+    checkpoint: Option<crate::audio::spool::Checkpoint>,
     settings: Settings,
     artifact: AudioArtifact,
     artifact_cleanup: TempArtifact,
@@ -78,6 +84,7 @@ struct Captured {
     stop_timings: StopTimings,
     translation_target: Option<String>,
     draft: Option<LiveDraft>,
+    live_session_lost: bool,
     edit_session: Option<EditSession>,
     ask_session: Option<AskSession>,
     smart_route: Option<SmartRoute>,
@@ -97,11 +104,18 @@ impl RecordingEvents for Desktop<'_> {
 
 impl RecordingDriver for Desktop<'_> {
     type Captured = Captured;
-    type Recognized = (RecordedTake, Option<EditSession>, Option<AskSession>);
+    type Recognized = (
+        RecordedTake,
+        Option<EditSession>,
+        Option<AskSession>,
+        bool,
+        Option<crate::audio::spool::Checkpoint>,
+    );
     fn lifecycle(&self) -> &PipelineLifecycle {
         &self.services.lifecycle
     }
     fn begin_trace(&self, id: u64, mode: PipelineMode) -> TakeTrace {
+        let _ = self.operation_id.set(id);
         // Dictation tests record nothing, like their metrics.
         if self.services.lifecycle.is_dictation_test(id) {
             return TakeTrace::disabled();
@@ -122,6 +136,7 @@ impl RecordingDriver for Desktop<'_> {
             services,
             state,
             storage,
+            ..
         } = *self;
         let (live_task, edit_session, ask_session, translation_target) = take_published_sessions(
             &services.live,
@@ -145,6 +160,15 @@ impl RecordingDriver for Desktop<'_> {
         }
         let audio_stop_started = Instant::now();
         let mut audio = services.audio.lock().await;
+        let checkpoint = audio.checkpoint();
+        if let Some(checkpoint) = &checkpoint {
+            let id = *self.operation_id.get().expect("stop claimed an operation");
+            storage.mark_stopping_checkpoint(id, checkpoint.clone());
+            if services.lifecycle.is_cancelled(id) {
+                audio.cancel().await.map_err(command_error)?;
+                return Err(cancellation_copy(mode).1.into());
+            }
+        }
         let artifact_result = audio.stop().await;
         let audio_stop_ms = audio_stop_started.elapsed().as_millis() as i64;
         trace.span(TakeSpan::AudioStop, audio_stop_ms);
@@ -162,7 +186,11 @@ impl RecordingDriver for Desktop<'_> {
         // Warm the AI provider connection while the live task drains and the
         // recording is recognized.
         if let Ok(settings) = &stop_settings {
-            if artifact_result.is_ok() && services.lifecycle.dictation_test_id().is_none() {
+            if artifact_result
+                .as_ref()
+                .is_ok_and(|artifact| !artifact.retry_only)
+                && services.lifecycle.dictation_test_id().is_none()
+            {
                 crate::correction::prewarm_connection(settings, mode);
             }
         }
@@ -174,16 +202,18 @@ impl RecordingDriver for Desktop<'_> {
         // Stop waits for an in-flight live window before the final recognition.
         let live_drain_started = Instant::now();
         let live_drained = live_task.is_some();
-        let draft = match live_task {
-            Some(task) => Some(task.finish().await?),
-            None if mode == PipelineMode::Edit
-                || mode == PipelineMode::Ask
-                || services.lifecycle.dictation_test_id().is_some() =>
-            {
-                None
-            }
-            None => return Err("live dictation session is unavailable".into()),
+        let (draft, live_drain_failed) = match live_task {
+            Some(task) => match task.finish().await {
+                Ok(draft) => (Some(draft), false),
+                Err(_) => (None, true),
+            },
+            None => (None, false),
         };
+        // Edit and Ask use a recognition-only live task. Their target
+        // ownership is carried by the separate edit and ask sessions.
+        let live_session_lost = draft.is_none()
+            && matches!(mode, PipelineMode::Dictate | PipelineMode::Translate)
+            && services.lifecycle.dictation_test_id().is_none();
         let live_drain_ms = live_drained.then(|| live_drain_started.elapsed().as_millis() as i64);
         if let Some(live_drain_ms) = live_drain_ms {
             trace.span(TakeSpan::LiveDrain, live_drain_ms);
@@ -195,9 +225,9 @@ impl RecordingDriver for Desktop<'_> {
                 emit_state(app, state, AppPhase::Error, message);
             })
         })?;
-        if disconnected {
+        if disconnected && !artifact.retry_only {
             emit_status(app, "microphone_disconnected", MICROPHONE_DISCONNECTED);
-        } else if reason == StopReason::MaximumDuration {
+        } else if !disconnected && matches!(reason, StopReason::MaximumDuration(_)) {
             emit_status(app, "recording_limit_reached", RECORDING_LIMIT_REACHED);
         }
         let mut artifact_cleanup = artifact_cleanup
@@ -208,6 +238,7 @@ impl RecordingDriver for Desktop<'_> {
         artifact_cleanup.retain = false;
 
         Ok(Captured {
+            checkpoint,
             settings,
             artifact,
             artifact_cleanup,
@@ -215,17 +246,21 @@ impl RecordingDriver for Desktop<'_> {
             disconnected,
             stop_timings: StopTimings {
                 audio_stop_ms,
-                live_drain_ms,
+                live_drain_ms: live_drain_ms.filter(|_| !live_drain_failed),
                 live_final_match: None,
             },
             translation_target,
             draft,
+            live_session_lost,
             edit_session,
             ask_session,
             smart_route,
         })
     }
     fn transcription_message(&self, capture: &Captured, reason: StopReason) -> &'static str {
+        if capture.artifact.retry_only {
+            return INTERRUPTED_CAPTURE_REJECTED;
+        }
         processing_message(
             reason,
             capture.disconnected,
@@ -244,13 +279,18 @@ impl RecordingDriver for Desktop<'_> {
         cancel: watch::Receiver<bool>,
         trace: &TakeTrace,
     ) -> Result<Self::Recognized, String> {
+        if capture.artifact.retry_only {
+            return Err(self.recover_interrupted_capture(operation_id, mode, capture, trace));
+        }
         let Self {
             app,
             services,
             state,
             storage,
+            ..
         } = *self;
         let Captured {
+            checkpoint,
             settings,
             artifact,
             mut artifact_cleanup,
@@ -258,6 +298,7 @@ impl RecordingDriver for Desktop<'_> {
             stop_timings,
             translation_target,
             mut draft,
+            live_session_lost,
             edit_session,
             ask_session,
             smart_route,
@@ -282,6 +323,15 @@ impl RecordingDriver for Desktop<'_> {
             mode,
             crate::app_context::history_category(app_context.as_ref()),
         );
+        if live_session_lost && !services.lifecycle.is_dictation_test(operation_id) {
+            let _ = metrics.add_metric(
+                "live_drain",
+                Some(&settings.asr_backend),
+                None,
+                false,
+                Some("live_session_lost"),
+            );
+        }
         // Stop-path timings are written once the take ends here or, after
         // delivery, by `deliver`. Dictation tests record none.
         let record_stop_timings = || {
@@ -401,6 +451,19 @@ impl RecordingDriver for Desktop<'_> {
         let transcript = match transcript_result {
             Ok(value) => value,
             Err((error, failure)) => {
+                if services.lifecycle.is_cancelled(operation_id) {
+                    record_stop_timings();
+                    report_temp_cleanup(app, &mut artifact_cleanup);
+                    emit_state(app, state, AppPhase::Idle, cancel_message);
+                    return Err(cancel_error.into());
+                }
+                // Failed recognition can keep a History row. Claim its terminal
+                // disposition before a concurrent cancel could accept the take.
+                services
+                    .lifecycle
+                    .commit_side_effect(operation_id, || Ok::<_, std::convert::Infallible>(()))
+                    .map_err(str::to_owned)?
+                    .expect("infallible cancellation fence");
                 let dictation_test = services.lifecycle.is_dictation_test(operation_id);
                 let _ = if dictation_test {
                     Ok(())
@@ -421,7 +484,7 @@ impl RecordingDriver for Desktop<'_> {
                     None
                 } else {
                     preserve_failed_take(
-                        storage,
+                        &storage.for_recorded_history(checkpoint.clone()),
                         &settings,
                         failed_take_history_item(
                             mode,
@@ -498,7 +561,13 @@ impl RecordingDriver for Desktop<'_> {
             trace: trace.clone(),
             smart_route,
         };
-        Ok((take, edit_session, ask_session))
+        Ok((
+            take,
+            edit_session,
+            ask_session,
+            live_session_lost,
+            checkpoint,
+        ))
     }
     async fn deliver(
         &self,
@@ -513,13 +582,16 @@ impl RecordingDriver for Desktop<'_> {
             services,
             state,
             storage,
+            ..
         } = *self;
-        let (mut take, mut edit_session, mut ask_session) = recognized;
+        let (mut take, mut edit_session, mut ask_session, live_session_lost, checkpoint) =
+            recognized;
+        let history_storage = storage.for_recorded_history(checkpoint);
         let context = PipelineContext {
             app,
             services,
             state,
-            storage,
+            storage: &history_storage,
             operation_id,
         };
         if services.lifecycle.is_dictation_test(operation_id) {
@@ -528,8 +600,6 @@ impl RecordingDriver for Desktop<'_> {
         // Attributed to the recognized mode, like the `asr` metric of the
         // same take, even when automatic routing changes the delivered mode.
         let metric_mode = take.mode;
-        let routed =
-            super::routing::route(&context, &mut take, &mut edit_session, &mut ask_session).await;
         // Captured before the mode finish consumes the take; written after it.
         let stop_timings = take.stop_timings;
         let metric_context = take.app_context.clone();
@@ -543,6 +613,13 @@ impl RecordingDriver for Desktop<'_> {
                 &asr_backend,
             );
         };
+        if live_session_lost {
+            let result = recover_live_transcript(context, take);
+            record_stop_timings();
+            return result;
+        }
+        let routed =
+            super::routing::route(&context, &mut take, &mut edit_session, &mut ask_session).await;
         if let Err(error) = routed {
             record_stop_timings();
             if services.lifecycle.is_cancelled(operation_id) {
@@ -580,6 +657,159 @@ impl RecordingDriver for Desktop<'_> {
     }
 }
 
+impl Desktop<'_> {
+    fn recover_interrupted_capture(
+        &self,
+        operation_id: u64,
+        mode: PipelineMode,
+        capture: Captured,
+        trace: &TakeTrace,
+    ) -> String {
+        let mode = capture.smart_route.map_or(mode, SmartRoute::mode);
+        trace.stage(TakeStage::Capture);
+        if self.services.lifecycle.is_dictation_test(operation_id) {
+            emit_state(
+                self.app,
+                self.state,
+                AppPhase::Error,
+                MICROPHONE_DISCONNECTED_WITHOUT_SPEECH,
+            );
+            return MICROPHONE_DISCONNECTED_WITHOUT_SPEECH.into();
+        }
+        let completion = self.storage.reserve_completion();
+        if let Err(error) = self
+            .services
+            .lifecycle
+            .commit_side_effect(operation_id, || Ok::<_, std::convert::Infallible>(()))
+        {
+            if self.services.lifecycle.is_cancelled(operation_id) {
+                let (message, error) = cancellation_copy(mode);
+                emit_state(self.app, self.state, AppPhase::Idle, message);
+                return error.into();
+            }
+            return error.into();
+        }
+        emit_state(
+            self.app,
+            self.state,
+            AppPhase::Error,
+            INTERRUPTED_CAPTURE_REJECTED,
+        );
+        let app = self.app.clone();
+        let storage = self
+            .storage
+            .for_recorded_history(capture.checkpoint.clone());
+        let Captured {
+            settings,
+            artifact,
+            mut artifact_cleanup,
+            edit_session,
+            translation_target,
+            ..
+        } = capture;
+        completion.defer(move || {
+            let asr_provider = model_identity(&settings)
+                .0
+                .unwrap_or_else(|| settings.asr_backend.clone());
+            let item = failed_take_history_item(
+                mode,
+                &asr_provider,
+                edit_session
+                    .as_ref()
+                    .map(|session| session.selection.text()),
+                translation_target.as_deref(),
+                None,
+                artifact.duration.as_millis() as u64,
+            );
+            if let Some(retention) = preserve_failed_take(&storage, &settings, item, &artifact.path)
+            {
+                let _ = app.emit(HISTORY_CHANGED_EVENT, ());
+                let message = match retention {
+                    crate::storage::FailedTakeRetention::Normal => {
+                        "The interrupted recording was saved to History. You can retry it there."
+                    }
+                    crate::storage::FailedTakeRetention::Temporary => {
+                        "The interrupted recording is available to retry from History for 24 hours."
+                    }
+                };
+                emit_status(&app, "interrupted_recording_saved", message);
+            }
+            report_temp_cleanup(&app, &mut artifact_cleanup);
+        });
+        INTERRUPTED_CAPTURE_REJECTED.into()
+    }
+}
+
+/// The full take still has a transcript, but its preview owner and insertion
+/// state were lost. Recover only the transcript through the app and History.
+fn recover_live_transcript(
+    context: PipelineContext<'_>,
+    mut take: RecordedTake,
+) -> Result<RecordingResult, String> {
+    let PipelineContext {
+        app,
+        services,
+        state,
+        storage,
+        operation_id,
+    } = context;
+    take.trace.stage(TakeStage::Delivery);
+    // Reserve before publishing so a privacy deletion waits for the
+    // recovered take. Keep the potentially slow WAV copy off the lifecycle lock.
+    let completion = storage.reserve_completion();
+    if let Err(error) = services
+        .lifecycle
+        .commit_side_effect(operation_id, || Ok::<_, std::convert::Infallible>(()))
+    {
+        if services.lifecycle.is_cancelled(operation_id) {
+            let (message, error) = cancellation_copy(take.mode);
+            emit_state(app, state, AppPhase::Idle, message);
+            return Err(error.into());
+        }
+        return Err(error.into());
+    }
+    take.trace.outcome(TakeOutcome::InsertionFailed);
+    crate::evaluation::insertion_detail(operation_id, Some("backend_failure"));
+    let _ = app.emit(
+        "app-state",
+        state.publish_result(take.transcript.text.clone()),
+    );
+    emit_state(app, state, AppPhase::Error, INSERTION_FAILED);
+    let app = app.clone();
+    let storage = storage.clone();
+    let latency_ms = take.started.elapsed().as_millis() as i64;
+    completion.defer(move || {
+        let (history_status, saved) = save_history_reporting_row(
+            &storage,
+            &NewHistoryItem {
+                transcript_text: &take.transcript.text,
+                processed_text: None,
+                source_text: None,
+                instruction_text: None,
+                action_kind: None,
+                search_site: None,
+                mode: "faithful",
+                asr_provider: &take.transcript.model,
+                llm_provider: None,
+                target_language: None,
+                app_category: app_context::history_category(take.app_context.as_ref()),
+                duration_ms: Some(take.artifact.duration.as_millis() as i64),
+                latency_ms: Some(latency_ms),
+                retry_of_id: None,
+                insertion_result: Some("insertion_failed"),
+                insertion_detail: Some("backend_failure"),
+            },
+            Some(&take.artifact.path),
+        );
+        if saved {
+            let _ = app.emit(HISTORY_CHANGED_EVENT, ());
+        }
+        report_history_save_warning(&app, history_status);
+        report_temp_cleanup(&app, &mut take.artifact_cleanup);
+    });
+    Err(INSERTION_FAILED.into())
+}
+
 pub(crate) async fn run(
     app: &AppHandle,
     services: &Services,
@@ -587,16 +817,18 @@ pub(crate) async fn run(
     storage: &Storage,
     reason: StopReason,
 ) -> Result<RecordingResult, String> {
-    super::orchestration::run(
-        &Desktop {
-            app,
-            services,
-            state,
-            storage,
-        },
-        reason,
-    )
-    .await
+    let driver = Desktop {
+        app,
+        services,
+        state,
+        storage,
+        operation_id: OnceLock::new(),
+    };
+    let result = super::orchestration::run(&driver, reason).await;
+    if let Some(&id) = driver.operation_id.get() {
+        storage.clear_stopping_checkpoint(id);
+    }
+    result
 }
 
 #[cfg(test)]

@@ -4,20 +4,25 @@
 //! handles are copied while the clipboard is open, then transferred one by
 //! one only after `SetClipboardData` succeeds.
 
-use super::{ClipboardExclusion, InjectionError, WriteError};
+use super::{
+    ClipboardExclusion, ClipboardStamp, ClipboardWrite, InjectionError, TargetWindow, WriteError,
+};
 use std::mem::size_of;
 use std::ptr;
 use std::thread;
 use std::time::Duration;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, GlobalFree, ERROR_SUCCESS, HANDLE, HGLOBAL, HWND, LPARAM, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     CopyEnhMetaFileW, DeleteEnhMetaFile, DeleteMetaFile, DeleteObject, HENHMETAFILE, HGDIOBJ,
     HMETAFILE,
 };
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
-    GetClipboardSequenceNumber, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardOwner,
+    GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
@@ -110,14 +115,28 @@ impl Drop for OwnedData {
 }
 
 struct ClipboardGuard {
-    _owner: HWND,
+    owner: HWND,
+    open: bool,
+    destroy_owner: bool,
+}
+
+impl ClipboardGuard {
+    fn close(&mut self) -> Result<(), InjectionError> {
+        unsafe { CloseClipboard() }.map_err(|_| InjectionError::ClipboardUnavailable)?;
+        self.open = false;
+        Ok(())
+    }
 }
 
 impl Drop for ClipboardGuard {
     fn drop(&mut self) {
         unsafe {
-            let _ = CloseClipboard();
-            let _ = DestroyWindow(self._owner);
+            if self.open {
+                let _ = CloseClipboard();
+            }
+            if self.destroy_owner {
+                let _ = DestroyWindow(self.owner);
+            }
         }
     }
 }
@@ -128,8 +147,13 @@ unsafe extern "system" fn owner_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
+    if delayed::handle_message(hwnd, msg, wparam) {
+        return windows::Win32::Foundation::LRESULT(0);
+    }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
+
+mod delayed;
 
 fn owner_window() -> Result<HWND, InjectionError> {
     static CLASS: &[u16] = &[
@@ -188,17 +212,26 @@ fn owner_window() -> Result<HWND, InjectionError> {
 }
 
 fn open_clipboard() -> Result<ClipboardGuard, InjectionError> {
-    let owner = owner_window()?;
+    open_with_owner(owner_window()?, true)
+}
+
+fn open_with_owner(owner: HWND, destroy_owner: bool) -> Result<ClipboardGuard, InjectionError> {
     for delay in std::iter::once(0).chain(OPEN_BACKOFF_MS) {
         if delay > 0 {
             thread::sleep(Duration::from_millis(delay));
         }
         if unsafe { OpenClipboard(owner) }.is_ok() {
-            return Ok(ClipboardGuard { _owner: owner });
+            return Ok(ClipboardGuard {
+                owner,
+                open: true,
+                destroy_owner,
+            });
         }
     }
-    unsafe {
-        let _ = DestroyWindow(owner);
+    if destroy_owner {
+        unsafe {
+            let _ = DestroyWindow(owner);
+        }
     }
     Err(InjectionError::ClipboardUnavailable)
 }
@@ -305,14 +338,11 @@ fn set_entry(entry: &mut Entry) -> Result<(), InjectionError> {
     unsafe { SetClipboardData(entry.format, handle) }
         .map_err(|_| InjectionError::ClipboardUnavailable)?;
     // The clipboard owns the handle now; prevent Drop from freeing it.
-    entry.data = match std::mem::replace(&mut entry.data, OwnedData::Hglobal(HGLOBAL::default())) {
-        OwnedData::Hglobal(_) => OwnedData::Hglobal(HGLOBAL::default()),
-        OwnedData::Gdi { .. } => OwnedData::Gdi {
-            handle: HGDIOBJ::default(),
-            kind: GdiKind::Object,
-        },
-        OwnedData::EnhMeta(_) => OwnedData::EnhMeta(HENHMETAFILE::default()),
-    };
+    match &mut entry.data {
+        OwnedData::Hglobal(handle) => *handle = HGLOBAL::default(),
+        OwnedData::Gdi { handle, .. } => *handle = HGDIOBJ::default(),
+        OwnedData::EnhMeta(handle) => *handle = HENHMETAFILE::default(),
+    }
     Ok(())
 }
 
@@ -410,8 +440,13 @@ fn can_add_restore_markers(format_count: usize) -> bool {
 
 /// A clipboard that stays locked is `ClipboardUnavailable`; one that opens
 /// but cannot be copied is `ClipboardUnpreservable`.
+#[cfg(test)]
 pub(super) fn snapshot() -> Result<Snapshot, InjectionError> {
     let _guard = open_clipboard()?;
+    snapshot_opened()
+}
+
+fn snapshot_opened() -> Result<Snapshot, InjectionError> {
     let mut entries = Vec::new();
     let mut format = unsafe { EnumClipboardFormats(0) };
     while format != 0 {
@@ -428,83 +463,220 @@ pub(super) fn snapshot() -> Result<Snapshot, InjectionError> {
         entries.push(Entry { format, data });
         format = unsafe { EnumClipboardFormats(format) };
     }
+    if unsafe { GetLastError() } != ERROR_SUCCESS {
+        return Err(InjectionError::ClipboardUnpreservable);
+    }
     Ok(Snapshot { entries })
 }
 
-/// Only a failure after EmptyClipboard changed the clipboard; failing to open
-/// it (another process holds it, perhaps while placing a newer copy) did not.
-pub(super) fn write(text: &str, exclusion: ClipboardExclusion) -> Result<u32, WriteError> {
-    let mut emptied = false;
-    let result = write_opened(text, exclusion, &mut emptied);
-    // Closing materializes synthesized formats and advances the sequence.
-    let sequence = unsafe { GetClipboardSequenceNumber() };
-    match result {
-        Ok(()) => Ok(sequence),
-        Err(error) if emptied => Err(WriteError::AfterEmpty { error, sequence }),
-        Err(error) => Err(WriteError::Untouched(error)),
-    }
+pub(super) fn sequence() -> u32 {
+    unsafe { GetClipboardSequenceNumber() }
 }
 
-fn write_opened(
+/// Hold the clipboard open across capture and replacement. After closing,
+/// only accept the sequence if the same window still owns the clipboard.
+pub(super) fn write(
     text: &str,
     exclusion: ClipboardExclusion,
-    emptied: &mut bool,
-) -> Result<(), InjectionError> {
-    {
-        let _guard = open_clipboard()?;
-        unsafe { EmptyClipboard() }.map_err(|_| InjectionError::ClipboardUnavailable)?;
-        *emptied = true;
-        if exclusion == ClipboardExclusion::ExcludeFromHistory && !apply_history_exclusion() {
-            return Err(InjectionError::ClipboardUnavailable);
-        }
-        let utf16: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
-        let allocation = unsafe { GlobalAlloc(GMEM_MOVEABLE, utf16.len() * size_of::<u16>()) }
-            .map_err(|_| InjectionError::ClipboardUnavailable)?;
-        let destination = unsafe { GlobalLock(allocation) } as *mut u16;
-        if destination.is_null() {
-            unsafe {
-                let _ = GlobalFree(allocation);
-            }
-            return Err(InjectionError::ClipboardUnavailable);
-        }
-        unsafe {
-            ptr::copy_nonoverlapping(utf16.as_ptr(), destination, utf16.len());
-            let _ = GlobalUnlock(allocation);
-        }
-        unsafe { SetClipboardData(CF_UNICODETEXT, HANDLE(allocation.0)) }.map_err(|_| {
-            unsafe {
-                let _ = GlobalFree(allocation);
-            };
-            InjectionError::ClipboardUnavailable
-        })?;
-    }
-    Ok(())
+    preserve: bool,
+) -> Result<ClipboardWrite<Snapshot>, WriteError<Snapshot>> {
+    let payload = Payload::Eager(unicode_entry(text).map_err(WriteError::Unowned)?);
+    publish(payload, exclusion, preserve)
 }
 
-pub(super) fn restore(
+pub(super) fn write_terminal(
+    text: &str,
+    target: &TargetWindow,
+) -> Result<ClipboardWrite<Snapshot>, WriteError<Snapshot>> {
+    let exclusion = ClipboardExclusion::ExcludeFromHistory;
+    match delayed::Receipt::start(text, target) {
+        Some(receipt) => publish(Payload::Delayed(receipt), exclusion, true),
+        None => write(text, exclusion, true),
+    }
+}
+
+enum Payload {
+    Eager(Entry),
+    Delayed(delayed::Receipt),
+}
+
+fn publish(
+    mut payload: Payload,
+    exclusion: ClipboardExclusion,
+    preserve: bool,
+) -> Result<ClipboardWrite<Snapshot>, WriteError<Snapshot>> {
+    // Allocate the Unicode handle before clearing the user's clipboard.
+    let mut guard = match &payload {
+        Payload::Eager(_) => open_clipboard(),
+        Payload::Delayed(receipt) => open_with_owner(receipt.owner(), false),
+    }
+    .map_err(WriteError::Unowned)?;
+    let previous = if preserve {
+        Some(
+            snapshot_opened()
+                .map_err(|_| WriteError::Unowned(InjectionError::ClipboardProtected))?,
+        )
+    } else {
+        None
+    };
+    unsafe { EmptyClipboard() }
+        .map_err(|_| WriteError::Unowned(InjectionError::ClipboardUnavailable))?;
+    let result =
+        if exclusion == ClipboardExclusion::ExcludeFromHistory && !apply_history_exclusion() {
+            Err(InjectionError::ClipboardUnavailable)
+        } else {
+            match &mut payload {
+                Payload::Eager(entry) => set_entry(entry),
+                Payload::Delayed(receipt) => {
+                    // A successful delayed registration also returns NULL.
+                    unsafe {
+                        let _ = SetClipboardData(CF_UNICODETEXT, None);
+                        IsClipboardFormatAvailable(CF_UNICODETEXT)
+                            .map_err(|_| InjectionError::ClipboardUnavailable)
+                            .map(|()| receipt.registered())
+                    }
+                }
+            }
+        };
+    // Close materializes synthesized formats. Read the sequence before the
+    // owner check, while the unique owner window is still alive.
+    guard.close().map_err(|_| WriteError::CloseFailed)?;
+    let sequence = sequence();
+    if !unsafe { GetClipboardOwner() }.is_ok_and(|owner| owner == guard.owner) {
+        return Err(WriteError::Unowned(InjectionError::ClipboardChanged));
+    }
+    let mut write = ClipboardWrite::eager(sequence, previous);
+    if let Payload::Delayed(receipt) = payload {
+        write.receipt = Some(Box::new(receipt));
+    }
+    match result {
+        Ok(()) => Ok(write),
+        Err(error) => Err(WriteError::AfterEmpty { error, write }),
+    }
+}
+
+fn unicode_entry(text: &str) -> Result<Entry, InjectionError> {
+    if text.contains('\0') {
+        return Err(InjectionError::BackendFailure(
+            "clipboard text contains an embedded NUL",
+        ));
+    }
+    let utf16: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    let allocation = unsafe { GlobalAlloc(GMEM_MOVEABLE, utf16.len() * size_of::<u16>()) }
+        .map_err(|_| InjectionError::ClipboardUnavailable)?;
+    let data = OwnedData::Hglobal(allocation);
+    let destination = unsafe { GlobalLock(allocation) } as *mut u16;
+    if destination.is_null() {
+        return Err(InjectionError::ClipboardUnavailable);
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(utf16.as_ptr(), destination, utf16.len());
+        let _ = GlobalUnlock(allocation);
+    }
+    Ok(Entry {
+        format: CF_UNICODETEXT,
+        data,
+    })
+}
+
+#[cfg(test)]
+pub(super) fn restore(snapshot: Snapshot, expected_sequence: u32) -> Result<bool, InjectionError> {
+    restore_owned(
+        snapshot,
+        ClipboardStamp {
+            sequence: expected_sequence,
+            owner: None,
+        },
+    )
+}
+
+pub(super) fn restore_owned(
     mut snapshot: Snapshot,
-    expected_sequence: u32,
+    expected: ClipboardStamp,
 ) -> Result<bool, InjectionError> {
-    let _guard = open_clipboard()?;
-    if unsafe { GetClipboardSequenceNumber() } != expected_sequence {
+    let mut guard = open_clipboard()?;
+    if sequence() != expected.sequence
+        || expected.owner.is_some_and(|owner| {
+            !unsafe { GetClipboardOwner() }.is_ok_and(|current| current.0 as isize == owner)
+        })
+    {
+        guard.close()?;
         return Ok(false);
     }
     unsafe { EmptyClipboard() }.map_err(|_| InjectionError::ClipboardUnavailable)?;
-    for entry in &mut snapshot.entries {
-        set_entry(entry)?;
+    // Include marker publication in the work completed before closing.
+    let result = restore_entries(
+        &mut snapshot.entries,
+        set_entry,
+        |entries| {
+            // Preserve an empty clipboard and leave room under the format cap.
+            if can_add_restore_markers(entries.len()) {
+                let present: Vec<u32> = entries.iter().map(|entry| entry.format).collect();
+                if !apply_history_exclusion_except(&present) {
+                    return Err(InjectionError::ClipboardUnavailable);
+                }
+            }
+            Ok(())
+        },
+        || guard.close(),
+    );
+    result.map(|()| true)
+}
+
+fn restore_entries<T>(
+    entries: &mut [T],
+    mut publish: impl FnMut(&mut T) -> Result<(), InjectionError>,
+    finish_publication: impl FnOnce(&[T]) -> Result<(), InjectionError>,
+    close: impl FnOnce() -> Result<(), InjectionError>,
+) -> Result<(), InjectionError> {
+    let mut result = Ok(());
+    for entry in entries.iter_mut() {
+        result = result.and(publish(entry));
     }
-    // Avoid recording or uploading restored content. Preserve an empty
-    // clipboard and leave room for every added format under the snapshot cap.
-    if can_add_restore_markers(snapshot.entries.len()) {
-        let present: Vec<u32> = snapshot.entries.iter().map(|entry| entry.format).collect();
-        let _ = apply_history_exclusion_except(&present);
-    }
-    Ok(true)
+    result.and(finish_publication(entries)).and(close())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_attempts_later_formats_and_reports_publication_or_close_failure() {
+        for (failed_format, failed_close) in [(true, false), (false, true), (false, false)] {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let result = restore_entries(
+                &mut [1, 2, 3],
+                |format| {
+                    calls.borrow_mut().push(*format);
+                    if *format == 2 && failed_format {
+                        return Err(InjectionError::ClipboardUnavailable);
+                    }
+                    Ok(())
+                },
+                |_| {
+                    calls.borrow_mut().push(4);
+                    Ok(())
+                },
+                || {
+                    calls.borrow_mut().push(5);
+                    if failed_close {
+                        return Err(InjectionError::ClipboardUnavailable);
+                    }
+                    Ok(())
+                },
+            );
+            assert_eq!(*calls.borrow(), [1, 2, 3, 4, 5]);
+            assert_eq!(result.is_err(), failed_format || failed_close);
+        }
+    }
+
+    #[test]
+    fn embedded_nul_cannot_be_published_as_truncated_unicode_text() {
+        assert!(matches!(
+            unicode_entry("prefix\0suffix"),
+            Err(InjectionError::BackendFailure(_))
+        ));
+    }
 
     #[test]
     fn a_locked_clipboard_is_retried_for_a_bounded_time() {
@@ -528,21 +700,13 @@ mod tests {
     #[test]
     #[ignore = "changes the real clipboard and requires an interactive Windows desktop"]
     fn native_clipboard_write_and_restore_round_trip() {
-        let original = snapshot().expect("snapshot the current clipboard");
-        let cleanup = snapshot().expect("snapshot the current clipboard for failure cleanup");
-        let sequence = write(
+        let write = write(
             "local voice input clipboard round-trip",
             ClipboardExclusion::ExcludeFromHistory,
+            true,
         )
         .expect("write the test clipboard payload");
-        let restored = restore(original, sequence).expect("restore the original clipboard");
-        if !restored {
-            let current_sequence = unsafe { GetClipboardSequenceNumber() };
-            assert!(
-                restore(cleanup, current_sequence).expect("clean up the test clipboard payload"),
-                "clipboard changed externally before failure cleanup"
-            );
-            panic!("clipboard sequence changed between write and restore");
-        }
+        assert!(restore(write.previous.unwrap(), write.sequence)
+            .expect("restore the original clipboard"));
     }
 }

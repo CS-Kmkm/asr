@@ -202,6 +202,7 @@ impl Storage {
         self.wait_for_deferred_completions();
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
+        let epoch = Self::advance_capture_spool_epoch(&transaction)?;
         let filenames = {
             let mut statement = transaction.prepare(
                 "SELECT audio_filename FROM dictation_history WHERE audio_filename IS NOT NULL",
@@ -222,6 +223,7 @@ impl Storage {
         transaction.commit()?;
         self.checkpoint_after_deletion(&connection);
         drop(connection);
+        self.delete_stale_capture_spools(Some(epoch));
         let _ = self.retry_pending_audio_deletions();
         Ok(changed)
     }

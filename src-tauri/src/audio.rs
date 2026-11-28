@@ -4,6 +4,9 @@
 //! the DSP and lifecycle code without requiring native ALSA development packages.
 
 mod dsp;
+#[cfg(all(test, target_os = "windows"))]
+mod hotplug_test;
+pub(crate) mod spool;
 mod vad;
 mod wav;
 
@@ -11,13 +14,13 @@ mod wav;
 pub use dsp::enhance_audio;
 pub use dsp::meter;
 use dsp::resample_linear_owned;
-pub(crate) use dsp::AntiAlias;
+pub(crate) use dsp::StreamingResampler;
 #[cfg(test)]
 pub use dsp::{interleaved_to_mono, resample_linear};
 #[cfg(test)]
 pub use vad::VoiceActivityDetector;
 pub use vad::{EnergyVad, EnergyVadConfig, VadAnalysis};
-pub(crate) use wav::read_pcm16_wav;
+pub(crate) use wav::{read_pcm16_wav, read_pcm16_wav_file};
 use wav::{temporary_wav_path, write_pcm16_wav};
 
 use serde::Serialize;
@@ -29,6 +32,8 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "windows")]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -48,6 +53,10 @@ const DEVICE_NAME_ID_PREFIX: &str = "name:";
 /// Default amount of audio retained ahead of a hotkey press so the leading edge
 /// of speech is never clipped by stream warm-up latency.
 pub const DEFAULT_PREROLL: Duration = Duration::from_millis(300);
+#[cfg(target_os = "windows")]
+const REOPEN_WINDOW: Duration = Duration::from_secs(3);
+#[cfg(target_os = "windows")]
+const MAX_REOPEN_RATE: u32 = 384_000;
 
 pub type AudioFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, AudioError>> + Send + 'a>>;
 
@@ -77,6 +86,9 @@ pub trait AudioCapture: Send {
         let _ = tail;
         false
     }
+    fn checkpoint(&self) -> Option<spool::Checkpoint> {
+        None
+    }
     fn stop(&mut self) -> AudioFuture<'_, AudioArtifact>;
     fn cancel(&mut self) -> AudioFuture<'_, ()>;
     #[cfg(test)]
@@ -84,6 +96,11 @@ pub trait AudioCapture: Send {
     fn level(&self) -> LevelMeter;
     fn stream_error(&self) -> Option<String> {
         None
+    }
+    /// Starts or polls a single replacement for a failed active stream.
+    /// True means it is pending or has been adopted by this take.
+    fn recover_stream(&mut self) -> bool {
+        false
     }
     /// Whether the open stream uses the default input device because the
     /// requested one was missing (see `CaptureConfig::fallback_to_default`).
@@ -117,6 +134,10 @@ pub struct CaptureConfig {
     pub vad: EnergyVadConfig,
     pub enhancement: AudioEnhancementConfig,
     pub artifact_directory: Option<PathBuf>,
+    /// Allow an interrupted recording rejected by the normal speech gate
+    /// to be handed to the caller for explicitly requested History retry.
+    pub retain_interrupted_audio: bool,
+    pub(crate) crash_spool: Option<spool::Policy>,
 }
 
 impl Default for CaptureConfig {
@@ -130,6 +151,8 @@ impl Default for CaptureConfig {
             vad: EnergyVadConfig::default(),
             enhancement: AudioEnhancementConfig::default(),
             artifact_directory: None,
+            retain_interrupted_audio: false,
+            crash_spool: None,
         }
     }
 }
@@ -184,6 +207,8 @@ pub struct AudioArtifact {
     /// Set when the input stream failed during the take. The artifact holds
     /// the audio captured before the failure.
     pub warning: Option<String>,
+    /// This take failed the automatic speech gate and is for manual Retry.
+    pub retry_only: bool,
 }
 
 #[derive(Clone)]
@@ -247,7 +272,7 @@ impl AudioSnapshot {
     }
 
     pub(crate) fn prepare(self) -> Result<PreparedAudio, AudioError> {
-        prepare_samples(self.samples, self.input_sample_rate, self.config)
+        prepare_samples(self.samples, self.input_sample_rate, self.config, false)
     }
 
     #[cfg(test)]
@@ -416,7 +441,7 @@ impl PreparedAudio {
     }
 
     pub(crate) fn into_artifact(self) -> Result<AudioArtifact, AudioError> {
-        write_prepared_audio(self.samples, &self.config)
+        write_prepared_audio(self.samples, &self.config, false)
     }
 }
 
@@ -571,6 +596,7 @@ impl PrerollBuffer {
 pub enum AudioError {
     AlreadyCapturing,
     NotCapturing,
+    Recovering,
     Cancelled,
     // The portable backend constructs this; WASAPI builds do not.
     #[cfg_attr(target_os = "windows", allow(dead_code))]
@@ -595,6 +621,7 @@ impl fmt::Display for AudioError {
         match self {
             Self::AlreadyCapturing => write!(formatter, "audio capture is already running"),
             Self::NotCapturing => write!(formatter, "audio capture is not running"),
+            Self::Recovering => write!(formatter, "audio input is recovering"),
             Self::Cancelled => write!(formatter, "audio capture was cancelled"),
             Self::UnsupportedPlatform => {
                 write!(formatter, "microphone capture is supported on Windows only")
@@ -649,12 +676,38 @@ impl From<io::Error> for AudioError {
 struct SharedCapture {
     /// Samples accumulated while `recording` is true.
     samples: Vec<f32>,
+    sample_limit: Option<usize>,
     /// Most recent pre-press audio; drained into `samples` when recording starts.
     preroll: PrerollBuffer,
     /// Whether the stream callback is currently accumulating into `samples`.
     recording: bool,
     level: LevelMeter,
     stream_error: Option<String>,
+    last_armed_input: Option<Duration>,
+    last_recording_input: Option<Duration>,
+    replacement_rate: Option<(u32, StreamingResampler)>,
+}
+
+const INPUT_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+/// Recordings stop automatically at this length and are transcribed as usual.
+pub(crate) const MAX_RECORDING_DURATION: Duration = Duration::from_secs(15 * 60);
+const INPUT_FRAME_TIMEOUT_ERROR: &str = "microphone stopped delivering input frames";
+
+fn recording_input_time() -> Duration {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::System::SystemInformation::GetTickCount64;
+        // Windows uptime includes sleep and hibernation. A resumed callback
+        // can detect the gap even if it runs before the level loop wakes.
+        // SAFETY: GetTickCount64 takes no arguments and borrows no state.
+        Duration::from_millis(unsafe { GetTickCount64() })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::{sync::OnceLock, time::Instant};
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed()
+    }
 }
 
 impl SharedCapture {
@@ -672,7 +725,57 @@ impl SharedCapture {
             return;
         }
         self.samples = self.preroll.drain();
+        if let Some(limit) = self.sample_limit {
+            self.samples.truncate(limit);
+        }
+        self.last_armed_input = None;
         self.recording = true;
+        self.last_recording_input = Some(recording_input_time());
+    }
+
+    fn check_input_timeout(&mut self, now: Duration) {
+        if self.stream_error.is_none()
+            && self
+                .last_recording_input
+                .or(self.last_armed_input)
+                .is_some_and(|last| now.saturating_sub(last) >= INPUT_FRAME_TIMEOUT)
+        {
+            self.stream_error = Some(INPUT_FRAME_TIMEOUT_ERROR.into());
+        }
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    fn append_recording_frames(&mut self, frames: &mut [f32], now: Duration) {
+        self.check_input_timeout(now);
+        if self.last_recording_input.is_some() && self.stream_error.is_none() && !frames.is_empty()
+        {
+            self.last_recording_input = Some(now);
+            if let Some((rate, resampler)) = &mut self.replacement_rate {
+                if let Some(frames) = resampler.push_buffer(frames, *rate, false) {
+                    self.append_take_samples(&frames);
+                }
+            } else {
+                self.append_take_samples(frames);
+            }
+        }
+    }
+
+    fn append_take_samples(&mut self, frames: &[f32]) {
+        let remaining = self.sample_limit.map_or(frames.len(), |limit| {
+            limit.saturating_sub(self.samples.len())
+        });
+        self.samples
+            .extend_from_slice(&frames[..frames.len().min(remaining)]);
+    }
+
+    fn seal_recording(&mut self) {
+        self.recording = false;
+        self.last_recording_input = None;
+        if let Some((rate, mut resampler)) = self.replacement_rate.take() {
+            if let Some(tail) = resampler.push(Vec::new(), rate, true) {
+                self.append_take_samples(&tail);
+            }
+        }
     }
 
     /// Ends the take and hands over its samples. A stream failure (for example
@@ -680,7 +783,7 @@ impl SharedCapture {
     /// and is returned alongside as a warning; the take fails only when the
     /// stream failed before any sample was captured.
     fn finish_recording(&mut self) -> Result<(Vec<f32>, Option<String>), AudioError> {
-        self.recording = false;
+        self.seal_recording();
         let samples = std::mem::take(&mut self.samples);
         match self.stream_error.clone() {
             Some(message) if samples.is_empty() => Err(AudioError::StreamFailure(message)),
@@ -698,6 +801,21 @@ struct ActiveCapture {
     shared: Arc<Mutex<SharedCapture>>,
     #[cfg(target_os = "windows")]
     stream_worker: StreamWorker,
+}
+
+impl ActiveCapture {
+    fn begin_recording(&self) -> Result<(), AudioError> {
+        let mut shared = self
+            .shared
+            .lock()
+            .map_err(|_| AudioError::StreamFailure("capture buffer lock poisoned".into()))?;
+        shared.check_input_timeout(recording_input_time());
+        if let Some(message) = &shared.stream_error {
+            return Err(AudioError::StreamFailure(message.clone()));
+        }
+        shared.begin_recording();
+        Ok(())
+    }
 }
 
 /// Owns the CPAL stream thread without moving `cpal::Stream` between threads.
@@ -736,6 +854,23 @@ pub struct CpalAudioCapture {
     recording: bool,
     /// Receives the raw audio after its mark when this recording ends.
     final_tail: Option<FinalTail>,
+    spool: Option<spool::CaptureSpool>,
+    #[cfg(target_os = "windows")]
+    reopen: Option<ReopenAttempt>,
+}
+
+#[cfg(target_os = "windows")]
+struct ReopenAttempt {
+    deadline: Duration,
+    result: Option<mpsc::Receiver<Result<ActiveCapture, AudioError>>>,
+    allowed: Arc<AtomicBool>,
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ReopenAttempt {
+    fn drop(&mut self) {
+        self.allowed.store(false, Ordering::Release);
+    }
 }
 
 /// A blocking task can outlive its awaiting future. Remove an unclaimed WAV
@@ -760,11 +895,155 @@ impl CpalAudioCapture {
         self.recording && self.active.is_some()
     }
 
+    #[cfg(target_os = "windows")]
+    fn start_reopen(
+        &self,
+        now: Duration,
+        open: impl FnOnce(
+            CaptureConfig,
+            Arc<AtomicBool>,
+        ) -> Option<mpsc::Receiver<Result<ActiveCapture, AudioError>>>,
+    ) -> ReopenAttempt {
+        let active = self.active.as_ref().expect("capture is recording");
+        let mut config = active.config.clone();
+        // A saved microphone remains the only allowed endpoint in an
+        // existing take. A system-default take may follow the new default.
+        config.fallback_to_default = false;
+        config.preroll = REOPEN_WINDOW;
+        let _ = active.stream_worker.shutdown.send(());
+        let allowed = Arc::new(AtomicBool::new(true));
+        ReopenAttempt {
+            deadline: now + REOPEN_WINDOW,
+            result: open(config, Arc::clone(&allowed)),
+            allowed,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn adopt_reopened_stream(&mut self, mut replacement: ActiveCapture, now: Duration) -> bool {
+        let Some(original) = self.active.as_ref().filter(|_| self.recording) else {
+            tokio::task::spawn_blocking(move || drop(replacement));
+            return false;
+        };
+        let stable_rate = original.input_sample_rate;
+        let native_rate = replacement.input_sample_rate;
+        let adopted = (|| {
+            let mut old = original.shared.lock().ok()?;
+            let mut new = replacement.shared.lock().ok()?;
+            new.check_input_timeout(now);
+            if new.stream_error.is_some()
+                || old.stream_error.is_none()
+                || native_rate == 0
+                || stable_rate == 0
+            {
+                return None;
+            }
+            new.begin_recording();
+            let mut preroll = std::mem::take(&mut new.samples);
+            new.samples = std::mem::take(&mut old.samples);
+            new.sample_limit = old.sample_limit;
+            if native_rate == stable_rate {
+                new.append_take_samples(&preroll);
+            } else {
+                new.replacement_rate = Some((native_rate, StreamingResampler::new(stable_rate)));
+                new.append_recording_frames(&mut preroll, now);
+            }
+            Some(())
+        })()
+        .is_some();
+        if !adopted {
+            tokio::task::spawn_blocking(move || drop(replacement));
+            return false;
+        }
+        replacement.config = original.config.clone();
+        replacement.input_sample_rate = stable_rate;
+        if let Some(spool) = &self.spool {
+            spool.use_capture(&replacement.shared);
+        }
+        let old = self.active.replace(replacement);
+        tokio::task::spawn_blocking(move || drop(old));
+        true
+    }
+
+    /// Freeze callback admission and the timeout before scheduling teardown.
+    fn freeze_input_deadline(&self, check_time: impl FnOnce() -> Duration) {
+        if let Some(active) = self.active.as_ref() {
+            let Ok(mut shared) = active.shared.lock() else {
+                return;
+            };
+            shared.check_input_timeout(check_time());
+            shared.last_recording_input = None;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn cancel_reopen(&mut self) {
+        if let Some(attempt) = self.reopen.take() {
+            attempt.allowed.store(false, Ordering::Release);
+            tokio::task::spawn_blocking(move || drop(attempt));
+        }
+    }
+
+    fn snapshot_error(&self, message: &str) -> AudioError {
+        #[cfg(target_os = "windows")]
+        if self
+            .reopen
+            .as_ref()
+            .is_none_or(|attempt| attempt.result.is_some())
+        {
+            return AudioError::Recovering;
+        }
+        AudioError::StreamFailure(message.to_owned())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn poll_reopen(&mut self, now: Duration) -> bool {
+        let Some(attempt) = self.reopen.as_mut() else {
+            return false;
+        };
+        let Some(receiver) = attempt.result.as_ref() else {
+            return false;
+        };
+        if now >= attempt.deadline {
+            attempt.allowed.store(false, Ordering::Release);
+            let expired = attempt.result.take();
+            tokio::task::spawn_blocking(move || drop(expired));
+            return false;
+        }
+        match receiver.try_recv() {
+            Ok(Ok(replacement)) => {
+                attempt.result = None;
+                self.adopt_reopened_stream(replacement, now)
+            }
+            Err(mpsc::TryRecvError::Empty) => true,
+            Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                attempt.result = None;
+                false
+            }
+        }
+    }
+
     fn finish(&mut self, cancelled: bool) -> Result<AudioArtifact, AudioError> {
         if !self.is_recording() {
             return Err(AudioError::NotCapturing);
         }
         let mut active = self.active.take().ok_or(AudioError::NotCapturing)?;
+        let mut spool = self.spool.take();
+        let discard = |spool: Option<&spool::CaptureSpool>| {
+            if let Some(spool) = spool {
+                spool
+                    .storage
+                    .discard_capture_spool(&spool.checkpoint)
+                    .map_err(|error| AudioError::Io(io::Error::other(error)))?;
+            }
+            Ok::<(), AudioError>(())
+        };
+        // The cancellation tombstone must commit before the driver can block.
+        let cancellation = if cancelled {
+            discard(spool.as_ref())
+        } else {
+            Ok(())
+        };
         self.recording = false;
         drop_active_stream(&mut active);
         // Whatever happens below, the mark is frozen when the take ends.
@@ -777,7 +1056,14 @@ impl CpalAudioCapture {
 
         if cancelled {
             unsealed(&final_tail);
-            return Err(AudioError::Cancelled);
+            return cancellation.and(Err(AudioError::Cancelled));
+        }
+
+        if let Some(spool) = &mut spool {
+            if let Ok(mut shared) = active.shared.lock() {
+                shared.seal_recording();
+            }
+            spool.flush_and_stop();
         }
 
         let finished = active
@@ -795,7 +1081,24 @@ impl CpalAudioCapture {
         if let Some(tail) = &final_tail {
             tail.seal(&mono, active.input_sample_rate, &active.config);
         }
-        let mut artifact = finalize_samples(mono, active.input_sample_rate, &active.config)?;
+        let keep_rejected = stream_error.is_some() && active.config.retain_interrupted_audio;
+        let mut artifact = match finalize_samples(
+            mono,
+            active.input_sample_rate,
+            &active.config,
+            keep_rejected,
+        ) {
+            Ok(artifact) => artifact,
+            Err(error @ (AudioError::TooShort { .. } | AudioError::NoVoiceDetected)) => {
+                discard(spool.as_ref())?;
+                return Err(if stream_error.is_some() {
+                    AudioError::StreamFailure(error.to_string())
+                } else {
+                    error
+                });
+            }
+            Err(error) => return Err(error),
+        };
         artifact.warning = stream_error;
         Ok(artifact)
     }
@@ -812,7 +1115,7 @@ impl AudioCapture for CpalAudioCapture {
             .lock()
             .map_err(|_| AudioError::StreamFailure("capture buffer lock poisoned".into()))?;
         if let Some(message) = &shared.stream_error {
-            return Err(AudioError::StreamFailure(message.clone()));
+            return Err(self.snapshot_error(message));
         }
         Ok(AudioSnapshot {
             samples: shared.samples[((since.as_secs_f64() * f64::from(active.input_sample_rate))
@@ -842,7 +1145,7 @@ impl AudioCapture for CpalAudioCapture {
             .lock()
             .map_err(|_| AudioError::StreamFailure("capture buffer lock poisoned".into()))?;
         if let Some(message) = &shared.stream_error {
-            return Err(AudioError::StreamFailure(message.clone()));
+            return Err(self.snapshot_error(message));
         }
         let rate = active.input_sample_rate;
         // The same index rounding as `snapshot`, so durations line up.
@@ -899,24 +1202,34 @@ impl AudioCapture for CpalAudioCapture {
             validate_config(&config)?;
             // Reuse the armed stream (preserving its preroll) when present, so the
             // leading edge of speech captured during warm-up is not lost.
-            let active = match self.active.take() {
-                Some(mut active) => {
-                    // Processing-only settings can change while the stream is
-                    // armed. Use the latest values without reopening the device.
-                    active.config.enhancement = config.enhancement;
+            let mut active = match self.active.take() {
+                Some(active)
+                    if active.config.device_id == config.device_id
+                        && active.config.fallback_to_default == config.fallback_to_default
+                        && active.config.preroll == config.preroll
+                        && active.begin_recording().is_ok() =>
+                {
                     active
                 }
-                None => start_cpal_capture_off_runtime(config).await?,
-            };
-            {
-                let mut shared = active.shared.lock().map_err(|_| {
-                    AudioError::StreamFailure("capture buffer lock poisoned".into())
-                })?;
-                if let Some(message) = &shared.stream_error {
-                    return Err(AudioError::StreamFailure(message.clone()));
+                stale => {
+                    if let Some(mut active) = stale {
+                        tokio::task::spawn_blocking(move || drop_active_stream(&mut active))
+                            .await
+                            .map_err(|_| {
+                                AudioError::StreamFailure(
+                                    "audio stream shutdown task failed".into(),
+                                )
+                            })?;
+                    }
+                    let fresh = start_cpal_capture_off_runtime(config.clone()).await?;
+                    fresh.begin_recording()?;
+                    fresh
                 }
-                shared.begin_recording();
-            }
+            };
+            active.config = config;
+            self.spool = active.config.crash_spool.as_ref().and_then(|policy| {
+                spool::CaptureSpool::start(policy, active.input_sample_rate, &active.shared)
+            });
             self.active = Some(active);
             self.recording = true;
             self.final_tail = None;
@@ -924,8 +1237,15 @@ impl AudioCapture for CpalAudioCapture {
         })
     }
 
+    fn checkpoint(&self) -> Option<spool::Checkpoint> {
+        self.spool.as_ref().map(|spool| spool.checkpoint.clone())
+    }
+
     fn stop(&mut self) -> AudioFuture<'_, AudioArtifact> {
         Box::pin(async move {
+            #[cfg(target_os = "windows")]
+            self.cancel_reopen();
+            self.freeze_input_deadline(recording_input_time);
             let mut capture = std::mem::take(self);
             let mut pending =
                 tokio::task::spawn_blocking(move || PendingArtifact(Some(capture.finish(false))))
@@ -939,6 +1259,8 @@ impl AudioCapture for CpalAudioCapture {
 
     fn cancel(&mut self) -> AudioFuture<'_, ()> {
         Box::pin(async move {
+            #[cfg(target_os = "windows")]
+            self.cancel_reopen();
             let mut capture = std::mem::take(self);
             let result = tokio::task::spawn_blocking(move || capture.finish(true))
                 .await
@@ -975,12 +1297,31 @@ impl AudioCapture for CpalAudioCapture {
 
     fn stream_error(&self) -> Option<String> {
         self.active.as_ref().and_then(|active| {
-            active
-                .shared
-                .lock()
-                .ok()
-                .and_then(|shared| shared.stream_error.clone())
+            let mut shared = active.shared.lock().ok()?;
+            shared.check_input_timeout(recording_input_time());
+            shared.stream_error.clone()
         })
+    }
+
+    #[cfg(target_os = "windows")]
+    fn recover_stream(&mut self) -> bool {
+        if !self.is_recording() {
+            return false;
+        }
+        let now = recording_input_time();
+        if self.reopen.is_none() {
+            self.reopen = Some(self.start_reopen(now, |config, allowed| {
+                let (sender, result) = mpsc::sync_channel(1);
+                thread::Builder::new()
+                    .name("cpal-input-reopen".into())
+                    .spawn(move || {
+                        let _ = sender.send(start_cpal_capture_with_gate(config, Some(allowed)));
+                    })
+                    .ok()
+                    .map(|_| result)
+            }));
+        }
+        self.poll_reopen(now)
     }
 }
 
@@ -1007,19 +1348,27 @@ fn finalize_samples(
     mono_samples: Vec<f32>,
     input_sample_rate: u32,
     config: &CaptureConfig,
+    keep_rejected: bool,
 ) -> Result<AudioArtifact, AudioError> {
-    prepare_samples(mono_samples, input_sample_rate, config.clone())?.into_artifact()
+    let prepared = prepare_samples(
+        mono_samples,
+        input_sample_rate,
+        config.clone(),
+        keep_rejected,
+    )?;
+    write_prepared_audio(prepared.samples, &prepared.config, keep_rejected)
 }
 
 fn prepare_samples(
     mono_samples: Vec<f32>,
     input_sample_rate: u32,
     config: CaptureConfig,
+    keep_rejected: bool,
 ) -> Result<PreparedAudio, AudioError> {
     let mut samples =
         resample_linear_owned(mono_samples, input_sample_rate, config.target_sample_rate);
     let duration = samples_to_duration(samples.len(), config.target_sample_rate);
-    if duration < config.minimum_duration {
+    if duration < config.minimum_duration && !keep_rejected {
         return Err(AudioError::TooShort {
             actual: duration,
             minimum: config.minimum_duration,
@@ -1038,9 +1387,16 @@ fn prepare_samples(
 fn write_prepared_audio(
     samples: Vec<f32>,
     config: &CaptureConfig,
+    keep_rejected: bool,
 ) -> Result<AudioArtifact, AudioError> {
     let duration = samples_to_duration(samples.len(), config.target_sample_rate);
-    if duration < config.minimum_duration {
+    // PCM with all samples below half a PCM16 quantization step cannot
+    // contain a recoverable signal in the WAV used for Retry.
+    let recoverable = keep_rejected
+        && samples
+            .iter()
+            .any(|sample| sample.is_finite() && sample.abs() >= 0.5 / f32::from(i16::MAX));
+    if duration < config.minimum_duration && !recoverable {
         return Err(AudioError::TooShort {
             actual: duration,
             minimum: config.minimum_duration,
@@ -1049,9 +1405,10 @@ fn write_prepared_audio(
 
     let (vad, levels) =
         EnergyVad::new(config.vad).analyze_with_meter(&samples, config.target_sample_rate);
-    if !vad.contains_voice {
+    if !vad.contains_voice && !recoverable {
         return Err(AudioError::NoVoiceDetected);
     }
+    let retry_only = duration < config.minimum_duration || !vad.contains_voice;
 
     let path = temporary_wav_path(config.artifact_directory.as_deref());
     if let Err(error) = write_pcm16_wav(&path, &samples, config.target_sample_rate) {
@@ -1068,6 +1425,7 @@ fn write_prepared_audio(
         rms_level: levels.rms,
         vad,
         warning: None,
+        retry_only,
     })
 }
 
@@ -1178,13 +1536,21 @@ fn list_cpal_devices() -> Result<Vec<AudioDevice>, AudioError> {
 
 #[cfg(target_os = "windows")]
 fn start_cpal_capture(config: CaptureConfig) -> Result<ActiveCapture, AudioError> {
+    start_cpal_capture_with_gate(config, None)
+}
+
+#[cfg(target_os = "windows")]
+fn start_cpal_capture_with_gate(
+    config: CaptureConfig,
+    allowed: Option<Arc<AtomicBool>>,
+) -> Result<ActiveCapture, AudioError> {
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     let (shutdown_tx, shutdown_rx) = mpsc::channel();
     let active_config = config.clone();
     let thread = thread::Builder::new()
         .name("cpal-input-stream".into())
         .spawn(move || {
-            let startup = start_cpal_stream(config);
+            let startup = start_cpal_stream(config, allowed);
             match startup {
                 Ok(CpalStartup {
                     input_sample_rate,
@@ -1245,7 +1611,10 @@ struct CpalStartup {
 }
 
 #[cfg(target_os = "windows")]
-fn start_cpal_stream(config: CaptureConfig) -> Result<CpalStartup, AudioError> {
+fn start_cpal_stream(
+    config: CaptureConfig,
+    allowed: Option<Arc<AtomicBool>>,
+) -> Result<CpalStartup, AudioError> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     let host = cpal::default_host();
@@ -1287,12 +1656,27 @@ fn start_cpal_stream(config: CaptureConfig) -> Result<CpalStartup, AudioError> {
     let stream_config: cpal::StreamConfig = supported.clone().into();
     // Size the preroll ring against the device's native rate; resampling to the
     // target rate happens later in finalize_samples().
-    let preroll = PrerollBuffer::new(config.preroll, input_sample_rate);
-    let shared = Arc::new(Mutex::new(SharedCapture::armed(preroll)));
+    let preroll_rate = if allowed.is_some() {
+        input_sample_rate.min(MAX_REOPEN_RATE)
+    } else {
+        input_sample_rate
+    };
+    let preroll = PrerollBuffer::new(config.preroll, preroll_rate);
+    let shared = Arc::new(Mutex::new(SharedCapture {
+        sample_limit: Some(duration_to_samples(
+            MAX_RECORDING_DURATION,
+            input_sample_rate,
+        )),
+        ..SharedCapture::armed(preroll)
+    }));
     let error_shared = Arc::clone(&shared);
     let error_callback = move |error: cpal::StreamError| {
         if let Ok(mut state) = error_shared.lock() {
-            state.stream_error = Some(error.to_string());
+            // An armed stream still needs to surface faults. Once stop has
+            // frozen a recording, teardown errors belong to the closing device.
+            if !state.recording || state.last_recording_input.is_some() {
+                state.stream_error.get_or_insert_with(|| error.to_string());
+            }
         }
     };
 
@@ -1302,6 +1686,7 @@ fn start_cpal_stream(config: CaptureConfig) -> Result<CpalStartup, AudioError> {
             &stream_config,
             channels,
             Arc::clone(&shared),
+            allowed.clone(),
             error_callback,
         ),
         cpal::SampleFormat::I16 => build_input_stream::<i16>(
@@ -1309,6 +1694,7 @@ fn start_cpal_stream(config: CaptureConfig) -> Result<CpalStartup, AudioError> {
             &stream_config,
             channels,
             Arc::clone(&shared),
+            allowed.clone(),
             error_callback,
         ),
         cpal::SampleFormat::U16 => build_input_stream::<u16>(
@@ -1316,15 +1702,29 @@ fn start_cpal_stream(config: CaptureConfig) -> Result<CpalStartup, AudioError> {
             &stream_config,
             channels,
             Arc::clone(&shared),
+            allowed.clone(),
             error_callback,
         ),
         format => Err(AudioError::DeviceConfiguration(format!(
             "unsupported sample format: {format:?}"
         ))),
     }?;
+    if allowed
+        .as_ref()
+        .is_some_and(|gate| !gate.load(Ordering::Acquire))
+    {
+        return Err(AudioError::Cancelled);
+    }
     stream
         .play()
         .map_err(|error| AudioError::StreamPlay(error.to_string()))?;
+    // Opening a device can block before play succeeds. Budget the first
+    // frame from a live stream, preserving any callback that already ran.
+    shared
+        .lock()
+        .map_err(|_| AudioError::StreamFailure("capture buffer lock poisoned".into()))?
+        .last_armed_input
+        .get_or_insert_with(recording_input_time);
 
     Ok(CpalStartup {
         input_sample_rate,
@@ -1345,6 +1745,7 @@ fn build_input_stream<T>(
     config: &cpal::StreamConfig,
     channels: u16,
     shared: Arc<Mutex<SharedCapture>>,
+    allowed: Option<Arc<AtomicBool>>,
     error_callback: impl FnMut(cpal::StreamError) + Send + 'static,
 ) -> Result<cpal::Stream, AudioError>
 where
@@ -1352,38 +1753,54 @@ where
     f32: cpal::FromSample<T>,
 {
     use cpal::traits::DeviceTrait;
+    let mut mono = Vec::with_capacity(1024);
 
     device
         .build_input_stream(
             config,
             move |data: &[T], _| {
+                if allowed
+                    .as_ref()
+                    .is_some_and(|gate| !gate.load(Ordering::Acquire))
+                {
+                    return;
+                }
                 // Convert and downmix directly into the mono buffer. The old
                 // path first allocated a full interleaved f32 copy on every
                 // callback, briefly doubling callback memory and copy work.
                 let channel_count = channels as usize;
-                let mono: Vec<f32> = if channel_count == 0 {
-                    Vec::new()
-                } else {
-                    data.chunks_exact(channel_count)
-                        .map(|frame| {
-                            frame
-                                .iter()
-                                .copied()
-                                .map(|sample| cpal::Sample::to_sample::<f32>(sample))
-                                .sum::<f32>()
-                                / channel_count as f32
-                        })
-                        .collect()
-                };
+                mono.clear();
+                if channel_count != 0 {
+                    mono.extend(data.chunks_exact(channel_count).map(|frame| {
+                        frame
+                            .iter()
+                            .copied()
+                            .map(|sample| cpal::Sample::to_sample::<f32>(sample))
+                            .sum::<f32>()
+                            / channel_count as f32
+                    }));
+                }
                 let current_level = meter(&mono);
                 if let Ok(mut state) = shared.lock() {
+                    if allowed
+                        .as_ref()
+                        .is_some_and(|gate| !gate.load(Ordering::Acquire))
+                    {
+                        return;
+                    }
                     state.level = current_level;
                     if state.recording {
                         // Already recording: append directly to the take. The
                         // ring stays empty so a later start cannot double-count.
-                        state.samples.extend(mono);
-                    } else {
+                        state.append_recording_frames(&mut mono, recording_input_time());
+                    } else if !mono.is_empty() && state.stream_error.is_none() {
                         // Armed: retain only the latest preroll window.
+                        let now = recording_input_time();
+                        state.check_input_timeout(now);
+                        if state.stream_error.is_some() {
+                            return;
+                        }
+                        state.last_armed_input = Some(now);
                         state.preroll.extend(&mono);
                     }
                 }
@@ -1427,7 +1844,7 @@ mod tests {
             ..CaptureConfig::default()
         };
         let samples: Vec<f32> = (0..24_000).map(|i| (i as f32 * 0.1).sin() * 0.2).collect();
-        let artifact = finalize_samples(samples, TARGET_SAMPLE_RATE, &config).unwrap();
+        let artifact = finalize_samples(samples, TARGET_SAMPLE_RATE, &config, false).unwrap();
         let path = artifact.path.clone();
         let retained = directory.path().join("unrelated.wav");
         fs::write(&retained, b"retained").unwrap();
@@ -1510,6 +1927,9 @@ mod tests {
         let mut capture = CpalAudioCapture {
             recording: true,
             final_tail: None,
+            spool: None,
+            #[cfg(target_os = "windows")]
+            reopen: None,
             active: Some(ActiveCapture {
                 config,
                 input_sample_rate: TARGET_SAMPLE_RATE,
@@ -1548,6 +1968,9 @@ mod tests {
         CpalAudioCapture {
             recording: true,
             final_tail: None,
+            spool: None,
+            #[cfg(target_os = "windows")]
+            reopen: None,
             active: Some(ActiveCapture {
                 config: CaptureConfig {
                     artifact_directory: Some(directory.to_owned()),
@@ -1604,10 +2027,11 @@ mod tests {
         assert_eq!(clamped.tail.len(), 2_400);
         // The stream error that fails a snapshot fails a probe too.
         shared.lock().unwrap().stream_error = Some("device disconnected".into());
-        assert!(matches!(
-            capture.probe(Duration::ZERO, Duration::ZERO),
-            Err(AudioError::StreamFailure(_))
-        ));
+        let error = capture.probe(Duration::ZERO, Duration::ZERO);
+        #[cfg(target_os = "windows")]
+        assert!(matches!(error, Err(AudioError::Recovering)));
+        #[cfg(not(target_os = "windows"))]
+        assert!(matches!(error, Err(AudioError::StreamFailure(_))));
     }
 
     #[tokio::test]
@@ -1684,6 +2108,146 @@ mod tests {
         artifact.remove().unwrap();
     }
 
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn reopened_device_preserves_the_prefix_and_original_sample_rate() {
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = vec![0.7; 12];
+        let original = Arc::new(Mutex::new(SharedCapture {
+            samples: prefix.clone(),
+            recording: true,
+            stream_error: Some("device disconnected".into()),
+            ..SharedCapture::default()
+        }));
+        let mut capture = recording_capture(&original, directory.path());
+        let mut next = SharedCapture::armed(PrerollBuffer::with_capacity(2));
+        next.preroll.extend(&[0.2, 0.2]);
+        let next = Arc::new(Mutex::new(next));
+        let mut replacement = recording_capture(&next, directory.path())
+            .active
+            .take()
+            .unwrap();
+        replacement.input_sample_rate = TARGET_SAMPLE_RATE / 2;
+
+        assert!(capture.adopt_reopened_stream(replacement, recording_input_time()));
+        assert_eq!(
+            capture.active.as_ref().unwrap().input_sample_rate,
+            TARGET_SAMPLE_RATE
+        );
+        let mut shared = next.lock().unwrap();
+        shared.append_recording_frames(&mut [0.2, 0.2], recording_input_time());
+        let (samples, warning) = shared.finish_recording().unwrap();
+        assert_eq!(&samples[..prefix.len()], prefix.as_slice());
+        assert_eq!(samples.len(), prefix.len() + 8);
+        assert_eq!(warning, None);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn delayed_reopen_keeps_the_whole_candidate_and_stop_revokes_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = Arc::new(Mutex::new(SharedCapture {
+            samples: vec![0.1; TARGET_SAMPLE_RATE as usize],
+            recording: true,
+            stream_error: Some("device disconnected".into()),
+            ..SharedCapture::default()
+        }));
+        let mut capture = recording_capture(&original, directory.path());
+        let now = Duration::from_secs(10);
+        assert!(matches!(
+            capture.snapshot(Duration::ZERO),
+            Err(AudioError::Recovering)
+        ));
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut candidate = None;
+        let mut gate = None;
+        capture.reopen = Some(capture.start_reopen(now, |config, allowed| {
+            let mut shared =
+                SharedCapture::armed(PrerollBuffer::new(config.preroll, TARGET_SAMPLE_RATE));
+            shared
+                .preroll
+                .extend(&vec![0.2; TARGET_SAMPLE_RATE as usize]);
+            shared
+                .preroll
+                .extend(&vec![0.3; TARGET_SAMPLE_RATE as usize]);
+            candidate = Some(
+                recording_capture(&Arc::new(Mutex::new(shared)), directory.path())
+                    .active
+                    .take()
+                    .unwrap(),
+            );
+            gate = Some(allowed);
+            Some(receiver)
+        }));
+        assert!(capture.poll_reopen(now + Duration::from_secs(1)));
+        assert!(matches!(
+            capture.snapshot(Duration::ZERO),
+            Err(AudioError::Recovering)
+        ));
+        sender.send(Ok(candidate.take().unwrap())).unwrap();
+        assert!(capture.poll_reopen(now + Duration::from_millis(2900)));
+        let samples = capture.snapshot(Duration::ZERO).unwrap().samples;
+        let rate = TARGET_SAMPLE_RATE as usize;
+        assert_eq!(samples.len(), 3 * rate);
+        assert!(samples[rate..2 * rate].iter().all(|&sample| sample == 0.2));
+        assert!(samples[2 * rate..].iter().all(|&sample| sample == 0.3));
+
+        // An outstanding reopen is revoked on stop. Even an already-built
+        // candidate cannot be adopted once the take has ended.
+        capture.reopen = Some(capture.start_reopen(now, |_, allowed| {
+            gate = Some(allowed);
+            Some(mpsc::channel().1)
+        }));
+        let late = recording_capture(&original, directory.path())
+            .active
+            .take()
+            .unwrap();
+        let stop = capture.stop().await;
+        if let Ok(artifact) = stop {
+            artifact.remove().unwrap();
+        }
+        assert!(!gate.unwrap().load(Ordering::Acquire));
+        assert!(!capture.poll_reopen(now + Duration::from_secs(1)));
+        assert!(!capture.adopt_reopened_stream(late, now + Duration::from_secs(1)));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn cancel_consumes_checkpoint_before_stalled_driver_returns() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage =
+            crate::storage::Storage::open(&directory.path().join("history.sqlite")).unwrap();
+        let shared = Arc::new(Mutex::new(SharedCapture {
+            recording: true,
+            ..SharedCapture::default()
+        }));
+        let mut capture = recording_capture(&shared, directory.path());
+        capture.spool = Some(spool::CaptureSpool::fixture(&storage, &shared));
+        let checkpoint = capture.checkpoint().unwrap();
+        let (shutdown, shutdown_rx) = mpsc::channel();
+        let (stalled, stalled_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = mpsc::channel();
+        capture.active.as_mut().unwrap().stream_worker = StreamWorker {
+            shutdown,
+            thread: Some(thread::spawn(move || {
+                shutdown_rx.recv().unwrap();
+                stalled.send(()).unwrap();
+                let _ = release_rx.recv();
+            })),
+        };
+        let cancel = capture.cancel();
+        let verify = async {
+            stalled_rx.await.unwrap();
+            assert!(!storage
+                .capture_spool_pending(&checkpoint.token, checkpoint.epoch)
+                .unwrap());
+            assert!(!checkpoint.path.exists());
+            release.send(()).unwrap();
+        };
+        let (cancelled, ()) = tokio::join!(cancel, verify);
+        cancelled.unwrap();
+    }
+
     #[tokio::test]
     async fn stream_failure_before_any_audio_still_fails_the_take() {
         let directory = tempfile::tempdir().unwrap();
@@ -1699,6 +2263,39 @@ mod tests {
         ));
         assert_eq!(capture.state(), CaptureState::Idle);
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn missing_input_frames_latch_a_failure_even_if_input_resumes_before_polling() {
+        let mut shared = SharedCapture::default();
+        shared.begin_recording();
+        let started = shared.last_recording_input.unwrap();
+        let first = started + INPUT_FRAME_TIMEOUT - Duration::from_millis(1);
+        shared.append_recording_frames(&mut [0.0; 4], first);
+        // Digital silence delivered complete frames. Empty buffers do not.
+        let next = first + INPUT_FRAME_TIMEOUT;
+        shared.append_recording_frames(&mut [], next - Duration::from_millis(1));
+        assert_eq!(shared.last_recording_input, Some(first));
+        shared.append_recording_frames(&mut [1.0; 4], next);
+        let (frames, warning) = shared.finish_recording().unwrap();
+        assert_eq!(frames, vec![0.0; 4]);
+        assert_eq!(warning.as_deref(), Some(INPUT_FRAME_TIMEOUT_ERROR));
+    }
+
+    #[test]
+    fn stopping_before_the_first_watchdog_poll_detects_an_expired_input_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let shared = Arc::new(Mutex::new(SharedCapture {
+            recording: true,
+            last_recording_input: Some(Duration::ZERO),
+            ..SharedCapture::default()
+        }));
+        let mut capture = recording_capture(&shared, directory.path());
+        capture.freeze_input_deadline(|| INPUT_FRAME_TIMEOUT);
+        assert!(matches!(
+            capture.finish(false),
+            Err(AudioError::StreamFailure(message)) if message == INPUT_FRAME_TIMEOUT_ERROR
+        ));
     }
 
     #[test]
@@ -1927,7 +2524,7 @@ mod tests {
             minimum_duration: Duration::from_millis(100),
             ..CaptureConfig::default()
         };
-        let error = finalize_samples(vec![0.5; 2_399], TARGET_SAMPLE_RATE, &config)
+        let error = finalize_samples(vec![0.5; 2_399], TARGET_SAMPLE_RATE, &config, false)
             .expect_err("short input must be rejected");
         assert!(matches!(error, AudioError::TooShort { .. }));
     }
@@ -1938,7 +2535,7 @@ mod tests {
             minimum_duration: Duration::from_millis(10),
             ..CaptureConfig::default()
         };
-        let error = finalize_samples(vec![0.0; 4_800], TARGET_SAMPLE_RATE, &config)
+        let error = finalize_samples(vec![0.0; 4_800], TARGET_SAMPLE_RATE, &config, false)
             .expect_err("silence must be rejected");
         assert!(matches!(error, AudioError::NoVoiceDetected));
     }
@@ -1971,7 +2568,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    finalize_samples(samples, rate, &config),
+                    finalize_samples(samples, rate, &config, false),
                     Err(AudioError::NoVoiceDetected)
                 ),
                 "{name} is rejected by the energy gate",
@@ -2012,6 +2609,7 @@ mod tests {
         let shared = Arc::new(Mutex::new(SharedCapture::default()));
         let mut capture = CpalAudioCapture {
             final_tail: None,
+            spool: None,
             active: Some(ActiveCapture {
                 config: CaptureConfig::default(),
                 input_sample_rate: TARGET_SAMPLE_RATE,
@@ -2033,6 +2631,7 @@ mod tests {
         let shared = Arc::new(Mutex::new(SharedCapture::default()));
         let capture = CpalAudioCapture {
             final_tail: None,
+            spool: None,
             active: Some(ActiveCapture {
                 config: CaptureConfig::default(),
                 input_sample_rate: TARGET_SAMPLE_RATE,
@@ -2102,6 +2701,20 @@ mod tests {
         assert_eq!(ring.capacity(), 14_400);
         let disabled = PrerollBuffer::new(Duration::ZERO, 48_000);
         assert_eq!(disabled.capacity(), 0);
+    }
+
+    #[test]
+    fn recording_budget_counts_preroll_and_keeps_the_earliest_samples() {
+        let mut shared = SharedCapture {
+            sample_limit: Some(4),
+            ..SharedCapture::armed(PrerollBuffer::with_capacity(2))
+        };
+        shared.preroll.extend(&[0.1, 0.2]);
+        shared.begin_recording();
+        let now = shared.last_recording_input.unwrap();
+        shared.append_recording_frames(&mut [0.3, 0.4, 0.5], now);
+        shared.append_recording_frames(&mut [0.6], now);
+        assert_eq!(shared.finish_recording().unwrap().0, [0.1, 0.2, 0.3, 0.4]);
     }
 
     #[test]

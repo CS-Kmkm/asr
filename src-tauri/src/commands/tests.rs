@@ -417,22 +417,31 @@ fn edit_persistence_failure_does_not_skip_metrics_or_propagate() {
 
 #[test]
 fn edit_replacement_failure_falls_back_to_clipboard_or_reports_no_outcome() {
+    use injection::InjectionError;
+
     for result in [
         InsertResult::ClipboardPaste,
         InsertResult::ClipboardOnly,
         InsertResult::PasteUnverified,
     ] {
-        let outcome = edit_insertion_outcome(Ok::<_, ()>(result), || -> Result<(), ()> {
+        let outcome = edit_insertion_outcome(Ok(result), || -> Result<(), ()> {
             panic!("a completed replacement must not copy again")
         });
         assert_eq!(outcome, Some(result));
     }
     assert_eq!(
-        edit_insertion_outcome(Err::<InsertResult, _>("replace"), || Ok::<_, ()>(())),
+        edit_insertion_outcome(Err(InjectionError::TargetChanged), || Ok::<_, ()>(())),
         Some(InsertResult::ClipboardOnly)
     );
     assert_eq!(
-        edit_insertion_outcome(Err::<InsertResult, _>("replace"), || Err("clipboard")),
+        edit_insertion_outcome(Err(InjectionError::TargetChanged), || Err("clipboard")),
+        None
+    );
+    assert_eq!(
+        edit_insertion_outcome(
+            Err(InjectionError::ClipboardChanged),
+            || -> Result<(), ()> { panic!("a clipboard conflict must not copy again") }
+        ),
         None
     );
 }
@@ -626,6 +635,35 @@ fn a_committed_dictation_output_completes_after_a_later_cancel() {
     assert!(!*cancel.borrow());
     assert!(monitor.unchanged_since(checkpoint));
     assert_eq!(mock.lock().unwrap().content(), "prefix final suffix");
+}
+
+#[test]
+fn ask_terminal_caret_queues_one_chord_and_reports_it_as_unverified() {
+    use crate::injection::{test_backend, InjectionOptions, SystemTextInjector};
+
+    let backend = test_backend::MockBackend::new();
+    backend.set_terminal();
+    let backend = Arc::new(Mutex::new(backend));
+    let injector = SystemTextInjector::with_mock(Arc::clone(&backend), InjectionOptions::default());
+    let monitor = crate::input_monitor::InputMonitor::default();
+    monitor.test_set_available(true);
+    let (_sender, cancel) = tokio::sync::watch::channel(false);
+    let result = injector.insert_monitored(
+        "answer",
+        &test_backend::target(),
+        &monitor,
+        monitor.checkpoint().unwrap(),
+        &cancel,
+    );
+    assert_eq!(
+        ask_insertion(Some(result), "caret", || panic!(
+            "the queued paste must not copy again"
+        )),
+        Ok("paste_unverified")
+    );
+    assert_eq!(test_backend::calls(&backend.lock().unwrap(), "paste"), 1);
+    assert_eq!(test_backend::calls(&backend.lock().unwrap(), "restore"), 0);
+    assert!(injector.take_clipboard_not_restored());
 }
 
 #[test]
@@ -867,7 +905,14 @@ fn edit_persistence_warning_claims_completion_only_after_a_confirmed_paste() {
                 assert!(message.starts_with("The edit was completed"), "{message}");
             } else {
                 assert!(!message.contains("completed"), "{message}");
-                assert!(message.contains("remains on the clipboard"), "{message}");
+                if insertion == InsertResult::ClipboardOnly {
+                    assert!(message.contains("remains on the clipboard"), "{message}");
+                } else {
+                    assert!(
+                        message.starts_with("Edit insertion could not be confirmed"),
+                        "{message}"
+                    );
+                }
             }
             assert_eq!(message.contains("history"), history_failed, "{message}");
             assert_eq!(
@@ -1547,7 +1592,8 @@ fn an_unverified_paste_is_not_reported_as_a_target_change() {
     let (kind, message) = selection_translation_status(InsertResult::PasteUnverified);
     assert_eq!(kind, "paste_unverified");
     assert!(!message.contains("target changed"), "{message}");
-    assert!(message.contains("only if the text did not appear"));
+    assert!(message.contains("could not be confirmed"));
+    assert!(!message.contains("Ctrl+V"), "{message}");
     assert_eq!(
         selection_translation_status(InsertResult::ClipboardOnly).1,
         "The target changed; the translation remains on the clipboard."
@@ -1955,20 +2001,20 @@ fn a_failed_microphone_or_the_time_limit_stops_the_recording() {
     let limit = MAX_RECORDING_DURATION;
     assert_eq!(limit, Duration::from_secs(15 * 60));
     assert_eq!(
-        automatic_stop_reason(false, Duration::from_secs(60), limit),
+        automatic_stop_reason(7, false, Duration::from_secs(60), limit),
         None
     );
     assert_eq!(
-        automatic_stop_reason(true, Duration::from_secs(1), limit),
-        Some(StopReason::MicrophoneDisconnected)
+        automatic_stop_reason(7, true, Duration::from_secs(1), limit),
+        Some(StopReason::MicrophoneDisconnected(7))
     );
     assert_eq!(
-        automatic_stop_reason(false, limit, limit),
-        Some(StopReason::MaximumDuration)
+        automatic_stop_reason(7, false, limit, limit),
+        Some(StopReason::MaximumDuration(7))
     );
     assert_eq!(
-        automatic_stop_reason(true, limit * 2, limit),
-        Some(StopReason::MicrophoneDisconnected)
+        automatic_stop_reason(7, true, limit * 2, limit),
+        Some(StopReason::MicrophoneDisconnected(7))
     );
 }
 
@@ -1984,6 +2030,7 @@ fn a_stream_failure_is_reported_even_when_the_user_stopped_first() {
         rms_level: 0.1,
         vad: audio::VadAnalysis::default(),
         warning: warning.map(str::to_owned),
+        retry_only: false,
     };
     assert!(!microphone_disconnected(
         StopReason::User,
@@ -1994,7 +2041,7 @@ fn a_stream_failure_is_reported_even_when_the_user_stopped_first() {
         &Ok(artifact(Some("device disconnected")))
     ));
     assert!(microphone_disconnected(
-        StopReason::MicrophoneDisconnected,
+        StopReason::MicrophoneDisconnected(7),
         &Ok(artifact(None))
     ));
     assert!(microphone_disconnected(
@@ -2004,7 +2051,7 @@ fn a_stream_failure_is_reported_even_when_the_user_stopped_first() {
         ))
     ));
     assert!(!microphone_disconnected(
-        StopReason::MaximumDuration,
+        StopReason::MaximumDuration(7),
         &Err(audio::AudioError::NoVoiceDetected)
     ));
 }
@@ -2020,15 +2067,15 @@ fn an_automatic_stop_keeps_its_reason_in_the_overlay() {
         MICROPHONE_DISCONNECTED_PROCESSING
     );
     assert_eq!(
-        processing_message(StopReason::MicrophoneDisconnected, false, "Stopping"),
+        processing_message(StopReason::MicrophoneDisconnected(7), false, "Stopping"),
         MICROPHONE_DISCONNECTED_PROCESSING
     );
     assert_eq!(
-        processing_message(StopReason::MaximumDuration, false, "Stopping"),
+        processing_message(StopReason::MaximumDuration(7), false, "Stopping"),
         RECORDING_LIMIT_PROCESSING
     );
     assert_eq!(
-        processing_message(StopReason::MaximumDuration, true, "Stopping"),
+        processing_message(StopReason::MaximumDuration(7), true, "Stopping"),
         MICROPHONE_DISCONNECTED_PROCESSING
     );
 }

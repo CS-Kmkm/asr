@@ -459,6 +459,31 @@ pub(super) fn read(target: &TargetWindow) -> Result<TargetText, InjectionError> 
     })
 }
 
+pub(super) fn writable_edit_is_current(target: &TargetWindow, before: &TargetText) -> bool {
+    use windows::Win32::UI::Accessibility::{
+        IUIAutomationValuePattern, UIA_EditControlTypeId, UIA_ValuePatternId,
+    };
+
+    let target = target.clone();
+    let before = before.clone();
+    dispatch(move |automation, deadline| {
+        let focused = focused_in_process(automation, target.process_id)?;
+        let kind = unsafe { focused.CurrentControlType() }.map_err(|_| unavailable())?;
+        if kind != UIA_EditControlTypeId || runtime_id(&focused)? != before.identity {
+            return Ok(false);
+        }
+        let value: IUIAutomationValuePattern =
+            unsafe { focused.GetCurrentPatternAs(UIA_ValuePatternId) }
+                .map_err(|_| unavailable())?;
+        let read_only = unsafe { value.CurrentIsReadOnly() }.map_err(|_| unavailable())?;
+        if read_only.as_bool() || !selection_is_empty_inner(&target, automation, deadline)? {
+            return Ok(false);
+        }
+        Ok(TextControl::focused(&target, automation, deadline)?.state()? == before)
+    })
+    .unwrap_or(false)
+}
+
 pub(super) fn probe(target: &TargetWindow) -> Result<TextProbe, InjectionError> {
     let target = target.clone();
     dispatch(move |automation, deadline| {

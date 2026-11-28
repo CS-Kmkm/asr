@@ -61,7 +61,7 @@ async fn wait_for_switch(delay: Duration, mut cancel: watch::Receiver<bool>) -> 
 
 fn insertion_message(result: InsertResult) -> &'static str {
     match result {
-        InsertResult::ClipboardPaste => "Insertion test completed.",
+        InsertResult::ClipboardPaste | InsertResult::DirectInsert => "Insertion test completed.",
         InsertResult::ClipboardOnly => {
             "The test text is on the clipboard; automatic insertion was skipped."
         }
@@ -189,6 +189,7 @@ pub(crate) async fn run_insertion(app: AppHandle, id: u64, cancel: watch::Receiv
             text,
             insertion: match result {
                 InsertResult::ClipboardPaste => "clipboard_paste",
+                InsertResult::DirectInsert => "caret",
                 InsertResult::ClipboardOnly => "clipboard_only",
                 InsertResult::PasteUnverified => "paste_unverified",
             }

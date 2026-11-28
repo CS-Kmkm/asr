@@ -155,6 +155,7 @@ const WARNING_STATUS_KINDS = new Set([
 ]);
 
 const SUCCESS_STATUS_KINDS = new Set([
+  "caret",
   "clipboard_paste",
   "gpu_available",
   "provisional_replace",

@@ -1,6 +1,95 @@
 //! Deterministic post-capture signal processing.
 use super::{AudioEnhancementConfig, EnergyVadConfig, LevelMeter, NoiseSuppressionLevel};
 
+/// Continuous linear resampling uses absolute rational positions, so neither
+/// chunk boundaries nor different microphone rates duplicate/drop samples.
+/// Downsampling first runs the batch path's anti-alias filter, whose state
+/// carries across chunks.
+pub(crate) struct StreamingResampler {
+    target_rate: u32,
+    pending: Vec<f32>,
+    base: usize,
+    total: usize,
+    next: usize,
+    rate: u32,
+    filter: Option<AntiAlias>,
+}
+
+impl StreamingResampler {
+    pub(crate) fn new(target_rate: u32) -> Self {
+        Self {
+            target_rate,
+            pending: Vec::new(),
+            base: 0,
+            total: 0,
+            next: 0,
+            rate: 0,
+            filter: None,
+        }
+    }
+
+    pub(crate) fn source_rate(&self) -> u32 {
+        self.rate
+    }
+
+    #[cfg(test)]
+    pub(crate) fn output_samples(&self) -> usize {
+        self.next
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_samples(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        mut samples: Vec<f32>,
+        rate: u32,
+        final_chunk: bool,
+    ) -> Option<Vec<f32>> {
+        self.push_buffer(&mut samples, rate, final_chunk)
+    }
+
+    pub(super) fn push_buffer(
+        &mut self,
+        samples: &mut [f32],
+        rate: u32,
+        final_chunk: bool,
+    ) -> Option<Vec<f32>> {
+        if rate == 0 || self.target_rate == 0 || (self.rate != 0 && self.rate != rate) {
+            return None;
+        }
+        self.rate = rate;
+        let target_rate = u64::from(self.target_rate);
+        if rate > self.target_rate {
+            self.filter
+                .get_or_insert_with(|| AntiAlias::new(rate, self.target_rate))
+                .process(samples);
+        }
+        self.total += samples.len();
+        self.pending.extend_from_slice(samples);
+        let mut output = Vec::new();
+        loop {
+            let position = self.next as u64 * u64::from(rate);
+            let left = (position / target_rate) as usize;
+            if left >= self.total || (!final_chunk && left + 1 >= self.total) {
+                break;
+            }
+            let right = (left + 1).min(self.total - 1);
+            let fraction = (position % target_rate) as f32 / self.target_rate as f32;
+            let a = self.pending[left - self.base];
+            let b = self.pending[right - self.base];
+            output.push(a + (b - a) * fraction);
+            self.next += 1;
+        }
+        let keep = ((self.next as u64 * u64::from(rate) / target_rate) as usize).min(self.total);
+        self.pending.drain(..keep - self.base);
+        self.base = keep;
+        Some(output)
+    }
+}
+
 /// Applies inexpensive, deterministic post-capture processing. Keeping this out
 /// of the CPAL callback prevents audio cleanup from competing with foreground
 /// typing while the microphone is active.

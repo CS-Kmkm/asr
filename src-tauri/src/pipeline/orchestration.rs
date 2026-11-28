@@ -58,10 +58,11 @@ pub(super) async fn run(
     // Stop-relative take spans start at the stop request.
     let stop_requested = Instant::now();
     let claimed = match reason {
-        StopReason::HoldRelease(id) | StopReason::DictationTest(id) => {
-            driver.lifecycle().begin_processing_for(Some(id))
-        }
-        _ => driver.lifecycle().begin_processing(),
+        StopReason::HoldRelease(id)
+        | StopReason::DictationTest(id)
+        | StopReason::MicrophoneDisconnected(id)
+        | StopReason::MaximumDuration(id) => driver.lifecycle().begin_processing_for(Some(id)),
+        StopReason::User => driver.lifecycle().begin_processing(),
     };
     let (id, mode, cancel) = claimed.map_err(|error| {
         // An automatic stop losing the race must not overwrite the winner.

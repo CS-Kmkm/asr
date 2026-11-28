@@ -55,6 +55,7 @@ impl AudioCapture for FakeAudio {
                 rms_level: 0.1,
                 vad: VadAnalysis::default(),
                 warning: None,
+                retry_only: false,
             })
         })
     }
@@ -332,22 +333,26 @@ async fn a_losing_automatic_stop_does_not_replace_completed_state() {
     run(&driver, StopReason::User).await.unwrap();
     let before = driver.state.snapshot();
     let events = driver.events.lock().unwrap().len();
-    assert!(run(&driver, StopReason::MaximumDuration).await.is_err());
+    assert!(run(&driver, StopReason::MaximumDuration(1)).await.is_err());
     assert_eq!(driver.state.snapshot(), before);
     assert_eq!(driver.events.lock().unwrap().len(), events);
     assert_eq!(driver.audio.lock().await.stops, 1);
 }
 
 #[tokio::test]
-async fn stale_hold_release_does_not_touch_another_recording() {
+async fn a_stale_stop_does_not_touch_another_recording() {
     let driver = FakeDriver::new(PipelineMode::Dictate, Fault::None);
     let current = driver.lifecycle.begin_processing().unwrap().0;
     driver.lifecycle.finish(current);
     let next = driver.lifecycle.begin_start(PipelineMode::Ask).unwrap();
     driver.lifecycle.mark_recording(next).unwrap();
-    assert!(run(&driver, StopReason::HoldRelease(current))
-        .await
-        .is_err());
+    for reason in [
+        StopReason::HoldRelease(current),
+        StopReason::MicrophoneDisconnected(current),
+        StopReason::MaximumDuration(current),
+    ] {
+        assert!(run(&driver, reason).await.is_err());
+    }
     assert_eq!(driver.lifecycle.phase(), PipelinePhase::Recording);
     assert_eq!(driver.audio.lock().await.stops, 0);
     assert_eq!(driver.transcriber.calls.load(Ordering::SeqCst), 0);
@@ -444,6 +449,6 @@ async fn a_cancel_during_recognition_records_a_cancelled_asr_take() {
 async fn a_stop_without_a_recording_records_no_take() {
     let driver = FakeDriver::new(PipelineMode::Dictate, Fault::None);
     run(&driver, StopReason::User).await.unwrap();
-    assert!(run(&driver, StopReason::MaximumDuration).await.is_err());
+    assert!(run(&driver, StopReason::MaximumDuration(1)).await.is_err());
     assert_eq!(take_rows(&driver).len(), 1);
 }

@@ -14,6 +14,7 @@ tauri-build = { version = "2.2", features = [] }
 
 [dependencies]
 async-trait = "0.1"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 csv = "1"
 directories = "6"
@@ -26,6 +27,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tauri = { version = "2.5", features = ["tray-icon"] }
 tauri-plugin-autostart = "2"
 tauri-plugin-global-shortcut = "2"
@@ -47,6 +49,7 @@ windows = { version = "0.58", features = [
   "Win32_System_Ole",
   "Win32_System_Com_StructuredStorage",
   "Win32_System_Diagnostics_Debug",
+  "Win32_System_JobObjects",
   "Win32_Graphics_Gdi",
   "Win32_Media_Audio",
   "Win32_System_Memory",

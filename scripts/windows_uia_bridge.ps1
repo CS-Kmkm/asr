@@ -23,6 +23,17 @@ public static class AcceptanceWindows {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int command);
     [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint current, uint other, bool attach);
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GuiThreadInfo {
+        public uint Size, Flags;
+        public IntPtr Active, Focus, Capture, MenuOwner, MoveSize, Caret;
+        public int Left, Top, Right, Bottom;
+    }
+    [DllImport("user32.dll")] private static extern bool GetGUIThreadInfo(uint thread, ref GuiThreadInfo info);
+    public static bool OwnsKeyboardFocus(IntPtr hwnd) {
+        var info = new GuiThreadInfo { Size = (uint)Marshal.SizeOf(typeof(GuiThreadInfo)) };
+        return GetGUIThreadInfo(0, ref info) && info.Focus != IntPtr.Zero && GetAncestor(info.Focus, 2) == hwnd;
+    }
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
     public static string Title(IntPtr hwnd) {
         var text = new StringBuilder(1024);
@@ -74,10 +85,11 @@ function Test-Identity($target) {
 function Test-Focused($target) {
     Test-Identity $target
     if ([AcceptanceWindows]::GetForegroundWindow() -ne $target.Hwnd) { return $false }
+    if ($target.FixtureKind -in @('mintty', 'putty')) { return [AcceptanceWindows]::OwnsKeyboardFocus($target.Hwnd) }
     $focused = [Windows.Automation.AutomationElement]::FocusedElement
     return [Windows.Automation.Automation]::Compare($focused, $target.Element)
 }
-function Set-EditorFocus($hwnd, $element, $owned) {
+function Set-EditorFocus($hwnd, $element, $owned, $classicTerminal = $false) {
     [void][AcceptanceWindows]::ShowWindow($hwnd, 9)
     [void][AcceptanceWindows]::SetForegroundWindow($hwnd)
     if ($owned -and [AcceptanceWindows]::GetForegroundWindow() -ne $hwnd) {
@@ -91,7 +103,7 @@ function Set-EditorFocus($hwnd, $element, $owned) {
             finally { [void][AcceptanceWindows]::AttachThreadInput($current, $foregroundThread, $false) }
         }
     }
-    $element.SetFocus()
+    if (-not $classicTerminal) { $element.SetFocus() }
 }
 function Test-LocalFixtureUrl($location) {
     try {
@@ -185,7 +197,7 @@ function Find-TerminalFixture($token, $session) {
     }
 }
 
-function Start-OwnedFixture($kind, $ownership) {
+function Start-OwnedFixture($kind, $ownership, [bool]$bracketed) {
     Assert-EvaluationGuest
     $run = Split-Path $bridgeRoot -Parent
     $evaluation = Join-Path $env:LOCALAPPDATA 'ASR-Evaluation'
@@ -226,6 +238,55 @@ function Start-OwnedFixture($kind, $ownership) {
             $python = 'C:\ASR-Evaluation\runtime\python\python.exe'
             $entry = Join-Path $bridgeRoot 'windows_acceptance_terminal.py'
             $arguments = "-w new new-tab --title $token --suppressApplicationTitle `"$python`" `"$entry`" `"$reader`""
+            if ($bracketed) { $arguments += ' --bracketed' }
+        }
+        'mintty' {
+            $exe = 'C:\ASR-Evaluation\tools\GitPortable\usr\bin\mintty.exe'
+            $name = 'mintty'
+            $reader = Join-Path $private 'receiver.utf8'
+            $config = Join-Path $private 'minttyrc'
+            [IO.File]::WriteAllText($config, "Locale=C`nCharset=UTF-8`nKeyFunctions=`n")
+            $entry = Join-Path $bridgeRoot 'windows_acceptance_mintty.sh'
+            $entry = '/c' + $entry.Substring(2).Replace('\', '/')
+            $output = '/c' + $reader.Substring(2).Replace('\', '/')
+            $arguments = "-d -t $token -c `"$config`" -o Locale=C -o Charset=UTF-8 -o KeyFunctions= /usr/bin/bash `"$entry`" `"$output`""
+        }
+        'putty' {
+            $exe = 'C:\ASR-Evaluation\tools\PuTTY\putty.exe'
+            if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'fixture application absent' }
+            $name = 'putty'
+            $reader = Join-Path $private 'receiver.utf8'
+            $portFile = Join-Path $private 'port.txt'
+            $python = 'C:\ASR-Evaluation\runtime\python\python.exe'
+            $entry = Join-Path $bridgeRoot 'windows_acceptance_putty.py'
+            $ownership.Receiver = Start-Process -FilePath $python -WindowStyle Hidden -PassThru -ArgumentList (
+                "`"$entry`" `"$portFile`" `"$reader`"")
+            $deadline = (Get-Date).AddSeconds(5)
+            $port = 0
+            do {
+                if (Test-Path -LiteralPath $portFile) {
+                    [void][int]::TryParse([IO.File]::ReadAllText($portFile), [ref]$port)
+                }
+                if ($port -or $ownership.Receiver.HasExited) { break }
+                Start-Sleep -Milliseconds 100
+            } while ((Get-Date) -lt $deadline)
+            if ($port -lt 1 -or $port -gt 65535) { throw 'local receiver did not bind' }
+            $sessions = 'HKCU:\Software\SimonTatham\PuTTY\Sessions'
+            $sessionKey = Join-Path $sessions $token
+            if (Test-Path -LiteralPath $sessionKey) { throw 'PuTTY scratch session already exists' }
+            if (!(Test-Path -LiteralPath $sessions)) { New-Item -Path $sessions -Force | Out-Null }
+            New-Item -Path $sessionKey | Out-Null
+            $ownership.PuttySession = $sessionKey
+            $strings = @{ HostName = '127.0.0.1'; Protocol = 'raw'; WinTitle = $token; LineCodePage = 'UTF-8' }
+            # PuTTY 0.85 stores FORCE_OFF as 1 in LocalEcho and LocalEdit.
+            $numbers = @{ Present = 1; PortNumber = $port; ProxyMethod = 0; WarnOnClose = 0; LocalEcho = 1; LocalEdit = 1 }
+            foreach ($entry in $strings.GetEnumerator()) {
+                New-ItemProperty -LiteralPath $sessionKey -Name $entry.Key -Value $entry.Value -PropertyType String | Out-Null
+            }
+            foreach ($entry in $numbers.GetEnumerator()) {
+                New-ItemProperty -LiteralPath $sessionKey -Name $entry.Key -Value $entry.Value -PropertyType DWord | Out-Null
+            }
+            $arguments = "-load $token"
         }
         default { throw 'unsupported fixture type' }
     }
@@ -248,7 +309,7 @@ function Start-OwnedFixture($kind, $ownership) {
         } else {
             Get-Process -Name $name -ErrorAction SilentlyContinue | Where-Object {
                 $_.SessionId -eq $session -and $_.Id -notin $existing -and $_.Path -eq $exe -and
-                ($kind -notin @('edge', 'chrome') -or $_.Id -eq $ownership.Launched.Id) -and
+                ($kind -notin @('edge', 'chrome', 'mintty', 'putty') -or $_.Id -eq $ownership.Launched.Id) -and
                 $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle.Contains($token)
             } | ForEach-Object { @{ Process = $_; Hwnd = $_.MainWindowHandle } }
         })
@@ -326,6 +387,24 @@ function Close-OwnedWindow($ownership) {
     $ownership.TerminalToken = $null
 }
 
+function Close-OwnedFixture($ownership) {
+    try { Close-OwnedWindow $ownership }
+    finally {
+        try {
+            if ($ownership.Receiver -and -not $ownership.Receiver.HasExited) {
+                $ownership.Receiver.Kill()
+                if (-not $ownership.Receiver.WaitForExit(2000)) { throw 'owned receiver did not exit' }
+            }
+            $ownership.Receiver = $null
+        } finally {
+            if ($ownership.PuttySession) {
+                Remove-Item -LiteralPath $ownership.PuttySession
+                $ownership.PuttySession = $null
+            }
+        }
+    }
+}
+
 try {
 while ($null -ne ($line = [Console]::ReadLine())) {
     $stage = 'unsupported_or_changed_target'
@@ -336,6 +415,7 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             if ($request.target -notin @('primary', 'secondary') -or $targets.ContainsKey($request.target)) { throw 'invalid target' }
             $fixtureToken = $null
             $fixtureKind = $null
+            $classicTerminal = $false
             $readerPath = $null
             if ($request.action -eq 'open_notepad') {
                 $stage = 'owned_notepad_launch_failed'
@@ -359,13 +439,19 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             } elseif ($request.action -eq 'open_fixture') {
                 $stage = 'owned_fixture_launch_failed'
                 if ($request.target -ne 'primary' -or $fixtureOwnership.Launched) { throw 'invalid fixture slot' }
-                $owned = Start-OwnedFixture $request.kind $fixtureOwnership
+                $owned = Start-OwnedFixture $request.kind $fixtureOwnership ($request.bracketed -eq $true)
                 $fixtureToken = $owned.Token
                 $fixtureKind = $owned.Kind
                 $readerPath = $owned.Reader
                 $hwnd = $owned.Hwnd
                 $stage = 'owned_fixture_editor_unavailable'
                 $root = [Windows.Automation.AutomationElement]::FromHandle($hwnd)
+                $classicTerminal = $fixtureKind -in @('mintty', 'putty')
+                if ($classicTerminal) {
+                    $element = $root
+                    $stage = 'owned_fixture_focus_unavailable'
+                    Set-EditorFocus $hwnd $element $true $true
+                } else {
                 $property = [Windows.Automation.AutomationElement]::ClassNameProperty
                 $value = switch ($fixtureKind) {
                     { $_ -in @('edge', 'chrome') } {
@@ -393,20 +479,25 @@ while ($null -ne ($line = [Console]::ReadLine())) {
                 $element = $editors[0]
                 $stage = 'owned_fixture_focus_unavailable'
                 Set-EditorFocus $hwnd $element $true
+                }
             } else {
                 $element = [Windows.Automation.AutomationElement]::FocusedElement
                 $hwnd = [AcceptanceWindows]::GetForegroundWindow()
             }
             if ($fixtureKind) { $stage = 'owned_fixture_target_unproven' }
             $kind = $element.Current.ControlType
-            if ($fixtureKind -ne 'terminal' -and $kind -ne [Windows.Automation.ControlType]::Edit -and
+            if (-not $classicTerminal -and $fixtureKind -ne 'terminal' -and $kind -ne [Windows.Automation.ControlType]::Edit -and
                 $kind -ne [Windows.Automation.ControlType]::Document) { throw 'unsupported control' }
             [uint32]$ownerId = 0
             [void][AcceptanceWindows]::GetWindowThreadProcessId($hwnd, [ref]$ownerId)
             $process = Get-Process -Id $ownerId
             # Only dedicated scratch editors/browser pages, never shell prompts,
             # credential dialogs, app permission dialogs, or arbitrary controls.
-            if ($fixtureKind -eq 'terminal') {
+            if ($classicTerminal) {
+                if ($process.ProcessName -ne $fixtureKind -or $owned.Process.Id -ne $process.Id) {
+                    throw 'unapproved classic terminal fixture'
+                }
+            } elseif ($fixtureKind -eq 'terminal') {
                 if ($process.ProcessName -ne 'WindowsTerminal' -or $element.Current.ClassName -ne 'TermControl') {
                     throw 'unapproved terminal fixture element'
                 }
@@ -417,7 +508,8 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             }
             if ($fixtureKind) { $stage = 'owned_fixture_receiver_not_empty' }
             $emptyText = Get-TargetText @{ Element = $element; Reader = $readerPath; FixtureKind = $fixtureKind }
-            if (-not $element.Current.IsKeyboardFocusable -or $emptyText -notin @('', "`r", "`n", "`r`n")) { throw 'empty scratch control required' }
+            if ((-not $classicTerminal -and -not $element.Current.IsKeyboardFocusable) -or
+                $emptyText -notin @('', "`r", "`n", "`r`n")) { throw 'empty scratch control required' }
             $runtimeId = $element.GetRuntimeId() -join ','
             foreach ($registered in $targets.Values) {
                 if ($registered.RuntimeId -eq $runtimeId) { throw 'duplicate target' }
@@ -440,7 +532,7 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             $result = @{ ok = $true }
         } elseif ($request.action -eq 'close_fixture' -and $fixtureOwnership.Launched) {
             $stage = 'owned_fixture_cleanup_failed'
-            Close-OwnedWindow $fixtureOwnership
+            Close-OwnedFixture $fixtureOwnership
             $result = @{ ok = $true }
         } else {
             if (-not $targets.ContainsKey($request.target)) { throw 'unregistered target' }
@@ -448,7 +540,7 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             Test-Identity $target
             switch ($request.action) {
                 'focus' {
-                    Set-EditorFocus $target.Hwnd $target.Element ([bool]$target.FixtureToken)
+                    Set-EditorFocus $target.Hwnd $target.Element ([bool]$target.FixtureToken) ($target.FixtureKind -in @('mintty', 'putty'))
                     $result = @{ ok = $true; focused = (Test-Focused $target) }
                 }
                 'focused' { $result = @{ ok = $true; focused = (Test-Focused $target) } }
@@ -468,6 +560,19 @@ while ($null -ne ($line = [Console]::ReadLine())) {
                     if (-not (Test-Focused $target)) { throw 'focus changed' }
                     $result = @{ ok = $true }
                 }
+                'matrix_caret' {
+                    if (-not (Test-Focused $target) -or $target.FixtureKind -eq 'terminal') { throw 'focus mismatch' }
+                    $pattern = $target.Element.GetCurrentPattern([Windows.Automation.TextPattern]::Pattern)
+                    $selection = @($pattern.GetSelection())
+                    $atEnd = $false
+                    if ($selection.Count -eq 1 -and $selection[0].CompareEndpoints('Start', $selection[0], 'End') -eq 0) {
+                        $before = $pattern.DocumentRange.Clone()
+                        $before.MoveEndpointByRange('End', $selection[0], 'Start')
+                        $atEnd = $before.GetText(-1) -ceq $request.prefix
+                    }
+                    if (-not (Test-Focused $target)) { throw 'focus changed' }
+                    $result = @{ ok = $true; at_end = $atEnd }
+                }
                 'minimize' {
                     [void][AcceptanceWindows]::ShowWindow($target.Hwnd, 7)
                     $result = @{ ok = $true }
@@ -482,6 +587,6 @@ while ($null -ne ($line = [Console]::ReadLine())) {
     }
 }
 } finally {
-    try { Close-OwnedWindow $fixtureOwnership }
+    try { Close-OwnedFixture $fixtureOwnership }
     finally { Close-OwnedWindow $notepadOwnership }
 }

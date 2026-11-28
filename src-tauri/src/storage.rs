@@ -128,6 +128,10 @@ pub struct Storage {
     wal_checkpoint_pending: Arc<AtomicBool>,
     /// Work a delivered take deferred; privacy deletions wait for it.
     completions: Arc<completion_queue::CompletionQueue>,
+    /// Set on the clone passed down a recording's History path.
+    history_checkpoint: Option<crate::audio::spool::Checkpoint>,
+    /// Makes cancellation independent of device teardown after stop starts.
+    stopping_checkpoint: Arc<Mutex<Option<(u64, crate::audio::spool::Checkpoint)>>>,
 }
 
 /// A reserved place in the deferred completion queue; see
@@ -931,6 +935,8 @@ impl Storage {
             settings_revision: Arc::new(AtomicU64::new(0)),
             wal_checkpoint_pending: Arc::new(AtomicBool::new(true)),
             completions: Arc::default(),
+            history_checkpoint: None,
+            stopping_checkpoint: Arc::default(),
         }
     }
 
@@ -1162,8 +1168,14 @@ impl Storage {
         // upgrade from a read snapshot.
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         save_settings_row(&transaction, settings)?;
+        let invalidated_epoch = (!promotes_failed_takes(settings))
+            .then(|| Self::advance_capture_spool_epoch(&transaction))
+            .transpose()?;
         transaction.commit()?;
-        Ok(self.advance_settings_revision(&connection))
+        let revision = self.advance_settings_revision(&connection);
+        drop(connection);
+        self.delete_stale_capture_spools(invalidated_epoch);
+        Ok(revision)
     }
 
     /// Persist settings and apply their retention policy as one database
@@ -1183,6 +1195,9 @@ impl Storage {
         // upgrade from a read snapshot.
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         save_settings_row(&transaction, settings)?;
+        let invalidated_epoch = (!promotes_failed_takes(settings))
+            .then(|| Self::advance_capture_spool_epoch(&transaction))
+            .transpose()?;
         purge_history(&transaction, settings, now)?;
         transaction.commit()?;
         let revision = self.advance_settings_revision(&connection);
@@ -1190,6 +1205,7 @@ impl Storage {
         // always truncates, as before.
         self.checkpoint_after_deletion(&connection);
         drop(connection);
+        self.delete_stale_capture_spools(invalidated_epoch);
         let _ = self.retry_pending_audio_deletions();
         Ok(revision)
     }
@@ -1298,26 +1314,189 @@ impl Storage {
         item: &NewHistoryItem<'_>,
         source_audio: &Path,
     ) -> Result<Option<FailedTakeRetention>, StorageError> {
+        let checkpoint = self.history_checkpoint.as_ref();
+        let result = self.add_failed_take_inner(
+            item,
+            source_audio,
+            checkpoint.map(|checkpoint| (checkpoint.token.as_str(), checkpoint.epoch)),
+        )?;
+        if let Some(checkpoint) = checkpoint {
+            self.discard_capture_spool(checkpoint)?;
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn for_recorded_history(
+        &self,
+        checkpoint: Option<crate::audio::spool::Checkpoint>,
+    ) -> Self {
+        Self {
+            history_checkpoint: checkpoint,
+            ..self.clone()
+        }
+    }
+
+    pub(crate) fn mark_stopping_checkpoint(
+        &self,
+        operation_id: u64,
+        checkpoint: crate::audio::spool::Checkpoint,
+    ) {
+        if let Ok(mut active) = self.stopping_checkpoint.lock() {
+            *active = Some((operation_id, checkpoint));
+        }
+    }
+
+    pub(crate) fn clear_stopping_checkpoint(&self, operation_id: u64) {
+        if let Ok(mut active) = self.stopping_checkpoint.lock() {
+            if active.as_ref().is_some_and(|(id, _)| *id == operation_id) {
+                *active = None;
+            }
+        }
+    }
+
+    pub(crate) fn stopping_checkpoint(
+        &self,
+        operation_id: u64,
+    ) -> Option<crate::audio::spool::Checkpoint> {
+        self.stopping_checkpoint
+            .lock()
+            .ok()?
+            .as_ref()
+            .filter(|(id, _)| *id == operation_id)
+            .map(|(_, checkpoint)| checkpoint.clone())
+    }
+
+    pub(crate) fn capture_spool_pending(
+        &self,
+        token: &str,
+        epoch: i64,
+    ) -> Result<bool, StorageError> {
+        let connection = self.connection()?;
+        Ok(Self::read_capture_spool_epoch(&connection)? == epoch
+            && !connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM imported_capture_spools WHERE token = ?1)",
+                [token],
+                |row| row.get::<_, bool>(0),
+            )?)
+    }
+
+    fn consume_capture_spool(connection: &Connection, token: &str) -> Result<bool, StorageError> {
+        Ok(connection.execute(
+            "INSERT OR IGNORE INTO imported_capture_spools (token, imported_at) VALUES (?1, ?2)",
+            rusqlite::params![token, Utc::now().to_rfc3339()],
+        )? != 0)
+    }
+
+    pub(crate) fn discard_capture_spool(
+        &self,
+        checkpoint: &crate::audio::spool::Checkpoint,
+    ) -> Result<(), StorageError> {
+        Self::consume_capture_spool(&*self.connection()?, &checkpoint.token)?;
+        checkpoint.unlink();
+        Ok(())
+    }
+
+    fn delete_stale_capture_spools(&self, epoch: Option<i64>) {
+        if let Some(epoch) = epoch {
+            crate::audio::spool::delete_stale(self, epoch);
+        }
+    }
+
+    pub(crate) fn capture_spool_dir(&self) -> PathBuf {
+        self.history_audio_dir.with_extension("capture-spool")
+    }
+
+    pub(crate) fn capture_spool_epoch(&self) -> Result<i64, StorageError> {
+        let connection = self.connection()?;
+        Self::read_capture_spool_epoch(&connection)
+    }
+
+    pub(crate) fn claim_capture_spool(&self, epoch: i64) -> Result<bool, StorageError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if Self::read_capture_spool_epoch(&transaction)? != epoch
+            || !promotes_failed_takes(&stored_settings(&transaction)?)
+        {
+            return Ok(false);
+        }
+        // An older reader could otherwise delete all History without
+        // invalidating our checkpoint. Require the first reader that honors
+        // the epoch before publishing any audio bytes.
+        let updated = transaction.execute(
+            "UPDATE schema_meta SET value = MAX(value, 9) WHERE key = ?1",
+            [schema::MIN_READER_VERSION_KEY],
+        )?;
+        transaction.commit()?;
+        Ok(updated == 1)
+    }
+
+    fn read_capture_spool_epoch(connection: &Connection) -> Result<i64, StorageError> {
+        Ok(connection.query_row(
+            "SELECT epoch FROM capture_spool_state WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn advance_capture_spool_epoch(connection: &Connection) -> Result<i64, StorageError> {
+        connection.execute(
+            "UPDATE capture_spool_state SET epoch = epoch + 1 WHERE id = 1",
+            [],
+        )?;
+        Self::read_capture_spool_epoch(connection)
+    }
+
+    pub(crate) fn import_capture_spool(
+        &self,
+        token: &str,
+        epoch: i64,
+        item: &NewHistoryItem<'_>,
+        source_audio: &Path,
+    ) -> Result<(), StorageError> {
+        self.add_failed_take_inner(item, source_audio, Some((token, epoch)))?;
+        Ok(())
+    }
+
+    fn add_failed_take_inner(
+        &self,
+        item: &NewHistoryItem<'_>,
+        source_audio: &Path,
+        spool_token: Option<(&str, i64)>,
+    ) -> Result<Option<FailedTakeRetention>, StorageError> {
+        let allowed = |settings: &Settings| {
+            FailedTakeRetention::for_settings(settings).filter(|retention| {
+                spool_token.is_none() || *retention == FailedTakeRetention::Normal
+            })
+        };
         let settings = self.get_settings()?;
-        if FailedTakeRetention::for_settings(&settings).is_none() {
+        if allowed(&settings).is_none() {
             return Ok(None);
         }
         self.apply_history_policy(&settings)?;
         // An unused copy is removed when it drops.
-        let Ok(mut staged_audio) = self.stage_history_audio(source_audio) else {
-            return Ok(None);
+        let mut staged_audio = match self.stage_history_audio(source_audio) {
+            Ok(staged) => staged,
+            Err(_) if spool_token.is_none() => return Ok(None),
+            Err(error) => return Err(error),
         };
         let mut connection = self.connection()?;
         // Settings can change while the WAV is being staged; decide with the
         // settings committed at the time of the insert.
-        let Some(retention) = FailedTakeRetention::for_settings(&stored_settings(&connection)?)
-        else {
+        let Some(retention) = allowed(&stored_settings(&connection)?) else {
             return Ok(None);
         };
         let now = Utc::now();
         let expires_at = (retention == FailedTakeRetention::Temporary)
             .then(|| failed_take_expires_at(now).to_rfc3339());
         let transaction = connection.transaction()?;
+        if let Some((token, epoch)) = spool_token {
+            if Self::read_capture_spool_epoch(&transaction)? != epoch {
+                return Ok(None);
+            }
+            if !Self::consume_capture_spool(&transaction, token)? {
+                return Ok(Some(retention));
+            }
+        }
         insert_history_row(
             &transaction,
             item,
@@ -1375,43 +1554,50 @@ impl Storage {
         if settings.history_retention == HistoryRetention::Never {
             // Nothing is written, but failed takes kept for Retry still expire.
             let _ = self.apply_history_policy(&settings);
+            if let Some(checkpoint) = &self.history_checkpoint {
+                self.discard_capture_spool(checkpoint)?;
+            }
             return Ok((false, false));
         }
         // Prune before insertion. After a row/file association commits, this
         // method must not turn cleanup trouble into a false command failure.
         self.apply_history_policy(&settings)?;
-        let mut audio_stage_failed = false;
+        let mut audio_stage_error = None;
         let mut staged_audio = if !settings.delete_audio_after_processing {
             source_audio.and_then(|path| match self.stage_history_audio(path) {
                 Ok(audio) => Some(audio),
-                Err(_) => {
-                    audio_stage_failed = true;
+                Err(error) => {
+                    audio_stage_error = Some(error);
                     None
                 }
             })
         } else {
             None
         };
-        let mut connection = self.connection()?;
-        // Serialize the final privacy decision with the insert. Settings can
-        // change while the WAV is being staged, so the earlier snapshot alone
-        // cannot decide whether this row or its audio may be retained.
-        let current_settings = stored_settings(&connection)?;
-        if current_settings.history_retention == HistoryRetention::Never {
-            return Ok((false, false));
-        }
-        if !current_settings.delete_audio_after_processing
-            && staged_audio.is_none()
+        if settings.delete_audio_after_processing
             && source_audio.is_some()
-            && settings.delete_audio_after_processing
+            && !self.get_settings()?.delete_audio_after_processing
         {
             staged_audio = source_audio.and_then(|path| match self.stage_history_audio(path) {
                 Ok(audio) => Some(audio),
-                Err(_) => {
-                    audio_stage_failed = true;
+                Err(error) => {
+                    audio_stage_error = Some(error);
                     None
                 }
             });
+        }
+        let mut connection = self.connection()?;
+        // Re-read retention inside the write transaction so a settings change
+        // through another SQLite connection cannot race the History insert.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_settings = stored_settings(&transaction)?;
+        if current_settings.history_retention == HistoryRetention::Never {
+            if let Some(checkpoint) = &self.history_checkpoint {
+                Self::consume_capture_spool(&transaction, &checkpoint.token)?;
+                transaction.commit()?;
+                checkpoint.unlink();
+            }
+            return Ok((false, false));
         }
         let audio_filename = if current_settings.delete_audio_after_processing {
             None
@@ -1419,7 +1605,23 @@ impl Storage {
             staged_audio.as_ref().map(|audio| audio.filename())
         };
         let retained_audio = audio_filename.is_some();
-        let transaction = connection.transaction()?;
+        if let Some(checkpoint) = &self.history_checkpoint {
+            if Self::read_capture_spool_epoch(&transaction)? != checkpoint.epoch {
+                checkpoint.unlink();
+                return Ok((false, false));
+            }
+            if !current_settings.delete_audio_after_processing && checkpoint.path.is_file() {
+                if let Some(error) = audio_stage_error.take() {
+                    // Leave the checkpoint eligible for startup recovery when
+                    // the intended History audio copy cannot be staged.
+                    return Err(error);
+                }
+            }
+            if !Self::consume_capture_spool(&transaction, &checkpoint.token)? {
+                checkpoint.unlink();
+                return Ok((false, false));
+            }
+        }
         insert_history_row(
             &transaction,
             item,
@@ -1434,9 +1636,12 @@ impl Storage {
             }
         }
         drop(connection);
+        if let Some(checkpoint) = &self.history_checkpoint {
+            checkpoint.unlink();
+        }
         Ok((
             true,
-            audio_stage_failed && !current_settings.delete_audio_after_processing,
+            audio_stage_error.is_some() && !current_settings.delete_audio_after_processing,
         ))
     }
 
@@ -3395,6 +3600,31 @@ mod tests {
         // The step is retried, not skipped, on the next start.
         assert!(run_migrations(&mut connection, &migrations).is_err());
         assert_eq!(user_version(&connection), 1);
+    }
+
+    #[test]
+    fn a_privacy_aware_reader_is_required_once_spooling_starts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("spool.sqlite3");
+        let storage = Storage::open(&path).unwrap();
+        storage
+            .update_settings(&Settings {
+                delete_audio_after_processing: false,
+                ..Settings::default()
+            })
+            .unwrap();
+        let mut older = Connection::open(&path).unwrap();
+        assert!(run_migrations(&mut older, &MIGRATIONS[..8]).is_ok());
+        assert!(storage
+            .claim_capture_spool(storage.capture_spool_epoch().unwrap())
+            .unwrap());
+        assert!(matches!(
+            run_migrations(&mut older, &MIGRATIONS[..8]),
+            Err(StorageError::IncompatibleSchema {
+                min_reader_version: 9,
+                ..
+            })
+        ));
     }
 
     /// Simulates a newer build that ran one more step on the database.

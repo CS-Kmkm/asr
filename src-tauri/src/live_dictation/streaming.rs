@@ -2,7 +2,7 @@
 //! requires a sealed capture tail, unchanged settings and model generation.
 use crate::{
     asr::{AsrError, ModelResidency, Transcriber, Transcript},
-    audio::{self, AudioCapture, CaptureConfig, FinalTail},
+    audio::{self, AudioCapture, CaptureConfig, FinalTail, StreamingResampler},
     types::Settings,
 };
 use serde_json::{json, Value};
@@ -27,67 +27,13 @@ fn generation(asr: &dyn Transcriber) -> Option<u64> {
     }
 }
 
-/// Continuous linear resampling uses absolute rational positions, so neither
-/// chunk boundaries nor different microphone rates duplicate/drop samples.
-/// Downsampling first runs the batch path's anti-alias filter, whose state
-/// carries across chunks.
-#[derive(Default)]
-struct Resampler {
-    pending: Vec<f32>,
-    base: usize,
-    total: usize,
-    next: usize,
-    rate: u32,
-    filter: Option<audio::AntiAlias>,
-}
-
-impl Resampler {
-    fn push(
-        &mut self,
-        samples: Vec<f32>,
-        rate: u32,
-        final_chunk: bool,
-    ) -> Result<Vec<f32>, AsrError> {
-        if rate == 0 || (self.rate != 0 && self.rate != rate) {
-            return Err(AsrError::Protocol("stream capture rate changed".into()));
-        }
-        self.rate = rate;
-        let mut samples = samples;
-        if rate > 16000 {
-            self.filter
-                .get_or_insert_with(|| audio::AntiAlias::new(rate, 16000))
-                .process(&mut samples);
-        }
-        self.total += samples.len();
-        self.pending.extend(samples);
-        let mut output = Vec::new();
-        loop {
-            let position = self.next as u64 * u64::from(rate);
-            let left = (position / 16000) as usize;
-            if left >= self.total || (!final_chunk && left + 1 >= self.total) {
-                break;
-            }
-            let right = (left + 1).min(self.total - 1);
-            let fraction = (position % 16000) as f32 / 16000.0;
-            let a = self.pending[left - self.base];
-            let b = self.pending[right - self.base];
-            output.push(a + (b - a) * fraction);
-            self.next += 1;
-        }
-        let keep = ((self.next as u64 * u64::from(rate) / 16000) as usize).min(self.total);
-        self.pending.drain(..keep - self.base);
-        self.base = keep;
-        Ok(output)
-    }
-}
-
 pub(crate) struct Session {
     id: String,
     settings: Settings,
     tail: FinalTail,
     cursor: usize,
     config: Option<CaptureConfig>,
-    resampler: Resampler,
+    resampler: StreamingResampler,
     generation: Option<u64>,
     offset: usize,
     started: bool,
@@ -107,7 +53,7 @@ impl Session {
             tail: FinalTail::default(),
             cursor: 0,
             config: None,
-            resampler: Resampler::default(),
+            resampler: StreamingResampler::new(16_000),
             generation: None,
             offset: 0,
             started: false,
@@ -170,19 +116,20 @@ impl Session {
                 if *stop.borrow() {
                     return Ok(());
                 }
-                let since = if self.resampler.rate == 0 {
+                let since = if self.resampler.source_rate() == 0 {
                     Duration::ZERO
                 } else {
-                    audio::raw_position(self.cursor, self.resampler.rate)
+                    audio::raw_position(self.cursor, self.resampler.source_rate())
                 };
                 match capture.snapshot(since) {
-                    Ok(value) => value,
+                    Ok(value) => Some(value),
+                    Err(audio::AudioError::Recovering) => None,
                     Err(audio::AudioError::NotCapturing) => return Ok(()),
                     Err(_) => return Err(AsrError::Protocol("stream capture failed".into())),
                 }
             };
-            let count = snapshot.raw_len();
-            if count > 0 {
+            if let Some(snapshot) = snapshot.filter(|snapshot| snapshot.raw_len() > 0) {
+                let count = snapshot.raw_len();
                 // Move the stop-time tail mark before releasing inference to the
                 // worker; stop may seal it while this exact chunk is in flight.
                 if !self.tail.advance(self.cursor + count) {
@@ -191,7 +138,10 @@ impl Session {
                 self.cursor += count;
                 let (samples, rate, config) = snapshot.into_stream_pcm();
                 self.check_config(&config)?;
-                let samples = self.resampler.push(samples, rate, false)?;
+                let samples = self
+                    .resampler
+                    .push(samples, rate, false)
+                    .ok_or_else(|| AsrError::Protocol("stream capture rate changed".into()))?;
                 let text = self.submit(asr, samples, cancel.clone()).await?;
                 preview(&text);
             }
@@ -311,7 +261,10 @@ impl Session {
         }
         let (samples, rate, config) = snapshot.into_stream_pcm();
         self.check_config(&config)?;
-        let samples = self.resampler.push(samples, rate, true)?;
+        let samples = self
+            .resampler
+            .push(samples, rate, true)
+            .ok_or_else(|| AsrError::Protocol("stream capture rate changed".into()))?;
         self.submit(asr, samples, cancel.clone()).await?;
         let reply = asr
             .stream_request(
@@ -450,7 +403,7 @@ mod tests {
             .resampler
             .push(vec![0.1; 2400], 24000, false)
             .unwrap();
-        session.offset = session.resampler.next;
+        session.offset = session.resampler.output_samples();
         session.tail.advance(2400);
         session.tail.seal(&vec![0.1; 4800], 24000, &config);
         (session, settings, FakeAsr::new())
@@ -520,17 +473,17 @@ mod tests {
     fn resampling_is_independent_of_chunk_boundaries() {
         for rate in [16000, 24000, 44100, 48000] {
             let input: Vec<f32> = (0..10003).map(|i| (i as f32 * 0.03).sin()).collect();
-            let expected = Resampler::default()
+            let expected = StreamingResampler::new(16_000)
                 .push(input.clone(), rate, true)
                 .unwrap();
-            let mut resampler = Resampler::default();
+            let mut resampler = StreamingResampler::new(16_000);
             let mut actual = vec![];
             for chunk in input.chunks(731) {
                 actual.extend(resampler.push(chunk.to_vec(), rate, false).unwrap());
             }
             actual.extend(resampler.push(vec![], rate, true).unwrap());
             assert_eq!(expected, actual);
-            assert!(resampler.pending.len() <= 1);
+            assert!(resampler.pending_samples() <= 1);
         }
     }
     #[test]
@@ -542,7 +495,7 @@ mod tests {
                         * 0.5
                 })
                 .collect();
-            let mut resampler = Resampler::default();
+            let mut resampler = StreamingResampler::new(16_000);
             let mut output = vec![];
             for chunk in input.chunks(960) {
                 output.extend(resampler.push(chunk.to_vec(), 48_000, false).unwrap());

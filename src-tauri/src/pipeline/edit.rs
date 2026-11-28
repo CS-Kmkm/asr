@@ -178,13 +178,14 @@ pub(crate) async fn finish(
     recording_overlay::set_phase(app, &AppPhase::Completed);
     let (insertion_label, completion) = match insertion {
         Some(InsertResult::ClipboardPaste) => ("clipboard_paste", "Selected text updated."),
+        Some(InsertResult::DirectInsert) => ("caret", "Selected text updated."),
         Some(InsertResult::ClipboardOnly) => (
             "clipboard_only",
             "Automatic replacement was skipped; the edit remains on the clipboard.",
         ),
         Some(InsertResult::PasteUnverified) => (
             "paste_unverified",
-            "The edit paste could not be confirmed; the result remains on the clipboard.",
+            "Edit insertion could not be confirmed. Check the target field.",
         ),
         None => ("insertion_failed", EDIT_CLIPBOARD_UNAVAILABLE),
     };
@@ -242,7 +243,7 @@ pub(crate) async fn finish(
     let snapshot = state.complete(edited.clone(), completion.into());
     let _ = app.emit("app-state", snapshot);
     emit_status(app, insertion_label, completion);
-    if insertion != InsertResult::ClipboardPaste || clipboard_lost {
+    if !insertion.confirmed() || clipboard_lost {
         recording_overlay::show_insertion_notice(
             app,
             injection::notice_outcome(insertion_label, clipboard_lost),
