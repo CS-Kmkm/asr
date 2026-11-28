@@ -1669,6 +1669,12 @@ fn setup_app(
     let _ = storage.back_up_unreadable_settings();
     storage.enforce_current_history_policy()?;
     let (settings, repairs) = storage.get_settings_with_repairs()?;
+    let recovery_storage = storage.clone();
+    let recovery_policy_readable =
+        !repairs.contains("historyRetention") && !repairs.contains("deleteAudioAfterProcessing");
+    storage.reserve_completion().defer(move || {
+        audio::spool::recover(&recovery_storage, recovery_policy_readable);
+    });
     if !repairs.is_empty() {
         // Once per start: later reads use the same in-memory fallbacks.
         emit_status(

@@ -56,7 +56,26 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         apply: migrate_v8_lookup_indexes,
         min_reader_version: 1,
     },
+    Migration {
+        apply: migrate_v9_capture_spool_imports,
+        min_reader_version: 1,
+    },
 ];
+
+fn migrate_v9_capture_spool_imports(connection: &Connection) -> Result<(), StorageError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS imported_capture_spools (
+           token TEXT PRIMARY KEY NOT NULL,
+           imported_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS capture_spool_state (
+           id INTEGER PRIMARY KEY CHECK (id = 1),
+           epoch INTEGER NOT NULL
+         );
+         INSERT OR IGNORE INTO capture_spool_state (id, epoch) VALUES (1, 0);",
+    )?;
+    Ok(())
+}
 
 /// Version 8: indexes for foreign-key child lookups and the metrics
 /// retention purge. With `foreign_keys` on, deleting a history row looks up

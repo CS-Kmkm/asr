@@ -1955,20 +1955,20 @@ fn a_failed_microphone_or_the_time_limit_stops_the_recording() {
     let limit = MAX_RECORDING_DURATION;
     assert_eq!(limit, Duration::from_secs(15 * 60));
     assert_eq!(
-        automatic_stop_reason(false, Duration::from_secs(60), limit),
+        automatic_stop_reason(7, false, Duration::from_secs(60), limit),
         None
     );
     assert_eq!(
-        automatic_stop_reason(true, Duration::from_secs(1), limit),
-        Some(StopReason::MicrophoneDisconnected)
+        automatic_stop_reason(7, true, Duration::from_secs(1), limit),
+        Some(StopReason::MicrophoneDisconnected(7))
     );
     assert_eq!(
-        automatic_stop_reason(false, limit, limit),
-        Some(StopReason::MaximumDuration)
+        automatic_stop_reason(7, false, limit, limit),
+        Some(StopReason::MaximumDuration(7))
     );
     assert_eq!(
-        automatic_stop_reason(true, limit * 2, limit),
-        Some(StopReason::MicrophoneDisconnected)
+        automatic_stop_reason(7, true, limit * 2, limit),
+        Some(StopReason::MicrophoneDisconnected(7))
     );
 }
 
@@ -1984,6 +1984,7 @@ fn a_stream_failure_is_reported_even_when_the_user_stopped_first() {
         rms_level: 0.1,
         vad: audio::VadAnalysis::default(),
         warning: warning.map(str::to_owned),
+        retry_only: false,
     };
     assert!(!microphone_disconnected(
         StopReason::User,
@@ -1994,7 +1995,7 @@ fn a_stream_failure_is_reported_even_when_the_user_stopped_first() {
         &Ok(artifact(Some("device disconnected")))
     ));
     assert!(microphone_disconnected(
-        StopReason::MicrophoneDisconnected,
+        StopReason::MicrophoneDisconnected(7),
         &Ok(artifact(None))
     ));
     assert!(microphone_disconnected(
@@ -2004,7 +2005,7 @@ fn a_stream_failure_is_reported_even_when_the_user_stopped_first() {
         ))
     ));
     assert!(!microphone_disconnected(
-        StopReason::MaximumDuration,
+        StopReason::MaximumDuration(7),
         &Err(audio::AudioError::NoVoiceDetected)
     ));
 }
@@ -2020,15 +2021,15 @@ fn an_automatic_stop_keeps_its_reason_in_the_overlay() {
         MICROPHONE_DISCONNECTED_PROCESSING
     );
     assert_eq!(
-        processing_message(StopReason::MicrophoneDisconnected, false, "Stopping"),
+        processing_message(StopReason::MicrophoneDisconnected(7), false, "Stopping"),
         MICROPHONE_DISCONNECTED_PROCESSING
     );
     assert_eq!(
-        processing_message(StopReason::MaximumDuration, false, "Stopping"),
+        processing_message(StopReason::MaximumDuration(7), false, "Stopping"),
         RECORDING_LIMIT_PROCESSING
     );
     assert_eq!(
-        processing_message(StopReason::MaximumDuration, true, "Stopping"),
+        processing_message(StopReason::MaximumDuration(7), true, "Stopping"),
         MICROPHONE_DISCONNECTED_PROCESSING
     );
 }

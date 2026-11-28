@@ -429,6 +429,18 @@
     "code": "transcription_failed_the_recording_is_kept_in_history_for_24_hours_where_you_can_retry_it",
     "ja": "文字起こしに失敗しました。録音は履歴に24時間保持されるので、履歴から再試行できます。"
   },
+  "The interrupted recording was saved to History. You can retry it there.": {
+    "code": "interrupted_recording_saved_to_history",
+    "ja": "中断された録音を履歴に保存しました。履歴から再試行できます。"
+  },
+  "Microphone input stopped before enough speech was captured for automatic transcription.": {
+    "code": "interrupted_capture_rejected",
+    "ja": "自動で文字起こしできるだけの音声を録音する前に、マイク入力が途切れました。"
+  },
+  "The interrupted recording is available to retry from History for 24 hours.": {
+    "code": "interrupted_recording_kept_for_retry",
+    "ja": "中断された録音は24時間、履歴から再試行できます。"
+  },
   "The recording was too long for this speech model. Retrying with the same model will fail the same way; record shorter clips or switch to faster-whisper.": {
     "code": "the_recording_was_too_long_for_this_speech_model_retrying_with_the_same_model_will_fail_the_same_way",
     "ja": "録音がこの音声認識モデルには長すぎました。同じモデルで再試行しても同様に失敗します。録音を短く区切るか、faster-whisper に切り替えてください。"
@@ -445,21 +457,21 @@
     "code": "live_transcription_stopped_because_the_microphone_input_failed",
     "ja": "マイク入力が途切れたため、録音中の文字起こしを停止しました。"
   },
-  "The microphone was disconnected, so recording stopped. The audio captured before the disconnection is being transcribed.": {
+  "Microphone input stopped. Transcribing the audio captured so far.": {
     "code": "the_microphone_was_disconnected_so_recording_stopped_the_audio_captured_before_the_disconnection_is_",
-    "ja": "マイクが切断されたため、録音を停止しました。切断までに録音した音声を文字起こししています。"
+    "ja": "マイク入力が途切れました。そこまでに録音した音声を文字起こししています。"
   },
-  "The microphone was disconnected before usable speech was captured. Check the microphone and start a new recording.": {
+  "Microphone input stopped before usable speech was captured. Check the microphone and start a new recording.": {
     "code": "the_microphone_was_disconnected_before_usable_speech_was_captured_check_the_microphone_and_start_a_n",
-    "ja": "使用できる音声を取得する前にマイクが切断されました。マイクを確認して、新しい録音を開始してください。"
+    "ja": "文字起こしに使える音声を録音する前にマイク入力が途切れました。マイクを確認して、録音をやり直してください。"
   },
   "Recording reached the 15-minute limit and stopped. The audio is being transcribed.": {
     "code": "recording_reached_the_15_minute_limit_and_stopped_the_audio_is_being_transcribed",
     "ja": "録音が上限の15分に達したため停止しました。音声を文字起こししています。"
   },
-  "Microphone disconnected. Transcribing what was captured.": {
+  "Microphone input stopped. Transcribing what was captured.": {
     "code": "microphone_disconnected_transcribing_what_was_captured",
-    "ja": "マイクが切断されました。録音できた分を文字起こししています。"
+    "ja": "マイク入力が途切れました。録音できた音声を文字起こししています。"
   },
   "Recording limit reached. Transcribing.": {
     "code": "recording_limit_reached_transcribing",

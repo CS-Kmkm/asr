@@ -25,19 +25,7 @@ pub(super) fn write_pcm16_wav(
             "WAV artifact is too large",
         ))?;
     let mut writer = BufWriter::new(File::create(path)?);
-
-    writer.write_all(b"RIFF")?;
-    writer.write_all(&riff_size.to_le_bytes())?;
-    writer.write_all(b"WAVEfmt ")?;
-    writer.write_all(&16u32.to_le_bytes())?;
-    writer.write_all(&1u16.to_le_bytes())?;
-    writer.write_all(&1u16.to_le_bytes())?;
-    writer.write_all(&sample_rate.to_le_bytes())?;
-    writer.write_all(&(sample_rate * 2).to_le_bytes())?;
-    writer.write_all(&2u16.to_le_bytes())?;
-    writer.write_all(&16u16.to_le_bytes())?;
-    writer.write_all(b"data")?;
-    writer.write_all(&data_size.to_le_bytes())?;
+    write_header(&mut writer, data_size, riff_size, sample_rate)?;
     const SAMPLES_PER_CHUNK: usize = 4096;
     let mut encoded = [0u8; SAMPLES_PER_CHUNK * 2];
     for chunk in samples.chunks(SAMPLES_PER_CHUNK) {
@@ -55,10 +43,63 @@ pub(super) fn write_pcm16_wav(
     Ok(())
 }
 
+fn write_header(
+    writer: &mut impl Write,
+    data_size: u32,
+    riff_size: u32,
+    sample_rate: u32,
+) -> std::io::Result<()> {
+    writer.write_all(b"RIFF")?;
+    writer.write_all(&riff_size.to_le_bytes())?;
+    writer.write_all(b"WAVEfmt ")?;
+    writer.write_all(&16u32.to_le_bytes())?;
+    writer.write_all(&1u16.to_le_bytes())?;
+    writer.write_all(&1u16.to_le_bytes())?;
+    writer.write_all(&sample_rate.to_le_bytes())?;
+    writer.write_all(&(sample_rate * 2).to_le_bytes())?;
+    writer.write_all(&2u16.to_le_bytes())?;
+    writer.write_all(&16u16.to_le_bytes())?;
+    writer.write_all(b"data")?;
+    writer.write_all(&data_size.to_le_bytes())?;
+    Ok(())
+}
+
+pub(super) fn write_pcm16_bytes(
+    file: File,
+    samples: &[u8],
+    sample_rate: u32,
+) -> std::io::Result<()> {
+    let size = u32::try_from(samples.len())
+        .ok()
+        .filter(|size| {
+            size.is_multiple_of(2) && *size <= u32::MAX - 36 && sample_rate <= u32::MAX / 2
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid PCM size or rate")
+        })?;
+    let mut writer = BufWriter::new(file);
+    write_header(&mut writer, size, 36 + size, sample_rate)?;
+    writer.write_all(samples)?;
+    writer.flush()?;
+    Ok(())
+}
+
 /// Reads a mono 16-bit PCM WAV as written by [`write_pcm16_wav`]: its
 /// samples and sample rate. Any other layout, or lengths that disagree with
 /// the file, is an error.
 pub(crate) fn read_pcm16_wav(path: &Path) -> Result<(Vec<f32>, u32), AudioError> {
+    let (bytes, sample_rate) = read_pcm16_wav_file(path)?;
+    let samples = bytes[44..]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| f32::from(i16::from_le_bytes(*pair)) / f32::from(i16::MAX))
+        .collect();
+    Ok((samples, sample_rate))
+}
+
+/// Validates the canonical layout while retaining the original PCM bytes.
+pub(crate) fn read_pcm16_wav_file(path: &Path) -> Result<(Vec<u8>, u32), AudioError> {
     let bytes = std::fs::read(path)?;
     let field =
         |at: usize| u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
@@ -83,13 +124,7 @@ pub(crate) fn read_pcm16_wav(path: &Path) -> Result<(Vec<f32>, u32), AudioError>
         ));
     }
     let sample_rate = field(24);
-    let samples = bytes[44..]
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| f32::from(i16::from_le_bytes(*pair)) / f32::from(i16::MAX))
-        .collect();
-    Ok((samples, sample_rate))
+    Ok((bytes, sample_rate))
 }
 
 pub(super) fn temporary_wav_path(directory: Option<&Path>) -> PathBuf {

@@ -13,7 +13,7 @@ use crate::{
     asr::{self, Transcriber},
     audio::{
         self, AudioCapture, AudioDevice, AudioEnhancementConfig, CaptureConfig,
-        NoiseSuppressionLevel,
+        NoiseSuppressionLevel, MAX_RECORDING_DURATION,
     },
     command_error,
     correction::{self, FailureOutcome},
@@ -1262,7 +1262,31 @@ async fn start_owned_recording(
         }
     }
     let prompt = join_blocking(prompt_load).await.flatten();
-    let capture_config = capture_config(&settings);
+    let target_language =
+        (mode == PipelineMode::Translate).then(|| settings.translation_target_language.clone());
+    let capture_config = CaptureConfig {
+        retain_interrupted_audio: !dictation_test
+            && matches!(
+                take_mode,
+                PipelineMode::Dictate | PipelineMode::Translate | PipelineMode::Edit
+            )
+            && storage::FailedTakeRetention::for_settings(&settings).is_some(),
+        crash_spool: (!dictation_test
+            && storage::FailedTakeRetention::for_settings(&settings)
+                == Some(storage::FailedTakeRetention::Normal))
+        .then(|| {
+            crate::audio::spool::Policy::new(
+                storage.inner().clone(),
+                take_mode,
+                target_language.as_deref(),
+                edit_session
+                    .as_ref()
+                    .map(|session| session.selection.text()),
+            )
+        })
+        .flatten(),
+        ..capture_config(&settings)
+    };
     let mut test = services.microphone_test.lock().await;
     let mut audio = services.audio.lock().await;
     release_microphone_test(&mut test, audio.as_mut())
@@ -1293,8 +1317,6 @@ async fn start_owned_recording(
         .app_context
         .lock()
         .map_err(|_| "target service is unavailable".to_string())? = app_context;
-    let target_language =
-        (mode == PipelineMode::Translate).then(|| settings.translation_target_language.clone());
     *services
         .voice_translation_target
         .lock()
@@ -1363,10 +1385,17 @@ async fn start_owned_recording(
                 break;
             }
             let (level, stream_failed) = {
-                let audio = services.audio.lock().await;
-                (audio.level(), audio.stream_error().is_some())
+                let mut audio = services.audio.lock().await;
+                if services.lifecycle.phase() != PipelinePhase::Recording
+                    || services.lifecycle.is_cancelled(operation_id)
+                {
+                    break;
+                }
+                let failed = audio.stream_error().is_some() && !audio.recover_stream();
+                (audio.level(), failed)
             };
             if let Some(reason) = automatic_stop_reason(
+                operation_id,
                 stream_failed,
                 recording_started.elapsed(),
                 MAX_RECORDING_DURATION,
@@ -1545,30 +1574,28 @@ async fn load_unless_cancelled(
     }
 }
 
-/// Recordings stop automatically at this length and are transcribed as usual.
-const MAX_RECORDING_DURATION: Duration = Duration::from_secs(15 * 60);
-
 /// Why a recording stopped. Only `User` comes from an explicit request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StopReason {
     User,
     HoldRelease(u64),
     DictationTest(u64),
-    MicrophoneDisconnected,
-    MaximumDuration,
+    MicrophoneDisconnected(u64),
+    MaximumDuration(u64),
 }
 
 /// Decides, on each level tick, whether a recording must stop by itself. A
 /// failed input stream delivers no more audio, so it wins over the time limit.
 fn automatic_stop_reason(
+    operation_id: u64,
     stream_failed: bool,
     elapsed: Duration,
     limit: Duration,
 ) -> Option<StopReason> {
     if stream_failed {
-        Some(StopReason::MicrophoneDisconnected)
+        Some(StopReason::MicrophoneDisconnected(operation_id))
     } else if elapsed >= limit {
-        Some(StopReason::MaximumDuration)
+        Some(StopReason::MaximumDuration(operation_id))
     } else {
         None
     }
@@ -1580,19 +1607,20 @@ pub(crate) fn microphone_disconnected(
     reason: StopReason,
     artifact: &Result<audio::AudioArtifact, audio::AudioError>,
 ) -> bool {
-    reason == StopReason::MicrophoneDisconnected
+    matches!(reason, StopReason::MicrophoneDisconnected(_))
         || match artifact {
             Ok(artifact) => artifact.warning.is_some(),
             Err(error) => matches!(error, audio::AudioError::StreamFailure(_)),
         }
 }
 
-pub(crate) const MICROPHONE_DISCONNECTED: &str = "The microphone was disconnected, so recording stopped. The audio captured before the disconnection is being transcribed.";
-pub(crate) const MICROPHONE_DISCONNECTED_WITHOUT_SPEECH: &str = "The microphone was disconnected before usable speech was captured. Check the microphone and start a new recording.";
+pub(crate) const MICROPHONE_DISCONNECTED: &str =
+    "Microphone input stopped. Transcribing the audio captured so far.";
+pub(crate) const MICROPHONE_DISCONNECTED_WITHOUT_SPEECH: &str = "Microphone input stopped before usable speech was captured. Check the microphone and start a new recording.";
 pub(crate) const RECORDING_LIMIT_REACHED: &str =
     "Recording reached the 15-minute limit and stopped. The audio is being transcribed.";
 const MICROPHONE_DISCONNECTED_PROCESSING: &str =
-    "Microphone disconnected. Transcribing what was captured.";
+    "Microphone input stopped. Transcribing what was captured.";
 const RECORDING_LIMIT_PROCESSING: &str = "Recording limit reached. Transcribing.";
 
 /// The Processing message the overlay shows. An automatic stop keeps its
@@ -1603,9 +1631,9 @@ pub(crate) fn processing_message(
     disconnected: bool,
     default: &'static str,
 ) -> &'static str {
-    if disconnected || reason == StopReason::MicrophoneDisconnected {
+    if disconnected || matches!(reason, StopReason::MicrophoneDisconnected(_)) {
         MICROPHONE_DISCONNECTED_PROCESSING
-    } else if reason == StopReason::MaximumDuration {
+    } else if matches!(reason, StopReason::MaximumDuration(_)) {
         RECORDING_LIMIT_PROCESSING
     } else {
         default
@@ -2523,7 +2551,7 @@ pub(crate) async fn cancel_recording(
 ) -> Result<(), String> {
     let mode = services.lifecycle.mode().unwrap_or(PipelineMode::Dictate);
     let (cancel_message, _) = cancellation_copy(mode);
-    let cancelled = cancel_pipeline_operation(
+    let cancelled = cancel_pipeline_operation_with_storage(
         &services.lifecycle,
         &services.audio,
         &services.target,
@@ -2531,6 +2559,8 @@ pub(crate) async fn cancel_recording(
         &services.live,
         &services.edit,
         &services.ask,
+        None,
+        Some(&storage),
         || emit_state(&app, &state, AppPhase::Idle, cancel_message),
     )
     .await?;
@@ -2566,6 +2596,7 @@ impl<F: FnOnce()> Drop for OnDrop<F> {
 /// nor overwrite a newer recording. Starting and Processing keep their owner,
 /// which publishes their terminal phase.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn cancel_pipeline_operation(
     lifecycle: &PipelineLifecycle,
     audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
@@ -2602,12 +2633,62 @@ async fn cancel_pipeline_operation_for(
     expected: Option<u64>,
     publish_cancelled: impl FnOnce(),
 ) -> Result<Option<PipelinePhase>, String> {
+    cancel_pipeline_operation_with_storage(
+        lifecycle,
+        audio,
+        target,
+        translation_target,
+        live,
+        edit,
+        ask,
+        expected,
+        None,
+        publish_cancelled,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cancel_pipeline_operation_with_storage(
+    lifecycle: &PipelineLifecycle,
+    audio: &tokio::sync::Mutex<Box<dyn AudioCapture>>,
+    target: &Mutex<Option<TargetWindow>>,
+    translation_target: &Mutex<Option<String>>,
+    live: &tokio::sync::Mutex<Option<live_dictation::LiveTask>>,
+    edit: &tokio::sync::Mutex<Option<EditSession>>,
+    ask: &tokio::sync::Mutex<Option<AskSession>>,
+    expected: Option<u64>,
+    storage: Option<&Storage>,
+    publish_cancelled: impl FnOnce(),
+) -> Result<Option<PipelinePhase>, String> {
     let Some((operation_id, phase)) = lifecycle.cancel_for(expected)? else {
         return Ok(None);
     };
     // Starting and Processing already have an owner. Releasing their lifecycle
     // here would allow a new recording to race their remaining writes/cleanup.
     if phase != PipelinePhase::Recording {
+        if phase == PipelinePhase::Processing {
+            if let Some(storage) = storage {
+                if let Some(checkpoint) = storage.stopping_checkpoint(operation_id) {
+                    storage
+                        .discard_capture_spool(&checkpoint)
+                        .map_err(command_error)?;
+                } else {
+                    // Stop may have claimed the operation just before registering its
+                    // checkpoint. The recorder lock serializes that handoff.
+                    let audio = audio.lock().await;
+                    let checkpoint = storage.stopping_checkpoint(operation_id).or_else(|| {
+                        lifecycle.cancellation(operation_id).ok()?;
+                        audio.checkpoint()
+                    });
+                    if let Some(checkpoint) = checkpoint {
+                        storage
+                            .discard_capture_spool(&checkpoint)
+                            .map_err(command_error)?;
+                    }
+                }
+            }
+        }
         return Ok(Some(phase));
     }
     // A recording cancelled before any stop ends its take here.
@@ -2622,6 +2703,15 @@ async fn cancel_pipeline_operation_for(
     if let Ok(mut target) = target.lock() {
         target.take();
     }
+    // Pause preview before shutdown where available, then invalidate the take
+    // at the recorder before waiting for the device.
+    if let Some(task) = live.lock().await.as_ref() {
+        task.signal_stop();
+    }
+    let audio_result = {
+        let mut audio = audio.lock().await;
+        audio.cancel().await
+    };
     let live_task = live.lock().await.take();
     edit.lock().await.take();
     ask.lock().await.take();
@@ -2631,10 +2721,6 @@ async fn cancel_pipeline_operation_for(
     if let Ok(mut language) = translation_target.lock() {
         language.take();
     }
-    let audio_result = {
-        let mut audio = audio.lock().await;
-        audio.cancel().await
-    };
     if let Some(task) = live_task {
         drop(task.finish().await?);
     }

@@ -871,7 +871,16 @@ async fn run_loop(
                 incremental::Turn::Idle => {}
                 incremental::Turn::Used => continue,
                 incremental::Turn::Stop => return Ok(()),
-                incremental::Turn::CaptureFailed => return Err(LiveFailure::Capture),
+                incremental::Turn::CaptureFailed => {
+                    // A replacement can be adopted between the failed read and
+                    // this check. Continue on either side of that handoff.
+                    let capture = audio.lock().await;
+                    match capture.probe(Duration::ZERO, Duration::MAX) {
+                        Ok(Some(_)) | Err(AudioError::Recovering) => continue,
+                        Err(AudioError::NotCapturing) => return Ok(()),
+                        _ => return Err(LiveFailure::Capture),
+                    }
+                }
             }
         }
         if !work.preview {
@@ -887,12 +896,14 @@ async fn run_loop(
                     Ok(Some(probe)) if !gate.should_prepare(&probe, &segmentation) => continue,
                     Ok(_) => {}
                     Err(AudioError::NotCapturing) => return Ok(()),
+                    Err(AudioError::Recovering) => continue,
                     Err(_) => return Err(LiveFailure::Capture),
                 }
             }
             match audio.snapshot(cursor) {
                 Ok(snapshot) => snapshot,
                 Err(AudioError::NotCapturing) => return Ok(()),
+                Err(AudioError::Recovering) => continue,
                 Err(_) => return Err(LiveFailure::Capture),
             }
         };
