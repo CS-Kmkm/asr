@@ -1,0 +1,7 @@
+{
+  "bundle": {
+    "resources": {
+      "../.ai/speech-cpp-packaging/runtime-0.10.1/": "speech-cpp/runtime-0.10.1/"
+    }
+  }
+}

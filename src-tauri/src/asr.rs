@@ -12,9 +12,15 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{broadcast, watch, Mutex, OwnedMutexGuard};
 use tokio::time::timeout;
 
+pub(crate) mod native;
+
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const PROTOCOL_VERSION: u64 = 1;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+// The RTX 3060 Vulkan cold start measured 8.9 s. Allow headroom for
+// slower devices without letting GPU initialization consume the install budget.
+const NATIVE_READY_BUDGET: Duration = Duration::from_secs(60);
+const REQUEST_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a cancelled transcription may take to confirm a protocol
 /// `cancel` before its worker is killed instead (which costs a model reload
@@ -76,6 +82,7 @@ pub struct WorkerCommand {
     pub quantization: Option<String>,
     pub(crate) provision: Option<crate::worker_setup::Provision>,
     pub(crate) source_required: bool,
+    pub(crate) native: Option<native::Speech>,
 }
 
 impl fmt::Debug for WorkerCommand {
@@ -116,6 +123,7 @@ impl WorkerCommand {
             quantization: None,
             provision: None,
             source_required: false,
+            native: None,
         }
     }
 
@@ -415,7 +423,7 @@ pub enum ModelResidency {
 
 struct RunningWorker {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     /// The start of a line whose read was abandoned by a cancelled wait. The
     /// next read continues the same line, so giving up on a response never
@@ -426,51 +434,129 @@ struct RunningWorker {
     /// worker is busy and its stream holds a stale response, so it is killed
     /// rather than reused or asked to shut down.
     in_flight: bool,
+    native: Option<native::Protocol>,
+    #[cfg(windows)]
+    _native_job: Option<std::os::windows::io::OwnedHandle>,
 }
 
 impl RunningWorker {
     async fn send(&mut self, message: &Value) -> Result<(), AsrError> {
+        self.in_flight = true;
+        if let Some(native) = self.native.as_mut() {
+            let deadline = if message["command"] == "transcribe" {
+                let duration = message["audio_path"]
+                    .as_str()
+                    .and_then(|path| wav_file_duration(Path::new(path)))
+                    .unwrap_or_default();
+                REQUEST_WRITE_TIMEOUT + duration.min(Duration::from_secs(15 * 60)) / 8
+            } else {
+                REQUEST_WRITE_TIMEOUT
+            };
+            let early_reply = Self::read_raw(&mut self.stdout, &mut self.partial_line, deadline);
+            return timeout(deadline, native.send(message, &mut self.stdin, early_reply))
+                .await
+                .map_err(|_| AsrError::Timeout)?;
+        }
         let mut encoded =
             serde_json::to_vec(message).map_err(|error| AsrError::Protocol(error.to_string()))?;
         encoded.push(b'\n');
-        self.in_flight = true;
-        self.stdin.write_all(&encoded).await?;
-        self.stdin.flush().await?;
+        let stdin = self.stdin.as_mut().ok_or(AsrError::Crashed)?;
+        timeout(REQUEST_WRITE_TIMEOUT, async {
+            stdin.write_all(&encoded).await?;
+            stdin.flush().await
+        })
+        .await
+        .map_err(|_| AsrError::Timeout)??;
         Ok(())
     }
 
     /// Read one complete line. Cancel-safe: a read dropped midway keeps what
     /// it consumed in `partial_line`.
     async fn read_line(&mut self, line_timeout: Duration) -> Result<Vec<u8>, AsrError> {
+        if self.native.is_none() {
+            return self.read_raw_line(line_timeout).await;
+        }
+        timeout(line_timeout, async {
+            loop {
+                if let Some(reply) = self.native.as_mut().and_then(native::Protocol::take_local) {
+                    return Ok(reply);
+                }
+                let line = self.read_raw_line(line_timeout).await?;
+                if let Some(reply) = self
+                    .native
+                    .as_mut()
+                    .expect("native protocol")
+                    .receive(&line)?
+                {
+                    return Ok(reply);
+                }
+            }
+        })
+        .await
+        .map_err(|_| AsrError::Timeout)?
+    }
+
+    async fn read_raw_line(&mut self, line_timeout: Duration) -> Result<Vec<u8>, AsrError> {
+        Self::read_raw(&mut self.stdout, &mut self.partial_line, line_timeout).await
+    }
+
+    async fn read_raw(
+        stdout: &mut BufReader<ChildStdout>,
+        partial_line: &mut Vec<u8>,
+        line_timeout: Duration,
+    ) -> Result<Vec<u8>, AsrError> {
         loop {
-            let limit = (MAX_RESPONSE_BYTES + 1).saturating_sub(self.partial_line.len());
+            let limit = (MAX_RESPONSE_BYTES + 1).saturating_sub(partial_line.len());
             let read = timeout(
                 line_timeout,
-                (&mut self.stdout)
+                (&mut *stdout)
                     .take(limit as u64)
-                    .read_until(b'\n', &mut self.partial_line),
+                    .read_until(b'\n', partial_line),
             )
             .await
             .map_err(|_| AsrError::Timeout)??;
-            if self.partial_line.len() > MAX_RESPONSE_BYTES {
-                self.partial_line.clear();
+            if partial_line.len() > MAX_RESPONSE_BYTES {
+                partial_line.clear();
                 return Err(AsrError::Protocol(
                     "worker response exceeded size limit".into(),
                 ));
             }
-            if self.partial_line.ends_with(b"\n") {
-                return Ok(std::mem::take(&mut self.partial_line));
+            if partial_line.ends_with(b"\n") {
+                return Ok(std::mem::take(partial_line));
             }
             if read == 0 {
-                let _ = self.child.wait().await;
+                // A worker can close stdout and keep running. The caller's
+                // reset or startup cleanup owns termination and reaping.
                 return Err(AsrError::Crashed);
             }
         }
     }
 
     async fn kill(&mut self) {
+        #[cfg(windows)]
+        if let Some(job) = self._native_job.take() {
+            drop(job);
+            let _ = self.child.wait().await;
+            return;
+        }
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
+    }
+
+    async fn native_exited(&mut self) -> bool {
+        if self.native.is_none() {
+            return false;
+        }
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return true;
+        }
+        // Poll the pipe once without consuming any bytes or waiting for output.
+        std::future::poll_fn(|cx| {
+            use tokio::io::AsyncBufRead;
+            let poll = std::pin::Pin::new(&mut self.stdout).poll_fill_buf(cx);
+            std::task::Poll::Ready(matches!(poll, std::task::Poll::Ready(Ok([]) | Err(_))))
+        })
+        .await
     }
 }
 
@@ -511,9 +597,12 @@ impl State {
     /// Kill a worker whose last response was abandoned without a drain. A
     /// restore abandoned the same way left no worker behind.
     async fn discard_abandoned_worker(&mut self) {
-        match &self.running {
-            Some(worker) if worker.in_flight => self.reset().await,
-            Some(_) => {}
+        match self.running.as_mut() {
+            Some(worker) => {
+                if worker.in_flight || worker.native_exited().await {
+                    self.reset().await;
+                }
+            }
             None => self.mark_not_resident(),
         }
     }
@@ -609,6 +698,7 @@ async fn drain_cancelled(
 pub struct JsonlTranscriber {
     request_timeout: Duration,
     load_timeout: Duration,
+    native_ready_budget: Duration,
     cancel_grace: Duration,
     shutdown_timeout: Duration,
     next_id: AtomicU64,
@@ -684,6 +774,7 @@ impl JsonlTranscriber {
         Self {
             request_timeout,
             load_timeout,
+            native_ready_budget: NATIVE_READY_BUDGET,
             cancel_grace: CANCEL_GRACE,
             shutdown_timeout: SHUTDOWN_TIMEOUT,
             next_id: AtomicU64::new(1),
@@ -792,6 +883,88 @@ impl JsonlTranscriber {
         .map_err(|_| AsrError::Timeout)?
     }
 
+    async fn ensure_native_cache(
+        &self,
+        native: &native::Speech,
+        deadline: tokio::time::Instant,
+        cancel: &mut Option<watch::Receiver<bool>>,
+        interrupt: &mut watch::Receiver<u64>,
+    ) -> Result<(), AsrError> {
+        let complete = until_cancelled(
+            tokio::time::timeout_at(deadline, native.verify_artifacts(deadline, Arc::from([]))),
+            cancel,
+            interrupt,
+        )
+        .await
+        .map_err(|_| AsrError::Cancelled)?
+        .map_err(|_| AsrError::Timeout)??;
+        if complete {
+            return Ok(());
+        }
+        let installer = native.installer()?;
+        if let Some(provision) = &installer.provision {
+            let synced = until_cancelled(
+                tokio::time::timeout_at(deadline, provision.is_synced_async()),
+                cancel,
+                interrupt,
+            )
+            .await
+            .map_err(|_| AsrError::Cancelled)?
+            .map_err(|_| AsrError::Timeout)?;
+            if !synced {
+                tokio::time::timeout_at(deadline, self.provision(provision, cancel, interrupt))
+                    .await
+                    .map_err(|_| AsrError::Timeout)??;
+            }
+        }
+        let _ = self.progress.send(LoadProgress {
+            stage: "download".into(),
+            model: None,
+            completed_bytes: None,
+            total_bytes: None,
+        });
+        let install = async {
+            const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
+            let mut command = worker_process_command(&installer, false);
+            command
+                .stdin(Stdio::null())
+                .env("ASR_SPEECH_CPP_HOME", native.cache_home());
+            #[cfg(windows)]
+            let (mut child, _job) = native::spawn_owned(&mut command).await?;
+            #[cfg(not(windows))]
+            let mut child = command.spawn()?;
+            let mut report = Vec::new();
+            child
+                .stdout
+                .take()
+                .ok_or(AsrError::Crashed)?
+                .take(MAX_RECEIPT_BYTES + 1)
+                .read_to_end(&mut report)
+                .await?;
+            if report.len() as u64 <= MAX_RECEIPT_BYTES && child.wait().await?.success() {
+                // Older installers can succeed without receipts. Those files
+                // still go through the normal SHA-256 verification.
+                let receipts: Vec<native::artifacts::Receipt> =
+                    serde_json::from_slice(&report).unwrap_or_default();
+                if native.verify_artifacts(deadline, receipts.into()).await? {
+                    return Ok(());
+                }
+            }
+            Err(AsrError::Worker(WorkerError {
+                code: "speech_cpp_unavailable".into(),
+                message: "Unable to install the pinned speech.cpp runtime and model".into(),
+            }))
+        };
+        until_cancelled(
+            tokio::time::timeout_at(deadline, install),
+            cancel,
+            interrupt,
+        )
+        .await
+        .map_err(|_| AsrError::Cancelled)?
+        .map_err(|_| AsrError::Timeout)?
+    }
+
     /// Start the worker process and complete its handshake.
     async fn start_process(
         &self,
@@ -799,9 +972,28 @@ impl JsonlTranscriber {
         cancel: &mut Option<watch::Receiver<bool>>,
         interrupt: &mut watch::Receiver<u64>,
     ) -> Result<RunningWorker, AsrError> {
+        let native_deadline = if let Some(native) = command_spec.native.as_ref() {
+            let deadline = tokio::time::Instant::now() + self.load_timeout;
+            self.ensure_native_cache(native, deadline, cancel, interrupt)
+                .await?;
+            if deadline <= tokio::time::Instant::now() {
+                return Err(AsrError::Timeout);
+            }
+            Some(deadline)
+        } else {
+            None
+        };
         // stderr carries the worker's internal_error details; persist it to the
         // rotating worker log when the app installed one.
         let mut command = worker_process_command(command_spec, crate::worker_log::is_installed());
+        #[cfg(windows)]
+        let (mut child, native_job) = if command_spec.native.is_some() {
+            let (child, job) = native::spawn_owned(&mut command).await?;
+            (child, Some(job))
+        } else {
+            (command.spawn()?, None)
+        };
+        #[cfg(not(windows))]
         let mut child = command.spawn()?;
         if let Some(stderr) = child.stderr.take() {
             crate::worker_log::mark_worker_start();
@@ -817,30 +1009,63 @@ impl JsonlTranscriber {
             .ok_or_else(|| AsrError::Protocol("worker stdout unavailable".into()))?;
         let mut worker = RunningWorker {
             child,
-            stdin,
+            stdin: Some(stdin),
             stdout: BufReader::new(stdout),
             partial_line: Vec::new(),
             in_flight: false,
+            native: None,
+            #[cfg(windows)]
+            _native_job: native_job,
         };
-        let id = self.next_id();
-        let hello = async {
-            worker.send(&json!({"id": id, "command": "hello"})).await?;
-            let response = self
-                .read_response(&mut worker, &json!(id), HANDSHAKE_TIMEOUT)
-                .await?;
-            Self::validate_hello(&response)
-        };
-        let result =
-            match until_cancelled(timeout(HANDSHAKE_TIMEOUT, hello), cancel, interrupt).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err(AsrError::Timeout),
-                Err(_) => Err(AsrError::Cancelled),
-            };
+        let result = self
+            .complete_startup(
+                &mut worker,
+                command_spec,
+                native_deadline,
+                cancel,
+                interrupt,
+            )
+            .await;
         if let Err(error) = result {
             worker.kill().await;
             return Err(error);
         }
         Ok(worker)
+    }
+
+    async fn complete_startup(
+        &self,
+        worker: &mut RunningWorker,
+        command_spec: &WorkerCommand,
+        native_deadline: Option<tokio::time::Instant>,
+        cancel: &mut Option<watch::Receiver<bool>>,
+        interrupt: &mut watch::Receiver<u64>,
+    ) -> Result<(), AsrError> {
+        if let Some((native, deadline)) = command_spec.native.as_ref().zip(native_deadline) {
+            let ready = until_cancelled(
+                worker.read_raw_line(phase_budget(deadline, self.native_ready_budget)?),
+                cancel,
+                interrupt,
+            )
+            .await
+            .map_err(|_| AsrError::Cancelled)??;
+            worker.native = Some(native::Protocol::ready(native.clone(), &ready)?);
+        }
+        let id = self.next_id();
+        let handshake_budget = native_deadline
+            .map(|deadline| phase_budget(deadline, HANDSHAKE_TIMEOUT))
+            .unwrap_or(Ok(HANDSHAKE_TIMEOUT))?;
+        let hello = async {
+            worker.send(&json!({"id": id, "command": "hello"})).await?;
+            let response = self
+                .read_response(worker, &json!(id), handshake_budget)
+                .await?;
+            Self::validate_hello(&response)
+        };
+        until_cancelled(timeout(handshake_budget, hello), cancel, interrupt)
+            .await
+            .map_err(|_| AsrError::Cancelled)?
+            .map_err(|_| AsrError::Timeout)?
     }
 
     fn validate_hello(response: &Value) -> Result<(), AsrError> {
@@ -996,7 +1221,7 @@ impl JsonlTranscriber {
         matches!(
             error,
             AsrError::Io(_) | AsrError::Protocol(_) | AsrError::Crashed | AsrError::Timeout
-        )
+        ) || matches!(error, AsrError::Worker(worker) if matches!(worker.code.as_str(), "native_cpu_oom" | "native_gpu_oom"))
     }
 
     /// Take the state lock unless the request is cancelled, or `shutdown` or
@@ -1146,6 +1371,11 @@ impl JsonlTranscriber {
         let mut interrupt = self.interrupt.subscribe();
         let mut state = self.lock_state(&mut cancel, &mut interrupt).await?;
         if !restore_model && state.running.is_none() {
+            if request["command"] == "health" && state.command.native.is_some() {
+                // A cold probe must not start the native engine and load its
+                // weights. It reports the active runtime after a normal load.
+                return Ok(json!({"health": native::health(None)}));
+            }
             // Diagnostics must not start a long model restore or publish
             // Restoring. Keep this temporary worker owned by the future;
             // kill_on_drop also handles an outer health deadline expiring.
@@ -1170,7 +1400,25 @@ impl JsonlTranscriber {
             .await?;
         let target_id = request.get("id").cloned().unwrap_or(Value::Null);
         let worker = state.running.as_mut().expect("worker was ensured");
-        let outcome = match worker.send(&request).await {
+        let sent = if worker.native.is_some() {
+            match until_cancelled(worker.send(&request), &mut cancel, &mut interrupt).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => {
+                    // An upload failure can leave an unfinished request in the peer.
+                    state.reset().await;
+                    return Err(error);
+                }
+                Err(_) => {
+                    // An interrupted upload can leave a partial JSONL frame
+                    // or a request that never received its transcribe message.
+                    state.reset().await;
+                    return Err(AsrError::Cancelled);
+                }
+            }
+        } else {
+            worker.send(&request).await
+        };
+        let outcome = match sent {
             Ok(()) => {
                 until_cancelled(
                     self.read_response(worker, &target_id, response_timeout),
@@ -1230,6 +1478,14 @@ impl JsonlTranscriber {
     async fn reset(&self) {
         self.state.lock().await.reset().await;
     }
+}
+
+fn phase_budget(deadline: tokio::time::Instant, cap: Duration) -> Result<Duration, AsrError> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(AsrError::Timeout);
+    }
+    Ok(remaining.min(cap))
 }
 
 fn load_request(id: u64, quantization: &str) -> Value {
@@ -1477,11 +1733,11 @@ impl Transcriber for JsonlTranscriber {
                 .await
         })
         .await;
-        // A worker that did not answer is not waited for a second time.
-        let exited = exchange.is_ok()
-            && timeout(self.shutdown_timeout, worker.child.wait())
-                .await
-                .is_ok();
+        let exited = matches!(&exchange, Ok(Ok(_)))
+            && matches!(
+                timeout(self.shutdown_timeout, worker.child.wait()).await,
+                Ok(Ok(_))
+            );
         if !exited {
             worker.kill().await;
         }
@@ -1967,11 +2223,14 @@ runtime"
                 .push(("PYTHONPATH".into(), root.to_string_lossy().into_owned()));
             let mut child = worker_process_command(&spec, true).spawn().unwrap();
             let mut worker = RunningWorker {
-                stdin: child.stdin.take().unwrap(),
+                stdin: child.stdin.take(),
                 stdout: BufReader::new(child.stdout.take().unwrap()),
                 child,
                 partial_line: Vec::new(),
                 in_flight: false,
+                native: None,
+                #[cfg(windows)]
+                _native_job: None,
             };
             let hello = async {
                 worker

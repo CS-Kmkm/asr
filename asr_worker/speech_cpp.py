@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 import platform
 import re
@@ -18,7 +19,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from .backends import BackendError, OpenAICompatibleBackend
+from .backends import BackendError, OpenAICompatibleBackend, ProgressReporting
 
 VERSION = "0.10.1"
 IS_WINDOWS = os.name == "nt"
@@ -87,9 +88,35 @@ def server_environment() -> dict[str, str]:
     return {name: value for name, value in os.environ.items() if name.upper() in allowed}
 
 
-def digest(path: Path) -> str:
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest() if hasattr(hashlib, "file_digest") else _digest(stream)
+def file_stamp(stream: Any) -> dict[str, int] | None:
+    if os.name != "nt":
+        return None
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class FileInformation(ctypes.Structure):
+        _fields_ = [
+            ("attributes", wintypes.DWORD), ("created", wintypes.FILETIME),
+            ("accessed", wintypes.FILETIME), ("written", wintypes.FILETIME),
+            ("volume", wintypes.DWORD), ("size_high", wintypes.DWORD),
+            ("size_low", wintypes.DWORD), ("links", wintypes.DWORD),
+            ("id_high", wintypes.DWORD), ("id_low", wintypes.DWORD),
+        ]
+
+    info = FileInformation()
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    query = kernel.GetFileInformationByHandle
+    query.argtypes = [wintypes.HANDLE, ctypes.POINTER(FileInformation)]
+    query.restype = wintypes.BOOL
+    if not query(msvcrt.get_osfhandle(stream.fileno()), ctypes.byref(info)):
+        return None
+    return {
+        "size": (info.size_high << 32) | info.size_low,
+        "modified": (info.written.dwHighDateTime << 32) | info.written.dwLowDateTime,
+        "volume": info.volume,
+        "file_id": (info.id_high << 32) | info.id_low,
+    }
 
 
 def _digest(stream: Any) -> str:
@@ -99,9 +126,16 @@ def _digest(stream: Any) -> str:
     return result.hexdigest()
 
 
-def verify(path: Path, expected: str) -> None:
-    if digest(path) != expected:
+def verify(path: Path, expected: str) -> dict[str, int] | None:
+    with path.open("rb") as stream:
+        stamp = file_stamp(stream)
+        actual = (hashlib.file_digest(stream, "sha256").hexdigest()
+                  if hasattr(hashlib, "file_digest") else _digest(stream))
+        if stamp != file_stamp(stream):
+            raise BackendError("speech_cpp_artifact_invalid", "speech.cpp artifact changed during verification")
+    if actual != expected:
         raise BackendError("speech_cpp_artifact_invalid", "speech.cpp artifact SHA256 mismatch; existing files were preserved")
+    return stamp
 
 
 def _remove_staging(path: Path) -> None:
@@ -111,21 +145,21 @@ def _remove_staging(path: Path) -> None:
         path.unlink(missing_ok=True)
 
 
-def publish_bytes(content: bytes, target: Path, expected: str) -> None:
+def publish_bytes(content: bytes, target: Path, expected: str) -> dict[str, int] | None:
     """Atomic no-clobber extraction, including interruption/disk-full cases."""
     if target.exists():
-        verify(target, expected)
-        return
+        return verify(target, expected)
     staging: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(dir=target.parent, prefix=f".download-{os.getpid()}-", delete=False) as stream:
             staging = Path(stream.name)
             stream.write(content)
-        verify(staging, expected)
+        stamp = verify(staging, expected)
         try:
             os.link(staging, target)
         except FileExistsError:
-            verify(target, expected)
+            return verify(target, expected)
+        return stamp
     finally:
         if staging is not None:
             _remove_staging(staging)
@@ -168,11 +202,10 @@ def cache_home() -> Path:
     return Path(override) if override else Path(os.environ.get("LOCALAPPDATA", Path.home() / ".cache")) / "LocalVoice" / "speech.cpp"
 
 
-def acquire(url: str, target: Path, expected: str, backend: Any) -> None:
+def acquire(url: str, target: Path, expected: str, backend: Any) -> dict[str, int] | None:
     """Download to a unique staging file and publish without replacing anything."""
     if target.exists():
-        verify(target, expected)
-        return
+        return verify(target, expected)
     if os.environ.get("ASR_OFFLINE_ONLY") == "1":
         raise BackendError("model_not_cached", "Offline mode requires the model and runtime already cached")
     import httpx
@@ -191,19 +224,21 @@ def acquire(url: str, target: Path, expected: str, backend: Any) -> None:
                     completed += len(chunk)
                     backend.report_progress("download", completed_bytes=completed,
                                             total_bytes=int(total) if total and total.isdigit() else None)
-        verify(staging, expected)
+        stamp = verify(staging, expected)
         backend.raise_if_cancelled()
         try:
             # Atomic, no-clobber publication on Windows and Unix, same volume.
             os.link(staging, target)
         except FileExistsError:
-            verify(target, expected)
+            return verify(target, expected)
+        return stamp
     finally:
         if staging is not None:
             _remove_staging(staging)
 
 
-def prepare(backend: Any) -> tuple[Path, Path]:
+def prepare(backend: Any, *, model_only: bool = False,
+            receipts: list[dict[str, Any]] | None = None) -> tuple[Path, Path]:
     if not IS_WINDOWS or platform.machine().lower() not in {"amd64", "x86_64"}:
         raise BackendError("speech_cpp_unsupported_platform", "Japanese Vulkan models require Windows x64. Select faster-whisper on this system.")
     model = MODELS.get(backend.catalog_id)
@@ -212,20 +247,29 @@ def prepare(backend: Any) -> tuple[Path, Path]:
     home = cache_home()
     clean_staging(home)
     runtime = home / f"runtime-{VERSION}"
-    if not all((runtime / name).is_file() for name in RUNTIME_FILES):
-        archive = home / ARCHIVE
-        acquire(f"https://github.com/nyosegawa/speech.cpp/releases/download/v{VERSION}/{ARCHIVE}", archive, ARCHIVE_SHA256, backend)
-        runtime.mkdir(parents=True, exist_ok=True)
-        # Extract only the two known, independently hashed executables. Never
-        # use extractall, and never replace a preexisting runtime file.
-        with zipfile.ZipFile(archive) as bundle:
+
+    def record(path: Path, sha256: str, stamp: dict[str, int] | None) -> None:
+        if receipts is not None and stamp is not None:
+            receipts.append({"path": str(path.resolve()), "sha256": sha256, "stamp": stamp})
+
+    if not model_only:
+        if not all((runtime / name).is_file() for name in RUNTIME_FILES):
+            archive = home / ARCHIVE
+            acquire(f"https://github.com/nyosegawa/speech.cpp/releases/download/v{VERSION}/{ARCHIVE}", archive, ARCHIVE_SHA256, backend)
+            runtime.mkdir(parents=True, exist_ok=True)
+            # Extract only the two known, independently hashed executables. Never
+            # use extractall, and never replace a preexisting runtime file.
+            with zipfile.ZipFile(archive) as bundle:
+                for name, expected in RUNTIME_FILES.items():
+                    path = runtime / name
+                    record(path, expected, publish_bytes(bundle.read(name), path, expected))
+        else:
             for name, expected in RUNTIME_FILES.items():
                 path = runtime / name
-                publish_bytes(bundle.read(name), path, expected)
-    for name, expected in RUNTIME_FILES.items():
-        verify(runtime / name, expected)
+                record(path, expected, verify(path, expected))
     audio_model = home / model["revision"] / model["file"]
-    acquire(f"https://huggingface.co/{model['repo']}/resolve/{model['revision']}/{model['file']}", audio_model, model["sha256"], backend)
+    stamp = acquire(f"https://huggingface.co/{model['repo']}/resolve/{model['revision']}/{model['file']}", audio_model, model["sha256"], backend)
+    record(audio_model, model["sha256"], stamp)
     return runtime / "speech.exe", audio_model
 
 
@@ -404,3 +448,21 @@ class SpeechCppBackend(OpenAICompatibleBackend):
                 process.stdout.close()
         if stuck:
             raise BackendError("speech_cpp_unavailable", "The GPU process did not stop; restart the worker or select faster-whisper")
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) != 2 or sys.argv[1] not in {"--prepare-only", "--prepare-model-only"}:
+        sys.exit(2)
+
+    class CacheInstaller(ProgressReporting):
+        catalog_id = os.environ.get("ASR_MODEL_ID", "").strip() or DEFAULT_MODEL
+
+    try:
+        verified: list[dict[str, Any]] = []
+        prepare(CacheInstaller(), model_only=sys.argv[1] == "--prepare-model-only", receipts=verified)
+        print(json.dumps(verified), flush=True)
+    except BackendError as error:
+        print(error.code, file=sys.stderr)
+        sys.exit(1)

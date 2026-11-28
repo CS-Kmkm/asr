@@ -125,8 +125,11 @@ class SpeechCppTests(IsolatedWorkerTestCase):
             network.return_value.__enter__.return_value = response
             target = Path(folder) / 'model.gguf'
             backend = SpeechCppBackend()
-            acquire('https://example.invalid', target, expected, backend)
-            verify(target, expected)
+            installed_stamp = acquire('https://example.invalid', target, expected, backend)
+            self.assertEqual(installed_stamp, verify(target, expected))
+            if os.name == 'nt':
+                self.assertEqual(installed_stamp['size'], len(content))
+                self.assertIn('file_id', installed_stamp)
             response.iter_bytes.return_value = iter([content])
             backend.cancel_requested = lambda: True
             with self.assertRaises(BackendError) as caught:
@@ -138,6 +141,27 @@ class SpeechCppTests(IsolatedWorkerTestCase):
             with self.assertRaises(BackendError):
                 acquire('https://example.invalid', Path(folder) / 'bad.gguf', '0' * 64, backend)
             self.assertEqual([p.name for p in Path(folder).iterdir()], ['model.gguf'])
+
+    def test_prepare_model_receipt_names_verified_target_and_digest(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            target = home / 'revision' / 'tiny.gguf'
+            stamp = {'size': 3, 'modified': 100, 'volume': 1, 'file_id': 2}
+            pinned = {'repo': 'example/model', 'revision': 'revision',
+                      'file': 'tiny.gguf', 'sha256': 'catalog digest'}
+            backend = SpeechCppBackend()
+            receipts = []
+            with patch('asr_worker.speech_cpp.IS_WINDOWS', True), \
+                 patch('asr_worker.speech_cpp.platform.machine', return_value='AMD64'), \
+                 patch('asr_worker.speech_cpp.cache_home', return_value=home), \
+                 patch('asr_worker.speech_cpp.MODELS', {backend.catalog_id: pinned}), \
+                 patch('asr_worker.speech_cpp.acquire', return_value=stamp) as install:
+                _, model_path = prepare(backend, model_only=True, receipts=receipts)
+            install.assert_called_once()
+            self.assertEqual(model_path, target)
+            self.assertEqual(receipts, [
+                {'path': str(target.resolve()), 'sha256': pinned['sha256'], 'stamp': stamp},
+            ])
 
     def _start(self, *, ready=True, models=None, job_error=False, expect_failure=False):
         backend = SpeechCppBackend()

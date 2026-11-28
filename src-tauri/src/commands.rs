@@ -80,7 +80,11 @@ pub(crate) enum TranscriptionFailure {
 impl TranscriptionFailure {
     pub(crate) fn of(error: &asr::AsrError) -> Self {
         match error {
-            asr::AsrError::Worker(worker) if worker.code == "cpu_oom" => Self::CpuMemory,
+            asr::AsrError::Worker(worker)
+                if matches!(worker.code.as_str(), "cpu_oom" | "native_cpu_oom") =>
+            {
+                Self::CpuMemory
+            }
             asr::AsrError::Worker(worker) if worker.code == TRANSCRIPT_TRUNCATED_CODE => {
                 Self::TooLongForModel
             }
