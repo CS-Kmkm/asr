@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory)][string]$OutputDirectory,
     [switch]$IncludeNotepad,
     [switch]$ExpandedMatrix,
+    [switch]$ClassicTerminals,
     [switch]$RealModelNotepad,
     [switch]$RealApps,
     [switch]$MockOnRealProfile,
@@ -18,6 +19,7 @@ $ErrorActionPreference = 'Stop'
 if ($RealApps -and -not $RealModelNotepad) { throw 'RealApps requires RealModelNotepad.' }
 if ($IncludeNotepad -and $RealModelNotepad) { throw 'Choose one Notepad mode.' }
 if ($ExpandedMatrix -and ($IncludeNotepad -or $RealModelNotepad)) { throw 'Choose one fixture suite.' }
+if ($ClassicTerminals -and ($ExpandedMatrix -or $IncludeNotepad -or $RealModelNotepad)) { throw 'Choose one fixture suite.' }
 if ($MockOnRealProfile -and $RealModelNotepad) { throw 'MockOnRealProfile is a mock-only mode.' }
 if (($RealRepeats -ne 1 -or $RealFixture -ne 'original') -and -not $RealModelNotepad) {
     throw 'RealRepeats and RealFixture require RealModelNotepad.'
@@ -51,6 +53,17 @@ try {
     $app = Get-Item -LiteralPath $AppBinary
     $digest = (Get-FileHash -LiteralPath $app.FullName).Hash
     $session = New-PSSession -VMName $vm.Name -Credential $credential
+    if ($ClassicTerminals) {
+        $report.classic_tools = @(Invoke-Command -Session $session -ScriptBlock {
+            foreach ($tool in 'GitPortable\usr\bin\mintty.exe', 'GitPortable\usr\bin\bash.exe',
+                'GitPortable\usr\bin\stty.exe', 'GitPortable\usr\bin\cat.exe', 'GitPortable\usr\bin\timeout.exe',
+                'GitPortable\usr\bin\msys-2.0.dll', 'PuTTY\putty.exe') {
+                $path = Join-Path 'C:\ASR-Evaluation\tools' $tool
+                if (!(Test-Path -LiteralPath $path -PathType Leaf)) { throw "Guest terminal is missing: $tool" }
+                [pscustomobject]@{ file = $tool; sha256 = (Get-FileHash -LiteralPath $path).Hash }
+            }
+        } | Select-Object file,sha256)
+    }
     $guestRoot = Invoke-Command -Session $session -ArgumentList $runId,$expectedUser -ScriptBlock {
         param($id, $userName)
         $ErrorActionPreference = 'Stop'
@@ -71,7 +84,8 @@ try {
     }
     Copy-Item -LiteralPath $app.FullName -Destination "$guestRoot\local-voice-input.exe" -ToSession $session
     $files = 'vm_insertion_smoke.py', 'windows_acceptance.py', 'bench_e2e.py', 'evaluation_events.py', 'score_asr.py', 'windows_uia_bridge.ps1',
-        'windows_acceptance_target.html', 'windows_acceptance_terminal.py'
+        'windows_acceptance_target.html', 'windows_acceptance_terminal.py',
+        'windows_acceptance_mintty.sh', 'windows_acceptance_putty.py'
     foreach ($file in $files) {
         Copy-Item -LiteralPath (Join-Path $PSScriptRoot $file) -Destination "$guestRoot\scripts" -ToSession $session
     }
@@ -141,8 +155,8 @@ try {
     $externalRepeats = 2
     $externalTakes = if ($RealApps) { 2 * $externalRepeats } else { 0 }
     $limit = if ($RealModelNotepad) { 155 + 160 * ($RealRepeats + $externalTakes) } elseif ($ExpandedMatrix) { 1100 } elseif ($IncludeNotepad) { 380 } else { 290 }
-    $previousRun = Invoke-Command -Session $session -ArgumentList $guestRoot,$taskName,$digest,$AppRevision,$runId,($IncludeNotepad.IsPresent),($RealModelNotepad.IsPresent),$expectedUser,$RealRepeats,$limit,($MockOnRealProfile.IsPresent),($ExpandedMatrix.IsPresent),($RealApps.IsPresent) -ScriptBlock {
-        param($root, $task, $expectedDigest, $revision, $owner, $notepad, $real, $userName, $repeats, $limit, $sharedMock, $expanded, $realApps)
+    $previousRun = Invoke-Command -Session $session -ArgumentList $guestRoot,$taskName,$digest,$AppRevision,$runId,($IncludeNotepad.IsPresent),($RealModelNotepad.IsPresent),$expectedUser,$RealRepeats,$limit,($MockOnRealProfile.IsPresent),($ExpandedMatrix.IsPresent),($RealApps.IsPresent),($ClassicTerminals.IsPresent) -ScriptBlock {
+        param($root, $task, $expectedDigest, $revision, $owner, $notepad, $real, $userName, $repeats, $limit, $sharedMock, $expanded, $realApps, $classicTerminals)
         $ErrorActionPreference = 'Stop'
         if ((Get-FileHash -LiteralPath (Join-Path $root 'local-voice-input.exe')).Hash -ne $expectedDigest) {
             throw 'The staged guest executable has an unexpected hash.'
@@ -161,7 +175,7 @@ exit $LASTEXITCODE
 '@
         $externalCase = if ($realApps) { "--real-apps --real-repeats $repeats" } elseif ($real) { "--real-notepad --real-repeats $repeats" } elseif ($expanded) {
             '--expanded-matrix'
-        } elseif ($notepad) { '--include-notepad' } else { '' }
+        } elseif ($classicTerminals) { '--classic-terminals' } elseif ($notepad) { '--include-notepad' } else { '' }
         if ($sharedMock) { $externalCase += ' --mock-on-real-profile' }
         $command = $command.Replace('__REVISION__', $revision).Replace('__EXTERNAL_CASE__', $externalCase)
         $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
@@ -209,6 +223,7 @@ exit $LASTEXITCODE
     if ($ExpandedMatrix) { $expectedCases += ',selection-change,minimize,mock-notepad,mock-edge,mock-vscode,mock-chrome,mock-terminal,worker-crash-recovery' }
     if ($RealModelNotepad) { $expectedCases = 'real-notepad' }
     if ($RealApps) { $expectedCases += ',real-vscode,real-chrome' }
+    if ($ClassicTerminals) { $expectedCases = 'mock-mintty,mock-putty' }
     if ($caseNames -ne $expectedCases -or @($guestResult.cases | Where-Object status -NotIn @('PASS','FAIL','BLOCKED')).Count) {
         throw 'Guest case coverage could not be verified.'
     }
@@ -266,13 +281,15 @@ exit $LASTEXITCODE
                     $userSid = (Get-LocalUser -Name $userName).SID.Value
                     $fixtureProfiles = Join-Path $root 'target-profiles'
                     $terminalEntry = Join-Path $root 'scripts\windows_acceptance_terminal.py'
+                    $puttyEntry = Join-Path $root 'scripts\windows_acceptance_putty.py'
                     $findRunProcesses = {
                         Get-CimInstance Win32_Process -Filter "Name='local-voice-input.exe' OR Name='python.exe' OR Name='uv.exe'" |
                             Where-Object {
                                 $_.ExecutablePath -eq $appPath -or (
                                     $_.CommandLine -and (
                                         $_.CommandLine.IndexOf($entry, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
-                                        $_.CommandLine.IndexOf($terminalEntry, [StringComparison]::OrdinalIgnoreCase) -ge 0))
+                                        $_.CommandLine.IndexOf($terminalEntry, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+                                        $_.CommandLine.IndexOf($puttyEntry, [StringComparison]::OrdinalIgnoreCase) -ge 0))
                             }
                         # Packaged Notepad can outlive the controller's job.
                         # Its command line contains the exact fresh scratch path.
@@ -290,11 +307,12 @@ exit $LASTEXITCODE
                             }
                         }
                         foreach ($folder in Get-ChildItem -LiteralPath $fixtureProfiles -Directory -ErrorAction SilentlyContinue) {
-                            if ($folder.Name -notmatch '^asr-(edge|chrome|code)-[0-9a-f]{32}$') { continue }
+                            if ($folder.Name -notmatch '^asr-(edge|chrome|code|mintty|putty)-[0-9a-f]{32}$') { continue }
                             $ownerPath = Join-Path $folder.FullName 'window-owner.json'
                             if (-not (Test-Path -LiteralPath $ownerPath -PathType Leaf)) { continue }
                             $window = Get-Content -Raw -LiteralPath $ownerPath | ConvertFrom-Json
-                            $processName = @{ edge = 'msedge'; chrome = 'chrome'; code = 'Code' }[$folder.Name.Split('-')[1]]
+                            $processName = @{ edge = 'msedge'; chrome = 'chrome'; code = 'Code'
+                                mintty = 'mintty'; putty = 'putty' }[$folder.Name.Split('-')[1]]
                             if ($window.name -ne $processName -or
                                 $window.pid -notmatch '^\d+$' -or $window.start_ticks -notmatch '^\d+$') {
                                 throw 'invalid external fixture ownership evidence'
@@ -304,8 +322,9 @@ exit $LASTEXITCODE
                                 $candidate.StartTime.ToUniversalTime() -ge $folder.CreationTimeUtc -and
                                 "$($candidate.StartTime.ToUniversalTime().Ticks)" -eq $window.start_ticks) {
                                 $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$($candidate.Id)"
+                                $marker = if ($processName -in @('mintty', 'putty')) { $folder.Name } else { $folder.FullName }
                                 if ($cim -and $cim.CommandLine -and
-                                    $cim.CommandLine.IndexOf($folder.FullName, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+                                    $cim.CommandLine.IndexOf($marker, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
                                     (Invoke-CimMethod -InputObject $cim -MethodName GetOwnerSid -ErrorAction SilentlyContinue).Sid -eq $userSid) {
                                     $cim
                                 }
@@ -328,6 +347,16 @@ exit $LASTEXITCODE
                         Start-Sleep -Milliseconds 200
                     } while ($settle.Elapsed.TotalSeconds -lt 15)
                     if (@(& $findRunProcesses).Count) { throw 'Evaluation processes did not exit; retaining the task reservation.' }
+                    foreach ($folder in Get-ChildItem -LiteralPath $fixtureProfiles -Directory -ErrorAction SilentlyContinue) {
+                        if ($folder.Name -notmatch '^asr-putty-[0-9a-f]{32}$') { continue }
+                        $sessionKey = "Registry::HKEY_USERS\$userSid\Software\SimonTatham\PuTTY\Sessions\$($folder.Name)"
+                        if (Test-Path -LiteralPath $sessionKey) {
+                            $value = Get-ItemProperty -LiteralPath $sessionKey
+                            if ($value.WinTitle -eq $folder.Name -and $value.HostName -eq '127.0.0.1') {
+                                Remove-Item -LiteralPath $sessionKey
+                            }
+                        }
+                    }
                     Unregister-ScheduledTask -TaskName $task -Confirm:$false
                 }
             }

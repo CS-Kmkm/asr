@@ -25,7 +25,7 @@ import time
 import uuid
 import wave
 
-from bench_e2e import (WinAPI, TargetWindow, WavePlayer, Keyboard, ConsoleKeyGuard,
+from bench_e2e import (WinAPI, TargetWindow, WavePlayer, Keyboard, ConsoleKeyGuard, Clipboard,
                        KEYBDINPUT, INPUT, load_manifest, parse_hotkey, BenchError)
 from evaluation_events import EventReader, EvidenceError
 from score_asr import cer_stats
@@ -47,9 +47,10 @@ WORKER_CRASH = 'worker-crash'
 WORKER_RECOVERY = 'worker-crash-recovery'
 MOCK_EXTERNAL = {'mock-notepad': 'notepad', 'mock-edge': 'edge', 'mock-vscode': 'code', 'mock-chrome': 'chrome',
                  'mock-terminal': 'terminal'}
+VM_CLASSIC_TERMINALS = {'mock-mintty': 'mintty', 'mock-putty': 'putty'}
 MOCK_RECEIVERS = (MOCK_INSERTION, *MOCK_EXTERNAL)
 VM_FULL_SCENARIOS = (*VM_SMOKE_SCENARIOS, *VM_EXTRA_GUARDS, *MOCK_EXTERNAL, WORKER_RECOVERY)
-VM_MOCK_CASES = (*MOCK_GUARDS, *VM_EXTRA_GUARDS, *MOCK_EXTERNAL)
+VM_MOCK_CASES = (*MOCK_GUARDS, *VM_EXTRA_GUARDS, *MOCK_EXTERNAL, *VM_CLASSIC_TERMINALS)
 WORKER_RECOVERY_TRIALS = (WORKER_CRASH, MOCK_INSERTION)
 DELIVERY_OUTCOMES = ('pasted', 'paste_unverified')
 MOCK_PREFIX = '前の文。'
@@ -184,7 +185,8 @@ def runtime_metadata(api, app_pid):
             'runner_files_sha256': {name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
                                     for name in ('windows_acceptance.py', 'bench_e2e.py', 'evaluation_events.py',
                                                  'score_asr.py', 'windows_uia_bridge.ps1', 'windows_acceptance_target.html',
-                                                 'windows_acceptance_terminal.py')},
+                                                 'windows_acceptance_terminal.py',
+                                                 'windows_acceptance_mintty.sh', 'windows_acceptance_putty.py')},
             'os_build': sys.getwindowsversion().build,
             'application_binary_sha256': digest,
             'application_identity_scope': 'loaded executable file; debug frontend is separate'}
@@ -474,7 +476,7 @@ def prepare(api, target, previous, text):
 
 
 def judge(scenario, primary, secondary, take, reference, max_cer, *, mock_text=MOCK_TEXT):
-    if scenario in MOCK_RECEIVERS:
+    if scenario in MOCK_RECEIVERS or scenario in VM_CLASSIC_TERMINALS:
         expected = MOCK_PREFIX + mock_text + MOCK_SUFFIX if scenario == MOCK_INSERTION else mock_text
         exact = primary == expected and not secondary
         result = {'status': 'PASS' if exact else 'FAIL', 'exact_receiver_match': exact}
@@ -611,7 +613,7 @@ def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, ho
     primary.focus()
     original = primary.read()
     mock_insertion = scenario == MOCK_INSERTION
-    empty_receiver = scenario in ('dictate', *REAL_RECEIVERS, *MOCK_EXTERNAL)
+    empty_receiver = scenario in ('dictate', *REAL_RECEIVERS, *MOCK_EXTERNAL, *VM_CLASSIC_TERMINALS)
     confirms_insertion = empty_receiver or mock_insertion
     expected_initial = MOCK_PREFIX + MOCK_SUFFIX if mock_insertion else ('' if empty_receiver else SEED)
     if original != expected_initial or secondary.read():
@@ -678,7 +680,7 @@ def _run_scenario(scenario, *, api, primary, secondary, reader, player, item, ho
                         first_confirmed_at = observed_at
                 else:
                     receiver_violation = True
-        elif scenario in MOCK_RECEIVERS:
+        elif scenario in MOCK_RECEIVERS or scenario in VM_CLASSIC_TERMINALS:
             expected = MOCK_PREFIX + mock_text + MOCK_SUFFIX if mock_insertion else mock_text
             receiver_violation |= primary.read() not in (original, expected)
         if secondary_violation or (not confirms_insertion and not ime and primary.read() != original):
@@ -838,7 +840,7 @@ def main(argv=None):
     parser.add_argument('--playback-device', default='CABLE Input')
     parser.add_argument('--microphone-id', default='name:CABLE Output (VB-Audio Virtual Cable)')
     parser.add_argument('--scenario', action='append',
-                        choices=SCENARIOS + OPTIONAL_SCENARIOS + tuple(MOCK_EXTERNAL))
+                        choices=SCENARIOS + OPTIONAL_SCENARIOS + tuple(MOCK_EXTERNAL) + tuple(VM_CLASSIC_TERMINALS))
     parser.add_argument('--recording-mode', choices=('toggle', 'hold'), default='toggle')
     parser.add_argument('--max-cer', type=float, default=.5)
     parser.add_argument('--mock-insertion', action='store_true', help='run one unattended native mock case in ASR-Eval')
@@ -869,7 +871,8 @@ def main(argv=None):
                                 or (args.scenario and (len(args.scenario) != 1
                                                        or args.scenario[0] not in VM_MOCK_CASES))):
         parser.error('--mock-insertion requires toggle mode and one supported VM case')
-    if not args.mock_insertion and any(case in MOCK_EXTERNAL for case in (args.scenario or ())):
+    if not args.mock_insertion and any(case in MOCK_EXTERNAL or case in VM_CLASSIC_TERMINALS
+                                       for case in (args.scenario or ())):
         parser.error('each VM mock case requires --mock-insertion in ASR-Eval')
     scenarios = (args.scenario or (MOCK_INSERTION,)) if args.mock_insertion else (
         args.scenario or (('dictate',) if args.recording_mode == 'hold' else SCENARIOS))
@@ -877,7 +880,8 @@ def main(argv=None):
         scenarios = (args.real_case,)
     if args.worker_recovery:
         scenarios = WORKER_RECOVERY_TRIALS
-    owned_target = REAL_RECEIVERS.get(args.real_case) or MOCK_EXTERNAL.get(scenarios[0])
+    owned_target = (REAL_RECEIVERS.get(args.real_case) or MOCK_EXTERNAL.get(scenarios[0])
+                    or VM_CLASSIC_TERMINALS.get(scenarios[0]))
     if args.recording_mode == 'hold' and any(scenario not in HOLD_SCENARIOS for scenario in scenarios):
         parser.error('--recording-mode hold supports dictate, focus-away, selection-change and cancel')
     if args.recording_mode == 'hold' and args.target != 'native' and 'selection-change' in scenarios:
@@ -983,6 +987,11 @@ def main(argv=None):
                     ime = NativeIME(api, primary) if scenario == 'ime-composition' else None
                     if ime:
                         scenario_cleanup.callback(ime.close)
+                    terminal_clipboard = None
+                    if unattended and scenario in ('mock-terminal', *VM_CLASSIC_TERMINALS):
+                        terminal_clipboard = Clipboard(api, int(secondary.root))
+                        sentinel = f'ASR terminal previous copy {uuid.uuid4().hex}'
+                        terminal_clipboard.write(sentinel, exclude_from_history=True)
                     result, previous[0], previous[1] = run_scenario(
                         scenario, api=api, primary=primary, secondary=secondary, reader=reader,
                         player=player, item=item, hotkey=hotkey, max_cer=args.max_cer, ime=ime,
@@ -990,6 +999,14 @@ def main(argv=None):
                         real_proof=args.worker_proof, mock_text=args.mock_text or MOCK_TEXT,
                         timeout=90 if args.real_case else (
                             15 if args.mock_insertion else 60))
+                    if terminal_clipboard and result['status'] == 'PASS':
+                        contents = terminal_clipboard.read()
+                        if contents == sentinel:
+                            result['terminal_clipboard'] = 'restored'
+                        elif contents == (args.mock_text or MOCK_TEXT):
+                            result['terminal_clipboard'] = 'transcript_retained'
+                        else:
+                            result.update(status='FAIL', reason='unexpected_terminal_clipboard_contents')
                 if read_profile() != profile:
                     raise EvidenceError('profile changed during trial')
                 if scenario == WORKER_CRASH and result['status'] == 'PASS':

@@ -22,7 +22,8 @@ from evaluation_events import EventReader, EvidenceError, SourceUnavailable
 from score_asr import Options, _manifest_metrics, load_manifest, parse_args as score_args
 from windows_acceptance import (
     MOCK_EXTERNAL, MOCK_INSERTION, MOCK_NOTEPAD, MOCK_TEXT, REAL_EXTERNAL, REAL_EXTERNAL_REPEATS,
-    REAL_NOTEPAD, REAL_RECEIVERS, VM_FULL_SCENARIOS, VM_SMOKE_SCENARIOS, WORKER_RECOVERY, WORKER_RECOVERY_TRIALS,
+    REAL_NOTEPAD, REAL_RECEIVERS, VM_CLASSIC_TERMINALS, VM_FULL_SCENARIOS, VM_SMOKE_SCENARIOS,
+    WORKER_RECOVERY, WORKER_RECOVERY_TRIALS,
     delivery_digest, live_process_start, read_real_proof, require_evaluation_guest, worker_identity,
 )
 
@@ -340,7 +341,8 @@ def run_acceptance(root, scenario, profile, manifest, item, exe_hash, events, di
         elif scenario != MOCK_INSERTION:
             command.extend(('--scenario', scenario))
     with (directory / 'acceptance.log').open('xb') as log:
-        timeout = 160 if real else 100 if recovery else 65 if scenario in MOCK_EXTERNAL else 50
+        external = scenario in MOCK_EXTERNAL or scenario in VM_CLASSIC_TERMINALS
+        timeout = 160 if real else 100 if recovery else 65 if external else 50
         code = subprocess.run(command, timeout=timeout, check=False,
                               stdout=log, stderr=subprocess.STDOUT).returncode
     report_path = directory / 'acceptance' / 'acceptance.json'
@@ -512,6 +514,7 @@ def main():
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--include-notepad', action='store_true')
     modes.add_argument('--expanded-matrix', action='store_true')
+    modes.add_argument('--classic-terminals', action='store_true')
     modes.add_argument('--real-notepad', action='store_true')
     modes.add_argument('--real-apps', action='store_true')
     parser.add_argument('--real-repeats', type=int, default=1)
@@ -525,6 +528,8 @@ def main():
     scenarios = (*VM_SMOKE_SCENARIOS, MOCK_NOTEPAD) if args.include_notepad else VM_SMOKE_SCENARIOS
     if args.expanded_matrix:
         scenarios = VM_FULL_SCENARIOS
+    elif args.classic_terminals:
+        scenarios = tuple(VM_CLASSIC_TERMINALS)
     elif args.real_notepad:
         scenarios = (REAL_NOTEPAD,)
     elif args.real_apps:
