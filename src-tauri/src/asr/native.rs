@@ -519,33 +519,52 @@ fn failure(id: u64, code: &str, message: &str) -> Value {
 #[ignore = "requires the installed pinned speech.cpp cache and a public PCM fixture"]
 async fn native_speech_transcribes_through_the_desktop_supervisor() {
     use super::{JsonlTranscriber, Transcriber};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
+    let model = std::env::var_os("ASR_NATIVE_SPEECH_MODEL")
+        .map(|value| value.into_string().expect("UTF-8 native smoke model ID"))
+        .unwrap_or_else(|| MODEL_ID.into());
     let settings = crate::types::Settings {
         asr_backend: "speech-cpp".into(),
-        model_id: Some(MODEL_ID.into()),
+        model_id: Some(model.clone()),
         model_quantization: "8bit".into(),
         offline_only: true,
         ..Default::default()
     };
     let command = command(&settings).expect("select the opt-in native route");
+    let speech = command.native.as_ref().unwrap();
+    let expected_model = format!("speech.cpp:{model}:Q8_0");
+    let prompt = speech.accepts_prompt.then_some("安全確認");
     let worker = JsonlTranscriber::new(command, Duration::from_secs(15), Duration::from_secs(60));
     assert!(!worker.health().await.unwrap().loaded);
+    let load_started = Instant::now();
     worker.load("8bit").await.unwrap();
+    let load_elapsed = load_started.elapsed();
     let health = worker.health().await.unwrap();
     assert!(health.loaded);
     assert_eq!(health.compute_type.as_deref(), Some("Q8_0"));
+    eprintln!(
+        "native load: model={model}, device={:?}, elapsed_ms={}",
+        health.device,
+        load_elapsed.as_millis()
+    );
     let wav = std::env::var_os("ASR_NATIVE_SPEECH_WAV")
         .map(PathBuf::from)
         .unwrap();
-    for _ in 0..2 {
+    for (index, locale) in [Some("ja-JP"), None].into_iter().enumerate() {
         let (_sender, cancel) = tokio::sync::watch::channel(false);
+        let started = Instant::now();
         let result = worker
-            .transcribe_with_locale(&wav, None, Some("ja-JP"), cancel)
+            .transcribe_with_locale(&wav, prompt, locale, cancel)
             .await
             .unwrap();
         assert!(!result.text.trim().is_empty());
-        assert_eq!(result.model, "speech.cpp:haas-ja-v1.0:Q8_0");
+        assert_eq!(result.model, expected_model);
+        eprintln!(
+            "native recognition: request={}, elapsed_ms={}",
+            index + 1,
+            started.elapsed().as_millis()
+        );
     }
 
     // Start a long request and cancel after the complete transcribe frame was
@@ -596,6 +615,7 @@ async fn native_speech_transcribes_through_the_desktop_supervisor() {
         .await
         .unwrap();
     assert!(!result.text.trim().is_empty());
+    assert_eq!(result.model, expected_model);
     eprintln!("native cancel: next recognition succeeded");
 
     worker.shutdown().await.unwrap();
