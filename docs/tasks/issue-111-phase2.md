@@ -63,10 +63,52 @@ The first checkpoint raises that profile's minimum database reader version to 9.
 
 ## Open gates
 
-- The 1,000-trial contract still includes 200 automatic terminal insertions. Its terminal trials require independent receiver readback. The application reports terminal paste as unverified.
+- The normal 1,000-trial matrix met its pooled point-estimate target. Follow up on the two VS Code observations and complete the remaining abnormal-race coverage. The application reports terminal paste as unverified, and receiver readback supplies the terminal counts.
 - Exercise process-death recovery in the desktop application, measure checkpoint overhead, and validate suspend/resume and confirmed device reconnection on hardware. A healthy active stream keeps its current endpoint until it reports a fault or stops delivering frames.
-- Build and exercise the optional runtime bundle and online cache bootstrap on clean Windows. Measure native Qwen recognition, in-flight cancellation and crash/OOM behavior. Product evaluation remains deferred.
-- Run the fixed 1,000-trial matrix, abnormal cases, soak, matched competitor measurements and full latency/accuracy/resource gates.
+- Build and exercise the optional runtime bundle and online cache bootstrap on clean Windows. Measure product-level Qwen latency and accuracy, and exercise native crash and OOM recovery with real models.
+- Complete the abnormal cases, soak, matched competitor measurements and full latency/accuracy/resource gates.
+
+## Fixed normal insertion matrix
+
+The runner uses the five receivers and four text conditions in the [measurement plan](issue-111-clipboard-ownership.md). Each receiver starts with the same sentinel in a fresh owned control or append-only terminal fixture. Each trial uses a unique nonce, runs through the actual recording and delivery hotkeys, and checks independently observed receiver content and captured-audio evidence. The matrix keeps every planned trial in the denominator and records per-target and per-condition Wilson intervals. One warm-up per target is excluded from that denominator.
+
+Use `scripts/run_vm_insertion_smoke.ps1` with the verified candidate executable, full revision, existing ASR-Eval credential, a fresh output path and `-NormalMatrix full -MockOnRealProfile`. Use `-NormalMatrix pilot` for one trial per condition and target. Pilot counts do not satisfy the 1,000-trial gate. The full run stages its own copy of the scripts and records a separate result in each trial directory.
+
+The pilot confirmed all 20 scheduled insertions, including multiline text in the dedicated Windows Terminal receiver that consumes bracketed paste as literal text. An earlier raw-receiver pilot confirmed 19/20 and lost focus during the terminal multiline trial. Evidence is in `.ai/evaluation/issue-111-matrix-pilot-26c504804f444ff49c19f79274643bd9/` and `.ai/evaluation/issue-111-matrix-pilot-60d6d27a6d54431b9a2257e41205c16d/`. [Windows Terminal paste behavior](https://github.com/microsoft/terminal/pull/19067)
+
+The full run confirmed 998/1,000 insertions (99.8%, Wilson 95% CI 99.27–99.95%). Native EDIT, Notepad, Chrome and Windows Terminal each confirmed 200/200. VS Code confirmed 198/200, with both failures in the short-text condition. The final receiver text matched in those two trials, but the observer reported an unexpected intermediate state, so both remain failures. The evidence does not distinguish an editor mutation from a transient view of the autosaved file. The 99.5% point-estimate gate passed. The host verified all 1,000 scheduled trial results and the staged binary identity. Evidence is under `.ai/evaluation/issue-111-matrix-full-60aef184f1804b14bd64bb37c8d3b595/`.
+
+The read-only resource sampler recorded 142 active samples between the native EDIT case and the end of the matrix. Across the five main app processes, observed private-memory peaks were 11.11–11.79 MiB and handle peaks were 475–497. The target changes start new app processes. The evidence covers those individual intervals. See `resource-samples-bf1dabc8f098450589c4aff914ad1b0c.jsonl` and `resource-summary-fb8fa8c047d844fb88ead4ecccec46fb.json` in the full-run directory.
+
+The separate abnormal checks passed 4/4 after the full matrix under `.ai/evaluation/issue-111-abnormal-guards-a7a072c1c9f44b94b929bebe0b62183b/`. The mode is `-InflightGuards -MockOnRealProfile`. The IME case combines composition with observed typing. The cancellation case waits for a transcription that the mock worker is holding. The clipboard cases require exact independent text insertion and independently read back the original text and bitmap or the newer copy made while the worker is held. The latter exercises a copy before clipboard publication, while the Rust race fixture covers the last sequence check before paste dispatch.
+
+## Native CPU product latency
+
+The Notepad lane uses `scripts/tauri.native-evaluation.conf.json` to build the release under a dedicated Tauri identifier. Before launch, the VM runner verifies the candidate manifest, executable SHA-256, override SHA-256, and embedded profile identifier. The staged guest verifies the same executable hash and checks the identifier before it creates the separate evaluation profile. The lane preserves the Phase 1 profile and runs the pinned Qwen3-ASR 0.6B Q8_0 model through the desktop's speech.cpp CPU path with the locked 3.19-second fixture. Model and runtime artifacts are hashed before and after guest staging. Python ASR is disabled for the application.
+
+The app and native worker must keep the same process identities across ten takes, and the worker must be reaped after the app exits. The captured timing runs from the stop hotkey to the first independent Notepad read of the final text. The lane scores the receiver text against the locked reference and reports normalized CER. The Phase 1 comparator instead verifies an exact match against its instrumented Python worker output. The native lane measures product latency and a fixed-utterance quality check. It leaves the corpus accuracy and longer soak gates open.
+
+The first ten-take guest run finished under `.ai/evaluation/issue-111-native-notepad-2367eb3f40e749788cc9ce7f8a8c46da/`. The guest accepted 10/10 reads and reaped the worker. Its nine warm takes measured p50 1,524 ms and p95 1,757 ms with normalized reference CER 10% for the fixed utterance. The corresponding median ASR and paste spans were 1,446 and 62 ms. The host blocked the run because its coverage validator erroneously expected two native trials. The validator now uses the requested count.
+
+The host verified the rerun with the same binary, model, profile and audio under `.ai/evaluation/issue-111-native-notepad-recheck-8c3001adb6a2444db354fd08a8cdb7bb/`. All 10 reads passed with the same app and native worker identity, and the worker was reaped on exit. The nine warm takes measured p50 1,503.51 ms, p95 1,575.93 ms and normalized reference CER 10%. The native worker's observed peak working set was 970.49 MiB. The p95 is below 2,500 ms. The p50 remains above 1,500 ms, and the corpus accuracy and product latency gates remain open.
+
+A matched run used `-NativeNotepad -NativeModel haas-ja-v1.0 -RealFixture short -RealRepeats 10` with the pinned Haas-ja-v1.0 Q8_0 model and the separate `scripts/tauri.haas-evaluation.conf.json` profile. It used the same VM, locked fixture, CPU route, Notepad receiver and warm-trial rule. The host verified 10/10 insertions, stable application and worker identities, and worker reaping after exit. The nine warm takes measured p50 666.13 ms and p95 705.71 ms. All ten takes scored 0% normalized reference CER on this utterance. The observed peak native worker working set was 657.03 MiB. This Haas configuration meets both latency thresholds on the fixed run. See `.ai/evaluation/issue-111-haas-notepad-ef81ec491a324be78d8e237b0f5794f3/`.
+
+## Optional Windows runtime package
+
+The release build using `src-tauri/tauri.speech-cpp.conf.json` produced both x64 MSI and NSIS installers. The build inputs were the pinned official speech.cpp 0.10.1 archive and four license files from the matching speech.cpp source tree and ggml submodule. See the [official release](https://github.com/nyosegawa/speech.cpp/releases/tag/v0.10.1).
+
+On the existing Windows 11 Pro evaluation VM, MSI administrative extraction and a new per-user NSIS installation both exited successfully. The extracted and installed packages contained byte-identical copies of `speech.exe`, `speech.dll`, and all four license files at the configured resource path. Both packages included the bootstrap source, and neither contained model weights. The package and payload digests are in `.ai/evaluation/issue-111-speech-bundle-7ac926d7dcba414784e6ef2810421df4/package-verification.json`. The VM already had an evaluation runtime. Clean Windows installation and app-driven first-run bootstrap remain open.
+
+Using the VM's provisioned uv and Python, the packaged `--prepare-model-only` entry point synced a new Python environment in 14.24 s. It fetched the pinned 841,502,336-byte Qwen3-ASR 0.6B Q8_0 model into a new per-attempt cache path in 123.39 s. The downloaded file matched the catalog digest, and offline reuse completed in 1.01 s with the same file identity and modification time in the two installer receipts. The harness checked that the model cache had no runtime directory. The installed `speech.exe` then loaded the downloaded model on CPU and returned one completed recognition for the locked 3.19-second audio. See `package-bootstrap.json`, `package-bootstrap-harness.ps1.txt`, `bootstrap-online.stdout`, `bootstrap-offline.stdout`, and `installed-runtime-smoke.json` in the same evidence directory.
+
+## CPU model comparison for the fixed utterance
+
+Separate host CLI processes ran the pinned Q8_0 variants of Qwen3-ASR 0.6B, Haas-ja-v1.0 and Parakeet Japanese on the same locked audio. All three completed recognition. Their normalized CERs were 10%, 0%, and 10%, respectively. CLI wall times including initial model load were 1,753, 748, and 741 ms. This single-utterance host check supports taking Haas into the matched desktop comparison. See `.ai/evaluation/issue-111-host-model-comparison-8a4a5f99a3664859a963594f844f4f98/host-cli-comparison.json`.
+
+## Frozen Japanese holdout accuracy
+
+Haas CPU via speech.cpp 0.10.1 completed recognition on all 200 locked holdout utterances. The comparison uses the same utterance IDs and reference lengths as the archived Phase 1 CUDA faster-whisper scores, with the candidate audio and references checked against the lock. The pooled normalized CER was 4.35% (370/8,511), compared with 4.85% (413/8,511) in Phase 1. Raw CER was 8.15% (749/9,187) and 10.61% (975/9,187), respectively. The normalized comparison was 4.07% versus 4.49% on FLEURS and 4.75% versus 5.38% on JVNV. The two runs used different devices and runtimes. These scores describe recognition accuracy on this corpus. The comparison leaves desktop resource, longer utterance delivery and competitor gates open. See `.ai/evaluation/issue-111-haas-holdout-d6025641e0f64dfe85d5709572d60669/host-holdout-comparison.json`.
 
 ## Verified on the integration checkout
 
@@ -92,4 +134,20 @@ The first checkpoint raises that profile's minimum database reader version to 9.
 
 The Windows host passed 1,010 Rust library tests with 12 ignored, Clippy with warnings denied, Rust formatting, TypeScript checking, 220 Vitest tests, and 520 pytest tests with one skipped. The Rust run includes the final checkpoint flush and Windows PID reuse regressions. The VM results above refer to the previously staged binaries.
 
-Status: Wave A's insertion, recording, and native worker changes are integrated on `feat/issue-111-phase2`. The full 1,000-trial matrix, abnormal cases, soak, and performance gates remain open.
+## Post-review product verification
+
+- The release candidate, recorded at build revision `8bf8d2b51e8c8df27f8d46ffdf20facc8076f914`, passed all 11 expanded VM cases and both classic terminal cases. The independent receivers matched the transcript in Windows Terminal, mintty, and PuTTY. The clipboard was restored in mintty and retained the transcript in PuTTY.
+- The same candidate passed all 14 real-model insertions in `ASR-Eval` on the 3.19-second locked Japanese fixture (Notepad 10/10, VS Code 2/2, Chrome 2/2). The Phase 1 comparison uses the same VM, fixture, model revision, faster-whisper 1.2.1 and CTranslate2 4.8.0 on CPU / int8. Both runs had median raw CER of 16.67% and normalized CER of 0.00% for the fixed utterance.
+- Warm Notepad stop-to-confirmed insertion was p50 11,382 ms and p95 11,836 ms (9/9 observed), versus 10,696 and 11,581 ms in Phase 1. The candidate's median ASR span was 11,313 ms and its median paste span was 47 ms. This comparison shows where latency accrued in this run. The nine warm samples come from one utterance, and the CPU run remains above both latency targets.
+- The VM exposed no USB audio device during preflight (`usb-audio-preflight.json`). Physical microphone disconnection and reconnection remain blocked pending a guest-visible USB microphone.
+- Evidence, including the candidate binary SHA-256 and per-case receiver reports, is under `.ai/evaluation/issue-111-post-review-38e0f6adcc11437d809643b8d9476217/`.
+
+The host native smoke passed all four combinations of Qwen3-ASR 0.6B / 1.7B and CPU / Vulkan using the same locked WAV and cached speech.cpp 0.10.1 Q8_0 artifacts. Each combination transcribed with explicit Japanese and automatic language, drained a cancellation, transcribed again, and shut down. These are supervisor checks on one utterance. Recognition output is checked for nonempty text and model identity. Timing includes supervisor and file I/O and covers neither UI insertion nor model accuracy. See `native-host/results.json` and the per-combination logs in the same evidence directory.
+
+To repeat the offline smoke, set `ASR_NATIVE_SPEECH_CPP` to `cpu` or `vulkan`, `ASR_NATIVE_SPEECH_MODEL` to `qwen3-asr-0.6b` or `qwen3-asr-1.7b`, and `ASR_NATIVE_SPEECH_WAV` to the locked fixture path. Run from `src-tauri`.
+
+```powershell
+cargo test --lib --locked --offline asr::native::native_speech_transcribes_through_the_desktop_supervisor -- --exact --ignored --nocapture
+```
+
+Status: Wave A's insertion, recording, and native worker changes are integrated on `feat/issue-111-phase2`. The normal 1,000-trial point-estimate gate and four additional abnormal checks passed. The host Qwen supervisor smoke passed on CPU and Vulkan. The Haas CPU product run met both fixed-utterance latency thresholds. The optional bundle and direct bootstrap checks passed on the evaluation VM. The remaining abnormal and hardware cases, longer soak, clean Windows installation and app-driven bootstrap, and full accuracy, resource and competitor comparisons remain open.
